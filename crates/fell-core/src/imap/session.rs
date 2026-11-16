@@ -277,6 +277,12 @@ impl Session {
                 }
                 return Err(imap_err(format!("{label} failed: {rest}")));
             }
+            if untagged.len() >= untagged_limit() {
+                return Err(imap_err(format!(
+                    "{label} exceeded {} untagged replies",
+                    untagged_limit()
+                )));
+            }
             untagged.push(Logical { text, literals });
         }
     }
@@ -329,8 +335,15 @@ impl Session {
 
     fn read_until_crlf(&mut self) -> Result<Vec<u8>, Error> {
         let mut buf = self.take_buf();
+        let limit = line_limit();
         loop {
             if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                if pos > limit {
+                    return Err(imap_err(format!(
+                        "response line from {} exceeds the {limit} byte limit",
+                        self.host
+                    )));
+                }
                 let mut line = buf.drain(..=pos).collect::<Vec<_>>();
                 self.restore_buf(buf);
                 if line.last() == Some(&b'\n') {
@@ -340,6 +353,12 @@ impl Session {
                     line.pop();
                 }
                 return Ok(line);
+            }
+            if buf.len() > limit {
+                return Err(imap_err(format!(
+                    "response line from {} exceeds the {limit} byte limit",
+                    self.host
+                )));
             }
             if !self.fill(&mut buf)? {
                 return Err(imap_err(format!("connection to {} closed", self.host)));
@@ -451,6 +470,11 @@ struct Reply {
 /// and that message is skipped; the rest of the response is still read.
 const MAX_LITERAL: usize = 32 * 1024 * 1024;
 const DISCARD_CHUNK: usize = 64 * 1024;
+/// Protocol text before a newline, not including a `{n}` literal that follows.
+const MAX_LINE: usize = 1024 * 1024;
+/// Untagged replies stored for one tagged command. Stops a server that trickles
+/// `* OK` lines and resets the read timeout on every chunk.
+const MAX_UNTAGGED: usize = 1_000_000;
 
 fn literal_limit() -> usize {
     #[cfg(test)]
@@ -481,6 +505,66 @@ pub(super) fn limit_literals_to(limit: usize) -> LiteralLimitGuard {
 impl Drop for LiteralLimitGuard {
     fn drop(&mut self) {
         TEST_LITERAL_LIMIT.with(|cell| cell.set(MAX_LITERAL));
+    }
+}
+
+fn line_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_LINE_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_LINE
+    }
+}
+
+fn untagged_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_UNTAGGED_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_UNTAGGED
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LINE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LINE) };
+    static TEST_UNTAGGED_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_UNTAGGED) };
+}
+
+#[cfg(test)]
+struct LineLimitGuard;
+
+#[cfg(test)]
+fn limit_lines_to(limit: usize) -> LineLimitGuard {
+    TEST_LINE_LIMIT.with(|cell| cell.set(limit));
+    LineLimitGuard
+}
+
+#[cfg(test)]
+impl Drop for LineLimitGuard {
+    fn drop(&mut self) {
+        TEST_LINE_LIMIT.with(|cell| cell.set(MAX_LINE));
+    }
+}
+
+#[cfg(test)]
+struct UntaggedLimitGuard;
+
+#[cfg(test)]
+fn limit_untagged_to(limit: usize) -> UntaggedLimitGuard {
+    TEST_UNTAGGED_LIMIT.with(|cell| cell.set(limit));
+    UntaggedLimitGuard
+}
+
+#[cfg(test)]
+impl Drop for UntaggedLimitGuard {
+    fn drop(&mut self) {
+        TEST_UNTAGGED_LIMIT.with(|cell| cell.set(MAX_UNTAGGED));
     }
 }
 
@@ -597,12 +681,19 @@ impl<S: Write> Write for Prefixed<S> {
     }
 }
 
+fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 fn tls_config(config: &ImapConfig) -> Result<Arc<ClientConfig>, Error> {
+    let provider = ring_provider();
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|err| imap_err(format!("tls config failed: {err}")))?;
     if config.accept_invalid_certs {
-        let provider = scratch_provider();
         let verifier = Arc::new(AcceptInvalidCerts { provider });
         return Ok(Arc::new(
-            ClientConfig::builder()
+            builder
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth(),
@@ -618,17 +709,8 @@ fn tls_config(config: &ImapConfig) -> Result<Arc<ClientConfig>, Error> {
         ));
     }
     Ok(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
+        builder.with_root_certificates(roots).with_no_client_auth(),
     ))
-}
-
-fn scratch_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let scratch = ClientConfig::builder()
-        .with_root_certificates(RootCertStore::empty())
-        .with_no_client_auth();
-    Arc::clone(scratch.crypto_provider())
 }
 
 #[derive(Debug)]
@@ -1013,34 +1095,123 @@ mod tests {
     }
 
     #[test]
+    fn response_line_longer_than_the_cap_is_rejected() {
+        use std::io::Write;
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let _limit = super::limit_lines_to(32);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut greeting = b"* OK ".to_vec();
+            greeting.extend(std::iter::repeat_n(b'A', 200));
+            greeting.extend(b"\r\n");
+            sock.write_all(&greeting).unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("an unbounded greeting was accepted");
+        };
+        let text = err.to_string();
+        assert!(text.contains("limit"), "{text}");
+        assert!(text.contains("32"), "{text}");
+    }
+
+    #[test]
+    fn too_many_untagged_replies_are_rejected() {
+        use std::io::Write;
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let _limit = super::limit_untagged_to(2);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK hi\r\n").unwrap();
+            let line = read_imap_line(&mut sock);
+            let tag = line.split_whitespace().next().unwrap_or("a1");
+            sock.write_all(b"* OK one\r\n* OK two\r\n* OK three\r\n")
+                .unwrap();
+            sock.write_all(format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n").as_bytes())
+                .unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("an untagged flood was accepted");
+        };
+        let text = err.to_string();
+        assert!(text.contains("untagged"), "{text}");
+        assert!(text.contains('2'), "{text}");
+    }
+
+    #[test]
     fn starttls_then_login_succeeds() {
+        login_over_tls(crate::imap::ImapSecurity::StartTls);
+    }
+
+    #[test]
+    fn implicit_tls_then_login_succeeds() {
+        login_over_tls(crate::imap::ImapSecurity::Tls);
+    }
+
+    fn login_over_tls(security: crate::imap::ImapSecurity) {
         use std::io::Write;
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-        use crate::imap::{ImapConfig, ImapSecurity};
+        use crate::imap::ImapConfig;
 
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certs = vec![CertificateDer::from(certified.cert.der().to_vec())];
         let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
-        let server_config = ServerConfig::builder()
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let saw_login = Arc::new(AtomicBool::new(false));
+        let login_flag = Arc::clone(&saw_login);
         thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            sock.write_all(b"* OK ready\r\n").unwrap();
-            let line = read_imap_line(&mut sock);
-            let tag = line.split_whitespace().next().unwrap_or("a1");
-            sock.write_all(format!("{tag} OK STARTTLS\r\n").as_bytes())
-                .unwrap();
+            if security == crate::imap::ImapSecurity::StartTls {
+                sock.write_all(b"* OK ready\r\n").unwrap();
+                let line = read_imap_line(&mut sock);
+                let tag = line.split_whitespace().next().unwrap_or("a1");
+                sock.write_all(format!("{tag} OK STARTTLS\r\n").as_bytes())
+                    .unwrap();
+            }
             let conn = ServerConnection::new(Arc::new(server_config)).unwrap();
             let mut tls = StreamOwned::new(conn, sock);
+            if security == crate::imap::ImapSecurity::Tls {
+                tls.write_all(b"* OK ready\r\n").unwrap();
+            }
             loop {
                 let line = read_imap_line(&mut tls);
                 if line.is_empty() {
@@ -1049,6 +1220,7 @@ mod tests {
                 let tag = line.split_whitespace().next().unwrap_or("*");
                 let upper = line.to_ascii_uppercase();
                 let response = if upper.contains("LOGIN") {
+                    login_flag.store(true, Ordering::SeqCst);
                     format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n")
                 } else if upper.contains("CAPABILITY") {
                     format!("* CAPABILITY IMAP4rev1\r\n{tag} OK\r\n")
@@ -1065,10 +1237,14 @@ mod tests {
             port,
             username: "caleb".into(),
             password: "secret".into(),
-            security: ImapSecurity::StartTls,
+            security,
             accept_invalid_certs: true,
         })
-        .expect("STARTTLS login");
+        .expect("TLS login");
+        assert!(
+            saw_login.load(Ordering::SeqCst),
+            "LOGIN must be read on the TLS stream, which means the handshake finished"
+        );
     }
 
     fn read_imap_line(stream: &mut impl Read) -> String {

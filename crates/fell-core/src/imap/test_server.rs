@@ -24,6 +24,8 @@ pub(super) struct FixtureMailbox {
     pub omit_uidnext: bool,
     /// LIST this mailbox, but answer EXAMINE with NO.
     pub reject_examine: bool,
+    /// EXAMINE succeeds, but UID FETCH answers NO/BAD.
+    pub reject_fetch: bool,
     pub messages: Vec<FixtureMessage>,
 }
 
@@ -32,6 +34,8 @@ pub(super) struct TestState {
     pub password: String,
     pub condstore: bool,
     pub close_after_starttls: bool,
+    /// Drop the socket when a UID command arrives, with no tagged reply.
+    pub close_during_uid_fetch: bool,
     pub mailboxes: Vec<FixtureMailbox>,
     pub commands: Vec<String>,
 }
@@ -230,6 +234,9 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     .write_all(format!("{tag} OK [READ-ONLY] EXAMINE completed\r\n").as_bytes());
             }
             "UID" => {
+                if state.lock().expect("state").close_during_uid_fetch {
+                    break;
+                }
                 let guard = state.lock().expect("state");
                 if rest.to_ascii_uppercase().contains("CHANGEDSINCE")
                     && guard.condstore
@@ -254,6 +261,10 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     let _ = write.write_all(format!("{tag} NO no mailbox\r\n").as_bytes());
                     continue;
                 };
+                if mailbox.reject_fetch {
+                    let _ = write.write_all(format!("{tag} BAD UID FETCH denied\r\n").as_bytes());
+                    continue;
+                }
                 let highest = mailbox
                     .messages
                     .iter()

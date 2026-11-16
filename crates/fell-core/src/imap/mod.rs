@@ -61,19 +61,13 @@ pub(crate) fn fetch_imap(
             }
             _ => None,
         };
-        let mut fetched = match &plan {
-            FetchPlan::ChangedSince(modseq) => session.uid_fetch("1:*", Some(*modseq))?,
-            FetchPlan::HighWater { start } => session.uid_fetch(&format!("{start}:*"), None)?,
-            FetchPlan::Full => session.uid_fetch("1:*", None)?,
-            FetchPlan::Discover { start } => {
-                let found = session.uid_find(&format!("{start}:*"))?;
-                let mut bodies = Vec::new();
-                for uid in found.into_iter().filter(|uid| *uid >= *start) {
-                    bodies.extend(session.uid_fetch(&uid.to_string(), None)?);
-                }
-                bodies
+        let mut fetched = match fetch_plan_bodies(&mut session, &plan) {
+            Ok(items) => items,
+            Err(err) if uid_fetch_refused(&err) => {
+                remember_previous(&mut checkpoints, &mailbox.raw, previous);
+                continue;
             }
-            FetchPlan::Idle => Vec::new(),
+            Err(err) => return Err(err),
         };
         let highest = fetched.iter().map(|item| item.uid).max();
         fetched.retain(|item| seen_through.is_none_or(|uid| item.uid > uid));
@@ -82,7 +76,15 @@ pub(crate) fn fetch_imap(
             && examined.highest_modseq.is_some()
             && !matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
         if needs_baseline {
-            for (uid, flag_names) in session.uid_flags("1:*")? {
+            let rows = match session.uid_flags("1:*") {
+                Ok(rows) => rows,
+                Err(err) if uid_fetch_refused(&err) => {
+                    remember_previous(&mut checkpoints, &mailbox.raw, previous);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            for (uid, flag_names) in rows {
                 let unread = !flag_names
                     .iter()
                     .any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
@@ -152,6 +154,42 @@ pub(crate) fn fetch_imap(
         flags,
         cursor: Some(encode_cursor(account_id.as_str(), &checkpoints)),
     })
+}
+
+fn fetch_plan_bodies(
+    session: &mut session::Session,
+    plan: &FetchPlan,
+) -> Result<Vec<session::Fetched>, Error> {
+    match plan {
+        FetchPlan::ChangedSince(modseq) => session.uid_fetch("1:*", Some(*modseq)),
+        FetchPlan::HighWater { start } => session.uid_fetch(&format!("{start}:*"), None),
+        FetchPlan::Full => session.uid_fetch("1:*", None),
+        FetchPlan::Discover { start } => {
+            let found = session.uid_find(&format!("{start}:*"))?;
+            let mut bodies = Vec::new();
+            for uid in found.into_iter().filter(|uid| *uid >= *start) {
+                bodies.extend(session.uid_fetch(&uid.to_string(), None)?);
+            }
+            Ok(bodies)
+        }
+        FetchPlan::Idle => Ok(Vec::new()),
+    }
+}
+
+/// Tagged NO/BAD on UID FETCH. The socket is still a valid IMAP session.
+/// A dropped connection is not this error and must abort the sync.
+fn uid_fetch_refused(err: &Error) -> bool {
+    matches!(err, Error::Backend(message) if message.contains("UID FETCH failed:"))
+}
+
+fn remember_previous(
+    checkpoints: &mut Vec<(String, MailboxCheckpoint)>,
+    raw: &str,
+    previous: Option<&MailboxCheckpoint>,
+) {
+    if let Some(prev) = previous {
+        checkpoints.push((raw.to_string(), prev.clone()));
+    }
 }
 
 fn inbox_rank(name: &str) -> u8 {

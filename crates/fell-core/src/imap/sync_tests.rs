@@ -33,6 +33,7 @@ fn sample_state() -> TestState {
         password: "secret".into(),
         condstore: false,
         close_after_starttls: false,
+        close_during_uid_fetch: false,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -42,6 +43,7 @@ fn sample_state() -> TestState {
                 uidnext: None,
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: Vec::new(),
             },
             FixtureMailbox {
@@ -51,6 +53,7 @@ fn sample_state() -> TestState {
                 uidnext: None,
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -72,6 +75,7 @@ fn sample_state() -> TestState {
                 uidnext: None,
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![
                     FixtureMessage {
                         uid: 1,
@@ -126,6 +130,7 @@ fn sample_state() -> TestState {
                 uidnext: None,
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -492,6 +497,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
         password: "secret".into(),
         condstore: false,
         close_after_starttls: false,
+        close_during_uid_fetch: false,
         commands: Vec::new(),
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
@@ -500,6 +506,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
             uidnext: Some(10),
             omit_uidnext: false,
             reject_examine: false,
+            reject_fetch: false,
             messages: vec![FixtureMessage {
                 uid: 5,
                 flags: vec!["\\Seen".into()],
@@ -544,6 +551,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         password: "secret".into(),
         condstore: true,
         close_after_starttls: false,
+        close_during_uid_fetch: false,
         commands: Vec::new(),
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
@@ -552,6 +560,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
             uidnext: Some(1),
             omit_uidnext: false,
             reject_examine: false,
+            reject_fetch: false,
             messages: vec![],
         }],
     });
@@ -598,6 +607,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         password: "secret".into(),
         condstore: false,
         close_after_starttls: false,
+        close_during_uid_fetch: false,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -607,6 +617,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
                 uidnext: Some(3),
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![FixtureMessage {
                     uid: 2,
                     flags: vec!["\\Seen".into()],
@@ -621,6 +632,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
                 uidnext: Some(2),
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -697,6 +709,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         password: "secret".into(),
         condstore: false,
         close_after_starttls: false,
+        close_during_uid_fetch: false,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -706,6 +719,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
                 uidnext: Some(2),
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -720,6 +734,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
                 uidnext: Some(3),
                 omit_uidnext: false,
                 reject_examine: false,
+                reject_fetch: false,
                 messages: vec![
                     FixtureMessage {
                         uid: 1,
@@ -778,5 +793,218 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
     assert!(
         !logged.iter().any(|line| line.contains("BODY.PEEK")),
         "the message after the oversized one must not be fetched again: {logged:?}"
+    );
+}
+
+/// UID FETCH NO/BAD skips that mailbox and keeps its checkpoint, including a
+/// modseq from an earlier CONDSTORE sync. Later syncs still finish, and a
+/// later successful FETCH can see new mail in the skipped mailbox.
+#[test]
+fn fetch_refusal_does_not_block_the_rest_of_the_account() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: true,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Sent".into(),
+                list_flags: String::new(),
+                uidvalidity: 8,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
+                }],
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
+                }],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let saved = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        saved.contains("Sent\t8\t1\t1"),
+        "first sync stores the Sent modseq: {saved}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "Sent")
+            .unwrap()
+            .reject_fetch = true;
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages.push(FixtureMessage {
+            uid: 2,
+            flags: vec![],
+            modseq: 2,
+            raw: raw_message("new@x", None, "Still here", "Ann <ann@x>", "new", ""),
+        });
+        inbox.uidnext = Some(3);
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let logged = commands(&server);
+    assert!(
+        logged.iter().any(|line| line.contains("CHANGEDSINCE")),
+        "the saved modseq must be retried, not discarded: {logged:?}"
+    );
+    assert!(
+        store
+            .list_threads(&acct.id)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.subject == "Still here")
+    );
+    let during = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        during.contains("Sent\t8\t1\t1"),
+        "refused FETCH keeps the previous checkpoint: {during}"
+    );
+    sync_once(&acct, &backend, &store).unwrap();
+    let still = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        still.contains("Sent\t8\t1\t1"),
+        "a permanent CHANGEDSINCE failure must not fail the account: {still}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        let sent = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "Sent")
+            .unwrap();
+        sent.reject_fetch = false;
+        sent.messages.push(FixtureMessage {
+            uid: 2,
+            flags: vec!["\\Seen".into()],
+            modseq: 4,
+            raw: raw_message("later@x", None, "Sent later", "Ann <ann@x>", "later", ""),
+        });
+        sent.uidnext = Some(3);
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "Sent later"));
+    assert_eq!(
+        threads
+            .iter()
+            .filter(|thread| thread.subject == "Sent copy")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fetch_io_error_aborts_before_the_cursor_moves() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Sent".into(),
+                list_flags: String::new(),
+                uidvalidity: 8,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
+                }],
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
+                }],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let before = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    {
+        let mut state = server.state.lock().expect("state");
+        state.close_during_uid_fetch = true;
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.messages.push(FixtureMessage {
+            uid: 2,
+            flags: vec![],
+            modseq: 2,
+            raw: raw_message("new@x", None, "Not stored", "Ann <ann@x>", "new", ""),
+        });
+        inbox.uidnext = Some(3);
+    }
+    let err = sync_once(&acct, &backend, &store).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        !text.contains("UID FETCH failed:"),
+        "a dropped connection is not a mailbox refusal: {text}"
+    );
+    assert_eq!(store.sync_cursor(&acct.id).unwrap().unwrap().token, before);
+    assert!(
+        !store
+            .list_threads(&acct.id)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.subject == "Not stored")
     );
 }
