@@ -335,7 +335,18 @@ fn image_el(source: &ImageSource, alt: &str, palette: &Palette, allow_remote: bo
         .into_any_element()
 }
 
-fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
+    div()
+        .w_full()
+        .child(
+            img(image)
+                .max_w(px(860.))
+                .object_fit(gpui::ObjectFit::Contain),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let mut data = image::load_from_memory(bytes).ok()?.into_rgba8();
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);

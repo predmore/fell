@@ -1,26 +1,27 @@
-//! WebKitGTK, via wry, in its own window.
+//! WebKitGTK via wry, painted into the conversation.
 //!
-//! wry 0.57 can child-embed only into an Xlib window. GPUI on Wayland hands
-//! back a Wayland surface, so the newsletter view is a GTK window created
-//! with `WebViewBuilderExtUnix::build_gtk`. The library stays dynamically
-//! linked. JavaScript is off and remote images stay blocked until allowed.
-//!
-//! The inbox does not own this window. It calls [`show`] and [`hide`] when
-//! the message body toggles.
+//! wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland
+//! does not provide one. The newsletter is laid out in an undecorated GTK
+//! window kept off-screen, snapshotted with JavaScript still disabled, and
+//! drawn in the message body. There is no title bar, no traffic-light
+//! chrome, and no second copy of the subject. The library stays dynamically
+//! linked.
 
+use std::cell::Cell;
 use std::cell::RefCell;
-use std::sync::{OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 use gtk::prelude::*;
+use wry::PageLoadEvent;
 use wry::WebViewBuilderExtUnix;
 use wry::WebViewExtUnix;
 
 #[derive(Clone)]
 pub struct WebRequest {
     pub html: String,
-    pub title: String,
+    pub token: u64,
     pub background: (u8, u8, u8),
-    pub foreground: (u8, u8, u8),
     pub allow_images: bool,
 }
 
@@ -32,12 +33,14 @@ enum Cmd {
 struct Host {
     window: gtk::Window,
     webview: wry::WebView,
-    css: gtk::CssProvider,
+    token: Cell<u64>,
 }
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
 }
+
+static FRAME: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
 
 pub fn show(request: WebRequest) {
     if let Some(tx) = sender() {
@@ -49,6 +52,15 @@ pub fn hide() {
     if let Some(tx) = sender() {
         let _ = tx.send(Cmd::Hide);
     }
+}
+
+/// Latest full-document PNG for `token`, if WebKit has finished painting it.
+pub fn frame_for(token: u64) -> Option<Vec<u8>> {
+    FRAME.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .filter(|(got, _)| *got == token)
+            .map(|(_, png)| png.clone())
+    })
 }
 
 fn sender() -> Option<&'static gtk::glib::Sender<Cmd>> {
@@ -107,77 +119,122 @@ fn present(request: WebRequest) {
         let Some(host) = slot.as_mut() else {
             return;
         };
-        apply_chrome(host, &request);
+        host.token.set(request.token);
         if let Err(err) = host.webview.load_html(&request.html) {
             eprintln!("fell: web view load failed: {err}");
         }
         tighten(&host.webview, request.allow_images);
         host.window.show_all();
-        host.window.present();
     });
 }
 
 fn open_host(request: &WebRequest) -> wry::Result<Host> {
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_default_size(960, 720);
-    let header = gtk::HeaderBar::new();
-    header.set_show_close_button(true);
-    header.set_title(Some("Fell"));
-    window.set_titlebar(Some(&header));
+    window.set_decorated(false);
+    window.set_resizable(false);
+    window.set_skip_taskbar_hint(true);
+    window.set_skip_pager_hint(true);
+    window.set_default_size(880, 480);
+    #[allow(deprecated)]
+    window.move_(-4000, -4000);
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
-    let css = gtk::CssProvider::new();
-    if let Some(screen) = gtk::gdk::Screen::default() {
-        gtk::StyleContext::add_provider_for_screen(
-            &screen,
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
-    apply_css(&css, request);
     window.show_all();
+    let (red, green, blue) = request.background;
     let webview = wry::WebViewBuilder::new()
         .with_html(&request.html)
         .with_javascript_disabled()
         .with_autoplay(false)
         .with_clipboard(false)
-        .with_background_color((
-            request.background.0,
-            request.background.1,
-            request.background.2,
-            255,
-        ))
+        .with_background_color((red, green, blue, 255))
         .with_navigation_handler(|uri| !remote_navigation(&uri))
         .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
+        .with_on_page_load_handler(|event, _url| {
+            if matches!(event, PageLoadEvent::Finished) {
+                capture_current();
+            }
+        })
         .build_gtk(&vbox)?;
     tighten(&webview, request.allow_images);
     Ok(Host {
         window,
         webview,
-        css,
+        token: Cell::new(request.token),
     })
 }
 
-fn apply_chrome(host: &Host, request: &WebRequest) {
-    host.window.set_title(&request.title);
-    if let Some(bar) = host
-        .window
-        .titlebar()
-        .and_then(|widget| widget.downcast::<gtk::HeaderBar>().ok())
-    {
-        bar.set_subtitle(Some(&request.title));
-    }
-    apply_css(&host.css, request);
+fn capture_current() {
+    let Some((widget, token)) = HOST.with(|slot| {
+        slot.borrow().as_ref().map(|host| {
+            let widget = host.webview.webview();
+            (widget, host.token.get())
+        })
+    }) else {
+        return;
+    };
+    // Let WebKit finish layout before the full-document snapshot.
+    gtk::glib::timeout_add_local(Duration::from_millis(120), move || {
+        snapshot(widget.clone(), token);
+        gtk::glib::ControlFlow::Break
+    });
 }
 
-fn apply_css(css: &gtk::CssProvider, request: &WebRequest) {
-    let (br, bg, bb) = request.background;
-    let (fr, fg, fb) = request.foreground;
-    let data = format!(
-        "window, headerbar {{ background-color: #{br:02x}{bg:02x}{bb:02x}; }} \
-         headerbar .title, headerbar .subtitle, headerbar label {{ color: #{fr:02x}{fg:02x}{fb:02x}; }}"
+fn snapshot(widget: webkit2gtk::WebView, token: u64) {
+    use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
+    widget.snapshot(
+        SnapshotRegion::FullDocument,
+        SnapshotOptions::NONE,
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            if let Ok(surface) = result
+                && let Some(png) = surface_png(surface)
+                && let Ok(mut slot) = FRAME.lock()
+            {
+                *slot = Some((token, png));
+            }
+            HOST.with(|slot| {
+                if let Some(host) = slot.borrow().as_ref() {
+                    host.window.hide();
+                }
+            });
+        },
     );
-    let _ = css.load_from_data(data.as_bytes());
+}
+
+fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
+    let mut image = gtk::cairo::ImageSurface::try_from(surface).ok()?;
+    image.flush();
+    let width = image.width();
+    let height = image.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let stride = image.stride() as usize;
+    let data = image.data().ok()?;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height as usize {
+        let start = y * stride;
+        let row = data.get(start..start + width as usize * 4)?;
+        for px in row.as_chunks::<4>().0 {
+            let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+            if a == 0 || a == 255 {
+                rgba.extend_from_slice(&[r, g, b, a]);
+            } else {
+                rgba.extend_from_slice(&[
+                    ((u16::from(r) * 255) / u16::from(a)) as u8,
+                    ((u16::from(g) * 255) / u16::from(a)) as u8,
+                    ((u16::from(b) * 255) / u16::from(a)) as u8,
+                    a,
+                ]);
+            }
+        }
+    }
+    let buffer = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
 }
 
 fn tighten(webview: &wry::WebView, allow_images: bool) {

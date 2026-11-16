@@ -5,11 +5,6 @@ use std::ops::Deref;
 /// everything else.
 pub struct WebFrame {
     pub scheme: &'static str,
-    pub background: &'static str,
-    pub foreground: &'static str,
-    pub accent: &'static str,
-    pub title: String,
-    pub notice: String,
     pub allow_remote_images: bool,
 }
 
@@ -27,31 +22,13 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
 <meta charset="utf-8">
 <meta name="color-scheme" content="{scheme}">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; {img_src} font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
-<title>{title}</title>
 <style>
-  html, body {{ margin: 0; background: {background}; color: {foreground}; }}
-  .fell-chrome {{
-    font: 13px/1.4 sans-serif;
-    padding: 10px 16px;
-    background: {background} !important;
-    color: {foreground} !important;
-    border-bottom: 1px solid {accent};
-  }}
-  .fell-chrome strong {{ color: {accent} !important; font-weight: 650; }}
-  .fell-mail {{ padding: 16px; }}
+  html, body {{ margin: 0; padding: 0; }}
 </style>
 </head>
-<body>
-  <div class="fell-chrome"><strong>Fell</strong> · {title}<br>{notice}</div>
-  <div class="fell-mail">{body}</div>
-</body>
+<body>{body}</body>
 </html>"#,
         scheme = frame.scheme,
-        title = escape(&frame.title),
-        background = frame.background,
-        foreground = frame.foreground,
-        accent = frame.accent,
-        notice = escape(&frame.notice),
         img_src = img_src,
         body = body,
     )
@@ -245,16 +222,12 @@ mod tests {
             html,
             &WebFrame {
                 scheme: "dark",
-                background: "#1c1c1c",
-                foreground: "#e8e8e8",
-                accent: "#8eb6ff",
-                title: "Notes".into(),
-                notice: "Remote images blocked".into(),
                 allow_remote_images: false,
             },
         );
         assert!(wrapped.contains("script-src 'none'"));
-        assert!(wrapped.contains("Remote images blocked"));
+        assert!(!wrapped.contains("fell-chrome"));
+        assert!(!wrapped.contains("<title>"));
     }
 
     #[test]

@@ -15,10 +15,16 @@ pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
 pub use native::document_column;
 pub use theme::{Palette, ThemeKind};
 
+use std::sync::Arc;
+
 use fell_render::{RenderMode, WebFrame, fixture, prepare, wrap_for_webview};
-use gpui::{Context, FocusHandle, KeyDownEvent, Render, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    Context, FocusHandle, KeyDownEvent, Render, RenderImage, SharedString, Window, div, prelude::*,
+    px,
+};
 
 use body::BodyModel as Model;
+use native::decode_image;
 use theme::{ThemeKind as Theme, paint};
 
 pub struct Reader {
@@ -30,6 +36,8 @@ pub struct Reader {
     theme: Theme,
     web_open: bool,
     web_key: String,
+    web_token: u64,
+    web_image: Option<Arc<RenderImage>>,
 }
 
 pub struct Opened {
@@ -50,6 +58,8 @@ impl Reader {
             theme: opened.theme,
             web_open: false,
             web_key: String::new(),
+            web_token: 0,
+            web_image: None,
         }
     }
 
@@ -65,36 +75,33 @@ impl Reader {
                     webview::hide();
                     self.web_open = false;
                     self.web_key.clear();
+                    self.web_image = None;
                 }
                 return;
             }
             let palette = self.theme.palette();
-            let notice = if self.model.remote_images_allowed() {
-                "Web view · remote images allowed for this message"
-            } else {
-                "Web view · remote images blocked · JavaScript off"
-            };
             let html = wrap_for_webview(
                 self.model.source_html(),
                 &WebFrame {
                     scheme: palette.scheme(),
-                    background: hex_css(palette.background),
-                    foreground: hex_css(palette.foreground),
-                    accent: hex_css(palette.accent),
-                    title: self.title.to_string(),
-                    notice: notice.to_string(),
                     allow_remote_images: self.model.remote_images_allowed(),
                 },
             );
             if self.web_open && self.web_key == html {
+                if self.web_image.is_none()
+                    && let Some(png) = webview::frame_for(self.web_token)
+                {
+                    self.web_image = decode_image(&png);
+                }
                 return;
             }
+            self.web_token = self.web_token.wrapping_add(1);
+            self.web_image = None;
             webview::ensure_started();
             webview::show(webview::WebRequest {
                 html: html.clone(),
-                title: self.title.to_string(),
+                token: self.web_token,
                 background: channels(palette.background),
-                foreground: channels(palette.foreground),
                 allow_images: self.model.remote_images_allowed(),
             });
             self.web_key = html;
@@ -156,6 +163,9 @@ impl Render for Reader {
             self.focus.focus(window);
         }
         self.sync_web();
+        if self.model.mode() == RenderMode::Web && self.web_image.is_none() {
+            window.request_animation_frame();
+        }
         let palette = self.theme.palette();
         let mode = match self.model.mode() {
             RenderMode::Native => "native",
@@ -222,20 +232,7 @@ impl Render for Reader {
                     .text_color(paint(palette.accent))
                     .child(images),
             )
-            .child(
-                div()
-                    .id("message-body")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .px_5()
-                    .py_4()
-                    .child(document_column(
-                        self.model.document(),
-                        &palette,
-                        self.model.remote_images_allowed(),
-                    )),
-            )
+            .child(message_body(self, &palette))
             .child(
                 div()
                     .px_4()
@@ -250,30 +247,37 @@ impl Render for Reader {
     }
 }
 
+fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpui::Div> {
+    let body = div()
+        .id("message-body")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .px_5()
+        .py_4();
+    if reader.model.mode() == RenderMode::Web {
+        if let Some(image) = reader.web_image.clone() {
+            body.child(native::embedded_web(image))
+        } else {
+            body.child(
+                div()
+                    .text_color(paint(palette.foreground))
+                    .child("Opening the web view"),
+            )
+        }
+    } else {
+        body.child(document_column(
+            reader.model.document(),
+            palette,
+            reader.model.remote_images_allowed(),
+        ))
+    }
+}
+
 fn channels(hex: u32) -> (u8, u8, u8) {
     (
         ((hex >> 16) & 0xff) as u8,
         ((hex >> 8) & 0xff) as u8,
         (hex & 0xff) as u8,
     )
-}
-
-fn hex_css(hex: u32) -> &'static str {
-    match hex {
-        0x1c1c1c => "#1c1c1c",
-        0xe8e8e8 => "#e8e8e8",
-        0xa3a3a3 => "#a3a3a3",
-        0x8eb6ff => "#8eb6ff",
-        0x2a2a2a => "#2a2a2a",
-        0x3a3a3a => "#3a3a3a",
-        0x242424 => "#242424",
-        0xf6f5f3 => "#f6f5f3",
-        0x1a1a1a => "#1a1a1a",
-        0x5e5e5e => "#5e5e5e",
-        0x0b4f9c => "#0b4f9c",
-        0xe7e5e1 => "#e7e5e1",
-        0xd5d2cc => "#d5d2cc",
-        0xfffefc => "#fffefc",
-        _ => "#000000",
-    }
 }
