@@ -51,7 +51,7 @@ Archive, label, delete, and undo update this SQLite file only. There is no socke
 
 The thread is the unit. Archive moves the folder the caller names (the folder on screen) to `Archive` on each message in the thread that has it. Any other folder on that row, such as `Sent`, stays. Delete moves that folder to `Trash`. Delete from `Trash` drops `Trash`, and removes the row when it was the last folder. Labels are a separate list. Each successful call stores the previous folders and labels on that account's undo stack. `Store::undo` restores the latest entry for that account and leaves other accounts as they are.
 
-`in:` and `label:` read the columns those calls write. Folder and label words enter and leave the trigram vocabulary with the change. `apply_delta` still unions folders and labels when the same Message-ID is stored again, so a removed folder can come back when that copy is synced. Outbound sync of these edits is separate.
+`in:` and `label:` read the columns those calls write. Folder and label words enter and leave the trigram vocabulary with the change. `apply_delta` still unions other folders and labels for the same Message-ID, and leaves out a folder archive or delete removed. Undo restores that folder and then drops the saved message copy, including the body and BCC. Outbound sync of these edits is separate.
 
 ## Threading
 

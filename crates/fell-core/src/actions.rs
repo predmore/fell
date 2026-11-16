@@ -9,9 +9,10 @@
 //! other folder on the same row, such as Sent, stays. Labels are a second
 //! list, not folders.
 //!
-//! A later [`Store::apply_delta`] still unions folders and labels for the same
-//! Message-ID, so a removed folder can return when that copy is synced again.
-//! Outbound sync of these edits is separate.
+//! A folder those calls remove is recorded on that message. A later
+//! [`Store::apply_delta`] still unions other folders and labels, and leaves
+//! the removed folder out. Undo puts the saved row back, then deletes that
+//! saved copy so the mailbox file does not keep the body or BCC.
 
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
+use crate::message::Message;
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
@@ -55,6 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_local_actions_account ON local_actions(account_id
 
 CREATE TABLE IF NOT EXISTS local_action_messages (
     action_id INTEGER NOT NULL,
+    removed INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     remote_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
@@ -79,6 +82,18 @@ CREATE TABLE IF NOT EXISTS local_action_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_local_action_messages ON local_action_messages(action_id);
+
+CREATE TABLE IF NOT EXISTS local_folder_tombstones (
+    action_id INTEGER NOT NULL,
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    PRIMARY KEY (action_id, message_id, folder),
+    FOREIGN KEY(action_id) REFERENCES local_actions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_folder_tombstones
+    ON local_folder_tombstones(account_id, message_id);
 "#;
 
 /// One recorded local edit. [`Store::undo`] returns the entry it restored.
@@ -252,6 +267,14 @@ impl Store {
         for row in &rows {
             restore_row(&tx, account_id, row)?;
         }
+        tx.execute(
+            "DELETE FROM local_folder_tombstones WHERE action_id = ?1",
+            params![action.id],
+        )?;
+        tx.execute(
+            "DELETE FROM local_action_messages WHERE action_id = ?1",
+            params![action.id],
+        )?;
         let changed = tx.execute(
             "UPDATE local_actions SET undone = 1
              WHERE id = ?1 AND account_id = ?2 AND undone = 0",
@@ -371,7 +394,8 @@ fn record_and_apply(
     )?;
     let id = conn.last_insert_rowid();
     for plan in plans {
-        insert_snapshot(conn, id, &plan.before)?;
+        insert_snapshot(conn, id, plan.remove_row, &plan.before)?;
+        record_tombstones(conn, id, account_id, plan)?;
         apply_plan(conn, account_id, plan)?;
     }
     Ok(LocalAction {
@@ -427,27 +451,73 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
     Ok(())
 }
 
-fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &SavedRow) -> Result<()> {
-    if let Some(current) = load_one(conn, account_id, &snapshot.message_id)? {
+fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -> Result<()> {
+    let saved = &snapshot.row;
+    if let Some(current) = load_one(conn, account_id, &saved.message_id)? {
+        if snapshot.removed {
+            return replace_message_row(conn, account_id, &current, saved);
+        }
         let old_terms = terms_of(&current);
-        let new_terms = terms_with(&current, &snapshot.folders, &snapshot.labels);
+        let new_terms = terms_with(&current, &saved.folders, &saved.labels);
         let changed = conn.execute(
             "UPDATE messages SET folders = ?1, labels = ?2
              WHERE account_id = ?3 AND message_id = ?4",
             params![
-                snapshot.folders,
-                snapshot.labels,
+                saved.folders,
+                saved.labels,
                 account_id.as_str(),
-                snapshot.message_id
+                saved.message_id
             ],
         )?;
-        expect_one(changed, &snapshot.message_id)?;
+        expect_one(changed, &saved.message_id)?;
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
         return Ok(());
     }
-    insert_message_row(conn, account_id, snapshot)?;
-    let terms = terms_of(snapshot);
+    insert_message_row(conn, account_id, saved)?;
+    let terms = terms_of(saved);
     sync_terms(conn, account_id.as_str(), &HashSet::new(), &terms)?;
+    Ok(())
+}
+
+fn replace_message_row(
+    conn: &Connection,
+    account_id: &AccountId,
+    current: &SavedRow,
+    snapshot: &SavedRow,
+) -> Result<()> {
+    let old_terms = terms_of(current);
+    let new_terms = terms_of(snapshot);
+    let mut values = saved_values(snapshot);
+    let message_id = values.remove(0);
+    values.push(Value::Text(account_id.as_str().to_string()));
+    values.push(message_id);
+    debug_assert_eq!(values.len(), 21);
+    let changed = conn.execute(
+        "UPDATE messages SET
+            remote_id = ?1,
+            thread_id = ?2,
+            proton_conversation_id = ?3,
+            in_reply_to = ?4,
+            references_header = ?5,
+            from_name = ?6,
+            from_email = ?7,
+            subject = ?8,
+            date_unix = ?9,
+            snippet = ?10,
+            body_text = ?11,
+            unread = ?12,
+            folders = ?13,
+            labels = ?14,
+            arrived_via = ?15,
+            to_line = ?16,
+            cc_line = ?17,
+            bcc_line = ?18,
+            has_attachment = ?19
+         WHERE account_id = ?20 AND message_id = ?21",
+        params_from_iter(values),
+    )?;
+    expect_one(changed, &snapshot.message_id)?;
+    sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
     Ok(())
 }
 
@@ -654,13 +724,18 @@ fn load_one(
     Ok(row)
 }
 
-fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<SavedRow>> {
+struct Snapshot {
+    removed: bool,
+    row: SavedRow,
+}
+
+fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<Snapshot>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {SELECT_SAVED} FROM local_action_messages
+        "SELECT removed, {SELECT_SAVED} FROM local_action_messages
          WHERE action_id = ?1
          ORDER BY message_id ASC"
     ))?;
-    let rows = stmt.query_map(params![action_id], read_saved)?;
+    let rows = stmt.query_map(params![action_id], read_snapshot)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -668,48 +743,174 @@ fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<SavedRow>> {
     Ok(out)
 }
 
-fn read_saved(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedRow> {
-    Ok(SavedRow {
-        message_id: row.get(0)?,
-        remote_id: row.get(1)?,
-        thread_id: row.get(2)?,
-        proton_conversation_id: row.get(3)?,
-        in_reply_to: row.get(4)?,
-        references_header: row.get(5)?,
-        from_name: row.get(6)?,
-        from_email: row.get(7)?,
-        subject: row.get(8)?,
-        date_unix: row.get(9)?,
-        snippet: row.get(10)?,
-        body_text: row.get(11)?,
-        unread: row.get(12)?,
-        folders: row.get(13)?,
-        labels: row.get(14)?,
-        arrived_via: row.get(15)?,
-        to_line: row.get(16)?,
-        cc_line: row.get(17)?,
-        bcc_line: row.get(18)?,
-        has_attachment: row.get(19)?,
+fn read_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
+    Ok(Snapshot {
+        removed: row.get::<_, i64>(0)? != 0,
+        row: read_saved_from(row, 1)?,
     })
 }
 
-fn insert_snapshot(conn: &Connection, action_id: i64, row: &SavedRow) -> Result<()> {
-    let mut values = vec![Value::Integer(action_id)];
+fn read_saved(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedRow> {
+    read_saved_from(row, 0)
+}
+
+fn read_saved_from(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<SavedRow> {
+    Ok(SavedRow {
+        message_id: row.get(at)?,
+        remote_id: row.get(at + 1)?,
+        thread_id: row.get(at + 2)?,
+        proton_conversation_id: row.get(at + 3)?,
+        in_reply_to: row.get(at + 4)?,
+        references_header: row.get(at + 5)?,
+        from_name: row.get(at + 6)?,
+        from_email: row.get(at + 7)?,
+        subject: row.get(at + 8)?,
+        date_unix: row.get(at + 9)?,
+        snippet: row.get(at + 10)?,
+        body_text: row.get(at + 11)?,
+        unread: row.get(at + 12)?,
+        folders: row.get(at + 13)?,
+        labels: row.get(at + 14)?,
+        arrived_via: row.get(at + 15)?,
+        to_line: row.get(at + 16)?,
+        cc_line: row.get(at + 17)?,
+        bcc_line: row.get(at + 18)?,
+        has_attachment: row.get(at + 19)?,
+    })
+}
+
+fn insert_snapshot(conn: &Connection, action_id: i64, removed: bool, row: &SavedRow) -> Result<()> {
+    let mut values = vec![
+        Value::Integer(action_id),
+        Value::Integer(i64::from(removed)),
+    ];
     values.extend(saved_values(row));
-    debug_assert_eq!(values.len(), 21);
+    debug_assert_eq!(values.len(), 22);
     conn.execute(
         "INSERT INTO local_action_messages (
-            action_id, message_id, remote_id, thread_id, proton_conversation_id,
+            action_id, removed, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, has_attachment
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
          )",
         params_from_iter(values),
     )?;
     Ok(())
+}
+
+fn record_tombstones(
+    conn: &Connection,
+    action_id: i64,
+    account_id: &AccountId,
+    plan: &Planned,
+) -> Result<()> {
+    for folder in removed_folders(plan) {
+        conn.execute(
+            "INSERT OR IGNORE INTO local_folder_tombstones
+                (action_id, account_id, message_id, folder)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                action_id,
+                account_id.as_str(),
+                plan.before.message_id,
+                folder
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn removed_folders(plan: &Planned) -> Vec<String> {
+    let before = split_tokens(&plan.before.folders);
+    if plan.remove_row {
+        return before;
+    }
+    let after = split_tokens(&plan.folders);
+    before
+        .into_iter()
+        .filter(|folder| !after.iter().any(|kept| kept.eq_ignore_ascii_case(folder)))
+        .collect()
+}
+
+/// Folder list to merge from a delta.
+///
+/// `None` means the row is gone and every folder on the delta was removed
+/// locally, so the message stays deleted.
+pub(crate) fn message_for_delta(conn: &Connection, message: &Message) -> Result<Option<Message>> {
+    let blocked = tombstoned_folders(
+        conn,
+        &message.account_id,
+        message.headers.message_id.as_str(),
+    )?;
+    if blocked.is_empty() {
+        return Ok(Some(message.clone()));
+    }
+    let mut kept = Vec::new();
+    let mut removed = 0;
+    for folder in &message.folders {
+        if blocked.iter().any(|tomb| tomb.eq_ignore_ascii_case(folder)) {
+            removed += 1;
+        } else {
+            kept.push(folder.clone());
+        }
+    }
+    if removed == 0 {
+        return Ok(Some(message.clone()));
+    }
+    if kept.is_empty()
+        && !message_row_exists(
+            conn,
+            &message.account_id,
+            message.headers.message_id.as_str(),
+        )?
+    {
+        return Ok(None);
+    }
+    let mut updated = message.clone();
+    updated.folders = kept;
+    Ok(Some(updated))
+}
+
+fn tombstoned_folders(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Vec<String>> {
+    let present: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'local_folder_tombstones'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if present.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT folder FROM local_folder_tombstones
+         WHERE account_id = ?1 AND message_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![account_id.as_str(), message_id], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow) -> Result<()> {
@@ -773,6 +974,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MailboxDelta;
     use crate::account::{Account, BackendKind};
     use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 
@@ -1332,5 +1534,189 @@ mod tests {
         store.undo(&owner).unwrap();
         assert!(messages(&store, "a1", &thread)[0].labels.is_empty());
         assert_eq!(text(store.undo(&owner)), "nothing to undo");
+    }
+
+    fn apply(store: &Store, message: Message) {
+        store
+            .apply_delta(
+                &message.account_id.clone(),
+                &MailboxDelta {
+                    messages: vec![message],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn tombstones(store: &Store, message_id: &str) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_folder_tombstones WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn saved_copies(store: &Store, needle: &str) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_action_messages
+                 WHERE IFNULL(body_text, '') LIKE '%' || ?1 || '%'
+                    OR IFNULL(bcc_line, '') LIKE '%' || ?1 || '%'",
+                params![needle],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn delta_skips_a_folder_removed_by_archive_or_delete() {
+        let store = open(&[("a1", "a@x"), ("a2", "b@x")]);
+        let mut archived = sample("a1", "arch@x", "Archived", "archive body");
+        archived.folders = vec![FOLDER_INBOX.into(), FOLDER_SENT.into()];
+        let archive_thread = store.upsert_message(&archived).unwrap();
+        store
+            .archive_thread(&account("a1"), &archive_thread, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(tombstones(&store, "arch@x"), 1);
+
+        let mut synced = messages(&store, "a1", &archive_thread)[0].clone();
+        synced.folders = vec!["inbox".into(), "Projects".into()];
+        synced.body_text = Some("from delta".into());
+        synced.snippet = "from delta".into();
+        apply(&store, synced);
+
+        let row = &messages(&store, "a1", &archive_thread)[0];
+        assert!(
+            !row.folders
+                .iter()
+                .any(|folder| folder.eq_ignore_ascii_case("INBOX"))
+        );
+        assert_eq!(
+            row.folders,
+            vec![
+                FOLDER_SENT.to_string(),
+                FOLDER_ARCHIVE.to_string(),
+                "Projects".to_string()
+            ]
+        );
+        assert_eq!(row.body_text.as_deref(), Some("from delta"));
+        assert!(subjects(&store, "a1", "in:INBOX").is_empty());
+        assert_eq!(
+            subjects(&store, "a1", "in:Projects"),
+            vec!["Archived".to_string()]
+        );
+
+        let other = sample("a2", "arch@x", "From B", "other body");
+        let other_thread = store.upsert_message(&other).unwrap();
+        let mut other_delta = messages(&store, "a2", &other_thread)[0].clone();
+        other_delta.folders = vec![FOLDER_INBOX.into()];
+        apply(&store, other_delta);
+        assert_eq!(
+            messages(&store, "a2", &other_thread)[0].folders,
+            vec![FOLDER_INBOX]
+        );
+
+        let deleted_thread = store
+            .upsert_message(&sample("a1", "del@x", "Deleted", "delete body"))
+            .unwrap();
+        store
+            .delete_thread(&account("a1"), &deleted_thread, "INBOX")
+            .unwrap();
+        let mut deleted_delta = messages(&store, "a1", &deleted_thread)[0].clone();
+        deleted_delta.folders = vec![FOLDER_INBOX.into()];
+        deleted_delta.body_text = Some("delete delta".into());
+        apply(&store, deleted_delta);
+        let deleted = &messages(&store, "a1", &deleted_thread)[0];
+        assert_eq!(deleted.folders, vec![FOLDER_TRASH]);
+        assert_eq!(deleted.body_text.as_deref(), Some("delete delta"));
+
+        store
+            .delete_thread(&account("a1"), &deleted_thread, FOLDER_TRASH)
+            .unwrap();
+        assert!(messages(&store, "a1", &deleted_thread).is_empty());
+        let mut resurrect = sample("a1", "del@x", "Deleted", "should stay gone");
+        resurrect.folders = vec!["inbox".into(), FOLDER_TRASH.into()];
+        apply(&store, resurrect);
+        assert!(messages(&store, "a1", &deleted_thread).is_empty());
+
+        let undone = store.undo(&account("a1")).unwrap();
+        assert_eq!(undone.kind, ActionKind::Delete);
+        assert_eq!(
+            messages(&store, "a1", &deleted_thread)[0].folders,
+            vec![FOLDER_TRASH]
+        );
+        assert_eq!(tombstones(&store, "del@x"), 1);
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(tombstones(&store, "del@x"), 0);
+        assert_eq!(
+            messages(&store, "a1", &deleted_thread)[0].folders,
+            vec![FOLDER_INBOX]
+        );
+    }
+
+    #[test]
+    fn undo_of_expunge_replaces_a_reinserted_row_and_drops_the_copy() {
+        let store = open(&[("a1", "a@x")]);
+        let mut note = sample("a1", "note@x", "Quarterly note", "original secret body");
+        note.bcc = vec![Address {
+            name: None,
+            email: "secret@x".into(),
+        }];
+        note.unread = false;
+        note.labels = vec!["notes".into()];
+        let thread = store.upsert_message(&note).unwrap();
+        let baseline = messages(&store, "a1", &thread);
+        store
+            .delete_thread(&account("a1"), &thread, FOLDER_INBOX)
+            .unwrap();
+        let expunged = store
+            .delete_thread(&account("a1"), &thread, FOLDER_TRASH)
+            .unwrap();
+        assert!(messages(&store, "a1", &thread).is_empty());
+        assert!(saved_copies(&store, "original secret body") >= 1);
+        assert!(saved_copies(&store, "secret@x") >= 1);
+
+        let mut replacement = sample("a1", "note@x", "Replacement", "replacement body");
+        replacement.bcc = vec![Address {
+            name: None,
+            email: "other@x".into(),
+        }];
+        replacement.unread = true;
+        store.upsert_message(&replacement).unwrap();
+        assert_eq!(
+            messages(&store, "a1", &thread)[0].body_text.as_deref(),
+            Some("replacement body")
+        );
+
+        assert_eq!(store.undo(&account("a1")).unwrap().id, expunged.id);
+        let restored = &messages(&store, "a1", &thread)[0];
+        assert_eq!(restored.body_text.as_deref(), Some("original secret body"));
+        assert_eq!(restored.headers.subject, "Quarterly note");
+        assert_eq!(restored.bcc, baseline[0].bcc);
+        assert_eq!(restored.labels, vec!["notes"]);
+        assert!(!restored.unread);
+        assert_eq!(restored.folders, vec![FOLDER_TRASH]);
+        assert_eq!(restored.thread_id, baseline[0].thread_id);
+        assert_eq!(saved_copies_for_action(&store, expunged.id), 0);
+
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(messages(&store, "a1", &thread), baseline);
+        assert_eq!(saved_copies(&store, "original secret body"), 0);
+        assert_eq!(saved_copies(&store, "secret@x"), 0);
+    }
+
+    fn saved_copies_for_action(store: &Store, action_id: i64) -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_action_messages WHERE action_id = ?1",
+                params![action_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }

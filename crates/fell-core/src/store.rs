@@ -242,7 +242,11 @@ impl Store {
                     message.account_id.as_str()
                 )));
             }
-            insert_message(&tx, message)?;
+            // Skip a folder archive or delete already took off this message.
+            let Some(message) = crate::actions::message_for_delta(&tx, message)? else {
+                continue;
+            };
+            insert_message(&tx, &message)?;
         }
         if !delta.messages.is_empty() {
             rethread(&tx, account_id)?;
