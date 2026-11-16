@@ -1,8 +1,10 @@
 //! Open the local store and, when it is empty, stub-sync fixture mail into it.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use fell_core::{Account, Store};
 
@@ -69,42 +71,56 @@ fn prepare(store: &Store) -> fell_core::Result<(Account, SyncKind)> {
 }
 
 fn open_store() -> fell_core::Result<Store> {
-    let path = store_path();
+    let path = store_path().map_err(fell_core::Error::Backend)?;
+    open_at(&path)
+}
+
+fn open_at(path: &Path) -> fell_core::Result<Store> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| fell_core::Error::Backend(err.to_string()))?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
-    Store::open(&path)
+    let store = Store::open(path)?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    Ok(store)
 }
 
-pub fn store_path() -> PathBuf {
-    if let Some(path) = env::var_os("FELL_STORE") {
-        return PathBuf::from(path);
+pub fn store_path() -> Result<PathBuf, String> {
+    store_path_from(
+        env::var_os("FELL_STORE").as_deref(),
+        env::var_os("XDG_DATA_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
+}
+
+fn store_path_from(
+    fell_store: Option<&OsStr>,
+    xdg_data: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = fell_store {
+        return Ok(PathBuf::from(path));
     }
-    data_dir().join("mail.db")
+    if let Some(data) = xdg_data {
+        return Ok(PathBuf::from(data).join("fell/mail.db"));
+    }
+    if let Some(home) = home {
+        return Ok(PathBuf::from(home).join(".local/share/fell/mail.db"));
+    }
+    Err("no private directory for the mailbox; set HOME, XDG_DATA_HOME, or FELL_STORE".into())
 }
 
-pub fn config_dir() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
-        .join("fell")
-}
-
-fn data_dir() -> PathBuf {
-    env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share"))
-        .join("fell")
-}
-
-fn home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config).join("fell"));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/fell"))
 }
 
 fn load_keymap() -> (Keymap, Option<String>) {
-    let path = config_dir().join("keymap.toml");
+    let Some(path) = config_dir().map(|dir| dir.join("keymap.toml")) else {
+        return (Keymap::default(), None);
+    };
     match fs::read_to_string(&path) {
         Ok(text) => match keymap::keymap_from_text(&text) {
             Ok(keymap) => (keymap, None),
@@ -116,7 +132,9 @@ fn load_keymap() -> (Keymap, Option<String>) {
 }
 
 fn load_split() -> f32 {
-    let path = config_dir().join("ui.toml");
+    let Some(path) = config_dir().map(|dir| dir.join("ui.toml")) else {
+        return 0.38;
+    };
     let Ok(text) = fs::read_to_string(path) else {
         return 0.38;
     };
@@ -134,9 +152,41 @@ fn load_split() -> f32 {
 }
 
 pub fn save_split(split: f32) {
-    let dir = config_dir();
+    let Some(dir) = config_dir() else {
+        return;
+    };
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let _ = fs::write(dir.join("ui.toml"), format!("split = {split:.3}\n"));
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let path = dir.join("ui.toml");
+    if fs::write(&path, format!("split = {split:.3}\n")).is_ok() {
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_home_does_not_put_mail_in_tmp() {
+        let err = store_path_from(None, None, None).unwrap_err();
+        assert!(!err.contains("/tmp"));
+        let path = store_path_from(None, None, Some(OsStr::new("/home/caleb"))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/caleb/.local/share/fell/mail.db"));
+    }
+
+    #[test]
+    fn created_mailbox_is_not_world_readable() {
+        let dir = std::env::temp_dir().join(format!("fell-perm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("mail.db");
+        open_at(&path).unwrap();
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o077, 0, "mailbox mode {file_mode:o}");
+        assert_eq!(dir_mode & 0o077, 0, "directory mode {dir_mode:o}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

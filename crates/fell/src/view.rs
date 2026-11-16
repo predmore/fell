@@ -55,6 +55,7 @@ struct Inbox {
     theme: Theme,
     list_scroll: ScrollHandle,
     conv_scroll: ScrollHandle,
+    palette_scroll: ScrollHandle,
     split: f32,
     dragging: bool,
     open_thread: Option<String>,
@@ -77,6 +78,7 @@ impl Inbox {
             theme,
             list_scroll: ScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
+            palette_scroll: ScrollHandle::new(),
             split: mailbox.split,
             dragging: false,
             open_thread: None,
@@ -177,6 +179,10 @@ impl Inbox {
         if !self.session.messages.is_empty() {
             self.conv_scroll.scroll_to_item(self.session.message_cursor);
         }
+        if self.session.overlay == Overlay::Palette {
+            self.palette_scroll
+                .scroll_to_item(self.session.palette_index);
+        }
         cx.notify();
     }
 
@@ -237,6 +243,7 @@ impl Render for Inbox {
         let session = self.session.clone();
         let list_scroll = self.list_scroll.clone();
         let conv_scroll = self.conv_scroll.clone();
+        let palette_scroll = self.palette_scroll.clone();
         let focus = self.focus.clone();
         let split = self.split;
         shell(
@@ -246,6 +253,7 @@ impl Render for Inbox {
             split,
             list_scroll,
             conv_scroll,
+            palette_scroll,
             focus,
             cx,
         )
@@ -260,6 +268,7 @@ fn shell(
     split: f32,
     list_scroll: ScrollHandle,
     conv_scroll: ScrollHandle,
+    palette_scroll: ScrollHandle,
     focus: FocusHandle,
     cx: &mut Context<Inbox>,
 ) -> impl IntoElement {
@@ -328,7 +337,7 @@ fn shell(
             |root| root.child(which_key_popup(&theme, &session)),
         )
         .when(session.overlay != Overlay::None, |root| {
-            root.child(overlay(&theme, &session, cx))
+            root.child(overlay(&theme, &session, &palette_scroll, cx))
         })
 }
 
@@ -1056,7 +1065,12 @@ fn which_key_popup(theme: &Theme, session: &Session) -> gpui::Div {
         }))
 }
 
-fn overlay(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
+fn overlay(
+    theme: &Theme,
+    session: &Session,
+    palette_scroll: &ScrollHandle,
+    cx: &mut Context<Inbox>,
+) -> gpui::Div {
     div()
         .absolute()
         .top(px(0.))
@@ -1075,14 +1089,19 @@ fn overlay(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::D
             }),
         )
         .child(match session.overlay {
-            Overlay::Palette => palette(theme, session, cx).into_any_element(),
+            Overlay::Palette => palette(theme, session, palette_scroll, cx).into_any_element(),
             Overlay::Folders => folder_picker(theme, session, cx).into_any_element(),
             Overlay::Help => help(theme, session, cx).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }
 
-fn palette(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
+fn palette(
+    theme: &Theme,
+    session: &Session,
+    scroll: &ScrollHandle,
+    cx: &mut Context<Inbox>,
+) -> gpui::Div {
     let items = session.palette();
     let selected = session.palette_index;
     div()
@@ -1122,6 +1141,7 @@ fn palette(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::D
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
+                .track_scroll(scroll)
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let action = item.action;

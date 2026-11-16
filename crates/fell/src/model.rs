@@ -34,6 +34,24 @@ pub enum Overlay {
     Help,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Motion {
+    Forward(usize),
+    Backward(usize),
+}
+
+fn step_index(cursor: usize, len: usize, motion: Motion) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    let cursor = cursor.min(last);
+    match motion {
+        Motion::Forward(steps) => cursor.saturating_add(steps).min(last),
+        Motion::Backward(steps) => cursor.saturating_sub(steps),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub reload_threads: bool,
@@ -167,24 +185,29 @@ impl Session {
 
     pub fn highlighted(&self) -> HashSet<String> {
         let mut ids = self.picked.clone();
-        if let Some(id) = &self.cursor_id {
+        if let Some(id) = &self.cursor_id
+            && self.threads.iter().any(|thread| &thread.id == id)
+        {
             ids.insert(id.clone());
         }
-        if self.visual {
-            let anchor = self
-                .threads
-                .iter()
-                .position(|thread| Some(&thread.id) == self.anchor_id.as_ref())
-                .unwrap_or(0);
-            let cursor = self.cursor_index();
-            let (lo, hi) = if anchor <= cursor {
-                (anchor, cursor)
-            } else {
-                (cursor, anchor)
-            };
-            for thread in &self.threads[lo..=hi.min(self.threads.len().saturating_sub(1))] {
-                ids.insert(thread.id.clone());
-            }
+        if !self.visual || self.threads.is_empty() {
+            return ids;
+        }
+        let Some(anchor) = self
+            .threads
+            .iter()
+            .position(|thread| Some(&thread.id) == self.anchor_id.as_ref())
+        else {
+            return ids;
+        };
+        let cursor = self.cursor_index().min(self.threads.len() - 1);
+        let (lo, hi) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        for thread in &self.threads[lo..=hi] {
+            ids.insert(thread.id.clone());
         }
         ids
     }
@@ -204,6 +227,14 @@ impl Session {
         }
         self.picked
             .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+        let anchor_here = self
+            .anchor_id
+            .as_ref()
+            .is_some_and(|id| self.threads.iter().any(|thread| &thread.id == id));
+        if self.visual && !anchor_here {
+            self.visual = false;
+            self.anchor_id = None;
+        }
         self.cursor_id != previous
     }
 
@@ -234,7 +265,10 @@ impl Session {
             && ch.is_ascii_digit()
             && (ch != '0' || !self.count.is_empty())
         {
-            self.count.push(ch);
+            // Longer than usize::MAX on this machine. Further digits stay saturated.
+            if self.count.len() < 20 {
+                self.count.push(ch);
+            }
             return step;
         }
         let key = if key == self.keymap.leader {
@@ -409,12 +443,12 @@ impl Session {
         let mut step = Step::default();
         match action {
             Action::Next => {
-                let count = self.take_count() as i32;
-                step.reload_messages = self.move_cursor(count);
+                let count = self.take_count();
+                step.reload_messages = self.move_cursor(Motion::Forward(count));
             }
             Action::Prev => {
-                let count = self.take_count() as i32;
-                step.reload_messages = self.move_cursor(-count);
+                let count = self.take_count();
+                step.reload_messages = self.move_cursor(Motion::Backward(count));
             }
             Action::First => step.reload_messages = self.jump_first(),
             Action::Last => step.reload_messages = self.jump_last(),
@@ -433,12 +467,12 @@ impl Session {
                 self.pane = Pane::List;
             }
             Action::PageDown => {
-                let delta = self.page_delta(page_rows);
-                step.reload_messages = self.move_cursor(delta);
+                let steps = self.page_steps(page_rows);
+                step.reload_messages = self.move_cursor(Motion::Forward(steps));
             }
             Action::PageUp => {
-                let delta = self.page_delta(page_rows);
-                step.reload_messages = self.move_cursor(-delta);
+                let steps = self.page_steps(page_rows);
+                step.reload_messages = self.move_cursor(Motion::Backward(steps));
             }
             Action::Inbox => step.reload_threads = self.go_folder("INBOX"),
             Action::Sent => step.reload_threads = self.go_folder("Sent"),
@@ -506,9 +540,8 @@ impl Session {
         true
     }
 
-    fn page_delta(&mut self, page_rows: usize) -> i32 {
-        let count = self.take_count();
-        count.saturating_mul(page_rows.max(1)) as i32
+    fn page_steps(&mut self, page_rows: usize) -> usize {
+        self.take_count().saturating_mul(page_rows.max(1))
     }
 
     fn jump_first(&mut self) -> bool {
@@ -552,33 +585,37 @@ impl Session {
         }
     }
 
-    fn move_cursor(&mut self, delta: i32) -> bool {
+    fn move_cursor(&mut self, motion: Motion) -> bool {
         match self.pane {
             Pane::List => {
-                if self.threads.is_empty() {
+                let len = self.threads.len();
+                if len == 0 {
                     return false;
                 }
-                let next = (self.cursor_index() as i32 + delta)
-                    .clamp(0, self.threads.len() as i32 - 1) as usize;
+                let next = step_index(self.cursor_index(), len, motion);
                 let id = self.threads[next].id.clone();
                 let changed = self.cursor_id.as_deref() != Some(id.as_str());
                 self.cursor_id = Some(id);
                 changed
             }
             Pane::Conversation => {
-                if self.messages.is_empty() {
+                let len = self.messages.len();
+                if len == 0 {
                     return false;
                 }
-                let next = (self.message_cursor as i32 + delta)
-                    .clamp(0, self.messages.len() as i32 - 1) as usize;
-                self.message_cursor = next;
+                self.message_cursor = step_index(self.message_cursor, len, motion);
                 false
             }
         }
     }
 
     fn take_count(&mut self) -> usize {
-        let n = self.count.parse::<usize>().unwrap_or(1).max(1);
+        let n = if self.count.is_empty() {
+            1
+        } else {
+            // A prefix that does not fit in usize still means "as far as possible".
+            self.count.parse::<usize>().unwrap_or(usize::MAX).max(1)
+        };
         self.count.clear();
         n
     }
@@ -749,6 +786,63 @@ mod tests {
         session.on_key(KeyId::Backspace, 4);
         assert!(session.chord.is_empty());
         assert!(!session.which_visible);
+    }
+
+    #[test]
+    fn empty_visual_range_does_not_panic() {
+        let mut session = session();
+        session.on_key(KeyId::Char('V'), 1);
+        assert!(session.visual);
+        session.set_threads(vec![]);
+        assert!(!session.visual);
+        assert!(session.anchor_id.is_none());
+        let _ = session.highlighted();
+    }
+
+    #[test]
+    fn missing_anchor_drops_visual_mode() {
+        let mut session = session();
+        session.on_key(KeyId::Char('G'), 1);
+        session.on_key(KeyId::Char('V'), 1);
+        session.on_key(KeyId::Char('k'), 1);
+        assert!(session.visual);
+        let changed = session.set_threads(vec![row("a"), row("b")]);
+        assert!(changed);
+        assert!(!session.visual);
+        let highlighted = session.highlighted();
+        assert!(!highlighted.contains("a") || session.cursor_id.as_deref() == Some("a"));
+        assert_eq!(highlighted.len(), usize::from(session.cursor_id.is_some()));
+    }
+
+    #[test]
+    fn huge_count_clamps_instead_of_overflowing() {
+        let mut session = session();
+        session.on_key(KeyId::Char('G'), 1);
+        for ch in "2147483648".chars() {
+            session.on_key(KeyId::Char(ch), 1);
+        }
+        session.on_key(KeyId::Char('k'), 1);
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
+
+        for ch in "2147483647".chars() {
+            session.on_key(KeyId::Char(ch), 1);
+        }
+        session.on_key(KeyId::Char('j'), 1);
+        assert_eq!(session.cursor_id.as_deref(), Some("e"));
+
+        session.pane = Pane::Conversation;
+        session.messages = vec![empty_message(false), empty_message(false)];
+        session.message_cursor = 0;
+        for ch in "2147483648".chars() {
+            session.on_key(KeyId::Char(ch), 1);
+        }
+        session.on_key(KeyId::Ctrl('d'), 4);
+        assert_eq!(session.message_cursor, 1);
+        for ch in "2147483648".chars() {
+            session.on_key(KeyId::Char(ch), 1);
+        }
+        session.on_key(KeyId::Ctrl('u'), 4);
+        assert_eq!(session.message_cursor, 0);
     }
 
     #[test]
