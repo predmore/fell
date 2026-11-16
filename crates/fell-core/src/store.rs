@@ -355,7 +355,7 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
         if via_alias {
             merge_provenance(conn, message, &stored)?;
         } else {
-            update_canonical(conn, message, &stored, &fingerprint)?;
+            update_canonical(conn, message, &stored)?;
         }
         return Ok(ThreadId(stored.thread_id));
     }
@@ -416,17 +416,14 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
     Ok(thread_id)
 }
 
-fn update_canonical(
-    conn: &Connection,
-    message: &Message,
-    stored: &StoredCopy,
-    fingerprint: &str,
-) -> Result<()> {
+fn update_canonical(conn: &Connection, message: &Message, stored: &StoredCopy) -> Result<()> {
     let account_id = &message.account_id;
-    let thread_id = resolve_thread_id(&message.headers, |parent| {
+    let (body_text, snippet, fingerprint) = canonical_body(stored, message);
+    let (in_reply_to, references) = canonical_parents(stored, message);
+    let headers = headers_keeping(message, &in_reply_to, &references);
+    let thread_id = resolve_thread_id(&headers, |parent| {
         thread_id_for_message_id(conn, account_id, parent)
     })?;
-    let references = references_header(&message.headers);
     let folders = union_tokens(&stored.folders, &message.folders, false);
     let labels = union_tokens(&stored.labels, &message.labels, false);
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
@@ -456,14 +453,14 @@ fn update_canonical(
             message.remote_id.0,
             thread_id.as_str(),
             message.headers.proton_conversation_id,
-            message.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            in_reply_to,
             references,
             message.headers.from.name,
             message.headers.from.email,
             message.headers.subject,
             message.headers.date_unix,
-            message.snippet,
-            message.body_text,
+            snippet,
+            body_text,
             i64::from(message.unread),
             folders,
             labels,
@@ -544,11 +541,14 @@ struct StoredCopy {
     references_header: String,
     snippet: String,
     body_text: Option<String>,
+    date_unix: i64,
+    rowid: i64,
 }
 
 const STORED_COPY_COLS: &str =
     "m.message_id, m.thread_id, m.list_id, m.folders, m.labels, m.arrived_via,
-    m.from_email, m.subject, m.in_reply_to, m.references_header, m.snippet, m.body_text";
+    m.from_email, m.subject, m.in_reply_to, m.references_header, m.snippet, m.body_text,
+    m.date_unix, m.rowid";
 
 fn map_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCopy> {
     Ok(StoredCopy {
@@ -564,6 +564,8 @@ fn map_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCopy> {
         references_header: row.get(9)?,
         snippet: row.get(10)?,
         body_text: row.get(11)?,
+        date_unix: row.get(12)?,
+        rowid: row.get(13)?,
     })
 }
 
@@ -587,7 +589,7 @@ fn find_stored(
     let hit = stmt
         .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
             let stored = map_stored(row)?;
-            let via_alias: i64 = row.get(12)?;
+            let via_alias: i64 = row.get(14)?;
             Ok((stored, via_alias != 0))
         })
         .optional()?;
@@ -597,6 +599,9 @@ fn find_stored(
 /// Same body as an existing row, one copy rewritten by a list, and a stronger
 /// identity than the fingerprint: shared parent ids, or the same sender and a
 /// subject that still matches after list-prefix stripping.
+///
+/// A shared parent outranks a subject-only hit. Equal hits use the closest
+/// date. Several subject-only hits and no shared parent do not collapse.
 fn find_list_collapse(
     conn: &Connection,
     message: &Message,
@@ -609,21 +614,49 @@ fn find_list_collapse(
     let mut stmt = conn.prepare(&format!(
         "SELECT {STORED_COPY_COLS}
          FROM messages m
-         WHERE m.account_id = ?1 AND m.body_fingerprint = ?2
-         ORDER BY m.rowid ASC"
+         WHERE m.account_id = ?1 AND m.body_fingerprint = ?2"
     ))?;
     let rows = stmt.query_map(
         params![message.account_id.as_str(), fingerprint],
         map_stored,
     )?;
+    let mut matches = Vec::new();
     for row in rows {
         let stored = row?;
         let existing_is_list = stored.list_id.as_deref().is_some_and(|id| !id.is_empty());
         if (incoming_is_list || existing_is_list) && is_same_rewritten_message(message, &stored) {
-            return Ok(Some(stored));
+            matches.push(stored);
         }
     }
-    Ok(None)
+    Ok(pick_collapse_target(message, matches))
+}
+
+fn pick_collapse_target(incoming: &Message, matches: Vec<StoredCopy>) -> Option<StoredCopy> {
+    if matches.is_empty() {
+        return None;
+    }
+    let parent_indexes: Vec<usize> = matches
+        .iter()
+        .enumerate()
+        .filter(|(_, stored)| shared_parent_ids(incoming, stored))
+        .map(|(index, _)| index)
+        .collect();
+    let indexes = if !parent_indexes.is_empty() {
+        parent_indexes
+    } else if matches.len() == 1 {
+        vec![0]
+    } else {
+        return None;
+    };
+    let incoming_date = incoming.headers.date_unix;
+    let best = indexes.into_iter().min_by_key(|index| {
+        let stored = &matches[*index];
+        (
+            stored.date_unix.abs_diff(incoming_date),
+            std::cmp::Reverse(stored.rowid),
+        )
+    })?;
+    matches.into_iter().nth(best)
 }
 
 /// Threading columns only — bodies stay on disk.
@@ -842,6 +875,59 @@ fn body_is_missing(body: &Option<String>) -> bool {
         Some(text) => text.trim().is_empty(),
         None => true,
     }
+}
+
+fn canonical_body(stored: &StoredCopy, message: &Message) -> (Option<String>, String, String) {
+    let body = if body_is_missing(&message.body_text) {
+        stored.body_text.clone()
+    } else {
+        message.body_text.clone()
+    };
+    let snippet = if message.snippet.trim().is_empty() {
+        stored.snippet.clone()
+    } else {
+        message.snippet.clone()
+    };
+    let source = match body.as_deref() {
+        Some(text) if !text.trim().is_empty() => text.to_string(),
+        _ => snippet.clone(),
+    };
+    let fingerprint = body_fingerprint(&source);
+    (body, snippet, fingerprint)
+}
+
+fn message_has_parents(message: &Message) -> bool {
+    message.headers.in_reply_to.is_some() || !message.headers.references.is_empty()
+}
+
+/// Keep stored parents when this copy has none. A copy that has parents replaces them.
+fn canonical_parents(stored: &StoredCopy, message: &Message) -> (Option<String>, String) {
+    if message_has_parents(message) {
+        (
+            message
+                .headers
+                .in_reply_to
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
+            references_header(&message.headers),
+        )
+    } else {
+        (stored.in_reply_to.clone(), stored.references_header.clone())
+    }
+}
+
+fn headers_keeping(
+    message: &Message,
+    in_reply_to: &Option<String>,
+    references: &str,
+) -> MessageHeaders {
+    let mut headers = message.headers.clone();
+    headers.in_reply_to = in_reply_to
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(MessageId::new);
+    headers.references = parse_references(references);
+    headers
 }
 
 /// Keep a stored body. Copy the incoming body only when the stored row has none.
@@ -2175,6 +2261,204 @@ mod tests {
         assert_eq!(msgs[0].folders, vec!["INBOX"]);
         assert_eq!(msgs[0].arrived_via, vec!["list@x.com"]);
         assert_eq!(msgs[0].list_id.as_deref(), Some("list.example"));
+    }
+
+    #[test]
+    fn list_resync_keeps_filled_body_and_parent() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let parent_thread = store
+            .upsert_message(&msg("root@x", None, None, "Root", "root body"))
+            .unwrap();
+        let mut echo = with_arrival(
+            msg("list-rewrite@x", None, None, "[list] Hello", "hello body"),
+            "INBOX",
+            "lists",
+            "list@x.com",
+            Some("list.example"),
+        );
+        echo.body_text = None;
+        store.upsert_message(&echo).unwrap();
+        let sent = with_arrival(
+            msg("orig@x", None, Some("root@x"), "Hello", "hello   body\n"),
+            "Sent",
+            "",
+            "me@x.com",
+            None,
+        );
+        assert_eq!(store.upsert_message(&sent).unwrap(), parent_thread);
+
+        let mut again = echo.clone();
+        again.body_text = None;
+        again.headers.in_reply_to = None;
+        again.headers.references.clear();
+        again.unread = false;
+        store.upsert_message(&again).unwrap();
+
+        let msgs = store
+            .thread_messages(&AccountId("a1".into()), &parent_thread)
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        let collapsed = msgs
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "list-rewrite@x")
+            .unwrap();
+        assert_eq!(
+            collapsed
+                .headers
+                .in_reply_to
+                .as_ref()
+                .map(MessageId::as_str),
+            Some("root@x")
+        );
+        assert_eq!(collapsed.headers.references, vec![MessageId::new("root@x")]);
+        assert_eq!(collapsed.body_text.as_deref(), Some("hello   body\n"));
+        assert!(!collapsed.unread);
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, parent_thread);
+    }
+
+    #[test]
+    fn list_echo_prefers_shared_parent_over_older_subject_match() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("root@x", None, None, "Root", "root body"))
+            .unwrap();
+        let mut older = msg("older@x", None, None, "Hello", "hello body");
+        older.headers.date_unix = 1;
+        store.upsert_message(&older).unwrap();
+        let mut sent = with_arrival(
+            msg("sent@x", None, Some("root@x"), "Hello", "hello body"),
+            "Sent",
+            "",
+            "me@x.com",
+            None,
+        );
+        sent.headers.date_unix = 100;
+        let sent_thread = store.upsert_message(&sent).unwrap();
+        let mut echo = with_arrival(
+            msg(
+                "list-rewrite@x",
+                None,
+                Some("root@x"),
+                "[list] Hello",
+                "hello body",
+            ),
+            "INBOX",
+            "lists",
+            "list@x.com",
+            Some("list.example"),
+        );
+        echo.headers.date_unix = 110;
+        let echo_thread = store.upsert_message(&echo).unwrap();
+        assert_eq!(echo_thread, sent_thread);
+        let collapsed = store
+            .thread_messages(&AccountId("a1".into()), &sent_thread)
+            .unwrap();
+        let sent_row = collapsed
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "sent@x")
+            .unwrap();
+        assert_eq!(sent_row.folders, vec!["Sent", "INBOX"]);
+        assert!(
+            store
+                .thread_messages(
+                    &AccountId("a1".into()),
+                    &ThreadId::from_message_id(&MessageId::new("older@x"))
+                )
+                .unwrap()
+                .iter()
+                .any(|message| message.headers.message_id.as_str() == "older@x")
+        );
+        assert_eq!(
+            store
+                .thread_messages(
+                    &AccountId("a1".into()),
+                    &ThreadId::from_message_id(&MessageId::new("older@x"))
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn several_subject_only_matches_do_not_collapse() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg("first@x", None, None, "Hello", "hello body");
+        first.headers.date_unix = 1;
+        let mut second = msg("second@x", None, None, "Hello", "hello body");
+        second.headers.date_unix = 20;
+        store.upsert_message(&first).unwrap();
+        store.upsert_message(&second).unwrap();
+        let mut echo = with_arrival(
+            msg("list-rewrite@x", None, None, "[list] Hello", "hello body"),
+            "INBOX",
+            "lists",
+            "list@x.com",
+            Some("list.example"),
+        );
+        echo.headers.date_unix = 21;
+        store.upsert_message(&echo).unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 3);
+        assert!(threads.iter().all(|thread| thread.message_count == 1));
+    }
+
+    #[test]
+    fn closest_date_wins_among_shared_parents() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("root@x", None, None, "Root", "root body"))
+            .unwrap();
+        let mut older = msg("older@x", None, Some("root@x"), "Hello", "hello body");
+        older.headers.date_unix = 10;
+        store.upsert_message(&older).unwrap();
+        let mut newer = with_arrival(
+            msg("newer@x", None, Some("root@x"), "Hello", "hello body"),
+            "Sent",
+            "",
+            "me@x.com",
+            None,
+        );
+        newer.headers.date_unix = 50;
+        let newer_thread = store.upsert_message(&newer).unwrap();
+        let mut echo = with_arrival(
+            msg(
+                "list-rewrite@x",
+                None,
+                Some("root@x"),
+                "[list] Hello",
+                "hello body",
+            ),
+            "INBOX",
+            "lists",
+            "list@x.com",
+            Some("list.example"),
+        );
+        echo.headers.date_unix = 52;
+        let echo_thread = store.upsert_message(&echo).unwrap();
+        assert_eq!(echo_thread, newer_thread);
+        let msgs = store
+            .thread_messages(&AccountId("a1".into()), &newer_thread)
+            .unwrap();
+        let kept = msgs
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "newer@x")
+            .unwrap();
+        assert_eq!(kept.folders, vec!["Sent", "INBOX"]);
+        assert!(
+            msgs.iter()
+                .any(|message| message.headers.message_id.as_str() == "older@x")
+        );
+        assert!(
+            msgs.iter()
+                .all(|message| message.headers.message_id.as_str() != "list-rewrite@x")
+        );
     }
 
     struct RemoveOnDrop<'a>(&'a std::path::Path);
