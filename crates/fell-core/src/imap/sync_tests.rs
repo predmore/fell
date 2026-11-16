@@ -41,6 +41,7 @@ fn sample_state() -> TestState {
                 uidvalidity: 1,
                 uidnext: None,
                 omit_uidnext: false,
+                reject_examine: false,
                 messages: Vec::new(),
             },
             FixtureMailbox {
@@ -49,6 +50,7 @@ fn sample_state() -> TestState {
                 uidvalidity: 10,
                 uidnext: None,
                 omit_uidnext: false,
+                reject_examine: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -69,6 +71,7 @@ fn sample_state() -> TestState {
                 uidvalidity: 20,
                 uidnext: None,
                 omit_uidnext: false,
+                reject_examine: false,
                 messages: vec![
                     FixtureMessage {
                         uid: 1,
@@ -122,6 +125,7 @@ fn sample_state() -> TestState {
                 uidvalidity: 7,
                 uidnext: None,
                 omit_uidnext: false,
+                reject_examine: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -495,6 +499,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
             uidvalidity: 3,
             uidnext: Some(10),
             omit_uidnext: false,
+            reject_examine: false,
             messages: vec![FixtureMessage {
                 uid: 5,
                 flags: vec!["\\Seen".into()],
@@ -530,4 +535,143 @@ fn star_range_does_not_reapply_the_highest_uid() {
         );
     }
     assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
+}
+
+#[test]
+fn empty_mailbox_records_modseq_before_mail_arrives() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: true,
+        close_after_starttls: false,
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 4,
+            uidnext: Some(1),
+            omit_uidnext: false,
+            reject_examine: false,
+            messages: vec![],
+        }],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap();
+    assert!(
+        cursor.token.contains("\t4\t0\t1"),
+        "empty mailbox should store HIGHESTMODSEQ: {}",
+        cursor.token
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state.mailboxes[0].messages.push(FixtureMessage {
+            uid: 1,
+            flags: vec![],
+            modseq: 2,
+            raw: raw_message("later@x", None, "Later", "Ann <ann@x>", "later body", ""),
+        });
+        state.mailboxes[0].uidnext = Some(2);
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert_eq!(threads.len(), 1);
+    assert!(threads[0].unread);
+    {
+        let mut state = server.state.lock().expect("state");
+        state.mailboxes[0].messages[0].flags = vec!["\\Seen".into()];
+        state.mailboxes[0].messages[0].modseq = 3;
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(!store.list_threads(&acct.id).unwrap()[0].unread);
+}
+
+#[test]
+fn examine_refusal_does_not_drop_the_rest_of_the_account() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Sent".into(),
+                list_flags: String::new(),
+                uidvalidity: 8,
+                uidnext: Some(3),
+                omit_uidnext: false,
+                reject_examine: false,
+                messages: vec![FixtureMessage {
+                    uid: 2,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
+                }],
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
+                }],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let before = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(before.contains("Sent"));
+    {
+        let mut state = server.state.lock().expect("state");
+        state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "Sent")
+            .unwrap()
+            .reject_examine = true;
+        state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap()
+            .messages
+            .push(FixtureMessage {
+                uid: 2,
+                flags: vec![],
+                modseq: 2,
+                raw: raw_message("new@x", None, "Still here", "Ann <ann@x>", "new", ""),
+            });
+        state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap()
+            .uidnext = Some(3);
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "Still here"));
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("Sent\t8\t"),
+        "refused mailbox keeps its checkpoint: {cursor}"
+    );
 }

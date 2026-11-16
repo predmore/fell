@@ -22,6 +22,8 @@ pub(super) struct FixtureMailbox {
     pub uidnext: Option<u32>,
     /// Omit UIDNEXT even when `uidnext` is set. Forces the UID-search path.
     pub omit_uidnext: bool,
+    /// LIST this mailbox, but answer EXAMINE with NO.
+    pub reject_examine: bool,
     pub messages: Vec<FixtureMessage>,
 }
 
@@ -190,6 +192,12 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     let _ = write.write_all(format!("{tag} NO no such mailbox\r\n").as_bytes());
                     continue;
                 };
+                if mailbox.reject_examine {
+                    let _ = write.write_all(
+                        format!("{tag} NO EXAMINE failed: permission denied\r\n").as_bytes(),
+                    );
+                    continue;
+                }
                 let exists = mailbox.messages.len();
                 let highest = mailbox
                     .messages
@@ -262,10 +270,19 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                         continue;
                     }
                     let seq = index + 1;
-                    if !rest.to_ascii_uppercase().contains("BODY") {
-                        let _ = write.write_all(
-                            format!("* {seq} FETCH (UID {})\r\n", message.uid).as_bytes(),
-                        );
+                    let upper_cmd = rest.to_ascii_uppercase();
+                    if !upper_cmd.contains("BODY") {
+                        if upper_cmd.contains("FLAGS") {
+                            let flags = message.flags.join(" ");
+                            let _ = write.write_all(
+                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
+                                    .as_bytes(),
+                            );
+                        } else {
+                            let _ = write.write_all(
+                                format!("* {seq} FETCH (UID {})\r\n", message.uid).as_bytes(),
+                            );
+                        }
                         continue;
                     }
                     let flags = message.flags.join(" ");

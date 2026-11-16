@@ -18,7 +18,8 @@ use std::fmt;
 
 use crate::Error;
 use crate::account::AccountId;
-use crate::backend::{MailboxDelta, SyncCursor};
+use crate::backend::{FlagUpdate, MailboxDelta, SyncCursor};
+use crate::message::RemoteId;
 
 pub(crate) fn fetch_imap(
     account_id: &AccountId,
@@ -38,10 +39,16 @@ pub(crate) fn fetch_imap(
     });
     let prior: HashMap<String, MailboxCheckpoint> = decode_cursor(cursor).into_iter().collect();
     let mut messages = Vec::new();
+    let mut flags = Vec::new();
     let mut checkpoints = Vec::new();
     for mailbox in &mailboxes {
-        let examined = session.examine(&mailbox.raw)?;
         let previous = prior.get(&mailbox.raw);
+        let Some(examined) = session.examine(&mailbox.raw)? else {
+            if let Some(prev) = previous {
+                checkpoints.push((mailbox.raw.clone(), prev.clone()));
+            }
+            continue;
+        };
         let plan = plan_fetch(previous, &examined);
         let same_validity = previous.is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
         // High-water body fetches ignore UIDs already at the checkpoint.
@@ -70,6 +77,25 @@ pub(crate) fn fetch_imap(
         };
         let highest = fetched.iter().map(|item| item.uid).max();
         fetched.retain(|item| seen_through.is_none_or(|uid| item.uid > uid));
+        let needs_baseline = same_validity
+            && previous.is_some_and(|prev| prev.modseq.is_none() && prev.uid > 0)
+            && examined.highest_modseq.is_some()
+            && !matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
+        if needs_baseline {
+            for (uid, flag_names) in session.uid_flags("1:*")? {
+                let unread = !flag_names
+                    .iter()
+                    .any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
+                flags.push(FlagUpdate {
+                    remote_id: RemoteId(format!(
+                        "imap:{}:{uid}:{}",
+                        examined.uidvalidity,
+                        escape_mailbox(&mailbox.raw)
+                    )),
+                    unread,
+                });
+            }
+        }
         for item in fetched {
             if rfc822::is_deleted(&item.flags) {
                 continue;
@@ -93,11 +119,15 @@ pub(crate) fn fetch_imap(
                 checkpoint_uid(previous, same_validity, highest)
             }
         };
-        // A UID-only pass has not seen flag changes on mail already stored.
-        // Recording a brand-new HIGHESTMODSEQ would make the next CHANGEDSINCE
-        // start too high and skip those changes.
-        let saw_flags = matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
-        let modseq = if saw_flags {
+        // Record HIGHESTMODSEQ when this pass saw every message's flags: a full
+        // or CHANGEDSINCE fetch, an empty mailbox, a high-water pass from uid 0,
+        // or a UID FLAGS baseline for older mail that had no modseq yet.
+        let saw_every_flag = matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_))
+            || examined.exists == 0
+            || needs_baseline
+            || (matches!(plan, FetchPlan::HighWater { start } if start <= 1)
+                && previous.map(|prev| prev.uid).unwrap_or(0) == 0);
+        let modseq = if saw_every_flag {
             examined
                 .highest_modseq
                 .or_else(|| previous.and_then(|prev| prev.modseq))
@@ -119,6 +149,7 @@ pub(crate) fn fetch_imap(
     checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(MailboxDelta {
         messages,
+        flags,
         cursor: Some(encode_cursor(account_id.as_str(), &checkpoints)),
     })
 }

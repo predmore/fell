@@ -11,10 +11,18 @@ pub struct SyncCursor {
     pub token: String,
 }
 
-/// Messages (and later flag/label changes) to apply to the local store.
+/// One already-stored message whose flags changed. The body is left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagUpdate {
+    pub remote_id: crate::RemoteId,
+    pub unread: bool,
+}
+
+/// Messages and flag updates to apply to the local store.
 #[derive(Debug, Clone, Default)]
 pub struct MailboxDelta {
     pub messages: Vec<Message>,
+    pub flags: Vec<FlagUpdate>,
     pub cursor: Option<SyncCursor>,
 }
 
@@ -158,6 +166,7 @@ impl MailBackend for FixtureBackend {
                 account_key: "fixture".into(),
                 token: "1".into(),
             }),
+            flags: Vec::new(),
         })
     }
 

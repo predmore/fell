@@ -52,7 +52,7 @@ pub(super) struct Session {
 
 enum Io {
     Plain(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    Tls(Box<StreamOwned<ClientConnection, Prefixed<TcpStream>>>),
 }
 
 impl Session {
@@ -60,7 +60,7 @@ impl Session {
         let stream = connect_tcp(config)?;
         let mut session = match config.security {
             ImapSecurity::Tls => Session {
-                io: Some(Io::Tls(Box::new(wrap_tls(stream, config)?))),
+                io: Some(Io::Tls(Box::new(wrap_tls(stream, Vec::new(), config)?))),
                 tag: 0,
                 caps: Vec::new(),
                 condstore: false,
@@ -116,14 +116,22 @@ impl Session {
         Ok(out)
     }
 
-    pub(super) fn examine(&mut self, mailbox: &str) -> Result<Examined, Error> {
+    /// `Ok(None)` when the server refuses this mailbox (`NO`/`BAD`). The
+    /// connection is still usable. Other errors abort the sync.
+    pub(super) fn examine(&mut self, mailbox: &str) -> Result<Option<Examined>, Error> {
         let name = quote_imap(mailbox).map_err(imap_err)?;
         let examine = if self.condstore {
             format!("EXAMINE {name} (CONDSTORE)")
         } else {
             format!("EXAMINE {name}")
         };
-        let lines = self.command("EXAMINE", &examine)?.untagged;
+        let lines = match self.command("EXAMINE", &examine) {
+            Ok(reply) => reply.untagged,
+            Err(Error::Backend(message)) if message.contains("EXAMINE failed:") => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
         let mut uidvalidity = None;
         let mut uidnext = None;
         let mut exists = 0;
@@ -144,12 +152,32 @@ impl Session {
         }
         let uidvalidity = uidvalidity
             .ok_or_else(|| imap_err(format!("EXAMINE {mailbox} returned no UIDVALIDITY")))?;
-        Ok(Examined {
+        Ok(Some(Examined {
             uidvalidity,
             uidnext,
             exists,
             highest_modseq,
-        })
+        }))
+    }
+
+    /// Flags only. Used to learn unread state before the first modseq is stored.
+    pub(super) fn uid_flags(&mut self, range: &str) -> Result<Vec<(u32, Vec<String>)>, Error> {
+        let lines = self
+            .command("UID FETCH", &format!("UID FETCH {range} (UID FLAGS)"))?
+            .untagged;
+        let mut out = Vec::new();
+        for line in lines {
+            let upper = line.text.to_ascii_uppercase();
+            if !upper.contains("FETCH") {
+                continue;
+            }
+            let Some(uid) = number_after(&upper, "UID ") else {
+                continue;
+            };
+            let flags = paren_after(&line.text, "FLAGS").unwrap_or_default();
+            out.push((uid, flags));
+        }
+        Ok(out)
     }
 
     pub(super) fn uid_fetch(
@@ -200,10 +228,11 @@ impl Session {
     }
 
     fn upgrade(&mut self, config: &ImapConfig) -> Result<(), Error> {
+        let pending = std::mem::take(&mut self.pending_buf);
         let Some(Io::Plain(tcp)) = self.io.take() else {
             return Err(imap_err("STARTTLS requires a cleartext session"));
         };
-        self.io = Some(Io::Tls(Box::new(wrap_tls(tcp, config)?)));
+        self.io = Some(Io::Tls(Box::new(wrap_tls(tcp, pending, config)?)));
         Ok(())
     }
 
@@ -429,8 +458,9 @@ fn connect_addrs(
 
 fn wrap_tls(
     tcp: TcpStream,
+    pending: Vec<u8>,
     config: &ImapConfig,
-) -> Result<StreamOwned<ClientConnection, TcpStream>, Error> {
+) -> Result<StreamOwned<ClientConnection, Prefixed<TcpStream>>, Error> {
     let tls = tls_config(config)?;
     let name = ServerName::try_from(config.host.as_str())
         .map_err(|_| {
@@ -442,7 +472,49 @@ fn wrap_tls(
         .to_owned();
     let conn = ClientConnection::new(tls, name)
         .map_err(|err| imap_err(format!("tls handshake setup failed: {err}")))?;
-    Ok(StreamOwned::new(conn, tcp))
+    // Bytes read with the tagged STARTTLS OK, including a ServerHello that
+    // arrived in the same read, must be seen by rustls.
+    Ok(StreamOwned::new(
+        conn,
+        Prefixed {
+            prefix: pending,
+            pos: 0,
+            inner: tcp,
+        },
+    ))
+}
+
+/// Reads `prefix` before the underlying socket, then writes straight through.
+struct Prefixed<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S: Read> Read for Prefixed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let count = (self.prefix.len() - self.pos).min(buf.len());
+            buf[..count].copy_from_slice(&self.prefix[self.pos..self.pos + count]);
+            self.pos += count;
+            if self.pos == self.prefix.len() {
+                self.prefix.clear();
+                self.pos = 0;
+            }
+            return Ok(count);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for Prefixed<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn tls_config(config: &ImapConfig) -> Result<Arc<ClientConfig>, Error> {
@@ -800,6 +872,7 @@ impl Io {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::net::{SocketAddr, TcpListener};
 
     use super::connect_addrs;
@@ -845,5 +918,79 @@ mod tests {
         drop(closed);
         let stream = connect_addrs([dead, good], "127.0.0.1", good.port()).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), good);
+    }
+
+    #[test]
+    fn starttls_then_login_succeeds() {
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::thread;
+
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::{ServerConfig, ServerConnection, StreamOwned};
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certs = vec![CertificateDer::from(certified.cert.der().to_vec())];
+        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK ready\r\n").unwrap();
+            let line = read_imap_line(&mut sock);
+            let tag = line.split_whitespace().next().unwrap_or("a1");
+            sock.write_all(format!("{tag} OK STARTTLS\r\n").as_bytes())
+                .unwrap();
+            let conn = ServerConnection::new(Arc::new(server_config)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            loop {
+                let line = read_imap_line(&mut tls);
+                if line.is_empty() {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap_or("*");
+                let upper = line.to_ascii_uppercase();
+                let response = if upper.contains("LOGIN") {
+                    format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n")
+                } else if upper.contains("CAPABILITY") {
+                    format!("* CAPABILITY IMAP4rev1\r\n{tag} OK\r\n")
+                } else {
+                    format!("{tag} OK\r\n")
+                };
+                if tls.write_all(response.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::StartTls,
+            accept_invalid_certs: true,
+        })
+        .expect("STARTTLS login");
+    }
+
+    fn read_imap_line(stream: &mut impl Read) -> String {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&line).into_owned()
     }
 }
