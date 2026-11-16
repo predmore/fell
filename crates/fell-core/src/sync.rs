@@ -60,7 +60,6 @@ mod tests {
             folders: Vec::new(),
             labels: Vec::new(),
             arrived_via: Vec::new(),
-            list_id: None,
         };
         let backend = FixtureBackend {
             messages: vec![msg],
