@@ -33,10 +33,11 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
   .fell-chrome {{
     font: 13px/1.4 sans-serif;
     padding: 10px 16px;
+    background: {background} !important;
+    color: {foreground} !important;
     border-bottom: 1px solid {accent};
-    color: {foreground};
   }}
-  .fell-chrome strong {{ color: {accent}; font-weight: 650; }}
+  .fell-chrome strong {{ color: {accent} !important; font-weight: 650; }}
   .fell-mail {{ padding: 16px; }}
 </style>
 </head>

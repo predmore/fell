@@ -344,3 +344,47 @@ fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let frames = SmallVec::<[Frame; 1]>::from_vec(vec![frame]);
     Some(Arc::new(RenderImage::new(frames)))
 }
+
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_image;
+    use fell_render::{Block, Inline, html_to_document};
+
+    fn find_images(inlines: &[Inline], out: &mut Vec<(String, usize)>) {
+        for inline in inlines {
+            match inline {
+                Inline::Image { source, alt } => {
+                    let n = match source {
+                        fell_render::ImageSource::Data { bytes, .. } => bytes.len(),
+                        _ => 0,
+                    };
+                    out.push((alt.clone(), n));
+                    if let fell_render::ImageSource::Data { bytes, .. } = source {
+                        assert!(decode_image(bytes).is_some(), "decode {alt}");
+                    }
+                }
+                Inline::Emphasis(c) | Inline::Strong(c) | Inline::Link { children: c, .. } => {
+                    find_images(c, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_inline_png_decodes() {
+        let doc = html_to_document(include_str!(
+            "../../../fell-render/fixtures/native-personal-reply.html"
+        ));
+        let mut found = Vec::new();
+        for block in &doc.blocks {
+            if let Block::Paragraph { inlines } = block {
+                find_images(inlines, &mut found);
+            }
+        }
+        assert!(
+            found.iter().any(|(alt, n)| alt == "sketch" && *n > 0),
+            "{found:?}"
+        );
+    }
+}
