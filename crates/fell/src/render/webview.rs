@@ -1,11 +1,10 @@
 //! WebKitGTK via wry, painted into the conversation.
 //!
 //! wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland
-//! does not provide one. The newsletter is laid out in an undecorated GTK
-//! window kept off-screen, snapshotted with JavaScript still disabled, and
-//! drawn in the message body. There is no title bar, no traffic-light
-//! chrome, and no second copy of the subject. The library stays dynamically
-//! linked.
+//! does not provide one. The newsletter is laid out in a GTK offscreen
+//! window, which Wayland does not map, then snapshotted with JavaScript
+//! still disabled and drawn in the message body. There is no title bar and
+//! no second copy of the subject. The library stays dynamically linked.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -31,9 +30,14 @@ enum Cmd {
 }
 
 struct Host {
-    window: gtk::Window,
+    window: gtk::OffscreenWindow,
     webview: wry::WebView,
     token: Cell<u64>,
+    /// Bumped on every load and every finished event, so only the latest
+    /// snapshot for the current token is stored.
+    capture: Cell<u64>,
+    pending: RefCell<Option<gtk::glib::SourceId>>,
+    fail_safe: RefCell<Option<gtk::glib::SourceId>>,
 }
 
 thread_local! {
@@ -105,38 +109,46 @@ fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
 }
 
 fn present(request: WebRequest) {
-    HOST.with(|slot| {
+    let created = HOST.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             match open_host(&request) {
                 Ok(host) => *slot = Some(host),
                 Err(err) => {
                     eprintln!("fell: web view failed: {err}");
-                    return;
+                    return false;
                 }
             }
         }
         let Some(host) = slot.as_mut() else {
-            return;
+            return false;
         };
+        cancel_source(&host.pending);
+        cancel_source(&host.fail_safe);
         host.token.set(request.token);
-        if let Err(err) = host.webview.load_html(&request.html) {
-            eprintln!("fell: web view load failed: {err}");
-        }
-        tighten(&host.webview, request.allow_images);
-        host.window.show_all();
+        host.capture.set(host.capture.get().wrapping_add(1));
+        true
     });
+    if !created {
+        return;
+    }
+    let (window, widget) = HOST.with(|slot| {
+        let slot = slot.borrow();
+        let host = slot.as_ref().expect("webview host");
+        (host.window.clone(), host.webview.webview())
+    });
+    window.show_all();
+    webkit2gtk::WebViewExt::load_html(&widget, &request.html, None);
+    tighten_widget(&widget, request.allow_images);
+    arm_fail_safe(request.token);
 }
 
 fn open_host(request: &WebRequest) -> wry::Result<Host> {
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_decorated(false);
-    window.set_resizable(false);
-    window.set_skip_taskbar_hint(true);
-    window.set_skip_pager_hint(true);
-    window.set_default_size(880, 480);
-    #[allow(deprecated)]
-    window.move_(-4000, -4000);
+    let window = gtk::OffscreenWindow::new();
+    window.set_focus_on_map(false);
+    window.set_accept_focus(false);
+    window.set_can_focus(false);
+    window.set_default_size(880, 1200);
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
     window.show_all();
@@ -160,45 +172,121 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
         window,
         webview,
         token: Cell::new(request.token),
+        capture: Cell::new(0),
+        pending: RefCell::new(None),
+        fail_safe: RefCell::new(None),
     })
 }
 
 fn capture_current() {
-    let Some((widget, token)) = HOST.with(|slot| {
-        slot.borrow().as_ref().map(|host| {
-            let widget = host.webview.webview();
-            (widget, host.token.get())
-        })
+    let Some((widget, token, capture)) = HOST.with(|slot| {
+        let slot = slot.borrow();
+        let host = slot.as_ref()?;
+        cancel_source(&host.pending);
+        let capture = host.capture.get().wrapping_add(1);
+        host.capture.set(capture);
+        Some((host.webview.webview(), host.token.get(), capture))
     }) else {
         return;
     };
-    // Let WebKit finish layout before the full-document snapshot.
-    gtk::glib::timeout_add_local(Duration::from_millis(120), move || {
-        snapshot(widget.clone(), token);
+    let id = gtk::glib::timeout_add_local(Duration::from_millis(120), move || {
+        HOST.with(|slot| {
+            if let Some(host) = slot.borrow().as_ref() {
+                let _ = host.pending.borrow_mut().take();
+                if host.token.get() == token && host.capture.get() == capture {
+                    snapshot(widget.clone(), token, capture);
+                }
+            }
+        });
         gtk::glib::ControlFlow::Break
+    });
+    HOST.with(|slot| {
+        if let Some(host) = slot.borrow().as_ref() {
+            if host.token.get() == token && host.capture.get() == capture {
+                *host.pending.borrow_mut() = Some(id);
+            } else {
+                id.remove();
+            }
+        } else {
+            id.remove();
+        }
     });
 }
 
-fn snapshot(widget: webkit2gtk::WebView, token: u64) {
+fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64) {
     use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
     widget.snapshot(
         SnapshotRegion::FullDocument,
         SnapshotOptions::NONE,
         None::<&gtk::gio::Cancellable>,
         move |result| {
+            let current = HOST.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|host| (host.token.get(), host.capture.get()))
+            });
+            if current != Some((token, capture)) {
+                return;
+            }
             if let Ok(surface) = result
                 && let Some(png) = surface_png(surface)
-                && let Ok(mut slot) = FRAME.lock()
+                && let Ok(mut frame) = FRAME.lock()
             {
-                *slot = Some((token, png));
+                *frame = Some((token, png));
             }
             HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref() {
+                if let Some(host) = slot.borrow().as_ref()
+                    && host.token.get() == token
+                    && host.capture.get() == capture
+                {
                     host.window.hide();
                 }
             });
         },
     );
+}
+
+fn arm_fail_safe(token: u64) {
+    let id = gtk::glib::timeout_add_local(Duration::from_secs(8), move || {
+        HOST.with(|slot| {
+            if let Some(host) = slot.borrow().as_ref() {
+                let _ = host.fail_safe.borrow_mut().take();
+                if host.token.get() == token {
+                    host.window.hide();
+                }
+            }
+        });
+        gtk::glib::ControlFlow::Break
+    });
+    HOST.with(|slot| {
+        if let Some(host) = slot.borrow().as_ref() {
+            if host.token.get() == token {
+                *host.fail_safe.borrow_mut() = Some(id);
+            } else {
+                id.remove();
+            }
+        } else {
+            id.remove();
+        }
+    });
+}
+
+fn cancel_source(slot: &RefCell<Option<gtk::glib::SourceId>>) {
+    if let Some(id) = slot.borrow_mut().take() {
+        id.remove();
+    }
+}
+
+fn tighten_widget(widget: &webkit2gtk::WebView, allow_images: bool) {
+    use webkit2gtk::{SettingsExt, WebViewExt};
+    if let Some(settings) = WebViewExt::settings(widget) {
+        settings.set_enable_javascript(false);
+        settings.set_auto_load_images(allow_images);
+        settings.set_enable_developer_extras(false);
+        settings.set_javascript_can_open_windows_automatically(false);
+        settings.set_enable_webaudio(false);
+        settings.set_enable_webgl(false);
+    }
 }
 
 fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {

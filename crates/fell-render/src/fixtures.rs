@@ -1,6 +1,3 @@
-use std::fs;
-use std::path::PathBuf;
-
 use crate::RenderMode;
 use crate::choose::MailHeaders;
 
@@ -12,47 +9,85 @@ pub struct Fixture {
     pub expected: RenderMode,
 }
 
+struct Embedded {
+    name: &'static str,
+    html: &'static str,
+    headers: &'static str,
+}
+
+/// Preview mail compiled into the binary. The tarball and AppImage do not
+/// ship the source tree, so `CARGO_MANIFEST_DIR` is not a runtime path.
+const EMBEDDED: &[Embedded] = &[
+    Embedded {
+        name: "native-bulk-simple",
+        html: include_str!("../fixtures/native-bulk-simple.html"),
+        headers: include_str!("../fixtures/native-bulk-simple.headers"),
+    },
+    Embedded {
+        name: "native-esp-simple",
+        html: include_str!("../fixtures/native-esp-simple.html"),
+        headers: include_str!("../fixtures/native-esp-simple.headers"),
+    },
+    Embedded {
+        name: "native-list-discussion",
+        html: include_str!("../fixtures/native-list-discussion.html"),
+        headers: include_str!("../fixtures/native-list-discussion.headers"),
+    },
+    Embedded {
+        name: "native-personal-complex",
+        html: include_str!("../fixtures/native-personal-complex.html"),
+        headers: include_str!("../fixtures/native-personal-complex.headers"),
+    },
+    Embedded {
+        name: "native-personal-reply",
+        html: include_str!("../fixtures/native-personal-reply.html"),
+        headers: include_str!("../fixtures/native-personal-reply.headers"),
+    },
+    Embedded {
+        name: "native-personal-table",
+        html: include_str!("../fixtures/native-personal-table.html"),
+        headers: include_str!("../fixtures/native-personal-table.headers"),
+    },
+    Embedded {
+        name: "web-list-digest",
+        html: include_str!("../fixtures/web-list-digest.html"),
+        headers: include_str!("../fixtures/web-list-digest.headers"),
+    },
+    Embedded {
+        name: "web-newsletter",
+        html: include_str!("../fixtures/web-newsletter.html"),
+        headers: include_str!("../fixtures/web-newsletter.headers"),
+    },
+    Embedded {
+        name: "web-sendgrid",
+        html: include_str!("../fixtures/web-sendgrid.html"),
+        headers: include_str!("../fixtures/web-sendgrid.headers"),
+    },
+];
+
 pub fn fixtures() -> Vec<Fixture> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    let mut names = Vec::new();
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "html")
-                && let Some(name) = path.file_stem().and_then(|stem| stem.to_str())
-            {
-                names.push(name.to_string());
-            }
-        }
-    }
-    names.sort();
-    names
-        .into_iter()
-        .filter_map(|name| load(&dir, &name))
-        .collect()
+    EMBEDDED.iter().map(materialize).collect()
 }
 
 pub fn fixture(name: &str) -> Option<Fixture> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    load(&dir, name)
+    EMBEDDED
+        .iter()
+        .find(|embedded| embedded.name == name)
+        .map(materialize)
 }
 
-fn load(dir: &std::path::Path, name: &str) -> Option<Fixture> {
-    let html = fs::read_to_string(dir.join(format!("{name}.html"))).ok()?;
-    let headers = fs::read_to_string(dir.join(format!("{name}.headers")))
-        .map(|text| MailHeaders::from_lines(&text))
-        .unwrap_or_default();
-    let expected = if name.starts_with("web-") {
+fn materialize(embedded: &Embedded) -> Fixture {
+    let expected = if embedded.name.starts_with("web-") {
         RenderMode::Web
     } else {
         RenderMode::Native
     };
-    Some(Fixture {
-        name: name.to_string(),
-        headers,
-        html,
+    Fixture {
+        name: embedded.name.to_string(),
+        headers: MailHeaders::from_lines(embedded.headers),
+        html: embedded.html.to_string(),
         expected,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -64,6 +99,7 @@ mod tests {
     fn corpus_matches_the_filename() {
         let fixtures = fixtures();
         assert!(fixtures.len() >= 8, "fixture corpus is missing files");
+        assert!(fixture("native-personal-reply").is_some());
         for fixture in fixtures {
             let mode = choose_view(&fixture.headers, &fixture.html);
             assert_eq!(mode, fixture.expected, "{}", fixture.name);

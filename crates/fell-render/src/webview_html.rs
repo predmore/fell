@@ -65,16 +65,17 @@ fn serialize_node(
                     | "link"
                     | "meta"
                     | "base"
-                    | "form"
                     | "input"
                     | "button"
                     | "textarea"
+                    | "form"
                     | "noscript"
+                    | "svg"
                     | "head"
                     | "html"
                     | "body"
             ) {
-                if name == "html" || name == "body" || name == "head" {
+                if matches!(name, "html" | "body" | "head" | "form" | "noscript" | "svg") {
                     for child in node.children() {
                         serialize_node(child, out, allow_remote_images);
                     }
@@ -228,6 +229,16 @@ mod tests {
         assert!(wrapped.contains("script-src 'none'"));
         assert!(!wrapped.contains("fell-chrome"));
         assert!(!wrapped.contains("<title>"));
+        let unwrapped = sanitize_html(
+            "<form><p>Hello</p><input><button>Go</button><textarea>x</textarea></form><noscript><p>Fallback</p></noscript>",
+            false,
+        );
+        assert!(unwrapped.contains("Hello"));
+        assert!(unwrapped.contains("Fallback"));
+        assert!(!unwrapped.contains("<form"));
+        assert!(!unwrapped.contains("<input"));
+        assert!(!unwrapped.contains("<button"));
+        assert!(!unwrapped.contains("<textarea"));
     }
 
     #[test]

@@ -95,7 +95,7 @@ The in-app action log, one-key undo, and an in-app confirm for bulk archive are 
 
 Personal and conversational mail stays native. The web view is used only when a bulk signal (List-Unsubscribe, Precedence: bulk or list, or an ESP header) coincides with layout the native painter would break (presentation or nested tables, or heavy CSS). The current store schema has `body_text` and no bulk-header columns, so a row read back with `prepare_stored` stays native. Call `prepare` when the headers are actually known. The fixture corpus under `crates/fell-render/fixtures` locks that choice.
 
-The web view is WebKitGTK through `wry`, dynamically linked. JavaScript is disabled and remote images are removed until the reader allows them. wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland does not provide one, so WebKit paints off-screen and the conversation shows that page in the message body. There is no second title bar and no second copy of the subject. The inbox shell toggles that with `MessageBody`; this crate does not register the keymap.
+The web view is WebKitGTK through `wry`, dynamically linked. JavaScript is disabled and remote images are removed until the reader allows them. wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland does not provide one, so WebKit paints in an offscreen window, which is not a mapped toplevel, and the conversation shows that page in the message body. There is no second title bar and no second copy of the subject. The inbox shell toggles that with `MessageBody`; this crate does not register the keymap.
 
 ## First platform
 

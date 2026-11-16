@@ -5,9 +5,91 @@ use scraper::node::Node;
 
 use crate::document::{Block, ImageSource, Inline, ListItem, StyledDocument};
 
+/// HTML only with a real signal: a doctype, or a known tag.
+///
+/// `<ada@example.com>` is an address, not a tag. The store does not keep a
+/// content type yet; when it does, `text/html` is the other signal.
 pub fn looks_like_html(body: &str) -> bool {
-    let trimmed = body.trim_start();
-    trimmed.starts_with('<') && trimmed.contains('>')
+    let lower = body.trim_start().to_ascii_lowercase();
+    if lower.starts_with("<!doctype") {
+        return true;
+    }
+    let Some(rest) = lower.strip_prefix('<') else {
+        return false;
+    };
+    let name_len = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric())
+        .count();
+    if name_len == 0 {
+        return false;
+    }
+    let name = &rest[..name_len];
+    let boundary = rest[name_len..].chars().next();
+    let closed = matches!(boundary, Some(ch) if ch.is_whitespace() || ch == '>' || ch == '/');
+    closed && known_html_tag(name)
+}
+
+fn known_html_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "abbr"
+            | "address"
+            | "article"
+            | "aside"
+            | "b"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "caption"
+            | "center"
+            | "code"
+            | "col"
+            | "colgroup"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "em"
+            | "figcaption"
+            | "figure"
+            | "font"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "header"
+            | "hr"
+            | "html"
+            | "i"
+            | "img"
+            | "li"
+            | "main"
+            | "nav"
+            | "noscript"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "span"
+            | "strong"
+            | "style"
+            | "svg"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "tr"
+            | "u"
+            | "ul"
+    )
 }
 
 pub fn html_to_document(html: &str) -> StyledDocument {
@@ -72,8 +154,8 @@ fn node_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
 
 fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str) -> Vec<Block> {
     match name {
-        "script" | "style" | "head" | "noscript" | "meta" | "link" | "title" | "svg" | "iframe"
-        | "object" | "embed" | "form" | "input" | "button" | "textarea" => Vec::new(),
+        "script" | "style" | "head" | "meta" | "link" | "title" | "iframe" | "object" | "embed"
+        | "input" | "button" | "textarea" => Vec::new(),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = name.as_bytes()[1].saturating_sub(b'0');
             vec![Block::Heading {
@@ -278,7 +360,7 @@ fn push_inline(node: ego_tree::NodeRef<'_, Node>, out: &mut Vec<Inline>) {
             }
         }
         Node::Element(element) => match element.name() {
-            "script" | "style" | "noscript" => {}
+            "script" | "style" | "input" | "button" | "textarea" => {}
             "br" => out.push(Inline::LineBreak),
             "a" => out.push(Inline::Link {
                 href: safe_href(element.attr("href").unwrap_or("")),
@@ -466,6 +548,28 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, Block::Table { .. }))
         );
+    }
+
+    #[test]
+    fn angle_address_stays_plain_text() {
+        let body = "<ada@example.com> wrote:\n\nHello";
+        assert!(!looks_like_html(body));
+        let text = document_from_body(body).plain_text();
+        assert!(text.contains("<ada@example.com>"));
+        assert!(text.contains("Hello"));
+    }
+
+    #[test]
+    fn form_and_noscript_keep_their_text() {
+        let doc = html_to_document(
+            "<form><p>See you Thursday</p><input type=\"text\"><button>Go</button><textarea>secret</textarea></form><noscript><p>Plain fallback</p></noscript><svg><text>Label</text></svg>",
+        );
+        let text = doc.plain_text();
+        assert!(text.contains("See you Thursday"));
+        assert!(text.contains("Plain fallback"));
+        assert!(text.contains("Label"));
+        assert!(!text.contains("Go"));
+        assert!(!text.contains("secret"));
     }
 
     #[test]
