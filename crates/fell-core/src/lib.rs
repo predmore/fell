@@ -19,7 +19,7 @@ pub use backend::{
     BridgeBackend, FixtureBackend, MailBackend, MailboxDelta, ProtonApiBackend, SyncCursor,
 };
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
-pub use search::SearchHit;
+pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
 pub use store::{Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
@@ -30,6 +30,8 @@ pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 pub enum Error {
     #[error("store: {0}")]
     Store(#[from] rusqlite::Error),
+    #[error("search: {0}")]
+    Search(String),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

@@ -37,6 +37,14 @@ The UI and MCP crates take `dyn MailBackend` (or a store already populated by sy
 
 SQLite is the source of truth for the UI. Sync writes messages, threads, and an FTS5 index. Reads do not block on the network. If Bridge or the API is down, the last synced mailbox still renders.
 
+## Search
+
+`Store::search` reads that store and nothing else. It does not call a backend, so results move only when a local write does.
+
+The query language is FTS5 BM25 plus operators: `from:`, `to:`, `subject:`, `in:`, `label:`, `has:attachment`, `is:unread`, `before:`, and `after:`. `from:`, `to:`, and `subject:` are FTS column filters (`to:` covers To, Cc, and Bcc). Folder, label, attachment, unread, and date operators filter the message row. Every operator on one query applies to the same message. Hits are then grouped to one row per thread, ordered by that message's BM25 score (subject weighted above sender, recipients, and body). A query that is only operators still runs.
+
+Misspellings use a character-trigram index of words from subject, sender, recipients, body, folders, and labels. Damerau-Levenshtein confirms a candidate. When the typed query matches nothing and the corrected query matches, the response carries those hits and `did_you_mean`. Semantic search is M5 and is not part of this path.
+
 ## Threading
 
 A thread id is assigned when a message is stored, then the account is re-resolved in memory from threading columns (not bodies):
@@ -45,9 +53,9 @@ A thread id is assigned when a message is stored, then the account is re-resolve
 2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent in the **same account**.
 3. Otherwise start a thread from the message's own `Message-ID`.
 
-Messages are unique on `(account_id, message_id)`. A second copy with the same id (a Sent copy, or the same message delivered to several aliases) stays one row and unions folders, labels, and arrival addresses. Copies with a different Message-ID stay separate.
+Messages are unique on `(account_id, message_id)`. A second copy with the same id (a Sent copy, or the same message delivered to several aliases) stays one row and unions folders, labels, arrival addresses, and recipients, and keeps an attachment if either copy had one. Copies with a different Message-ID stay separate. There is no body-fingerprint collapse.
 
-After a delta with messages is written, each row's previous thread and its header-parent thread are unioned. A `proton:` id absorbs a non-proton header thread. Two different `proton:` ids are not unioned. Non-proton merges keep the earliest already-assigned thread id, so the first id handed back still lists the messages after a missing parent arrives. Cursor-only deltas skip the scan. A thread-id-only update does not rewrite FTS (the update trigger is `OF` subject, sender, and body). A delta whose rows belong to another account is rejected and does not advance the cursor.
+After a delta with messages is written, each row's previous thread and its header-parent thread are unioned. A `proton:` id absorbs a non-proton header thread. Two different `proton:` ids are not unioned. Non-proton merges keep the earliest already-assigned thread id, so the first id handed back still lists the messages after a missing parent arrives. Cursor-only deltas skip the scan. A thread-id-only update does not rewrite FTS (the update trigger is `OF` subject, from name, from email, body, snippet, and the recipient columns). A delta whose rows belong to another account is rejected and does not advance the cursor.
 
 Proton conversation ids are preferred so Bridge and the future API stay consistent with Proton's own threading, and two Proton conversations stay two threads. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
 

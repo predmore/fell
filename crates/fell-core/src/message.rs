@@ -59,6 +59,51 @@ pub struct Message {
     pub labels: Vec<String>,
     /// Addresses this copy arrived through (the account, an alias, a list).
     pub arrived_via: Vec<String>,
+    /// `To` recipients. Searched by `to:` along with `cc` and `bcc`.
+    pub to: Vec<Address>,
+    /// `Cc` recipients.
+    pub cc: Vec<Address>,
+    /// `Bcc` recipients.
+    pub bcc: Vec<Address>,
+    /// True when any stored copy of this message has an attachment.
+    pub has_attachment: bool,
+}
+
+pub(crate) fn encode_addresses(addrs: &[Address]) -> String {
+    addrs
+        .iter()
+        .filter(|addr| !addr.email.trim().is_empty())
+        .map(|addr| {
+            let name = addr
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .replace(['\u{1e}', '\u{1f}'], " ");
+            let email = addr.email.trim().replace(['\u{1e}', '\u{1f}'], " ");
+            format!("{name}\u{1f}{email}")
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+pub(crate) fn decode_addresses(raw: &str) -> Vec<Address> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.split('\u{1e}')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (name, email) = part.split_once('\u{1f}').unwrap_or(("", part));
+            Address {
+                name: if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                },
+                email: email.to_string(),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn normalize_message_id(raw: &str) -> &str {
