@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/fell-core",
+    "crates/fell-render",
     "crates/fell",
     "crates/fell-mcp",
     "crates/fell-confirm",
@@ -20,6 +21,7 @@ xattr = { path = "vendor/xattr" }
 
 [workspace.dependencies]
 fell-core = { path = "crates/fell-core", version = "0.1.0" }
+fell-render = { path = "crates/fell-render", version = "0.1.0" }
 fell-confirm = { path = "crates/fell-confirm", version = "0.1.0" }
 gpui = { version = "0.2.2", default-features = false, features = [
     "font-kit",

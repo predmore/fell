@@ -1,0 +1,477 @@
+use std::ops::Deref;
+
+use scraper::Html;
+use scraper::node::Node;
+
+use crate::document::{Block, ImageSource, Inline, ListItem, StyledDocument};
+
+pub fn looks_like_html(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    trimmed.starts_with('<') && trimmed.contains('>')
+}
+
+pub fn html_to_document(html: &str) -> StyledDocument {
+    let dom = Html::parse_document(html);
+    let blocks = children_blocks(dom.root_element());
+    StyledDocument {
+        blocks: blocks
+            .into_iter()
+            .filter(|block| !block_is_empty(block))
+            .collect(),
+    }
+}
+
+/// Plain text stored in `body_text` becomes paragraphs. HTML is parsed.
+pub fn document_from_body(body: &str) -> StyledDocument {
+    if looks_like_html(body) {
+        html_to_document(body)
+    } else {
+        plain_to_document(body)
+    }
+}
+
+pub fn plain_to_document(body: &str) -> StyledDocument {
+    let mut blocks = Vec::new();
+    for para in body.split("\n\n") {
+        let text = para.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut inlines = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if index > 0 {
+                inlines.push(Inline::LineBreak);
+            }
+            inlines.push(Inline::Text(line.to_string()));
+        }
+        blocks.push(Block::Paragraph { inlines });
+    }
+    StyledDocument { blocks }
+}
+
+fn children_blocks(node: scraper::ElementRef<'_>) -> Vec<Block> {
+    node.children().flat_map(node_blocks).collect()
+}
+
+fn node_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+    match node.value() {
+        Node::Text(text) => {
+            let text = normalize_ws(text.deref());
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![Block::Paragraph {
+                    inlines: vec![Inline::Text(text.trim().to_string())],
+                }]
+            }
+        }
+        Node::Element(element) => element_blocks(node, element.name()),
+        _ => Vec::new(),
+    }
+}
+
+fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str) -> Vec<Block> {
+    match name {
+        "script" | "style" | "head" | "noscript" | "meta" | "link" | "title" | "svg" | "iframe"
+        | "object" | "embed" | "form" | "input" | "button" | "textarea" => Vec::new(),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let level = name.as_bytes()[1].saturating_sub(b'0');
+            vec![Block::Heading {
+                level,
+                inlines: collect_inlines(node),
+            }]
+        }
+        "p" => paragraph(collect_inlines(node)),
+        "blockquote" => vec![Block::Quote {
+            blocks: children_of(node),
+        }],
+        "pre" => vec![Block::Code {
+            text: raw_text(node).trim_matches('\n').to_string(),
+        }],
+        "ul" => vec![list_block(node, false)],
+        "ol" => vec![list_block(node, true)],
+        "hr" => vec![Block::ThematicBreak],
+        "img" => node
+            .value()
+            .as_element()
+            .map(image_block)
+            .into_iter()
+            .collect(),
+        "table" => table_blocks(node),
+        "br" => Vec::new(),
+        _ => {
+            if has_block_child(node) {
+                children_of(node)
+            } else {
+                paragraph(collect_inlines(node))
+            }
+        }
+    }
+}
+
+fn paragraph(inlines: Vec<Inline>) -> Vec<Block> {
+    if inlines.is_empty() {
+        Vec::new()
+    } else {
+        vec![Block::Paragraph { inlines }]
+    }
+}
+
+fn children_of(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+    node.children().flat_map(node_blocks).collect()
+}
+
+fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool) -> Block {
+    let mut items = Vec::new();
+    for child in node.children() {
+        let Some(element) = child.value().as_element() else {
+            continue;
+        };
+        if element.name() != "li" {
+            continue;
+        }
+        let blocks = if has_block_child(child) {
+            children_of(child)
+        } else {
+            paragraph(collect_inlines(child))
+        };
+        if !blocks.is_empty() {
+            items.push(ListItem { blocks });
+        }
+    }
+    Block::List { ordered, items }
+}
+
+fn table_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+    let presentation = node.value().as_element().is_some_and(|element| {
+        element.attr("role").is_some_and(|role| {
+            role.eq_ignore_ascii_case("presentation") || role.eq_ignore_ascii_case("none")
+        })
+    });
+    if presentation || table_count(node) > 1 {
+        return children_of(node);
+    }
+    let mut header = Vec::new();
+    let mut rows = Vec::new();
+    collect_rows(node, true, &mut header, &mut rows);
+    if header.is_empty() && rows.is_empty() {
+        return children_of(node);
+    }
+    vec![Block::Table { header, rows }]
+}
+
+fn collect_rows(
+    node: ego_tree::NodeRef<'_, Node>,
+    root: bool,
+    header: &mut Vec<Vec<Inline>>,
+    rows: &mut Vec<Vec<Vec<Inline>>>,
+) {
+    for child in node.children() {
+        let Some(element) = child.value().as_element() else {
+            continue;
+        };
+        match element.name() {
+            "table" if !root => continue,
+            "tr" => {
+                let cells = row_cells(child);
+                if cells.is_empty() {
+                    continue;
+                }
+                let all_header = child.children().all(|cell| {
+                    cell.value()
+                        .as_element()
+                        .is_none_or(|element| element.name() != "td")
+                }) && child.children().any(|cell| {
+                    cell.value()
+                        .as_element()
+                        .is_some_and(|element| element.name() == "th")
+                });
+                if all_header && header.is_empty() {
+                    header.extend(cells);
+                } else {
+                    rows.push(cells);
+                }
+            }
+            _ => collect_rows(child, false, header, rows),
+        }
+    }
+}
+
+fn row_cells(row: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<Inline>> {
+    row.children()
+        .filter_map(|cell| {
+            let name = cell.value().as_element()?.name();
+            (name == "td" || name == "th").then(|| collect_inlines(cell))
+        })
+        .collect()
+}
+
+fn table_count(node: ego_tree::NodeRef<'_, Node>) -> usize {
+    let here = node
+        .value()
+        .as_element()
+        .is_some_and(|element| element.name() == "table") as usize;
+    here + node.children().map(table_count).sum::<usize>()
+}
+
+fn has_block_child(node: ego_tree::NodeRef<'_, Node>) -> bool {
+    node.children().any(|child| {
+        child
+            .value()
+            .as_element()
+            .is_some_and(|element| is_block_tag(element.name()))
+            || has_block_child(child)
+    })
+}
+
+fn is_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "div"
+            | "dl"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "ul"
+            | "tr"
+            | "center"
+    )
+}
+
+fn collect_inlines(node: ego_tree::NodeRef<'_, Node>) -> Vec<Inline> {
+    let mut out = Vec::new();
+    for child in node.children() {
+        push_inline(child, &mut out);
+    }
+    trim_inlines(&mut out);
+    out
+}
+
+fn push_inline(node: ego_tree::NodeRef<'_, Node>, out: &mut Vec<Inline>) {
+    match node.value() {
+        Node::Text(text) => {
+            let text = normalize_ws(text.deref());
+            if !text.is_empty() {
+                out.push(Inline::Text(text));
+            }
+        }
+        Node::Element(element) => match element.name() {
+            "script" | "style" | "noscript" => {}
+            "br" => out.push(Inline::LineBreak),
+            "a" => out.push(Inline::Link {
+                href: safe_href(element.attr("href").unwrap_or("")),
+                children: collect_inlines(node),
+            }),
+            "em" | "i" => out.push(Inline::Emphasis(collect_inlines(node))),
+            "strong" | "b" => out.push(Inline::Strong(collect_inlines(node))),
+            "code" => out.push(Inline::Code(raw_text(node).trim().to_string())),
+            "img" => out.push(image_inline(element)),
+            _ => {
+                for child in node.children() {
+                    push_inline(child, out);
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
+fn trim_inlines(inlines: &mut Vec<Inline>) {
+    if let Some(Inline::Text(text)) = inlines.first_mut() {
+        *text = text.trim_start().to_string();
+        if text.is_empty() {
+            inlines.remove(0);
+        }
+    }
+    if let Some(Inline::Text(text)) = inlines.last_mut() {
+        *text = text.trim_end().to_string();
+        if text.is_empty() {
+            inlines.pop();
+        }
+    }
+}
+
+fn image_block(element: &scraper::node::Element) -> Block {
+    let inline = image_inline(element);
+    match inline {
+        Inline::Image { source, alt } => Block::Image { source, alt },
+        _ => Block::Paragraph {
+            inlines: vec![inline],
+        },
+    }
+}
+
+fn image_inline(element: &scraper::node::Element) -> Inline {
+    let alt = element.attr("alt").unwrap_or("").trim().to_string();
+    let source = element
+        .attr("src")
+        .map(image_source)
+        .unwrap_or(ImageSource::Remote(String::new()));
+    Inline::Image { source, alt }
+}
+
+pub(crate) fn image_source_from_markdown(src: &str) -> ImageSource {
+    image_source(src)
+}
+
+fn image_source(src: &str) -> ImageSource {
+    let src = src.trim();
+    if let Some(rest) = src.strip_prefix("cid:") {
+        return ImageSource::Cid(rest.to_string());
+    }
+    if let Some(rest) = src.strip_prefix("data:") {
+        return data_image(rest);
+    }
+    ImageSource::Remote(src.to_string())
+}
+
+fn data_image(rest: &str) -> ImageSource {
+    let Some((meta, data)) = rest.split_once(',') else {
+        return ImageSource::Remote(format!("data:{rest}"));
+    };
+    let mut parts = meta.split(';');
+    let media_type = parts
+        .next()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let base64 = meta.to_ascii_lowercase().contains("base64");
+    if !base64 {
+        return ImageSource::Data {
+            media_type,
+            bytes: data.as_bytes().to_vec(),
+        };
+    }
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())
+        .or_else(|_| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD_NO_PAD,
+                data.trim(),
+            )
+        });
+    match decoded {
+        Ok(bytes) => ImageSource::Data { media_type, bytes },
+        Err(_) => ImageSource::Remote(format!("data:{rest}")),
+    }
+}
+
+fn safe_href(href: &str) -> String {
+    let trimmed = href.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("javascript:") || lower.starts_with("data:text/html") {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn raw_text(node: ego_tree::NodeRef<'_, Node>) -> String {
+    let mut out = String::new();
+    for descendant in node.descendants() {
+        if let Node::Text(text) = descendant.value() {
+            out.push_str(text.deref());
+        }
+    }
+    out
+}
+
+fn normalize_ws(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    if text.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+        out.push(' ');
+    }
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    if pending_space && !out.is_empty() && !out.ends_with(' ') {
+        out.push(' ');
+    }
+    if out.trim().is_empty() {
+        String::new()
+    } else {
+        out
+    }
+}
+
+fn block_is_empty(block: &Block) -> bool {
+    match block {
+        Block::Heading { inlines, .. } | Block::Paragraph { inlines } => inlines.is_empty(),
+        Block::List { items, .. } => items.is_empty(),
+        Block::Quote { blocks } => blocks.is_empty(),
+        Block::Code { text } => text.trim().is_empty(),
+        Block::Table { header, rows } => header.is_empty() && rows.is_empty(),
+        Block::Image { .. } | Block::ThematicBreak => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_keeps_emphasis_link_quote_list_and_image() {
+        let doc = html_to_document(include_str!("../fixtures/native-personal-reply.html"));
+        let text = doc.plain_text();
+        assert!(text.contains("Thursday"));
+        assert!(text.contains("bridge"));
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|block| matches!(block, Block::Quote { .. }))
+        );
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|block| matches!(block, Block::List { .. }))
+        );
+        assert!(text.contains("cabin"));
+        assert!(doc.plain_text().contains("sketch"));
+    }
+
+    #[test]
+    fn simple_table_stays_a_table() {
+        let doc = html_to_document(include_str!("../fixtures/native-personal-table.html"));
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|block| matches!(block, Block::Table { .. }))
+        );
+    }
+
+    #[test]
+    fn plain_text_is_paragraphs() {
+        let doc = document_from_body("Hello\n\nNext");
+        assert_eq!(doc.blocks.len(), 2);
+        assert!(!looks_like_html("Hello"));
+    }
+}

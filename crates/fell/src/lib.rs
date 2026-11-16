@@ -1,4 +1,9 @@
 //! GPUI app crate. Send confirmation is minted here, not in `fell-mcp`.
+//!
+//! [`render`] paints one message. The inbox shell embeds that trait; this
+//! crate does not own the thread list, keymap, or command palette.
+
+pub mod render;
 
 mod fixtures;
 mod keymap;

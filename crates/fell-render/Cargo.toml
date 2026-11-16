@@ -1,0 +1,17 @@
+[package]
+name = "fell-render"
+description = "Styled document shared by native HTML mail and later markdown compose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ego-tree = "0.10"
+pulldown-cmark = "0.13"
+scraper = "0.22"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -20,8 +20,9 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 | Crate | Role |
 | --- | --- |
 | `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
+| `fell-render` | Styled document shared by received HTML and later markdown compose. Chooses native vs web view. No GPUI. |
 | `fell-confirm` | Sealed `InteractiveUi` (private field, not `Default`). Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
-| `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
+| `fell` | GPUI application. Opens a Wayland window and paints one message with `fell::render::MessageBody`. Does not own the thread list, keymap, or command palette. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
 | `fell-mcp` | Stdio MCP server. Search, read threads, list labels, triage, and review drafts. No send tool. Scopes stay off until enabled. |
 
 ## Backends
@@ -87,6 +88,14 @@ Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a
 Search returns at most 20 hits per page: ids, sender address, date, and a short snippet. Thread bodies are plain text and truncated. Draft bodies are capped when they are saved. Text that came from mail is returned only as `untrusted_email_content`, with ids, sender address, and date outside that object. The model is told to treat that text as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`. See [agents.md](agents.md).
 
 The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server. Neither is binding `in_reply_to` into the send-confirmation snapshot.
+
+## HTML mail
+
+`fell-render` turns HTML into a `StyledDocument` (paragraphs, headings, lists, links, emphasis, quotes, simple tables, images). The same tree is what M3 compose will produce from markdown via `markdown_to_document`, and `fell::render::document_column` paints it. The composer is not in this crate.
+
+Personal and conversational mail stays native. The web view is used only when a bulk signal (List-Unsubscribe, Precedence: bulk or list, or an ESP header) coincides with layout the native painter would break (presentation or nested tables, or heavy CSS). The current store schema has `body_text` and no bulk-header columns, so a row read back with `prepare_stored` stays native. Call `prepare` when the headers are actually known. The fixture corpus under `crates/fell-render/fixtures` locks that choice.
+
+The web view is WebKitGTK through `wry`, dynamically linked. JavaScript is disabled and remote images are removed until the reader allows them. The newsletter is snapshotted offscreen and painted inside the message, because wry cannot child-embed into a Wayland GPUI window. The inbox shell toggles that with `MessageBody`; this crate does not register the keymap.
 
 ## First platform
 

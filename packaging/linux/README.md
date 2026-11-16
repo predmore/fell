@@ -18,9 +18,9 @@ Run `./fell`. For a launcher, copy the binary onto `PATH`, the desktop file to `
 
 ## WebKitGTK
 
-This nightly binary does not link WebKitGTK. `readelf -d` on `fell` has no `libwebkit2gtk` `NEEDED` entry, so the app launches without the distro package. The library is not in the tarball or the AppImage.
-
-Once the newsletter fallback is compiled in, `webkit2gtk` is a runtime requirement and must stay dynamically linked, not bundled:
+`fell` dynamically links WebKitGTK. `readelf -d` on the binary has a `libwebkit2gtk` `NEEDED` entry, so the dynamic loader requires the distro package before `main`:
 
 - Debian or Ubuntu: `libwebkit2gtk-4.1-0`
 - Arch: `webkit2gtk-4.1`
+
+The library is not in the tarball or the AppImage. Compiling the link needs `libwebkit2gtk-4.1-dev` on the nightly job ([issue #8](https://github.com/predmore/fell/issues/8)).

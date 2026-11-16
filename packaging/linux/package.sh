@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Nightly x86_64 artifacts: a tarball and an AppImage.
 #
-# The current release binary does not link WebKitGTK (no libwebkit2gtk in
-# DT_NEEDED). wry is not a crate yet. linuxdeploy still excludes
-# libwebkit2gtk and libjavascriptcoregtk, and this script fails if either
-# artifact contains them, so a later fallback cannot start bundling the
-# LGPL library. Once that fallback is compiled in, the distro package is a
-# runtime requirement: libwebkit2gtk-4.1-0 (Debian/Ubuntu) or
-# webkit2gtk-4.1 (Arch).
+# fell links WebKitGTK dynamically (libwebkit2gtk in DT_NEEDED). The
+# distro package is required to launch: libwebkit2gtk-4.1-0 (Debian/Ubuntu)
+# or webkit2gtk-4.1 (Arch). The nightly apt dev package is
+# https://github.com/predmore/fell/issues/8
+# linuxdeploy excludes libwebkit2gtk and libjavascriptcoregtk, and this
+# script fails if either artifact contains them.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -159,11 +158,11 @@ if ! grep -q 'type2-runtime' <<<"$runtime_version_text"; then
 fi
 echo "$runtime_version_text"
 
-if readelf -d "$stage/fell" | grep NEEDED | grep -Ei 'webkit|javascriptcore'; then
-  echo "fell dynamically links WebKitGTK; artifacts leave the .so on the system"
-else
-  echo "fell does not link WebKitGTK (no libwebkit2gtk in DT_NEEDED)"
+if ! readelf -d "$stage/fell" | grep NEEDED | grep -q 'libwebkit2gtk'; then
+  echo "fell must dynamically link libwebkit2gtk; the newsletter view needs the distro package" >&2
+  exit 1
 fi
+echo "fell dynamically links WebKitGTK; launch requires the distro package, artifacts do not bundle it"
 
 echo "tarball:  $tarball"
 echo "AppImage: $appimage"

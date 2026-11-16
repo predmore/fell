@@ -1,0 +1,6 @@
+From: List member <member@example.com>
+Subject: Re: the patch
+Precedence: list
+List-Id: <dev.example.com>
+Message-ID: <list-reply@example.com>
+In-Reply-To: <patch@example.com>
