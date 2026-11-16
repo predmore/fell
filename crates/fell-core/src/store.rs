@@ -67,7 +67,8 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     WHERE account_id = old.account_id AND message_id = old.message_id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+DROP TRIGGER IF EXISTS messages_au;
+CREATE TRIGGER messages_au AFTER UPDATE OF subject, from_email, body_text, snippet ON messages BEGIN
     DELETE FROM messages_fts
     WHERE account_id = old.account_id AND message_id = old.message_id;
     INSERT INTO messages_fts(subject, sender, body, account_id, message_id)
@@ -162,6 +163,13 @@ impl Store {
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for message in &delta.messages {
+            if &message.account_id != account_id {
+                return Err(crate::Error::Backend(format!(
+                    "delta for account {} includes message for {}",
+                    account_id.as_str(),
+                    message.account_id.as_str()
+                )));
+            }
             insert_message(&tx, message)?;
         }
         if !delta.messages.is_empty() {
@@ -392,9 +400,9 @@ fn rethread(conn: &Connection, account_id: &AccountId) -> Result<()> {
         let header = header_parent_thread_id(&row.headers, |parent| {
             Ok::<_, crate::Error>(by_message.get(parent).cloned())
         })?;
-        union.union(row.thread_id.as_str(), onto.as_str());
+        union.union_prefer(row.thread_id.as_str(), onto.as_str());
         if let Some(header) = header {
-            union.union(header.as_str(), onto.as_str());
+            union.union_prefer(header.as_str(), onto.as_str());
         }
     }
 
@@ -468,23 +476,23 @@ impl ThreadUnion {
         root
     }
 
-    fn union(&mut self, a: &str, b: &str) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb {
+    /// Merge `member` with `preferred`.
+    ///
+    /// Proton conversation ids always win (the resolved `preferred` id when it
+    /// is `proton:…`, otherwise an existing proton root). Non-Proton merges
+    /// keep `member` — the already-assigned thread a caller may have stored —
+    /// instead of renaming by string order.
+    fn union_prefer(&mut self, member: &str, preferred: &str) {
+        let member_root = self.find(member);
+        let preferred_root = self.find(preferred);
+        if member_root == preferred_root {
             return;
         }
-        let (root, other) = preferred_thread(&ra, &rb);
-        self.parent.insert(other, root);
-    }
-}
-
-fn preferred_thread(a: &str, b: &str) -> (String, String) {
-    match (a.starts_with("proton:"), b.starts_with("proton:")) {
-        (true, false) => (a.to_string(), b.to_string()),
-        (false, true) => (b.to_string(), a.to_string()),
-        _ if a <= b => (a.to_string(), b.to_string()),
-        _ => (b.to_string(), a.to_string()),
+        if preferred_root.starts_with("proton:") {
+            self.parent.insert(member_root, preferred_root);
+        } else {
+            self.parent.insert(preferred_root, member_root);
+        }
     }
 }
 
@@ -696,24 +704,48 @@ mod tests {
     fn reply_before_parent_joins_one_thread() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
-        let child = msg("reply@x", None, Some("root@x"), "Re: Root", "reply");
-        let parent = msg("root@x", None, None, "Root", "root");
-        store
-            .apply_delta(
-                &AccountId("a1".into()),
-                &MailboxDelta {
-                    messages: vec![child, parent],
-                    cursor: None,
-                },
-            )
+        let child_tid = store
+            .upsert_message(&msg("zzz@x", None, Some("aaa@x"), "Re: Root", "reply"))
             .unwrap();
-        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].message_count, 2);
+        assert_eq!(
+            store
+                .thread_messages(&AccountId("a1".into()), &child_tid)
+                .unwrap()
+                .len(),
+            1
+        );
+        let parent_tid = store
+            .upsert_message(&msg("aaa@x", None, None, "Root", "root"))
+            .unwrap();
+        assert_eq!(parent_tid, child_tid);
         let msgs = store
-            .thread_messages(&AccountId("a1".into()), &threads[0].thread_id)
+            .thread_messages(&AccountId("a1".into()), &child_tid)
             .unwrap();
         assert_eq!(msgs.len(), 2);
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, child_tid);
+        assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn parent_before_reply_keeps_parent_thread_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let parent_tid = store
+            .upsert_message(&msg("zzz@x", None, None, "Root", "root"))
+            .unwrap();
+        let child_tid = store
+            .upsert_message(&msg("aaa@x", None, Some("zzz@x"), "Re: Root", "reply"))
+            .unwrap();
+        assert_eq!(child_tid, parent_tid);
+        assert_eq!(
+            store
+                .thread_messages(&AccountId("a1".into()), &parent_tid)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -849,7 +881,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, crate::Error::Store(_)));
+        assert!(matches!(err, crate::Error::Backend(_)));
         assert!(
             store
                 .list_threads(&AccountId("a1".into()))
@@ -862,5 +894,87 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn apply_delta_rejects_other_account_messages() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store.upsert_account(&account_b()).unwrap();
+        let err = store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![
+                        msg("a@x", None, None, "From A", "a"),
+                        msg_for("a2", "b@x", None, Some("a@x"), "From B", "b"),
+                    ],
+                    cursor: Some(SyncCursor {
+                        account_key: "a1".into(),
+                        token: "must-not-advance".into(),
+                    }),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Backend(_)));
+        assert!(
+            store
+                .list_threads(&AccountId("a1".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_threads(&AccountId("a2".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .sync_cursor(&AccountId("a1".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn thread_id_update_does_not_rewrite_fts_bodies() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("aaa@x", None, None, "Root", "rootbody"))
+            .unwrap();
+        store
+            .upsert_message(&msg("zzz@x", None, Some("aaa@x"), "Re: Root", "replybody"))
+            .unwrap();
+        store.conn.execute("DELETE FROM messages_fts", []).unwrap();
+        store
+            .upsert_message(&msg("aaa@x", Some("conv"), None, "Root", "rootbody"))
+            .unwrap();
+        assert!(
+            store
+                .search(&AccountId("a1".into()), "replybody")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "rootbody")
+                .unwrap()
+                .len(),
+            1
+        );
+        let sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_au'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("AFTER UPDATE OF"));
+        assert!(sql.contains("subject"));
+        assert!(sql.contains("from_email"));
+        assert!(sql.contains("body_text"));
     }
 }

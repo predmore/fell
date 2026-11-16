@@ -45,7 +45,7 @@ A thread id is assigned when a message is stored, then the account is re-resolve
 2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent in the **same account**.
 3. Otherwise start a thread from the message's own `Message-ID`.
 
-Messages are unique on `(account_id, message_id)`. After a delta with messages is written, each row's previous thread and its header-parent thread are unioned onto the resolved id, so a proton-tagged reply still pulls the parent's header thread with it. Cursor-only deltas skip the scan.
+Messages are unique on `(account_id, message_id)`. After a delta with messages is written, each row's previous thread and its header-parent thread are unioned: Proton conversation ids win; otherwise the already-assigned thread is kept so a caller-held id still lists the messages. Cursor-only deltas skip the scan. A thread-id-only update does not rewrite FTS (the update trigger is `OF` subject, sender, and body). A delta whose rows belong to another account is rejected and does not advance the cursor.
 
 Proton conversation ids win when present so Bridge and the future API stay consistent with Proton's own threading. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
 
