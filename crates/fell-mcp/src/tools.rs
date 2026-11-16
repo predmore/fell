@@ -95,9 +95,9 @@ fn search(session: &Session, args: &Value) -> Result<Value, String> {
         .iter()
         .map(|hit| {
             json!({
-                "message_id": hit.message_id.as_str(),
-                "thread_id": hit.thread_id.as_str(),
-                "sender_address": untrusted::provenance_address(&hit.sender_email),
+                "message_id": session.show_id(hit.message_id.as_str()),
+                "thread_id": session.show_id(hit.thread_id.as_str()),
+                "sender_address": session.show_id(&hit.sender_email),
                 "date_unix": hit.date_unix,
                 "snippet": untrusted::envelope(&hit.snippet, SNIPPET_CHARS),
             })
@@ -110,7 +110,7 @@ fn search(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn read_thread(session: &Session, args: &Value) -> Result<Value, String> {
-    let thread_id = ThreadId(require_string(args, "thread_id")?);
+    let thread_id = ThreadId(session.resolve_id(&require_string(args, "thread_id")?));
     let max_chars = match optional_i64(args, "max_chars")? {
         None => DEFAULT_THREAD_CHARS,
         Some(value) if value <= 0 => {
@@ -128,10 +128,10 @@ fn read_thread(session: &Session, args: &Value) -> Result<Value, String> {
     let mut budget = max_chars;
     let messages = messages
         .iter()
-        .map(|message| message_json(message, &mut budget))
+        .map(|message| message_json(session, message, &mut budget))
         .collect::<Vec<_>>();
     Ok(json!({
-        "thread_id": thread_id.as_str(),
+        "thread_id": session.show_id(thread_id.as_str()),
         "max_chars": max_chars,
         "messages": messages,
     }))
@@ -146,7 +146,7 @@ fn list_labels(session: &Session) -> Result<Value, String> {
 }
 
 fn label(session: &Session, args: &Value) -> Result<Value, String> {
-    let thread_id = ThreadId(require_string(args, "thread_id")?);
+    let thread_id = thread_arg(session, args)?;
     let label = require_string(args, "label")?;
     let mode = require_string(args, "mode")?;
     let actor = actor_name(session);
@@ -166,7 +166,7 @@ fn label(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn archive(session: &Session, args: &Value) -> Result<Value, String> {
-    let thread_id = ThreadId(require_string(args, "thread_id")?);
+    let thread_id = thread_arg(session, args)?;
     let action = session
         .store
         .agent_archive_thread(&session.account_id, &thread_id, &actor_name(session))
@@ -175,7 +175,7 @@ fn archive(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn mark_read(session: &Session, args: &Value) -> Result<Value, String> {
-    let thread_id = ThreadId(require_string(args, "thread_id")?);
+    let thread_id = thread_arg(session, args)?;
     let action = session
         .store
         .mark_thread_read(&session.account_id, &thread_id, &actor_name(session))
@@ -184,7 +184,7 @@ fn mark_read(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn snooze(session: &Session, args: &Value) -> Result<Value, String> {
-    let thread_id = ThreadId(require_string(args, "thread_id")?);
+    let thread_id = thread_arg(session, args)?;
     let until_unix = require_i64(args, "until_unix")?;
     let action = session
         .store
@@ -201,7 +201,7 @@ fn snooze(session: &Session, args: &Value) -> Result<Value, String> {
 fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
     let thread_id = optional_string(args, "thread_id")?
         .filter(|value| !value.trim().is_empty())
-        .map(ThreadId);
+        .map(|value| ThreadId(session.resolve_id(&value)));
     let in_reply_to = optional_string(args, "in_reply_to")?
         .filter(|value| !value.trim().is_empty())
         .map(MessageId::new);
@@ -243,7 +243,7 @@ fn list_drafts(session: &Session, args: &Value) -> Result<Value, String> {
     .map_err(|err| err.to_string())?;
     let drafts = drafts
         .iter()
-        .map(|draft| draft_json(draft, &caller))
+        .map(|draft| draft_json(session, draft, &caller))
         .collect::<Vec<_>>();
     Ok(json!({ "drafts": drafts }))
 }
@@ -287,11 +287,11 @@ fn mutation_json(action: Option<fell_core::RecordedAction>) -> Value {
     }
 }
 
-fn message_json(message: &Message, body_budget: &mut usize) -> Value {
+fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -> Value {
     let body = message.body_text.as_deref().unwrap_or("");
     json!({
-        "message_id": message.headers.message_id.as_str(),
-        "sender_address": untrusted::provenance_address(&message.headers.from.email),
+        "message_id": session.show_id(message.headers.message_id.as_str()),
+        "sender_address": session.show_id(&message.headers.from.email),
         "date_unix": message.headers.date_unix,
         "from_name": message.headers.from.name.as_deref().map(|name| untrusted::envelope(name, SNIPPET_CHARS)),
         "subject": untrusted::envelope(&message.headers.subject, SNIPPET_CHARS),
@@ -305,7 +305,7 @@ fn message_json(message: &Message, body_budget: &mut usize) -> Value {
     })
 }
 
-fn draft_json(draft: &ReviewDraft, caller: &str) -> Value {
+fn draft_json(session: &Session, draft: &ReviewDraft, caller: &str) -> Value {
     let own = draft.actor == caller;
     json!({
         "draft_id": draft.id,
@@ -316,10 +316,16 @@ fn draft_json(draft: &ReviewDraft, caller: &str) -> Value {
         "bcc_redacted": !own,
         "subject": untrusted::envelope(&draft.subject, SNIPPET_CHARS),
         "body": untrusted::envelope(&draft.body, MAX_THREAD_CHARS),
-        "in_reply_to": draft.in_reply_to.as_ref().map(|id| id.as_str()),
-        "thread_id": draft.thread_id.as_ref().map(|id| id.as_str()),
+        "in_reply_to": draft.in_reply_to.as_ref().map(|id| session.show_id(id.as_str())),
+        "thread_id": draft.thread_id.as_ref().map(|id| session.show_id(id.as_str())),
         "created_unix": draft.created_unix,
     })
+}
+
+fn thread_arg(session: &Session, args: &Value) -> Result<ThreadId, String> {
+    Ok(ThreadId(
+        session.resolve_id(&require_string(args, "thread_id")?),
+    ))
 }
 
 fn actor_name(session: &Session) -> String {

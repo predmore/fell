@@ -1069,7 +1069,18 @@ fn union_tokens(existing: &str, incoming: &[String], address: bool) -> String {
 }
 
 fn ensure_message_columns(conn: &Connection) -> Result<()> {
-    let have = column_names(conn, "messages")?;
+    // Exclusive lock so two processes opening an old file don't both ALTER.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = add_missing_message_columns(conn);
+    if result.is_ok() {
+        conn.execute_batch("COMMIT")?;
+    } else {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+fn add_missing_message_columns(conn: &Connection) -> Result<()> {
     let missing: &[(&str, &str)] = &[
         (
             "folders",
@@ -1108,9 +1119,15 @@ fn ensure_message_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE messages ADD COLUMN snooze_until INTEGER",
         ),
     ];
+    let have = column_names(conn, "messages")?;
     for (name, ddl) in missing {
-        if !have.iter().any(|column| column == name) {
-            conn.execute(ddl, [])?;
+        if have.iter().any(|column| column == name) {
+            continue;
+        }
+        if let Err(err) = conn.execute(ddl, [])
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
         }
     }
     Ok(())
@@ -1151,6 +1168,12 @@ fn ensure_fts(conn: &Connection) -> Result<()> {
     tx.execute_batch(FTS_TRIGGERS)?;
     tx.commit()?;
     Ok(())
+}
+
+fn duplicate_column(err: &rusqlite::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate column")
 }
 
 fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
@@ -2617,5 +2640,50 @@ mod tests {
             .unwrap();
         assert_eq!(archived, 0);
         assert!(snooze.is_none());
+    }
+
+    #[test]
+    fn concurrent_column_migration_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                rowid INTEGER PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                barrier.wait();
+                ensure_message_columns(&conn).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let names = column_names(&conn, "messages").unwrap();
+        assert!(names.iter().any(|name| name == "archived"));
+        assert!(names.iter().any(|name| name == "snooze_until"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

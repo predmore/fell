@@ -4,6 +4,8 @@
 //! not in the registry, including anything that would send mail, is a
 //! JSON-RPC error so it never looks like a tool Fell supports.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,8 @@ pub struct Session {
     pub(crate) account_id: AccountId,
     pub(crate) agent_id: String,
     pub(crate) mutations: MutationBudget,
+    /// Shown id -> stored id, when the stored header was not a safe token.
+    ids: RefCell<HashMap<String, String>>,
     initialized: bool,
 }
 
@@ -77,8 +81,25 @@ impl Session {
             account_id,
             agent_id,
             mutations: MutationBudget::production(),
+            ids: RefCell::new(HashMap::new()),
             initialized: false,
         })
+    }
+
+    pub(crate) fn show_id(&self, raw: &str) -> String {
+        let shown = crate::untrusted::public_id(raw);
+        if shown != raw {
+            self.ids.borrow_mut().insert(shown.clone(), raw.to_string());
+        }
+        shown
+    }
+
+    pub(crate) fn resolve_id(&self, given: &str) -> String {
+        self.ids
+            .borrow()
+            .get(given)
+            .cloned()
+            .unwrap_or_else(|| given.to_string())
     }
 
     #[cfg(test)]
