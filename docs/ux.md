@@ -34,7 +34,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Messages stacked oldest to newest; read messages collapsed to one line (sender, snippet, date), unread and the latest expanded.
 - Quoted history and signatures collapsed by default with a key to expand.
 - Native styled text by default; a key toggles to the web view for complex HTML; remote images blocked with a one-line, per-sender allow prompt.
-- `j`/`k` move between messages when the conversation has focus; `Space`/`Shift-Space` page.
+- `j`/`k` move between messages when the conversation has focus; `Ctrl-d`/`Ctrl-u` page (Space is the leader).
 
 ## Theme: follow Omarchy
 - Read the active Omarchy theme and map its palette (background, foreground, accent, selection, dimmed, error) to Fell's tokens.
@@ -51,3 +51,11 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 ## Evidence for UX judges
 - Screenshots of the running app on Hyprland-sized windows, on at least two stock Omarchy themes (one dark, one light), plus a narrow-window shot.
 - A short recording for any keyboard flow (navigate, open, move, undo).
+
+## Leader key, chords, which-key and command palette
+- Leader key defaults to `Space` and is configurable in the keymap file.
+- Chords live under the leader, grouped by mnemonic, for example `Space f` folders (`Space f i` inbox, `Space f m` move), `Space s` search, `Space t` toggles (web view, theme, density), `Space a` agents (M4).
+- Which-key: after the leader or any chord prefix, a popup lists the next keys and their actions within one frame of a short delay (default 300 ms, configurable; 0 shows it immediately). `Esc` cancels; `Backspace` steps back a level.
+- Direct vim keys (`j`, `e`, `gi`...) stay as they are; the leader is for less frequent actions and discovery, not a replacement.
+- Command palette (`:` and `Ctrl-Shift-p`): fuzzy search over every action, showing each action's key binding; recent actions first; runs on Enter with the current selection as the target.
+- Every action is reachable from the palette, and every chord shows in which-key, so nothing is hidden behind a memorized key.

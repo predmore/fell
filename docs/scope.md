@@ -32,9 +32,9 @@ Render HTML as native styled text in GPUI wherever possible (paragraphs, heading
 | Memory at rest, 100k messages | 250 MB |
 
 ## Default keymap
-`j`/`k`, `gg`/`G` move; `Enter`/`o` open; `x`, `V` select / visual range; `e` archive, `#` delete, `!` spam; `m` move the thread's messages out of the current folder (undoable); `r`, `R`, `f` reply, reply all, forward; `c` compose; `l` label, `s` star; `gi`, `gs`, `gd` inbox, sent, drafts; `gf` fuzzy folder picker; `/`, `n`/`N` search; `:` command palette; `u` undo (including agent actions).
+Leader defaults to `Space` and is configurable. Chords are grouped under it, with which-key hints. Direct keys: `j`/`k`, `gg`/`G` move; `Enter`/`o` open; `x`, `V` select / visual range; `e` archive, `#` delete, `!` spam; `m` move the thread's messages out of the current folder (undoable); `r`, `R`, `f` reply, reply all, forward; `c` compose; `l` label, `s` star; `gi`, `gs`, `gd` inbox, sent, drafts; `gf` fuzzy folder picker; `/`, `n`/`N` search; `u` undo (including agent actions). Conversation paging is `Ctrl-d` / `Ctrl-u`, not `Space`. The command palette is `:` and `Ctrl-Shift-p` and lists every action with its binding.
 
-The move action itself ships in M3. The M1 inbox PR only leaves room for it.
+The move action itself ships in M3. PR3 only leaves room for it.
 
 ## Out of scope for v1
 Direct Proton API backend; calendar, contacts, rules/filters; rich HTML compose (v1 composes plain text and Markdown); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
@@ -49,9 +49,9 @@ Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
 
 ## Milestones
 - **M0 Foundation**: merged in #1.
-- **M1 Read your mail**: read-only IMAP sync into the store (Bridge first, generic IMAP path), threaded inbox, conversation view with native HTML-to-text rendering and web view fallback, vim navigation. Fix #2 and #3.
+- **M1 Read your mail**: read-only IMAP sync into the store (Bridge first, generic IMAP path), threaded inbox, conversation view with native HTML-to-text rendering and web view fallback, vim navigation. PR3 needs the leader key and which-key with a few real chords, plus the palette over the M1 actions. The full chord set grows with later milestones. Fix #2 and #3.
 - **M2 Find anything**: full-text search with operators, typo tolerance, offline indexing at scale.
-- **M3 Act and reply**: archive, move, label, delete, undo, compose/reply, SMTP send; other-provider support incl. OAuth. The move action itself (`m`) ships here; the M1 inbox PR only leaves room for it.
+- **M3 Act and reply**: archive, move, label, delete, undo, compose/reply, SMTP send; other-provider support incl. OAuth. The move action itself (`m`) ships here; PR3 only leaves room for it.
 - **M4 Agents**: MCP server with search, read, triage, draft tools, scoped access, action log.
 - **M5 Semantic search**: local embeddings, hybrid ranking, opt-in cloud embeddings.
 - **M6 Daily driver**: budgets enforced in CI, keymap config, AUR (`fell-git` and `fell-bin`), GitHub Release tarball, and AppImage.
