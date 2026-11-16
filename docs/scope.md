@@ -45,3 +45,11 @@ Direct Proton API backend; calendar, contacts, rules/filters; rich HTML compose 
 - **M4 Agents**: MCP server with search, read, triage, draft tools, scoped access, action log.
 - **M5 Semantic search**: local embeddings, hybrid ranking, opt-in cloud embeddings.
 - **M6 Daily driver**: budgets enforced in CI, keymap config, AUR package for Omarchy.
+
+## Review gates
+UX quality is a top priority. Any PR that changes something the user sees or touches (UI, keymap, rendering, interaction, performance feel) merges only when, in addition to CI and the code reviewer:
+
+- Independent UX judges who did not write the code each score it 9.5 or better out of 10 against the scope principles (Zed-like speed and polish, keyboard-first vim grammar, typography and density, clarity, focus states, empty and loading states, error handling).
+- The PR description attaches screenshots of the running app (before/after when changing existing UI, several window sizes) and a short recording for keyboard flows. Those are the same images the judges score.
+
+Applies from M1's inbox PR onward.
