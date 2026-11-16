@@ -39,12 +39,14 @@ fn sample_state() -> TestState {
                 name: "Parent".into(),
                 list_flags: "\\Noselect".into(),
                 uidvalidity: 1,
+                uidnext: None,
                 messages: Vec::new(),
             },
             FixtureMailbox {
                 name: "Sent".into(),
                 list_flags: String::new(),
                 uidvalidity: 10,
+                uidnext: None,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -63,6 +65,7 @@ fn sample_state() -> TestState {
                 name: "INBOX".into(),
                 list_flags: String::new(),
                 uidvalidity: 20,
+                uidnext: None,
                 messages: vec![
                     FixtureMessage {
                         uid: 1,
@@ -114,6 +117,7 @@ fn sample_state() -> TestState {
                 name: "&Jjo-".into(),
                 list_flags: String::new(),
                 uidvalidity: 7,
+                uidnext: None,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -458,4 +462,50 @@ fn same_body_different_message_ids_stay_distinct() {
     sync_once(&acct, &backend, &store).unwrap();
     let threads = store.list_threads(&acct.id).unwrap();
     assert_eq!(threads.len(), 2);
+}
+
+/// RFC 3501: `6:*` still returns UID 5 when 5 is the highest UID. UIDNEXT is
+/// past that, so the client must fetch and then drop the already-stored UID.
+#[test]
+fn star_range_does_not_reapply_the_highest_uid() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 3,
+            uidnext: Some(10),
+            messages: vec![FixtureMessage {
+                uid: 5,
+                flags: vec!["\\Seen".into()],
+                modseq: 1,
+                raw: raw_message("only@x", None, "Only", "Ann <ann@x>", "only body", ""),
+            }],
+        }],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        state.commands.clear();
+    }
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 0);
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.contains("UID FETCH") && line.contains("6:*")),
+        "high-water fetch should run because UIDNEXT is past the checkpoint: {logged:?}"
+    );
 }

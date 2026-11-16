@@ -18,6 +18,8 @@ pub(super) struct FixtureMailbox {
     pub name: String,
     pub list_flags: String,
     pub uidvalidity: u32,
+    /// When set, EXAMINE reports this UIDNEXT instead of one past the highest UID.
+    pub uidnext: Option<u32>,
     pub messages: Vec<FixtureMessage>,
 }
 
@@ -167,13 +169,13 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     continue;
                 };
                 let exists = mailbox.messages.len();
-                let next = mailbox
+                let highest = mailbox
                     .messages
                     .iter()
                     .map(|message| message.uid)
                     .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
+                    .unwrap_or(0);
+                let next = mailbox.uidnext.unwrap_or(highest.saturating_add(1));
                 let _ = write.write_all(format!("* {exists} EXISTS\r\n").as_bytes());
                 let _ = write.write_all(
                     format!("* OK [UIDVALIDITY {}] UIDs valid\r\n", mailbox.uidvalidity).as_bytes(),
@@ -209,8 +211,14 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     let _ = write.write_all(format!("{tag} NO no mailbox\r\n").as_bytes());
                     continue;
                 };
+                let highest = mailbox
+                    .messages
+                    .iter()
+                    .map(|message| message.uid)
+                    .max()
+                    .unwrap_or(0);
                 for (index, message) in mailbox.messages.iter().enumerate() {
-                    if !uid_in_range(message.uid, &range) {
+                    if !uid_in_range(message.uid, &range, highest) {
                         continue;
                     }
                     if let Some(since) = changed_since
@@ -280,18 +288,24 @@ fn last_examined(commands: &[String]) -> Option<String> {
     None
 }
 
-fn uid_in_range(uid: u32, range: &str) -> bool {
+/// RFC 3501: `n:*` includes the mailbox's highest UID even when `n` is greater
+/// than every assigned UID.
+fn uid_in_range(uid: u32, range: &str, highest: u32) -> bool {
     let (start, end) = range.split_once(':').unwrap_or((range, range));
     let start = if start == "*" {
         u32::MAX
     } else {
         start.parse().unwrap_or(0)
     };
-    let end = if end == "*" {
+    let end_star = end == "*";
+    let end = if end_star {
         u32::MAX
     } else {
         end.parse().unwrap_or(0)
     };
+    if end_star && highest > 0 && start > highest && uid == highest {
+        return true;
+    }
     let (low, high) = if start <= end {
         (start, end)
     } else {

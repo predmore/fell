@@ -42,12 +42,27 @@ pub(crate) fn fetch_imap(
     for mailbox in &mailboxes {
         let examined = session.examine(&mailbox.raw)?;
         let previous = prior.get(&mailbox.raw);
-        let fetched = match plan_fetch(previous, &examined) {
+        let plan = plan_fetch(previous, &examined);
+        // High-water fetches must ignore UIDs the checkpoint already has.
+        // `n:*` still returns the current highest UID when `n` is past it.
+        // CHANGEDSINCE results stay intact so an older flag update is kept.
+        let seen_through = match (previous, plan.as_ref()) {
+            (Some(prev), Some(plan))
+                if plan.changed_since.is_none() && prev.uidvalidity == examined.uidvalidity =>
+            {
+                Some(prev.uid)
+            }
+            _ => None,
+        };
+        let fetched = match plan {
             Some(plan) => session.uid_fetch(&plan.range, plan.changed_since)?,
             None => Vec::new(),
         };
         let highest = fetched.iter().map(|item| item.uid).max();
         for item in fetched {
+            if seen_through.is_some_and(|uid| item.uid <= uid) {
+                continue;
+            }
             if rfc822::is_deleted(&item.flags) {
                 continue;
             }
@@ -113,7 +128,12 @@ fn plan_fetch(
                     range: "1:*".to_string(),
                     changed_since: prev.modseq,
                 })
-            } else if prev.uid == u32::MAX {
+            } else if prev.uid == u32::MAX
+                || examined
+                    .uidnext
+                    .is_some_and(|next| next <= prev.uid.saturating_add(1))
+            {
+                // UIDNEXT at or below the next UID means nothing newer exists.
                 None
             } else {
                 Some(FetchPlan {

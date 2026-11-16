@@ -28,6 +28,8 @@ pub(super) struct Listed {
 
 pub(super) struct Examined {
     pub uidvalidity: u32,
+    /// Next UID the server will assign. `None` when EXAMINE omitted `UIDNEXT`.
+    pub uidnext: Option<u32>,
     pub exists: u32,
     pub highest_modseq: Option<u64>,
 }
@@ -108,6 +110,7 @@ impl Session {
         let name = quote_imap(mailbox).map_err(imap_err)?;
         let lines = self.command("EXAMINE", &format!("EXAMINE {name}"))?;
         let mut uidvalidity = None;
+        let mut uidnext = None;
         let mut exists = 0;
         let mut highest_modseq = None;
         for line in &lines {
@@ -117,6 +120,9 @@ impl Session {
             if let Some(value) = bracket_u32(&line.text, "UIDVALIDITY") {
                 uidvalidity = Some(value);
             }
+            if let Some(value) = bracket_u32(&line.text, "UIDNEXT") {
+                uidnext = Some(value);
+            }
             if let Some(value) = bracket_u64(&line.text, "HIGHESTMODSEQ") {
                 highest_modseq = Some(value);
             }
@@ -125,6 +131,7 @@ impl Session {
             .ok_or_else(|| imap_err(format!("EXAMINE {mailbox} returned no UIDVALIDITY")))?;
         Ok(Examined {
             uidvalidity,
+            uidnext,
             exists,
             highest_modseq,
         })
@@ -322,7 +329,7 @@ struct ParsedList {
 }
 
 fn connect_tcp(config: &ImapConfig) -> Result<TcpStream, Error> {
-    let mut addrs = (config.host.as_str(), config.port)
+    let addrs = (config.host.as_str(), config.port)
         .to_socket_addrs()
         .map_err(|err| {
             imap_err(format!(
@@ -330,26 +337,41 @@ fn connect_tcp(config: &ImapConfig) -> Result<TcpStream, Error> {
                 config.host, config.port
             ))
         })?;
-    let Some(addr) = addrs.next() else {
+    connect_addrs(addrs, &config.host, config.port)
+}
+
+/// Use the first address that accepts a connection. An earlier unreachable
+/// address must not hide a later working one.
+fn connect_addrs(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, Error> {
+    let mut last_err = None;
+    let mut tried = false;
+    for addr in addrs {
+        tried = true;
+        match TcpStream::connect_timeout(&addr, TIMEOUT) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(TIMEOUT))
+                    .map_err(|err| imap_err(err.to_string()))?;
+                stream
+                    .set_write_timeout(Some(TIMEOUT))
+                    .map_err(|err| imap_err(err.to_string()))?;
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    if !tried {
         return Err(imap_err(format!(
-            "resolve {}:{} returned no address",
-            config.host, config.port
+            "resolve {host}:{port} returned no address"
         )));
-    };
-    let stream = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|err| {
-        imap_err(format!(
-            "connect {}:{} failed: {err}",
-            config.host, config.port
-        ))
-    })?;
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|err| imap_err(err.to_string()))?;
-    stream
-        .set_write_timeout(Some(TIMEOUT))
-        .map_err(|err| imap_err(err.to_string()))?;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    }
+    let err = last_err.expect("a failed connect records an error");
+    Err(imap_err(format!("connect {host}:{port} failed: {err}")))
 }
 
 fn wrap_tls(
@@ -709,5 +731,23 @@ impl Io {
             Self::Plain(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{SocketAddr, TcpListener};
+
+    use super::connect_addrs;
+
+    #[test]
+    fn connect_uses_a_later_address_when_the_first_refuses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = listener.local_addr().unwrap();
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead: SocketAddr = closed.local_addr().unwrap();
+        drop(closed);
+        let stream = connect_addrs([dead, good], "127.0.0.1", good.port()).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
     }
 }
