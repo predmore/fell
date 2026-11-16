@@ -20,7 +20,8 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 | Crate | Role |
 | --- | --- |
 | `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
-| `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. |
+| `fell-confirm` | ZST `InteractiveUi`. Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
+| `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
 | `fell-mcp` | Stub MCP server for later agent access. Tools: search, summarize, triage, draft. No send tool. |
 
 ## Backends
@@ -38,17 +39,19 @@ SQLite is the source of truth for the UI. Sync writes messages, threads, and an 
 
 ## Threading
 
-A thread id is assigned when a message is stored:
+A thread id is assigned when a message is stored, then the account is re-resolved until stable:
 
 1. If Proton sent a conversation id, that is the thread key (`proton:…`).
-2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent.
+2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent in the **same account**.
 3. Otherwise start a thread from the message's own `Message-ID`.
 
-Proton conversation ids win when present so Bridge and the future API stay consistent with Proton's own threading.
+Messages are unique on `(account_id, message_id)`. After a delta is written, thread ids are re-resolved and descendants/siblings on the old thread move with a changed row, so a reply stored before its parent (or a later Proton conversation id) still ends up in one thread.
+
+Proton conversation ids win when present so Bridge and the future API stay consistent with Proton's own threading. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
 
 ## Sending mail
 
-Agents may prepare a `Draft`. Transmitting mail requires a `UserSendConfirmation` that only the GPUI app is allowed to mint after an explicit user action. The MCP crate has no send tool and cannot construct that token. See `fell_core::send`.
+Agents may prepare a `Draft`. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi` (see `fell::confirmation_from_ui`). The MCP crate has no send tool and does not depend on `fell-confirm`, so it cannot construct that token.
 
 ## First platform
 

@@ -1584,14 +1584,20 @@ dependencies = [
 name = "fell"
 version = "0.1.0"
 dependencies = [
+ "fell-confirm",
  "fell-core",
  "gpui",
 ]
 
 [[package]]
+name = "fell-confirm"
+version = "0.1.0"
+
+[[package]]
 name = "fell-core"
 version = "0.1.0"
 dependencies = [
+ "fell-confirm",
  "rusqlite",
  "thiserror 2.0.21",
 ]

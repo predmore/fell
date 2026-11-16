@@ -1,0 +1,11 @@
+[package]
+name = "fell-confirm"
+description = "UI-only proof token for confirming a Fell send"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

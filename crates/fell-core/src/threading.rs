@@ -23,26 +23,28 @@ impl ThreadId {
 /// 1. Proton conversation id, when present.
 /// 2. Else the thread of the first stored parent (`In-Reply-To` / `References`).
 /// 3. Else a new thread keyed by this message's `Message-ID`.
-pub fn resolve_thread_id(
+///
+/// Parent lookup errors propagate; a missing parent is `Ok(None)`, not an error.
+pub fn resolve_thread_id<E>(
     headers: &MessageHeaders,
-    lookup_parent: impl Fn(&MessageId) -> Option<ThreadId>,
-) -> ThreadId {
+    mut lookup_parent: impl FnMut(&MessageId) -> Result<Option<ThreadId>, E>,
+) -> Result<ThreadId, E> {
     if let Some(id) = headers
         .proton_conversation_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return ThreadId::proton(id);
+        return Ok(ThreadId::proton(id));
     }
 
     for parent in headers.parent_ids() {
-        if let Some(thread) = lookup_parent(parent) {
-            return thread;
+        if let Some(thread) = lookup_parent(parent)? {
+            return Ok(thread);
         }
     }
 
-    ThreadId::from_message_id(&headers.message_id)
+    Ok(ThreadId::from_message_id(&headers.message_id))
 }
 
 #[cfg(test)]
@@ -50,6 +52,7 @@ mod tests {
     use super::*;
     use crate::message::Address;
     use std::collections::HashMap;
+    use std::convert::Infallible;
 
     fn headers(
         id: &str,
@@ -71,10 +74,19 @@ mod tests {
         }
     }
 
+    fn lookup<'a>(
+        map: &'a HashMap<MessageId, ThreadId>,
+    ) -> impl FnMut(&MessageId) -> Result<Option<ThreadId>, Infallible> + 'a {
+        |id| Ok(map.get(id).cloned())
+    }
+
     #[test]
     fn proton_id_wins_over_headers() {
         let h = headers("child@x", Some("conv-1"), Some("parent@x"), &[]);
-        let thread = resolve_thread_id(&h, |_| panic!("must not walk headers"));
+        let thread = resolve_thread_id(&h, |_| -> Result<_, Infallible> {
+            panic!("must not walk headers")
+        })
+        .unwrap();
         assert_eq!(thread, ThreadId::proton("conv-1"));
     }
 
@@ -83,7 +95,7 @@ mod tests {
         let parent_thread = ThreadId::from_message_id(&MessageId::new("root@x"));
         let map = HashMap::from([(MessageId::new("root@x"), parent_thread.clone())]);
         let h = headers("child@x", None, Some("root@x"), &["root@x"]);
-        let thread = resolve_thread_id(&h, |id| map.get(id).cloned());
+        let thread = resolve_thread_id(&h, lookup(&map)).unwrap();
         assert_eq!(thread, parent_thread);
     }
 
@@ -92,14 +104,14 @@ mod tests {
         let parent_thread = ThreadId::from_message_id(&MessageId::new("root@x"));
         let map = HashMap::from([(MessageId::new("root@x"), parent_thread.clone())]);
         let h = headers("child@x", None, None, &["root@x", "mid@x"]);
-        let thread = resolve_thread_id(&h, |id| map.get(id).cloned());
+        let thread = resolve_thread_id(&h, lookup(&map)).unwrap();
         assert_eq!(thread, parent_thread);
     }
 
     #[test]
     fn new_thread_when_no_parents() {
         let h = headers("solo@x", None, None, &[]);
-        let thread = resolve_thread_id(&h, |_| None);
+        let thread = resolve_thread_id(&h, |_| -> Result<_, Infallible> { Ok(None) }).unwrap();
         assert_eq!(thread, ThreadId::from_message_id(&MessageId::new("solo@x")));
     }
 }

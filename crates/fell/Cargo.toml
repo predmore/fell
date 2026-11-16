@@ -8,5 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fell-confirm.workspace = true
 fell-core.workspace = true
 gpui.workspace = true

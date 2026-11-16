@@ -1,8 +1,8 @@
 //! Sending mail always needs an explicit UI confirmation.
 //!
 //! MCP tools may produce a [`Draft`]. They cannot construct a
-//! [`UserSendConfirmation`]; that type is minted only by the GPUI app after the
-//! user confirms send.
+//! [`UserSendConfirmation`]: minting requires [`fell_confirm::InteractiveUi`],
+//! and `fell-mcp` does not depend on `fell-confirm`.
 
 use crate::account::AccountId;
 
@@ -31,18 +31,23 @@ pub struct PendingSend {
 
 /// Proof that the user confirmed send in the Fell UI.
 ///
-/// Only [`UserSendConfirmation::from_interactive_ui`] constructs this, and that
-/// function is intended to be called from `fell` (the GPUI crate) alone.
+/// Constructed only via [`UserSendConfirmation::from_interactive_ui`], which
+/// requires [`fell_confirm::InteractiveUi`]. That crate is a dependency of the
+/// GPUI app, not of `fell-mcp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSendConfirmation {
     pending_id: PendingSendId,
 }
 
 impl UserSendConfirmation {
-    /// Call only from the GPUI app after an explicit user Send action.
+    /// Call from the GPUI app after an explicit user Send action.
     ///
-    /// Agent / MCP code must not call this. There is no send MCP tool.
-    pub fn from_interactive_ui(pending_id: PendingSendId) -> Self {
+    /// `fell-mcp` cannot name [`fell_confirm::InteractiveUi`] without adding a
+    /// Cargo dependency on `fell-confirm`. There is no send MCP tool.
+    pub fn from_interactive_ui(
+        _ui: &fell_confirm::InteractiveUi,
+        pending_id: PendingSendId,
+    ) -> Self {
         Self { pending_id }
     }
 
@@ -91,7 +96,10 @@ mod tests {
     fn backend_will_not_send_without_matching_confirmation() {
         let backend = ProtonApiBackend;
         let pending = backend.submit_draft(draft()).unwrap();
-        let other = UserSendConfirmation::from_interactive_ui(PendingSendId("nope".into()));
+        let other = UserSendConfirmation::from_interactive_ui(
+            &fell_confirm::InteractiveUi,
+            PendingSendId("nope".into()),
+        );
         let err = backend.confirm_send(pending, other).unwrap_err();
         assert!(matches!(err, crate::Error::SendUnconfirmed));
     }

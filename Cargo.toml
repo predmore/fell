@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/fell-core", "crates/fell", "crates/fell-mcp"]
+members = [
+    "crates/fell-core",
+    "crates/fell",
+    "crates/fell-mcp",
+    "crates/fell-confirm",
+]
 
 [workspace.package]
 edition = "2024"
@@ -15,6 +20,7 @@ xattr = { path = "vendor/xattr" }
 
 [workspace.dependencies]
 fell-core = { path = "crates/fell-core", version = "0.1.0" }
+fell-confirm = { path = "crates/fell-confirm", version = "0.1.0" }
 gpui = { version = "0.2.2", default-features = false, features = [
     "font-kit",
     "wayland",

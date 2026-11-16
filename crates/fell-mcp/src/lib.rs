@@ -1,7 +1,9 @@
 //! MCP server stub for Fell.
 //!
 //! Planned tools: search, summarize, triage, draft. There is **no send tool**.
-//! Sending mail requires [`fell_core::UserSendConfirmation`] from the GPUI UI.
+//! Sending mail requires [`fell_core::UserSendConfirmation`] minted by the
+//! GPUI app via `fell-confirm::InteractiveUi`. This crate must not depend on
+//! `fell-confirm`.
 
 use fell_core::{AccountId, Draft, SearchHit, Store, ThreadId};
 

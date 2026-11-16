@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS messages (
     rowid INTEGER PRIMARY KEY,
     account_id TEXT NOT NULL,
-    message_id TEXT NOT NULL UNIQUE,
+    message_id TEXT NOT NULL,
     remote_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     proton_conversation_id TEXT,
@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS messages (
     snippet TEXT NOT NULL,
     body_text TEXT,
     unread INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY(account_id) REFERENCES accounts(id)
+    FOREIGN KEY(account_id) REFERENCES accounts(id),
+    UNIQUE (account_id, message_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_id);
@@ -50,24 +51,34 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject,
     sender,
     body,
+    account_id UNINDEXED,
     message_id UNINDEXED
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(subject, sender, body, message_id)
-    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet), new.message_id);
+    INSERT INTO messages_fts(subject, sender, body, account_id, message_id)
+    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet),
+            new.account_id, new.message_id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE message_id = old.message_id;
+    DELETE FROM messages_fts
+    WHERE account_id = old.account_id AND message_id = old.message_id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE message_id = old.message_id;
-    INSERT INTO messages_fts(subject, sender, body, message_id)
-    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet), new.message_id);
+    DELETE FROM messages_fts
+    WHERE account_id = old.account_id AND message_id = old.message_id;
+    INSERT INTO messages_fts(subject, sender, body, account_id, message_id)
+    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet),
+            new.account_id, new.message_id);
 END;
 "#;
+
+const SELECT_MESSAGE_COLS: &str =
+    "account_id, message_id, remote_id, thread_id, proton_conversation_id,
+        in_reply_to, references_header, from_name, from_email, subject,
+        date_unix, snippet, body_text, unread";
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
@@ -144,103 +155,33 @@ impl Store {
     }
 
     pub fn sync_cursor(&self, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
-        let key = format!("cursor:{}", account_id.as_str());
-        let token: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(token.map(|token| crate::SyncCursor {
-            account_key: account_id.0.clone(),
-            token,
-        }))
-    }
-
-    fn set_sync_cursor(&self, account_id: &AccountId, cursor: &crate::SyncCursor) -> Result<()> {
-        let key = format!("cursor:{}", account_id.as_str());
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, cursor.token],
-        )?;
-        Ok(())
+        sync_cursor_on(&self.conn, account_id)
     }
 
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         for message in &delta.messages {
-            self.upsert_message(message)?;
+            insert_message(&tx, message)?;
         }
+        rethread(&tx, account_id)?;
         if let Some(cursor) = &delta.cursor {
-            self.set_sync_cursor(account_id, cursor)?;
+            set_sync_cursor_on(&tx, account_id, cursor)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
-        let thread_id = resolve_thread_id(&message.headers, |parent| {
-            self.thread_id_for_message_id(parent).ok().flatten()
-        });
-
-        let references = message
-            .headers
-            .references
-            .iter()
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1e}");
-
-        self.conn.execute(
-            "INSERT INTO messages (
-                account_id, message_id, remote_id, thread_id, proton_conversation_id,
-                in_reply_to, references_header, from_name, from_email, subject,
-                date_unix, snippet, body_text, unread
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(message_id) DO UPDATE SET
-                remote_id = excluded.remote_id,
-                thread_id = excluded.thread_id,
-                proton_conversation_id = excluded.proton_conversation_id,
-                in_reply_to = excluded.in_reply_to,
-                references_header = excluded.references_header,
-                from_name = excluded.from_name,
-                from_email = excluded.from_email,
-                subject = excluded.subject,
-                date_unix = excluded.date_unix,
-                snippet = excluded.snippet,
-                body_text = excluded.body_text,
-                unread = excluded.unread",
-            params![
-                message.account_id.as_str(),
-                message.headers.message_id.as_str(),
-                message.remote_id.0,
-                thread_id.as_str(),
-                message.headers.proton_conversation_id,
-                message.headers.in_reply_to.as_ref().map(MessageId::as_str),
-                references,
-                message.headers.from.name,
-                message.headers.from.email,
-                message.headers.subject,
-                message.headers.date_unix,
-                message.snippet,
-                message.body_text,
-                i64::from(message.unread),
-            ],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        insert_message(&tx, message)?;
+        rethread(&tx, &message.account_id)?;
+        let thread_id =
+            thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
+                .ok_or_else(|| {
+                    crate::Error::Backend("upserted message missing after rethread".into())
+                })?;
+        tx.commit()?;
         Ok(thread_id)
-    }
-
-    fn thread_id_for_message_id(&self, message_id: &MessageId) -> Result<Option<ThreadId>> {
-        let id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT thread_id FROM messages WHERE message_id = ?1",
-                params![message_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(id.map(ThreadId))
     }
 
     pub fn list_threads(&self, account_id: &AccountId) -> Result<Vec<ThreadSummary>> {
@@ -276,14 +217,12 @@ impl Store {
         account_id: &AccountId,
         thread_id: &ThreadId,
     ) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT account_id, message_id, remote_id, thread_id, proton_conversation_id,
-                    in_reply_to, references_header, from_name, from_email, subject,
-                    date_unix, snippet, body_text, unread
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_MESSAGE_COLS}
              FROM messages
              WHERE account_id = ?1 AND thread_id = ?2
-             ORDER BY date_unix ASC",
-        )?;
+             ORDER BY date_unix ASC"
+        ))?;
         let rows = stmt.query_map(
             params![account_id.as_str(), thread_id.as_str()],
             row_to_message,
@@ -303,7 +242,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT m.message_id, m.thread_id, m.subject, m.snippet
              FROM messages_fts
-             JOIN messages m ON m.message_id = messages_fts.message_id
+             JOIN messages m
+               ON m.message_id = messages_fts.message_id
+              AND m.account_id = messages_fts.account_id
              WHERE m.account_id = ?1 AND messages_fts MATCH ?2
              ORDER BY rank",
         )?;
@@ -318,6 +259,148 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+}
+
+fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
+    let key = format!("cursor:{}", account_id.as_str());
+    let token: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(token.map(|token| crate::SyncCursor {
+        account_key: account_id.0.clone(),
+        token,
+    }))
+}
+
+fn set_sync_cursor_on(
+    conn: &Connection,
+    account_id: &AccountId,
+    cursor: &crate::SyncCursor,
+) -> Result<()> {
+    let key = format!("cursor:{}", account_id.as_str());
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, cursor.token],
+    )?;
+    Ok(())
+}
+
+fn thread_id_for_message_id(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &MessageId,
+) -> Result<Option<ThreadId>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id.map(ThreadId))
+}
+
+fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
+    let account_id = &message.account_id;
+    let thread_id = resolve_thread_id(&message.headers, |parent| {
+        thread_id_for_message_id(conn, account_id, parent)
+    })?;
+
+    let references = message
+        .headers
+        .references
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join("\u{1e}");
+
+    conn.execute(
+        "INSERT INTO messages (
+            account_id, message_id, remote_id, thread_id, proton_conversation_id,
+            in_reply_to, references_header, from_name, from_email, subject,
+            date_unix, snippet, body_text, unread
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+            remote_id = excluded.remote_id,
+            thread_id = excluded.thread_id,
+            proton_conversation_id = excluded.proton_conversation_id,
+            in_reply_to = excluded.in_reply_to,
+            references_header = excluded.references_header,
+            from_name = excluded.from_name,
+            from_email = excluded.from_email,
+            subject = excluded.subject,
+            date_unix = excluded.date_unix,
+            snippet = excluded.snippet,
+            body_text = excluded.body_text,
+            unread = excluded.unread",
+        params![
+            message.account_id.as_str(),
+            message.headers.message_id.as_str(),
+            message.remote_id.0,
+            thread_id.as_str(),
+            message.headers.proton_conversation_id,
+            message.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            references,
+            message.headers.from.name,
+            message.headers.from.email,
+            message.headers.subject,
+            message.headers.date_unix,
+            message.snippet,
+            message.body_text,
+            i64::from(message.unread),
+        ],
+    )?;
+    Ok(thread_id)
+}
+
+/// Re-resolve thread ids for an account until nothing moves.
+///
+/// When a message's resolved id changes, every row currently on that message's
+/// old thread moves with it (descendants / siblings, including a later Proton
+/// conversation id).
+fn rethread(conn: &Connection, account_id: &AccountId) -> Result<()> {
+    loop {
+        let messages = load_account_messages(conn, account_id)?;
+        let mut moved = false;
+        for message in &messages {
+            let new_tid = resolve_thread_id(&message.headers, |parent| {
+                thread_id_for_message_id(conn, account_id, parent)
+            })?;
+            if new_tid == message.thread_id {
+                continue;
+            }
+            conn.execute(
+                "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
+                params![
+                    new_tid.as_str(),
+                    account_id.as_str(),
+                    message.thread_id.as_str()
+                ],
+            )?;
+            moved = true;
+            break;
+        }
+        if !moved {
+            return Ok(());
+        }
+    }
+}
+
+fn load_account_messages(conn: &Connection, account_id: &AccountId) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_MESSAGE_COLS} FROM messages WHERE account_id = ?1"
+    ))?;
+    let rows = stmt.query_map(params![account_id.as_str()], row_to_message)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn parse_references(raw: &str) -> Vec<MessageId> {
@@ -356,6 +439,8 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MailboxDelta;
+    use crate::backend::SyncCursor;
 
     fn account() -> Account {
         Account {
@@ -366,7 +451,17 @@ mod tests {
         }
     }
 
-    fn msg(
+    fn account_b() -> Account {
+        Account {
+            id: AccountId("a2".into()),
+            display_name: "Other".into(),
+            email: "o@x".into(),
+            backend_kind: BackendKind::Bridge,
+        }
+    }
+
+    fn msg_for(
+        account: &str,
         id: &str,
         proton: Option<&str>,
         in_reply_to: Option<&str>,
@@ -374,7 +469,7 @@ mod tests {
         body: &str,
     ) -> Message {
         Message {
-            account_id: AccountId("a1".into()),
+            account_id: AccountId(account.into()),
             headers: MessageHeaders {
                 message_id: MessageId::new(id),
                 proton_conversation_id: proton.map(str::to_string),
@@ -387,12 +482,22 @@ mod tests {
                 subject: subject.into(),
                 date_unix: 1,
             },
-            remote_id: RemoteId(id.into()),
+            remote_id: RemoteId(format!("{account}:{id}")),
             thread_id: ThreadId::from_message_id(&MessageId::new(id)),
             snippet: body.into(),
             body_text: Some(body.into()),
             unread: true,
         }
+    }
+
+    fn msg(
+        id: &str,
+        proton: Option<&str>,
+        in_reply_to: Option<&str>,
+        subject: &str,
+        body: &str,
+    ) -> Message {
+        msg_for("a1", id, proton, in_reply_to, subject, body)
     }
 
     #[test]
@@ -454,5 +559,139 @@ mod tests {
         assert_eq!(hits[0].message_id.as_str(), "a@x");
         let body_hits = store.search(&AccountId("a1".into()), "pay me").unwrap();
         assert_eq!(body_hits.len(), 1);
+    }
+
+    #[test]
+    fn two_accounts_keep_separate_rows_for_same_message_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store.upsert_account(&account_b()).unwrap();
+        store
+            .upsert_message(&msg_for(
+                "a1",
+                "shared@x",
+                None,
+                None,
+                "From A",
+                "account a body",
+            ))
+            .unwrap();
+        store
+            .upsert_message(&msg_for(
+                "a2",
+                "shared@x",
+                None,
+                None,
+                "From B",
+                "account b body",
+            ))
+            .unwrap();
+
+        let a_threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        let b_threads = store.list_threads(&AccountId("a2".into())).unwrap();
+        assert_eq!(a_threads.len(), 1);
+        assert_eq!(b_threads.len(), 1);
+        let a_msgs = store
+            .thread_messages(&AccountId("a1".into()), &a_threads[0].thread_id)
+            .unwrap();
+        let b_msgs = store
+            .thread_messages(&AccountId("a2".into()), &b_threads[0].thread_id)
+            .unwrap();
+        assert_eq!(a_msgs.len(), 1);
+        assert_eq!(b_msgs.len(), 1);
+        assert_eq!(a_msgs[0].headers.subject, "From A");
+        assert_eq!(a_msgs[0].body_text.as_deref(), Some("account a body"));
+        assert_eq!(b_msgs[0].headers.subject, "From B");
+        assert_eq!(b_msgs[0].body_text.as_deref(), Some("account b body"));
+        assert_eq!(a_msgs[0].remote_id.0, "a1:shared@x");
+        assert_eq!(b_msgs[0].remote_id.0, "a2:shared@x");
+    }
+
+    #[test]
+    fn reply_before_parent_joins_one_thread() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let child = msg("reply@x", None, Some("root@x"), "Re: Root", "reply");
+        let parent = msg("root@x", None, None, "Root", "root");
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![child, parent],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].message_count, 2);
+        let msgs = store
+            .thread_messages(&AccountId("a1".into()), &threads[0].thread_id)
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn later_proton_id_moves_header_siblings() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![
+                        msg("root@x", None, None, "Root", "root"),
+                        msg("reply@x", None, Some("root@x"), "Re: Root", "reply"),
+                    ],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![msg("root@x", Some("conv-9"), None, "Root", "root")],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, ThreadId::proton("conv-9"));
+        assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn apply_delta_rolls_back_on_error() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let ok = msg("ok@x", None, None, "Ok", "ok");
+        let bad = msg_for("missing", "bad@x", None, None, "Bad", "bad");
+        let err = store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![ok, bad],
+                    cursor: Some(SyncCursor {
+                        account_key: "a1".into(),
+                        token: "should-not-stick".into(),
+                    }),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Store(_)));
+        assert!(
+            store
+                .list_threads(&AccountId("a1".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .sync_cursor(&AccountId("a1".into()))
+                .unwrap()
+                .is_none()
+        );
     }
 }
