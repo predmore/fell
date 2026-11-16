@@ -28,7 +28,7 @@ pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
-pub use store::{Store, ThreadSummary};
+pub use store::{SearchPage, Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
@@ -55,6 +55,8 @@ pub enum Error {
     NothingToUndo,
     #[error("{0}")]
     Invalid(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

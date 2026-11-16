@@ -5,6 +5,7 @@
 //! JSON-RPC error so it never looks like a tool Fell supports.
 
 use std::io::{BufRead, Write};
+use std::time::{Duration, Instant};
 
 use fell_core::{AccountId, Store};
 use serde_json::{Value, json};
@@ -18,7 +19,44 @@ pub struct Session {
     pub(crate) store: Store,
     pub(crate) account_id: AccountId,
     pub(crate) agent_id: String,
+    pub(crate) mutations: MutationBudget,
     initialized: bool,
+}
+
+/// Caps mailbox changes from one agent. The default is 30 per minute.
+pub(crate) struct MutationBudget {
+    window: Duration,
+    limit: u32,
+    started: Instant,
+    used: u32,
+}
+
+impl MutationBudget {
+    fn production() -> Self {
+        Self {
+            window: Duration::from_secs(60),
+            limit: 30,
+            started: Instant::now(),
+            used: 0,
+        }
+    }
+
+    pub(crate) fn allow(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if now.duration_since(self.started) >= self.window {
+            self.started = now;
+            self.used = 0;
+        }
+        if self.used >= self.limit {
+            return Err(format!(
+                "too many mailbox changes; at most {} every {} seconds",
+                self.limit,
+                self.window.as_secs()
+            ));
+        }
+        self.used += 1;
+        Ok(())
+    }
 }
 
 impl Session {
@@ -38,8 +76,16 @@ impl Session {
             store,
             account_id,
             agent_id,
+            mutations: MutationBudget::production(),
             initialized: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mutation_limit(&mut self, limit: u32) {
+        self.mutations.limit = limit;
+        self.mutations.used = 0;
+        self.mutations.started = Instant::now();
     }
 
     /// Handle one JSON-RPC message. Notifications return `None`.
@@ -156,7 +202,7 @@ impl Session {
         rpc_result(id, json!({ "tools": tools }))
     }
 
-    fn tools_call(&self, id: &Value, params: &Value) -> String {
+    fn tools_call(&mut self, id: &Value, params: &Value) -> String {
         let Some(obj) = params.as_object() else {
             return rpc_error(id, -32602, "invalid params");
         };
@@ -176,9 +222,10 @@ impl Session {
 
     fn instructions(&self) -> String {
         let mut text = format!(
-            "Fell agent `{}` on account `{}`. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. There is no send tool. Mail leaves the machine only from the Fell window. ",
+            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. There is no send tool. Mail leaves the machine only from the Fell window. {} ",
             self.agent_id,
-            self.account_id.as_str()
+            self.account_id.as_str(),
+            crate::tools::UNTRUSTED_NOTE
         );
         match self.store.agent_grant(&self.account_id, &self.agent_id) {
             Ok(grant) if grant.enabled => {
@@ -416,6 +463,10 @@ mod tests {
         );
         let hits = tool_json(&call(&mut session, "search", json!({ "query": "invoice" })));
         assert_eq!(hits["hits"][0]["thread_id"], thread.as_str());
+        assert_eq!(hits["hits"][0]["subject"]["untrusted"], true);
+        assert_eq!(hits["hits"][0]["subject"]["source"], "email");
+        assert_eq!(hits["hits"][0]["subject"]["text"], "Invoice March");
+        assert!(hits["hits"][0].get("body").is_none());
         let secret = tool_json(&call(
             &mut session,
             "search",
@@ -427,7 +478,11 @@ mod tests {
             "read_thread",
             json!({ "thread_id": thread.as_str() }),
         ));
-        assert_eq!(read["messages"][0]["body"], "please pay the invoice");
+        assert_eq!(
+            read["messages"][0]["body"]["text"],
+            "please pay the invoice"
+        );
+        assert_eq!(read["messages"][0]["body"]["untrusted"], true);
         let labels = tool_json(&call(&mut session, "list_labels", json!({})));
         assert_eq!(labels["labels"][0], "billing");
         let archived = call(
@@ -543,9 +598,11 @@ mod tests {
         assert_eq!(draft["status"], "review");
         let listed = tool_json(&call(&mut session, "list_drafts", json!({})));
         assert_eq!(
-            listed["drafts"][0]["body"],
+            listed["drafts"][0]["body"]["text"],
             "unique draft body not in the mailbox"
         );
+        assert_eq!(listed["drafts"][0]["body"]["untrusted"], true);
+        assert_eq!(listed["drafts"][0]["bcc_redacted"], false);
         assert!(
             session
                 .store
@@ -650,6 +707,94 @@ mod tests {
                 .iter()
                 .all(|tool| !tool["name"].as_str().unwrap().contains("send"))
         );
+    }
+
+    #[test]
+    fn triage_tools_stay_off_without_the_scope_and_mutations_are_limited() {
+        let (mut session, _thread) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        init(&mut session);
+        for name in ["label", "archive", "mark_read", "snooze"] {
+            assert!(
+                !tool_names(&mut session).iter().any(|tool| tool == name),
+                "{name}"
+            );
+        }
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        session.set_mutation_limit(2);
+        init(&mut session);
+        for (index, label) in ["one", "two"].into_iter().enumerate() {
+            let result = tool_json(&call(
+                &mut session,
+                "label",
+                json!({ "thread_id": thread.as_str(), "label": label, "mode": "add" }),
+            ));
+            assert_eq!(result["changed"], true, "{index}");
+        }
+        let limited = call(
+            &mut session,
+            "label",
+            json!({ "thread_id": thread.as_str(), "label": "three", "mode": "add" }),
+        );
+        assert_eq!(limited["result"]["isError"], true);
+        assert!(tool_text(&limited).contains("too many mailbox changes"));
+        let labels = session.store.list_labels(&session.account_id).unwrap();
+        assert!(labels.iter().any(|label| label == "two"));
+        assert!(!labels.iter().any(|label| label == "three"));
+        let found = tool_json(&call(&mut session, "search", json!({ "query": "invoice" })));
+        assert_eq!(found["hits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_thread_truncates_bodies_and_draft_lists_hide_other_bcc() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, false, true), "bot");
+        let long = "y".repeat(50);
+        let mut replacement = message("a1", "root@x", "Invoice March", &long, "billing");
+        replacement.remote_id = fell_core::RemoteId("a1:root-long".into());
+        session.store.upsert_message(&replacement).unwrap();
+        session
+            .store
+            .create_review_draft(
+                fell_core::ReviewDraftInput {
+                    account_id: session.account_id.clone(),
+                    to: vec!["pat@x".into()],
+                    cc: vec![],
+                    bcc: vec!["secret@x".into()],
+                    subject: "other".into(),
+                    body: "other body".into(),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:other",
+            )
+            .unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": thread.as_str(), "max_chars": 12 }),
+        ));
+        let text = read["messages"][0]["body"]["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 12);
+        assert_eq!(read["messages"][0]["body"]["truncated"], true);
+        let own = tool_json(&call(
+            &mut session,
+            "create_draft",
+            json!({ "to": ["pat@x"], "bcc": ["mine@x"], "body": "mine" }),
+        ));
+        assert_eq!(own["status"], "review");
+        let listed = tool_json(&call(&mut session, "list_drafts", json!({})));
+        assert_eq!(listed["drafts"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["drafts"][0]["bcc"][0], "mine@x");
+        let all = tool_json(&call(&mut session, "list_drafts", json!({ "all": true })));
+        let drafts = all["drafts"].as_array().unwrap();
+        assert_eq!(drafts.len(), 2);
+        let other = drafts
+            .iter()
+            .find(|draft| draft["subject"]["text"] == "other")
+            .unwrap();
+        assert_eq!(other["bcc_redacted"], true);
+        assert!(other["bcc"].as_array().unwrap().is_empty());
+        assert_eq!(other["body"]["untrusted"], true);
     }
 
     #[test]

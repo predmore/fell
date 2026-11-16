@@ -10,7 +10,9 @@ use crate::backend::MailboxDelta;
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, decode_addresses, encode_addresses,
 };
-use crate::search::{IndexedText, SearchResults, sync_terms, terms_for_indexed};
+use crate::search::{
+    IndexedText, SearchHit, SearchResults, fts5_phrase, sync_terms, terms_for_indexed,
+};
 use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 const SCHEMA: &str = r#"
@@ -210,6 +212,14 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
     pub(crate) conn: Connection,
+    path: Option<std::path::PathBuf>,
+}
+
+/// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,10 +233,16 @@ pub struct ThreadSummary {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // The mailbox holds message text. Create it owner-only before SQLite writes.
+        create_private_file(path)?;
         let conn = Connection::open(path)?;
         // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        Self::from_connection(conn)
+        let mut store = Self::from_connection(conn)?;
+        store.path = Some(path.to_path_buf());
+        store.seal_private_files()?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -246,7 +262,14 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
+    }
+
+    pub(crate) fn seal_private_files(&self) -> Result<()> {
+        if let Some(path) = &self.path {
+            restrict_store_files(path)?;
+        }
+        Ok(())
     }
 
     pub fn upsert_account(&self, account: &Account) -> Result<()> {
@@ -264,6 +287,7 @@ impl Store {
                 account.backend_kind.as_str()
             ],
         )?;
+        self.seal_private_files()?;
         Ok(())
     }
 
@@ -327,6 +351,7 @@ impl Store {
             set_sync_cursor_on(&tx, account_id, cursor)?;
         }
         tx.commit()?;
+        self.seal_private_files()?;
         Ok(())
     }
 
@@ -340,6 +365,7 @@ impl Store {
                     crate::Error::Backend("upserted message missing after rethread".into())
                 })?;
         tx.commit()?;
+        self.seal_private_files()?;
         Ok(thread_id)
     }
 
@@ -437,6 +463,113 @@ impl Store {
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    /// Up to 20 hits. `cursor` is `None` for the first page, or `next_cursor`.
+    pub fn search_page(
+        &self,
+        account_id: &AccountId,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<SearchPage> {
+        if query.trim().is_empty() {
+            return Ok(SearchPage {
+                hits: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let offset = page_offset(cursor)?;
+        let phrase = fts5_phrase(query);
+        let mut stmt = self.conn.prepare(
+            "SELECT m.message_id, m.thread_id, m.subject, m.snippet
+             FROM messages_fts
+             JOIN messages m
+               ON m.message_id = messages_fts.message_id
+              AND m.account_id = messages_fts.account_id
+             WHERE m.account_id = ?1 AND messages_fts MATCH ?2
+             ORDER BY rank, m.message_id
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id.as_str(), phrase, SEARCH_PAGE_SIZE + 1, offset],
+            |row| {
+                Ok(SearchHit {
+                    message_id: MessageId(row.get(0)?),
+                    thread_id: ThreadId(row.get(1)?),
+                    subject: row.get(2)?,
+                    snippet: row.get(3)?,
+                })
+            },
+        )?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        let next_cursor = if hits.len() as i64 > SEARCH_PAGE_SIZE {
+            hits.truncate(SEARCH_PAGE_SIZE as usize);
+            Some((offset + SEARCH_PAGE_SIZE).to_string())
+        } else {
+            None
+        };
+        Ok(SearchPage { hits, next_cursor })
+    }
+}
+
+const SEARCH_PAGE_SIZE: i64 = 20;
+
+fn page_offset(cursor: Option<&str>) -> Result<i64> {
+    match cursor.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(0),
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|offset| *offset >= 0)
+            .ok_or_else(|| crate::Error::Invalid("cursor is not a page token".into())),
+    }
+}
+
+fn create_private_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        return restrict_mode(path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)?;
+    }
+    Ok(())
+}
+
+fn restrict_store_files(path: &Path) -> Result<()> {
+    restrict_mode(path)?;
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    restrict_mode(Path::new(&wal))?;
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    restrict_mode(Path::new(&shm))?;
+    Ok(())
+}
+
+fn restrict_mode(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
@@ -2366,6 +2499,72 @@ mod tests {
                 .delete_message(&AccountId("a1".into()), &MessageId::new("missing@x"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn search_page_returns_twenty_then_the_rest() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        for n in 0..25 {
+            store
+                .upsert_message(&msg(&format!("m{n}@x"), None, None, "Paged", "pageword"))
+                .unwrap();
+        }
+        let first = store
+            .search_page(&AccountId("a1".into()), "pageword", None)
+            .unwrap();
+        assert_eq!(first.hits.len(), 20);
+        let cursor = first.next_cursor.expect("next page");
+        let second = store
+            .search_page(&AccountId("a1".into()), "pageword", Some(&cursor))
+            .unwrap();
+        assert_eq!(second.hits.len(), 5);
+        assert!(second.next_cursor.is_none());
+        let mut ids: Vec<_> = first
+            .hits
+            .iter()
+            .chain(second.hits.iter())
+            .map(|hit| hit.message_id.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 25);
+        assert!(
+            store
+                .search_page(&AccountId("a1".into()), "pageword", Some("nope"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_wal_and_shm_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "fell-store-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&account()).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = if suffix.is_empty() {
+                path.clone()
+            } else {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                std::path::PathBuf::from(name)
+            };
+            assert!(file.exists(), "missing {}", file.display());
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", file.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -40,7 +40,7 @@ Use the Apache-2.0 `gpui` crate and its published dependencies only. Do not take
 
 ## MCP and sending
 
-The MCP server is MIT like the rest of the workspace. Agent tools may search, read threads, list labels, triage, and save drafts for review. Sending mail is not an MCP capability; it always needs explicit UI confirmation (`UserSendConfirmation`). Scopes stay off until a person enables them. `fell-mcp` does not depend on `fell-confirm` and cannot mint a send token.
+The MCP server is MIT like the rest of the workspace. It speaks stdio only. Agent tools may search, read threads, list labels, triage, and save drafts for review. Sending mail is not an MCP capability; it always needs explicit UI confirmation (`UserSendConfirmation`). Scopes stay off until a person enables them. `fell-mcp` does not depend on `fell-confirm` and cannot mint a send token. A future network transport would have to bind to `127.0.0.1`, use a token file mode `0600`, and check `Origin`.
 
 ## WebKitGTK stays on the system
 

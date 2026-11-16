@@ -117,6 +117,9 @@ struct Snap {
     snooze_until: Option<i64>,
 }
 
+/// Maximum review-draft body, in Unicode scalar values.
+pub const MAX_REVIEW_DRAFT_BODY_CHARS: usize = 100_000;
+
 impl crate::Store {
     pub fn set_agent_grant(
         &self,
@@ -146,6 +149,7 @@ impl crate::Store {
             ],
         )?;
         tx.commit()?;
+        self.seal_private_files()?;
         Ok(())
     }
 
@@ -334,6 +338,7 @@ impl crate::Store {
             params![action.id, draft_id],
         )?;
         tx.commit()?;
+        self.seal_private_files()?;
         Ok(SavedDraft {
             draft: ReviewDraft {
                 id: draft_id,
@@ -353,13 +358,39 @@ impl crate::Store {
     }
 
     pub fn list_review_drafts(&self, account_id: &AccountId) -> Result<Vec<ReviewDraft>> {
+        self.list_review_drafts_for(account_id, None)
+    }
+
+    /// Drafts on the account. When `actor` is set, only that actor's rows.
+    pub fn list_review_drafts_for(
+        &self,
+        account_id: &AccountId,
+        actor: Option<&str>,
+    ) -> Result<Vec<ReviewDraft>> {
         require_account(&self.conn, account_id)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
-                    in_reply_to, thread_id, created_unix
-             FROM review_drafts WHERE account_id = ?1 ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![account_id.as_str()], map_draft)?;
+        let actor = match actor {
+            Some(actor) => Some(require_token(actor, "actor")?),
+            None => None,
+        };
+        let sql = match actor {
+            Some(_) => {
+                "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
+                        in_reply_to, thread_id, created_unix
+                 FROM review_drafts
+                 WHERE account_id = ?1 AND actor = ?2
+                 ORDER BY id ASC"
+            }
+            None => {
+                "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
+                        in_reply_to, thread_id, created_unix
+                 FROM review_drafts WHERE account_id = ?1 ORDER BY id ASC"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = match actor {
+            Some(actor) => stmt.query_map(params![account_id.as_str(), actor], map_draft)?,
+            None => stmt.query_map(params![account_id.as_str()], map_draft)?,
+        };
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -418,6 +449,7 @@ impl crate::Store {
             params![action.id],
         )?;
         tx.commit()?;
+        self.seal_private_files()?;
         action.undone = true;
         Ok(action)
     }
@@ -482,6 +514,7 @@ impl crate::Store {
             )?;
         }
         tx.commit()?;
+        self.seal_private_files()?;
         Ok(Some(action))
     }
 }
@@ -550,6 +583,11 @@ fn normalize_addrs(addrs: &[String], field: &str, required: bool) -> Result<Vec<
         if addr.is_empty() || addr.chars().any(|c| c.is_control() || c == '\u{1e}') {
             return Err(Error::Invalid(format!("{field} has an invalid address")));
         }
+        if addr.contains(',') {
+            return Err(Error::Invalid(format!(
+                "{field} has more than one address; pass each address separately"
+            )));
+        }
         if !addr.contains('@') {
             return Err(Error::Invalid(format!("{field} address needs an @")));
         }
@@ -578,6 +616,11 @@ fn body_ok(body: &str) -> Result<()> {
         .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
     {
         return Err(Error::Invalid("body contains a control character".into()));
+    }
+    if body.chars().count() > MAX_REVIEW_DRAFT_BODY_CHARS {
+        return Err(Error::Invalid(format!(
+            "body is longer than {MAX_REVIEW_DRAFT_BODY_CHARS} characters"
+        )));
     }
     Ok(())
 }
@@ -1145,5 +1188,48 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn comma_joined_address_is_not_one_address() {
+        let (store, account_id, _) = seeded();
+        let err = store
+            .create_review_draft(
+                ReviewDraftInput {
+                    account_id,
+                    to: vec!["a@x, b@y".into()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "s".into(),
+                    body: "b".into(),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:bot",
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("more than one address"), "{message}");
+    }
+
+    #[test]
+    fn review_draft_body_is_capped() {
+        let (store, account_id, _) = seeded();
+        let err = store
+            .create_review_draft(
+                ReviewDraftInput {
+                    account_id,
+                    to: vec!["a@x".into()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "s".into(),
+                    body: "x".repeat(MAX_REVIEW_DRAFT_BODY_CHARS + 1),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:bot",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("longer than"));
     }
 }

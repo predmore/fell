@@ -22,7 +22,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 | `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
 | `fell-confirm` | Sealed `InteractiveUi` (private field, not `Default`). Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
 | `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
-| `fell-mcp` | MCP server. Search, read threads, list labels, triage, and review drafts. No send tool. Scopes stay off until enabled. |
+| `fell-mcp` | Stdio MCP server. Search, read threads, list labels, triage, and review drafts. No send tool. Scopes stay off until enabled. |
 
 ## Backends
 
@@ -80,7 +80,13 @@ An agent draft is a `review_drafts` row (`Store::list_review_drafts`), not a `Pe
 
 Triage (label, archive, mark read, snooze) writes an `agent_actions` row and the previous message state. `Store::undo` reverses the latest action on the account, including ones an agent took. `Store::undo_actor` reverses only that actor's latest action. Archive and snooze survive a later copy of the same Message-ID.
 
-Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a later UI) enables them. `read` covers search, reading a thread, and listing labels. `triage` covers the four triage tools and undo of those. `draft` covers saving and listing review drafts and undo of those. A disabled agent gets an empty tool list.
+Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a later UI) enables them. `read` covers search, reading a thread, and listing labels. `triage` covers the four triage tools and undo of those, and stays off unless that scope is granted. `draft` covers saving and listing review drafts and undo of those. A disabled agent gets an empty tool list. Mailbox changes are rate-limited.
+
+`fell-mcp` speaks MCP on stdio only. It does not listen on a socket. Any future network transport must bind to `127.0.0.1`, authenticate with a token file created mode `0600`, and check the `Origin` header.
+
+Search returns at most 20 hits per page: ids plus a short subject and snippet. Thread bodies are truncated. Draft bodies are capped when they are saved. Text that came from mail is returned as `{"untrusted":true,"source":"email","text":"..."}`. The model is told to treat `text` as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`.
+
+The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server. Neither is binding `in_reply_to` into the send-confirmation snapshot.
 
 ## First platform
 

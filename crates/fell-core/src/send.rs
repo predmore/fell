@@ -199,6 +199,43 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_does_not_cover_mutated_to_cc_or_bcc() {
+        let backend = FixtureBackend::default();
+        let pending = backend
+            .submit_draft(Draft {
+                account_id: AccountId("a1".into()),
+                to: vec!["b@x".into()],
+                cc: vec!["c@x".into()],
+                bcc: vec!["d@x".into()],
+                subject: "hi".into(),
+                body: "shown".into(),
+                in_reply_to: None,
+            })
+            .unwrap();
+        let confirm = mint(&pending);
+        for swapped in [
+            {
+                let mut draft = pending.clone();
+                draft.draft.to = vec!["other@x".into()];
+                draft
+            },
+            {
+                let mut draft = pending.clone();
+                draft.draft.cc = vec!["other@x".into()];
+                draft
+            },
+            {
+                let mut draft = pending.clone();
+                draft.draft.bcc = vec!["other@x".into()];
+                draft
+            },
+        ] {
+            let err = backend.confirm_send(swapped, confirm.clone()).unwrap_err();
+            assert!(matches!(err, crate::Error::SendUnconfirmed));
+        }
+    }
+
+    #[test]
     fn confirmation_does_not_cover_mutated_account_id() {
         let backend = FixtureBackend::default();
         let pending = backend.submit_draft(draft("shown")).unwrap();
