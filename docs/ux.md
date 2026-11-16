@@ -59,3 +59,13 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Direct vim keys (`j`, `e`, `gi`...) stay as they are; the leader is for less frequent actions and discovery, not a replacement.
 - Command palette (`:` and `Ctrl-Shift-p`): fuzzy search over every action, showing each action's key binding; recent actions first; runs on Enter with the current selection as the target.
 - Every action is reachable from the palette, and every chord shows in which-key, so nothing is hidden behind a memorized key.
+
+## Compose: styled markdown you edit as plain text
+- The composer is a markdown editor that styles as you type. The text you edit is always plain markdown (no hidden rich-text model, no toolbar needed), but headings, bold, italics, code, lists, quotes and links render styled in place, so the draft looks like the email the recipient will get.
+- Markdown markers (`**`, `#`, `>`, link URLs) stay editable: they show dimmed on the line the cursor is on and fold away elsewhere. Cursor movement, selection, undo and vim motions behave exactly as in plain text.
+- Inline images render in place, at a sensible max width. Paste or drag an image (or attach with a key) and it inserts a markdown image reference that displays as the image; deleting the reference removes the image. Images go out as inline CID parts, not links to anywhere.
+- Replies and forwards show the quoted original styled and collapsed below the draft, expandable, and keep its inline images.
+- A key toggles raw source view (no styling) for anyone who wants it; styled is the default.
+- Sending produces multipart/alternative: an HTML part rendered from the markdown with a small, conservative stylesheet that looks right in Gmail, Outlook and Proton, plus a text/plain part that is the markdown itself. Inline images go in multipart/related. A preview key shows the rendered HTML before send.
+- The rendering path is shared with the conversation view's native renderer so composed and received mail look consistent.
+- Judges need screenshots of a draft with headings, lists, a link, a quote and an inline image in dark and light themes, plus a recording of pasting an image and editing around it.

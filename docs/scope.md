@@ -37,7 +37,7 @@ Leader defaults to `Space` and is configurable. Chords are grouped under it, wit
 The move action itself ships in M3. PR3 only leaves room for it.
 
 ## Out of scope for v1
-Direct Proton API backend; calendar, contacts, rules/filters; rich HTML compose (v1 composes plain text and Markdown); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
+Direct Proton API backend; calendar, contacts, rules/filters; a WYSIWYG toolbar or HTML-source compose (v1 composes styled Markdown with inline images, see docs/ux.md); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
 
 ## Packaging
 Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
