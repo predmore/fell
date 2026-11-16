@@ -41,7 +41,7 @@ cargo run -p fell
 
 A push to `main` builds a release x86_64 binary and uploads two GitHub Actions artifacts (not a GitHub Release): `fell-x86_64-linux.tar.gz` (binary, `.desktop` file, and icon) and `fell-x86_64.AppImage`.
 
-Neither artifact bundles WebKitGTK. `wry` stays dynamically linked to the system library, so the LGPL code stays out of the crate graph and out of the download. Install `libwebkit2gtk-4.1-0` (Debian/Ubuntu) or `webkit2gtk-4.1` (Arch) for the newsletter web view. The native UI does not need it. Details: [packaging/linux/README.md](packaging/linux/README.md).
+This nightly binary does not link WebKitGTK. `readelf -d` on the release `fell` has no `libwebkit2gtk` `NEEDED` entry, and `wry` is not a dependency yet, so it launches without the distro package. Neither artifact bundles the library. Once the newsletter fallback is compiled in, `webkit2gtk` is a runtime requirement (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch) and must stay dynamically linked, so the LGPL library stays out of the crate graph and out of these artifacts. Details: [packaging/linux/README.md](packaging/linux/README.md).
 
 ## License
 

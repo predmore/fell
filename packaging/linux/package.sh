@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Nightly x86_64 artifacts: a tarball and an AppImage.
 #
-# WebKitGTK is LGPL. wry stays dynamically linked to the system library
-# (not a crate), so cargo-deny never sees it. linuxdeploy excludes
+# The current release binary does not link WebKitGTK (no libwebkit2gtk in
+# DT_NEEDED). wry is not a crate yet. linuxdeploy still excludes
 # libwebkit2gtk and libjavascriptcoregtk, and this script fails if either
-# artifact contains them. Runtime package: libwebkit2gtk-4.1-0
-# (Debian/Ubuntu) or webkit2gtk-4.1 (Arch).
+# artifact contains them, so a later fallback cannot start bundling the
+# LGPL library. Once that fallback is compiled in, the distro package is a
+# runtime requirement: libwebkit2gtk-4.1-0 (Debian/Ubuntu) or
+# webkit2gtk-4.1 (Arch).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -79,8 +81,8 @@ deploy_bin=$work/fell
 cp "$bin" "$deploy_bin"
 chmod +x "$deploy_bin"
 
-# Bundled plugin creates the AppImage. Do not bundle WebKitGTK: the image
-# must keep the system SONAME and load the distro library at runtime.
+# Do not bundle WebKitGTK. This binary has no WebKit SONAME. If a later
+# build adds one, leave it out so the distro library is used at runtime.
 export APPIMAGE_EXTRACT_AND_RUN=1
 export ARCH=x86_64
 export LDAI_OUTPUT=$appimage
@@ -126,8 +128,10 @@ if grep -Ei 'webkit2gtk|javascriptcoregtk|WebKitNetworkProcess|WebKitWebProcess|
   exit 1
 fi
 
-if readelf -d "$stage/fell" | grep -E 'NEEDED' | grep -Ei 'webkit|javascriptcore'; then
+if readelf -d "$stage/fell" | grep NEEDED | grep -Ei 'webkit|javascriptcore'; then
   echo "fell dynamically links WebKitGTK; artifacts leave the .so on the system"
+else
+  echo "fell does not link WebKitGTK (no libwebkit2gtk in DT_NEEDED)"
 fi
 
 echo "tarball:  $tarball"

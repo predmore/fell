@@ -42,4 +42,4 @@ The MCP stub is MIT like the rest of the workspace. Agent tools may search, summ
 
 ## WebKitGTK stays on the system
 
-The newsletter web view uses WebKitGTK via `wry`, dynamically linked. That library is LGPL, so it is not a crate and nightly Linux artifacts do not bundle it. The tarball and the AppImage both depend on the distro package (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch). Native GPUI rendering does not load it. `cargo deny` still rejects LGPL in the crate graph. See [packaging/linux/README.md](../packaging/linux/README.md).
+The current nightly `fell` binary does not link WebKitGTK. `readelf -d` shows no `libwebkit2gtk` `NEEDED` entry, and `wry` is not in the crate graph, so `cargo deny` still sees no LGPL. The tarball and the AppImage do not bundle the library. Once the newsletter fallback is compiled in, that view uses WebKitGTK via `wry`, dynamically linked, and the distro package (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch) is a runtime requirement. See [packaging/linux/README.md](../packaging/linux/README.md).

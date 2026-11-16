@@ -3,10 +3,12 @@ name: Linux artifacts
 # Push to main only. Two downloadable artifacts, not a GitHub Release:
 # fell-x86_64-linux.tar.gz and fell-x86_64.AppImage.
 #
-# WebKitGTK is LGPL. wry stays dynamically linked to the system library
-# (not a crate), and neither artifact bundles it. Runtime package:
-# libwebkit2gtk-4.1-0 (Debian/Ubuntu) or webkit2gtk-4.1 (Arch).
-# cargo-deny still rejects LGPL in the crate graph.
+# WebKitGTK is LGPL and is not bundled. The current fell binary does not
+# link it (no libwebkit2gtk in DT_NEEDED; wry is not a dependency), so this
+# job does not install libwebkit2gtk-4.1-dev. linuxdeploy still excludes
+# libwebkit2gtk and libjavascriptcoregtk. Once the newsletter fallback is
+# compiled in, the distro package is a runtime requirement and must stay
+# dynamically linked. cargo-deny still rejects LGPL in the crate graph.
 
 on:
   push:

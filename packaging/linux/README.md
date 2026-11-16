@@ -18,11 +18,9 @@ Run `./fell`. For a launcher, copy the binary onto `PATH`, the desktop file to `
 
 ## WebKitGTK
 
-WebKitGTK is not in the tarball or the AppImage. The newsletter web view uses `wry`, dynamically linked against the system library, so these builds do not redistribute LGPL code and `cargo deny` stays clean.
+This nightly binary does not link WebKitGTK. `readelf -d` on `fell` has no `libwebkit2gtk` `NEEDED` entry, so the app launches without the distro package. The library is not in the tarball or the AppImage.
 
-Install the distro package:
+Once the newsletter fallback is compiled in, `webkit2gtk` is a runtime requirement and must stay dynamically linked, not bundled:
 
 - Debian or Ubuntu: `libwebkit2gtk-4.1-0`
 - Arch: `webkit2gtk-4.1`
-
-The native GPUI UI does not load WebKitGTK. The web view fallback does.
