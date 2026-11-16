@@ -30,6 +30,8 @@ pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 pub enum Error {
     #[error("store: {0}")]
     Store(#[from] rusqlite::Error),
+    #[error("search: {0}")]
+    Search(String),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]

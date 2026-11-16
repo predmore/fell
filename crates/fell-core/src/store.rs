@@ -6,8 +6,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
-use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
-use crate::search::{SearchHit, fts5_phrase};
+use crate::message::{
+    Address, Message, MessageHeaders, MessageId, RemoteId, decode_addresses, encode_addresses,
+};
+use crate::search::{IndexedText, SearchResults, sync_terms, terms_for_indexed};
 use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 const SCHEMA: &str = r#"
@@ -44,6 +46,10 @@ CREATE TABLE IF NOT EXISTS messages (
     folders TEXT NOT NULL DEFAULT '',
     labels TEXT NOT NULL DEFAULT '',
     arrived_via TEXT NOT NULL DEFAULT '',
+    to_line TEXT NOT NULL DEFAULT '',
+    cc_line TEXT NOT NULL DEFAULT '',
+    bcc_line TEXT NOT NULL DEFAULT '',
+    has_attachment INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(account_id) REFERENCES accounts(id),
     UNIQUE (account_id, message_id)
 );
@@ -54,36 +60,72 @@ CREATE INDEX IF NOT EXISTS idx_messages_account_date ON messages(account_id, dat
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject,
     sender,
+    recipients,
     body,
     account_id UNINDEXED,
     message_id UNINDEXED
 );
+"#;
 
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(subject, sender, body, account_id, message_id)
-    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet),
-            new.account_id, new.message_id);
+const FTS_TABLE: &str = r#"
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    subject,
+    sender,
+    recipients,
+    body,
+    account_id UNINDEXED,
+    message_id UNINDEXED
+);
+"#;
+
+const FTS_TRIGGERS: &str = r#"
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
+    VALUES (
+        new.subject,
+        trim(coalesce(new.from_name, '') || ' ' || new.from_email),
+        trim(
+            replace(replace(new.to_line, char(31), ' '), char(30), ' ') || ' ' ||
+            replace(replace(new.cc_line, char(31), ' '), char(30), ' ') || ' ' ||
+            replace(replace(new.bcc_line, char(31), ' '), char(30), ' ')
+        ),
+        COALESCE(new.body_text, new.snippet),
+        new.account_id,
+        new.message_id
+    );
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts
     WHERE account_id = old.account_id AND message_id = old.message_id;
 END;
 
-DROP TRIGGER IF EXISTS messages_au;
-CREATE TRIGGER messages_au AFTER UPDATE OF subject, from_email, body_text, snippet ON messages BEGIN
+CREATE TRIGGER messages_au AFTER UPDATE OF
+    subject, from_name, from_email, body_text, snippet, to_line, cc_line, bcc_line
+ON messages BEGIN
     DELETE FROM messages_fts
     WHERE account_id = old.account_id AND message_id = old.message_id;
-    INSERT INTO messages_fts(subject, sender, body, account_id, message_id)
-    VALUES (new.subject, new.from_email, COALESCE(new.body_text, new.snippet),
-            new.account_id, new.message_id);
+    INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
+    VALUES (
+        new.subject,
+        trim(coalesce(new.from_name, '') || ' ' || new.from_email),
+        trim(
+            replace(replace(new.to_line, char(31), ' '), char(30), ' ') || ' ' ||
+            replace(replace(new.cc_line, char(31), ' '), char(30), ' ') || ' ' ||
+            replace(replace(new.bcc_line, char(31), ' '), char(30), ' ')
+        ),
+        COALESCE(new.body_text, new.snippet),
+        new.account_id,
+        new.message_id
+    );
 END;
 "#;
 
 const SELECT_MESSAGE_COLS: &str =
     "account_id, message_id, remote_id, thread_id, proton_conversation_id,
         in_reply_to, references_header, from_name, from_email, subject,
-        date_unix, snippet, body_text, unread, folders, labels, arrived_via";
+        date_unix, snippet, body_text, unread, folders, labels, arrived_via,
+        to_line, cc_line, bcc_line, has_attachment";
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
@@ -113,8 +155,12 @@ impl Store {
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
+        ensure_fts(&conn)?;
+        crate::search::ensure_vocabulary(&conn)?;
+        crate::search::rebuild_vocabulary_if_empty(&conn)?;
         conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')",
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
         Ok(Self { conn })
@@ -249,30 +295,14 @@ impl Store {
         Ok(out)
     }
 
-    pub fn search(&self, account_id: &AccountId, query: &str) -> Result<Vec<SearchHit>> {
-        if query.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let phrase = fts5_phrase(query);
-        let mut stmt = self.conn.prepare(
-            "SELECT m.message_id, m.thread_id, m.subject, m.snippet
-             FROM messages_fts
-             JOIN messages m
-               ON m.message_id = messages_fts.message_id
-              AND m.account_id = messages_fts.account_id
-             WHERE m.account_id = ?1 AND messages_fts MATCH ?2
-             ORDER BY rank",
-        )?;
-        let rows = stmt.query_map(params![account_id.as_str(), phrase], |row| {
-            Ok(SearchHit {
-                message_id: MessageId(row.get(0)?),
-                thread_id: ThreadId(row.get(1)?),
-                subject: row.get(2)?,
-                snippet: row.get(3)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+    /// Search one account in the local store.
+    ///
+    /// This reads SQLite only. It never calls a backend, so the hits change
+    /// only after a local write. One hit per thread, best BM25 message first.
+    /// When the typed query misses and a trigram correction hits, `did_you_mean`
+    /// is set and `hits` are the corrected results.
+    pub fn search(&self, account_id: &AccountId, query: &str) -> Result<SearchResults> {
+        crate::search::execute(&self.conn, account_id, query)
     }
 }
 
@@ -333,13 +363,20 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
         thread_id_for_message_id(conn, account_id, parent)
     })?;
     let references = references_header(&message.headers);
+    let folders = union_tokens("", &message.folders, false);
+    let labels = union_tokens("", &message.labels, false);
+    let to_line = encode_addresses(&message.to);
+    let cc_line = encode_addresses(&message.cc);
+    let bcc_line = encode_addresses(&message.bcc);
     conn.execute(
         "INSERT INTO messages (
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
-            date_unix, snippet, body_text, unread, folders, labels, arrived_via
+            date_unix, snippet, body_text, unread, folders, labels, arrived_via,
+            to_line, cc_line, bcc_line, has_attachment
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+            ?18, ?19, ?20, ?21
          )",
         params![
             message.account_id.as_str(),
@@ -356,11 +393,28 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
             message.snippet,
             message.body_text,
             i64::from(message.unread),
-            union_tokens("", &message.folders, false),
-            union_tokens("", &message.labels, false),
+            folders,
+            labels,
             union_tokens("", &message.arrived_via, true),
+            to_line,
+            cc_line,
+            bcc_line,
+            i64::from(message.has_attachment),
         ],
     )?;
+    let body = message.body_text.as_deref().unwrap_or(&message.snippet);
+    let terms = terms_for_indexed(IndexedText {
+        subject: &message.headers.subject,
+        from_name: message.headers.from.name.as_deref(),
+        from_email: &message.headers.from.email,
+        body,
+        to_line: &to_line,
+        cc_line: &cc_line,
+        bcc_line: &bcc_line,
+        folders: &folders,
+        labels: &labels,
+    });
+    sync_terms(conn, message.account_id.as_str(), &HashSet::new(), &terms)?;
     Ok(thread_id)
 }
 
@@ -373,6 +427,21 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
     let folders = union_tokens(&stored.folders, &message.folders, false);
     let labels = union_tokens(&stored.labels, &message.labels, false);
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
+    let to_line = union_addresses(&stored.to_line, &message.to);
+    let cc_line = union_addresses(&stored.cc_line, &message.cc);
+    let bcc_line = union_addresses(&stored.bcc_line, &message.bcc);
+    let has_attachment = stored.has_attachment || message.has_attachment;
+    let old_terms = terms_for_indexed(IndexedText {
+        subject: &stored.subject,
+        from_name: stored.from_name.as_deref(),
+        from_email: &stored.from_email,
+        body: &stored.body,
+        to_line: &stored.to_line,
+        cc_line: &stored.cc_line,
+        bcc_line: &stored.bcc_line,
+        folders: &stored.folders,
+        labels: &stored.labels,
+    });
     conn.execute(
         "UPDATE messages SET
             remote_id = ?1,
@@ -389,8 +458,12 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
             unread = ?12,
             folders = ?13,
             labels = ?14,
-            arrived_via = ?15
-         WHERE account_id = ?16 AND message_id = ?17",
+            arrived_via = ?15,
+            to_line = ?16,
+            cc_line = ?17,
+            bcc_line = ?18,
+            has_attachment = ?19
+         WHERE account_id = ?20 AND message_id = ?21",
         params![
             message.remote_id.0,
             thread_id.as_str(),
@@ -407,10 +480,27 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
             folders,
             labels,
             arrived_via,
+            to_line,
+            cc_line,
+            bcc_line,
+            i64::from(has_attachment),
             message.account_id.as_str(),
             message.headers.message_id.as_str(),
         ],
     )?;
+    let body = message.body_text.as_deref().unwrap_or(&message.snippet);
+    let new_terms = terms_for_indexed(IndexedText {
+        subject: &message.headers.subject,
+        from_name: message.headers.from.name.as_deref(),
+        from_email: &message.headers.from.email,
+        body,
+        to_line: &to_line,
+        cc_line: &cc_line,
+        bcc_line: &bcc_line,
+        folders: &folders,
+        labels: &labels,
+    });
+    sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
     Ok(thread_id)
 }
 
@@ -418,6 +508,14 @@ struct Arrival {
     folders: String,
     labels: String,
     arrived_via: String,
+    to_line: String,
+    cc_line: String,
+    bcc_line: String,
+    has_attachment: bool,
+    subject: String,
+    from_name: Option<String>,
+    from_email: String,
+    body: String,
 }
 
 fn find_arrival(
@@ -427,7 +525,9 @@ fn find_arrival(
 ) -> Result<Option<Arrival>> {
     let hit = conn
         .query_row(
-            "SELECT folders, labels, arrived_via FROM messages
+            "SELECT folders, labels, arrived_via, to_line, cc_line, bcc_line, has_attachment,
+                    subject, from_name, from_email, COALESCE(body_text, snippet)
+             FROM messages
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), message_id.as_str()],
             |row| {
@@ -435,11 +535,35 @@ fn find_arrival(
                     folders: row.get(0)?,
                     labels: row.get(1)?,
                     arrived_via: row.get(2)?,
+                    to_line: row.get(3)?,
+                    cc_line: row.get(4)?,
+                    bcc_line: row.get(5)?,
+                    has_attachment: row.get::<_, i64>(6)? != 0,
+                    subject: row.get(7)?,
+                    from_name: row.get(8)?,
+                    from_email: row.get(9)?,
+                    body: row.get(10)?,
                 })
             },
         )
         .optional()?;
     Ok(hit)
+}
+
+fn union_addresses(existing: &str, incoming: &[Address]) -> String {
+    let mut out = decode_addresses(existing);
+    let mut seen: HashSet<String> = out.iter().map(|addr| addr.email.to_lowercase()).collect();
+    for addr in incoming {
+        let email = addr.email.trim();
+        if email.is_empty() || !seen.insert(email.to_lowercase()) {
+            continue;
+        }
+        out.push(Address {
+            name: addr.name.clone(),
+            email: email.to_string(),
+        });
+    }
+    encode_addresses(&out)
 }
 
 /// Threading columns only — bodies stay on disk.
@@ -664,12 +788,74 @@ fn ensure_message_columns(conn: &Connection) -> Result<()> {
             "arrived_via",
             "ALTER TABLE messages ADD COLUMN arrived_via TEXT NOT NULL DEFAULT ''",
         ),
+        (
+            "to_line",
+            "ALTER TABLE messages ADD COLUMN to_line TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "cc_line",
+            "ALTER TABLE messages ADD COLUMN cc_line TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "bcc_line",
+            "ALTER TABLE messages ADD COLUMN bcc_line TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "has_attachment",
+            "ALTER TABLE messages ADD COLUMN has_attachment INTEGER NOT NULL DEFAULT 0",
+        ),
     ];
     for (name, ddl) in missing {
         if !have.iter().any(|column| column == name) {
             conn.execute(ddl, [])?;
         }
     }
+    Ok(())
+}
+
+fn ensure_fts(conn: &Connection) -> Result<()> {
+    let have = column_names(conn, "messages_fts")?;
+    let needed = [
+        "subject",
+        "sender",
+        "recipients",
+        "body",
+        "account_id",
+        "message_id",
+    ];
+    let current = needed
+        .iter()
+        .all(|name| have.iter().any(|column| column == name));
+    if !current {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_ai;
+             DROP TRIGGER IF EXISTS messages_ad;
+             DROP TRIGGER IF EXISTS messages_au;
+             DROP TABLE IF EXISTS messages_fts;",
+        )?;
+        conn.execute_batch(FTS_TABLE)?;
+        conn.execute_batch(
+            "INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
+             SELECT
+                subject,
+                trim(coalesce(from_name, '') || ' ' || from_email),
+                trim(
+                    replace(replace(to_line, char(31), ' '), char(30), ' ') || ' ' ||
+                    replace(replace(cc_line, char(31), ' '), char(30), ' ') || ' ' ||
+                    replace(replace(bcc_line, char(31), ' '), char(30), ' ')
+                ),
+                COALESCE(body_text, snippet),
+                account_id,
+                message_id
+             FROM messages",
+        )?;
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_ai;
+         DROP TRIGGER IF EXISTS messages_ad;
+         DROP TRIGGER IF EXISTS messages_au;",
+    )?;
+    conn.execute_batch(FTS_TRIGGERS)?;
     Ok(())
 }
 
@@ -708,6 +894,10 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         folders: split_field(&row.get::<_, String>(14)?),
         labels: split_field(&row.get::<_, String>(15)?),
         arrived_via: split_field(&row.get::<_, String>(16)?),
+        to: decode_addresses(&row.get::<_, String>(17)?),
+        cc: decode_addresses(&row.get::<_, String>(18)?),
+        bcc: decode_addresses(&row.get::<_, String>(19)?),
+        has_attachment: row.get::<_, i64>(20)? != 0,
     })
 }
 
@@ -765,6 +955,10 @@ mod tests {
             folders: Vec::new(),
             labels: Vec::new(),
             arrived_via: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            has_attachment: false,
         }
     }
 
@@ -833,10 +1027,11 @@ mod tests {
             .upsert_message(&msg("b@x", None, None, "Hello", "unrelated"))
             .unwrap();
         let hits = store.search(&AccountId("a1".into()), "Invoice").unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id.as_str(), "a@x");
+        assert!(hits.did_you_mean.is_none());
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].message_id.as_str(), "a@x");
         let body_hits = store.search(&AccountId("a1".into()), "pay me").unwrap();
-        assert_eq!(body_hits.len(), 1);
+        assert_eq!(body_hits.hits.len(), 1);
     }
 
     #[test]
@@ -1140,12 +1335,14 @@ mod tests {
             store
                 .search(&AccountId("a1".into()), "replybody")
                 .unwrap()
+                .hits
                 .is_empty()
         );
         assert_eq!(
             store
                 .search(&AccountId("a1".into()), "rootbody")
                 .unwrap()
+                .hits
                 .len(),
             1
         );
@@ -1333,6 +1530,7 @@ mod tests {
             store
                 .search(&AccountId("a1".into()), "hello body")
                 .unwrap()
+                .hits
                 .len(),
             1
         );
@@ -1351,5 +1549,491 @@ mod tests {
         let threads = store.list_threads(&AccountId("a1".into())).unwrap();
         assert_eq!(threads.len(), 2);
         assert!(threads.iter().all(|thread| thread.message_count == 1));
+    }
+
+    fn seed_search() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store.upsert_account(&account_b()).unwrap();
+
+        let mut ada = msg(
+            "ada@msg",
+            None,
+            None,
+            "March invoice",
+            "please pay the march invoice",
+        );
+        ada.headers.from = Address {
+            name: Some("Ada Lovelace".into()),
+            email: "ada@x.com".into(),
+        };
+        ada.headers.date_unix = crate::search::parse_ymd("2024-03-02").unwrap() + 3600;
+        ada.to.push(Address {
+            name: Some("Bo Lee".into()),
+            email: "bo@x.com".into(),
+        });
+        ada.cc.push(Address {
+            name: None,
+            email: "cc@x.com".into(),
+        });
+        ada.folders = vec!["INBOX".into()];
+        ada.labels = vec!["work".into()];
+        ada.unread = true;
+        ada.has_attachment = true;
+
+        let mut reply = msg(
+            "reply-ada@msg",
+            None,
+            Some("ada@msg"),
+            "Re: March invoice",
+            "thanks will pay",
+        );
+        reply.headers.from = Address {
+            name: Some("Bo Lee".into()),
+            email: "bo@x.com".into(),
+        };
+        reply.headers.date_unix = crate::search::parse_ymd("2024-03-03").unwrap();
+        reply.folders = vec!["INBOX".into()];
+        reply.unread = false;
+
+        let mut archived = msg(
+            "other@msg",
+            None,
+            None,
+            "Weekend plan",
+            "the word work appears in the body but not as a label",
+        );
+        archived.headers.from = Address {
+            name: Some("Cara".into()),
+            email: "cara@x.com".into(),
+        };
+        archived.headers.date_unix = crate::search::parse_ymd("2024-04-01").unwrap();
+        archived.to.push(Address {
+            name: None,
+            email: "ada@x.com".into(),
+        });
+        archived.folders = vec!["Archive".into()];
+        archived.labels = vec!["workspace".into()];
+        archived.unread = false;
+        archived.snippet = archived.body_text.clone().unwrap_or_default();
+
+        let mut quiet = msg("bcc@msg", None, None, "Quiet note", "secret plan");
+        quiet.bcc.push(Address {
+            name: None,
+            email: "hidden@x.com".into(),
+        });
+        quiet.folders = vec!["INBOX".into()];
+        quiet.unread = true;
+        quiet.headers.date_unix = crate::search::parse_ymd("2024-03-04").unwrap();
+
+        let mut foreign = msg_for(
+            "a2",
+            "foreign@msg",
+            None,
+            None,
+            "March invoice",
+            "please pay the march invoice",
+        );
+        foreign.folders = vec!["INBOX".into()];
+        foreign.labels = vec!["work".into()];
+        foreign.has_attachment = true;
+
+        let mut subject_rank = msg("subj@msg", None, None, "zebraunique", "hello there");
+        subject_rank.headers.date_unix = crate::search::parse_ymd("2024-05-01").unwrap();
+        let mut body_rank = msg(
+            "body@msg",
+            None,
+            None,
+            "ordinary note",
+            &format!("{} zebraunique", "padding ".repeat(40)),
+        );
+        body_rank.headers.date_unix = crate::search::parse_ymd("2024-05-02").unwrap();
+        body_rank.snippet = "zebraunique".into();
+
+        for message in [
+            ada,
+            reply,
+            archived,
+            quiet,
+            foreign,
+            subject_rank,
+            body_rank,
+        ] {
+            store.upsert_message(&message).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn search_groups_threads_and_ranks_subject_over_body() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let invoice = store.search(&account, "invoice").unwrap();
+        assert!(invoice.did_you_mean.is_none());
+        assert_eq!(invoice.hits.len(), 1);
+        assert_eq!(
+            invoice.hits[0].thread_id,
+            ThreadId::from_message_id(&MessageId::new("ada@msg"))
+        );
+        let ranked = store.search(&account, "zebraunique").unwrap();
+        assert_eq!(ranked.hits.len(), 2);
+        assert_eq!(ranked.hits[0].message_id.as_str(), "subj@msg");
+        assert_eq!(ranked.hits[1].message_id.as_str(), "body@msg");
+    }
+
+    #[test]
+    fn search_operators_filter_the_same_message() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let from_ada = store.search(&account, "from:ada invoice").unwrap();
+        assert_eq!(from_ada.hits.len(), 1);
+        assert!(
+            store
+                .search(&account, "from:cara invoice")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search(&account, "from:\"Ada Lovelace\"")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(store.search(&account, "to:bo@x.com").unwrap().hits.len(), 1);
+        assert_eq!(store.search(&account, "to:cc@x.com").unwrap().hits.len(), 1);
+        assert_eq!(
+            store
+                .search(&account, "to:hidden@x.com")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search(&account, "to:hidden@x.com from:cara")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search(&account, "subject:invoice")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search(&account, "subject:secret")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search(&account, "in:inbox label:work")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search(&account, "label:work")
+                .unwrap()
+                .hits
+                .iter()
+                .all(|hit| hit.message_id.as_str() != "other@msg")
+        );
+        assert!(
+            store
+                .search(&account, "in:inbox")
+                .unwrap()
+                .hits
+                .iter()
+                .all(|hit| hit.message_id.as_str() != "other@msg")
+        );
+        assert_eq!(
+            store.search(&account, "has:attachment").unwrap().hits.len(),
+            1
+        );
+        assert_eq!(
+            store.search(&account, "has:attachment").unwrap().hits[0]
+                .message_id
+                .as_str(),
+            "ada@msg"
+        );
+        let unread_work = store.search(&account, "is:unread label:work").unwrap();
+        assert_eq!(unread_work.hits.len(), 1);
+        assert_eq!(unread_work.hits[0].message_id.as_str(), "ada@msg");
+        assert!(
+            store
+                .search(&account, "is:unread label:workspace")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let march = store
+            .search(&account, "after:2024-03-03 before:2024-03-05")
+            .unwrap();
+        let ids: Vec<_> = march
+            .hits
+            .iter()
+            .map(|hit| hit.message_id.as_str())
+            .collect();
+        assert!(ids.contains(&"reply-ada@msg"));
+        assert!(ids.contains(&"bcc@msg"));
+        assert!(!ids.contains(&"ada@msg"));
+        assert!(
+            store
+                .search(&account, "before:2024-03-03 after:2024-04-01")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert!(
+            store
+                .search(&account, "in:INBOX' OR '1'='1")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let quoted = store.search(&account, "\"pay the march\"").unwrap();
+        assert_eq!(quoted.hits.len(), 1);
+        assert!(
+            store
+                .search(&account, "\"march the pay\"")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            store.search(&account, "march the pay").unwrap().hits.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_stays_inside_the_account() {
+        let store = seed_search();
+        let local = store.search(&AccountId("a1".into()), "invoice").unwrap();
+        let foreign = store.search(&AccountId("a2".into()), "invoice").unwrap();
+        assert_eq!(local.hits.len(), 1);
+        assert_eq!(foreign.hits.len(), 1);
+        assert_eq!(foreign.hits[0].message_id.as_str(), "foreign@msg");
+        assert_ne!(local.hits[0].message_id, foreign.hits[0].message_id);
+    }
+
+    #[test]
+    fn trigram_did_you_mean_rewrites_a_miss_and_keeps_operators() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let trigrams: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_trigrams WHERE account_id = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigrams > 0);
+        let transposed = store.search(&account, "invioce").unwrap();
+        assert_eq!(transposed.did_you_mean.as_deref(), Some("invoice"));
+        assert_eq!(transposed.hits.len(), 1);
+        let distant = store.search(&account, "invose").unwrap();
+        assert_eq!(distant.did_you_mean.as_deref(), Some("invoice"));
+        assert_eq!(distant.hits.len(), 1);
+        let with_op = store.search(&account, "from:ada invose").unwrap();
+        assert_eq!(with_op.did_you_mean.as_deref(), Some("from:ada invoice"));
+        assert_eq!(with_op.hits.len(), 1);
+        let flag = store.search(&account, "has:attachement").unwrap();
+        assert_eq!(flag.did_you_mean.as_deref(), Some("has:attachment"));
+        assert_eq!(flag.hits[0].message_id.as_str(), "ada@msg");
+        let folder = store.search(&account, "in:inbx").unwrap();
+        assert_eq!(folder.did_you_mean.as_deref(), Some("in:inbox"));
+        assert!(!folder.hits.is_empty());
+        let label = store.search(&account, "label:wrk").unwrap();
+        assert_eq!(label.did_you_mean.as_deref(), Some("label:work"));
+        assert_eq!(label.hits.len(), 1);
+        assert!(store.search(&account, "").unwrap().hits.is_empty());
+        assert!(
+            store
+                .search(&account, "from:ada invoice")
+                .unwrap()
+                .did_you_mean
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn search_follows_local_writes_without_a_backend() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut message = msg(
+            "local@msg",
+            None,
+            None,
+            "Alpha subject",
+            "alphaonly uniquebody",
+        );
+        store.upsert_message(&message).unwrap();
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "uniquebody")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        message.headers.subject = "Beta subject".into();
+        message.body_text = Some("betaonly uniquebody".into());
+        message.snippet = "betaonly uniquebody".into();
+        store.upsert_message(&message).unwrap();
+        assert!(
+            store
+                .search(&AccountId("a1".into()), "alphaonly")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert!(
+            store
+                .search(&AccountId("a1".into()), "subject:Alpha")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let hits = store.search(&AccountId("a1".into()), "betaonly").unwrap();
+        assert!(hits.did_you_mean.is_none());
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].message_id.as_str(), "local@msg");
+    }
+
+    #[test]
+    fn same_id_unions_recipients_and_attachment_flag() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg("same@x", None, None, "Hello", "body");
+        first.to.push(Address {
+            name: Some("Ada".into()),
+            email: "ada@x.com".into(),
+        });
+        let mut second = msg("same@x", None, None, "Hello", "body");
+        second.cc.push(Address {
+            name: None,
+            email: "bob@x.com".into(),
+        });
+        second.has_attachment = true;
+        store.upsert_message(&first).unwrap();
+        store.upsert_message(&second).unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        let msgs = store
+            .thread_messages(&AccountId("a1".into()), &threads[0].thread_id)
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].to, first.to);
+        assert_eq!(msgs[0].cc[0].email, "bob@x.com");
+        assert!(msgs[0].has_attachment);
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "to:bob@x.com")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "has:attachment")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_reads_a_database_from_before_recipient_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-m2-migrate-{}-pre-recipients.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    arrived_via TEXT NOT NULL DEFAULT '',
+                    UNIQUE (account_id, message_id)
+                 );
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(
+                    subject, sender, body, account_id UNINDEXED, message_id UNINDEXED
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                 VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders
+                 ) VALUES (
+                    'a1', 'old@x', 'r1', 'msgid:old@x', '',
+                    'ada@x.com', 'March invoice', 10, 'please pay', 'please pay the invoice', 1, 'INBOX'
+                 );",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let hits = store.search(&AccountId("a1".into()), "invioce").unwrap();
+        assert_eq!(hits.did_you_mean.as_deref(), Some("invoice"));
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].message_id.as_str(), "old@x");
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "in:inbox from:ada")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }
