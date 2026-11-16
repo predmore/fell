@@ -1,8 +1,13 @@
-//! MCP server stub for Fell.
+//! MCP server for Fell.
 //!
-//! Planned tools: search, summarize, triage, draft. There is **no send tool**.
-//! Sending mail requires [`fell_core::UserSendConfirmation`] minted by the
-//! GPUI app via `fell_confirm::InteractiveUi`. This crate must not depend on
+//! Tools: search, read threads, list labels, triage (label, archive, mark
+//! read, snooze), and drafts saved for review. Scopes (read / triage / draft)
+//! stay off until a person enables them. Triage and drafts are logged and
+//! undoable.
+//!
+//! There is **no send tool**. Sending mail requires
+//! [`fell_core::UserSendConfirmation`] minted by the GPUI app via
+//! `fell_confirm::InteractiveUi`. This crate must not depend on
 //! `fell-confirm`.
 //!
 //! ```compile_fail
@@ -22,69 +27,38 @@
 //! let _ = UserSendConfirmation::from_interactive_ui(&Default::default(), &pending);
 //! ```
 
-use fell_core::{AccountId, Draft, SearchHit, Store, ThreadId};
+#![forbid(unsafe_code)]
 
-/// Agent-facing tools. Intentionally excludes send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentTool {
-    Search { query: String },
-    Summarize { thread_id: ThreadId },
-    Triage { thread_id: ThreadId },
-    DraftReply { thread_id: ThreadId, body: String },
-}
+mod cli;
+mod protocol;
+mod tools;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentToolResult {
-    Search(Vec<SearchHit>),
-    Summary(String),
-    Triage(TriageSuggestion),
-    Draft(Draft),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TriageSuggestion {
-    pub thread_id: ThreadId,
-    pub label: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum McpError {
-    #[error(transparent)]
-    Core(#[from] fell_core::Error),
-    #[error("{0} is not implemented yet")]
-    NotImplemented(&'static str),
-}
-
-/// Execute a read/draft tool against the local store. Never sends.
-pub fn dispatch(
-    _store: &Store,
-    _account: &AccountId,
-    tool: AgentTool,
-) -> Result<AgentToolResult, McpError> {
-    match tool {
-        AgentTool::Search { .. } => Err(McpError::NotImplemented("mcp search")),
-        AgentTool::Summarize { .. } => Err(McpError::NotImplemented("mcp summarize")),
-        AgentTool::Triage { .. } => Err(McpError::NotImplemented("mcp triage")),
-        AgentTool::DraftReply { .. } => Err(McpError::NotImplemented("mcp draft")),
-    }
-}
+pub use cli::cli_main;
+pub use protocol::Session;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn no_send_variant() {
-        let names = ["search", "summarize", "triage", "draft"];
-        assert!(names.iter().all(|n| *n != "send"));
-        let err = dispatch(
-            &Store::open_in_memory().unwrap(),
-            &AccountId("a".into()),
-            AgentTool::Search {
-                query: "invoice".into(),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, McpError::NotImplemented(_)));
+    fn mcp_sources_do_not_mint_send_tokens() {
+        const FILES: &[&str] = &[
+            include_str!("../Cargo.toml"),
+            include_str!("cli.rs"),
+            include_str!("tools.rs"),
+            include_str!("protocol.rs"),
+            include_str!("main.rs"),
+        ];
+        const BANNED: &[&str] = &[
+            "fell_confirm",
+            "fell-confirm",
+            "for_fell_app",
+            "InteractiveUi",
+            "from_interactive_ui",
+            "UserSendConfirmation",
+        ];
+        for file in FILES {
+            for word in BANNED {
+                assert!(!file.contains(word), "{word} appeared in an MCP source");
+            }
+        }
     }
 }

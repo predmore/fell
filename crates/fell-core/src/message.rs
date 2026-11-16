@@ -67,6 +67,10 @@ pub struct Message {
     pub bcc: Vec<Address>,
     /// True when any stored copy of this message has an attachment.
     pub has_attachment: bool,
+    /// Local archive bit. A later copy of the same Message-ID does not clear it.
+    pub archived: bool,
+    /// Unix seconds until which this message stays snoozed. `None` is not snoozed.
+    pub snooze_until: Option<i64>,
 }
 
 pub(crate) fn encode_addresses(addrs: &[Address]) -> String {

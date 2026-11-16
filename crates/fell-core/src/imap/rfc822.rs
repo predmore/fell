@@ -133,6 +133,8 @@ pub(super) fn to_message(
         has_attachment: parsed
             .as_ref()
             .is_some_and(|message| message.has_attachments()),
+        archived: false,
+        snooze_until: None,
     }
 }
 

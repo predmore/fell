@@ -1,12 +1,13 @@
 //! UI-free core for Fell: accounts, backends, local store, threading, search, and actions.
 //!
-//! The GPUI crate and the MCP stub depend on this crate. This crate does not
+//! The GPUI crate and the MCP server depend on this crate. This crate does not
 //! depend on them.
 
 #![forbid(unsafe_code)]
 
 pub mod account;
 pub mod actions;
+pub mod agent;
 pub mod backend;
 pub mod imap;
 pub mod message;
@@ -18,6 +19,7 @@ pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use actions::{ActionKind, LabelChange, LocalAction};
+pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
     SyncCursor,
@@ -45,6 +47,14 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    #[error("unknown account {0}")]
+    UnknownAccount(String),
+    #[error("unknown thread {0}")]
+    UnknownThread(String),
+    #[error("nothing to undo")]
+    NothingToUndo,
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

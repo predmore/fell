@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -50,6 +51,8 @@ CREATE TABLE IF NOT EXISTS messages (
     cc_line TEXT NOT NULL DEFAULT '',
     bcc_line TEXT NOT NULL DEFAULT '',
     has_attachment INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    snooze_until INTEGER,
     FOREIGN KEY(account_id) REFERENCES accounts(id),
     UNIQUE (account_id, message_id)
 );
@@ -64,6 +67,61 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     body,
     account_id UNINDEXED,
     message_id UNINDEXED
+);
+
+CREATE TABLE IF NOT EXISTS agent_grants (
+    agent_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    can_read INTEGER NOT NULL,
+    can_triage INTEGER NOT NULL,
+    can_draft INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, account_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    undone INTEGER NOT NULL DEFAULT 0,
+    created_unix INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
+
+CREATE TABLE IF NOT EXISTS agent_action_messages (
+    action_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    folders TEXT NOT NULL,
+    unread INTEGER NOT NULL,
+    archived INTEGER NOT NULL,
+    snooze_until INTEGER,
+    FOREIGN KEY(action_id) REFERENCES agent_actions(id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_action_drafts (
+    action_id INTEGER NOT NULL,
+    draft_id INTEGER NOT NULL,
+    FOREIGN KEY(action_id) REFERENCES agent_actions(id)
+);
+
+CREATE TABLE IF NOT EXISTS review_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    to_addrs TEXT NOT NULL,
+    cc_addrs TEXT NOT NULL,
+    bcc_addrs TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    in_reply_to TEXT,
+    thread_id TEXT,
+    created_unix INTEGER NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
 "#;
 
@@ -143,15 +201,15 @@ ON messages BEGIN
 END;
 "#;
 
-const SELECT_MESSAGE_COLS: &str =
+pub(crate) const SELECT_MESSAGE_COLS: &str =
     "account_id, message_id, remote_id, thread_id, proton_conversation_id,
         in_reply_to, references_header, from_name, from_email, subject,
         date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-        to_line, cc_line, bcc_line, has_attachment";
+        to_line, cc_line, bcc_line, has_attachment, archived, snooze_until";
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +224,8 @@ pub struct ThreadSummary {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::from_connection(conn)
     }
 
@@ -175,6 +235,7 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
         ensure_fts(&conn)?;
@@ -435,7 +496,10 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
         thread_id_for_message_id(conn, account_id, parent)
     })?;
     let references = references_header(&message.headers);
-    let folders = union_tokens("", &message.folders, false);
+    let mut folders = union_tokens("", &message.folders, false);
+    if message.archived {
+        folders = strip_inbox_tokens(&folders);
+    }
     let labels = union_tokens("", &message.labels, false);
     let to_line = encode_addresses(&message.to);
     let cc_line = encode_addresses(&message.cc);
@@ -445,10 +509,10 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment
+            to_line, cc_line, bcc_line, has_attachment, archived, snooze_until
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19, ?20, ?21
+            ?18, ?19, ?20, ?21, ?22, ?23
          )",
         params![
             message.account_id.as_str(),
@@ -472,6 +536,8 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
             cc_line,
             bcc_line,
             i64::from(message.has_attachment),
+            i64::from(message.archived),
+            message.snooze_until,
         ],
     )?;
     let body = message.body_text.as_deref().unwrap_or(&message.snippet);
@@ -496,7 +562,13 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
         thread_id_for_message_id(conn, account_id, parent)
     })?;
     let references = references_header(&message.headers);
-    let folders = union_tokens(&stored.folders, &message.folders, false);
+    // Duplicate copies union arrival folders and labels. Archive and snooze are
+    // local triage, so a later copy must not clear them, and INBOX stays off
+    // while the message is archived.
+    let mut folders = union_tokens(&stored.folders, &message.folders, false);
+    if stored.archived {
+        folders = strip_inbox_tokens(&folders);
+    }
     let labels = union_tokens(&stored.labels, &message.labels, false);
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
     let to_line = union_addresses(&stored.to_line, &message.to);
@@ -588,6 +660,7 @@ struct Arrival {
     from_name: Option<String>,
     from_email: String,
     body: String,
+    archived: bool,
 }
 
 fn find_arrival(
@@ -598,7 +671,7 @@ fn find_arrival(
     let hit = conn
         .query_row(
             "SELECT folders, labels, arrived_via, to_line, cc_line, bcc_line, has_attachment,
-                    subject, from_name, from_email, COALESCE(body_text, snippet)
+                    subject, from_name, from_email, COALESCE(body_text, snippet), archived
              FROM messages
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), message_id.as_str()],
@@ -615,6 +688,7 @@ fn find_arrival(
                     from_name: row.get(8)?,
                     from_email: row.get(9)?,
                     body: row.get(10)?,
+                    archived: row.get::<_, i64>(11)? != 0,
                 })
             },
         )
@@ -808,7 +882,7 @@ fn parse_references(raw: &str) -> Vec<MessageId> {
     }
 }
 
-fn split_field(raw: &str) -> Vec<String> {
+pub(crate) fn split_field(raw: &str) -> Vec<String> {
     raw.split('\u{1e}')
         .filter(|part| !part.is_empty())
         .map(str::to_string)
@@ -820,6 +894,18 @@ fn references_header(headers: &MessageHeaders) -> String {
         .references
         .iter()
         .map(MessageId::as_str)
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+pub(crate) fn join_tokens(tokens: &[String]) -> String {
+    tokens.join("\u{1e}")
+}
+
+fn strip_inbox_tokens(raw: &str) -> String {
+    split_field(raw)
+        .into_iter()
+        .filter(|folder| !folder.eq_ignore_ascii_case("INBOX"))
         .collect::<Vec<_>>()
         .join("\u{1e}")
 }
@@ -875,6 +961,14 @@ fn ensure_message_columns(conn: &Connection) -> Result<()> {
         (
             "has_attachment",
             "ALTER TABLE messages ADD COLUMN has_attachment INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "archived",
+            "ALTER TABLE messages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "snooze_until",
+            "ALTER TABLE messages ADD COLUMN snooze_until INTEGER",
         ),
     ];
     for (name, ddl) in missing {
@@ -932,7 +1026,7 @@ fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let references: String = row.get(6)?;
     let in_reply_to: Option<String> = row.get(5)?;
     Ok(Message {
@@ -961,6 +1055,8 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         cc: decode_addresses(&row.get::<_, String>(18)?),
         bcc: decode_addresses(&row.get::<_, String>(19)?),
         has_attachment: row.get::<_, i64>(20)? != 0,
+        archived: row.get::<_, i64>(21)? != 0,
+        snooze_until: row.get(22)?,
     })
 }
 
@@ -1022,6 +1118,8 @@ mod tests {
             cc: Vec::new(),
             bcc: Vec::new(),
             has_attachment: false,
+            archived: false,
+            snooze_until: None,
         }
     }
 
@@ -2268,5 +2366,53 @@ mod tests {
                 .delete_message(&AccountId("a1".into()), &MessageId::new("missing@x"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn migrates_archive_columns_onto_existing_messages() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                rowid INTEGER PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                proton_conversation_id TEXT,
+                in_reply_to TEXT,
+                references_header TEXT NOT NULL,
+                from_name TEXT,
+                from_email TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                date_unix INTEGER NOT NULL,
+                snippet TEXT NOT NULL,
+                body_text TEXT,
+                unread INTEGER NOT NULL DEFAULT 1,
+                folders TEXT NOT NULL DEFAULT '',
+                labels TEXT NOT NULL DEFAULT '',
+                arrived_via TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (
+                account_id, message_id, remote_id, thread_id, references_header,
+                from_email, subject, date_unix, snippet, unread
+             ) VALUES ('a', 'm@x', 'r', 't', '', 'f@x', 's', 1, 'snip', 1)",
+            [],
+        )
+        .unwrap();
+        ensure_message_columns(&conn).unwrap();
+        let names = column_names(&conn, "messages").unwrap();
+        assert!(names.iter().any(|name| name == "archived"));
+        assert!(names.iter().any(|name| name == "snooze_until"));
+        let archived: i64 = conn
+            .query_row("SELECT archived FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let snooze: Option<i64> = conn
+            .query_row("SELECT snooze_until FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, 0);
+        assert!(snooze.is_none());
     }
 }

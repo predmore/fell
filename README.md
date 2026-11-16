@@ -1,6 +1,6 @@
 # Fell
 
-A fast, native Proton Mail client written in Rust. Threads are first-class. The UI is GPUI on Wayland. AI agents will talk to a local store over MCP — they can search, summarize, triage, and draft, but they cannot send mail without you confirming it in the UI.
+A fast, native Proton Mail client written in Rust. Threads are first-class. The UI is GPUI on Wayland. AI agents talk to the local store over MCP. They can search, read threads, list labels, triage, and save drafts for you to review. They cannot send mail. Sending stays a confirmation in the Fell window.
 
 ## Why this shape
 
@@ -17,7 +17,7 @@ Bridge is GPL-3.0 and runs as a **separate process**. Fell does not link it and 
 crates/fell-core      accounts, backend trait, sync, SQLite+FTS, threading, search, local actions
 crates/fell-confirm   UI-only token required to mint a send confirmation
 crates/fell           GPUI app (Wayland window)
-crates/fell-mcp       MCP server stub (search / summarize / triage / draft)
+crates/fell-mcp       MCP server (search / read / triage / review drafts; no send)
 ```
 
 ## Build
@@ -36,6 +36,19 @@ cargo run -p fell
 ```
 
 `fell` opens an empty window against an in-memory store. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account.
+
+## Agents
+
+`fell-mcp` speaks MCP over stdio. Tools: `search`, `read_thread`, `list_labels`, `label`, `archive`, `mark_read`, `snooze`, `create_draft`, `list_drafts`, and `undo`. Triage and drafts are written to the local store, logged, and undoable. Drafts stay in Fell for review. There is no send tool.
+
+Agents are off until you grant a scope:
+
+```sh
+fell-mcp grant --store /path/to/fell.sqlite --account ACCOUNT --agent AGENT --read --triage --draft
+fell-mcp serve --store /path/to/fell.sqlite --account ACCOUNT --agent AGENT
+```
+
+`--read` is search, read, and list labels. `--triage` is label, archive, mark read, snooze, and undo of those. `--draft` is saving and listing review drafts, and undo of those. `fell-mcp revoke` turns the agent off again.
 
 ## Nightly Linux artifacts
 
