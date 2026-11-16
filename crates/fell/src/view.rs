@@ -553,13 +553,10 @@ fn names(
     let mut line = div()
         .flex()
         .flex_row()
-        .gap(px(4.))
+        .gap(px(6.))
         .min_w(px(0.))
         .overflow_hidden();
     for (index, span) in spans.iter().enumerate() {
-        if index > 0 {
-            line = line.child(div().text_color(rgb(dim)).child(","));
-        }
         let span_weight = if span.emphasis {
             if weight == FontWeight::BOLD {
                 FontWeight::BOLD
@@ -568,6 +565,12 @@ fn names(
             }
         } else {
             weight
+        };
+        let last = index + 1 == spans.len() && extra == 0;
+        let text = if last {
+            span.text.clone()
+        } else {
+            format!("{},", span.text)
         };
         line = line.child(
             div()
@@ -581,7 +584,7 @@ fn names(
                 } else {
                     dim
                 }))
-                .child(span.text.clone()),
+                .child(text),
         );
     }
     if extra > 0 {
