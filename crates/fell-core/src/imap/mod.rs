@@ -119,6 +119,7 @@ pub(crate) fn fetch_imap(
         let mut batch = Vec::new();
         let mut batch_bytes = 0usize;
         let mut highest: Option<u32> = None;
+        let mut min_unparsed: Option<u32> = None;
         let flush_batch = |batch: &mut Vec<Message>,
                            batch_bytes: &mut usize,
                            highest: Option<u32>,
@@ -156,10 +157,12 @@ pub(crate) fn fetch_imap(
         };
         let stop = stream_bodies(&mut session, &plan, |item| {
             let counts = seen_through.is_none_or(|floor| item.uid > floor);
-            if counts {
+            if counts && item.body_missing {
+                min_unparsed = Some(min_unparsed.map_or(item.uid, |uid| uid.min(item.uid)));
+            } else if counts {
                 highest = Some(highest.map_or(item.uid, |current| current.max(item.uid)));
             }
-            if !counts || item.skipped || rfc822::is_deleted(&item.flags) {
+            if !counts || item.skipped || item.body_missing || rfc822::is_deleted(&item.flags) {
                 return Ok(());
             }
             let raw_len = item.body.len();
@@ -174,7 +177,13 @@ pub(crate) fn fetch_imap(
             ));
             batch_bytes += raw_len;
             if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
-                flush_batch(&mut batch, &mut batch_bytes, highest, &mut persist, &done)?;
+                flush_batch(
+                    &mut batch,
+                    &mut batch_bytes,
+                    capped_highest(highest, min_unparsed),
+                    &mut persist,
+                    &done,
+                )?;
             }
             Ok(())
         })?;
@@ -234,7 +243,7 @@ pub(crate) fn fetch_imap(
                 Err(err) => return Err(err),
             }
         }
-        let uid = if finished {
+        let mut uid = if finished {
             match &plan {
                 FetchPlan::Full | FetchPlan::HighWater { .. } => match uidnext {
                     Some(next) => highest.unwrap_or(0).max(next.saturating_sub(1)),
@@ -251,11 +260,15 @@ pub(crate) fn fetch_imap(
             };
             checkpoint_uid(previous_owned.as_ref(), same_validity, partial)
         };
+        if let Some(missing) = min_unparsed {
+            uid = uid.min(missing.saturating_sub(1));
+        }
         // Record HIGHESTMODSEQ when this pass saw every message's flags: a full
         // or CHANGEDSINCE fetch, an empty mailbox, a high-water pass from uid 0,
         // or a UID FLAGS baseline for older mail that had no modseq yet.
         let saw_every_flag = finished
             && flags_complete
+            && min_unparsed.is_none()
             && (matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_))
                 || exists == 0
                 || needs_baseline
@@ -289,6 +302,17 @@ pub(crate) fn fetch_imap(
     }
     session.logout();
     Ok(())
+}
+
+fn capped_highest(highest: Option<u32>, min_unparsed: Option<u32>) -> Option<u32> {
+    match min_unparsed {
+        Some(missing) => Some(
+            highest
+                .map(|uid| uid.min(missing.saturating_sub(1)))
+                .unwrap_or(missing.saturating_sub(1)),
+        ),
+        None => highest,
+    }
 }
 
 fn stream_bodies(

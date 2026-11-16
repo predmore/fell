@@ -41,6 +41,9 @@ pub(super) struct Fetched {
     /// The body was larger than the cap. The UID is kept so the checkpoint
     /// can move past it; the bytes were not stored.
     pub skipped: bool,
+    /// `BODY[]` was not a literal, quoted string, or NIL, so the bytes were
+    /// never read. The checkpoint must stay below this UID.
+    pub body_missing: bool,
 }
 
 /// How a streaming UID FETCH ended. `Truncated` means the untagged cap was hit;
@@ -128,7 +131,11 @@ impl Session {
     /// `Ok(None)` when the server refuses this mailbox (`NO`/`BAD`). The
     /// connection is still usable. Other errors abort the sync.
     pub(super) fn examine(&mut self, mailbox: &str) -> Result<Option<Examined>, Error> {
-        let name = quote_imap(mailbox).map_err(imap_err)?;
+        // CR, LF, or NUL cannot be quoted. Skip the mailbox instead of failing
+        // the rest of the account.
+        let Ok(name) = quote_imap(mailbox) else {
+            return Ok(None);
+        };
         let examine = if self.condstore {
             format!("EXAMINE {name} (CONDSTORE)")
         } else {
@@ -391,20 +398,44 @@ impl Session {
     fn read_logical(&mut self) -> Result<(String, Vec<LiteralBytes>), Error> {
         let mut text = Vec::new();
         let mut literals = Vec::new();
+        let mut retained = 0usize;
+        let mut over_response = false;
         loop {
             let line = self.read_until_crlf()?;
-            if let Some(len) = literal_len(&line) {
-                text.extend_from_slice(&line);
-                if len > literal_limit() {
-                    self.discard_exact(len)?;
-                    literals.push(LiteralBytes::Discarded);
-                } else {
-                    literals.push(LiteralBytes::Kept(self.read_exact(len)?));
+            match literal_marker(&line) {
+                LiteralMarker::NotLiteral => {
+                    text.extend_from_slice(&line);
+                    break;
                 }
-                continue;
+                LiteralMarker::Unusable => {
+                    return Err(imap_err(
+                        "literal length is not a usable number; closing the connection",
+                    ));
+                }
+                LiteralMarker::Length(len) => {
+                    text.extend_from_slice(&line);
+                    let too_big = len > literal_limit();
+                    let over_total =
+                        over_response || retained.saturating_add(len) > response_limit();
+                    if too_big || over_total {
+                        self.discard_exact(len)?;
+                        literals.push(LiteralBytes::Discarded);
+                        if over_total && !too_big {
+                            over_response = true;
+                        }
+                    } else {
+                        let bytes = self.read_exact(len)?;
+                        retained += bytes.len();
+                        literals.push(LiteralBytes::Kept(bytes));
+                    }
+                }
             }
-            text.extend_from_slice(&line);
-            break;
+        }
+        if over_response {
+            return Err(imap_err(format!(
+                "response literals exceed the {} byte limit",
+                response_limit()
+            )));
         }
         let text = String::from_utf8_lossy(&text).into_owned();
         Ok((text, literals))
@@ -553,6 +584,22 @@ const MAX_LINE: usize = 1024 * 1024;
 /// `* OK` lines and resets the read timeout on every chunk.
 const MAX_UNTAGGED: usize = 1_000_000;
 
+/// Bytes of literals kept from one protocol response. Further literals are
+/// discarded and the response fails, so a chain of under-cap literals cannot
+/// grow without bound.
+const MAX_RESPONSE: usize = MAX_LITERAL;
+
+fn response_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_RESPONSE_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_RESPONSE
+    }
+}
+
 fn literal_limit() -> usize {
     #[cfg(test)]
     {
@@ -567,6 +614,7 @@ fn literal_limit() -> usize {
 #[cfg(test)]
 thread_local! {
     static TEST_LITERAL_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LITERAL) };
+    static TEST_RESPONSE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_RESPONSE) };
 }
 
 #[cfg(test)]
@@ -582,6 +630,22 @@ pub(super) fn limit_literals_to(limit: usize) -> LiteralLimitGuard {
 impl Drop for LiteralLimitGuard {
     fn drop(&mut self) {
         TEST_LITERAL_LIMIT.with(|cell| cell.set(MAX_LITERAL));
+    }
+}
+
+#[cfg(test)]
+struct ResponseLimitGuard;
+
+#[cfg(test)]
+fn limit_response_bytes_to(limit: usize) -> ResponseLimitGuard {
+    TEST_RESPONSE_LIMIT.with(|cell| cell.set(limit));
+    ResponseLimitGuard
+}
+
+#[cfg(test)]
+impl Drop for ResponseLimitGuard {
+    fn drop(&mut self) {
+        TEST_RESPONSE_LIMIT.with(|cell| cell.set(MAX_RESPONSE));
     }
 }
 
@@ -860,19 +924,34 @@ fn quote_imap(value: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn literal_len(line: &[u8]) -> Option<usize> {
+enum LiteralMarker {
+    NotLiteral,
+    Length(usize),
+    /// `{...}` is a literal marker, but the length does not fit in `usize`.
+    Unusable,
+}
+
+fn literal_marker(line: &[u8]) -> LiteralMarker {
     if !line.ends_with(b"}") {
-        return None;
+        return LiteralMarker::NotLiteral;
     }
-    let start = line.iter().rposition(|byte| *byte == b'{')?;
+    let Some(start) = line.iter().rposition(|byte| *byte == b'{') else {
+        return LiteralMarker::NotLiteral;
+    };
     let mut number = &line[start + 1..line.len() - 1];
     if let Some(stripped) = number.strip_suffix(b"+") {
         number = stripped;
     }
     if number.is_empty() || !number.iter().all(u8::is_ascii_digit) {
-        return None;
+        return LiteralMarker::NotLiteral;
     }
-    std::str::from_utf8(number).ok()?.parse().ok()
+    match std::str::from_utf8(number)
+        .ok()
+        .and_then(|text| text.parse().ok())
+    {
+        Some(len) => LiteralMarker::Length(len),
+        None => LiteralMarker::Unusable,
+    }
 }
 
 fn text_starts_with_tag(text: &str, tag: &str) -> bool {
@@ -973,7 +1052,7 @@ fn parse_list(text: &str, literals: &[LiteralBytes]) -> Option<ParsedList> {
     })
 }
 
-fn parse_fetch(text: &str, literals: Vec<LiteralBytes>) -> Option<Fetched> {
+fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('*') {
         return None;
@@ -984,17 +1063,136 @@ fn parse_fetch(text: &str, literals: Vec<LiteralBytes>) -> Option<Fetched> {
     }
     let uid = number_after(&upper, "UID ")?;
     let flags = paren_after(text, "FLAGS").unwrap_or_default();
-    let skipped = matches!(literals.first(), Some(LiteralBytes::Discarded));
-    let body = match literals.into_iter().next() {
-        Some(LiteralBytes::Kept(bytes)) => bytes,
-        _ => Vec::new(),
-    };
+    let (body, skipped, body_missing) = body_after_body_key(text, &mut literals);
     Some(Fetched {
         uid,
         flags,
         body,
         skipped,
+        body_missing,
     })
+}
+
+/// The nstring after `BODY` / `BODY[...]`, not whichever literal arrived first.
+fn body_after_body_key(text: &str, literals: &mut [LiteralBytes]) -> (Vec<u8>, bool, bool) {
+    let upper = text.to_ascii_uppercase();
+    let bytes = text.as_bytes();
+    let mut search = 0;
+    while let Some(rel) = upper[search..].find("BODY") {
+        let index = search + rel;
+        let after = index + 4;
+        let boundary = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+        let next = bytes.get(after).copied();
+        if !boundary || next == Some(b'S') || next == Some(b'.') {
+            search = after;
+            continue;
+        }
+        let mut cursor = after;
+        if bytes.get(cursor) == Some(&b'[') {
+            let Some(end) = text[cursor..].find(']') else {
+                return (Vec::new(), false, true);
+            };
+            cursor += end + 1;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if text[cursor..].len() >= 3 && text[cursor..cursor + 3].eq_ignore_ascii_case("NIL") {
+            let boundary = bytes
+                .get(cursor + 3)
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric());
+            if boundary {
+                return (Vec::new(), false, false);
+            }
+        }
+        if bytes.get(cursor) == Some(&b'"') {
+            return match imap_quoted(&text[cursor..]) {
+                Some(body) => (body, false, false),
+                None => (Vec::new(), false, true),
+            };
+        }
+        if bytes.get(cursor) == Some(&b'{') {
+            let slot = literal_slot_index(text, cursor);
+            return match literals.get_mut(slot) {
+                Some(literal) => match std::mem::replace(literal, LiteralBytes::Discarded) {
+                    LiteralBytes::Kept(body) => (body, false, false),
+                    LiteralBytes::Discarded => (Vec::new(), true, false),
+                },
+                None => (Vec::new(), false, true),
+            };
+        }
+        return (Vec::new(), false, true);
+    }
+    (Vec::new(), false, true)
+}
+
+fn imap_quoted(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 1;
+                out.push(*bytes.get(index)?);
+            }
+            b'"' => return Some(out),
+            byte => out.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn literal_slot_index(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut count = 0;
+    while index < at && index < bytes.len() {
+        if bytes[index] == b'"' {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == b'"' {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'{'
+            && let Some(token) = literal_token_len(&text[index..])
+        {
+            count += 1;
+            index += token;
+            continue;
+        }
+        index += 1;
+    }
+    count
+}
+
+fn literal_token_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let end = bytes.iter().position(|byte| *byte == b'}')?;
+    let mut inner = &bytes[1..end];
+    if inner.last() == Some(&b'+') {
+        inner = &inner[..inner.len() - 1];
+    }
+    if inner.is_empty() || !inner.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(end + 1)
 }
 
 fn uid_in_fetch_text(text: &str) -> Option<u32> {
@@ -1256,6 +1454,104 @@ mod tests {
         let listed = session.list_selectable().expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].decoded, "INBOX");
+    }
+
+    #[test]
+    fn quoted_nil_and_later_literal_bodies_are_distinct() {
+        let quoted = super::parse_fetch(
+            r#"* 1 FETCH (UID 3 FLAGS (\Seen) BODY[] "hello")"#,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(quoted.body, b"hello");
+        assert!(!quoted.body_missing);
+        assert!(!quoted.skipped);
+
+        let nil =
+            super::parse_fetch("* 1 FETCH (UID 3 FLAGS (\\Seen) BODY[] NIL)", Vec::new()).unwrap();
+        assert!(nil.body.is_empty());
+        assert!(!nil.body_missing);
+
+        let flagged = super::parse_fetch(
+            r#"* 1 FETCH (UID 7 FLAGS {5} BODY[] "hello")"#,
+            vec![super::LiteralBytes::Kept(br"\Seen".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(flagged.body, b"hello");
+        assert!(!flagged.body_missing);
+
+        let literal = super::parse_fetch(
+            "* 1 FETCH (UID 1 FLAGS (\\Seen) BODY[] {5})",
+            vec![super::LiteralBytes::Kept(b"hello".to_vec())],
+        )
+        .unwrap();
+        assert_eq!(literal.body, b"hello");
+
+        let missing = super::parse_fetch("* 1 FETCH (UID 4 FLAGS (\\Seen))", Vec::new()).unwrap();
+        assert!(missing.body_missing);
+        assert!(missing.body.is_empty());
+    }
+
+    #[test]
+    fn unusable_literal_length_stops_the_session() {
+        use std::io::Write;
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK {999999999999999999999}\r\n").unwrap();
+            sock.write_all(b"not-a-line\r\n").unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("an unusable literal length was treated as protocol text");
+        };
+        let text = err.to_string();
+        assert!(text.contains("literal length"), "{text}");
+    }
+
+    #[test]
+    fn chained_literals_cannot_grow_without_a_total_cap() {
+        use std::io::Write;
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let _limit = super::limit_response_bytes_to(10);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK {8}\r\n").unwrap();
+            sock.write_all(b"IMAP4rev1").unwrap();
+            sock.write_all(b" {8}\r\n").unwrap();
+            sock.write_all(b"IMAP4rev1\r\n").unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("chained literals were retained without a total cap");
+        };
+        let text = err.to_string();
+        assert!(text.contains("response literals"), "{text}");
+        assert!(text.contains("10"), "{text}");
     }
 
     #[test]

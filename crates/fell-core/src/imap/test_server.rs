@@ -7,11 +7,21 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum BodyForm {
+    #[default]
+    Literal,
+    Quoted,
+    Nil,
+    Absent,
+}
+
 pub(super) struct FixtureMessage {
     pub uid: u32,
     pub flags: Vec<String>,
     pub modseq: u64,
     pub raw: Vec<u8>,
+    pub body_form: BodyForm,
 }
 
 pub(super) struct FixtureMailbox {
@@ -207,9 +217,18 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     } else {
                         mailbox.list_flags.clone()
                     };
-                    let name = quote(&mailbox.name);
-                    let _ =
-                        write.write_all(format!("* LIST ({flags}) \"/\" {name}\r\n").as_bytes());
+                    if mailbox_needs_literal(&mailbox.name) {
+                        let _ = write.write_all(
+                            format!("* LIST ({flags}) \"/\" {{{}}}\r\n", mailbox.name.len())
+                                .as_bytes(),
+                        );
+                        let _ = write.write_all(mailbox.name.as_bytes());
+                        let _ = write.write_all(b"\r\n");
+                    } else {
+                        let name = quote(&mailbox.name);
+                        let _ = write
+                            .write_all(format!("* LIST ({flags}) \"/\" {name}\r\n").as_bytes());
+                    }
                 }
                 let _ = write.write_all(format!("{tag} OK LIST\r\n").as_bytes());
             }
@@ -323,14 +342,43 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                         continue;
                     }
                     let flags = message.flags.join(" ");
-                    let header = format!(
-                        "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {{{}}}\r\n",
-                        message.uid,
-                        message.raw.len()
-                    );
-                    let _ = write.write_all(header.as_bytes());
-                    let _ = write.write_all(&message.raw);
-                    let _ = write.write_all(b")\r\n");
+                    match message.body_form {
+                        BodyForm::Literal => {
+                            let header = format!(
+                                "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {{{}}}\r\n",
+                                message.uid,
+                                message.raw.len()
+                            );
+                            let _ = write.write_all(header.as_bytes());
+                            let _ = write.write_all(&message.raw);
+                            let _ = write.write_all(b")\r\n");
+                        }
+                        BodyForm::Quoted => {
+                            let quoted = quote_bytes(&message.raw);
+                            let _ = write.write_all(
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {quoted})\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        BodyForm::Nil => {
+                            let _ = write.write_all(
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] NIL)\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        BodyForm::Absent => {
+                            let _ = write.write_all(
+                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
+                                    .as_bytes(),
+                            );
+                        }
+                    }
                     if let Some(left) = bodies_left.as_mut() {
                         *left = left.saturating_sub(1);
                         if *left == 0 {
@@ -511,6 +559,27 @@ fn take_astring(input: &str) -> (String, &str) {
     }
     let end = input.find(' ').unwrap_or(input.len());
     (input[..end].to_string(), &input[end..])
+}
+
+fn mailbox_needs_literal(name: &str) -> bool {
+    name.bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+}
+
+fn quote_bytes(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for byte in bytes {
+        match byte {
+            b'\\' | b'"' => {
+                out.push('\\');
+                out.push(*byte as char);
+            }
+            byte if byte.is_ascii() && *byte != b'\r' && *byte != b'\n' => out.push(*byte as char),
+            _ => out.push('?'),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn quote(value: &str) -> String {

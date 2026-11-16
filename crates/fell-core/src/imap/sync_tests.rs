@@ -5,7 +5,9 @@ use crate::store::Store;
 use crate::sync::sync_once;
 use crate::threading::ThreadId;
 
-use super::test_server::{FixtureMailbox, FixtureMessage, TestServer, TestState, raw_message};
+use super::test_server::{
+    BodyForm, FixtureMailbox, FixtureMessage, TestServer, TestState, raw_message,
+};
 
 fn account(id: &str, kind: BackendKind) -> Account {
     Account {
@@ -61,6 +63,7 @@ fn sample_state() -> TestState {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message(
                         "root@x",
                         None,
@@ -84,6 +87,7 @@ fn sample_state() -> TestState {
                         uid: 1,
                         flags: vec!["\\Seen".into(), "work".into()],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: raw_message(
                             "root@x",
                             None,
@@ -97,6 +101,7 @@ fn sample_state() -> TestState {
                         uid: 2,
                         flags: vec![],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: raw_message(
                             "reply@x",
                             Some("root@x"),
@@ -110,18 +115,21 @@ fn sample_state() -> TestState {
                         uid: 3,
                         flags: vec!["\\Deleted".into()],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: raw_message("gone@x", None, "Gone", "Ann <ann@x>", "gone", ""),
                     },
                     FixtureMessage {
                         uid: 4,
                         flags: vec!["\\Seen".into()],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: b"From: Ann <ann@x>\r\nSubject: Html\r\nMessage-ID: <html@x>\r\nDate: Mon, 16 Nov 2026 12:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Hello from html</p></body></html>".to_vec(),
                     },
                     FixtureMessage {
                         uid: 5,
                         flags: vec!["\\Seen".into()],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: b"From: Ann <ann@x>\r\nSubject: No id\r\nDate: Mon, 16 Nov 2026 12:00:00 +0000\r\n\r\nmissing id\r\n".to_vec(),
                     },
                 ],
@@ -138,6 +146,7 @@ fn sample_state() -> TestState {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message(
                         "smile@x",
                         None,
@@ -261,6 +270,7 @@ fn second_sync_fetches_only_new_uids() {
                 uid: 6,
                 flags: vec![],
                 modseq: 2,
+                body_form: BodyForm::Literal,
                 raw: raw_message("new@x", None, "New", "Ann <ann@x>", "new body", ""),
             });
     }
@@ -473,12 +483,14 @@ fn same_body_different_message_ids_stay_distinct() {
             uid: 1,
             flags: vec!["\\Seen".into()],
             modseq: 1,
+            body_form: BodyForm::Literal,
             raw: raw_message("one@x", None, "Same", "Ann <ann@x>", "same body", ""),
         },
         FixtureMessage {
             uid: 2,
             flags: vec!["\\Seen".into()],
             modseq: 1,
+            body_form: BodyForm::Literal,
             raw: raw_message("two@x", None, "Same", "Ann <ann@x>", "same body", ""),
         },
     ];
@@ -520,6 +532,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
                 uid: 5,
                 flags: vec!["\\Seen".into()],
                 modseq: 1,
+                body_form: BodyForm::Literal,
                 raw: raw_message("only@x", None, "Only", "Ann <ann@x>", "only body", ""),
             }],
         }],
@@ -595,6 +608,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
             uid: 1,
             flags: vec![],
             modseq: 2,
+            body_form: BodyForm::Literal,
             raw: raw_message("later@x", None, "Later", "Ann <ann@x>", "later body", ""),
         });
         state.mailboxes[0].uidnext = Some(2);
@@ -637,6 +651,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
                     uid: 2,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
                 }],
             },
@@ -652,6 +667,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
                 }],
             },
@@ -684,6 +700,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
                 uid: 2,
                 flags: vec![],
                 modseq: 2,
+                body_form: BodyForm::Literal,
                 raw: raw_message("new@x", None, "Still here", "Ann <ann@x>", "new", ""),
             });
         state
@@ -742,6 +759,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("sent@x", None, "Already there", "Ann <ann@x>", "sent", ""),
                 }],
             },
@@ -758,12 +776,14 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
                         uid: 1,
                         flags: vec!["\\Seen".into()],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: oversized,
                     },
                     FixtureMessage {
                         uid: 2,
                         flags: vec![],
                         modseq: 1,
+                        body_form: BodyForm::Literal,
                         raw: small,
                     },
                 ],
@@ -842,6 +862,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
                 }],
             },
@@ -857,6 +878,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
                 }],
             },
@@ -891,6 +913,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
             uid: 2,
             flags: vec![],
             modseq: 2,
+            body_form: BodyForm::Literal,
             raw: raw_message("new@x", None, "Still here", "Ann <ann@x>", "new", ""),
         });
         inbox.uidnext = Some(3);
@@ -932,6 +955,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
             uid: 2,
             flags: vec!["\\Seen".into()],
             modseq: 4,
+            body_form: BodyForm::Literal,
             raw: raw_message("later@x", None, "Sent later", "Ann <ann@x>", "later", ""),
         });
         sent.uidnext = Some(3);
@@ -973,6 +997,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("sent@x", None, "Sent copy", "Ann <ann@x>", "sent", ""),
                 }],
             },
@@ -988,6 +1013,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("in@x", None, "Inbox", "Ann <ann@x>", "inbox", ""),
                 }],
             },
@@ -1013,6 +1039,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
             uid: 2,
             flags: vec![],
             modseq: 2,
+            body_form: BodyForm::Literal,
             raw: raw_message("new@x", None, "Not stored", "Ann <ann@x>", "new", ""),
         });
         inbox.uidnext = Some(3);
@@ -1057,6 +1084,7 @@ fn non_ascii_password_logs_in_as_a_literal() {
                 uid: 1,
                 flags: vec!["\\Seen".into()],
                 modseq: 1,
+                body_form: BodyForm::Literal,
                 raw: raw_message(
                     "in@x",
                     None,
@@ -1122,18 +1150,21 @@ fn fetch_batches_survive_a_dropped_connection() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("one@x", None, "One", "Ann <ann@x>", "one", ""),
                 },
                 FixtureMessage {
                     uid: 2,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("two@x", None, "Two", "Ann <ann@x>", "two", ""),
                 },
                 FixtureMessage {
                     uid: 3,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("three@x", None, "Three", "Ann <ann@x>", "three", ""),
                 },
             ],
@@ -1189,6 +1220,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
             uid,
             flags: vec!["\\Seen".into()],
             modseq: 1,
+            body_form: BodyForm::Literal,
             raw: raw_message(
                 &format!("m{uid}@x"),
                 None,
@@ -1232,6 +1264,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
                     modseq: 1,
+                    body_form: BodyForm::Literal,
                     raw: raw_message("in@x", None, "Inbox kept", "Ann <ann@x>", "inbox", ""),
                 }],
             },
@@ -1264,4 +1297,200 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
             .count(),
         1
     );
+}
+
+#[test]
+fn quoted_body_is_stored_and_nil_is_not_missing() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 6,
+            uidnext: Some(3),
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            messages: vec![
+                FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Quoted,
+                    raw: b"Subject: Quoted hello".to_vec(),
+                },
+                FixtureMessage {
+                    uid: 2,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Nil,
+                    raw: Vec::new(),
+                },
+            ],
+        }],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 2);
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t6\t2\t"),
+        "quoted and NIL bodies were read, so the checkpoint can move: {cursor}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state.commands.clear();
+    }
+    let again = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(again.upserted, 0);
+    let logged = commands(&server);
+    assert!(
+        !logged.iter().any(|line| line.contains("BODY.PEEK")),
+        "{logged:?}"
+    );
+}
+
+#[test]
+fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 5,
+            uidnext: Some(3),
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            messages: vec![
+                FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Absent,
+                    raw: Vec::new(),
+                },
+                FixtureMessage {
+                    uid: 2,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Literal,
+                    raw: raw_message("two@x", None, "Second", "Ann <ann@x>", "two", ""),
+                },
+            ],
+        }],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(
+        store
+            .list_threads(&acct.id)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.subject == "Second")
+    );
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t5\t0\t"),
+        "UID 1 had no body, so the checkpoint stays below it: {cursor}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state.mailboxes[0].messages[0].body_form = BodyForm::Literal;
+        state.mailboxes[0].messages[0].raw =
+            raw_message("one@x", None, "First", "Ann <ann@x>", "one", "");
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "First"));
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(cursor.contains("INBOX\t5\t2\t"), "{cursor}");
+}
+
+#[test]
+fn mailbox_name_with_a_newline_does_not_abort_the_account() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Bad\nName".into(),
+                list_flags: String::new(),
+                uidvalidity: 2,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Literal,
+                    raw: raw_message("bad@x", None, "Should skip", "Ann <ann@x>", "bad", ""),
+                }],
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    body_form: BodyForm::Literal,
+                    raw: raw_message("in@x", None, "Inbox ok", "Ann <ann@x>", "inbox", ""),
+                }],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "Inbox ok"));
+    assert!(!threads.iter().any(|thread| thread.subject == "Should skip"));
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(cursor.contains("INBOX"), "{cursor}");
 }
