@@ -164,10 +164,11 @@ pub fn one_line(text: &str) -> String {
 }
 
 pub fn relative_date(now: i64, then: i64) -> String {
-    let delta = now.saturating_sub(then);
-    if delta < 0 {
+    // A future timestamp is not "now". Compare first: saturating_sub never goes negative.
+    if then > now {
         return absolute_date(then);
     }
+    let delta = now.saturating_sub(then);
     if delta < 45 {
         return "now".into();
     }
@@ -315,6 +316,20 @@ mod tests {
         assert!(!rows[0].spans[1].emphasis);
         assert_eq!(rows[0].snippet, "hello there friend");
         assert_eq!(rows[0].date, "2m");
+    }
+
+    #[test]
+    fn future_dates_are_absolute() {
+        let now = 1_700_000_000;
+        assert_eq!(relative_date(now, now), "now");
+        assert_eq!(relative_date(now, now - 30), "now");
+        assert_eq!(relative_date(now, now - 120), "2m");
+        let soon = now + 180;
+        let tomorrow = now + 86_400;
+        assert_eq!(relative_date(now, soon), absolute_date(soon));
+        assert_eq!(relative_date(now, tomorrow), absolute_date(tomorrow));
+        assert_ne!(relative_date(now, soon), "now");
+        assert_ne!(relative_date(now, tomorrow), "now");
     }
 
     #[test]

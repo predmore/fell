@@ -88,6 +88,7 @@ impl Inbox {
         }
         inbox.reload_threads();
         inbox.reload_messages(true);
+        inbox.scroll_conversation();
         inbox.watch_theme(cx);
         inbox
     }
@@ -160,30 +161,42 @@ impl Inbox {
         };
         window.focus(&self.focus);
         let page = self.page_rows();
+        let message_before = self.session.message_cursor;
         let step = self.session.on_key(key, page);
-        self.apply_step(step, cx);
+        self.apply_step(step, message_before, cx);
         cx.stop_propagation();
     }
 
-    fn apply_step(&mut self, step: Step, cx: &mut Context<Self>) {
+    fn apply_step(&mut self, step: Step, message_before: usize, cx: &mut Context<Self>) {
+        let mut loaded_messages = false;
         if step.reload_threads {
             self.reload_threads();
             self.reload_messages(true);
+            loaded_messages = true;
         } else if step.reload_messages {
             self.reload_messages(true);
+            loaded_messages = true;
         }
         if step.arm_which {
             self.arm_which(cx);
         }
         self.list_scroll.scroll_to_item(self.session.cursor_index());
-        if !self.session.messages.is_empty() {
-            self.conv_scroll.scroll_to_item(self.session.message_cursor);
+        // A tall message aligns to its top when scrolled into view. Skip that
+        // unless the reader moved to another message, or a new thread loaded.
+        if loaded_messages || self.session.message_cursor != message_before {
+            self.scroll_conversation();
         }
         if self.session.overlay == Overlay::Palette {
             self.palette_scroll
                 .scroll_to_item(self.session.palette_index);
         }
         cx.notify();
+    }
+
+    fn scroll_conversation(&mut self) {
+        if !self.session.messages.is_empty() {
+            self.conv_scroll.scroll_to_item(self.session.message_cursor);
+        }
     }
 
     fn arm_which(&mut self, cx: &mut Context<Self>) {
@@ -231,6 +244,7 @@ impl Inbox {
         self.session.pane = Pane::List;
         if changed {
             self.reload_messages(true);
+            self.scroll_conversation();
         }
         self.list_scroll.scroll_to_item(self.session.cursor_index());
     }
@@ -1171,8 +1185,9 @@ fn palette(
                                 window.focus(&inbox.focus);
                                 inbox.session.overlay = Overlay::None;
                                 let page = inbox.page_rows();
+                                let message_before = inbox.session.message_cursor;
                                 let step = inbox.session.perform(action, page);
-                                inbox.apply_step(step, cx);
+                                inbox.apply_step(step, message_before, cx);
                             }),
                         )
                         .child(div().flex_1().child(item.label.clone()))
@@ -1263,6 +1278,7 @@ fn folder_picker(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> g
                                     inbox.session.folder = name.clone();
                                     inbox.reload_threads();
                                     inbox.reload_messages(true);
+                                    inbox.scroll_conversation();
                                 }
                                 cx.notify();
                             }),
