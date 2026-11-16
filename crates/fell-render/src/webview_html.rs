@@ -37,13 +37,18 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
     let dom = crate::html::parse_html(html);
     let mut out = String::new();
-    serialize_children(dom.root_element(), &mut out, allow_remote_images);
+    serialize_children(dom.root_element(), &mut out, allow_remote_images, 0);
     out
 }
 
-fn serialize_children(node: scraper::ElementRef<'_>, out: &mut String, allow_remote_images: bool) {
+fn serialize_children(
+    node: scraper::ElementRef<'_>,
+    out: &mut String,
+    allow_remote_images: bool,
+    depth: u32,
+) {
     for child in node.children() {
-        serialize_node(child, out, allow_remote_images);
+        serialize_node(child, out, allow_remote_images, depth + 1);
     }
 }
 
@@ -51,7 +56,12 @@ fn serialize_node(
     node: ego_tree::NodeRef<'_, scraper::node::Node>,
     out: &mut String,
     allow_remote_images: bool,
+    depth: u32,
 ) {
+    if depth >= crate::html::MAX_HTML_DEPTH {
+        out.push_str(&escape(&subtree_text(node)));
+        return;
+    }
     match node.value() {
         scraper::node::Node::Text(text) => out.push_str(&escape(text.deref())),
         scraper::node::Node::Element(element) => {
@@ -77,7 +87,7 @@ fn serialize_node(
             ) {
                 if matches!(name, "html" | "body" | "head" | "form" | "noscript" | "svg") {
                     for child in node.children() {
-                        serialize_node(child, out, allow_remote_images);
+                        serialize_node(child, out, allow_remote_images, depth + 1);
                     }
                 }
                 return;
@@ -116,7 +126,7 @@ fn serialize_node(
             out.push('>');
             if !VOID.contains(&name) {
                 for child in node.children() {
-                    serialize_node(child, out, allow_remote_images);
+                    serialize_node(child, out, allow_remote_images, depth + 1);
                 }
                 out.push_str("</");
                 out.push_str(name);
@@ -128,6 +138,16 @@ fn serialize_node(
 }
 
 const VOID: &[&str] = &["area", "br", "hr", "img", "wbr", "col"];
+
+fn subtree_text(node: ego_tree::NodeRef<'_, scraper::node::Node>) -> String {
+    let mut text = String::new();
+    for descendant in node.descendants() {
+        if let scraper::node::Node::Text(value) = descendant.value() {
+            text.push_str(value.deref());
+        }
+    }
+    text
+}
 
 fn keep_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> bool {
     let name_l = name.to_ascii_lowercase();
@@ -448,6 +468,17 @@ mod tests {
         assert!(clean.contains("https://example.com/read"), "{clean}");
         assert!(clean.contains("data:image/png"), "{clean}");
         assert!(clean.contains("notes.png"), "{clean}");
+        let mut nested = String::new();
+        for _ in 0..2_000 {
+            nested.push_str("<div>");
+        }
+        nested.push_str("Still here");
+        for _ in 0..2_000 {
+            nested.push_str("</div>");
+        }
+        let deep = sanitize_html(&nested, false);
+        assert!(deep.contains("Still here"), "{deep}");
+        assert!(!deep.contains("&lt;div"), "{deep}");
         assert!(clean.contains(">x<") || clean.contains(">x</p>"), "{clean}");
     }
 }

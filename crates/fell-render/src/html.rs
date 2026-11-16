@@ -5,29 +5,88 @@ use scraper::node::Node;
 
 use crate::document::{Block, ImageSource, Inline, ListItem, StyledDocument};
 
-/// HTML only with a real signal: a doctype, or a known tag.
+/// How deep the native walk and the web serializer will recurse.
 ///
-/// `<ada@example.com>` is an address, not a tag. The store does not keep a
-/// content type yet; when it does, `text/html` is the other signal.
+/// Past this, the rest of the subtree is kept as text. A few thousand nested
+/// elements must not overflow the stack.
+pub(crate) const MAX_HTML_DEPTH: u32 = 256;
+
+/// HTML only with a real signal: a doctype, a comment, or a known tag that
+/// actually closes or carries an attribute.
+///
+/// `<ada@example.com>` is an address. `<p Hello there>` is a sentence. The
+/// store does not keep a content type yet; when it does, `text/html` is the
+/// other signal.
 pub fn looks_like_html(body: &str) -> bool {
-    let lower = body.trim_start().to_ascii_lowercase();
-    if lower.starts_with("<!doctype") {
+    let rest = skip_html_preamble(body);
+    if rest.starts_with("<!--") || rest.to_ascii_lowercase().starts_with("<!doctype") {
         return true;
     }
-    let Some(rest) = lower.strip_prefix('<') else {
+    leading_tag_is_markup(rest)
+}
+
+/// Drop a leading BOM and finished comments. An unclosed `<!--`, including
+/// `<!--[if mso]>`, stays in place so the caller can treat it as markup.
+fn skip_html_preamble(body: &str) -> &str {
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('\u{feff}') {
+            rest = stripped;
+            continue;
+        }
+        let Some(after) = rest.strip_prefix("<!--") else {
+            return rest;
+        };
+        // `<!--[if mso]>` is markup. The matching `-->` sits on `<![endif]-->`,
+        // so skipping it would hide the HTML that follows the condition.
+        if after.starts_with("[if") {
+            return rest;
+        }
+        let Some(end) = after.find("-->") else {
+            return rest;
+        };
+        rest = &after[end + 3..];
+    }
+}
+
+fn leading_tag_is_markup(body: &str) -> bool {
+    let Some(after_lt) = body.strip_prefix('<') else {
         return false;
     };
-    let name_len = rest
+    let name_len = after_lt
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric())
         .count();
     if name_len == 0 {
         return false;
     }
-    let name = &rest[..name_len];
-    let boundary = rest[name_len..].chars().next();
-    let closed = matches!(boundary, Some(ch) if ch.is_whitespace() || ch == '>' || ch == '/');
-    closed && known_html_tag(name)
+    let name = &after_lt[..name_len];
+    if !known_html_tag(&name.to_ascii_lowercase()) {
+        return false;
+    }
+    tag_closes_or_has_attribute(&after_lt[name_len..])
+}
+
+/// `<p>` and `<br />` close. `<p class="x">` assigns an attribute.
+/// `<p Hello there>` does neither: the `>` is not the next token.
+fn tag_closes_or_has_attribute(after_name: &str) -> bool {
+    let mut bytes = after_name.bytes();
+    let mut skipped = 0;
+    for byte in bytes.by_ref() {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        skipped += 1;
+    }
+    let rest = &after_name[skipped..];
+    if rest.starts_with('>') || rest.starts_with("/>") {
+        return true;
+    }
+    match rest.find('>') {
+        Some(end) => rest[..end].contains('='),
+        None => rest.contains('='),
+    }
 }
 
 fn known_html_tag(name: &str) -> bool {
@@ -106,7 +165,7 @@ pub(crate) fn parse_html(html: &str) -> Html {
 
 pub fn html_to_document(html: &str) -> StyledDocument {
     let dom = parse_html(html);
-    let blocks = children_blocks(dom.root_element());
+    let blocks = children_blocks(dom.root_element(), 0);
     StyledDocument {
         blocks: blocks
             .into_iter()
@@ -143,11 +202,16 @@ pub fn plain_to_document(body: &str) -> StyledDocument {
     StyledDocument { blocks }
 }
 
-fn children_blocks(node: scraper::ElementRef<'_>) -> Vec<Block> {
-    node.children().flat_map(node_blocks).collect()
+fn children_blocks(node: scraper::ElementRef<'_>, depth: u32) -> Vec<Block> {
+    node.children()
+        .flat_map(|child| node_blocks(child, depth + 1))
+        .collect()
 }
 
-fn node_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+fn node_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
+    if depth >= MAX_HTML_DEPTH {
+        return text_blocks(node);
+    }
     match node.value() {
         Node::Text(text) => {
             let text = normalize_ws(text.deref());
@@ -159,12 +223,24 @@ fn node_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
                 }]
             }
         }
-        Node::Element(element) => element_blocks(node, element.name()),
+        Node::Element(element) => element_blocks(node, element.name(), depth),
         _ => Vec::new(),
     }
 }
 
-fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str) -> Vec<Block> {
+fn text_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+    let text = normalize_ws(&raw_text(node));
+    let text = text.trim();
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![Block::Paragraph {
+            inlines: vec![Inline::Text(text.to_string())],
+        }]
+    }
+}
+
+fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str, depth: u32) -> Vec<Block> {
     match name {
         "script" | "style" | "head" | "meta" | "link" | "title" | "iframe" | "object" | "embed"
         | "input" | "button" | "textarea" => Vec::new(),
@@ -172,18 +248,18 @@ fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str) -> Vec<Block> {
             let level = name.as_bytes()[1].saturating_sub(b'0');
             vec![Block::Heading {
                 level,
-                inlines: collect_inlines(node),
+                inlines: collect_inlines(node, depth),
             }]
         }
-        "p" => paragraph(collect_inlines(node)),
+        "p" => paragraph(collect_inlines(node, depth)),
         "blockquote" => vec![Block::Quote {
-            blocks: children_of(node),
+            blocks: children_of(node, depth),
         }],
         "pre" => vec![Block::Code {
             text: raw_text(node).trim_matches('\n').to_string(),
         }],
-        "ul" => vec![list_block(node, false)],
-        "ol" => vec![list_block(node, true)],
+        "ul" => vec![list_block(node, false, depth)],
+        "ol" => vec![list_block(node, true, depth)],
         "hr" => vec![Block::ThematicBreak],
         "img" => node
             .value()
@@ -191,13 +267,13 @@ fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str) -> Vec<Block> {
             .map(image_block)
             .into_iter()
             .collect(),
-        "table" => table_blocks(node),
+        "table" => table_blocks(node, depth),
         "br" => Vec::new(),
         _ => {
-            if has_block_child(node) {
-                children_of(node)
+            if has_block_child(node, depth) {
+                children_of(node, depth)
             } else {
-                paragraph(collect_inlines(node))
+                paragraph(collect_inlines(node, depth))
             }
         }
     }
@@ -211,11 +287,13 @@ fn paragraph(inlines: Vec<Inline>) -> Vec<Block> {
     }
 }
 
-fn children_of(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
-    node.children().flat_map(node_blocks).collect()
+fn children_of(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
+    node.children()
+        .flat_map(|child| node_blocks(child, depth + 1))
+        .collect()
 }
 
-fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool) -> Block {
+fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool, depth: u32) -> Block {
     let mut items = Vec::new();
     for child in node.children() {
         let Some(element) = child.value().as_element() else {
@@ -224,10 +302,10 @@ fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool) -> Block {
         if element.name() != "li" {
             continue;
         }
-        let blocks = if has_block_child(child) {
-            children_of(child)
+        let blocks = if has_block_child(child, depth + 1) {
+            children_of(child, depth + 1)
         } else {
-            paragraph(collect_inlines(child))
+            paragraph(collect_inlines(child, depth + 1))
         };
         if !blocks.is_empty() {
             items.push(ListItem { blocks });
@@ -236,20 +314,20 @@ fn list_block(node: ego_tree::NodeRef<'_, Node>, ordered: bool) -> Block {
     Block::List { ordered, items }
 }
 
-fn table_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+fn table_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
     let presentation = node.value().as_element().is_some_and(|element| {
         element.attr("role").is_some_and(|role| {
             role.eq_ignore_ascii_case("presentation") || role.eq_ignore_ascii_case("none")
         })
     });
-    if presentation || table_count(node) > 1 {
-        return children_of(node);
+    if presentation || table_count(node, depth) > 1 {
+        return children_of(node, depth);
     }
     let mut header = Vec::new();
     let mut rows = Vec::new();
-    collect_rows(node, true, &mut header, &mut rows);
+    collect_rows(node, true, depth, &mut header, &mut rows);
     if header.is_empty() && rows.is_empty() {
-        return children_of(node);
+        return children_of(node, depth);
     }
     vec![Block::Table { header, rows }]
 }
@@ -257,9 +335,13 @@ fn table_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
 fn collect_rows(
     node: ego_tree::NodeRef<'_, Node>,
     root: bool,
+    depth: u32,
     header: &mut Vec<Vec<Block>>,
     rows: &mut Vec<Vec<Vec<Block>>>,
 ) {
+    if depth >= MAX_HTML_DEPTH {
+        return;
+    }
     for child in node.children() {
         let Some(element) = child.value().as_element() else {
             continue;
@@ -267,7 +349,7 @@ fn collect_rows(
         match element.name() {
             "table" if !root => continue,
             "tr" => {
-                let cells = row_cells(child);
+                let cells = row_cells(child, depth + 1);
                 if cells.is_empty() {
                     continue;
                 }
@@ -286,27 +368,27 @@ fn collect_rows(
                     rows.push(cells);
                 }
             }
-            _ => collect_rows(child, false, header, rows),
+            _ => collect_rows(child, false, depth + 1, header, rows),
         }
     }
 }
 
-fn row_cells(row: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<Block>> {
+fn row_cells(row: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Vec<Block>> {
     row.children()
         .filter_map(|cell| {
             let name = cell.value().as_element()?.name();
-            (name == "td" || name == "th").then(|| cell_blocks(cell))
+            (name == "td" || name == "th").then(|| cell_blocks(cell, depth))
         })
         .collect()
 }
 
 /// A cell keeps its paragraphs, lists, and quotes. Inlines are only for a cell
 /// that has no block children, where a `<br>` is still a line break.
-fn cell_blocks(cell: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
-    let blocks = if has_block_child(cell) {
-        children_of(cell)
+fn cell_blocks(cell: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
+    let blocks = if has_block_child(cell, depth) {
+        children_of(cell, depth)
     } else {
-        paragraph(collect_inlines(cell))
+        paragraph(collect_inlines(cell, depth))
     };
     blocks
         .into_iter()
@@ -314,21 +396,30 @@ fn cell_blocks(cell: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
         .collect()
 }
 
-fn table_count(node: ego_tree::NodeRef<'_, Node>) -> usize {
+fn table_count(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> usize {
     let here = node
         .value()
         .as_element()
         .is_some_and(|element| element.name() == "table") as usize;
-    here + node.children().map(table_count).sum::<usize>()
+    if depth >= MAX_HTML_DEPTH {
+        return here;
+    }
+    here + node
+        .children()
+        .map(|child| table_count(child, depth + 1))
+        .sum::<usize>()
 }
 
-fn has_block_child(node: ego_tree::NodeRef<'_, Node>) -> bool {
+fn has_block_child(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> bool {
+    if depth >= MAX_HTML_DEPTH {
+        return false;
+    }
     node.children().any(|child| {
         child
             .value()
             .as_element()
             .is_some_and(|element| is_block_tag(element.name()))
-            || has_block_child(child)
+            || has_block_child(child, depth + 1)
     })
 }
 
@@ -368,16 +459,23 @@ fn is_block_tag(name: &str) -> bool {
     )
 }
 
-fn collect_inlines(node: ego_tree::NodeRef<'_, Node>) -> Vec<Inline> {
+fn collect_inlines(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Inline> {
     let mut out = Vec::new();
     for child in node.children() {
-        push_inline(child, &mut out);
+        push_inline(child, depth + 1, &mut out);
     }
     trim_inlines(&mut out);
     out
 }
 
-fn push_inline(node: ego_tree::NodeRef<'_, Node>, out: &mut Vec<Inline>) {
+fn push_inline(node: ego_tree::NodeRef<'_, Node>, depth: u32, out: &mut Vec<Inline>) {
+    if depth >= MAX_HTML_DEPTH {
+        let text = normalize_ws(&raw_text(node));
+        if !text.trim().is_empty() {
+            out.push(Inline::Text(text.trim().to_string()));
+        }
+        return;
+    }
     match node.value() {
         Node::Text(text) => {
             let text = normalize_ws(text.deref());
@@ -390,15 +488,15 @@ fn push_inline(node: ego_tree::NodeRef<'_, Node>, out: &mut Vec<Inline>) {
             "br" => out.push(Inline::LineBreak),
             "a" => out.push(Inline::Link {
                 href: safe_href(element.attr("href").unwrap_or("")),
-                children: collect_inlines(node),
+                children: collect_inlines(node, depth),
             }),
-            "em" | "i" => out.push(Inline::Emphasis(collect_inlines(node))),
-            "strong" | "b" => out.push(Inline::Strong(collect_inlines(node))),
+            "em" | "i" => out.push(Inline::Emphasis(collect_inlines(node, depth))),
+            "strong" | "b" => out.push(Inline::Strong(collect_inlines(node, depth))),
             "code" => out.push(Inline::Code(raw_text(node).trim().to_string())),
             "img" => out.push(image_inline(element)),
             _ => {
                 for child in node.children() {
-                    push_inline(child, out);
+                    push_inline(child, depth + 1, out);
                 }
             }
         },
@@ -710,6 +808,54 @@ mod tests {
         let text = document_from_body(body).plain_text();
         assert!(text.contains("<ada@example.com>"));
         assert!(text.contains("Hello"));
+
+        for body in ["<p Hello there>", "<table for Thursday>"] {
+            assert!(!looks_like_html(body), "{body}");
+            let text = document_from_body(body).plain_text();
+            assert!(
+                text.contains("Hello") || text.contains("Thursday"),
+                "{text}"
+            );
+            assert!(text.contains("there") || text.contains("for"), "{text}");
+        }
+        assert!(looks_like_html("<p>Hello</p>"));
+        assert!(looks_like_html("<br/>"));
+        assert!(looks_like_html("<p class=\"x\">Hello</p>"));
+        assert!(looks_like_html("\u{feff}<p>Hello</p>"));
+        assert!(looks_like_html("<!-- note --><p>Hello</p>"));
+        assert!(!looks_like_html("<!-- note --> Hello there"));
+        assert!(looks_like_html(
+            "<!--[if mso]><table><tr><td>Hidden</td></tr></table><![endif]--><p>Visible</p>"
+        ));
+        let outlook = document_from_body("<!--[if mso]><p>Hidden</p><![endif]--><p>Visible</p>");
+        assert!(outlook.plain_text().contains("Visible"), "{outlook:?}");
+        assert!(!outlook.plain_text().contains("[if mso]"));
+    }
+
+    #[test]
+    fn deep_nesting_keeps_the_text() {
+        let mut html = String::new();
+        for _ in 0..2_000 {
+            html.push_str("<div>");
+        }
+        html.push_str("Still here");
+        for _ in 0..2_000 {
+            html.push_str("</div>");
+        }
+        let text = html_to_document(&html).plain_text();
+        assert!(text.contains("Still here"), "{text}");
+
+        let mut spans = String::from("<p>");
+        for _ in 0..2_000 {
+            spans.push_str("<span>");
+        }
+        spans.push_str("Inline");
+        for _ in 0..2_000 {
+            spans.push_str("</span>");
+        }
+        spans.push_str("</p>");
+        let text = html_to_document(&spans).plain_text();
+        assert!(text.contains("Inline"), "{text}");
     }
 
     #[test]

@@ -363,6 +363,46 @@ pub(crate) fn raster_allowed(width: u32, height: u32) -> bool {
         .is_some_and(|bytes| bytes <= MAX_IMAGE_BYTES)
 }
 
+/// Fit a web-view snapshot under the same cap without rejecting a tall page.
+///
+/// Inline images still use [`raster_allowed`] as a hard stop. A newsletter
+/// taller than that is scaled down so the reader can show it.
+pub(crate) fn fit_snapshot(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (1, 1);
+    }
+    if raster_allowed(width, height) {
+        return (width, height);
+    }
+    let (mut dst_w, mut dst_h) = if width >= height {
+        let dst_w = width.min(MAX_IMAGE_EDGE);
+        let dst_h = ((u64::from(height) * u64::from(dst_w)) / u64::from(width)).max(1);
+        (dst_w, u32::try_from(dst_h).unwrap_or(MAX_IMAGE_EDGE))
+    } else {
+        let dst_h = height.min(MAX_IMAGE_EDGE);
+        let dst_w = ((u64::from(width) * u64::from(dst_h)) / u64::from(height)).max(1);
+        (u32::try_from(dst_w).unwrap_or(MAX_IMAGE_EDGE), dst_h)
+    };
+    while !raster_allowed(dst_w, dst_h) {
+        if dst_w <= 1 && dst_h <= 1 {
+            break;
+        }
+        let next_w = ((u64::from(dst_w) * 9) / 10).max(1);
+        let next_h = ((u64::from(dst_h) * 9) / 10).max(1);
+        if next_w == u64::from(dst_w) && next_h == u64::from(dst_h) {
+            if dst_w > 1 {
+                dst_w -= 1;
+            } else {
+                dst_h -= 1;
+            }
+        } else {
+            dst_w = u32::try_from(next_w).unwrap_or(1);
+            dst_h = u32::try_from(next_h).unwrap_or(1);
+        }
+    }
+    (dst_w.max(1), dst_h.max(1))
+}
+
 fn image_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_EDGE);
@@ -445,6 +485,19 @@ mod decode_tests {
         assert!(!raster_allowed(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE));
         assert!(!raster_allowed(u32::MAX, u32::MAX));
         assert!(decode_image(&png_header(100_000, 100_000)).is_none());
+    }
+
+    #[test]
+    fn tall_snapshot_is_scaled_into_the_cap() {
+        use super::{fit_snapshot, raster_allowed};
+
+        assert_eq!(fit_snapshot(880, 1_200), (880, 1_200));
+        let (width, height) = fit_snapshot(880, 20_000);
+        assert!(raster_allowed(width, height), "{width}x{height}");
+        assert!(height > width, "{width}x{height}");
+        let (width, height) = fit_snapshot(880, 9_500);
+        assert!(raster_allowed(width, height), "{width}x{height}");
+        assert!(height > 4_000, "{width}x{height}");
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {

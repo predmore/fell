@@ -11,7 +11,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use gtk::prelude::*;
@@ -51,7 +51,7 @@ thread_local! {
 }
 
 struct StoredPng {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     generation: u64,
     settled: bool,
 }
@@ -66,7 +66,7 @@ static FRAME: Mutex<Option<(u64, StoredFrame)>> = Mutex::new(None);
 pub enum WebStatus {
     Pending,
     Ready {
-        png: Vec<u8>,
+        png: Arc<[u8]>,
         generation: u64,
         settled: bool,
     },
@@ -98,7 +98,7 @@ pub fn status_for(token: u64) -> WebStatus {
     };
     match slot.as_ref() {
         Some((got, StoredFrame::Png(png))) if *got == token => WebStatus::Ready {
-            png: png.bytes.clone(),
+            png: Arc::clone(&png.bytes),
             generation: png.generation,
             settled: png.settled,
         },
@@ -406,7 +406,7 @@ fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64, shot: u64) {
                     *frame = Some((
                         token,
                         StoredFrame::Png(StoredPng {
-                            bytes: png,
+                            bytes: Arc::from(png),
                             generation,
                             settled,
                         }),
@@ -538,17 +538,20 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
     let Ok(height) = u32::try_from(height) else {
         return None;
     };
-    if !super::native::raster_allowed(width, height) {
-        return None;
-    }
+    let (dst_w, dst_h) = super::native::fit_snapshot(width, height);
     let stride = image.stride() as usize;
     let data = image.data().ok()?;
-    let mut rgba =
-        Vec::with_capacity(usize::try_from(u64::from(width) * u64::from(height) * 4).ok()?);
-    for y in 0..height as usize {
-        let start = y * stride;
-        let row = data.get(start..start + width as usize * 4)?;
-        for px in row.as_chunks::<4>().0 {
+    let src_w = width as usize;
+    let src_h = height as usize;
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let mut rgba = Vec::with_capacity(dst_w_us * dst_h_us * 4);
+    for y in 0..dst_h_us {
+        let src_y = y * src_h / dst_h_us;
+        for x in 0..dst_w_us {
+            let src_x = x * src_w / dst_w_us;
+            let offset = src_y * stride + src_x * 4;
+            let px = data.get(offset..offset + 4)?;
             let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
             if a == 0 || a == 255 {
                 rgba.extend_from_slice(&[r, g, b, a]);
@@ -562,7 +565,7 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
             }
         }
     }
-    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
+    let buffer = image::RgbaImage::from_raw(dst_w, dst_h, rgba)?;
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(buffer)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
