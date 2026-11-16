@@ -39,19 +39,19 @@ SQLite is the source of truth for the UI. Sync writes messages, threads, and an 
 
 ## Threading
 
-A thread id is assigned when a message is stored, then the account is re-resolved until stable:
+A thread id is assigned when a message is stored, then the account is re-resolved in memory from threading columns (not bodies):
 
 1. If Proton sent a conversation id, that is the thread key (`proton:…`).
 2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent in the **same account**.
 3. Otherwise start a thread from the message's own `Message-ID`.
 
-Messages are unique on `(account_id, message_id)`. After a delta is written, thread ids are re-resolved and descendants/siblings on the old thread move with a changed row, so a reply stored before its parent (or a later Proton conversation id) still ends up in one thread.
+Messages are unique on `(account_id, message_id)`. After a delta with messages is written, each row's previous thread and its header-parent thread are unioned onto the resolved id, so a proton-tagged reply still pulls the parent's header thread with it. Cursor-only deltas skip the scan.
 
 Proton conversation ids win when present so Bridge and the future API stay consistent with Proton's own threading. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
 
 ## Sending mail
 
-Agents may prepare a `Draft`. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi` (see `fell::confirmation_from_ui`). The MCP crate has no send tool and does not depend on `fell-confirm`, so it cannot construct that token.
+Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi` (see `fell::confirmation_from_ui`) and bound to that id plus the recipients and body that were shown. A token for draft A does not confirm draft B. The MCP crate has no send tool and does not depend on `fell-confirm`, so it cannot construct that token.
 
 ## First platform
 

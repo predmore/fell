@@ -23,7 +23,7 @@ pub use search::SearchHit;
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
 pub use store::{Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
-pub use threading::{ThreadId, resolve_thread_id};
+pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 /// Crate-wide error. IMAP/Proton failures will map here once those backends exist.
 #[derive(Debug, thiserror::Error)]

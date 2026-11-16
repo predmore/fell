@@ -1,8 +1,6 @@
 use crate::account::BackendKind;
 use crate::message::Message;
-use crate::send::{
-    Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation, require_confirmation,
-};
+use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
 use crate::{Error, Result};
 
 /// Opaque sync checkpoint from a backend (IMAP UIDVALIDITY/HIGHESTMODSEQ, Proton event id, …).
@@ -66,10 +64,7 @@ impl MailBackend for BridgeBackend {
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
-        Ok(PendingSend {
-            id: PendingSendId("bridge-pending".into()),
-            draft,
-        })
+        Ok(PendingSend::new("bridge", draft))
     }
 
     fn confirm_send(
@@ -96,10 +91,7 @@ impl MailBackend for ProtonApiBackend {
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
-        Ok(PendingSend {
-            id: PendingSendId("api-pending".into()),
-            draft,
-        })
+        Ok(PendingSend::new("api", draft))
     }
 
     fn confirm_send(
@@ -134,10 +126,7 @@ impl MailBackend for FixtureBackend {
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
-        Ok(PendingSend {
-            id: PendingSendId("fixture-pending".into()),
-            draft,
-        })
+        Ok(PendingSend::new("fixture", draft))
     }
 
     fn confirm_send(
@@ -182,10 +171,8 @@ mod tests {
                 in_reply_to: None,
             })
             .unwrap();
-        let confirm = UserSendConfirmation::from_interactive_ui(
-            &fell_confirm::InteractiveUi,
-            pending.id.clone(),
-        );
+        let confirm =
+            UserSendConfirmation::from_interactive_ui(&fell_confirm::InteractiveUi, &pending);
         let sent = backend.confirm_send(pending, confirm).unwrap();
         assert_eq!(sent.remote_id.0, "fixture-sent");
     }

@@ -47,6 +47,21 @@ pub fn resolve_thread_id<E>(
     Ok(ThreadId::from_message_id(&headers.message_id))
 }
 
+/// Thread of the nearest stored header parent (`In-Reply-To` / `References`).
+/// Ignores Proton conversation ids so a proton-tagged reply can still join
+/// the parent's header thread.
+pub fn header_parent_thread_id<E>(
+    headers: &MessageHeaders,
+    mut lookup_parent: impl FnMut(&MessageId) -> Result<Option<ThreadId>, E>,
+) -> Result<Option<ThreadId>, E> {
+    for parent in headers.parent_ids() {
+        if let Some(thread) = lookup_parent(parent)? {
+            return Ok(Some(thread));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +128,20 @@ mod tests {
         let h = headers("solo@x", None, None, &[]);
         let thread = resolve_thread_id(&h, |_| -> Result<_, Infallible> { Ok(None) }).unwrap();
         assert_eq!(thread, ThreadId::from_message_id(&MessageId::new("solo@x")));
+    }
+
+    #[test]
+    fn header_parent_ignores_proton_id() {
+        let parent_thread = ThreadId::from_message_id(&MessageId::new("root@x"));
+        let map = HashMap::from([(MessageId::new("root@x"), parent_thread.clone())]);
+        let h = headers("child@x", Some("conv"), Some("root@x"), &[]);
+        assert_eq!(
+            header_parent_thread_id(&h, lookup(&map)).unwrap(),
+            Some(parent_thread)
+        );
+        assert_eq!(
+            resolve_thread_id(&h, lookup(&map)).unwrap(),
+            ThreadId::proton("conv")
+        );
     }
 }

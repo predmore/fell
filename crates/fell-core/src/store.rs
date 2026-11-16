@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -7,7 +8,7 @@ use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
 use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 use crate::search::{SearchHit, fts5_phrase};
-use crate::threading::{ThreadId, resolve_thread_id};
+use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -163,7 +164,9 @@ impl Store {
         for message in &delta.messages {
             insert_message(&tx, message)?;
         }
-        rethread(&tx, account_id)?;
+        if !delta.messages.is_empty() {
+            rethread(&tx, account_id)?;
+        }
         if let Some(cursor) = &delta.cursor {
             set_sync_cursor_on(&tx, account_id, cursor)?;
         }
@@ -358,49 +361,131 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
     Ok(thread_id)
 }
 
-/// Re-resolve thread ids for an account until nothing moves.
-///
-/// When a message's resolved id changes, every row currently on that message's
-/// old thread moves with it (descendants / siblings, including a later Proton
-/// conversation id).
-fn rethread(conn: &Connection, account_id: &AccountId) -> Result<()> {
-    loop {
-        let messages = load_account_messages(conn, account_id)?;
-        let mut moved = false;
-        for message in &messages {
-            let new_tid = resolve_thread_id(&message.headers, |parent| {
-                thread_id_for_message_id(conn, account_id, parent)
-            })?;
-            if new_tid == message.thread_id {
-                continue;
-            }
-            conn.execute(
-                "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
-                params![
-                    new_tid.as_str(),
-                    account_id.as_str(),
-                    message.thread_id.as_str()
-                ],
-            )?;
-            moved = true;
-            break;
-        }
-        if !moved {
-            return Ok(());
-        }
-    }
+/// Threading columns only — bodies stay on disk.
+struct ThreadingRow {
+    thread_id: ThreadId,
+    headers: MessageHeaders,
 }
 
-fn load_account_messages(conn: &Connection, account_id: &AccountId) -> Result<Vec<Message>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {SELECT_MESSAGE_COLS} FROM messages WHERE account_id = ?1"
-    ))?;
-    let rows = stmt.query_map(params![account_id.as_str()], row_to_message)?;
+/// Re-resolve thread ids for an account in one in-memory pass.
+///
+/// `resolve_thread_id` returns a Proton id without walking parents, so a
+/// proton-tagged reply would otherwise sit on `proton:…` while the parent
+/// stays on `msgid:…`. Before assigning that id, this unions the row's
+/// previous thread and the header-parent thread onto the resolved id.
+fn rethread(conn: &Connection, account_id: &AccountId) -> Result<()> {
+    let rows = load_threading_rows(conn, account_id)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let by_message: HashMap<MessageId, ThreadId> = rows
+        .iter()
+        .map(|row| (row.headers.message_id.clone(), row.thread_id.clone()))
+        .collect();
+
+    let mut union = ThreadUnion::default();
+    for row in &rows {
+        let onto = resolve_thread_id(&row.headers, |parent| {
+            Ok::<_, crate::Error>(by_message.get(parent).cloned())
+        })?;
+        let header = header_parent_thread_id(&row.headers, |parent| {
+            Ok::<_, crate::Error>(by_message.get(parent).cloned())
+        })?;
+        union.union(row.thread_id.as_str(), onto.as_str());
+        if let Some(header) = header {
+            union.union(header.as_str(), onto.as_str());
+        }
+    }
+
+    let mut written = HashSet::new();
+    for row in &rows {
+        let from = row.thread_id.as_str();
+        let onto = union.find(from);
+        if from == onto || !written.insert(from.to_string()) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
+            params![onto.as_str(), account_id.as_str(), from],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_threading_rows(conn: &Connection, account_id: &AccountId) -> Result<Vec<ThreadingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT message_id, thread_id, proton_conversation_id, in_reply_to, references_header
+         FROM messages WHERE account_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![account_id.as_str()], |row| {
+        let message_id: String = row.get(0)?;
+        let thread_id: String = row.get(1)?;
+        let proton_conversation_id: Option<String> = row.get(2)?;
+        let in_reply_to: Option<String> = row.get(3)?;
+        let references: String = row.get(4)?;
+        Ok(ThreadingRow {
+            thread_id: ThreadId(thread_id),
+            headers: MessageHeaders {
+                message_id: MessageId(message_id),
+                proton_conversation_id,
+                in_reply_to: in_reply_to.map(MessageId),
+                references: parse_references(&references),
+                from: Address {
+                    name: None,
+                    email: String::new(),
+                },
+                subject: String::new(),
+                date_unix: 0,
+            },
+        })
+    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+#[derive(Default)]
+struct ThreadUnion {
+    parent: HashMap<String, String>,
+}
+
+impl ThreadUnion {
+    fn find(&mut self, id: &str) -> String {
+        let parent = self
+            .parent
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string());
+        if parent == id {
+            self.parent.entry(id.to_string()).or_insert(id.to_string());
+            return parent;
+        }
+        let root = self.find(&parent);
+        self.parent.insert(id.to_string(), root.clone());
+        root
+    }
+
+    fn union(&mut self, a: &str, b: &str) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        let (root, other) = preferred_thread(&ra, &rb);
+        self.parent.insert(other, root);
+    }
+}
+
+fn preferred_thread(a: &str, b: &str) -> (String, String) {
+    match (a.starts_with("proton:"), b.starts_with("proton:")) {
+        (true, false) => (a.to_string(), b.to_string()),
+        (false, true) => (b.to_string(), a.to_string()),
+        _ if a <= b => (a.to_string(), b.to_string()),
+        _ => (b.to_string(), a.to_string()),
+    }
 }
 
 fn parse_references(raw: &str) -> Vec<MessageId> {
@@ -660,6 +745,90 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].thread_id, ThreadId::proton("conv-9"));
         assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn reply_carries_proton_id_joins_parent_in_same_delta() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![
+                        msg("root@x", None, None, "Root", "root"),
+                        msg("reply@x", Some("conv"), Some("root@x"), "Re: Root", "reply"),
+                    ],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, ThreadId::proton("conv"));
+        assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn later_reply_proton_id_joins_existing_header_thread() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![
+                        msg("root@x", None, None, "Root", "root"),
+                        msg("reply@x", None, Some("root@x"), "Re: Root", "reply"),
+                    ],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        store
+            .upsert_message(&msg(
+                "reply@x",
+                Some("conv"),
+                Some("root@x"),
+                "Re: Root",
+                "reply",
+            ))
+            .unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, ThreadId::proton("conv"));
+        assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn cursor_only_delta_leaves_threads_in_place() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("root@x", None, None, "Root", "root"))
+            .unwrap();
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: vec![],
+                    cursor: Some(SyncCursor {
+                        account_key: "a1".into(),
+                        token: "cursor-only".into(),
+                    }),
+                },
+            )
+            .unwrap();
+        let threads = store.list_threads(&AccountId("a1".into())).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            store
+                .sync_cursor(&AccountId("a1".into()))
+                .unwrap()
+                .unwrap()
+                .token,
+            "cursor-only"
+        );
     }
 
     #[test]
