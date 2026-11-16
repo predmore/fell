@@ -19,13 +19,51 @@ use std::fmt;
 use crate::Error;
 use crate::account::AccountId;
 use crate::backend::{FlagUpdate, MailboxDelta, SyncCursor};
-use crate::message::RemoteId;
+use crate::message::{Message, RemoteId};
+
+/// Messages held in memory before they are persisted. A larger mailbox is
+/// written in several deltas so the cursor can move before the FETCH ends.
+const BATCH_MESSAGES: usize = 32;
+const BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+fn batch_message_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_BATCH_MESSAGES.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        BATCH_MESSAGES
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BATCH_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(BATCH_MESSAGES) };
+}
+
+#[cfg(test)]
+pub(super) struct BatchLimitGuard;
+
+#[cfg(test)]
+pub(super) fn limit_fetch_batch(messages: usize) -> BatchLimitGuard {
+    TEST_BATCH_MESSAGES.with(|cell| cell.set(messages));
+    BatchLimitGuard
+}
+
+#[cfg(test)]
+impl Drop for BatchLimitGuard {
+    fn drop(&mut self) {
+        TEST_BATCH_MESSAGES.with(|cell| cell.set(BATCH_MESSAGES));
+    }
+}
 
 pub(crate) fn fetch_imap(
     account_id: &AccountId,
     config: &ImapConfig,
     cursor: Option<&SyncCursor>,
-) -> Result<MailboxDelta, Error> {
+    mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
+) -> Result<(), Error> {
     if config.username.is_empty() {
         return Err(Error::Backend("imap username is empty".into()));
     }
@@ -38,22 +76,35 @@ pub(crate) fn fetch_imap(
             .then_with(|| left.raw.cmp(&right.raw))
     });
     let prior: HashMap<String, MailboxCheckpoint> = decode_cursor(cursor).into_iter().collect();
-    let mut messages = Vec::new();
-    let mut flags = Vec::new();
-    let mut checkpoints = Vec::new();
+    let mut done: HashMap<String, MailboxCheckpoint> = HashMap::new();
     for mailbox in &mailboxes {
         let previous = prior.get(&mailbox.raw);
         let Some(examined) = session.examine(&mailbox.raw)? else {
             if let Some(prev) = previous {
-                checkpoints.push((mailbox.raw.clone(), prev.clone()));
+                done.insert(mailbox.raw.clone(), prev.clone());
+                emit_progress(
+                    &mut persist,
+                    &Snapshot {
+                        account_id,
+                        listed: &mailboxes,
+                        prior: &prior,
+                        done: &done,
+                    },
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )?;
             }
             continue;
         };
         let plan = plan_fetch(previous, &examined);
-        let same_validity = previous.is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
+        let previous_owned = previous.cloned();
+        let same_validity = previous_owned
+            .as_ref()
+            .is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
         // High-water body fetches ignore UIDs already at the checkpoint.
         // CHANGEDSINCE results are kept so an older flag update is applied.
-        let seen_through = match (previous, &plan) {
+        let seen_through = match (previous_owned.as_ref(), &plan) {
             (Some(prev), FetchPlan::HighWater { .. } | FetchPlan::Discover { .. })
                 if same_validity =>
             {
@@ -61,119 +112,256 @@ pub(crate) fn fetch_imap(
             }
             _ => None,
         };
-        let mut fetched = match fetch_plan_bodies(&mut session, &plan) {
-            Ok(items) => items,
-            Err(err) if uid_fetch_refused(&err) => {
-                remember_previous(&mut checkpoints, &mailbox.raw, previous);
-                continue;
+        let uidvalidity = examined.uidvalidity;
+        let uidnext = examined.uidnext;
+        let highest_modseq = examined.highest_modseq;
+        let exists = examined.exists;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0usize;
+        let mut highest: Option<u32> = None;
+        let flush_batch = |batch: &mut Vec<Message>,
+                           batch_bytes: &mut usize,
+                           highest: Option<u32>,
+                           persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
+                           done: &HashMap<String, MailboxCheckpoint>|
+         -> Result<(), Error> {
+            if batch.is_empty() {
+                return Ok(());
             }
-            Err(err) => return Err(err),
-        };
-        let highest = fetched.iter().map(|item| item.uid).max();
-        fetched.retain(|item| seen_through.is_none_or(|uid| item.uid > uid));
-        let needs_baseline = same_validity
-            && previous.is_some_and(|prev| prev.modseq.is_none() && prev.uid > 0)
-            && examined.highest_modseq.is_some()
-            && !matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
-        if needs_baseline {
-            let rows = match session.uid_flags("1:*") {
-                Ok(rows) => rows,
-                Err(err) if uid_fetch_refused(&err) => {
-                    remember_previous(&mut checkpoints, &mailbox.raw, previous);
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let uid = checkpoint_uid(previous_owned.as_ref(), same_validity, highest);
+            let modseq = if same_validity {
+                previous_owned.as_ref().and_then(|prev| prev.modseq)
+            } else {
+                None
             };
-            for (uid, flag_names) in rows {
-                let unread = !flag_names
-                    .iter()
-                    .any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
-                flags.push(FlagUpdate {
-                    remote_id: RemoteId(format!(
-                        "imap:{}:{uid}:{}",
-                        examined.uidvalidity,
-                        escape_mailbox(&mailbox.raw)
-                    )),
-                    unread,
-                });
+            let current = MailboxCheckpoint {
+                uidvalidity,
+                uid,
+                modseq,
+            };
+            emit_progress(
+                persist,
+                &Snapshot {
+                    account_id,
+                    listed: &mailboxes,
+                    prior: &prior,
+                    done,
+                },
+                Some((&mailbox.raw, &current)),
+                std::mem::take(batch),
+                Vec::new(),
+            )?;
+            *batch_bytes = 0;
+            Ok(())
+        };
+        let stop = stream_bodies(&mut session, &plan, |item| {
+            let counts = seen_through.is_none_or(|floor| item.uid > floor);
+            if counts {
+                highest = Some(highest.map_or(item.uid, |current| current.max(item.uid)));
             }
-        }
-        for item in fetched {
-            if item.skipped || rfc822::is_deleted(&item.flags) {
-                continue;
+            if !counts || item.skipped || rfc822::is_deleted(&item.flags) {
+                return Ok(());
             }
-            messages.push(rfc822::to_message(
+            let raw_len = item.body.len();
+            batch.push(rfc822::to_message(
                 account_id,
                 &mailbox.raw,
                 &mailbox.decoded,
-                examined.uidvalidity,
+                uidvalidity,
                 item.uid,
                 &item.flags,
                 &item.body,
             ));
-        }
-        let uid = match &plan {
-            FetchPlan::Full | FetchPlan::HighWater { .. } => match examined.uidnext {
-                Some(next) => highest.unwrap_or(0).max(next.saturating_sub(1)),
-                None => checkpoint_uid(previous, same_validity, highest),
-            },
-            FetchPlan::Discover { .. } | FetchPlan::ChangedSince(_) | FetchPlan::Idle => {
-                checkpoint_uid(previous, same_validity, highest)
+            batch_bytes += raw_len;
+            if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
+                flush_batch(&mut batch, &mut batch_bytes, highest, &mut persist, &done)?;
             }
+            Ok(())
+        })?;
+        let (finished, min_skipped) = match stop {
+            session::FetchStop::Done => (true, None),
+            session::FetchStop::Refused => {
+                if batch.is_empty() && highest.is_none() {
+                    if let Some(prev) = previous_owned.clone() {
+                        done.insert(mailbox.raw.clone(), prev);
+                        emit_progress(
+                            &mut persist,
+                            &Snapshot {
+                                account_id,
+                                listed: &mailboxes,
+                                prior: &prior,
+                                done: &done,
+                            },
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
+                    }
+                    continue;
+                }
+                (false, None)
+            }
+            session::FetchStop::Truncated { min_skipped_uid } => (false, min_skipped_uid),
+        };
+        let mut flags = Vec::new();
+        let mut flags_complete = true;
+        let needs_baseline = finished
+            && same_validity
+            && previous_owned
+                .as_ref()
+                .is_some_and(|prev| prev.modseq.is_none() && prev.uid > 0)
+            && highest_modseq.is_some()
+            && !matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
+        if needs_baseline {
+            match session.uid_flags("1:*") {
+                Ok(rows) => {
+                    for (uid, flag_names) in rows {
+                        let unread = !flag_names
+                            .iter()
+                            .any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
+                        flags.push(FlagUpdate {
+                            remote_id: RemoteId(format!(
+                                "imap:{uidvalidity}:{uid}:{}",
+                                escape_mailbox(&mailbox.raw)
+                            )),
+                            unread,
+                        });
+                    }
+                }
+                Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
+                    flags_complete = false;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let uid = if finished {
+            match &plan {
+                FetchPlan::Full | FetchPlan::HighWater { .. } => match uidnext {
+                    Some(next) => highest.unwrap_or(0).max(next.saturating_sub(1)),
+                    None => checkpoint_uid(previous_owned.as_ref(), same_validity, highest),
+                },
+                FetchPlan::Discover { .. } | FetchPlan::ChangedSince(_) | FetchPlan::Idle => {
+                    checkpoint_uid(previous_owned.as_ref(), same_validity, highest)
+                }
+            }
+        } else {
+            let partial = match min_skipped {
+                Some(skipped) => Some(skipped.saturating_sub(1)),
+                None => highest,
+            };
+            checkpoint_uid(previous_owned.as_ref(), same_validity, partial)
         };
         // Record HIGHESTMODSEQ when this pass saw every message's flags: a full
         // or CHANGEDSINCE fetch, an empty mailbox, a high-water pass from uid 0,
         // or a UID FLAGS baseline for older mail that had no modseq yet.
-        let saw_every_flag = matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_))
-            || examined.exists == 0
-            || needs_baseline
-            || (matches!(plan, FetchPlan::HighWater { start } if start <= 1)
-                && previous.map(|prev| prev.uid).unwrap_or(0) == 0);
+        let saw_every_flag = finished
+            && flags_complete
+            && (matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_))
+                || exists == 0
+                || needs_baseline
+                || (matches!(plan, FetchPlan::HighWater { start } if start <= 1)
+                    && previous_owned.as_ref().map(|prev| prev.uid).unwrap_or(0) == 0));
         let modseq = if saw_every_flag {
-            examined
-                .highest_modseq
-                .or_else(|| previous.and_then(|prev| prev.modseq))
+            highest_modseq.or_else(|| previous_owned.as_ref().and_then(|prev| prev.modseq))
         } else if same_validity {
-            previous.and_then(|prev| prev.modseq)
+            previous_owned.as_ref().and_then(|prev| prev.modseq)
         } else {
             None
         };
-        checkpoints.push((
-            mailbox.raw.clone(),
-            MailboxCheckpoint {
-                uidvalidity: examined.uidvalidity,
-                uid,
-                modseq,
+        let current = MailboxCheckpoint {
+            uidvalidity,
+            uid,
+            modseq,
+        };
+        emit_progress(
+            &mut persist,
+            &Snapshot {
+                account_id,
+                listed: &mailboxes,
+                prior: &prior,
+                done: &done,
             },
-        ));
+            Some((&mailbox.raw, &current)),
+            std::mem::take(&mut batch),
+            flags,
+        )?;
+        done.insert(mailbox.raw.clone(), current);
     }
     session.logout();
-    checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(MailboxDelta {
-        messages,
-        flags,
-        cursor: Some(encode_cursor(account_id.as_str(), &checkpoints)),
-    })
+    Ok(())
 }
 
-fn fetch_plan_bodies(
+fn stream_bodies(
     session: &mut session::Session,
     plan: &FetchPlan,
-) -> Result<Vec<session::Fetched>, Error> {
+    mut on_fetched: impl FnMut(session::Fetched) -> Result<(), Error>,
+) -> Result<session::FetchStop, Error> {
     match plan {
-        FetchPlan::ChangedSince(modseq) => session.uid_fetch("1:*", Some(*modseq)),
-        FetchPlan::HighWater { start } => session.uid_fetch(&format!("{start}:*"), None),
-        FetchPlan::Full => session.uid_fetch("1:*", None),
-        FetchPlan::Discover { start } => {
-            let found = session.uid_find(&format!("{start}:*"))?;
-            let mut bodies = Vec::new();
-            for uid in found.into_iter().filter(|uid| *uid >= *start) {
-                bodies.extend(session.uid_fetch(&uid.to_string(), None)?);
-            }
-            Ok(bodies)
+        FetchPlan::Idle => Ok(session::FetchStop::Done),
+        FetchPlan::ChangedSince(modseq) => session.uid_fetch_each("1:*", Some(*modseq), on_fetched),
+        FetchPlan::HighWater { start } => {
+            session.uid_fetch_each(&format!("{start}:*"), None, on_fetched)
         }
-        FetchPlan::Idle => Ok(Vec::new()),
+        FetchPlan::Full => session.uid_fetch_each("1:*", None, on_fetched),
+        FetchPlan::Discover { start } => {
+            let found = match session.uid_find(&format!("{start}:*")) {
+                Ok(uids) => uids,
+                Err(err) if untagged_overflow(&err) => {
+                    return Ok(session::FetchStop::Truncated {
+                        min_skipped_uid: None,
+                    });
+                }
+                Err(err) if uid_fetch_refused(&err) => return Ok(session::FetchStop::Refused),
+                Err(err) => return Err(err),
+            };
+            for uid in found.into_iter().filter(|uid| *uid >= *start) {
+                match session.uid_fetch_each(&uid.to_string(), None, &mut on_fetched)? {
+                    session::FetchStop::Done => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(session::FetchStop::Done)
+        }
     }
+}
+
+struct Snapshot<'a> {
+    account_id: &'a AccountId,
+    listed: &'a [session::Listed],
+    prior: &'a HashMap<String, MailboxCheckpoint>,
+    done: &'a HashMap<String, MailboxCheckpoint>,
+}
+
+fn emit_progress(
+    persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
+    snapshot: &Snapshot<'_>,
+    current: Option<(&str, &MailboxCheckpoint)>,
+    messages: Vec<Message>,
+    flags: Vec<FlagUpdate>,
+) -> Result<(), Error> {
+    let mut pairs = Vec::new();
+    for mailbox in snapshot.listed {
+        let checkpoint = if let Some((name, cp)) = current
+            && name == mailbox.raw
+        {
+            Some(cp.clone())
+        } else {
+            snapshot
+                .done
+                .get(&mailbox.raw)
+                .cloned()
+                .or_else(|| snapshot.prior.get(&mailbox.raw).cloned())
+        };
+        if let Some(checkpoint) = checkpoint {
+            pairs.push((mailbox.raw.clone(), checkpoint));
+        }
+    }
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    persist(MailboxDelta {
+        messages,
+        flags,
+        cursor: Some(encode_cursor(snapshot.account_id.as_str(), &pairs)),
+    })
 }
 
 /// Tagged NO/BAD on UID FETCH. The socket is still a valid IMAP session.
@@ -182,14 +370,9 @@ fn uid_fetch_refused(err: &Error) -> bool {
     matches!(err, Error::Backend(message) if message.contains("UID FETCH failed:"))
 }
 
-fn remember_previous(
-    checkpoints: &mut Vec<(String, MailboxCheckpoint)>,
-    raw: &str,
-    previous: Option<&MailboxCheckpoint>,
-) {
-    if let Some(prev) = previous {
-        checkpoints.push((raw.to_string(), prev.clone()));
-    }
+/// The untagged-reply cap. The command was drained, so later mailboxes can run.
+fn untagged_overflow(err: &Error) -> bool {
+    matches!(err, Error::Backend(message) if message.contains("exceeded") && message.contains("untagged"))
 }
 
 fn inbox_rank(name: &str) -> u8 {
@@ -200,6 +383,7 @@ fn inbox_rank(name: &str) -> u8 {
     }
 }
 
+#[derive(Clone, Copy)]
 enum FetchPlan {
     /// Nothing new, or the mailbox is empty.
     Idle,

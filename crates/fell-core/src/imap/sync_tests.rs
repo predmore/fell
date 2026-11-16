@@ -34,6 +34,9 @@ fn sample_state() -> TestState {
         condstore: false,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -342,7 +345,10 @@ fn condstore_updates_unread_without_a_second_copy() {
     assert!(store.list_threads(&acct.id).unwrap()[0].unread);
     let logged = commands(&server);
     assert!(logged.iter().any(|line| line.contains("CHANGEDSINCE")));
-    let login_at = logged.iter().position(|line| line == "LOGIN").unwrap();
+    let login_at = logged
+        .iter()
+        .position(|line| line.starts_with("LOGIN"))
+        .unwrap();
     let enable_at = logged
         .iter()
         .position(|line| line.contains("ENABLE"))
@@ -498,6 +504,9 @@ fn star_range_does_not_reapply_the_highest_uid() {
         condstore: false,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
@@ -552,6 +561,9 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         condstore: true,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
@@ -608,6 +620,9 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         condstore: false,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -710,6 +725,9 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         condstore: false,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -807,6 +825,9 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         condstore: true,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -935,6 +956,9 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         condstore: false,
         close_after_starttls: false,
         close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
         commands: Vec::new(),
         mailboxes: vec![
             FixtureMailbox {
@@ -1006,5 +1030,238 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
             .unwrap()
             .iter()
             .any(|thread| thread.subject == "Not stored")
+    );
+}
+
+#[test]
+fn non_ascii_password_logs_in_as_a_literal() {
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "pâssword".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: true,
+        require_utf8_for_login: true,
+        close_after_body_fetches: None,
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 3,
+            uidnext: Some(2),
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            messages: vec![FixtureMessage {
+                uid: 1,
+                flags: vec!["\\Seen".into()],
+                modseq: 1,
+                raw: raw_message(
+                    "in@x",
+                    None,
+                    "From literal login",
+                    "Ann <ann@x>",
+                    "body",
+                    "",
+                ),
+            }],
+        }],
+    });
+    let mut imap = config(server.addr.port());
+    imap.password = "pâssword".into();
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: imap,
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let logged = commands(&server);
+    let enable_at = logged
+        .iter()
+        .position(|line| line.to_ascii_uppercase().contains("ENABLE UTF8=ACCEPT"))
+        .expect("UTF8=ACCEPT should be enabled before a non-ASCII password");
+    let login_at = logged
+        .iter()
+        .position(|line| line == "LOGIN literal")
+        .expect("credentials should be sent as literals");
+    assert!(enable_at < login_at, "{logged:?}");
+    assert!(
+        store
+            .list_threads(&acct.id)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.subject == "From literal login")
+    );
+}
+
+#[test]
+fn fetch_batches_survive_a_dropped_connection() {
+    let _batch = super::limit_fetch_batch(1);
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: Some(2),
+        commands: Vec::new(),
+        mailboxes: vec![FixtureMailbox {
+            name: "INBOX".into(),
+            list_flags: String::new(),
+            uidvalidity: 4,
+            uidnext: Some(4),
+            omit_uidnext: false,
+            reject_examine: false,
+            reject_fetch: false,
+            messages: vec![
+                FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("one@x", None, "One", "Ann <ann@x>", "one", ""),
+                },
+                FixtureMessage {
+                    uid: 2,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("two@x", None, "Two", "Ann <ann@x>", "two", ""),
+                },
+                FixtureMessage {
+                    uid: 3,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("three@x", None, "Three", "Ann <ann@x>", "three", ""),
+                },
+            ],
+        }],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    assert!(sync_once(&acct, &backend, &store).is_err());
+    let subjects: Vec<_> = store
+        .list_threads(&acct.id)
+        .unwrap()
+        .into_iter()
+        .map(|thread| thread.subject)
+        .collect();
+    assert!(subjects.contains(&"One".into()), "{subjects:?}");
+    assert!(subjects.contains(&"Two".into()), "{subjects:?}");
+    assert!(!subjects.contains(&"Three".into()), "{subjects:?}");
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t4\t2\t"),
+        "the cursor advances through the persisted prefix: {cursor}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state.close_after_body_fetches = None;
+        state.commands.clear();
+    }
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 1);
+    let logged = commands(&server);
+    assert!(
+        logged.iter().any(|line| line.contains("3:*")),
+        "the third message is fetched without repeating the stored prefix: {logged:?}"
+    );
+    assert!(
+        store
+            .list_threads(&acct.id)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.subject == "Three")
+    );
+}
+
+#[test]
+fn untagged_flood_does_not_block_the_rest_of_the_account() {
+    let _limit = super::session::limit_untagged_to(4);
+    let messages = (1..=6)
+        .map(|uid| FixtureMessage {
+            uid,
+            flags: vec!["\\Seen".into()],
+            modseq: 1,
+            raw: raw_message(
+                &format!("m{uid}@x"),
+                None,
+                &format!("Sent {uid}"),
+                "Ann <ann@x>",
+                "body",
+                "",
+            ),
+        })
+        .collect();
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        close_during_uid_fetch: false,
+        utf8_accept: false,
+        require_utf8_for_login: false,
+        close_after_body_fetches: None,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Sent".into(),
+                list_flags: String::new(),
+                uidvalidity: 8,
+                uidnext: Some(7),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages,
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                reject_fetch: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("in@x", None, "Inbox kept", "Ann <ann@x>", "inbox", ""),
+                }],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "Sent 4"));
+    assert!(!threads.iter().any(|thread| thread.subject == "Sent 5"));
+    assert!(threads.iter().any(|thread| thread.subject == "Inbox kept"));
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("Sent\t8\t4\t"),
+        "discarded replies stay below the checkpoint: {cursor}"
+    );
+    drop(_limit);
+    sync_once(&acct, &backend, &store).unwrap();
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(threads.iter().any(|thread| thread.subject == "Sent 6"));
+    assert_eq!(
+        threads
+            .iter()
+            .filter(|thread| thread.subject == "Sent 1")
+            .count(),
+        1
     );
 }

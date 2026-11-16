@@ -43,6 +43,14 @@ pub(super) struct Fetched {
     pub skipped: bool,
 }
 
+/// How a streaming UID FETCH ended. `Truncated` means the untagged cap was hit;
+/// the rest of that command was discarded and the connection is still usable.
+pub(super) enum FetchStop {
+    Done,
+    Refused,
+    Truncated { min_skipped_uid: Option<u32> },
+}
+
 pub(super) struct Session {
     io: Option<Io>,
     tag: u32,
@@ -84,9 +92,7 @@ impl Session {
             session.command("STARTTLS", "STARTTLS")?;
             session.upgrade(config)?;
         }
-        let user = quote_imap(&config.username).map_err(imap_err)?;
-        let pass = quote_imap(&config.password).map_err(imap_err)?;
-        let logged_in = session.command("LOGIN", &format!("LOGIN {user} {pass}"))?;
+        let logged_in = session.login(&config.username, &config.password)?;
         // RFC 5161: ENABLE is only valid after authentication. A pre-login
         // CAPABILITY is not repeated here unless LOGIN omitted one.
         if let Some(caps) = capability_from_ok(&logged_in.ok) {
@@ -183,26 +189,54 @@ impl Session {
         Ok(out)
     }
 
-    pub(super) fn uid_fetch(
+    /// Deliver each FETCH as it arrives. Bodies are not kept after `on_fetched`
+    /// returns. Past the untagged cap, further replies are read and dropped so
+    /// the next command stays in sync.
+    pub(super) fn uid_fetch_each(
         &mut self,
         range: &str,
         changed_since: Option<u64>,
-    ) -> Result<Vec<Fetched>, Error> {
+        mut on_fetched: impl FnMut(Fetched) -> Result<(), Error>,
+    ) -> Result<FetchStop, Error> {
         let cmd = match changed_since {
             Some(modseq) => {
                 format!("UID FETCH {range} (UID FLAGS BODY.PEEK[]) (CHANGEDSINCE {modseq})")
             }
             None => format!("UID FETCH {range} (UID FLAGS BODY.PEEK[])"),
         };
-        let lines = self.command("UID FETCH", &cmd)?.untagged;
-        let mut out = Vec::new();
-        for line in lines {
-            if let Some(fetched) = parse_fetch(&line.text, &line.literals) {
-                out.push(fetched);
+        self.tag += 1;
+        let tag = format!("a{}", self.tag);
+        self.write_all(format!("{tag} {cmd}\r\n").as_bytes())?;
+        let mut seen = 0usize;
+        let mut discarding = false;
+        let mut min_skipped = None;
+        loop {
+            let (text, literals) = self.read_logical()?;
+            if text_starts_with_tag(&text, &tag) {
+                let rest = text[tag.len()..].trim_start();
+                let upper = rest.to_ascii_uppercase();
+                if !upper.starts_with("OK") {
+                    return Ok(FetchStop::Refused);
+                }
+                if discarding {
+                    return Ok(FetchStop::Truncated {
+                        min_skipped_uid: min_skipped,
+                    });
+                }
+                return Ok(FetchStop::Done);
+            }
+            seen += 1;
+            if discarding || seen > untagged_limit() {
+                discarding = true;
+                if let Some(uid) = uid_in_fetch_text(&text) {
+                    min_skipped = Some(min_skipped.map_or(uid, |current| current.min(uid)));
+                }
+                continue;
+            }
+            if let Some(fetched) = parse_fetch(&text, literals) {
+                on_fetched(fetched)?;
             }
         }
-        out.sort_by_key(|item| item.uid);
-        Ok(out)
     }
 
     /// UIDs in `range` without message bodies. `n:*` may still name the current
@@ -259,15 +293,60 @@ impl Session {
         self.caps.iter().any(|cap| cap.eq_ignore_ascii_case(name))
     }
 
+    /// Username and password are IMAP literals, so octets above 7-bit are legal.
+    /// When the server advertises `UTF8=ACCEPT`, enable it before LOGIN if a
+    /// credential is not ASCII. Some servers reject the password until then.
+    fn login(&mut self, username: &str, password: &str) -> Result<Reply, Error> {
+        let non_ascii =
+            username.bytes().any(|byte| byte > 127) || password.bytes().any(|byte| byte > 127);
+        if non_ascii && !self.has_cap("UTF8=ACCEPT") {
+            let _ = self.read_capabilities();
+        }
+        if non_ascii && self.has_cap("UTF8=ACCEPT") {
+            let _ = self.command("ENABLE", "ENABLE UTF8=ACCEPT");
+        }
+        self.tag += 1;
+        let tag = format!("a{}", self.tag);
+        self.write_all(format!("{tag} LOGIN ").as_bytes())?;
+        self.write_literal(username.as_bytes())?;
+        self.write_all(b" ")?;
+        self.write_literal(password.as_bytes())?;
+        self.write_all(b"\r\n")?;
+        self.read_reply(&tag, "LOGIN")
+    }
+
+    fn write_literal(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.write_all(format!("{{{}}}\r\n", bytes.len()).as_bytes())?;
+        let (text, _) = self.read_logical()?;
+        if text.trim_start().starts_with('+') {
+            self.write_all(bytes)?;
+            return Ok(());
+        }
+        Err(imap_err(format!(
+            "expected a command continuation, got {text}"
+        )))
+    }
+
     fn command(&mut self, label: &str, cmd: &str) -> Result<Reply, Error> {
         self.tag += 1;
         let tag = format!("a{}", self.tag);
         self.write_all(format!("{tag} {cmd}\r\n").as_bytes())?;
+        self.read_reply(&tag, label)
+    }
+
+    fn read_reply(&mut self, tag: &str, label: &str) -> Result<Reply, Error> {
         let mut untagged = Vec::new();
+        let mut overflow = false;
         loop {
             let (text, literals) = self.read_logical()?;
-            if text_starts_with_tag(&text, &tag) {
+            if text_starts_with_tag(&text, tag) {
                 let rest = text[tag.len()..].trim_start();
+                if overflow {
+                    return Err(imap_err(format!(
+                        "{label} exceeded {} untagged replies",
+                        untagged_limit()
+                    )));
+                }
                 let upper = rest.to_ascii_uppercase();
                 if upper.starts_with("OK") {
                     return Ok(Reply {
@@ -277,11 +356,9 @@ impl Session {
                 }
                 return Err(imap_err(format!("{label} failed: {rest}")));
             }
-            if untagged.len() >= untagged_limit() {
-                return Err(imap_err(format!(
-                    "{label} exceeded {} untagged replies",
-                    untagged_limit()
-                )));
+            if overflow || untagged.len() >= untagged_limit() {
+                overflow = true;
+                continue;
             }
             untagged.push(Logical { text, literals });
         }
@@ -553,10 +630,10 @@ impl Drop for LineLimitGuard {
 }
 
 #[cfg(test)]
-struct UntaggedLimitGuard;
+pub(super) struct UntaggedLimitGuard;
 
 #[cfg(test)]
-fn limit_untagged_to(limit: usize) -> UntaggedLimitGuard {
+pub(super) fn limit_untagged_to(limit: usize) -> UntaggedLimitGuard {
     TEST_UNTAGGED_LIMIT.with(|cell| cell.set(limit));
     UntaggedLimitGuard
 }
@@ -896,7 +973,7 @@ fn parse_list(text: &str, literals: &[LiteralBytes]) -> Option<ParsedList> {
     })
 }
 
-fn parse_fetch(text: &str, literals: &[LiteralBytes]) -> Option<Fetched> {
+fn parse_fetch(text: &str, literals: Vec<LiteralBytes>) -> Option<Fetched> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('*') {
         return None;
@@ -908,8 +985,8 @@ fn parse_fetch(text: &str, literals: &[LiteralBytes]) -> Option<Fetched> {
     let uid = number_after(&upper, "UID ")?;
     let flags = paren_after(text, "FLAGS").unwrap_or_default();
     let skipped = matches!(literals.first(), Some(LiteralBytes::Discarded));
-    let body = match literals.first() {
-        Some(LiteralBytes::Kept(bytes)) => bytes.clone(),
+    let body = match literals.into_iter().next() {
+        Some(LiteralBytes::Kept(bytes)) => bytes,
         _ => Vec::new(),
     };
     Some(Fetched {
@@ -918,6 +995,14 @@ fn parse_fetch(text: &str, literals: &[LiteralBytes]) -> Option<Fetched> {
         body,
         skipped,
     })
+}
+
+fn uid_in_fetch_text(text: &str) -> Option<u32> {
+    let upper = text.to_ascii_uppercase();
+    if !upper.contains("FETCH") {
+        return None;
+    }
+    number_after(&upper, "UID ")
 }
 
 fn number_after(upper: &str, key: &str) -> Option<u32> {
@@ -941,7 +1026,8 @@ fn paren_after(text: &str, key: &str) -> Option<Vec<String>> {
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
         Some(&text[prefix.len()..])
     } else {
         None
@@ -1046,7 +1132,7 @@ impl Io {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
 
     use super::connect_addrs;
@@ -1064,7 +1150,7 @@ mod tests {
         thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             sock.write_all(b"* OK hi\r\n").unwrap();
-            let line = read_imap_line(&mut sock);
+            let line = read_imap_command(&mut sock);
             let tag = line.split_whitespace().next().unwrap_or("a1");
             sock.write_all(b"* CAPABILITY {24}\r\n").unwrap();
             sock.write_all(b"xxxxxxxxxxxxxxxxxxxxxxxx\r\n").unwrap();
@@ -1128,6 +1214,51 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_list_line_is_skipped() {
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        assert!(super::parse_list("* €é", &[]).is_none());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK hi\r\n").unwrap();
+            loop {
+                let line = read_imap_command(&mut sock);
+                if line.is_empty() {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap_or("a1");
+                let upper = line.to_ascii_uppercase();
+                let response = if upper.contains("LOGIN") {
+                    format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n")
+                } else if upper.contains("LIST") {
+                    format!("* €é\r\n* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{tag} OK LIST\r\n")
+                } else {
+                    format!("{tag} OK\r\n")
+                };
+                if sock.write_all(response.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut session = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        })
+        .expect("login");
+        let listed = session.list_selectable().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].decoded, "INBOX");
+    }
+
+    #[test]
     fn too_many_untagged_replies_are_rejected() {
         use std::io::Write;
         use std::thread;
@@ -1140,7 +1271,7 @@ mod tests {
         thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             sock.write_all(b"* OK hi\r\n").unwrap();
-            let line = read_imap_line(&mut sock);
+            let line = read_imap_command(&mut sock);
             let tag = line.split_whitespace().next().unwrap_or("a1");
             sock.write_all(b"* OK one\r\n* OK two\r\n* OK three\r\n")
                 .unwrap();
@@ -1202,7 +1333,7 @@ mod tests {
             let (mut sock, _) = listener.accept().unwrap();
             if security == crate::imap::ImapSecurity::StartTls {
                 sock.write_all(b"* OK ready\r\n").unwrap();
-                let line = read_imap_line(&mut sock);
+                let line = read_imap_command(&mut sock);
                 let tag = line.split_whitespace().next().unwrap_or("a1");
                 sock.write_all(format!("{tag} OK STARTTLS\r\n").as_bytes())
                     .unwrap();
@@ -1213,7 +1344,7 @@ mod tests {
                 tls.write_all(b"* OK ready\r\n").unwrap();
             }
             loop {
-                let line = read_imap_line(&mut tls);
+                let line = read_imap_command(&mut tls);
                 if line.is_empty() {
                     break;
                 }
@@ -1245,6 +1376,40 @@ mod tests {
             saw_login.load(Ordering::SeqCst),
             "LOGIN must be read on the TLS stream, which means the handshake finished"
         );
+    }
+
+    fn read_imap_command(stream: &mut (impl Read + std::io::Write)) -> String {
+        let mut line = String::new();
+        loop {
+            let chunk = read_imap_line(stream);
+            if chunk.is_empty() && line.is_empty() {
+                return String::new();
+            }
+            line.push_str(chunk.trim_end_matches(['\r', '\n']));
+            let Some(len) = command_literal_len(&line) else {
+                return line;
+            };
+            if let Some(start) = line.rfind('{') {
+                line.truncate(start);
+            }
+            stream.write_all(b"+ continue\r\n").unwrap();
+            stream.flush().unwrap();
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).unwrap();
+            line.push_str(&String::from_utf8_lossy(&buf));
+        }
+    }
+
+    fn command_literal_len(line: &str) -> Option<usize> {
+        if !line.ends_with('}') {
+            return None;
+        }
+        let start = line.rfind('{')?;
+        let inner = &line[start + 1..line.len() - 1];
+        if inner.is_empty() || !inner.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        inner.parse().ok()
     }
 
     fn read_imap_line(stream: &mut impl Read) -> String {

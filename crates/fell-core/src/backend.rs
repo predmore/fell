@@ -32,6 +32,15 @@ pub trait MailBackend {
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta>;
 
+    /// Persist each bounded delta as it is produced. The default fetches once.
+    fn sync_changes(
+        &self,
+        cursor: Option<&SyncCursor>,
+        persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
+    ) -> Result<()> {
+        persist(self.fetch_changes(cursor)?)
+    }
+
     /// Accept a draft for later send. Must not transmit.
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend>;
 
@@ -72,7 +81,15 @@ impl MailBackend for BridgeBackend {
     }
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
-        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor)
+        collect_imap(&self.account_id, &self.imap, cursor)
+    }
+
+    fn sync_changes(
+        &self,
+        cursor: Option<&SyncCursor>,
+        persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
+    ) -> Result<()> {
+        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, persist)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
@@ -104,7 +121,15 @@ impl MailBackend for ImapBackend {
     }
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
-        crate::imap::fetch_imap(&self.account_id, &self.config, cursor)
+        collect_imap(&self.account_id, &self.config, cursor)
+    }
+
+    fn sync_changes(
+        &self,
+        cursor: Option<&SyncCursor>,
+        persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
+    ) -> Result<()> {
+        crate::imap::fetch_imap(&self.account_id, &self.config, cursor, persist)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
@@ -146,6 +171,23 @@ impl MailBackend for ProtonApiBackend {
         require_confirmation(&pending, &confirmation)?;
         Err(Error::NotImplemented("Proton API send"))
     }
+}
+
+fn collect_imap(
+    account_id: &AccountId,
+    config: &ImapConfig,
+    cursor: Option<&SyncCursor>,
+) -> Result<MailboxDelta> {
+    let mut combined = MailboxDelta::default();
+    crate::imap::fetch_imap(account_id, config, cursor, |mut delta| {
+        combined.messages.append(&mut delta.messages);
+        combined.flags.append(&mut delta.flags);
+        if delta.cursor.is_some() {
+            combined.cursor = delta.cursor;
+        }
+        Ok(())
+    })?;
+    Ok(combined)
 }
 
 /// In-process backend for tests and the empty-window demo. No network.

@@ -1,6 +1,6 @@
 //! In-process IMAP server for tests. Speaks the read-only subset the client uses.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,12 @@ pub(super) struct TestState {
     pub close_after_starttls: bool,
     /// Drop the socket when a UID command arrives, with no tagged reply.
     pub close_during_uid_fetch: bool,
+    /// Advertise UTF8=ACCEPT and allow ENABLE before authentication.
+    pub utf8_accept: bool,
+    /// Reject a non-ASCII password until UTF8=ACCEPT has been enabled.
+    pub require_utf8_for_login: bool,
+    /// Close the socket after this many BODY FETCH replies, with no tagged OK.
+    pub close_after_body_fetches: Option<u32>,
     pub mailboxes: Vec<FixtureMailbox>,
     pub commands: Vec<String>,
 }
@@ -101,14 +107,9 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
     let _ = write.flush();
     let mut authed = false;
     let mut condstore_enabled = false;
+    let mut utf8_enabled = false;
     let mut selected_condstore = false;
-    loop {
-        let mut line = String::new();
-        match read.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let line = line.trim_end_matches(['\r', '\n']).to_string();
+    while let Some((line, literals)) = read_client_command(&mut read, &mut write) {
         if line.is_empty() {
             continue;
         }
@@ -119,7 +120,12 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
         {
             let mut guard = state.lock().expect("state");
             if verb.eq_ignore_ascii_case("LOGIN") {
-                guard.commands.push("LOGIN".into());
+                let kind = if literals.is_empty() {
+                    "LOGIN"
+                } else {
+                    "LOGIN literal"
+                };
+                guard.commands.push(kind.into());
             } else {
                 guard.commands.push(line.clone());
             }
@@ -127,25 +133,36 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
         let verb_upper = verb.to_ascii_uppercase();
         match verb_upper.as_str() {
             "CAPABILITY" => {
-                let caps = if state.lock().expect("state").condstore {
-                    "IMAP4rev1 CONDSTORE"
-                } else {
-                    "IMAP4rev1"
-                };
+                let caps = capability_text(&state.lock().expect("state"));
                 let _ = write.write_all(
                     format!("* CAPABILITY {caps}\r\n{tag} OK CAPABILITY\r\n").as_bytes(),
                 );
             }
             "ENABLE" => {
-                if !authed {
+                let upper = rest.to_ascii_uppercase();
+                let wants_utf8 = upper.contains("UTF8=ACCEPT");
+                let wants_condstore = upper.contains("CONDSTORE");
+                if !authed && !(wants_utf8 && state.lock().expect("state").utf8_accept) {
                     let _ = write.write_all(
                         format!("{tag} NO ENABLE is only valid in the authenticated state\r\n")
                             .as_bytes(),
                     );
                 } else {
-                    condstore_enabled = true;
+                    if wants_utf8 {
+                        utf8_enabled = true;
+                    }
+                    if wants_condstore && authed {
+                        condstore_enabled = true;
+                    }
+                    let enabled = if wants_utf8 && wants_condstore {
+                        "UTF8=ACCEPT CONDSTORE"
+                    } else if wants_utf8 {
+                        "UTF8=ACCEPT"
+                    } else {
+                        "CONDSTORE"
+                    };
                     let _ = write.write_all(
-                        format!("* ENABLED CONDSTORE\r\n{tag} OK ENABLE\r\n").as_bytes(),
+                        format!("* ENABLED {enabled}\r\n{tag} OK ENABLE\r\n").as_bytes(),
                     );
                 }
             }
@@ -157,15 +174,23 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 }
             }
             "LOGIN" => {
-                let (user, pass) = login_args(&rest);
+                let (user, pass) = if literals.len() >= 2 {
+                    (
+                        String::from_utf8_lossy(&literals[0]).into_owned(),
+                        String::from_utf8_lossy(&literals[1]).into_owned(),
+                    )
+                } else {
+                    login_args(&rest)
+                };
                 let guard = state.lock().expect("state");
-                if user == guard.username && pass == guard.password {
+                let non_ascii = pass.bytes().any(|byte| byte > 127);
+                if guard.require_utf8_for_login && non_ascii && !utf8_enabled {
+                    let _ = write.write_all(
+                        format!("{tag} NO [CLIENTBUG] UTF8=ACCEPT required\r\n").as_bytes(),
+                    );
+                } else if user == guard.username && pass == guard.password {
                     authed = true;
-                    let caps = if guard.condstore {
-                        "IMAP4rev1 CONDSTORE"
-                    } else {
-                        "IMAP4rev1"
-                    };
+                    let caps = capability_text(&guard);
                     let _ = write
                         .write_all(format!("{tag} OK [CAPABILITY {caps}] LOGIN\r\n").as_bytes());
                 } else {
@@ -265,6 +290,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     let _ = write.write_all(format!("{tag} BAD UID FETCH denied\r\n").as_bytes());
                     continue;
                 }
+                let mut bodies_left = guard.close_after_body_fetches;
                 let highest = mailbox
                     .messages
                     .iter()
@@ -305,6 +331,13 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     let _ = write.write_all(header.as_bytes());
                     let _ = write.write_all(&message.raw);
                     let _ = write.write_all(b")\r\n");
+                    if let Some(left) = bodies_left.as_mut() {
+                        *left = left.saturating_sub(1);
+                        if *left == 0 {
+                            let _ = write.flush();
+                            return;
+                        }
+                    }
                 }
                 let _ = write.write_all(format!("{tag} OK UID FETCH\r\n").as_bytes());
             }
@@ -381,6 +414,66 @@ fn uid_in_range(uid: u32, range: &str, highest: u32) -> bool {
         (end, start)
     };
     uid >= low && uid <= high
+}
+
+fn capability_text(state: &TestState) -> String {
+    let mut caps = String::from("IMAP4rev1");
+    if state.condstore {
+        caps.push_str(" CONDSTORE");
+    }
+    if state.utf8_accept {
+        caps.push_str(" UTF8=ACCEPT");
+    }
+    caps
+}
+
+fn read_client_command(
+    read: &mut BufReader<TcpStream>,
+    write: &mut TcpStream,
+) -> Option<(String, Vec<Vec<u8>>)> {
+    let mut line = String::new();
+    let mut literals = Vec::new();
+    loop {
+        let mut chunk = String::new();
+        match read.read_line(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        line.push_str(chunk.trim_end_matches(['\r', '\n']));
+        let Some((len, needs_continuation)) = trailing_literal(&line) else {
+            return Some((line, literals));
+        };
+        if let Some(start) = line.rfind('{') {
+            line.truncate(start);
+        }
+        if needs_continuation
+            && (write.write_all(b"+ continue\r\n").is_err() || write.flush().is_err())
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if read.read_exact(&mut buf).is_err() {
+            return None;
+        }
+        line.push_str(&String::from_utf8_lossy(&buf));
+        literals.push(buf);
+    }
+}
+
+fn trailing_literal(line: &str) -> Option<(usize, bool)> {
+    if !line.ends_with('}') {
+        return None;
+    }
+    let start = line.rfind('{')?;
+    let mut inner = &line[start + 1..line.len() - 1];
+    let nonsync = inner.ends_with('+');
+    if nonsync {
+        inner = &inner[..inner.len() - 1];
+    }
+    if inner.is_empty() || !inner.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((inner.parse().ok()?, !nonsync))
 }
 
 fn split_command(line: &str) -> Option<(String, String, String)> {
