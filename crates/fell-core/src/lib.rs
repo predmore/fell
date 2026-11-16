@@ -8,6 +8,7 @@
 pub mod account;
 pub mod actions;
 pub mod backend;
+pub mod imap;
 pub mod message;
 pub mod search;
 pub mod send;
