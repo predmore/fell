@@ -164,6 +164,10 @@ pub fn round_trip_body(body: &str, subject: &str) -> fell_core::Result<Message> 
         folders: vec!["INBOX".into()],
         labels: Vec::new(),
         arrived_via: Vec::new(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        has_attachment: false,
     };
     let thread_id = store.upsert_message(&message)?;
     let mut messages = store.thread_messages(&account.id, &thread_id)?;
