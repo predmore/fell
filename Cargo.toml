@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/fell-core", "crates/fell", "crates/fell-mcp"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/predmore/fell"
+rust-version = "1.100"
+version = "0.1.0"
+
+# gpui 0.2.2 → zed-async-tar → xattr 0.2.3 fails on current libc (no ENOATTR on Linux).
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
+
+[workspace.dependencies]
+fell-core = { path = "crates/fell-core", version = "0.1.0" }
+gpui = { version = "0.2.2", default-features = false, features = [
+    "font-kit",
+    "wayland",
+] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+thiserror = "2"

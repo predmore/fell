@@ -1,0 +1,15 @@
+[package]
+name = "fell-core"
+description = "UI-free Proton Mail engine: accounts, backends, sync, store, threading, search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

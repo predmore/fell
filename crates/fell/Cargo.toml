@@ -1,0 +1,12 @@
+[package]
+name = "fell"
+description = "Fell GPUI client for Proton Mail (Wayland)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fell-core.workspace = true
+gpui.workspace = true
