@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS messages (
     to_line TEXT NOT NULL DEFAULT '',
     cc_line TEXT NOT NULL DEFAULT '',
     bcc_line TEXT NOT NULL DEFAULT '',
+    starred INTEGER NOT NULL DEFAULT 0,
     has_attachment INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     snooze_until INTEGER,
@@ -207,7 +208,7 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
     "account_id, message_id, remote_id, thread_id, proton_conversation_id,
         in_reply_to, references_header, from_name, from_email, subject,
         date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-        to_line, cc_line, bcc_line, has_attachment, archived, snooze_until";
+        to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until";
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
@@ -526,6 +527,163 @@ impl Store {
         };
         Ok(SearchPage { hits, next_cursor })
     }
+
+    pub fn list_accounts(&self) -> Result<Vec<Account>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, display_name, email, backend_kind FROM accounts ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, display_name, email, kind) = row?;
+            let backend_kind = BackendKind::parse(&kind)
+                .ok_or_else(|| crate::Error::Backend(format!("unknown backend_kind {kind}")))?;
+            out.push(Account {
+                id: AccountId(id),
+                display_name,
+                email,
+                backend_kind,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Distinct folder names stored for this account, in first-seen order.
+    pub fn folder_names(&self, account_id: &AccountId) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folders FROM messages WHERE account_id = ?1")?;
+        let rows = stmt.query_map(params![account_id.as_str()], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in rows {
+            for name in split_field(&raw?) {
+                let key = name.to_ascii_lowercase();
+                if seen.insert(key) {
+                    out.push(name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Threads with at least one message in `folder`, newest activity first.
+    ///
+    /// A message with no folder is treated as Inbox. Matching is case-insensitive.
+    /// `message_count` is the whole thread, including copies in other folders.
+    pub fn folder_threads(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+    ) -> Result<Vec<FolderThread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_id, from_name, from_email, subject, date_unix, snippet,
+                    unread, folders, labels, starred, has_attachment
+             FROM messages
+             WHERE account_id = ?1
+             ORDER BY date_unix ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id.as_str()], |row| {
+            Ok(HeaderRow {
+                thread_id: row.get(0)?,
+                from_name: row.get(1)?,
+                from_email: row.get(2)?,
+                subject: row.get(3)?,
+                date_unix: row.get(4)?,
+                snippet: row.get(5)?,
+                unread: row.get::<_, i64>(6)? != 0,
+                folders: row.get(7)?,
+                labels: row.get(8)?,
+                starred: row.get::<_, i64>(9)? != 0,
+                has_attachment: row.get::<_, i64>(10)? != 0,
+            })
+        })?;
+        let mut grouped: Vec<FolderAcc> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let row = row?;
+            let idx = if let Some(idx) = index.get(&row.thread_id) {
+                *idx
+            } else {
+                let idx = grouped.len();
+                index.insert(row.thread_id.clone(), idx);
+                grouped.push(FolderAcc {
+                    thread_id: ThreadId(row.thread_id.clone()),
+                    subject: row.subject.clone(),
+                    snippet: String::new(),
+                    last_date_unix: 0,
+                    message_count: 0,
+                    unread: false,
+                    in_folder: false,
+                    participants: Vec::new(),
+                    seen_email: HashSet::new(),
+                    latest_email: String::new(),
+                    latest_name: None,
+                    labels: Vec::new(),
+                    seen_label: HashSet::new(),
+                    starred: false,
+                    has_attachment: false,
+                });
+                idx
+            };
+            let acc = &mut grouped[idx];
+            acc.message_count += 1;
+            acc.snippet = row.snippet;
+            acc.last_date_unix = row.date_unix;
+            acc.latest_email = row.from_email.clone();
+            acc.latest_name = row.from_name.clone();
+            acc.starred |= row.starred;
+            acc.has_attachment |= row.has_attachment;
+            let email_key = row.from_email.to_ascii_lowercase();
+            if acc.seen_email.insert(email_key) {
+                acc.participants.push(Participant {
+                    name: row.from_name.clone(),
+                    email: row.from_email.clone(),
+                });
+            }
+            for label in split_field(&row.labels) {
+                let key = label.to_ascii_lowercase();
+                if acc.seen_label.insert(key) {
+                    acc.labels.push(label);
+                }
+            }
+            if folder_contains(&row.folders, folder) {
+                acc.in_folder = true;
+                acc.unread |= row.unread;
+            }
+        }
+        let mut threads: Vec<FolderThread> = grouped
+            .into_iter()
+            .filter(|acc| acc.in_folder)
+            .map(|acc| FolderThread {
+                thread_id: acc.thread_id,
+                subject: acc.subject,
+                snippet: acc.snippet,
+                last_date_unix: acc.last_date_unix,
+                message_count: acc.message_count,
+                unread: acc.unread,
+                participants: acc.participants,
+                latest_email: acc.latest_email,
+                latest_name: acc.latest_name,
+                labels: acc.labels,
+                starred: acc.starred,
+                has_attachment: acc.has_attachment,
+            })
+            .collect();
+        threads.sort_by(|a, b| {
+            b.last_date_unix
+                .cmp(&a.last_date_unix)
+                .then_with(|| a.thread_id.as_str().cmp(b.thread_id.as_str()))
+        });
+        Ok(threads)
+    }
 }
 
 const SEARCH_PAGE_SIZE: i64 = 20;
@@ -595,6 +753,71 @@ fn restrict_mode(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+/// One person on a thread row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Participant {
+    pub name: Option<String>,
+    pub email: String,
+}
+
+/// A thread as it appears in one folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderThread {
+    pub thread_id: ThreadId,
+    pub subject: String,
+    pub snippet: String,
+    pub last_date_unix: i64,
+    pub message_count: usize,
+    pub unread: bool,
+    /// First-seen senders, oldest first.
+    pub participants: Vec<Participant>,
+    pub latest_email: String,
+    pub latest_name: Option<String>,
+    pub labels: Vec<String>,
+    pub starred: bool,
+    pub has_attachment: bool,
+}
+
+struct HeaderRow {
+    thread_id: String,
+    from_name: Option<String>,
+    from_email: String,
+    subject: String,
+    date_unix: i64,
+    snippet: String,
+    unread: bool,
+    folders: String,
+    labels: String,
+    starred: bool,
+    has_attachment: bool,
+}
+
+struct FolderAcc {
+    thread_id: ThreadId,
+    subject: String,
+    snippet: String,
+    last_date_unix: i64,
+    message_count: usize,
+    unread: bool,
+    in_folder: bool,
+    participants: Vec<Participant>,
+    seen_email: HashSet<String>,
+    latest_email: String,
+    latest_name: Option<String>,
+    labels: Vec<String>,
+    seen_label: HashSet<String>,
+    starred: bool,
+    has_attachment: bool,
+}
+
+fn folder_contains(stored: &str, want: &str) -> bool {
+    let parts = split_field(stored);
+    if parts.is_empty() {
+        return want.eq_ignore_ascii_case("inbox");
+    }
+    parts.iter().any(|name| name.eq_ignore_ascii_case(want))
 }
 
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
@@ -667,10 +890,10 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment, archived, snooze_until
+            to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19, ?20, ?21, ?22, ?23
+            ?18, ?19, ?20, ?21, ?22, ?23, ?24
          )",
         params![
             message.account_id.as_str(),
@@ -693,6 +916,7 @@ fn insert_new(conn: &Connection, message: &Message) -> Result<ThreadId> {
             to_line,
             cc_line,
             bcc_line,
+            i64::from(message.starred),
             i64::from(message.has_attachment),
             i64::from(message.archived),
             message.snooze_until,
@@ -764,8 +988,9 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
             to_line = ?16,
             cc_line = ?17,
             bcc_line = ?18,
-            has_attachment = ?19
-         WHERE account_id = ?20 AND message_id = ?21",
+            starred = ?19,
+            has_attachment = ?20
+         WHERE account_id = ?21 AND message_id = ?22",
         params![
             message.remote_id.0,
             thread_id.as_str(),
@@ -785,6 +1010,7 @@ fn update_same_id(conn: &Connection, message: &Message, stored: &Arrival) -> Res
             to_line,
             cc_line,
             bcc_line,
+            i64::from(stored.starred || message.starred),
             i64::from(has_attachment),
             message.account_id.as_str(),
             message.headers.message_id.as_str(),
@@ -813,6 +1039,7 @@ struct Arrival {
     to_line: String,
     cc_line: String,
     bcc_line: String,
+    starred: bool,
     has_attachment: bool,
     subject: String,
     from_name: Option<String>,
@@ -828,7 +1055,7 @@ fn find_arrival(
 ) -> Result<Option<Arrival>> {
     let hit = conn
         .query_row(
-            "SELECT folders, labels, arrived_via, to_line, cc_line, bcc_line, has_attachment,
+            "SELECT folders, labels, arrived_via, to_line, cc_line, bcc_line, starred, has_attachment,
                     subject, from_name, from_email, COALESCE(body_text, snippet), archived
              FROM messages
              WHERE account_id = ?1 AND message_id = ?2",
@@ -841,12 +1068,13 @@ fn find_arrival(
                     to_line: row.get(3)?,
                     cc_line: row.get(4)?,
                     bcc_line: row.get(5)?,
-                    has_attachment: row.get::<_, i64>(6)? != 0,
-                    subject: row.get(7)?,
-                    from_name: row.get(8)?,
-                    from_email: row.get(9)?,
-                    body: row.get(10)?,
-                    archived: row.get::<_, i64>(11)? != 0,
+                    starred: row.get::<_, i64>(6)? != 0,
+                    has_attachment: row.get::<_, i64>(7)? != 0,
+                    subject: row.get(8)?,
+                    from_name: row.get(9)?,
+                    from_email: row.get(10)?,
+                    body: row.get(11)?,
+                    archived: row.get::<_, i64>(12)? != 0,
                 })
             },
         )
@@ -1128,6 +1356,10 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE messages ADD COLUMN bcc_line TEXT NOT NULL DEFAULT ''",
         ),
         (
+            "starred",
+            "ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "has_attachment",
             "ALTER TABLE messages ADD COLUMN has_attachment INTEGER NOT NULL DEFAULT 0",
         ),
@@ -1235,9 +1467,10 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
         to: decode_addresses(&row.get::<_, String>(17)?),
         cc: decode_addresses(&row.get::<_, String>(18)?),
         bcc: decode_addresses(&row.get::<_, String>(19)?),
-        has_attachment: row.get::<_, i64>(20)? != 0,
-        archived: row.get::<_, i64>(21)? != 0,
-        snooze_until: row.get(22)?,
+        starred: row.get::<_, i64>(20)? != 0,
+        has_attachment: row.get::<_, i64>(21)? != 0,
+        archived: row.get::<_, i64>(22)? != 0,
+        snooze_until: row.get(23)?,
     })
 }
 
@@ -1298,6 +1531,7 @@ mod tests {
             to: Vec::new(),
             cc: Vec::new(),
             bcc: Vec::new(),
+            starred: false,
             has_attachment: false,
             archived: false,
             snooze_until: None,
@@ -2706,5 +2940,67 @@ mod tests {
         assert!(names.iter().any(|name| name == "archived"));
         assert!(names.iter().any(|name| name == "snooze_until"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_threads_include_sent_copies_and_skip_other_folders() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut root = msg("root@x", None, None, "Threading", "root body");
+        root.folders = vec!["INBOX".into()];
+        root.headers.from.name = Some("Jon".into());
+        root.headers.from.email = "jon@x".into();
+        root.headers.date_unix = 10;
+        root.unread = false;
+        root.labels = vec!["work".into()];
+        let mut reply = msg(
+            "reply@x",
+            None,
+            Some("root@x"),
+            "Re: Threading",
+            "sent body",
+        );
+        reply.folders = vec!["Sent".into()];
+        reply.headers.from.name = Some("Caleb".into());
+        reply.headers.from.email = "c@x".into();
+        reply.headers.date_unix = 20;
+        reply.snippet = "sent body".into();
+        reply.starred = true;
+        reply.has_attachment = true;
+        let mut draft = msg("draft@x", None, None, "Draft", "only a draft");
+        draft.folders = vec!["Drafts".into()];
+        draft.headers.date_unix = 30;
+        store.upsert_message(&root).unwrap();
+        store.upsert_message(&reply).unwrap();
+        store.upsert_message(&draft).unwrap();
+
+        let inbox = store
+            .folder_threads(&AccountId("a1".into()), "inbox")
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message_count, 2);
+        assert_eq!(inbox[0].snippet, "sent body");
+        assert!(inbox[0].starred);
+        assert!(inbox[0].has_attachment);
+        assert_eq!(inbox[0].labels, vec!["work".to_string()]);
+        assert_eq!(inbox[0].latest_email, "c@x");
+        assert_eq!(inbox[0].participants.len(), 2);
+        let sent = store
+            .folder_threads(&AccountId("a1".into()), "Sent")
+            .unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].thread_id, inbox[0].thread_id);
+        assert!(
+            store
+                .folder_threads(&AccountId("a1".into()), "Drafts")
+                .unwrap()
+                .len()
+                == 1
+        );
+        let msgs = store
+            .thread_messages(&AccountId("a1".into()), &inbox[0].thread_id)
+            .unwrap();
+        assert!(msgs.iter().any(|message| message.folders == ["Sent"]));
+        assert!(msgs.iter().any(|message| message.starred));
     }
 }

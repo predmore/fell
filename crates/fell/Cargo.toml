@@ -11,3 +11,4 @@ rust-version.workspace = true
 fell-confirm.workspace = true
 fell-core.workspace = true
 gpui.workspace = true
+libc = "0.2"
