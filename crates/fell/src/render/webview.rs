@@ -3,16 +3,18 @@
 //! wry 0.57 can child-embed only into an Xlib window, and GPUI on Wayland
 //! does not provide one. The newsletter is laid out in a GTK offscreen
 //! window, which Wayland does not map, then snapshotted with JavaScript
-//! still disabled and drawn in the message body. There is no title bar and
-//! no second copy of the subject. The library stays dynamically linked.
+//! still disabled and drawn in the message body. The snapshot waits until
+//! the document and its images have finished; a load that never finishes
+//! becomes a terminal failure instead of an endless poll. There is no title
+//! bar and no second copy of the subject. The library stays dynamically linked.
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use gtk::prelude::*;
-use wry::PageLoadEvent;
 use wry::WebViewBuilderExtUnix;
 use wry::WebViewExtUnix;
 
@@ -33,9 +35,13 @@ struct Host {
     window: gtk::OffscreenWindow,
     webview: wry::WebView,
     token: Cell<u64>,
-    /// Bumped on every load and every finished event, so only the latest
-    /// snapshot for the current token is stored.
+    /// Bumped on every load. A snapshot callback from the previous load
+    /// no longer matches.
     capture: Cell<u64>,
+    /// Bumped whenever a snapshot is scheduled or abandoned, so a picture
+    /// taken while images were still loading cannot be stored.
+    shot: Cell<u64>,
+    progress: Cell<LoadProgress>,
     pending: RefCell<Option<gtk::glib::SourceId>>,
     fail_safe: RefCell<Option<gtk::glib::SourceId>>,
 }
@@ -44,7 +50,28 @@ thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
 }
 
-static FRAME: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
+struct StoredPng {
+    bytes: Vec<u8>,
+    generation: u64,
+    settled: bool,
+}
+
+enum StoredFrame {
+    Png(StoredPng),
+    Failed,
+}
+
+static FRAME: Mutex<Option<(u64, StoredFrame)>> = Mutex::new(None);
+
+pub enum WebStatus {
+    Pending,
+    Ready {
+        png: Vec<u8>,
+        generation: u64,
+        settled: bool,
+    },
+    Failed,
+}
 
 pub fn show(request: WebRequest) {
     if let Some(tx) = sender() {
@@ -58,13 +85,23 @@ pub fn hide() {
     }
 }
 
-/// Latest full-document PNG for `token`, if WebKit has finished painting it.
-pub fn frame_for(token: u64) -> Option<Vec<u8>> {
-    FRAME.lock().ok().and_then(|slot| {
-        slot.as_ref()
-            .filter(|(got, _)| *got == token)
-            .map(|(_, png)| png.clone())
-    })
+/// Latest full-document PNG for `token`, or a terminal failure.
+///
+/// `Pending` means the load is still settling. The reader polls this on its
+/// own; it does not rebuild the HTML to find out.
+pub fn status_for(token: u64) -> WebStatus {
+    let Ok(slot) = FRAME.lock() else {
+        return WebStatus::Pending;
+    };
+    match slot.as_ref() {
+        Some((got, StoredFrame::Png(png))) if *got == token => WebStatus::Ready {
+            png: png.bytes.clone(),
+            generation: png.generation,
+            settled: png.settled,
+        },
+        Some((got, StoredFrame::Failed)) if *got == token => WebStatus::Failed,
+        _ => WebStatus::Pending,
+    }
 }
 
 fn sender() -> Option<&'static gtk::glib::Sender<Cmd>> {
@@ -116,22 +153,25 @@ fn present(request: WebRequest) {
                 Ok(host) => *slot = Some(host),
                 Err(err) => {
                     eprintln!("fell: web view failed: {err}");
-                    return false;
+                    if let Ok(mut frame) = FRAME.lock() {
+                        *frame = Some((request.token, StoredFrame::Failed));
+                    }
+                    return None;
                 }
             }
         }
-        let Some(host) = slot.as_mut() else {
-            return false;
-        };
+        let host = slot.as_mut()?;
         cancel_source(&host.pending);
         cancel_source(&host.fail_safe);
         host.token.set(request.token);
         host.capture.set(host.capture.get().wrapping_add(1));
-        true
+        host.shot.set(host.shot.get().wrapping_add(1));
+        host.progress.set(LoadProgress::new());
+        Some(host.capture.get())
     });
-    if !created {
+    let Some(capture) = created else {
         return;
-    }
+    };
     let (window, widget) = HOST.with(|slot| {
         let slot = slot.borrow();
         let host = slot.as_ref().expect("webview host");
@@ -140,7 +180,7 @@ fn present(request: WebRequest) {
     window.show_all();
     webkit2gtk::WebViewExt::load_html(&widget, &request.html, None);
     tighten_widget(&widget, request.allow_images);
-    arm_fail_safe(request.token);
+    arm_fail_safe(request.token, capture);
 }
 
 fn open_host(request: &WebRequest) -> wry::Result<Host> {
@@ -161,48 +201,138 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
         .with_background_color((red, green, blue, 255))
         .with_navigation_handler(|uri| !remote_navigation(&uri))
         .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
-        .with_on_page_load_handler(|event, _url| {
-            if matches!(event, PageLoadEvent::Finished) {
-                capture_current();
-            }
-        })
         .build_gtk(&vbox)?;
     tighten(&webview, request.allow_images);
+    watch_loads(&webview.webview());
     Ok(Host {
         window,
         webview,
         token: Cell::new(request.token),
         capture: Cell::new(0),
+        shot: Cell::new(0),
+        progress: Cell::new(LoadProgress::new()),
         pending: RefCell::new(None),
         fail_safe: RefCell::new(None),
     })
 }
 
-fn capture_current() {
-    let Some((widget, token, capture)) = HOST.with(|slot| {
+fn watch_loads(widget: &webkit2gtk::WebView) {
+    use webkit2gtk::{LoadEvent, WebViewExt};
+    widget.connect_load_changed(|_, event| {
+        if event == LoadEvent::Finished {
+            apply_progress(LoadProgress::document_finished);
+        }
+    });
+    widget.connect_load_failed(|_, _, _, err| {
+        if !load_was_cancelled(err) {
+            apply_progress(LoadProgress::timed_out);
+        }
+        false
+    });
+    widget.connect_web_process_terminated(|_, _| {
+        apply_progress(LoadProgress::timed_out);
+    });
+    widget.connect_resource_load_started(|_, resource, _| track_resource(resource));
+}
+
+fn track_resource(resource: &webkit2gtk::WebResource) {
+    use webkit2gtk::WebResourceExt;
+    apply_progress(LoadProgress::start_resource);
+    let Some(capture) = current_capture() else {
+        return;
+    };
+    let done = Rc::new(Cell::new(false));
+    resource.connect_finished({
+        let done = Rc::clone(&done);
+        move |_| finish_resource(&done, capture)
+    });
+    resource.connect_failed({
+        let done = Rc::clone(&done);
+        move |_, _| finish_resource(&done, capture)
+    });
+    resource.connect_failed_with_tls_errors({
+        let done = Rc::clone(&done);
+        move |_, _, _| finish_resource(&done, capture)
+    });
+}
+
+fn finish_resource(done: &Rc<Cell<bool>>, capture: u64) {
+    if done.replace(true) || current_capture() != Some(capture) {
+        return;
+    }
+    apply_progress(LoadProgress::end_resource);
+}
+
+fn current_capture() -> Option<u64> {
+    HOST.with(|slot| slot.borrow().as_ref().map(|host| host.capture.get()))
+}
+
+fn load_was_cancelled(err: &webkit2gtk::Error) -> bool {
+    err.matches(webkit2gtk::NetworkError::Cancelled)
+        || err.message().to_ascii_lowercase().contains("cancel")
+}
+
+fn apply_progress(update: impl FnOnce(&mut LoadProgress) -> Settle) {
+    let Some((token, capture, action)) = HOST.with(|slot| {
         let slot = slot.borrow();
         let host = slot.as_ref()?;
-        cancel_source(&host.pending);
-        let capture = host.capture.get().wrapping_add(1);
-        host.capture.set(capture);
-        Some((host.webview.webview(), host.token.get(), capture))
+        let mut progress = host.progress.get();
+        let action = update(&mut progress);
+        host.progress.set(progress);
+        Some((host.token.get(), host.capture.get(), action))
     }) else {
         return;
     };
-    let id = gtk::glib::timeout_add_local(Duration::from_millis(120), move || {
-        HOST.with(|slot| {
-            if let Some(host) = slot.borrow().as_ref() {
-                let _ = host.pending.borrow_mut().take();
-                if host.token.get() == token && host.capture.get() == capture {
-                    snapshot(widget.clone(), token, capture);
-                }
-            }
+    match action {
+        Settle::Wait => {}
+        Settle::Snapshot { delay_ms } => {
+            schedule_snapshot(token, capture, Duration::from_millis(delay_ms));
+        }
+        Settle::Failed => publish_failure(token, capture),
+        Settle::Finish => mark_settled(token, capture),
+    }
+}
+
+fn schedule_snapshot(token: u64, capture: u64, delay: Duration) {
+    let Some((widget, shot)) = HOST.with(|slot| {
+        let slot = slot.borrow();
+        let host = slot.as_ref()?;
+        let progress = host.progress.get();
+        if host.token.get() != token || host.capture.get() != capture || progress.settled {
+            return None;
+        }
+        cancel_source(&host.pending);
+        let shot = host.shot.get().wrapping_add(1);
+        host.shot.set(shot);
+        Some((host.webview.webview(), shot))
+    }) else {
+        return;
+    };
+    let id = gtk::glib::timeout_add_local(delay, move || {
+        let still = HOST.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|host| {
+                let progress = host.progress.get();
+                host.token.get() == token
+                    && host.capture.get() == capture
+                    && host.shot.get() == shot
+                    && !progress.settled
+                    && progress.document_done
+            })
         });
+        if still {
+            HOST.with(|slot| {
+                if let Some(host) = slot.borrow().as_ref() {
+                    let _ = host.pending.borrow_mut().take();
+                }
+            });
+            snapshot(widget.clone(), token, capture, shot);
+        }
         gtk::glib::ControlFlow::Break
     });
     HOST.with(|slot| {
         if let Some(host) = slot.borrow().as_ref() {
-            if host.token.get() == token && host.capture.get() == capture {
+            if host.token.get() == token && host.capture.get() == capture && host.shot.get() == shot
+            {
                 *host.pending.borrow_mut() = Some(id);
             } else {
                 id.remove();
@@ -213,7 +343,7 @@ fn capture_current() {
     });
 }
 
-fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64) {
+fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64, shot: u64) {
     use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
     widget.snapshot(
         SnapshotRegion::FullDocument,
@@ -221,46 +351,135 @@ fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64) {
         None::<&gtk::gio::Cancellable>,
         move |result| {
             let current = HOST.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|host| (host.token.get(), host.capture.get()))
+                slot.borrow().as_ref().is_some_and(|host| {
+                    let progress = host.progress.get();
+                    host.token.get() == token
+                        && host.capture.get() == capture
+                        && host.shot.get() == shot
+                        && !progress.settled
+                        && progress.document_done
+                })
             });
-            if current != Some((token, capture)) {
+            if !current {
                 return;
             }
+            let settled = HOST.with(|slot| {
+                slot.borrow().as_ref().is_some_and(|host| {
+                    let progress = host.progress.get();
+                    progress.document_done && progress.inflight == 0
+                })
+            });
             if let Ok(surface) = result
                 && let Some(png) = surface_png(surface)
-                && let Ok(mut frame) = FRAME.lock()
             {
-                *frame = Some((token, png));
-            }
-            HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref()
-                    && host.token.get() == token
-                    && host.capture.get() == capture
+                let generation = HOST.with(|slot| {
+                    slot.borrow().as_ref().map(|host| {
+                        let generation = host.shot.get();
+                        let mut progress = host.progress.get();
+                        progress.note_snapshot(settled);
+                        host.progress.set(progress);
+                        if settled {
+                            host.window.hide();
+                        }
+                        generation
+                    })
+                });
+                if let Some(generation) = generation
+                    && let Ok(mut frame) = FRAME.lock()
                 {
-                    host.window.hide();
+                    *frame = Some((
+                        token,
+                        StoredFrame::Png(StoredPng {
+                            bytes: png,
+                            generation,
+                            settled,
+                        }),
+                    ));
                 }
-            });
+                return;
+            }
+            apply_progress(LoadProgress::snapshot_empty);
         },
     );
 }
 
-fn arm_fail_safe(token: u64) {
+fn mark_settled(token: u64, capture: u64) {
+    let still = HOST.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|host| {
+            host.token.get() == token
+                && host.capture.get() == capture
+                && host.progress.get().settled
+        })
+    });
+    if !still {
+        return;
+    }
+    if let Ok(mut frame) = FRAME.lock()
+        && let Some((got, StoredFrame::Png(png))) = frame.as_mut()
+        && *got == token
+    {
+        png.settled = true;
+    }
+    HOST.with(|slot| {
+        if let Some(host) = slot.borrow().as_ref()
+            && host.token.get() == token
+            && host.capture.get() == capture
+        {
+            cancel_source(&host.pending);
+            cancel_source(&host.fail_safe);
+            host.window.hide();
+        }
+    });
+}
+
+fn publish_failure(token: u64, capture: u64) {
+    let still = HOST.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|host| {
+            host.token.get() == token
+                && host.capture.get() == capture
+                && host.progress.get().published
+        })
+    });
+    if !still {
+        return;
+    }
+    if let Ok(mut frame) = FRAME.lock() {
+        *frame = Some((token, StoredFrame::Failed));
+    }
+    HOST.with(|slot| {
+        if let Some(host) = slot.borrow().as_ref()
+            && host.token.get() == token
+            && host.capture.get() == capture
+        {
+            cancel_source(&host.pending);
+            cancel_source(&host.fail_safe);
+            host.window.hide();
+        }
+    });
+}
+
+fn arm_fail_safe(token: u64, capture: u64) {
     let id = gtk::glib::timeout_add_local(Duration::from_secs(8), move || {
-        HOST.with(|slot| {
-            if let Some(host) = slot.borrow().as_ref() {
-                let _ = host.fail_safe.borrow_mut().take();
-                if host.token.get() == token {
-                    host.window.hide();
-                }
-            }
+        let should_stop = HOST.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|host| {
+                host.token.get() == token
+                    && host.capture.get() == capture
+                    && !host.progress.get().settled
+            })
         });
+        if should_stop {
+            HOST.with(|slot| {
+                if let Some(host) = slot.borrow().as_ref() {
+                    host.fail_safe.borrow_mut().take();
+                }
+            });
+            apply_progress(LoadProgress::timed_out);
+        }
         gtk::glib::ControlFlow::Break
     });
     HOST.with(|slot| {
         if let Some(host) = slot.borrow().as_ref() {
-            if host.token.get() == token {
+            if host.token.get() == token && host.capture.get() == capture {
                 *host.fail_safe.borrow_mut() = Some(id);
             } else {
                 id.remove();
@@ -345,4 +564,153 @@ fn remote_navigation(uri: &str) -> bool {
 
 pub fn ensure_started() {
     boot();
+}
+
+/// When a web-view load may be snapshotted.
+///
+/// The document finishing schedules a picture immediately. If images were
+/// still loading, another picture is scheduled once they settle, and that
+/// one replaces the first. An empty picture is retried, then reported as
+/// failure. A load that never produces a frame fails on the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    Wait,
+    Snapshot {
+        delay_ms: u64,
+    },
+    Failed,
+    /// Keep the picture we have and stop waiting.
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadProgress {
+    inflight: u32,
+    document_done: bool,
+    published: bool,
+    settled: bool,
+    empty_snapshots: u32,
+}
+
+impl LoadProgress {
+    fn new() -> Self {
+        Self {
+            inflight: 0,
+            document_done: false,
+            published: false,
+            settled: false,
+            empty_snapshots: 0,
+        }
+    }
+
+    fn start_resource(&mut self) -> Settle {
+        self.inflight = self.inflight.saturating_add(1);
+        Settle::Wait
+    }
+
+    fn end_resource(&mut self) -> Settle {
+        self.inflight = self.inflight.saturating_sub(1);
+        if self.document_done && self.inflight == 0 && !self.settled {
+            Settle::Snapshot { delay_ms: 120 }
+        } else {
+            Settle::Wait
+        }
+    }
+
+    fn document_finished(&mut self) -> Settle {
+        self.document_done = true;
+        if self.settled {
+            Settle::Wait
+        } else {
+            Settle::Snapshot { delay_ms: 120 }
+        }
+    }
+
+    fn note_snapshot(&mut self, settled: bool) {
+        self.published = true;
+        self.empty_snapshots = 0;
+        if settled {
+            self.settled = true;
+        }
+    }
+
+    fn snapshot_empty(&mut self) -> Settle {
+        if self.settled {
+            return Settle::Wait;
+        }
+        self.empty_snapshots = self.empty_snapshots.saturating_add(1);
+        if self.empty_snapshots < 4 {
+            return Settle::Snapshot {
+                delay_ms: 200 * u64::from(self.empty_snapshots),
+            };
+        }
+        self.settled = true;
+        if self.published {
+            Settle::Finish
+        } else {
+            self.published = true;
+            Settle::Failed
+        }
+    }
+
+    fn timed_out(&mut self) -> Settle {
+        if self.settled {
+            Settle::Wait
+        } else if self.published {
+            self.settled = true;
+            Settle::Finish
+        } else {
+            self.published = true;
+            self.settled = true;
+            Settle::Failed
+        }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::{LoadProgress, Settle};
+
+    #[test]
+    fn snapshot_again_after_images_finish() {
+        let mut load = LoadProgress::new();
+        assert_eq!(load.start_resource(), Settle::Wait);
+        assert_eq!(load.start_resource(), Settle::Wait);
+        assert_eq!(load.document_finished(), Settle::Snapshot { delay_ms: 120 });
+        load.note_snapshot(false);
+        assert_eq!(load.end_resource(), Settle::Wait);
+        assert_eq!(
+            load.end_resource(),
+            Settle::Snapshot { delay_ms: 120 },
+            "replace the early picture once every image has finished"
+        );
+        load.note_snapshot(true);
+        assert_eq!(load.end_resource(), Settle::Wait);
+        assert_eq!(load.timed_out(), Settle::Wait);
+    }
+
+    #[test]
+    fn timeout_without_a_frame_fails() {
+        let mut load = LoadProgress::new();
+        assert_eq!(load.timed_out(), Settle::Failed);
+        assert_eq!(load.timed_out(), Settle::Wait);
+        assert_eq!(load.document_finished(), Settle::Wait);
+
+        let mut early = LoadProgress::new();
+        early.document_finished();
+        early.note_snapshot(false);
+        assert_eq!(early.timed_out(), Settle::Finish);
+        assert_eq!(early.timed_out(), Settle::Wait);
+    }
+
+    #[test]
+    fn empty_snapshots_stop_instead_of_polling() {
+        let mut retry = LoadProgress::new();
+        retry.document_finished();
+        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 200 });
+        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 400 });
+        assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 600 });
+        assert_eq!(retry.snapshot_empty(), Settle::Failed);
+        assert_eq!(retry.snapshot_empty(), Settle::Wait);
+    }
 }

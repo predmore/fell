@@ -128,8 +128,8 @@ fn list_item(
 }
 
 fn render_table(
-    header: &[Vec<Inline>],
-    rows: &[Vec<Vec<Inline>>],
+    header: &[Vec<Block>],
+    rows: &[Vec<Vec<Block>>],
     palette: &Palette,
     allow_remote: bool,
 ) -> AnyElement {
@@ -149,7 +149,7 @@ fn render_table(
 }
 
 fn table_row(
-    cells: &[Vec<Inline>],
+    cells: &[Vec<Block>],
     palette: &Palette,
     allow_remote: bool,
     header: bool,
@@ -161,11 +161,13 @@ fn table_row(
     if header {
         row = row.font_weight(FontWeight::BOLD).bg(paint(palette.surface));
     }
+    // The same block renderer as the rest of the message, so a list keeps its
+    // bullet or number and a quote keeps its rule.
     row.children(cells.iter().map(|cell| {
-        div()
-            .flex_1()
-            .p_2()
-            .children(render_inlines(cell, palette, allow_remote))
+        div().flex_1().p_2().flex().flex_col().gap_2().children(
+            cell.iter()
+                .map(|block| render_block(block, palette, allow_remote)),
+        )
     }))
     .into_any_element()
 }

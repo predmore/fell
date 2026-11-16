@@ -35,9 +35,15 @@ pub struct Reader {
     model: Model,
     theme: Theme,
     web_open: bool,
-    web_key: String,
+    /// Wrapped HTML is rebuilt only when one of these three inputs changes.
+    web_source: String,
+    web_scheme: &'static str,
+    web_images: bool,
     web_token: u64,
     web_image: Option<Arc<RenderImage>>,
+    web_generation: u64,
+    web_settled: bool,
+    web_failed: bool,
 }
 
 pub struct Opened {
@@ -57,9 +63,14 @@ impl Reader {
             model: opened.model,
             theme: opened.theme,
             web_open: false,
-            web_key: String::new(),
+            web_source: String::new(),
+            web_scheme: "",
+            web_images: false,
             web_token: 0,
             web_image: None,
+            web_generation: 0,
+            web_settled: false,
+            web_failed: false,
         }
     }
 
@@ -74,40 +85,100 @@ impl Reader {
                 if self.web_open {
                     webview::hide();
                     self.web_open = false;
-                    self.web_key.clear();
+                    self.web_source.clear();
+                    self.web_scheme = "";
+                    self.web_images = false;
                     self.web_image = None;
+                    self.web_generation = 0;
+                    self.web_settled = false;
+                    self.web_failed = false;
                 }
                 return;
             }
             let palette = self.theme.palette();
-            let html = wrap_for_webview(
+            let scheme = palette.scheme();
+            let allow_images = self.model.remote_images_allowed();
+            let unchanged = web_frame_is_current(
+                self.web_open,
+                &self.web_source,
                 self.model.source_html(),
-                &WebFrame {
-                    scheme: palette.scheme(),
-                    allow_remote_images: self.model.remote_images_allowed(),
-                },
+                self.web_scheme,
+                scheme,
+                self.web_images,
+                allow_images,
             );
-            if self.web_open && self.web_key == html {
-                if self.web_image.is_none()
-                    && let Some(png) = webview::frame_for(self.web_token)
-                {
-                    self.web_image = decode_image(&png);
-                }
+            if unchanged {
+                self.poll_web_frame();
                 return;
             }
+            let source = self.model.source_html().to_string();
+            let html = wrap_for_webview(
+                &source,
+                &WebFrame {
+                    scheme,
+                    allow_remote_images: allow_images,
+                },
+            );
             self.web_token = self.web_token.wrapping_add(1);
             self.web_image = None;
+            self.web_generation = 0;
+            self.web_settled = false;
+            self.web_failed = false;
             webview::ensure_started();
             webview::show(webview::WebRequest {
-                html: html.clone(),
+                html,
                 token: self.web_token,
                 background: channels(palette.background),
-                allow_images: self.model.remote_images_allowed(),
+                allow_images,
             });
-            self.web_key = html;
+            self.web_source = source;
+            self.web_scheme = scheme;
+            self.web_images = allow_images;
             self.web_open = true;
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn poll_web_frame(&mut self) {
+        if self.web_failed || self.web_settled {
+            return;
+        }
+        match webview::status_for(self.web_token) {
+            webview::WebStatus::Ready {
+                png,
+                generation,
+                settled,
+            } => {
+                if generation != self.web_generation {
+                    match decode_image(&png) {
+                        Some(image) => {
+                            self.web_image = Some(image);
+                            self.web_generation = generation;
+                        }
+                        None => {
+                            self.web_failed = true;
+                            return;
+                        }
+                    }
+                }
+                self.web_settled = settled;
+            }
+            webview::WebStatus::Failed => self.web_failed = true,
+            webview::WebStatus::Pending => {}
+        }
+    }
+}
+
+fn web_frame_is_current(
+    open: bool,
+    cached_source: &str,
+    source: &str,
+    cached_scheme: &str,
+    scheme: &str,
+    cached_images: bool,
+    allow_images: bool,
+) -> bool {
+    open && cached_source == source && cached_scheme == scheme && cached_images == allow_images
 }
 
 pub fn open_fixture(name: &str, theme: Theme) -> Opened {
@@ -163,7 +234,7 @@ impl Render for Reader {
             self.focus.focus(window);
         }
         self.sync_web();
-        if self.model.mode() == RenderMode::Web && self.web_image.is_none() {
+        if self.model.mode() == RenderMode::Web && !self.web_failed && !self.web_settled {
             window.request_animation_frame();
         }
         let palette = self.theme.palette();
@@ -258,6 +329,12 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
     if reader.model.mode() == RenderMode::Web {
         if let Some(image) = reader.web_image.clone() {
             body.child(native::embedded_web(image))
+        } else if reader.web_failed {
+            body.child(
+                div()
+                    .text_color(paint(palette.foreground))
+                    .child("The web view did not finish loading."),
+            )
         } else {
             body.child(
                 div()
@@ -280,4 +357,28 @@ fn channels(hex: u32) -> (u8, u8, u8) {
         ((hex >> 8) & 0xff) as u8,
         (hex & 0xff) as u8,
     )
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::web_frame_is_current;
+
+    #[test]
+    fn web_html_is_rebuilt_only_when_inputs_change() {
+        assert!(web_frame_is_current(
+            true, "<p>a</p>", "<p>a</p>", "dark", "dark", false, false
+        ));
+        assert!(!web_frame_is_current(
+            false, "<p>a</p>", "<p>a</p>", "dark", "dark", false, false
+        ));
+        assert!(!web_frame_is_current(
+            true, "<p>a</p>", "<p>b</p>", "dark", "dark", false, false
+        ));
+        assert!(!web_frame_is_current(
+            true, "<p>a</p>", "<p>a</p>", "dark", "light", false, false
+        ));
+        assert!(!web_frame_is_current(
+            true, "<p>a</p>", "<p>a</p>", "dark", "dark", false, true
+        ));
+    }
 }

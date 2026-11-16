@@ -28,9 +28,12 @@ pub enum Block {
     Code {
         text: String,
     },
+    /// Cells are blocks, so a paragraph break, list marker, or quote inside a
+    /// cell survives. Flattening a cell to inlines glues `<p>Hello</p><p>World</p>`
+    /// into `HelloWorld` and drops those markers.
     Table {
-        header: Vec<Vec<Inline>>,
-        rows: Vec<Vec<Vec<Inline>>>,
+        header: Vec<Vec<Block>>,
+        rows: Vec<Vec<Vec<Block>>>,
     },
     Image {
         source: ImageSource,
@@ -102,14 +105,14 @@ fn push_block(out: &mut String, block: &Block) {
         Block::Table { header, rows } => {
             if !header.is_empty() {
                 for cell in header {
-                    push_inlines(out, cell);
+                    push_blocks(out, cell);
                     out.push('\t');
                 }
                 out.push('\n');
             }
             for row in rows {
                 for cell in row {
-                    push_inlines(out, cell);
+                    push_blocks(out, cell);
                     out.push('\t');
                 }
                 out.push('\n');
@@ -122,6 +125,12 @@ fn push_block(out: &mut String, block: &Block) {
             }
         }
         Block::ThematicBreak => out.push('\n'),
+    }
+}
+
+fn push_blocks(out: &mut String, blocks: &[Block]) {
+    for block in blocks {
+        push_block(out, block);
     }
 }
 

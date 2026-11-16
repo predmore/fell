@@ -134,37 +134,200 @@ fn keep_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> b
     if name_l.starts_with("on") || name_l == "srcdoc" || name_l == "formaction" {
         return false;
     }
-    if name_l == "href" || name_l == "src" || name_l == "srcset" {
-        let lower = value.trim().to_ascii_lowercase();
-        if lower.starts_with("javascript:") || lower.starts_with("vbscript:") {
+    if matches!(
+        name_l.as_str(),
+        "href" | "src" | "srcset" | "poster" | "background" | "lowsrc" | "dynsrc" | "xlink:href"
+    ) {
+        let normalized = normalize_resource_url(value).to_ascii_lowercase();
+        if normalized.starts_with("javascript:") || normalized.starts_with("vbscript:") {
             return false;
         }
     }
-    if tag == "img" && (name_l == "src" || name_l == "srcset") && !allow_remote_images {
-        return !is_remote_url(value);
-    }
-    if name_l == "style" && !allow_remote_images {
-        return true;
-    }
-    true
+    allow_remote_images || !image_attr_is_remote(tag, &name_l, value)
 }
 
-fn rewrite_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
+fn rewrite_attr(_tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
     if name.eq_ignore_ascii_case("style") && !allow_remote_images {
         return strip_remote_css_urls(value);
-    }
-    if tag == "img" && name.eq_ignore_ascii_case("srcset") && !allow_remote_images {
-        return String::new();
     }
     value.to_string()
 }
 
+/// `src` on any element, plus the other attributes that load an image.
+/// Anchor `href` is a link, not an image, so it stays.
+fn image_attr_is_remote(tag: &str, name: &str, value: &str) -> bool {
+    match name {
+        "src" | "poster" | "background" | "lowsrc" | "dynsrc" => is_remote_url(value),
+        "srcset" => srcset_is_remote(value),
+        // HTML parses `<image>` as `<img>`, so a remote href on either is an image.
+        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
+            is_remote_url(value)
+        }
+        _ => false,
+    }
+}
+
+fn srcset_is_remote(value: &str) -> bool {
+    value.split(',').any(is_remote_url)
+}
+
 fn is_remote_url(value: &str) -> bool {
-    let value = value.trim().to_ascii_lowercase();
+    let value = normalize_resource_url(value).to_ascii_lowercase();
     value.starts_with("http:")
         || value.starts_with("https:")
         || value.starts_with("//")
         || value.starts_with("file:")
+}
+
+/// URL parsers drop newlines and tabs, and CSS hex escapes decode before that.
+/// `ht&#10;tps://` and `url(\68 ttp://...)` are both `http://` after this.
+fn normalize_resource_url(value: &str) -> String {
+    let decoded = decode_html_character_references(value);
+    let unescaped = decode_css_escapes(&decoded);
+    unescaped
+        .chars()
+        .filter(|ch| !is_ignorable_url_ws(*ch))
+        .collect()
+}
+
+fn is_ignorable_url_ws(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}' | '\u{000b}')
+}
+
+fn decode_html_character_references(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let (ch, consumed) = decode_character_reference(&rest[start..]).unwrap_or(('&', 1));
+        out.push(ch);
+        rest = &rest[start + consumed..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_character_reference(input: &str) -> Option<(char, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'&') {
+        return None;
+    }
+    if bytes.get(1) == Some(&b'#') {
+        let (hex, digit_at) = if matches!(bytes.get(2), Some(b'x' | b'X')) {
+            (true, 3)
+        } else {
+            (false, 2)
+        };
+        let mut end = digit_at;
+        while end < bytes.len() && end - digit_at < 8 {
+            let digit = bytes[end];
+            let ok = if hex {
+                digit.is_ascii_hexdigit()
+            } else {
+                digit.is_ascii_digit()
+            };
+            if !ok {
+                break;
+            }
+            end += 1;
+        }
+        if end == digit_at {
+            return None;
+        }
+        let digits = std::str::from_utf8(&bytes[digit_at..end]).ok()?;
+        let code = if hex {
+            u32::from_str_radix(digits, 16).ok()?
+        } else {
+            digits.parse().ok()?
+        };
+        if bytes.get(end) == Some(&b';') {
+            end += 1;
+        }
+        let ch = match code {
+            0 => '\u{FFFD}',
+            value => char::from_u32(value).unwrap_or('\u{FFFD}'),
+        };
+        return Some((ch, end));
+    }
+    let mut end = 1;
+    while end < bytes.len() && bytes[end].is_ascii_alphabetic() && end < 32 {
+        end += 1;
+    }
+    if bytes.get(end) != Some(&b';') {
+        return None;
+    }
+    let name = std::str::from_utf8(&bytes[1..end]).ok()?;
+    let ch = match name.to_ascii_lowercase().as_str() {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{00A0}',
+        "newline" => '\n',
+        "tab" => '\t',
+        _ => return None,
+    };
+    Some((ch, end + 1))
+}
+
+fn decode_css_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(next) = chars.peek().copied() else {
+            out.push('\\');
+            break;
+        };
+        if next == '\n' || next == '\u{000c}' {
+            chars.next();
+            continue;
+        }
+        if next == '\r' {
+            chars.next();
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            continue;
+        }
+        if next.is_ascii_hexdigit() {
+            let mut hex = String::new();
+            while hex.len() < 6 {
+                let Some(digit) = chars.peek().copied() else {
+                    break;
+                };
+                if !digit.is_ascii_hexdigit() {
+                    break;
+                }
+                hex.push(digit);
+                chars.next();
+            }
+            if let Some(whitespace) = chars.peek().copied()
+                && is_css_whitespace(whitespace)
+            {
+                chars.next();
+                if whitespace == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            let code = u32::from_str_radix(&hex, 16).unwrap_or(0);
+            out.push(match code {
+                0 => '\u{FFFD}',
+                value => char::from_u32(value).unwrap_or('\u{FFFD}'),
+            });
+            continue;
+        }
+        out.push(chars.next().expect("peeked"));
+    }
+    out
+}
+
+fn is_css_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
 }
 
 pub fn strip_remote_css_urls(css: &str) -> String {
@@ -243,8 +406,47 @@ mod tests {
 
     #[test]
     fn allowing_images_keeps_https_src() {
-        let html = r#"<img src="https://cdn.example/a.png" alt="hero">"#;
+        let html = r#"<img src="https://cdn.example/a.png" alt="hero"><table><tr><td background="https://cdn.example/bg.png"></td></tr></table><video poster="https://cdn.example/poster.png"></video>"#;
         let clean = sanitize_html(html, true);
         assert!(clean.contains("https://cdn.example/a.png"));
+        assert!(clean.contains("https://cdn.example/bg.png"));
+        assert!(clean.contains("https://cdn.example/poster.png"));
+    }
+
+    #[test]
+    fn remote_image_urls_are_normalized_before_the_check() {
+        assert!(is_remote_url("ht\ntps://tracker.example/p.png"));
+        assert!(is_remote_url("ht&#10;tps://tracker.example/p.png"));
+        assert!(is_remote_url("ht&#x0A;tps://tracker.example/p.png"));
+        assert!(is_remote_url("ht&NewLine;tps://tracker.example/p.png"));
+        assert!(is_remote_url(r"\68 ttp://tracker.example/p.png"));
+        assert!(is_remote_url(r"\000068ttp://tracker.example/p.png"));
+        assert!(!is_remote_url("data:image/png;base64,aaaa"));
+        assert!(!is_remote_url("notes.png"));
+
+        let html = concat!(
+            r#"<img src="ht&#10;tps://tracker.example/a.png" alt="a">"#,
+            r#"<img srcset="ht&#10;tps://tracker.example/f.png 1x">"#,
+            r#"<table><tr><td background="https://tracker.example/b.png"></td></tr></table>"#,
+            r#"<video poster="https://tracker.example/c.png"></video>"#,
+            r#"<source src="https://tracker.example/g.png">"#,
+            r#"<style>b { background: url(\68 ttp://tracker.example/d.png); }</style>"#,
+            r#"<p style="background:url(\68 ttp://tracker.example/e.png)">x</p>"#,
+            r#"<image href="https://tracker.example/h.png"></image>"#,
+            r#"<a href="https://example.com/read">Read</a>"#,
+            r#"<a href="java&#10;script:alert(1)">no</a>"#,
+            r#"<img src="data:image/png;base64,aaaa" alt="dot">"#,
+            r#"<table><tr><td background="notes.png"></td></tr></table>"#,
+        );
+        let clean = sanitize_html(html, false);
+        assert!(!clean.contains("tracker.example"), "{clean}");
+        assert!(
+            !clean.to_ascii_lowercase().contains("javascript:"),
+            "{clean}"
+        );
+        assert!(clean.contains("https://example.com/read"), "{clean}");
+        assert!(clean.contains("data:image/png"), "{clean}");
+        assert!(clean.contains("notes.png"), "{clean}");
+        assert!(clean.contains(">x<") || clean.contains(">x</p>"), "{clean}");
     }
 }

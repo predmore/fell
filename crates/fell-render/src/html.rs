@@ -245,8 +245,8 @@ fn table_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
 fn collect_rows(
     node: ego_tree::NodeRef<'_, Node>,
     root: bool,
-    header: &mut Vec<Vec<Inline>>,
-    rows: &mut Vec<Vec<Vec<Inline>>>,
+    header: &mut Vec<Vec<Block>>,
+    rows: &mut Vec<Vec<Vec<Block>>>,
 ) {
     for child in node.children() {
         let Some(element) = child.value().as_element() else {
@@ -279,12 +279,26 @@ fn collect_rows(
     }
 }
 
-fn row_cells(row: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<Inline>> {
+fn row_cells(row: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<Block>> {
     row.children()
         .filter_map(|cell| {
             let name = cell.value().as_element()?.name();
-            (name == "td" || name == "th").then(|| collect_inlines(cell))
+            (name == "td" || name == "th").then(|| cell_blocks(cell))
         })
+        .collect()
+}
+
+/// A cell keeps its paragraphs, lists, and quotes. Inlines are only for a cell
+/// that has no block children, where a `<br>` is still a line break.
+fn cell_blocks(cell: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
+    let blocks = if has_block_child(cell) {
+        children_of(cell)
+    } else {
+        paragraph(collect_inlines(cell))
+    };
+    blocks
+        .into_iter()
+        .filter(|block| !block_is_empty(block))
         .collect()
 }
 
@@ -445,17 +459,51 @@ fn data_image(rest: &str) -> ImageSource {
             bytes: data.as_bytes().to_vec(),
         };
     }
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim())
-        .or_else(|_| {
-            base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD_NO_PAD,
-                data.trim(),
-            )
-        });
+    // MIME wraps base64 at 76 columns, and a data URI may also carry a
+    // percent-encoded newline. The standard engine rejects that whitespace.
+    let payload = strip_data_payload(data);
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        payload.as_bytes(),
+    )
+    .or_else(|_| {
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            payload.as_bytes(),
+        )
+    });
     match decoded {
         Ok(bytes) => ImageSource::Data { media_type, bytes },
         Err(_) => ImageSource::Remote(format!("data:{rest}")),
     }
+}
+
+fn strip_data_payload(data: &str) -> String {
+    let bytes = data.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && is_percent_encoded_space(&bytes[index + 1..index + 3])
+        {
+            index += 3;
+            continue;
+        }
+        if !bytes[index].is_ascii_whitespace() {
+            out.push(bytes[index] as char);
+        }
+        index += 1;
+    }
+    out
+}
+
+fn is_percent_encoded_space(bytes: &[u8]) -> bool {
+    let hex = [bytes[0].to_ascii_lowercase(), bytes[1].to_ascii_lowercase()];
+    matches!(
+        hex,
+        [b'0', b'a'] | [b'0', b'd'] | [b'0', b'9'] | [b'2', b'0'] | [b'0', b'c']
+    )
 }
 
 fn safe_href(href: &str) -> String {
@@ -543,11 +591,104 @@ mod tests {
     #[test]
     fn simple_table_stays_a_table() {
         let doc = html_to_document(include_str!("../fixtures/native-personal-table.html"));
-        assert!(
-            doc.blocks
-                .iter()
-                .any(|block| matches!(block, Block::Table { .. }))
+        let Block::Table { header, rows } = doc
+            .blocks
+            .iter()
+            .find(|block| matches!(block, Block::Table { .. }))
+            .expect("table")
+        else {
+            unreachable!("find");
+        };
+        assert_eq!(header.len(), 2);
+        assert_eq!(rows.len(), 2);
+        assert!(cell_text(&rows[0][1]).contains("Coffee"));
+        assert!(!cell_text(&rows[1][1]).contains("Walkthrough"));
+
+        let rich = html_to_document(
+            "<table>\
+                <tr><th>When</th><th>What</th></tr>\
+                <tr>\
+                    <td><p>Hello</p><p>World</p></td>\
+                    <td><ul><li>One</li><li>Two</li></ul><ol><li>Third</li></ol></td>\
+                    <td><blockquote><p>Said</p></blockquote></td>\
+                </tr>\
+            </table>",
         );
+        let Block::Table { rows, .. } = rich
+            .blocks
+            .iter()
+            .find(|block| matches!(block, Block::Table { .. }))
+            .expect("rich table")
+        else {
+            unreachable!("find");
+        };
+        let paragraphs = &rows[0][0];
+        assert_eq!(paragraphs.len(), 2, "{paragraphs:?}");
+        let text = cell_text(paragraphs);
+        assert!(text.contains("Hello"), "{text}");
+        assert!(text.contains("World"), "{text}");
+        assert!(!text.contains("HelloWorld"), "{text}");
+        assert!(
+            matches!(
+                &rows[0][1][0],
+                Block::List {
+                    ordered: false,
+                    items
+                } if items.len() == 2
+            ),
+            "unordered marker: {:?}",
+            rows[0][1]
+        );
+        assert!(
+            matches!(&rows[0][1][1], Block::List { ordered: true, .. }),
+            "ordered marker: {:?}",
+            rows[0][1]
+        );
+        assert!(
+            matches!(&rows[0][2][0], Block::Quote { .. }),
+            "quote marker: {:?}",
+            rows[0][2]
+        );
+        assert!(cell_text(&rows[0][2]).contains("Said"));
+    }
+
+    fn cell_text(blocks: &[Block]) -> String {
+        StyledDocument {
+            blocks: blocks.to_vec(),
+        }
+        .plain_text()
+    }
+
+    #[test]
+    fn wrapped_data_uri_decodes() {
+        let raw: Vec<u8> = (0..180).map(|index| (index % 251) as u8).collect();
+        let payload = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw);
+        assert!(payload.len() > 76);
+        let mut wrapped = String::new();
+        for (index, ch) in payload.chars().enumerate() {
+            if index > 0 && index % 76 == 0 {
+                wrapped.push('\n');
+            }
+            wrapped.push(ch);
+        }
+        let source = image_source(&format!("data:image/png;base64,{wrapped}"));
+        match source {
+            ImageSource::Data { bytes, .. } => assert_eq!(bytes, raw),
+            other => panic!("wrapped payload became {other:?}"),
+        }
+        let break_at = payload.len() / 2;
+        let mut encoded = String::new();
+        for (index, ch) in payload.chars().enumerate() {
+            if index == break_at {
+                encoded.push_str("%0A");
+            }
+            encoded.push(ch);
+        }
+        let source = image_source(&format!("data:image/png;base64,{encoded}"));
+        match source {
+            ImageSource::Data { bytes, .. } => assert_eq!(bytes, raw),
+            other => panic!("percent-encoded newline became {other:?}"),
+        }
     }
 
     #[test]
