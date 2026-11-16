@@ -37,6 +37,14 @@ Render HTML as native styled text in GPUI wherever possible (paragraphs, heading
 ## Out of scope for v1
 Direct Proton API backend; calendar, contacts, rules/filters; rich HTML compose (v1 composes plain text and Markdown); in-app agent panel; mobile/Windows/macOS builds (core stays portable; Linux on Hyprland is the supported target); PGP for non-Proton recipients beyond what Bridge does.
 
+## Packaging
+Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
+
+- **AUR**, by M6, not now: `fell-git` builds `main`; `fell-bin` wraps tagged releases.
+- **GitHub Release tarball** per tag, by M6: an x86_64 Linux binary, a `.desktop` file, and an icon.
+- **AppImage** per tag, by M6. Depend on the system WebKitGTK library rather than bundling it. `wry` (or similar) stays dynamically linked, so the LGPL library stays out of the crate graph and out of the release artifact. That keeps Fell MIT-compatible and cargo-deny-clean. Native rendering needs no WebKitGTK; the newsletter fallback needs the distro's WebKitGTK package installed.
+- **Nightly CI from `main`**, in M1, as its own small PR: the tarball and the AppImage as downloadable artifacts, so Jon can test without compiling.
+
 ## Milestones
 - **M0 Foundation**: merged in #1.
 - **M1 Read your mail**: read-only IMAP sync into the store (Bridge first, generic IMAP path), threaded inbox, conversation view with native HTML-to-text rendering and web view fallback, vim navigation. Fix #2 and #3.
@@ -44,7 +52,7 @@ Direct Proton API backend; calendar, contacts, rules/filters; rich HTML compose 
 - **M3 Act and reply**: archive, label, delete, undo, compose/reply, SMTP send; other-provider support incl. OAuth.
 - **M4 Agents**: MCP server with search, read, triage, draft tools, scoped access, action log.
 - **M5 Semantic search**: local embeddings, hybrid ranking, opt-in cloud embeddings.
-- **M6 Daily driver**: budgets enforced in CI, keymap config, AUR package for Omarchy.
+- **M6 Daily driver**: budgets enforced in CI, keymap config, AUR (`fell-git` and `fell-bin`), GitHub Release tarball, and AppImage.
 
 ## Review gates
 UX quality is a top priority. Any PR that changes something the user sees or touches (UI, keymap, rendering, interaction, performance feel) merges only when, in addition to CI and the code reviewer:
