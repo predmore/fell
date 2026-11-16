@@ -22,6 +22,10 @@ tarball=$dist/fell-x86_64-linux.tar.gz
 appimage=$dist/fell-x86_64.AppImage
 linuxdeploy_version=1-alpha-20251107-1
 linuxdeploy_sha256=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+# Static type2 runtime (musl, libfuse linked in). Not the classic runtime
+# that dlopens libfuse.so.2, which Ubuntu 24.04 does not ship.
+runtime_version=20251108
+runtime_sha256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 
 if [[ $(uname -m) != x86_64 ]]; then
   echo "this packager builds x86_64 artifacts only (got $(uname -m))" >&2
@@ -77,16 +81,27 @@ if [[ ! -f $linuxdeploy ]] || ! echo "$linuxdeploy_sha256  $linuxdeploy" | sha25
   chmod +x "$linuxdeploy"
 fi
 
+runtime=$tools/runtime-x86_64
+if [[ ! -f $runtime ]] || ! echo "$runtime_sha256  $runtime" | sha256sum -c --status -; then
+  wget -nv -O "$runtime" \
+    "https://github.com/AppImage/type2-runtime/releases/download/${runtime_version}/runtime-x86_64"
+  echo "$runtime_sha256  $runtime" | sha256sum -c -
+  chmod +x "$runtime"
+fi
+
 deploy_bin=$work/fell
 cp "$bin" "$deploy_bin"
 chmod +x "$deploy_bin"
 
 # Do not bundle WebKitGTK. This binary has no WebKit SONAME. If a later
 # build adds one, leave it out so the distro library is used at runtime.
+# LDAI_RUNTIME_FILE is the static type2 runtime, so the AppImage does not
+# dlopen libfuse.so.2.
 export APPIMAGE_EXTRACT_AND_RUN=1
 export ARCH=x86_64
 export LDAI_OUTPUT=$appimage
 export LDAI_NO_APPSTREAM=1
+export LDAI_RUNTIME_FILE=$runtime
 
 (
   cd "$work"
@@ -127,6 +142,22 @@ if grep -Ei 'webkit2gtk|javascriptcoregtk|WebKitNetworkProcess|WebKitWebProcess|
   echo "AppImage bundles WebKitGTK; refusing to redistribute LGPL code" >&2
   exit 1
 fi
+
+if readelf -l "$appimage" | grep -q 'Requesting program interpreter'; then
+  echo "AppImage runtime is dynamically linked; it must be the static type2 runtime" >&2
+  exit 1
+fi
+if strings -a "$appimage" | grep -F 'libfuse.so.2'; then
+  echo "AppImage runtime requires libfuse.so.2" >&2
+  exit 1
+fi
+runtime_version_text=$("$appimage" --appimage-version 2>&1 || true)
+if ! grep -q 'type2-runtime' <<<"$runtime_version_text"; then
+  echo "AppImage static runtime did not start:" >&2
+  printf '%s\n' "$runtime_version_text" >&2
+  exit 1
+fi
+echo "$runtime_version_text"
 
 if readelf -d "$stage/fell" | grep NEEDED | grep -Ei 'webkit|javascriptcore'; then
   echo "fell dynamically links WebKitGTK; artifacts leave the .so on the system"

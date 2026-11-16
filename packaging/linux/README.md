@@ -14,7 +14,7 @@ Run `./fell`. For a launcher, copy the binary onto `PATH`, the desktop file to `
 
 ## AppImage
 
-`fell-x86_64.AppImage` is the other CI artifact. `chmod +x` it after download; Actions stores artifacts in a zip and does not keep the executable bit.
+`fell-x86_64.AppImage` is the other CI artifact. `chmod +x` it after download; Actions stores artifacts in a zip and does not keep the executable bit. It embeds the static type 2 runtime, so it does not need `libfuse2`.
 
 ## WebKitGTK
 

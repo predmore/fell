@@ -9,6 +9,7 @@ name: Linux artifacts
 # libwebkit2gtk and libjavascriptcoregtk. Once the newsletter fallback is
 # compiled in, the distro package is a runtime requirement and must stay
 # dynamically linked. cargo-deny still rejects LGPL in the crate graph.
+# The AppImage uses the static type2 runtime, so it does not need libfuse2.
 
 on:
   push:
