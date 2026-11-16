@@ -87,7 +87,7 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
             continue;
         }
         let mut parts = line.split('\t');
-        let Some(name) = parts.next().and_then(|raw| unescape_mailbox(raw)) else {
+        let Some(name) = parts.next().and_then(unescape_mailbox) else {
             return Vec::new();
         };
         let Some(uidvalidity) = parts.next().and_then(|raw| raw.parse().ok()) else {
