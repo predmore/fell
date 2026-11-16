@@ -557,14 +557,12 @@ fn names(
         .min_w(px(0.))
         .overflow_hidden();
     for (index, span) in spans.iter().enumerate() {
-        let span_weight = if span.emphasis {
-            if weight == FontWeight::BOLD {
-                FontWeight::BOLD
-            } else {
-                FontWeight::SEMIBOLD
-            }
+        let span_weight = if weight == FontWeight::BOLD {
+            FontWeight::BOLD
+        } else if span.emphasis {
+            FontWeight::SEMIBOLD
         } else {
-            weight
+            FontWeight::NORMAL
         };
         let last = index + 1 == spans.len() && extra == 0;
         let text = if last {
@@ -575,14 +573,10 @@ fn names(
         line = line.child(
             div()
                 .font_weight(span_weight)
-                .text_color(rgb(if span.emphasis || selected {
-                    if selected {
-                        theme.on_selection
-                    } else {
-                        theme.foreground
-                    }
+                .text_color(rgb(if selected {
+                    theme.on_selection
                 } else {
-                    dim
+                    theme.foreground
                 }))
                 .child(text),
         );
@@ -599,8 +593,8 @@ fn thread_line_two(
     weight: FontWeight,
     selected: bool,
 ) -> gpui::Div {
-    let dim = if selected {
-        theme.on_selection
+    let snippet = if selected {
+        theme.on_selection_dim
     } else {
         theme.dimmed
     };
@@ -618,6 +612,11 @@ fn thread_line_two(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
+                .text_color(rgb(if selected {
+                    theme.on_selection
+                } else {
+                    theme.foreground
+                }))
                 .child(row.subject.clone()),
         )
         .when(!row.snippet.is_empty(), |line| {
@@ -628,7 +627,7 @@ fn thread_line_two(
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_color(rgb(dim))
+                    .text_color(rgb(snippet))
                     .child(row.snippet.clone()),
             )
         })
@@ -718,10 +717,13 @@ fn conversation(
             pane.child(
                 div()
                     .px(px(28.))
-                    .pt(px(18.))
-                    .pb(px(8.))
-                    .text_size(px(theme.ui_px + 3.0))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .pt(px(22.))
+                    .pb(px(14.))
+                    .text_size(px(theme.ui_px + 11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .line_height(px(theme.ui_px + 16.0))
+                    .border_b(px(1.))
+                    .border_color(rgb(theme.border))
                     .child(subject),
             )
         })

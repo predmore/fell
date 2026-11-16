@@ -29,6 +29,8 @@ pub struct Theme {
     pub accent: u32,
     pub selection: u32,
     pub on_selection: u32,
+    /// Snippet and meta on a selected row. Dimmer than `on_selection`, still AA on `selection`.
+    pub on_selection_dim: u32,
     pub error: u32,
     pub border: u32,
     pub star: u32,
@@ -139,34 +141,37 @@ fn map_palette(
     fonts: &Fonts,
 ) -> Theme {
     let _mode = raw.mode.as_deref();
-    let foreground = ensure(foreground_raw, background, TEXT_CONTRAST);
-    let surface = mix(background, foreground, 0.045);
-    let surfaces = [background, surface];
     let dim_raw = color(raw, &["dark_foreground", "muted", "color8"])
-        .unwrap_or_else(|| mix(foreground, background, 0.42));
+        .unwrap_or_else(|| mix(foreground_raw, background, 0.55));
+    let (foreground, dimmed) = text_pair(foreground_raw, dim_raw, background);
+    let surface = mix(background, foreground, 0.045);
+    let (foreground, dimmed) = text_pair(foreground, dimmed, surface);
     let accent_raw = color(raw, &["accent", "blue", "color4", "color12"]).unwrap_or(foreground);
     let error_raw = color(raw, &["red", "bright_red", "color1"]).unwrap_or(0xcc3333);
     let star_raw = color(raw, &["yellow", "bright_yellow", "color3"]).unwrap_or(accent_raw);
-    let selection_raw = color(
-        raw,
-        &["selection", "selection_background", "lighter_background"],
-    )
-    .unwrap_or_else(|| mix(background, foreground, 0.16));
+    // The row highlight is the theme selection, or the theme surface when a
+    // palette has no selection key. A light wash stays light. Text on it is
+    // adjusted to AA instead of turning the wash into a mid-gray band.
+    let selection_raw = color(raw, &["selection", "selection_background"])
+        .or_else(|| color(raw, &["lighter_background"]))
+        .unwrap_or(surface);
+    let selection = usable_fill(selection_raw, background);
     let on_selection_raw = color(raw, &["selection_foreground"]).unwrap_or(foreground);
-    let selection = separate(selection_raw, background, MARK_CONTRAST, foreground);
+    let (on_selection, on_selection_dim) = text_pair(on_selection_raw, on_selection_raw, selection);
     Theme {
         name,
         kind,
         background,
         surface,
-        foreground: ensure_all(foreground, &surfaces, TEXT_CONTRAST),
-        dimmed: ensure_all(dim_raw, &surfaces, TEXT_CONTRAST),
-        accent: ensure_all(accent_raw, &surfaces, TEXT_CONTRAST),
+        foreground,
+        dimmed,
+        accent: ensure_all(accent_raw, &[background, surface], TEXT_CONTRAST),
         selection,
-        on_selection: ensure(on_selection_raw, selection, TEXT_CONTRAST),
-        error: ensure_all(error_raw, &surfaces, TEXT_CONTRAST),
+        on_selection,
+        on_selection_dim,
+        error: ensure_all(error_raw, &[background, surface], TEXT_CONTRAST),
         border: mix(background, foreground, 0.16),
-        star: ensure_all(star_raw, &surfaces, TEXT_CONTRAST),
+        star: ensure_all(star_raw, &[background, surface], TEXT_CONTRAST),
         ui_family: fonts.ui_family.clone(),
         ui_px: fonts.ui_px,
         mono_family: fonts.mono_family.clone(),
@@ -186,8 +191,12 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             return false;
         }
     }
-    contrast(theme.selection, theme.background) >= MARK_CONTRAST
-        && contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
+    contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.foreground, theme.background)
+            >= contrast(theme.dimmed, theme.background) + 0.8
+        && contrast(theme.on_selection, theme.selection)
+            >= contrast(theme.on_selection_dim, theme.selection) + 0.8
         && contrast(theme.accent, theme.background) >= MARK_CONTRAST
 }
 
@@ -217,9 +226,11 @@ fn palette_name(path: &Path) -> String {
 
 fn load_fonts() -> Fonts {
     let mut fonts = Fonts {
-        ui_family: None,
+        // A face with a real bold cut, so unread rows are heavier than read ones
+        // even when Omarchy has not named a UI font.
+        ui_family: Some("DejaVu Sans".into()),
         ui_px: 15.0,
-        mono_family: None,
+        mono_family: Some("DejaVu Sans Mono".into()),
         mono_px: 13.0,
     };
     for path in gtk_settings_paths() {
@@ -533,28 +544,71 @@ fn ensure_all(fg: u32, backgrounds: &[u32], min: f64) -> u32 {
     color
 }
 
-fn separate(color: u32, bg: u32, min: f64, toward: u32) -> u32 {
-    if contrast(color, bg) >= min {
-        return color;
+/// Keep `raw` when black or white text can meet AA on it. Otherwise walk it
+/// toward `page` until one of those can, so a light selection stays light.
+fn usable_fill(raw: u32, page: u32) -> u32 {
+    if can_hold_text(raw) {
+        return raw;
     }
     let mut lo = 0.0;
     let mut hi = 1.0;
-    let mut best = toward;
+    let mut best = page;
     for _ in 0..24 {
         let mid = (lo + hi) / 2.0;
-        let mixed = mix(color, toward, mid);
-        if contrast(mixed, bg) >= min {
+        let mixed = mix(raw, page, mid);
+        if can_hold_text(mixed) {
             best = mixed;
             hi = mid;
         } else {
             lo = mid;
         }
     }
-    if contrast(best, bg) < min {
-        toward
-    } else {
-        best
+    if can_hold_text(best) { best } else { page }
+}
+
+fn can_hold_text(fill: u32) -> bool {
+    contrast(0x000000, fill) >= TEXT_CONTRAST || contrast(0xffffff, fill) >= TEXT_CONTRAST
+}
+
+/// Primary text and a dimmer secondary, both at least AA on `surface`.
+/// The secondary starts from the theme's muted color and fades toward the
+/// surface until it is clearly quieter than the primary.
+fn text_pair(primary_raw: u32, dim_raw: u32, surface: u32) -> (u32, u32) {
+    let mut primary = ensure(primary_raw, surface, TEXT_CONTRAST);
+    let mut dim = fade_toward(dim_raw, surface);
+    for _ in 0..10 {
+        if contrast(primary, surface) >= contrast(dim, surface) + 0.8
+            && contrast(primary, dim) >= 1.2
+        {
+            break;
+        }
+        let away = if luminance(surface) > 0.45 {
+            0x000000
+        } else {
+            0xffffff
+        };
+        primary = ensure(mix(primary, away, 0.22), surface, TEXT_CONTRAST);
+        dim = fade_toward(mix(dim, surface, 0.35), surface);
     }
+    (primary, dim)
+}
+
+/// The quietest color on `surface` that still meets AA, starting from `color`.
+fn fade_toward(color: u32, surface: u32) -> u32 {
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    let mut best = ensure(color, surface, TEXT_CONTRAST);
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        let mixed = mix(color, surface, mid);
+        if contrast(mixed, surface) >= TEXT_CONTRAST {
+            best = mixed;
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -620,6 +674,31 @@ mod tests {
     }
 
     #[test]
+    fn latte_selection_stays_light_and_text_meets_aa() {
+        let fonts = Fonts {
+            ui_family: None,
+            ui_px: 15.0,
+            mono_family: None,
+            mono_px: 13.0,
+        };
+        let text = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stock-themes/catppuccin-latte.toml"),
+        )
+        .unwrap();
+        let theme = theme_from_palette(&text, &fonts, "catppuccin-latte".into()).unwrap();
+        assert!(contrast_ok(&theme));
+        assert!(
+            luminance(theme.selection) > 0.45,
+            "selection {:06x} collapsed into a mid-gray",
+            theme.selection
+        );
+        assert!(contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST);
+        assert!(contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST);
+        assert!(luminance(theme.dimmed) > luminance(theme.foreground));
+        assert!(luminance(theme.on_selection_dim) > luminance(theme.on_selection));
+    }
+
+    #[test]
     fn dim_text_on_white_is_lifted() {
         let fonts = Fonts {
             ui_family: None,
@@ -630,7 +709,8 @@ mod tests {
         let text = "mode = \"light\"\nbackground = \"#ffffff\"\nforeground = \"#000000\"\naccent = \"#666666\"\ndark_foreground = \"#c0c0c0\"\nselection = \"#c0c0c0\"\nred = \"#dddddd\"\nyellow = \"#eeeeee\"\n";
         let theme = theme_from_palette(text, &fonts, "white".into()).unwrap();
         assert!(contrast(theme.dimmed, theme.background) >= TEXT_CONTRAST);
-        assert!(contrast(theme.selection, theme.background) >= MARK_CONTRAST);
+        assert!(contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST);
+        assert!(contrast_ok(&theme));
         assert!(theme.is_light());
     }
 
