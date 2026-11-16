@@ -111,7 +111,14 @@ fn plain_as_html(body: &str) -> String {
             continue;
         }
         html.push_str("<p>");
-        html.push_str(&escape_html(para));
+        // A single newline is a line break in the native document. Inside a
+        // `<p>`, HTML would otherwise collapse it into a space.
+        for (index, line) in para.lines().enumerate() {
+            if index > 0 {
+                html.push_str("<br>");
+            }
+            html.push_str(&escape_html(line));
+        }
         html.push_str("</p>");
     }
     html.push_str("</article>");
@@ -185,7 +192,7 @@ fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fell_render::fixture;
+    use fell_render::{Block, Inline, fixture};
 
     #[test]
     fn stored_html_stays_native_without_bulk_headers() {
@@ -205,5 +212,24 @@ mod tests {
         let prepared = prepare_stored(&message);
         assert_eq!(prepared.suggested, RenderMode::Native);
         assert_eq!(prepared.document.blocks.len(), 2);
+    }
+
+    #[test]
+    fn stored_plain_text_keeps_a_single_newline() {
+        let message = round_trip_body("Hello\nWorld", "Plain").unwrap();
+        let prepared = prepare_stored(&message);
+        let Block::Paragraph { inlines } = &prepared.document.blocks[0] else {
+            panic!("{:?}", prepared.document.blocks);
+        };
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, Inline::LineBreak))
+        );
+        assert!(
+            prepared.source_html.contains("<p>Hello<br>World</p>"),
+            "{}",
+            prepared.source_html
+        );
     }
 }

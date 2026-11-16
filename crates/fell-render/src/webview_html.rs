@@ -35,7 +35,7 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
 }
 
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
-    let dom = scraper::Html::parse_document(html);
+    let dom = crate::html::parse_html(html);
     let mut out = String::new();
     serialize_children(dom.root_element(), &mut out, allow_remote_images);
     out
@@ -397,7 +397,8 @@ mod tests {
             false,
         );
         assert!(unwrapped.contains("Hello"));
-        assert!(unwrapped.contains("Fallback"));
+        assert!(unwrapped.contains("<p>Fallback</p>"), "{unwrapped}");
+        assert!(!unwrapped.contains("&lt;p&gt;"), "{unwrapped}");
         assert!(!unwrapped.contains("<form"));
         assert!(!unwrapped.contains("<input"));
         assert!(!unwrapped.contains("<button"));

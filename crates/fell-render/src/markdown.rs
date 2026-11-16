@@ -90,7 +90,9 @@ pub fn markdown_to_document(markdown: &str) -> StyledDocument {
                 }
             }
             Event::Code(text) => push_inline(&mut stack, Inline::Code(text.to_string())),
-            Event::SoftBreak => push_inline(&mut stack, Inline::LineBreak),
+            // CommonMark joins a wrapped line with a space. Two spaces before
+            // the newline, or a backslash, is the hard break.
+            Event::SoftBreak => push_inline(&mut stack, Inline::Text(" ".to_string())),
             Event::HardBreak => push_inline(&mut stack, Inline::LineBreak),
             Event::Rule => push_block(&mut stack, Block::ThematicBreak),
             Event::Html(html) | Event::InlineHtml(html) => {
@@ -183,7 +185,7 @@ fn push_inline(stack: &mut [Frame], inline: Inline) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Block;
+    use crate::document::{Block, Inline};
 
     #[test]
     fn compose_markdown_uses_the_same_blocks_as_html() {
@@ -209,5 +211,32 @@ mod tests {
         assert!(text.contains("Bold"));
         assert!(text.contains("notes"));
         assert!(text.contains("sketch"));
+    }
+
+    #[test]
+    fn soft_break_is_a_space_and_hard_break_is_a_line() {
+        let soft = markdown_to_document("Hello\nworld\n");
+        let Block::Paragraph { inlines } = &soft.blocks[0] else {
+            panic!("{:?}", soft.blocks);
+        };
+        assert!(
+            !inlines
+                .iter()
+                .any(|inline| matches!(inline, Inline::LineBreak)),
+            "{inlines:?}"
+        );
+        assert_eq!(soft.plain_text(), "Hello world");
+
+        let hard = markdown_to_document("Hello  \nworld\n");
+        let Block::Paragraph { inlines } = &hard.blocks[0] else {
+            panic!("{:?}", hard.blocks);
+        };
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, Inline::LineBreak)),
+            "{inlines:?}"
+        );
+        assert_eq!(hard.plain_text(), "Hello\nworld");
     }
 }

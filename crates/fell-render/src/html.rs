@@ -92,8 +92,20 @@ fn known_html_tag(name: &str) -> bool {
     )
 }
 
+/// Mail is parsed with scripting off, so `<noscript>` children are elements.
+/// The default parser treats that subtree as one text node of escaped markup.
+pub(crate) fn parse_html(html: &str) -> Html {
+    use html5ever::ParseOpts;
+    use html5ever::parse_document;
+    use tendril::TendrilSink;
+
+    let mut opts = ParseOpts::default();
+    opts.tree_builder.scripting_enabled = false;
+    parse_document(scraper::HtmlTreeSink::new(Html::new_document()), opts).one(html)
+}
+
 pub fn html_to_document(html: &str) -> StyledDocument {
-    let dom = Html::parse_document(html);
+    let dom = parse_html(html);
     let blocks = children_blocks(dom.root_element());
     StyledDocument {
         blocks: blocks
@@ -709,6 +721,7 @@ mod tests {
         assert!(text.contains("See you Thursday"));
         assert!(text.contains("Plain fallback"));
         assert!(text.contains("Label"));
+        assert!(!text.contains("<p>"), "{text}");
         assert!(!text.contains("Go"));
         assert!(!text.contains("secret"));
     }

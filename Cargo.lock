@@ -1888,8 +1888,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ego-tree",
+ "html5ever 0.29.1",
  "pulldown-cmark",
  "scraper",
+ "tendril 0.4.3",
 ]
 
 [[package]]

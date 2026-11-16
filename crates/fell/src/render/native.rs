@@ -348,8 +348,43 @@ pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
         .into_any_element()
 }
 
+/// A mail image or a web snapshot. Far below the image crate's 512MiB default,
+/// and checked before the pixels are allocated.
+pub(crate) const MAX_IMAGE_EDGE: u32 = 8_192;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+pub(crate) fn raster_allowed(width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 || width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE {
+        return false;
+    }
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= MAX_IMAGE_BYTES)
+}
+
+fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_EDGE);
+    limits.max_image_height = Some(MAX_IMAGE_EDGE);
+    limits.max_alloc = Some(MAX_IMAGE_BYTES);
+    limits
+}
+
 pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
-    let mut data = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let mut header = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    header.limits(image_limits());
+    let (width, height) = header.into_dimensions().ok()?;
+    if !raster_allowed(width, height) {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(image_limits());
+    let mut data = reader.decode().ok()?.into_rgba8();
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
@@ -399,5 +434,52 @@ mod decode_tests {
             found.iter().any(|(alt, n)| alt == "sketch" && *n > 0),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn oversized_image_is_not_decoded() {
+        use super::{MAX_IMAGE_EDGE, raster_allowed};
+
+        assert!(raster_allowed(160, 90));
+        assert!(!raster_allowed(100_000, 100_000));
+        assert!(!raster_allowed(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE));
+        assert!(!raster_allowed(u32::MAX, u32::MAX));
+        assert!(decode_image(&png_header(100_000, 100_000)).is_none());
+    }
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        fn crc(data: &[u8]) -> u32 {
+            let mut sum = 0xFFFF_FFFFu32;
+            for &byte in data {
+                sum ^= u32::from(byte);
+                for _ in 0..8 {
+                    let bit = sum & 1;
+                    sum >>= 1;
+                    if bit == 1 {
+                        sum ^= 0xEDB8_8320;
+                    }
+                }
+            }
+            !sum
+        }
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut body = Vec::with_capacity(4 + data.len());
+            body.extend_from_slice(kind);
+            body.extend_from_slice(data);
+            let sum = crc(&body);
+            let mut out = Vec::new();
+            out.extend_from_slice(&(u32::try_from(data.len()).unwrap_or(u32::MAX)).to_be_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&sum.to_be_bytes());
+            out
+        }
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IEND", &[]));
+        png
     }
 }

@@ -74,13 +74,16 @@ pub enum WebStatus {
 }
 
 pub fn show(request: WebRequest) {
-    if let Some(tx) = sender() {
-        let _ = tx.send(Cmd::Show(request));
+    match boot() {
+        WebTransport::Live(tx) => {
+            let _ = tx.send(Cmd::Show(request));
+        }
+        WebTransport::Failed => publish_failed(request.token),
     }
 }
 
 pub fn hide() {
-    if let Some(tx) = sender() {
+    if let WebTransport::Live(tx) = boot() {
         let _ = tx.send(Cmd::Hide);
     }
 }
@@ -104,21 +107,36 @@ pub fn status_for(token: u64) -> WebStatus {
     }
 }
 
-fn sender() -> Option<&'static gtk::glib::Sender<Cmd>> {
-    SENDER.get()
+enum WebTransport {
+    Live(gtk::glib::Sender<Cmd>),
+    Failed,
 }
 
-static SENDER: OnceLock<gtk::glib::Sender<Cmd>> = OnceLock::new();
+static SENDER: OnceLock<WebTransport> = OnceLock::new();
 
-fn boot() {
+fn boot() -> &'static WebTransport {
     SENDER.get_or_init(|| {
         let (ready_tx, ready_rx) = mpsc::channel();
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("fell-webview".into())
             .spawn(move || gtk_thread(ready_tx))
-            .expect("spawn webview thread");
-        ready_rx.recv().expect("webkit thread")
-    });
+            .is_err()
+        {
+            return WebTransport::Failed;
+        }
+        // gtk::init failure returns without sending, which closes this channel.
+        // That is a failed web view, not a panic on the message window.
+        match ready_rx.recv() {
+            Ok(tx) => WebTransport::Live(tx),
+            Err(_) => WebTransport::Failed,
+        }
+    })
+}
+
+fn publish_failed(token: u64) {
+    if let Ok(mut frame) = FRAME.lock() {
+        *frame = Some((token, StoredFrame::Failed));
+    }
 }
 
 fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
@@ -153,9 +171,7 @@ fn present(request: WebRequest) {
                 Ok(host) => *slot = Some(host),
                 Err(err) => {
                     eprintln!("fell: web view failed: {err}");
-                    if let Ok(mut frame) = FRAME.lock() {
-                        *frame = Some((request.token, StoredFrame::Failed));
-                    }
+                    publish_failed(request.token);
                     return None;
                 }
             }
@@ -516,9 +532,19 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
     if width <= 0 || height <= 0 {
         return None;
     }
+    let Ok(width) = u32::try_from(width) else {
+        return None;
+    };
+    let Ok(height) = u32::try_from(height) else {
+        return None;
+    };
+    if !super::native::raster_allowed(width, height) {
+        return None;
+    }
     let stride = image.stride() as usize;
     let data = image.data().ok()?;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    let mut rgba =
+        Vec::with_capacity(usize::try_from(u64::from(width) * u64::from(height) * 4).ok()?);
     for y in 0..height as usize {
         let start = y * stride;
         let row = data.get(start..start + width as usize * 4)?;
@@ -536,7 +562,7 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
             }
         }
     }
-    let buffer = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(buffer)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
