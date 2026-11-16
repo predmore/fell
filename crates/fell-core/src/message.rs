@@ -53,6 +53,12 @@ pub struct Message {
     pub snippet: String,
     pub body_text: Option<String>,
     pub unread: bool,
+    /// Folders this message was stored in (`Sent`, `INBOX`, …).
+    pub folders: Vec<String>,
+    /// Labels applied on any copy of this message.
+    pub labels: Vec<String>,
+    /// Addresses this copy arrived through (the account, an alias, a list).
+    pub arrived_via: Vec<String>,
 }
 
 pub(crate) fn normalize_message_id(raw: &str) -> &str {
