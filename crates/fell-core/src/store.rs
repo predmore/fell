@@ -78,6 +78,28 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 "#;
 
+const FTS_COPY: &str = r#"
+INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
+SELECT
+    subject,
+    trim(coalesce(from_name, '') || ' ' || from_email),
+    trim(
+        replace(replace(to_line, char(31), ' '), char(30), ' ') || ' ' ||
+        replace(replace(cc_line, char(31), ' '), char(30), ' ') || ' ' ||
+        replace(replace(bcc_line, char(31), ' '), char(30), ' ')
+    ),
+    COALESCE(body_text, snippet),
+    account_id,
+    message_id
+FROM messages;
+"#;
+
+const DROP_FTS_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+"#;
+
 const FTS_TRIGGERS: &str = r#"
 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
@@ -243,6 +265,36 @@ impl Store {
                 })?;
         tx.commit()?;
         Ok(thread_id)
+    }
+
+    /// Remove one message and its search postings.
+    ///
+    /// Document frequency drops the same way an insert raises it, inside the
+    /// transaction that deletes the row. `false` means the message was not stored.
+    pub fn delete_message(&self, account_id: &AccountId, message_id: &MessageId) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(stored) = find_arrival(&tx, account_id, message_id)? else {
+            tx.rollback()?;
+            return Ok(false);
+        };
+        let old_terms = terms_for_indexed(IndexedText {
+            subject: &stored.subject,
+            from_name: stored.from_name.as_deref(),
+            from_email: &stored.from_email,
+            body: &stored.body,
+            to_line: &stored.to_line,
+            cc_line: &stored.cc_line,
+            bcc_line: &stored.bcc_line,
+            folders: &stored.folders,
+            labels: &stored.labels,
+        });
+        sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
+        let removed = tx.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(removed > 0)
     }
 
     pub fn list_threads(&self, account_id: &AccountId) -> Result<Vec<ThreadSummary>> {
@@ -814,7 +866,11 @@ fn ensure_message_columns(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {
-    let have = column_names(conn, "messages_fts")?;
+    // Drop, create, and copy commit together. A killed process rolls the
+    // upgrade back, so the next open tries again instead of keeping an empty
+    // index whose columns merely look current.
+    let tx = conn.unchecked_transaction()?;
+    let have = column_names(&tx, "messages_fts")?;
     let needed = [
         "subject",
         "sender",
@@ -826,36 +882,23 @@ fn ensure_fts(conn: &Connection) -> Result<()> {
     let current = needed
         .iter()
         .all(|name| have.iter().any(|column| column == name));
+    let messages: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
     if !current {
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS messages_ai;
-             DROP TRIGGER IF EXISTS messages_ad;
-             DROP TRIGGER IF EXISTS messages_au;
-             DROP TABLE IF EXISTS messages_fts;",
-        )?;
-        conn.execute_batch(FTS_TABLE)?;
-        conn.execute_batch(
-            "INSERT INTO messages_fts(subject, sender, recipients, body, account_id, message_id)
-             SELECT
-                subject,
-                trim(coalesce(from_name, '') || ' ' || from_email),
-                trim(
-                    replace(replace(to_line, char(31), ' '), char(30), ' ') || ' ' ||
-                    replace(replace(cc_line, char(31), ' '), char(30), ' ') || ' ' ||
-                    replace(replace(bcc_line, char(31), ' '), char(30), ' ')
-                ),
-                COALESCE(body_text, snippet),
-                account_id,
-                message_id
-             FROM messages",
-        )?;
+        tx.execute_batch(&format!(
+            "{DROP_FTS_TRIGGERS} DROP TABLE IF EXISTS messages_fts;"
+        ))?;
+        tx.execute_batch(FTS_TABLE)?;
+        tx.execute_batch(FTS_COPY)?;
+    } else if messages > 0 {
+        let indexed: i64 =
+            tx.query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))?;
+        if indexed == 0 {
+            tx.execute_batch(FTS_COPY)?;
+        }
     }
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS messages_ai;
-         DROP TRIGGER IF EXISTS messages_ad;
-         DROP TRIGGER IF EXISTS messages_au;",
-    )?;
-    conn.execute_batch(FTS_TRIGGERS)?;
+    tx.execute_batch(DROP_FTS_TRIGGERS)?;
+    tx.execute_batch(FTS_TRIGGERS)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2035,5 +2078,166 @@ mod tests {
         assert_eq!(version, "2");
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_fts_index_is_refilled_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-m2-empty-fts-{}-refill.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account()).unwrap();
+            store
+                .upsert_message(&msg(
+                    "kept@x",
+                    None,
+                    None,
+                    "March invoice",
+                    "please pay the invoice",
+                ))
+                .unwrap();
+            store.conn.execute("DELETE FROM messages_fts", []).unwrap();
+            assert!(
+                store
+                    .search(&AccountId("a1".into()), "invoice")
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+        }
+        let store = Store::open(&path).unwrap();
+        let hits = store.search(&AccountId("a1".into()), "invoice").unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].message_id.as_str(), "kept@x");
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "is:unread")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vocabulary_rebuild_retries_after_a_partial_fill() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("a@x", None, None, "Invoice", "please pay the invoice"))
+            .unwrap();
+        store
+            .upsert_message(&msg("b@x", None, None, "Calendar", "team calendar"))
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM search_trigrams", [])
+            .unwrap();
+        store.conn.execute("DELETE FROM search_terms", []).unwrap();
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::search::testing_stop_vocabulary_rebuild_at(None);
+            }
+        }
+        let _reset = Reset;
+        crate::search::testing_stop_vocabulary_rebuild_at(Some(1));
+        let err = crate::search::rebuild_vocabulary_if_empty(&store.conn).unwrap_err();
+        assert!(matches!(err, crate::Error::Search(_)));
+        let terms: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM search_terms", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(terms, 0);
+        crate::search::testing_stop_vocabulary_rebuild_at(None);
+        crate::search::rebuild_vocabulary_if_empty(&store.conn).unwrap();
+        let hits = store.search(&AccountId("a1".into()), "invioce").unwrap();
+        assert_eq!(hits.did_you_mean.as_deref(), Some("invoice"));
+        assert_eq!(hits.hits.len(), 1);
+    }
+
+    #[test]
+    fn deleting_mail_drops_its_terms_from_did_you_mean() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg(
+                "gone@x",
+                None,
+                None,
+                "Invoice",
+                "please pay the invoice",
+            ))
+            .unwrap();
+        store
+            .upsert_message(&msg("stay@x", None, None, "Calendar", "team calendar"))
+            .unwrap();
+        assert!(
+            store
+                .delete_message(&AccountId("a1".into()), &MessageId::new("gone@x"))
+                .unwrap()
+        );
+        let invoice_terms: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_terms WHERE term = 'invoice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let invoice_trigrams: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM search_trigrams WHERE term = 'invoice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invoice_terms, 0);
+        assert_eq!(invoice_trigrams, 0);
+        let missed = store.search(&AccountId("a1".into()), "invioce").unwrap();
+        assert_ne!(missed.did_you_mean.as_deref(), Some("invoice"));
+        assert!(missed.hits.is_empty());
+        let live = store.search(&AccountId("a1".into()), "calendr").unwrap();
+        assert_eq!(live.did_you_mean.as_deref(), Some("calendar"));
+        assert_eq!(live.hits[0].message_id.as_str(), "stay@x");
+
+        store
+            .upsert_message(&msg("c1@x", None, None, "Budget", "sharedbudget"))
+            .unwrap();
+        store
+            .upsert_message(&msg("c2@x", None, None, "Budget two", "sharedbudget"))
+            .unwrap();
+        store
+            .delete_message(&AccountId("a1".into()), &MessageId::new("c1@x"))
+            .unwrap();
+        let df: i64 = store
+            .conn
+            .query_row(
+                "SELECT df FROM search_terms WHERE account_id = 'a1' AND term = 'sharedbudget'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df, 1);
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "sharedbudget")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            !store
+                .delete_message(&AccountId("a1".into()), &MessageId::new("missing@x"))
+                .unwrap()
+        );
     }
 }

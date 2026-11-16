@@ -13,6 +13,9 @@
 
 use std::collections::HashSet;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
@@ -73,6 +76,9 @@ pub(crate) fn ensure_vocabulary(conn: &Connection) -> Result<()> {
 }
 
 /// Fill the trigram vocabulary from messages already stored before the table existed.
+///
+/// Rows are read one at a time inside a transaction. If that transaction does
+/// not commit, the partial vocabulary is removed so the next open retries.
 pub(crate) fn rebuild_vocabulary_if_empty(conn: &Connection) -> Result<()> {
     let terms: i64 = conn.query_row("SELECT COUNT(*) FROM search_terms", [], |row| row.get(0))?;
     if terms > 0 {
@@ -82,31 +88,53 @@ pub(crate) fn rebuild_vocabulary_if_empty(conn: &Connection) -> Result<()> {
     if messages == 0 {
         return Ok(());
     }
-    let mut stmt = conn.prepare(
-        "SELECT account_id, subject, from_name, from_email,
-                COALESCE(body_text, snippet), to_line, cc_line, bcc_line, folders, labels
-         FROM messages",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(StoredText {
-            account_id: row.get(0)?,
-            subject: row.get(1)?,
-            from_name: row.get(2)?,
-            from_email: row.get(3)?,
-            body: row.get(4)?,
-            to_line: row.get(5)?,
-            cc_line: row.get(6)?,
-            bcc_line: row.get(7)?,
-            folders: row.get(8)?,
-            labels: row.get(9)?,
-        })
-    })?;
-    let mut batch = Vec::new();
-    for row in rows {
-        batch.push(row?);
+    let outcome = {
+        let tx = conn.unchecked_transaction()?;
+        match rebuild_vocabulary_rows(&tx) {
+            Ok(()) => tx.commit().map_err(crate::Error::from),
+            Err(err) => {
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
+    };
+    if let Err(err) = outcome {
+        clear_vocabulary(conn)?;
+        return Err(err);
     }
-    drop(stmt);
-    for row in batch {
+    Ok(())
+}
+
+fn rebuild_vocabulary_rows(conn: &Connection) -> Result<()> {
+    let mut id_stmt = conn.prepare("SELECT rowid FROM messages ORDER BY rowid")?;
+    let ids = id_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    let mut rowids = Vec::new();
+    for id in ids {
+        rowids.push(id?);
+    }
+    drop(id_stmt);
+    for (index, rowid) in rowids.into_iter().enumerate() {
+        interrupt_vocabulary_rebuild(index)?;
+        let row = conn.query_row(
+            "SELECT account_id, subject, from_name, from_email,
+                    COALESCE(body_text, snippet), to_line, cc_line, bcc_line, folders, labels
+             FROM messages WHERE rowid = ?1",
+            rusqlite::params![rowid],
+            |row| {
+                Ok(StoredText {
+                    account_id: row.get(0)?,
+                    subject: row.get(1)?,
+                    from_name: row.get(2)?,
+                    from_email: row.get(3)?,
+                    body: row.get(4)?,
+                    to_line: row.get(5)?,
+                    cc_line: row.get(6)?,
+                    bcc_line: row.get(7)?,
+                    folders: row.get(8)?,
+                    labels: row.get(9)?,
+                })
+            },
+        )?;
         let terms = terms_for_indexed(IndexedText {
             subject: &row.subject,
             from_name: row.from_name.as_deref(),
@@ -121,6 +149,38 @@ pub(crate) fn rebuild_vocabulary_if_empty(conn: &Connection) -> Result<()> {
         sync_terms(conn, &row.account_id, &HashSet::new(), &terms)?;
     }
     Ok(())
+}
+
+fn interrupt_vocabulary_rebuild(index: usize) -> Result<()> {
+    #[cfg(test)]
+    if stop_vocabulary_rebuild_at(index) {
+        return Err(Error::Search("vocabulary rebuild interrupted".into()));
+    }
+    #[cfg(not(test))]
+    let _ = index;
+    Ok(())
+}
+
+fn clear_vocabulary(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM search_trigrams", [])?;
+    conn.execute("DELETE FROM search_terms", [])?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static REBUILD_STOP_AT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn stop_vocabulary_rebuild_at(index: usize) -> bool {
+    REBUILD_STOP_AT.with(|cell| cell.get() == Some(index))
+}
+
+/// Test hook. `Some(n)` makes the vocabulary rebuild fail before message `n`.
+#[cfg(test)]
+pub(crate) fn testing_stop_vocabulary_rebuild_at(index: Option<usize>) {
+    REBUILD_STOP_AT.with(|cell| cell.set(index));
 }
 
 struct StoredText {
