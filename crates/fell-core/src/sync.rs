@@ -57,6 +57,10 @@ mod tests {
             snippet: "Hello".into(),
             body_text: Some("Hello body".into()),
             unread: true,
+            folders: Vec::new(),
+            labels: Vec::new(),
+            arrived_via: Vec::new(),
+            list_id: None,
         };
         let backend = FixtureBackend {
             messages: vec![msg],

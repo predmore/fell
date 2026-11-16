@@ -45,9 +45,11 @@ A thread id is assigned when a message is stored, then the account is re-resolve
 2. Otherwise join via `In-Reply-To` / `References` to an already-stored parent in the **same account**.
 3. Otherwise start a thread from the message's own `Message-ID`.
 
-Messages are unique on `(account_id, message_id)`. After a delta with messages is written, each row's previous thread and its header-parent thread are unioned: Proton conversation ids win; otherwise the already-assigned thread is kept so a caller-held id still lists the messages. Cursor-only deltas skip the scan. A thread-id-only update does not rewrite FTS (the update trigger is `OF` subject, sender, and body). A delta whose rows belong to another account is rejected and does not advance the cursor.
+Messages are unique on `(account_id, message_id)`. A second copy with the same id (a Sent copy, or the same message delivered to several aliases) stays one row and unions folders, labels, and arrival addresses. A mailing-list echo that rewrites headers is collapsed the same way when its body fingerprint matches and either copy carries a list id; the rewritten id still resolves as that message for threading.
 
-Proton conversation ids win when present so Bridge and the future API stay consistent with Proton's own threading. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
+After a delta with messages is written, each row's previous thread and its header-parent thread are unioned. A `proton:` id absorbs a non-proton header thread. Two different `proton:` ids are not unioned. Non-proton merges keep the earliest already-assigned thread id, so the first id handed back still lists the messages after a missing parent arrives. Cursor-only deltas skip the scan. A thread-id-only update does not rewrite FTS (the update trigger is `OF` subject, sender, and body). A delta whose rows belong to another account is rejected and does not advance the cursor.
+
+Proton conversation ids are preferred so Bridge and the future API stay consistent with Proton's own threading, and two Proton conversations stay two threads. Sync applies a mailbox delta in one SQLite transaction (messages, rethread, cursor).
 
 ## Sending mail
 
