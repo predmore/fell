@@ -356,6 +356,11 @@ impl Store {
     pub fn search(&self, account_id: &AccountId, query: &str) -> Result<SearchResults> {
         crate::search::execute(&self.conn, account_id, query)
     }
+
+    /// Connection for [`crate::actions`]. The UI does not call this.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {

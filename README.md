@@ -14,7 +14,7 @@ Bridge is GPL-3.0 and runs as a **separate process**. Fell does not link it and 
 ## Workspace
 
 ```text
-crates/fell-core      accounts, backend trait, sync, SQLite+FTS, threading, search
+crates/fell-core      accounts, backend trait, sync, SQLite+FTS, threading, search, local actions
 crates/fell-confirm   UI-only token required to mint a send confirmation
 crates/fell           GPUI app (Wayland window)
 crates/fell-mcp       MCP server stub (search / summarize / triage / draft)
