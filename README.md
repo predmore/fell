@@ -37,6 +37,12 @@ cargo run -p fell
 
 `fell` opens an empty window against an in-memory store. There is no live IMAP yet; the Bridge backend is a typed stub.
 
+## Nightly Linux artifacts
+
+A push to `main` builds a release x86_64 binary and uploads two GitHub Actions artifacts (not a GitHub Release): `fell-x86_64-linux.tar.gz` (binary, `.desktop` file, and icon) and `fell-x86_64.AppImage`.
+
+Neither artifact bundles WebKitGTK. `wry` stays dynamically linked to the system library, so the LGPL code stays out of the crate graph and out of the download. Install `libwebkit2gtk-4.1-0` (Debian/Ubuntu) or `webkit2gtk-4.1` (Arch) for the newsletter web view. The native UI does not need it. Details: [packaging/linux/README.md](packaging/linux/README.md).
+
 ## License
 
 MIT, copyright Caleb Predmore. See [LICENSE](LICENSE).

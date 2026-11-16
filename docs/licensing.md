@@ -39,3 +39,7 @@ Use the Apache-2.0 `gpui` crate and its published dependencies only. Do not take
 ## MCP and sending
 
 The MCP stub is MIT like the rest of the workspace. Agent tools may search, summarize, triage, and draft. Sending mail is not an MCP capability; it always needs explicit UI confirmation (`UserSendConfirmation`).
+
+## WebKitGTK stays on the system
+
+The newsletter web view uses WebKitGTK via `wry`, dynamically linked. That library is LGPL, so it is not a crate and nightly Linux artifacts do not bundle it. The tarball and the AppImage both depend on the distro package (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch). Native GPUI rendering does not load it. `cargo deny` still rejects LGPL in the crate graph. See [packaging/linux/README.md](../packaging/linux/README.md).
