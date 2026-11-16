@@ -2,11 +2,132 @@
 //!
 //! The session lists mailboxes, examines them, and fetches with `BODY.PEEK`
 //! so the server is not asked to mark mail read. There is no SMTP, no OAuth,
-//! and no send command.
+//! and no send command. IDLE and removal of vanished messages are later work.
 
+mod rfc822;
+mod session;
+mod utf7;
+
+#[cfg(test)]
+mod sync_tests;
+#[cfg(test)]
+mod test_server;
+
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::backend::SyncCursor;
+use crate::Error;
+use crate::account::AccountId;
+use crate::backend::{MailboxDelta, SyncCursor};
+
+pub(crate) fn fetch_imap(
+    account_id: &AccountId,
+    config: &ImapConfig,
+    cursor: Option<&SyncCursor>,
+) -> Result<MailboxDelta, Error> {
+    if config.username.is_empty() {
+        return Err(Error::Backend("imap username is empty".into()));
+    }
+    let mut session = session::Session::open(config)?;
+    let mut mailboxes = session.list_selectable()?;
+    mailboxes.sort_by(|left, right| {
+        inbox_rank(&left.decoded)
+            .cmp(&inbox_rank(&right.decoded))
+            .then_with(|| left.decoded.cmp(&right.decoded))
+            .then_with(|| left.raw.cmp(&right.raw))
+    });
+    let prior: HashMap<String, MailboxCheckpoint> = decode_cursor(cursor).into_iter().collect();
+    let mut messages = Vec::new();
+    let mut checkpoints = Vec::new();
+    for mailbox in &mailboxes {
+        let examined = session.examine(&mailbox.raw)?;
+        let previous = prior.get(&mailbox.raw);
+        let fetched = match plan_fetch(previous, &examined) {
+            Some(plan) => session.uid_fetch(&plan.range, plan.changed_since)?,
+            None => Vec::new(),
+        };
+        let highest = fetched.iter().map(|item| item.uid).max();
+        for item in fetched {
+            if rfc822::is_deleted(&item.flags) {
+                continue;
+            }
+            messages.push(rfc822::to_message(
+                account_id,
+                &mailbox.raw,
+                &mailbox.decoded,
+                examined.uidvalidity,
+                item.uid,
+                &item.flags,
+                &item.body,
+            ));
+        }
+        let uid = if previous.is_some_and(|prev| prev.uidvalidity == examined.uidvalidity) {
+            previous
+                .map(|prev| prev.uid)
+                .unwrap_or(0)
+                .max(highest.unwrap_or(0))
+        } else {
+            highest.unwrap_or(0)
+        };
+        checkpoints.push((
+            mailbox.raw.clone(),
+            MailboxCheckpoint {
+                uidvalidity: examined.uidvalidity,
+                uid,
+                modseq: examined.highest_modseq,
+            },
+        ));
+    }
+    session.logout();
+    checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(MailboxDelta {
+        messages,
+        cursor: Some(encode_cursor(account_id.as_str(), &checkpoints)),
+    })
+}
+
+fn inbox_rank(name: &str) -> u8 {
+    if name.eq_ignore_ascii_case("INBOX") {
+        1
+    } else {
+        0
+    }
+}
+
+struct FetchPlan {
+    range: String,
+    changed_since: Option<u64>,
+}
+
+fn plan_fetch(
+    previous: Option<&MailboxCheckpoint>,
+    examined: &session::Examined,
+) -> Option<FetchPlan> {
+    if examined.exists == 0 {
+        return None;
+    }
+    match previous {
+        Some(prev) if prev.uidvalidity == examined.uidvalidity => {
+            if prev.modseq.is_some() && examined.highest_modseq.is_some() {
+                Some(FetchPlan {
+                    range: "1:*".to_string(),
+                    changed_since: prev.modseq,
+                })
+            } else if prev.uid == u32::MAX {
+                None
+            } else {
+                Some(FetchPlan {
+                    range: format!("{}:*", prev.uid.saturating_add(1)),
+                    changed_since: None,
+                })
+            }
+        }
+        _ => Some(FetchPlan {
+            range: "1:*".to_string(),
+            changed_since: None,
+        }),
+    }
+}
 
 /// How the TCP session is protected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +262,7 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
     }
 }
 
-fn escape_mailbox(name: &str) -> String {
+pub(super) fn escape_mailbox(name: &str) -> String {
     name.replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")

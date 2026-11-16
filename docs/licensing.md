@@ -21,6 +21,8 @@ Backend 1 talks to [Proton Mail Bridge](https://github.com/ProtonMail/proton-bri
 
 Do **not** copy or depend on `ProtonMail/clients` `project/mail/rust` (formerly `ProtonMail/rust-mail`). That tree is AGPL-3.0. Reading it for API shapes is allowed; copying code or adding it as a Cargo dependency is not.
 
+IMAP parsing uses `mail-parser` (Apache-2.0 OR MIT) and the Rustls stack. That code is ours plus those crates. It is not copied from the Proton tree.
+
 ## Allowed Proton / crypto references
 
 Fine to depend on or study, as verified 2026-11-15:

@@ -35,7 +35,7 @@ cargo test --workspace
 cargo run -p fell
 ```
 
-`fell` opens an empty window against an in-memory store. There is no live IMAP yet; the Bridge backend is a typed stub.
+`fell` opens an empty window against an in-memory store. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account.
 
 ## Nightly Linux artifacts
 

@@ -1,4 +1,5 @@
-use crate::account::BackendKind;
+use crate::account::{AccountId, BackendKind};
+use crate::imap::ImapConfig;
 use crate::message::Message;
 use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
 use crate::{Error, Result};
@@ -34,11 +35,14 @@ pub trait MailBackend {
     ) -> Result<SentMessage>;
 }
 
-/// Proton Mail Bridge over local IMAP/SMTP. Protocol work is not wired yet.
+/// Proton Mail Bridge as a local IMAP account. Bridge stays a separate process.
+///
+/// SMTP fields are recorded for a later send path. This backend does not connect
+/// to them and does not transmit mail.
 #[derive(Debug, Clone)]
 pub struct BridgeBackend {
-    pub imap_host: String,
-    pub imap_port: u16,
+    pub account_id: AccountId,
+    pub imap: ImapConfig,
     pub smtp_host: String,
     pub smtp_port: u16,
 }
@@ -46,8 +50,8 @@ pub struct BridgeBackend {
 impl Default for BridgeBackend {
     fn default() -> Self {
         Self {
-            imap_host: "127.0.0.1".into(),
-            imap_port: 1143,
+            account_id: AccountId("bridge".into()),
+            imap: ImapConfig::bridge_local("", ""),
             smtp_host: "127.0.0.1".into(),
             smtp_port: 1025,
         }
@@ -59,8 +63,8 @@ impl MailBackend for BridgeBackend {
         BackendKind::Bridge
     }
 
-    fn fetch_changes(&self, _cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
-        Err(Error::NotImplemented("Proton Mail Bridge IMAP"))
+    fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
+        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
@@ -74,6 +78,38 @@ impl MailBackend for BridgeBackend {
     ) -> Result<SentMessage> {
         require_confirmation(&pending, &confirmation)?;
         Err(Error::NotImplemented("Proton Mail Bridge SMTP"))
+    }
+}
+
+/// Any IMAP account, including one that is not Proton Mail Bridge.
+///
+/// Read-only. `confirm_send` does not transmit.
+#[derive(Debug, Clone)]
+pub struct ImapBackend {
+    pub account_id: AccountId,
+    pub config: ImapConfig,
+}
+
+impl MailBackend for ImapBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Imap
+    }
+
+    fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
+        crate::imap::fetch_imap(&self.account_id, &self.config, cursor)
+    }
+
+    fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
+        Ok(PendingSend::new("imap", draft))
+    }
+
+    fn confirm_send(
+        &self,
+        pending: PendingSend,
+        confirmation: UserSendConfirmation,
+    ) -> Result<SentMessage> {
+        require_confirmation(&pending, &confirmation)?;
+        Err(Error::NotImplemented("IMAP send"))
     }
 }
 
@@ -146,15 +182,16 @@ impl MailBackend for FixtureBackend {
 mod tests {
     use super::*;
     use crate::account::AccountId;
+    use crate::imap::ImapSecurity;
 
     #[test]
-    fn bridge_is_typed_stub() {
+    fn bridge_fetch_needs_credentials() {
         let backend = BridgeBackend::default();
         assert_eq!(backend.kind(), BackendKind::Bridge);
-        assert!(matches!(
-            backend.fetch_changes(None),
-            Err(Error::NotImplemented(_))
-        ));
+        assert_eq!(backend.imap.security, ImapSecurity::StartTls);
+        assert_eq!(backend.imap.port, 1143);
+        let err = backend.fetch_changes(None).unwrap_err();
+        assert!(matches!(err, Error::Backend(message) if message.contains("username")));
     }
 
     #[test]
