@@ -49,8 +49,8 @@ pub enum Error {
     Backend(String),
     #[error("unknown account {0}")]
     UnknownAccount(String),
-    #[error("unknown thread {0}")]
-    UnknownThread(String),
+    #[error("unknown thread")]
+    UnknownThread,
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("{0}")]

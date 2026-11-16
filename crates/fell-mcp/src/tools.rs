@@ -90,9 +90,8 @@ fn search(session: &Session, args: &Value) -> Result<Value, String> {
     let page = session
         .store
         .search_page(&session.account_id, &query, cursor.as_deref())
-        .map_err(|err| err.to_string())?;
-    let hits = page.hits
-        .iter()
+        .map_err(store_error)?;
+    let hits = page.hits.iter()
         .map(|hit| {
             json!({
                 "message_id": session.show_id(hit.message_id.as_str()),
@@ -121,7 +120,7 @@ fn read_thread(session: &Session, args: &Value) -> Result<Value, String> {
     let messages = session
         .store
         .thread_messages(&session.account_id, &thread_id)
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     if messages.is_empty() {
         return Err("unknown thread".into());
     }
@@ -141,7 +140,7 @@ fn list_labels(session: &Session) -> Result<Value, String> {
     let labels = session
         .store
         .list_labels(&session.account_id)
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(json!({ "labels": labels }))
 }
 
@@ -161,7 +160,7 @@ fn label(session: &Session, args: &Value) -> Result<Value, String> {
         }
         _ => return Err("mode must be add or remove".into()),
     }
-    .map_err(|err| err.to_string())?;
+    .map_err(store_error)?;
     Ok(mutation_json(action))
 }
 
@@ -170,7 +169,7 @@ fn archive(session: &Session, args: &Value) -> Result<Value, String> {
     let action = session
         .store
         .agent_archive_thread(&session.account_id, &thread_id, &actor_name(session))
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(mutation_json(action))
 }
 
@@ -179,7 +178,7 @@ fn mark_read(session: &Session, args: &Value) -> Result<Value, String> {
     let action = session
         .store
         .mark_thread_read(&session.account_id, &thread_id, &actor_name(session))
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(mutation_json(action))
 }
 
@@ -194,7 +193,7 @@ fn snooze(session: &Session, args: &Value) -> Result<Value, String> {
             until_unix,
             &actor_name(session),
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(mutation_json(action))
 }
 
@@ -220,13 +219,13 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
             },
             &actor_name(session),
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(json!({
         "draft_id": saved.draft.id,
         "status": "review",
         "subject": untrusted::envelope(&saved.draft.subject, SNIPPET_CHARS),
         "action_id": saved.action.id,
-        "summary": saved.action.summary,
+        "summary": public_summary(&saved.action.summary),
     }))
 }
 
@@ -240,7 +239,7 @@ fn list_drafts(session: &Session, args: &Value) -> Result<Value, String> {
             .store
             .list_review_drafts_for(&session.account_id, Some(&caller))
     }
-    .map_err(|err| err.to_string())?;
+    .map_err(store_error)?;
     let drafts = drafts
         .iter()
         .map(|draft| draft_json(session, draft, &caller))
@@ -253,7 +252,7 @@ fn undo(session: &Session) -> Result<Value, String> {
     let latest = session
         .store
         .latest_open_action(&session.account_id, &actor)
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     let Some(latest) = latest else {
         return Err("nothing to undo".into());
     };
@@ -266,12 +265,12 @@ fn undo(session: &Session) -> Result<Value, String> {
     let action = session
         .store
         .undo_actor(&session.account_id, &actor)
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     Ok(json!({
         "undone": true,
         "action_id": action.id,
         "kind": action.kind,
-        "summary": action.summary,
+        "summary": public_summary(&action.summary),
     }))
 }
 
@@ -282,7 +281,7 @@ fn mutation_json(action: Option<fell_core::RecordedAction>) -> Value {
             "changed": true,
             "action_id": action.id,
             "kind": action.kind,
-            "summary": action.summary,
+            "summary": public_summary(&action.summary),
         }),
     }
 }
@@ -322,6 +321,28 @@ fn draft_json(session: &Session, draft: &ReviewDraft, caller: &str) -> Value {
     })
 }
 
+fn store_error(err: fell_core::Error) -> String {
+    match err {
+        fell_core::Error::UnknownThread => "unknown thread".into(),
+        other => {
+            let text = other.to_string();
+            if text.chars().any(|ch| ch.is_control()) {
+                "request failed".into()
+            } else {
+                text
+            }
+        }
+    }
+}
+
+fn public_summary(summary: &str) -> String {
+    if summary.chars().any(|ch| ch.is_control()) {
+        "mailbox change".into()
+    } else {
+        summary.to_string()
+    }
+}
+
 fn thread_arg(session: &Session, args: &Value) -> Result<ThreadId, String> {
     Ok(ThreadId(
         session.resolve_id(&require_string(args, "thread_id")?),
@@ -336,7 +357,7 @@ fn authorize(session: &Session, scope: ToolScope) -> Result<(), String> {
     let grant = session
         .store
         .agent_grant(&session.account_id, &session.agent_id)
-        .map_err(|err| err.to_string())?;
+        .map_err(store_error)?;
     if !grant.enabled {
         return Err(format!("agent {} is disabled", session.agent_id));
     }

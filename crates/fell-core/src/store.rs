@@ -449,6 +449,27 @@ impl Store {
         Ok(out)
     }
 
+    /// True when `token` is already a message id, thread id, reply id, or address.
+    pub fn id_is_stored(&self, account_id: &AccountId, token: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM messages
+                 WHERE account_id = ?1
+                   AND (message_id = ?2 OR thread_id = ?2
+                        OR IFNULL(in_reply_to, '') = ?2 OR from_email = ?2)
+                 UNION ALL
+                 SELECT 1 FROM review_drafts
+                 WHERE account_id = ?1
+                   AND (IFNULL(thread_id, '') = ?2 OR IFNULL(in_reply_to, '') = ?2)
+                 LIMIT 1",
+                params![account_id.as_str(), token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Search one account in the local store.
     ///
     /// This reads SQLite only. It never calls a backend, so the hits change

@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
@@ -22,9 +23,28 @@ pub struct Session {
     pub(crate) account_id: AccountId,
     pub(crate) agent_id: String,
     pub(crate) mutations: MutationBudget,
-    /// Shown id -> stored id, when the stored header was not a safe token.
-    ids: RefCell<HashMap<String, String>>,
+    /// Aliases for headers that are not already safe tokens.
+    ids: RefCell<ShownIds>,
     initialized: bool,
+}
+
+/// Shown id to stored header. A shown id is never reused for a second row.
+struct ShownIds {
+    by_shown: HashMap<String, String>,
+    by_raw: HashMap<String, String>,
+    seed: u64,
+    counter: u64,
+}
+
+impl ShownIds {
+    fn new() -> Self {
+        Self {
+            by_shown: HashMap::new(),
+            by_raw: HashMap::new(),
+            seed: std::collections::hash_map::RandomState::new().hash_one(0xFEu64),
+            counter: 0,
+        }
+    }
 }
 
 /// Caps mailbox changes from one agent. The default is 30 per minute.
@@ -81,25 +101,81 @@ impl Session {
             account_id,
             agent_id,
             mutations: MutationBudget::production(),
-            ids: RefCell::new(HashMap::new()),
+            ids: RefCell::new(ShownIds::new()),
             initialized: false,
         })
     }
 
     pub(crate) fn show_id(&self, raw: &str) -> String {
-        let shown = crate::untrusted::public_id(raw);
-        if shown != raw {
-            self.ids.borrow_mut().insert(shown.clone(), raw.to_string());
+        if let Some(shown) = self.ids.borrow().by_raw.get(raw).cloned() {
+            return shown;
         }
-        shown
+        if let Some(verbatim) = crate::untrusted::verbatim_id(raw)
+            && !self.ids.borrow().by_shown.contains_key(verbatim)
+        {
+            return verbatim.to_string();
+        }
+        loop {
+            let shown = self.allocate_alias(raw);
+            let mut ids = self.ids.borrow_mut();
+            if let Some(existing) = ids.by_raw.get(raw).cloned() {
+                return existing;
+            }
+            if ids.by_shown.contains_key(&shown) {
+                continue;
+            }
+            ids.by_shown.insert(shown.clone(), raw.to_string());
+            ids.by_raw.insert(raw.to_string(), shown.clone());
+            return shown;
+        }
     }
 
     pub(crate) fn resolve_id(&self, given: &str) -> String {
         self.ids
             .borrow()
+            .by_shown
             .get(given)
             .cloned()
             .unwrap_or_else(|| given.to_string())
+    }
+
+    /// A fresh id for this session. It is not a stored token and not another row's alias.
+    fn allocate_alias(&self, raw: &str) -> String {
+        let mut failures = 0;
+        loop {
+            let candidate = {
+                let mut ids = self.ids.borrow_mut();
+                ids.counter = ids.counter.wrapping_add(1);
+                format!("fellid:{:016x}{:016x}", ids.seed, ids.counter)
+            };
+            if candidate == raw {
+                continue;
+            }
+            let taken = {
+                let ids = self.ids.borrow();
+                ids.by_shown.contains_key(&candidate) || ids.by_raw.contains_key(&candidate)
+            };
+            if taken {
+                continue;
+            }
+            match self.store.id_is_stored(&self.account_id, &candidate) {
+                Ok(false) => return candidate,
+                Ok(true) => continue,
+                Err(_) => {
+                    failures += 1;
+                    if failures >= 4 {
+                        return candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_alias_seed(&self, seed: u64) {
+        let mut ids = self.ids.borrow_mut();
+        ids.seed = seed;
+        ids.counter = 0;
     }
 
     #[cfg(test)]
@@ -838,5 +914,33 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 9, "method": "resources/list" }),
         );
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn normalized_id_does_not_point_at_another_thread() {
+        let (session, _) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        session.set_alias_seed(0);
+        let planted = "fellid:00000000000000000000000000000001";
+        session
+            .store
+            .upsert_message(&message("a1", planted, "Planted", "body", ""))
+            .unwrap();
+        let hostile = format!("root@x{}", '\u{200B}');
+        let shown = session.show_id(&hostile);
+        assert_eq!(shown, "fellid:00000000000000000000000000000002");
+        assert_eq!(session.resolve_id("root@x"), "root@x");
+        assert_eq!(session.resolve_id(&shown), hostile);
+        let fullwidth: String = "root@x"
+            .chars()
+            .map(|ch| char::from_u32(ch as u32 + 0xFEE0).unwrap())
+            .collect();
+        let other = session.show_id(&fullwidth);
+        assert_ne!(other, "root@x");
+        assert_ne!(other, shown);
+        assert_eq!(session.resolve_id("root@x"), "root@x");
+        assert_eq!(session.show_id(&hostile), shown);
+        let collision = session.show_id(&shown);
+        assert_ne!(collision, shown);
+        assert_eq!(session.resolve_id(&shown), hostile);
     }
 }
