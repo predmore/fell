@@ -2,8 +2,25 @@
 //!
 //! Planned tools: search, summarize, triage, draft. There is **no send tool**.
 //! Sending mail requires [`fell_core::UserSendConfirmation`] minted by the
-//! GPUI app via `fell-confirm::InteractiveUi`. This crate must not depend on
+//! GPUI app via `fell_confirm::InteractiveUi`. This crate must not depend on
 //! `fell-confirm`.
+//!
+//! ```compile_fail
+//! use fell_core::{AccountId, Draft, PendingSend, UserSendConfirmation};
+//! let pending = PendingSend::new(
+//!     "x",
+//!     Draft {
+//!         account_id: AccountId("a".into()),
+//!         to: vec![],
+//!         cc: vec![],
+//!         bcc: vec![],
+//!         subject: String::new(),
+//!         body: String::new(),
+//!         in_reply_to: None,
+//!     },
+//! );
+//! let _ = UserSendConfirmation::from_interactive_ui(&Default::default(), &pending);
+//! ```
 
 use fell_core::{AccountId, Draft, SearchHit, Store, ThreadId};
 

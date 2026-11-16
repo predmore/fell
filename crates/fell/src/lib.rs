@@ -5,10 +5,11 @@ use fell_core::{PendingSend, UserSendConfirmation};
 
 /// Proof of an explicit Send click in the Fell window.
 ///
-/// Bound to this pending send's id, recipients, and body. `fell-mcp` does not
-/// depend on `fell-confirm` and cannot call this. There is no send MCP tool.
+/// Bound to this pending send's id, account, recipients, subject, and body.
+/// `fell-mcp` does not depend on `fell-confirm` and cannot call this. There
+/// is no send MCP tool.
 pub fn confirmation_from_ui(pending: &PendingSend) -> UserSendConfirmation {
-    UserSendConfirmation::from_interactive_ui(&InteractiveUi, pending)
+    UserSendConfirmation::from_interactive_ui(&InteractiveUi::for_fell_app(), pending)
 }
 
 #[cfg(test)]

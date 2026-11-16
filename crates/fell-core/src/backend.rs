@@ -171,8 +171,10 @@ mod tests {
                 in_reply_to: None,
             })
             .unwrap();
-        let confirm =
-            UserSendConfirmation::from_interactive_ui(&fell_confirm::InteractiveUi, &pending);
+        let confirm = UserSendConfirmation::from_interactive_ui(
+            &fell_confirm::InteractiveUi::for_fell_app(),
+            &pending,
+        );
         let sent = backend.confirm_send(pending, confirm).unwrap();
         assert_eq!(sent.remote_id.0, "fixture-sent");
     }

@@ -20,7 +20,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 | Crate | Role |
 | --- | --- |
 | `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
-| `fell-confirm` | ZST `InteractiveUi`. Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
+| `fell-confirm` | Sealed `InteractiveUi` (private field, not `Default`). Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
 | `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
 | `fell-mcp` | Stub MCP server for later agent access. Tools: search, summarize, triage, draft. No send tool. |
 
@@ -51,7 +51,7 @@ Proton conversation ids win when present so Bridge and the future API stay consi
 
 ## Sending mail
 
-Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi` (see `fell::confirmation_from_ui`) and bound to that id plus the recipients and body that were shown. A token for draft A does not confirm draft B. The MCP crate has no send tool and does not depend on `fell-confirm`, so it cannot construct that token.
+Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, and body that were shown. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
 
 ## First platform
 
