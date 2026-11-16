@@ -39,3 +39,7 @@ Use the Apache-2.0 `gpui` crate and its published dependencies only. Do not take
 ## MCP and sending
 
 The MCP stub is MIT like the rest of the workspace. Agent tools may search, summarize, triage, and draft. Sending mail is not an MCP capability; it always needs explicit UI confirmation (`UserSendConfirmation`).
+
+## WebKitGTK stays on the system
+
+The current nightly `fell` binary does not link WebKitGTK. `readelf -d` shows no `libwebkit2gtk` `NEEDED` entry, and `wry` is not in the crate graph, so `cargo deny` still sees no LGPL. The tarball and the AppImage do not bundle the library. Once the newsletter fallback is compiled in, that view uses WebKitGTK via `wry`, dynamically linked, and the distro package (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch) is a runtime requirement. See [packaging/linux/README.md](../packaging/linux/README.md).

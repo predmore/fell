@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Fell
+GenericName=Mail
+Comment=Fast native mail client
+Exec=fell
+Icon=dev.predmore.fell
+Terminal=false
+Categories=Network;Email;
+StartupWMClass=dev.predmore.fell

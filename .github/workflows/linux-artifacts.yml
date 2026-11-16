@@ -1,0 +1,56 @@
+name: Linux artifacts
+
+# Push to main only. Two downloadable artifacts, not a GitHub Release:
+# fell-x86_64-linux.tar.gz and fell-x86_64.AppImage.
+#
+# WebKitGTK is LGPL and is not bundled. The current fell binary does not
+# link it (no libwebkit2gtk in DT_NEEDED; wry is not a dependency), so this
+# job does not install libwebkit2gtk-4.1-dev. linuxdeploy still excludes
+# libwebkit2gtk and libjavascriptcoregtk. Once the newsletter fallback is
+# compiled in, the distro package is a runtime requirement and must stay
+# dynamically linked. cargo-deny still rejects LGPL in the crate graph.
+# The AppImage uses the static type2 runtime, so it does not need libfuse2.
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  artifacts:
+    name: x86_64 tarball and AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang cmake pkg-config \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libvulkan1 \
+            wget squashfs-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked -p fell
+      - name: Package tarball and AppImage
+        run: packaging/linux/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fell-x86_64-linux.tar.gz
+          path: dist/fell-x86_64-linux.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fell-x86_64.AppImage
+          path: dist/fell-x86_64.AppImage
+          if-no-files-found: error
