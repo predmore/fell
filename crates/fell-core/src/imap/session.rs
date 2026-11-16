@@ -38,6 +38,9 @@ pub(super) struct Fetched {
     pub uid: u32,
     pub flags: Vec<String>,
     pub body: Vec<u8>,
+    /// The body was larger than the cap. The UID is kept so the checkpoint
+    /// can move past it; the bytes were not stored.
+    pub skipped: bool,
 }
 
 pub(super) struct Session {
@@ -302,19 +305,19 @@ impl Session {
         Ok(())
     }
 
-    fn read_logical(&mut self) -> Result<(String, Vec<Vec<u8>>), Error> {
+    fn read_logical(&mut self) -> Result<(String, Vec<LiteralBytes>), Error> {
         let mut text = Vec::new();
         let mut literals = Vec::new();
         loop {
             let line = self.read_until_crlf()?;
             if let Some(len) = literal_len(&line) {
-                if len > MAX_LITERAL {
-                    return Err(imap_err(format!(
-                        "literal of {len} bytes exceeds the {MAX_LITERAL} byte message limit"
-                    )));
-                }
                 text.extend_from_slice(&line);
-                literals.push(self.read_exact(len)?);
+                if len > literal_limit() {
+                    self.discard_exact(len)?;
+                    literals.push(LiteralBytes::Discarded);
+                } else {
+                    literals.push(LiteralBytes::Kept(self.read_exact(len)?));
+                }
                 continue;
             }
             text.extend_from_slice(&line);
@@ -359,6 +362,45 @@ impl Session {
         Ok(exact)
     }
 
+    /// Drop `len` octets already promised by a literal, in fixed chunks, without
+    /// keeping them. The rest of the response stays readable.
+    fn discard_exact(&mut self, mut remaining: usize) -> Result<(), Error> {
+        let mut buf = self.take_buf();
+        let from_buf = remaining.min(buf.len());
+        buf.drain(..from_buf);
+        remaining -= from_buf;
+        self.restore_buf(buf);
+        let mut chunk = [0u8; DISCARD_CHUNK];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            let read = self.read_some(&mut chunk[..want])?;
+            if read == 0 {
+                return Err(imap_err(format!(
+                    "connection to {} closed while discarding a literal",
+                    self.host
+                )));
+            }
+            remaining -= read;
+        }
+        Ok(())
+    }
+
+    fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let io = self
+            .io
+            .as_mut()
+            .ok_or_else(|| imap_err("connection closed"))?;
+        loop {
+            match io.read(buf) {
+                Ok(count) => return Ok(count),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    return Err(imap_err(format!("read from {} failed: {err}", self.host)));
+                }
+            }
+        }
+    }
+
     fn take_buf(&mut self) -> Vec<u8> {
         std::mem::take(self.pending())
     }
@@ -390,9 +432,14 @@ impl Session {
     }
 }
 
+enum LiteralBytes {
+    Kept(Vec<u8>),
+    Discarded,
+}
+
 struct Logical {
     text: String,
-    literals: Vec<Vec<u8>>,
+    literals: Vec<LiteralBytes>,
 }
 
 struct Reply {
@@ -400,9 +447,42 @@ struct Reply {
     ok: String,
 }
 
-/// Largest RFC 822 payload this client will store. A bigger literal is refused
-/// before it is buffered.
+/// Largest RFC 822 payload this client will store. A bigger literal is discarded
+/// and that message is skipped; the rest of the response is still read.
 const MAX_LITERAL: usize = 32 * 1024 * 1024;
+const DISCARD_CHUNK: usize = 64 * 1024;
+
+fn literal_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_LITERAL_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_LITERAL
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LITERAL_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LITERAL) };
+}
+
+#[cfg(test)]
+pub(super) struct LiteralLimitGuard;
+
+#[cfg(test)]
+pub(super) fn limit_literals_to(limit: usize) -> LiteralLimitGuard {
+    TEST_LITERAL_LIMIT.with(|cell| cell.set(limit));
+    LiteralLimitGuard
+}
+
+#[cfg(test)]
+impl Drop for LiteralLimitGuard {
+    fn drop(&mut self) {
+        TEST_LITERAL_LIMIT.with(|cell| cell.set(MAX_LITERAL));
+    }
+}
 
 struct ParsedList {
     raw: String,
@@ -704,7 +784,7 @@ fn bracket_number<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
-fn parse_list(text: &str, literals: &[Vec<u8>]) -> Option<ParsedList> {
+fn parse_list(text: &str, literals: &[LiteralBytes]) -> Option<ParsedList> {
     let rest = text.trim().strip_prefix('*')?.trim_start();
     let rest = strip_prefix_ignore_ascii_case(rest, "LIST")?.trim_start();
     if !rest.starts_with('(') {
@@ -734,7 +814,7 @@ fn parse_list(text: &str, literals: &[Vec<u8>]) -> Option<ParsedList> {
     })
 }
 
-fn parse_fetch(text: &str, literals: &[Vec<u8>]) -> Option<Fetched> {
+fn parse_fetch(text: &str, literals: &[LiteralBytes]) -> Option<Fetched> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('*') {
         return None;
@@ -745,8 +825,17 @@ fn parse_fetch(text: &str, literals: &[Vec<u8>]) -> Option<Fetched> {
     }
     let uid = number_after(&upper, "UID ")?;
     let flags = paren_after(text, "FLAGS").unwrap_or_default();
-    let body = literals.first().cloned().unwrap_or_default();
-    Some(Fetched { uid, flags, body })
+    let skipped = matches!(literals.first(), Some(LiteralBytes::Discarded));
+    let body = match literals.first() {
+        Some(LiteralBytes::Kept(bytes)) => bytes.clone(),
+        _ => Vec::new(),
+    };
+    Some(Fetched {
+        uid,
+        flags,
+        body,
+        skipped,
+    })
 }
 
 fn number_after(upper: &str, key: &str) -> Option<u32> {
@@ -780,7 +869,7 @@ fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a
 struct Scan<'a> {
     text: &'a str,
     index: usize,
-    literals: &'a [Vec<u8>],
+    literals: &'a [LiteralBytes],
     literal: usize,
 }
 
@@ -797,7 +886,10 @@ impl Scan<'_> {
         if rest.starts_with('{') {
             let close = rest.find('}')?;
             self.index += close + 1;
-            let bytes = self.literals.get(self.literal)?;
+            let bytes = match self.literals.get(self.literal)? {
+                LiteralBytes::Kept(bytes) => bytes,
+                LiteralBytes::Discarded => return None,
+            };
             self.literal += 1;
             return Some(String::from_utf8_lossy(bytes).into_owned());
         }
@@ -878,35 +970,35 @@ mod tests {
     use super::connect_addrs;
 
     #[test]
-    fn oversized_literal_is_rejected_without_buffering_it() {
+    fn oversized_literal_is_discarded_and_the_response_continues() {
         use std::io::{Read, Write};
         use std::thread;
 
         use crate::imap::{ImapConfig, ImapSecurity};
 
+        let _limit = super::limit_literals_to(8);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             sock.write_all(b"* OK hi\r\n").unwrap();
-            let mut buf = [0u8; 128];
-            let _ = sock.read(&mut buf);
-            sock.write_all(b"* CAPABILITY {2000000000}\r\n").unwrap();
+            let line = read_imap_line(&mut sock);
+            let tag = line.split_whitespace().next().unwrap_or("a1");
+            sock.write_all(b"* CAPABILITY {24}\r\n").unwrap();
+            sock.write_all(b"xxxxxxxxxxxxxxxxxxxxxxxx\r\n").unwrap();
+            sock.write_all(format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n").as_bytes())
+                .unwrap();
+            let _ = sock.read(&mut [0u8; 64]);
         });
-        let opened = super::Session::open(&ImapConfig {
+        super::Session::open(&ImapConfig {
             host: "127.0.0.1".into(),
             port,
             username: "caleb".into(),
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
-        });
-        let Err(err) = opened else {
-            panic!("oversized literal was accepted");
-        };
-        let text = err.to_string();
-        assert!(text.contains("2000000000"), "{text}");
-        assert!(text.contains("limit"), "{text}");
+        })
+        .expect("an oversized literal is discarded so the rest of the response can finish");
     }
 
     #[test]

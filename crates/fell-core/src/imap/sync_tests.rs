@@ -675,3 +675,108 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         "refused mailbox keeps its checkpoint: {cursor}"
     );
 }
+
+/// One message bigger than the cap must not stall the account. The body is
+/// discarded, the UID is skipped, and the checkpoint moves past it so the
+/// following message is stored once.
+#[test]
+fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
+    let small = raw_message(
+        "small@x",
+        None,
+        "After the large one",
+        "Ann <ann@x>",
+        "small body",
+        "",
+    );
+    let _limit = super::session::limit_literals_to(small.len());
+    let mut oversized = b"oversizedmarker ".to_vec();
+    oversized.resize(small.len() + 80_000, b'Q');
+    let server = TestServer::spawn(TestState {
+        username: "caleb".into(),
+        password: "secret".into(),
+        condstore: false,
+        close_after_starttls: false,
+        commands: Vec::new(),
+        mailboxes: vec![
+            FixtureMailbox {
+                name: "Sent".into(),
+                list_flags: String::new(),
+                uidvalidity: 4,
+                uidnext: Some(2),
+                omit_uidnext: false,
+                reject_examine: false,
+                messages: vec![FixtureMessage {
+                    uid: 1,
+                    flags: vec!["\\Seen".into()],
+                    modseq: 1,
+                    raw: raw_message("sent@x", None, "Already there", "Ann <ann@x>", "sent", ""),
+                }],
+            },
+            FixtureMailbox {
+                name: "INBOX".into(),
+                list_flags: String::new(),
+                uidvalidity: 9,
+                uidnext: Some(3),
+                omit_uidnext: false,
+                reject_examine: false,
+                messages: vec![
+                    FixtureMessage {
+                        uid: 1,
+                        flags: vec!["\\Seen".into()],
+                        modseq: 1,
+                        raw: oversized,
+                    },
+                    FixtureMessage {
+                        uid: 2,
+                        flags: vec![],
+                        modseq: 1,
+                        raw: small,
+                    },
+                ],
+            },
+        ],
+    });
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 2);
+    let threads = store.list_threads(&acct.id).unwrap();
+    assert!(
+        threads
+            .iter()
+            .any(|thread| thread.subject == "Already there")
+    );
+    assert!(
+        threads
+            .iter()
+            .any(|thread| thread.subject == "After the large one")
+    );
+    assert!(
+        store
+            .search(&acct.id, "oversizedmarker")
+            .unwrap()
+            .is_empty(),
+        "the oversized body must not be stored"
+    );
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t9\t2\t"),
+        "checkpoint must move past the skipped UID: {cursor}"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        state.commands.clear();
+    }
+    let again = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(again.upserted, 0);
+    let logged = commands(&server);
+    assert!(
+        !logged.iter().any(|line| line.contains("BODY.PEEK")),
+        "the message after the oversized one must not be fetched again: {logged:?}"
+    );
+}

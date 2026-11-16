@@ -97,7 +97,7 @@ pub(crate) fn fetch_imap(
             }
         }
         for item in fetched {
-            if rfc822::is_deleted(&item.flags) {
+            if item.skipped || rfc822::is_deleted(&item.flags) {
                 continue;
             }
             messages.push(rfc822::to_message(
