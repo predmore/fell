@@ -19,7 +19,7 @@ pub use backend::{
     BridgeBackend, FixtureBackend, MailBackend, MailboxDelta, ProtonApiBackend, SyncCursor,
 };
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
-pub use search::SearchHit;
+pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
 pub use store::{Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
