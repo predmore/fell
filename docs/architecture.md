@@ -84,7 +84,7 @@ Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a
 
 `fell-mcp` speaks MCP on stdio only. It does not listen on a socket. Any future network transport must bind to `127.0.0.1`, authenticate with a token file created mode `0600`, and check the `Origin` header.
 
-Search returns at most 20 hits per page: ids plus a short subject and snippet. Thread bodies are truncated. Draft bodies are capped when they are saved. Text that came from mail is returned as `{"untrusted":true,"source":"email","text":"..."}`. The model is told to treat `text` as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`.
+Search returns at most 20 hits per page: ids, sender address, date, and a short snippet. Thread bodies are plain text and truncated. Draft bodies are capped when they are saved. Text that came from mail is returned only as `untrusted_email_content`, with ids, sender address, and date outside that object. The model is told to treat that text as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`. See [agents.md](agents.md).
 
 The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server. Neither is binding `in_reply_to` into the send-confirmation snapshot.
 

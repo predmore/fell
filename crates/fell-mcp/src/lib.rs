@@ -13,8 +13,11 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+#[cfg(test)]
+mod corpus;
 mod protocol;
 mod tools;
+mod untrusted;
 
 pub use cli::cli_main;
 pub use protocol::Session;

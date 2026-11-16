@@ -225,7 +225,7 @@ impl Session {
             "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. There is no send tool. Mail leaves the machine only from the Fell window. {} ",
             self.agent_id,
             self.account_id.as_str(),
-            crate::tools::UNTRUSTED_NOTE
+            crate::untrusted::UNTRUSTED_NOTE
         );
         match self.store.agent_grant(&self.account_id, &self.agent_id) {
             Ok(grant) if grant.enabled => {
@@ -463,10 +463,14 @@ mod tests {
         );
         let hits = tool_json(&call(&mut session, "search", json!({ "query": "invoice" })));
         assert_eq!(hits["hits"][0]["thread_id"], thread.as_str());
-        assert_eq!(hits["hits"][0]["subject"]["untrusted"], true);
-        assert_eq!(hits["hits"][0]["subject"]["source"], "email");
-        assert_eq!(hits["hits"][0]["subject"]["text"], "Invoice March");
+        assert_eq!(hits["hits"][0]["sender_address"], "ada@x");
+        assert_eq!(hits["hits"][0]["date_unix"], 30);
+        assert!(hits["hits"][0].get("subject").is_none());
         assert!(hits["hits"][0].get("body").is_none());
+        assert_eq!(
+            hits["hits"][0]["snippet"]["untrusted_email_content"]["text"],
+            "please pay the invoice"
+        );
         let secret = tool_json(&call(
             &mut session,
             "search",
@@ -479,10 +483,10 @@ mod tests {
             json!({ "thread_id": thread.as_str() }),
         ));
         assert_eq!(
-            read["messages"][0]["body"]["text"],
+            read["messages"][0]["body"]["untrusted_email_content"]["text"],
             "please pay the invoice"
         );
-        assert_eq!(read["messages"][0]["body"]["untrusted"], true);
+        assert_eq!(read["messages"][0]["sender_address"], "ada@x");
         let labels = tool_json(&call(&mut session, "list_labels", json!({})));
         assert_eq!(labels["labels"][0], "billing");
         let archived = call(
@@ -598,10 +602,9 @@ mod tests {
         assert_eq!(draft["status"], "review");
         let listed = tool_json(&call(&mut session, "list_drafts", json!({})));
         assert_eq!(
-            listed["drafts"][0]["body"]["text"],
+            listed["drafts"][0]["body"]["untrusted_email_content"]["text"],
             "unique draft body not in the mailbox"
         );
-        assert_eq!(listed["drafts"][0]["body"]["untrusted"], true);
         assert_eq!(listed["drafts"][0]["bcc_redacted"], false);
         assert!(
             session
@@ -773,9 +776,14 @@ mod tests {
             "read_thread",
             json!({ "thread_id": thread.as_str(), "max_chars": 12 }),
         ));
-        let text = read["messages"][0]["body"]["text"].as_str().unwrap();
+        let text = read["messages"][0]["body"]["untrusted_email_content"]["text"]
+            .as_str()
+            .unwrap();
         assert_eq!(text.chars().count(), 12);
-        assert_eq!(read["messages"][0]["body"]["truncated"], true);
+        assert_eq!(
+            read["messages"][0]["body"]["untrusted_email_content"]["truncated"],
+            true
+        );
         let own = tool_json(&call(
             &mut session,
             "create_draft",
@@ -790,11 +798,11 @@ mod tests {
         assert_eq!(drafts.len(), 2);
         let other = drafts
             .iter()
-            .find(|draft| draft["subject"]["text"] == "other")
+            .find(|draft| draft["subject"]["untrusted_email_content"]["text"] == "other")
             .unwrap();
         assert_eq!(other["bcc_redacted"], true);
         assert!(other["bcc"].as_array().unwrap().is_empty());
-        assert_eq!(other["body"]["untrusted"], true);
+        assert!(other["body"]["untrusted_email_content"]["text"].is_string());
     }
 
     #[test]

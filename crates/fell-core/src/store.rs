@@ -480,7 +480,7 @@ impl Store {
         let offset = page_offset(cursor)?;
         let phrase = fts5_phrase(query);
         let mut stmt = self.conn.prepare(
-            "SELECT m.message_id, m.thread_id, m.subject, m.snippet
+            "SELECT m.message_id, m.thread_id, m.subject, m.snippet, m.from_email, m.date_unix
              FROM messages_fts
              JOIN messages m
                ON m.message_id = messages_fts.message_id
@@ -491,14 +491,7 @@ impl Store {
         )?;
         let rows = stmt.query_map(
             params![account_id.as_str(), phrase, SEARCH_PAGE_SIZE + 1, offset],
-            |row| {
-                Ok(SearchHit {
-                    message_id: MessageId(row.get(0)?),
-                    thread_id: ThreadId(row.get(1)?),
-                    subject: row.get(2)?,
-                    snippet: row.get(3)?,
-                })
-            },
+            search_hit_from_row,
         )?;
         let mut hits = Vec::new();
         for row in rows {
@@ -515,6 +508,17 @@ impl Store {
 }
 
 const SEARCH_PAGE_SIZE: i64 = 20;
+
+fn search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
+    Ok(SearchHit {
+        message_id: MessageId(row.get(0)?),
+        thread_id: ThreadId(row.get(1)?),
+        subject: row.get(2)?,
+        snippet: row.get(3)?,
+        sender_email: row.get(4)?,
+        date_unix: row.get(5)?,
+    })
+}
 
 fn page_offset(cursor: Option<&str>) -> Result<i64> {
     match cursor.map(str::trim).filter(|value| !value.is_empty()) {
