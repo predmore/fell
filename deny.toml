@@ -1,0 +1,42 @@
+# License policy for Fell. Anything not listed is denied, including GPL/AGPL/LGPL.
+# See docs/licensing.md.
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on yanked crates. Unmaintained gpui transitives (async-std, paste, …)
+# are not ours to upgrade until gpui publishes a newer crates.io release.
+yanked = "deny"
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+]
+# Permissive licenses pulled only by gpui 0.2.2. Prefer dropping these if a
+# newer gpui release removes the crates.
+exceptions = [
+    { crate = "hexf-parse", allow = ["CC0-1.0"] },
+    { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]

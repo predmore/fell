@@ -1,0 +1,16 @@
+[package]
+name = "fell-mcp"
+description = "MCP server stub for Fell agents (search, summarize, triage, draft)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fell-mcp"
+path = "src/main.rs"
+
+[dependencies]
+fell-core.workspace = true
+thiserror.workspace = true
