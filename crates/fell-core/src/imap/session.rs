@@ -44,6 +44,8 @@ pub(super) struct Session {
     io: Option<Io>,
     tag: u32,
     caps: Vec<String>,
+    /// Server advertised CONDSTORE after login, so EXAMINE sends that modifier.
+    condstore: bool,
     host: String,
     pending_buf: Vec<u8>,
 }
@@ -61,6 +63,7 @@ impl Session {
                 io: Some(Io::Tls(Box::new(wrap_tls(stream, config)?))),
                 tag: 0,
                 caps: Vec::new(),
+                condstore: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -68,6 +71,7 @@ impl Session {
                 io: Some(Io::Plain(stream)),
                 tag: 0,
                 caps: Vec::new(),
+                condstore: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -77,19 +81,25 @@ impl Session {
             session.command("STARTTLS", "STARTTLS")?;
             session.upgrade(config)?;
         }
-        session.read_capabilities()?;
-        if session.has_cap("CONDSTORE") {
-            // UID high-water still works when ENABLE is refused.
-            let _ = session.command("ENABLE", "ENABLE CONDSTORE");
-        }
         let user = quote_imap(&config.username).map_err(imap_err)?;
         let pass = quote_imap(&config.password).map_err(imap_err)?;
-        session.command("LOGIN", &format!("LOGIN {user} {pass}"))?;
+        let logged_in = session.command("LOGIN", &format!("LOGIN {user} {pass}"))?;
+        // RFC 5161: ENABLE is only valid after authentication. A pre-login
+        // CAPABILITY is not repeated here unless LOGIN omitted one.
+        if let Some(caps) = capability_from_ok(&logged_in.ok) {
+            session.caps = caps;
+        } else {
+            session.read_capabilities()?;
+        }
+        if session.has_cap("CONDSTORE") {
+            let _ = session.command("ENABLE", "ENABLE CONDSTORE");
+            session.condstore = true;
+        }
         Ok(session)
     }
 
     pub(super) fn list_selectable(&mut self) -> Result<Vec<Listed>, Error> {
-        let lines = self.command("LIST", "LIST \"\" \"*\"")?;
+        let lines = self.command("LIST", "LIST \"\" \"*\"")?.untagged;
         let mut out = Vec::new();
         for line in lines {
             let Some(listed) = parse_list(&line.text, &line.literals) else {
@@ -108,7 +118,12 @@ impl Session {
 
     pub(super) fn examine(&mut self, mailbox: &str) -> Result<Examined, Error> {
         let name = quote_imap(mailbox).map_err(imap_err)?;
-        let lines = self.command("EXAMINE", &format!("EXAMINE {name}"))?;
+        let examine = if self.condstore {
+            format!("EXAMINE {name} (CONDSTORE)")
+        } else {
+            format!("EXAMINE {name}")
+        };
+        let lines = self.command("EXAMINE", &examine)?.untagged;
         let mut uidvalidity = None;
         let mut uidnext = None;
         let mut exists = 0;
@@ -148,7 +163,7 @@ impl Session {
             }
             None => format!("UID FETCH {range} (UID FLAGS BODY.PEEK[])"),
         };
-        let lines = self.command("UID FETCH", &cmd)?;
+        let lines = self.command("UID FETCH", &cmd)?.untagged;
         let mut out = Vec::new();
         for line in lines {
             if let Some(fetched) = parse_fetch(&line.text, &line.literals) {
@@ -157,6 +172,27 @@ impl Session {
         }
         out.sort_by_key(|item| item.uid);
         Ok(out)
+    }
+
+    /// UIDs in `range` without message bodies. `n:*` may still name the current
+    /// highest UID; callers drop anything at or below the checkpoint.
+    pub(super) fn uid_find(&mut self, range: &str) -> Result<Vec<u32>, Error> {
+        let lines = self
+            .command("UID FETCH", &format!("UID FETCH {range} (UID)"))?
+            .untagged;
+        let mut uids = Vec::new();
+        for line in lines {
+            let upper = line.text.to_ascii_uppercase();
+            if !upper.contains("FETCH") {
+                continue;
+            }
+            if let Some(uid) = number_after(&upper, "UID ") {
+                uids.push(uid);
+            }
+        }
+        uids.sort_unstable();
+        uids.dedup();
+        Ok(uids)
     }
 
     pub(super) fn logout(&mut self) {
@@ -182,7 +218,7 @@ impl Session {
     }
 
     fn read_capabilities(&mut self) -> Result<(), Error> {
-        let lines = self.command("CAPABILITY", "CAPABILITY")?;
+        let lines = self.command("CAPABILITY", "CAPABILITY")?.untagged;
         self.caps = caps_from(&lines);
         Ok(())
     }
@@ -191,7 +227,7 @@ impl Session {
         self.caps.iter().any(|cap| cap.eq_ignore_ascii_case(name))
     }
 
-    fn command(&mut self, label: &str, cmd: &str) -> Result<Vec<Logical>, Error> {
+    fn command(&mut self, label: &str, cmd: &str) -> Result<Reply, Error> {
         self.tag += 1;
         let tag = format!("a{}", self.tag);
         self.write_all(format!("{tag} {cmd}\r\n").as_bytes())?;
@@ -202,7 +238,10 @@ impl Session {
                 let rest = text[tag.len()..].trim_start();
                 let upper = rest.to_ascii_uppercase();
                 if upper.starts_with("OK") {
-                    return Ok(untagged);
+                    return Ok(Reply {
+                        untagged,
+                        ok: rest.to_string(),
+                    });
                 }
                 return Err(imap_err(format!("{label} failed: {rest}")));
             }
@@ -240,6 +279,11 @@ impl Session {
         loop {
             let line = self.read_until_crlf()?;
             if let Some(len) = literal_len(&line) {
+                if len > MAX_LITERAL {
+                    return Err(imap_err(format!(
+                        "literal of {len} bytes exceeds the {MAX_LITERAL} byte message limit"
+                    )));
+                }
                 text.extend_from_slice(&line);
                 literals.push(self.read_exact(len)?);
                 continue;
@@ -321,6 +365,15 @@ struct Logical {
     text: String,
     literals: Vec<Vec<u8>>,
 }
+
+struct Reply {
+    untagged: Vec<Logical>,
+    ok: String,
+}
+
+/// Largest RFC 822 payload this client will store. A bigger literal is refused
+/// before it is buffered.
+const MAX_LITERAL: usize = 32 * 1024 * 1024;
 
 struct ParsedList {
     raw: String,
@@ -534,6 +587,17 @@ fn caps_from(lines: &[Logical]) -> Vec<String> {
     Vec::new()
 }
 
+/// Capabilities from a tagged OK that carries `[CAPABILITY ...]`.
+fn capability_from_ok(ok: &str) -> Option<Vec<String>> {
+    let upper = ok.to_ascii_uppercase();
+    let marker = "[CAPABILITY ";
+    let start = upper.find(marker)?;
+    let rest = &ok[start + marker.len()..];
+    let end = rest.find(']')?;
+    let caps: Vec<String> = rest[..end].split_whitespace().map(str::to_string).collect();
+    if caps.is_empty() { None } else { Some(caps) }
+}
+
 fn exists_count(text: &str) -> Option<u32> {
     let rest = text.trim().strip_prefix('*')?.trim_start();
     let (number, rest) = rest.split_once(' ')?;
@@ -739,6 +803,38 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
 
     use super::connect_addrs;
+
+    #[test]
+    fn oversized_literal_is_rejected_without_buffering_it() {
+        use std::io::{Read, Write};
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK hi\r\n").unwrap();
+            let mut buf = [0u8; 128];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"* CAPABILITY {2000000000}\r\n").unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("oversized literal was accepted");
+        };
+        let text = err.to_string();
+        assert!(text.contains("2000000000"), "{text}");
+        assert!(text.contains("limit"), "{text}");
+    }
 
     #[test]
     fn connect_uses_a_later_address_when_the_first_refuses() {

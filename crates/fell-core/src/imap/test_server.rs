@@ -20,6 +20,8 @@ pub(super) struct FixtureMailbox {
     pub uidvalidity: u32,
     /// When set, EXAMINE reports this UIDNEXT instead of one past the highest UID.
     pub uidnext: Option<u32>,
+    /// Omit UIDNEXT even when `uidnext` is set. Forces the UID-search path.
+    pub omit_uidnext: bool,
     pub messages: Vec<FixtureMessage>,
 }
 
@@ -91,6 +93,9 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
     let mut read = BufReader::new(stream);
     let _ = write.write_all(b"* OK fell-test ready\r\n");
     let _ = write.flush();
+    let mut authed = false;
+    let mut condstore_enabled = false;
+    let mut selected_condstore = false;
     loop {
         let mut line = String::new();
         match read.read_line(&mut line) {
@@ -126,8 +131,17 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 );
             }
             "ENABLE" => {
-                let _ = write
-                    .write_all(format!("* ENABLED CONDSTORE\r\n{tag} OK ENABLE\r\n").as_bytes());
+                if !authed {
+                    let _ = write.write_all(
+                        format!("{tag} NO ENABLE is only valid in the authenticated state\r\n")
+                            .as_bytes(),
+                    );
+                } else {
+                    condstore_enabled = true;
+                    let _ = write.write_all(
+                        format!("* ENABLED CONDSTORE\r\n{tag} OK ENABLE\r\n").as_bytes(),
+                    );
+                }
             }
             "STARTTLS" => {
                 let _ = write.write_all(format!("{tag} OK STARTTLS\r\n").as_bytes());
@@ -140,7 +154,14 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 let (user, pass) = login_args(&rest);
                 let guard = state.lock().expect("state");
                 if user == guard.username && pass == guard.password {
-                    let _ = write.write_all(format!("{tag} OK LOGIN\r\n").as_bytes());
+                    authed = true;
+                    let caps = if guard.condstore {
+                        "IMAP4rev1 CONDSTORE"
+                    } else {
+                        "IMAP4rev1"
+                    };
+                    let _ = write
+                        .write_all(format!("{tag} OK [CAPABILITY {caps}] LOGIN\r\n").as_bytes());
                 } else {
                     let _ = write.write_all(
                         format!("{tag} NO [AUTHENTICATIONFAILED] login failed\r\n").as_bytes(),
@@ -162,7 +183,8 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 let _ = write.write_all(format!("{tag} OK LIST\r\n").as_bytes());
             }
             "EXAMINE" => {
-                let name = unquote(rest.trim());
+                let name = mailbox_name(rest.trim());
+                selected_condstore = rest.to_ascii_uppercase().contains("CONDSTORE");
                 let guard = state.lock().expect("state");
                 let Some(mailbox) = guard.mailboxes.iter().find(|item| item.name == name) else {
                     let _ = write.write_all(format!("{tag} NO no such mailbox\r\n").as_bytes());
@@ -180,9 +202,12 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 let _ = write.write_all(
                     format!("* OK [UIDVALIDITY {}] UIDs valid\r\n", mailbox.uidvalidity).as_bytes(),
                 );
-                let _ = write
-                    .write_all(format!("* OK [UIDNEXT {next}] Predicted next UID\r\n").as_bytes());
-                if guard.condstore {
+                if !mailbox.omit_uidnext {
+                    let _ = write.write_all(
+                        format!("* OK [UIDNEXT {next}] Predicted next UID\r\n").as_bytes(),
+                    );
+                }
+                if guard.condstore && (condstore_enabled || selected_condstore) {
                     let highest = mailbox
                         .messages
                         .iter()
@@ -198,6 +223,16 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
             }
             "UID" => {
                 let guard = state.lock().expect("state");
+                if rest.to_ascii_uppercase().contains("CHANGEDSINCE")
+                    && guard.condstore
+                    && !condstore_enabled
+                    && !selected_condstore
+                {
+                    let _ = write.write_all(
+                        format!("{tag} BAD CHANGEDSINCE requires CONDSTORE\r\n").as_bytes(),
+                    );
+                    continue;
+                }
                 let Some((range, changed_since, mailbox_name)) = parse_uid_fetch(&rest, &guard)
                 else {
                     let _ = write.write_all(format!("{tag} BAD uid fetch\r\n").as_bytes());
@@ -226,8 +261,14 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     {
                         continue;
                     }
-                    let flags = message.flags.join(" ");
                     let seq = index + 1;
+                    if !rest.to_ascii_uppercase().contains("BODY") {
+                        let _ = write.write_all(
+                            format!("* {seq} FETCH (UID {})\r\n", message.uid).as_bytes(),
+                        );
+                        continue;
+                    }
+                    let flags = message.flags.join(" ");
                     let header = format!(
                         "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {{{}}}\r\n",
                         message.uid,
@@ -283,7 +324,7 @@ fn last_examined(commands: &[String]) -> Option<String> {
         let Some(index) = upper.find(" EXAMINE ") else {
             continue;
         };
-        return Some(unquote(command[index + " EXAMINE ".len()..].trim()));
+        return Some(mailbox_name(command[index + " EXAMINE ".len()..].trim()));
     }
     None
 }
@@ -355,15 +396,26 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn unquote(value: &str) -> String {
-    let value = value.trim();
-    if let Some(inner) = value
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    {
-        return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+fn mailbox_name(rest: &str) -> String {
+    let rest = rest.trim();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let mut name = String::new();
+        let mut chars = quoted.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    name.push(next);
+                }
+                continue;
+            }
+            if ch == '"' {
+                return name;
+            }
+            name.push(ch);
+        }
+        return name;
     }
-    value.to_string()
+    rest.split_whitespace().next().unwrap_or("").to_string()
 }
 
 fn strip_prefix_ignore<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {

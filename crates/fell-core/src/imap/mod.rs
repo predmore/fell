@@ -43,26 +43,34 @@ pub(crate) fn fetch_imap(
         let examined = session.examine(&mailbox.raw)?;
         let previous = prior.get(&mailbox.raw);
         let plan = plan_fetch(previous, &examined);
-        // High-water fetches must ignore UIDs the checkpoint already has.
-        // `n:*` still returns the current highest UID when `n` is past it.
-        // CHANGEDSINCE results stay intact so an older flag update is kept.
-        let seen_through = match (previous, plan.as_ref()) {
-            (Some(prev), Some(plan))
-                if plan.changed_since.is_none() && prev.uidvalidity == examined.uidvalidity =>
+        let same_validity = previous.is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
+        // High-water body fetches ignore UIDs already at the checkpoint.
+        // CHANGEDSINCE results are kept so an older flag update is applied.
+        let seen_through = match (previous, &plan) {
+            (Some(prev), FetchPlan::HighWater { .. } | FetchPlan::Discover { .. })
+                if same_validity =>
             {
                 Some(prev.uid)
             }
             _ => None,
         };
-        let fetched = match plan {
-            Some(plan) => session.uid_fetch(&plan.range, plan.changed_since)?,
-            None => Vec::new(),
+        let mut fetched = match &plan {
+            FetchPlan::ChangedSince(modseq) => session.uid_fetch("1:*", Some(*modseq))?,
+            FetchPlan::HighWater { start } => session.uid_fetch(&format!("{start}:*"), None)?,
+            FetchPlan::Full => session.uid_fetch("1:*", None)?,
+            FetchPlan::Discover { start } => {
+                let found = session.uid_find(&format!("{start}:*"))?;
+                let mut bodies = Vec::new();
+                for uid in found.into_iter().filter(|uid| *uid >= *start) {
+                    bodies.extend(session.uid_fetch(&uid.to_string(), None)?);
+                }
+                bodies
+            }
+            FetchPlan::Idle => Vec::new(),
         };
         let highest = fetched.iter().map(|item| item.uid).max();
+        fetched.retain(|item| seen_through.is_none_or(|uid| item.uid > uid));
         for item in fetched {
-            if seen_through.is_some_and(|uid| item.uid <= uid) {
-                continue;
-            }
             if rfc822::is_deleted(&item.flags) {
                 continue;
             }
@@ -76,20 +84,34 @@ pub(crate) fn fetch_imap(
                 &item.body,
             ));
         }
-        let uid = if previous.is_some_and(|prev| prev.uidvalidity == examined.uidvalidity) {
-            previous
-                .map(|prev| prev.uid)
-                .unwrap_or(0)
-                .max(highest.unwrap_or(0))
+        let uid = match &plan {
+            FetchPlan::Full | FetchPlan::HighWater { .. } => match examined.uidnext {
+                Some(next) => highest.unwrap_or(0).max(next.saturating_sub(1)),
+                None => checkpoint_uid(previous, same_validity, highest),
+            },
+            FetchPlan::Discover { .. } | FetchPlan::ChangedSince(_) | FetchPlan::Idle => {
+                checkpoint_uid(previous, same_validity, highest)
+            }
+        };
+        // A UID-only pass has not seen flag changes on mail already stored.
+        // Recording a brand-new HIGHESTMODSEQ would make the next CHANGEDSINCE
+        // start too high and skip those changes.
+        let saw_flags = matches!(plan, FetchPlan::Full | FetchPlan::ChangedSince(_));
+        let modseq = if saw_flags {
+            examined
+                .highest_modseq
+                .or_else(|| previous.and_then(|prev| prev.modseq))
+        } else if same_validity {
+            previous.and_then(|prev| prev.modseq)
         } else {
-            highest.unwrap_or(0)
+            None
         };
         checkpoints.push((
             mailbox.raw.clone(),
             MailboxCheckpoint {
                 uidvalidity: examined.uidvalidity,
                 uid,
-                modseq: examined.highest_modseq,
+                modseq,
             },
         ));
     }
@@ -109,43 +131,59 @@ fn inbox_rank(name: &str) -> u8 {
     }
 }
 
-struct FetchPlan {
-    range: String,
-    changed_since: Option<u64>,
+enum FetchPlan {
+    /// Nothing new, or the mailbox is empty.
+    Idle,
+    /// Every message, including flags.
+    Full,
+    /// CONDSTORE flag and new-message pass.
+    ChangedSince(u64),
+    /// Body fetch from `start`. UIDNEXT is known, so the checkpoint can move
+    /// to `UIDNEXT - 1` after this succeeds.
+    HighWater { start: u32 },
+    /// UIDNEXT was omitted. Learn UIDs without bodies, then fetch only new ones.
+    Discover { start: u32 },
 }
 
-fn plan_fetch(
+fn checkpoint_uid(
     previous: Option<&MailboxCheckpoint>,
-    examined: &session::Examined,
-) -> Option<FetchPlan> {
+    same_validity: bool,
+    highest: Option<u32>,
+) -> u32 {
+    let prior = if same_validity {
+        previous.map(|prev| prev.uid).unwrap_or(0)
+    } else {
+        0
+    };
+    prior.max(highest.unwrap_or(0))
+}
+
+fn plan_fetch(previous: Option<&MailboxCheckpoint>, examined: &session::Examined) -> FetchPlan {
     if examined.exists == 0 {
-        return None;
+        return FetchPlan::Idle;
     }
     match previous {
         Some(prev) if prev.uidvalidity == examined.uidvalidity => {
-            if prev.modseq.is_some() && examined.highest_modseq.is_some() {
-                Some(FetchPlan {
-                    range: "1:*".to_string(),
-                    changed_since: prev.modseq,
-                })
-            } else if prev.uid == u32::MAX
+            if let Some(modseq) = prev.modseq
+                && examined.highest_modseq.is_some()
+            {
+                return FetchPlan::ChangedSince(modseq);
+            }
+            if prev.uid == u32::MAX
                 || examined
                     .uidnext
                     .is_some_and(|next| next <= prev.uid.saturating_add(1))
             {
-                // UIDNEXT at or below the next UID means nothing newer exists.
-                None
+                return FetchPlan::Idle;
+            }
+            let start = prev.uid.saturating_add(1);
+            if examined.uidnext.is_some() {
+                FetchPlan::HighWater { start }
             } else {
-                Some(FetchPlan {
-                    range: format!("{}:*", prev.uid.saturating_add(1)),
-                    changed_since: None,
-                })
+                FetchPlan::Discover { start }
             }
         }
-        _ => Some(FetchPlan {
-            range: "1:*".to_string(),
-            changed_since: None,
-        }),
+        _ => FetchPlan::Full,
     }
 }
 

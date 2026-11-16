@@ -40,6 +40,7 @@ fn sample_state() -> TestState {
                 list_flags: "\\Noselect".into(),
                 uidvalidity: 1,
                 uidnext: None,
+                omit_uidnext: false,
                 messages: Vec::new(),
             },
             FixtureMailbox {
@@ -47,6 +48,7 @@ fn sample_state() -> TestState {
                 list_flags: String::new(),
                 uidvalidity: 10,
                 uidnext: None,
+                omit_uidnext: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -66,6 +68,7 @@ fn sample_state() -> TestState {
                 list_flags: String::new(),
                 uidvalidity: 20,
                 uidnext: None,
+                omit_uidnext: false,
                 messages: vec![
                     FixtureMessage {
                         uid: 1,
@@ -118,6 +121,7 @@ fn sample_state() -> TestState {
                 list_flags: String::new(),
                 uidvalidity: 7,
                 uidnext: None,
+                omit_uidnext: false,
                 messages: vec![FixtureMessage {
                     uid: 1,
                     flags: vec!["\\Seen".into()],
@@ -329,6 +333,17 @@ fn condstore_updates_unread_without_a_second_copy() {
     assert!(store.list_threads(&acct.id).unwrap()[0].unread);
     let logged = commands(&server);
     assert!(logged.iter().any(|line| line.contains("CHANGEDSINCE")));
+    let login_at = logged.iter().position(|line| line == "LOGIN").unwrap();
+    let enable_at = logged
+        .iter()
+        .position(|line| line.contains("ENABLE"))
+        .unwrap();
+    assert!(login_at < enable_at);
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.contains("EXAMINE") && line.contains("CONDSTORE"))
+    );
 }
 
 #[test]
@@ -464,8 +479,8 @@ fn same_body_different_message_ids_stay_distinct() {
     assert_eq!(threads.len(), 2);
 }
 
-/// RFC 3501: `6:*` still returns UID 5 when 5 is the highest UID. UIDNEXT is
-/// past that, so the client must fetch and then drop the already-stored UID.
+/// UID 5 with UIDNEXT 10: the first sync stores the body and moves the
+/// checkpoint to UIDNEXT-1. Later syncs must not download that body again.
 #[test]
 fn star_range_does_not_reapply_the_highest_uid() {
     let server = TestServer::spawn(TestState {
@@ -479,6 +494,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
             list_flags: String::new(),
             uidvalidity: 3,
             uidnext: Some(10),
+            omit_uidnext: false,
             messages: vec![FixtureMessage {
                 uid: 5,
                 flags: vec!["\\Seen".into()],
@@ -494,18 +510,24 @@ fn star_range_does_not_reapply_the_highest_uid() {
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
-    {
-        let mut state = server.state.lock().expect("state");
-        state.commands.clear();
-    }
-    let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 0);
-    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
-    let logged = commands(&server);
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap();
     assert!(
-        logged
-            .iter()
-            .any(|line| line.contains("UID FETCH") && line.contains("6:*")),
-        "high-water fetch should run because UIDNEXT is past the checkpoint: {logged:?}"
+        cursor.token.contains("\t3\t9\t"),
+        "checkpoint should sit at UIDNEXT-1: {}",
+        cursor.token
     );
+    for _ in 0..2 {
+        {
+            let mut state = server.state.lock().expect("state");
+            state.commands.clear();
+        }
+        let report = sync_once(&acct, &backend, &store).unwrap();
+        assert_eq!(report.upserted, 0);
+        let logged = commands(&server);
+        assert!(
+            !logged.iter().any(|line| line.contains("BODY.PEEK")),
+            "unchanged gap must not download the body again: {logged:?}"
+        );
+    }
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
 }
