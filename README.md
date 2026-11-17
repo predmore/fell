@@ -35,7 +35,7 @@ cargo test --workspace
 cargo run -p fell
 ```
 
-`fell` opens an empty window against an in-memory store. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account.
+`fell` opens a two-pane inbox on the local store. An empty store is filled with fixture threads, and the status line says the sync is offline. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
 
 ## Agents
 

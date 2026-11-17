@@ -65,6 +65,8 @@ pub struct Message {
     pub cc: Vec<Address>,
     /// `Bcc` recipients.
     pub bcc: Vec<Address>,
+    /// User star. This is not a label; chips stay on `labels`.
+    pub starred: bool,
     /// True when any stored copy of this message has an attachment.
     pub has_attachment: bool,
     /// Local archive bit. A later copy of the same Message-ID does not clear it.

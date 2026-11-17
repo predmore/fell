@@ -1,0 +1,518 @@
+//! Leader chords, which-key, and the command palette index.
+//!
+//! `m` is reserved for move and ships in M3. Nothing in this keymap binds it.
+
+use std::fmt::Write as _;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyId {
+    Char(char),
+    Space,
+    /// The configured leader, after it has been recognized.
+    Leader,
+    Ctrl(char),
+    CtrlShiftP,
+    Escape,
+    Backspace,
+    Enter,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    Next,
+    Prev,
+    First,
+    Last,
+    Open,
+    Back,
+    PageDown,
+    PageUp,
+    Inbox,
+    Sent,
+    Drafts,
+    FolderPicker,
+    ToggleSelect,
+    Visual,
+    FullWidth,
+    ToggleQuotes,
+    Palette,
+    Help,
+}
+
+impl Action {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Next => "Next",
+            Self::Prev => "Previous",
+            Self::First => "First",
+            Self::Last => "Last",
+            Self::Open => "Open conversation",
+            Self::Back => "Back to list",
+            Self::PageDown => "Page down",
+            Self::PageUp => "Page up",
+            Self::Inbox => "Go to Inbox",
+            Self::Sent => "Go to Sent",
+            Self::Drafts => "Go to Drafts",
+            Self::FolderPicker => "Choose folder",
+            Self::ToggleSelect => "Toggle select",
+            Self::Visual => "Visual select",
+            Self::FullWidth => "Full-width conversation",
+            Self::ToggleQuotes => "Quoted text",
+            Self::Palette => "Command palette",
+            Self::Help => "Help",
+        }
+    }
+
+    pub fn all() -> &'static [Action] {
+        &ALL_ACTIONS
+    }
+}
+
+const ALL_ACTIONS: [Action; 18] = [
+    Action::Next,
+    Action::Prev,
+    Action::First,
+    Action::Last,
+    Action::Open,
+    Action::Back,
+    Action::PageDown,
+    Action::PageUp,
+    Action::Inbox,
+    Action::Sent,
+    Action::Drafts,
+    Action::FolderPicker,
+    Action::ToggleSelect,
+    Action::Visual,
+    Action::FullWidth,
+    Action::ToggleQuotes,
+    Action::Palette,
+    Action::Help,
+];
+
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub keys: Vec<KeyId>,
+    pub action: Action,
+    pub group: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Keymap {
+    pub leader: KeyId,
+    pub leader_name: String,
+    pub which_key_ms: u64,
+    pub bindings: Vec<Binding>,
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::new(KeyId::Space, "space", 300)
+    }
+}
+
+impl Keymap {
+    pub fn new(leader: KeyId, leader_name: impl Into<String>, which_key_ms: u64) -> Self {
+        let bindings = default_bindings();
+        Self {
+            leader,
+            leader_name: leader_name.into(),
+            which_key_ms,
+            bindings,
+        }
+    }
+
+    pub fn bindings_for(&self, action: Action) -> Vec<&Binding> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.action == action)
+            .collect()
+    }
+}
+
+fn default_bindings() -> Vec<Binding> {
+    let mut bindings = Vec::new();
+    let mut bind = |keys: &[KeyId], action: Action, group: Option<&'static str>| {
+        bindings.push(Binding {
+            keys: keys.to_vec(),
+            action,
+            group,
+        });
+    };
+    bind(&[KeyId::Char('j')], Action::Next, None);
+    bind(&[KeyId::Char('k')], Action::Prev, None);
+    bind(&[KeyId::Char('g'), KeyId::Char('g')], Action::First, None);
+    bind(&[KeyId::Char('G')], Action::Last, None);
+    bind(&[KeyId::Enter], Action::Open, None);
+    bind(&[KeyId::Char('o')], Action::Open, None);
+    bind(&[KeyId::Escape], Action::Back, None);
+    bind(&[KeyId::Char('h')], Action::Back, None);
+    bind(&[KeyId::Ctrl('d')], Action::PageDown, None);
+    bind(&[KeyId::Ctrl('u')], Action::PageUp, None);
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('i')],
+        Action::Inbox,
+        Some("go"),
+    );
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('s')],
+        Action::Sent,
+        Some("go"),
+    );
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('d')],
+        Action::Drafts,
+        Some("go"),
+    );
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('f')],
+        Action::FolderPicker,
+        Some("go"),
+    );
+    bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
+    bind(&[KeyId::Char('V')], Action::Visual, None);
+    bind(&[KeyId::Char('z')], Action::FullWidth, None);
+    bind(&[KeyId::Char('q')], Action::ToggleQuotes, None);
+    bind(&[KeyId::Char(':')], Action::Palette, None);
+    bind(&[KeyId::CtrlShiftP], Action::Palette, None);
+    bind(&[KeyId::Char('?')], Action::Help, None);
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('i')],
+        Action::Inbox,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('s')],
+        Action::Sent,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('d')],
+        Action::Drafts,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('f')],
+        Action::FolderPicker,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
+        Action::FullWidth,
+        Some("toggles"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('q')],
+        Action::ToggleQuotes,
+        Some("toggles"),
+    );
+    bindings
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqMatch {
+    Action(Action),
+    Prefix,
+    None,
+}
+
+pub fn match_seq(keymap: &Keymap, seq: &[KeyId]) -> SeqMatch {
+    let mut prefix = false;
+    for binding in &keymap.bindings {
+        if binding.keys == seq {
+            return SeqMatch::Action(binding.action);
+        }
+        if binding.keys.starts_with(seq) {
+            prefix = true;
+        }
+    }
+    if prefix {
+        SeqMatch::Prefix
+    } else {
+        SeqMatch::None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhichItem {
+    pub key: String,
+    pub label: String,
+}
+
+pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
+    let mut groups: Vec<(String, Vec<&Binding>)> = Vec::new();
+    for binding in &keymap.bindings {
+        if binding.keys.len() <= prefix.len() || !binding.keys.starts_with(prefix) {
+            continue;
+        }
+        let key = key_label(binding.keys[prefix.len()], &keymap.leader_name);
+        if let Some((_, bucket)) = groups.iter_mut().find(|(name, _)| name == &key) {
+            bucket.push(binding);
+        } else {
+            groups.push((key, vec![binding]));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(key, bindings)| WhichItem {
+            key,
+            label: which_label(prefix, &bindings),
+        })
+        .collect()
+}
+
+fn which_label(prefix: &[KeyId], bindings: &[&Binding]) -> String {
+    let terminal = prefix.len() + 1;
+    if bindings.len() == 1
+        && bindings
+            .iter()
+            .all(|binding| binding.keys.len() == terminal)
+    {
+        return bindings[0].action.label().to_string();
+    }
+    bindings
+        .iter()
+        .find_map(|binding| binding.group)
+        .unwrap_or("more")
+        .to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteItem {
+    pub action: Action,
+    pub label: String,
+    pub binding: String,
+}
+
+pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<PaletteItem> {
+    let mut items: Vec<(i32, usize, PaletteItem)> = Vec::new();
+    for (index, action) in Action::all().iter().copied().enumerate() {
+        let label = action.label();
+        let Some(score) = fuzzy(query, label) else {
+            continue;
+        };
+        let recent_rank = recent
+            .iter()
+            .position(|item| *item == action)
+            .map(|pos| pos as i32)
+            .unwrap_or(100);
+        let query_empty = query.trim().is_empty();
+        let sort = if query_empty { recent_rank } else { -score };
+        items.push((
+            sort,
+            index,
+            PaletteItem {
+                action,
+                label: label.to_string(),
+                binding: binding_text(keymap, action),
+            },
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    items.into_iter().map(|(_, _, item)| item).collect()
+}
+
+pub fn binding_text(keymap: &Keymap, action: Action) -> String {
+    keymap
+        .bindings_for(action)
+        .iter()
+        .map(|binding| {
+            binding
+                .keys
+                .iter()
+                .map(|key| key_label(*key, &keymap.leader_name))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+pub fn key_label(key: KeyId, leader_name: &str) -> String {
+    match key {
+        KeyId::Char(ch) => ch.to_string(),
+        KeyId::Space => "space".into(),
+        KeyId::Leader => leader_name.to_string(),
+        KeyId::Ctrl(ch) => format!("ctrl-{ch}"),
+        KeyId::CtrlShiftP => "ctrl-shift-p".into(),
+        KeyId::Escape => "esc".into(),
+        KeyId::Backspace => "backspace".into(),
+        KeyId::Enter => "enter".into(),
+        KeyId::Up => "up".into(),
+        KeyId::Down => "down".into(),
+    }
+}
+
+pub fn prefix_text(keys: &[KeyId], leader_name: &str) -> String {
+    let mut out = String::new();
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let _ = write!(out, "{}", key_label(*key, leader_name));
+    }
+    out
+}
+
+/// `leader` and `which_key_ms` from the keymap file. Other lines are ignored.
+pub fn keymap_from_text(text: &str) -> Result<Keymap, String> {
+    let mut leader = KeyId::Space;
+    let mut leader_name = "space".to_string();
+    let mut which_key_ms = 300_u64;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        match key {
+            "leader" => {
+                let parsed = parse_leader(value)?;
+                leader = parsed.0;
+                leader_name = parsed.1;
+            }
+            "which_key_ms" => {
+                which_key_ms = value
+                    .parse()
+                    .map_err(|_| format!("bad which_key_ms {value}"))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(Keymap::new(leader, leader_name, which_key_ms))
+}
+
+fn parse_leader(value: &str) -> Result<(KeyId, String), String> {
+    match value {
+        "space" | "Space" => Ok((KeyId::Space, "space".into())),
+        other if other.chars().count() == 1 => {
+            let ch = other.chars().next().unwrap();
+            Ok((KeyId::Char(ch), other.to_string()))
+        }
+        other => Err(format!("unsupported leader {other}")),
+    }
+}
+
+fn fuzzy(query: &str, label: &str) -> Option<i32> {
+    let query: Vec<char> = query.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let label: Vec<char> = label.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    let mut score = 0;
+    let mut qi = 0;
+    let mut prev: Option<usize> = None;
+    for (index, ch) in label.iter().enumerate() {
+        if qi < query.len() && ch == &query[qi] {
+            score += 10;
+            if prev == Some(index.wrapping_sub(1)) {
+                score += 8;
+            }
+            if index == 0 || !label[index - 1].is_ascii_alphanumeric() {
+                score += 6;
+            }
+            prev = Some(index);
+            qi += 1;
+        }
+    }
+    if qi == query.len() { Some(score) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leader_defaults_to_space_and_m_is_free() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.leader, KeyId::Space);
+        assert_eq!(keymap.which_key_ms, 300);
+        assert_eq!(match_seq(&keymap, &[KeyId::Char('m')]), SeqMatch::None);
+        let root = which_key(&keymap, &[]);
+        assert!(root.iter().all(|item| item.key != "m"));
+        let leader = which_key(&keymap, &[KeyId::Leader]);
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "f" && item.label == "folders")
+        );
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "t" && item.label == "toggles")
+        );
+        assert!(leader.iter().all(|item| item.key != "m"));
+        let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
+        assert!(folders.iter().any(|item| item.key == "i"));
+        assert!(folders.iter().all(|item| item.key != "m"));
+    }
+
+    #[test]
+    fn chords_and_direct_keys_resolve() {
+        let keymap = Keymap::default();
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char('g'), KeyId::Char('i')]),
+            SeqMatch::Action(Action::Inbox)
+        );
+        assert_eq!(match_seq(&keymap, &[KeyId::Char('g')]), SeqMatch::Prefix);
+        assert_eq!(
+            match_seq(
+                &keymap,
+                &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('s')]
+            ),
+            SeqMatch::Action(Action::Sent)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Ctrl('d')]),
+            SeqMatch::Action(Action::PageDown)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Ctrl('u')]),
+            SeqMatch::Action(Action::PageUp)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char(':')]),
+            SeqMatch::Action(Action::Palette)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::CtrlShiftP]),
+            SeqMatch::Action(Action::Palette)
+        );
+        assert_eq!(match_seq(&keymap, &[KeyId::Space]), SeqMatch::None);
+    }
+
+    #[test]
+    fn palette_lists_bindings_and_recent_first() {
+        let keymap = Keymap::default();
+        let items = palette_items(&keymap, "", &[Action::Sent, Action::Inbox]);
+        assert_eq!(items[0].action, Action::Sent);
+        assert_eq!(items[1].action, Action::Inbox);
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.label.to_lowercase().contains("move"))
+        );
+        let inbox = palette_items(&keymap, "inbox", &[]);
+        assert_eq!(inbox[0].action, Action::Inbox);
+        assert!(inbox[0].binding.contains("g i"));
+        assert!(inbox[0].binding.contains("space f i"));
+    }
+
+    #[test]
+    fn leader_is_configurable() {
+        let keymap = keymap_from_text("leader = \",\"\nwhich_key_ms = 0\n").unwrap();
+        assert_eq!(keymap.leader, KeyId::Char(','));
+        assert_eq!(keymap.which_key_ms, 0);
+        assert_eq!(keymap.leader_name, ",");
+        assert!(
+            which_key(&keymap, &[KeyId::Leader])
+                .iter()
+                .any(|item| item.key == "f")
+        );
+    }
+}

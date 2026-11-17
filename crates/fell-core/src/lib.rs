@@ -28,7 +28,10 @@ pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
-pub use store::{SearchPage, Store, ThreadSummary};
+pub use store::{
+    FolderThread, Participant, SearchPage, Store, ThreadSummary, canonical_folder_name,
+    folder_aliases,
+};
 pub use sync::{SyncReport, sync_once};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 

@@ -1,7 +1,21 @@
 //! GPUI app crate. Send confirmation is minted here, not in `fell-mcp`.
 
+mod fixtures;
+mod keymap;
+mod mailbox;
+mod model;
+mod present;
+mod text_render;
+mod theme;
+mod view;
+
 use fell_confirm::InteractiveUi;
 use fell_core::{PendingSend, UserSendConfirmation};
+
+/// Open the inbox window.
+pub fn run() {
+    view::run();
+}
 
 /// Proof of an explicit Send click in the Fell window.
 ///

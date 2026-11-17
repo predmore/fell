@@ -1603,6 +1603,7 @@ dependencies = [
  "fell-confirm",
  "fell-core",
  "gpui",
+ "libc",
 ]
 
 [[package]]
