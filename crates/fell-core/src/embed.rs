@@ -324,24 +324,22 @@ fn index_loop(path: std::path::PathBuf, stop: Arc<AtomicBool>, pause: Arc<Atomic
         return;
     }
     let _ = delete_orphans(&conn);
+    let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
         if pause.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
-        match index_stale(&conn, INDEX_BATCH) {
-            Ok(0) | Err(_) => {
-                // A caught-up mailbox must not rescan on a tight loop.
-                sleep_unless_stopped(idle, &stop);
-                idle = next_idle(idle);
-            }
-            Ok(_) => {
-                idle = IDLE_MIN;
-                // One batch, then let sync and fell-mcp take the write lock.
-                sleep_unless_stopped(BATCH_YIELD, &stop);
-            }
-        }
+        let kind = match scan.step(&conn, INDEX_BATCH) {
+            Ok(IndexStep::Wrote(_)) => AfterBatch::Progress,
+            Ok(IndexStep::Idle) => AfterBatch::Idle,
+            // Busy and snapshot errors are not an empty index. Retry soon.
+            Err(_) => AfterBatch::Retry,
+        };
+        let (next_idle_wait, delay) = pause_after(kind, idle);
+        idle = next_idle_wait;
+        sleep_unless_stopped(delay, &stop);
     }
 }
 
@@ -349,6 +347,25 @@ const INDEX_BATCH: usize = 32;
 const IDLE_MIN: Duration = Duration::from_secs(1);
 const IDLE_MAX: Duration = Duration::from_secs(30);
 const BATCH_YIELD: Duration = Duration::from_millis(20);
+const BUSY_RETRY: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy)]
+enum AfterBatch {
+    Progress,
+    Idle,
+    Retry,
+}
+
+/// `(next idle wait, delay before the next batch)`.
+///
+/// Only an empty pass grows the idle wait. A lock or snapshot error keeps it.
+fn pause_after(kind: AfterBatch, idle: Duration) -> (Duration, Duration) {
+    match kind {
+        AfterBatch::Progress => (IDLE_MIN, BATCH_YIELD),
+        AfterBatch::Idle => (next_idle(idle), idle),
+        AfterBatch::Retry => (idle, BUSY_RETRY),
+    }
+}
 
 fn next_idle(current: Duration) -> Duration {
     current.saturating_mul(2).clamp(IDLE_MIN, IDLE_MAX)
@@ -371,7 +388,10 @@ fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize> {
     delete_orphans(conn)?;
-    index_stale(conn, limit)
+    match Scan::default().step(conn, limit)? {
+        IndexStep::Wrote(n) => Ok(n),
+        IndexStep::Idle => Ok(0),
+    }
 }
 
 /// Drop a stored vector that no longer matches this body.
@@ -462,66 +482,191 @@ fn delete_orphans(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn index_stale(conn: &Connection, limit: usize) -> Result<usize> {
-    if limit == 0 {
-        return Ok(0);
+#[derive(Clone, Copy)]
+struct MailKey {
+    date_unix: i64,
+    rowid: i64,
+}
+
+struct StaleRow {
+    key: MailKey,
+    account_id: String,
+    message_id: String,
+}
+
+enum Bound {
+    Any,
+    Older(MailKey),
+    Newer(MailKey),
+}
+
+enum IndexStep {
+    Wrote(#[allow(dead_code)] usize),
+    Idle,
+}
+
+/// One newest-to-oldest pass over rows that still need a vector.
+///
+/// `before` is the oldest key already taken. The next older batch starts
+/// strictly below it, so a catch-up does not reread the prefix it just wrote.
+/// `high` is the newest key in this pass. Mail that arrives after that is
+/// taken before the walk continues downward.
+#[derive(Default)]
+struct Scan {
+    before: Option<MailKey>,
+    high: Option<MailKey>,
+}
+
+impl Scan {
+    fn step(&mut self, conn: &Connection, limit: usize) -> Result<IndexStep> {
+        if limit == 0 {
+            return Ok(IndexStep::Idle);
+        }
+        if let Some(high) = self.high {
+            let newer = select_stale(conn, limit, Bound::Newer(high))?;
+            if !newer.is_empty() {
+                let wrote = write_batch(conn, &newer)?;
+                self.high = newer.first().map(|row| row.key);
+                return Ok(IndexStep::Wrote(wrote));
+            }
+        }
+        let bound = match self.before {
+            Some(key) => Bound::Older(key),
+            None => Bound::Any,
+        };
+        let older = select_stale(conn, limit, bound)?;
+        if !older.is_empty() {
+            let wrote = write_batch(conn, &older)?;
+            if self.high.is_none() {
+                self.high = older.first().map(|row| row.key);
+            }
+            self.before = older.last().map(|row| row.key);
+            return Ok(IndexStep::Wrote(wrote));
+        }
+        if self.before.is_some() || self.high.is_some() {
+            self.before = None;
+            self.high = None;
+            let top = select_stale(conn, limit, Bound::Any)?;
+            if top.is_empty() {
+                return Ok(IndexStep::Idle);
+            }
+            let wrote = write_batch(conn, &top)?;
+            self.high = top.first().map(|row| row.key);
+            self.before = top.last().map(|row| row.key);
+            return Ok(IndexStep::Wrote(wrote));
+        }
+        Ok(IndexStep::Idle)
     }
-    let mut stmt = conn.prepare(
-        "SELECT m.account_id, m.message_id
-         FROM messages m
-         LEFT JOIN message_embeddings e
-           ON e.account_id = m.account_id AND e.message_id = m.message_id
-         WHERE e.message_id IS NULL
-            OR e.model != ?1
-            OR e.model_version != ?2
-            OR e.dims != ?3
-            OR length(e.vector) != ?4
-         ORDER BY m.date_unix DESC, m.rowid DESC
-         LIMIT ?5",
-    )?;
+}
+
+fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<StaleRow>> {
     let embedder = active_embedder();
     let id = embedder.id();
     let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
-    let rows = stmt.query_map(
-        params![
-            id.model,
-            id.version,
-            dims,
-            dims.saturating_mul(4),
-            i64::try_from(limit).unwrap_or(i64::MAX)
-        ],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    )?;
+    let bytes = dims.saturating_mul(4);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let (sql, date, rowid) = match bound {
+        Bound::Any => (
+            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+             FROM messages m
+             LEFT JOIN message_embeddings e
+               ON e.account_id = m.account_id AND e.message_id = m.message_id
+             WHERE e.message_id IS NULL
+                OR e.model != ?1
+                OR e.model_version != ?2
+                OR e.dims != ?3
+                OR length(e.vector) != ?4
+             ORDER BY m.date_unix DESC, m.rowid DESC
+             LIMIT ?5",
+            None,
+            None,
+        ),
+        Bound::Older(key) => (
+            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+             FROM messages m
+             LEFT JOIN message_embeddings e
+               ON e.account_id = m.account_id AND e.message_id = m.message_id
+             WHERE (e.message_id IS NULL
+                OR e.model != ?1
+                OR e.model_version != ?2
+                OR e.dims != ?3
+                OR length(e.vector) != ?4)
+               AND (m.date_unix < ?6 OR (m.date_unix = ?6 AND m.rowid < ?7))
+             ORDER BY m.date_unix DESC, m.rowid DESC
+             LIMIT ?5",
+            Some(key.date_unix),
+            Some(key.rowid),
+        ),
+        Bound::Newer(key) => (
+            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+             FROM messages m
+             LEFT JOIN message_embeddings e
+               ON e.account_id = m.account_id AND e.message_id = m.message_id
+             WHERE (e.message_id IS NULL
+                OR e.model != ?1
+                OR e.model_version != ?2
+                OR e.dims != ?3
+                OR length(e.vector) != ?4)
+               AND (m.date_unix > ?6 OR (m.date_unix = ?6 AND m.rowid > ?7))
+             ORDER BY m.date_unix DESC, m.rowid DESC
+             LIMIT ?5",
+            Some(key.date_unix),
+            Some(key.rowid),
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mapped = |row: &rusqlite::Row<'_>| {
+        Ok(StaleRow {
+            key: MailKey {
+                rowid: row.get(0)?,
+                date_unix: row.get(1)?,
+            },
+            account_id: row.get(2)?,
+            message_id: row.get(3)?,
+        })
+    };
+    let rows = match (date, rowid) {
+        (Some(date), Some(rowid)) => stmt.query_map(
+            params![id.model, id.version, dims, bytes, limit, date, rowid],
+            mapped,
+        )?,
+        _ => stmt.query_map(params![id.model, id.version, dims, bytes, limit], mapped)?,
+    };
     let mut pending = Vec::new();
     for row in rows {
         pending.push(row?);
     }
-    drop(stmt);
-    if pending.is_empty() {
-        return Ok(0);
+    Ok(pending)
+}
+
+fn write_batch(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
+    // Immediate, so the re-read and the insert share one write lock.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let wrote = write_batch_locked(conn, rows);
+    match wrote {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
     }
-    // Hash outside the write lock. The transaction below only stores vectors
-    // whose body is still the one we hashed, and it commits the whole batch.
-    let mut prepared = Vec::new();
-    for (index, (account_id, message_id)) in pending.into_iter().enumerate() {
+}
+
+fn write_batch_locked(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
+    let mut wrote = 0;
+    for (index, row) in rows.iter().enumerate() {
         interrupt_rebuild(index)?;
-        let Some(body) = message_body(conn, &account_id, &message_id)? else {
+        let Some(body) = message_body(conn, &row.account_id, &row.message_id)? else {
+            remove_message_embedding(conn, &row.account_id, &row.message_id)?;
             continue;
         };
         let values = active_embedder().embed(&body);
-        prepared.push((account_id, message_id, body, values));
+        store_embedding(conn, &row.account_id, &row.message_id, &body, &values)?;
+        wrote += 1;
     }
-    if prepared.is_empty() {
-        return Ok(0);
-    }
-    let tx = conn.unchecked_transaction()?;
-    let mut wrote = 0;
-    for (account_id, message_id, body, values) in prepared {
-        if store_if_unchanged(&tx, &account_id, &message_id, &body, &values)? {
-            wrote += 1;
-        }
-    }
-    tx.commit()?;
     Ok(wrote)
 }
 
@@ -537,20 +682,13 @@ fn message_body(conn: &Connection, account_id: &str, message_id: &str) -> Result
     .map_err(Into::into)
 }
 
-fn store_if_unchanged(
+fn store_embedding(
     conn: &Connection,
     account_id: &str,
     message_id: &str,
     body: &str,
     values: &[f32],
-) -> Result<bool> {
-    let Some(current) = message_body(conn, account_id, message_id)? else {
-        remove_message_embedding(conn, account_id, message_id)?;
-        return Ok(false);
-    };
-    if current != body {
-        return Ok(false);
-    }
+) -> Result<()> {
     let id = active_embedder().id();
     let hash = body_hash(body);
     let dims = i64::try_from(values.len()).unwrap_or(i64::MAX);
@@ -574,7 +712,7 @@ fn store_if_unchanged(
             encode_vector(values)
         ],
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn indexer_starts_paused() -> bool {
@@ -1256,6 +1394,59 @@ mod tests {
         assert_eq!(next_idle(IDLE_MIN), Duration::from_secs(2));
         assert_eq!(next_idle(Duration::from_secs(16)), IDLE_MAX);
         assert_eq!(next_idle(IDLE_MAX), IDLE_MAX);
+        let (idle, delay) = pause_after(AfterBatch::Retry, Duration::from_secs(8));
+        assert_eq!(idle, Duration::from_secs(8));
+        assert_eq!(delay, BUSY_RETRY);
+        let (idle, delay) = pause_after(AfterBatch::Idle, Duration::from_secs(8));
+        assert_eq!(delay, Duration::from_secs(8));
+        assert_eq!(idle, Duration::from_secs(16));
+    }
+
+    #[test]
+    fn catch_up_resumes_below_the_row_it_just_stored() {
+        let store = open(&["a1"]);
+        for (id, date) in [("new@x", 30_i64), ("mid@x", 20), ("old@x", 10)] {
+            let mut message = message("a1", id, id);
+            message.headers.date_unix = date;
+            store.upsert_message(&message).unwrap();
+        }
+        let mut scan = Scan::default();
+        assert!(matches!(
+            scan.step(&store.conn, 1).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert!(stored(&store, "a1", "new@x").model == EMBEDDING_MODEL);
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("mid@x"))
+                .unwrap()
+                .is_none()
+        );
+        let mut arrived = message("a1", "later@x", "later mail");
+        arrived.headers.date_unix = 40;
+        store.upsert_message(&arrived).unwrap();
+        assert!(matches!(
+            scan.step(&store.conn, 1).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert_eq!(stored(&store, "a1", "later@x"), embed_body("later mail"));
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("mid@x"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            scan.step(&store.conn, 1).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert_eq!(stored(&store, "a1", "mid@x").version, EMBEDDING_VERSION);
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("old@x"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
