@@ -454,6 +454,9 @@ impl DraftSession {
     }
 
     pub fn set_body_from_user(&mut self, body: String) {
+        if self.send_lock.is_some() {
+            return;
+        }
         if body == self.body {
             return;
         }
@@ -466,6 +469,9 @@ impl DraftSession {
     }
 
     pub fn set_subject_from_user(&mut self, subject: String) {
+        if self.send_lock.is_some() {
+            return;
+        }
         if subject == self.fields.subject {
             return;
         }
@@ -478,6 +484,9 @@ impl DraftSession {
     }
 
     pub fn set_from_user(&mut self, from: String) {
+        if self.send_lock.is_some() {
+            return;
+        }
         if from == self.fields.from {
             return;
         }
@@ -490,6 +499,7 @@ impl DraftSession {
     }
 
     pub fn set_addresses_from_user(&mut self, field: &str, line: &str) -> Result<(), String> {
+        self.ensure_editable()?;
         let parsed = parse_address_line(line)?;
         if !matches!(field, "to" | "cc" | "bcc") {
             return Err("unknown address field".into());
@@ -508,6 +518,9 @@ impl DraftSession {
     }
 
     pub fn undo(&mut self) -> bool {
+        if self.send_lock.is_some() {
+            return false;
+        }
         self.undo_open = false;
         let Some(previous) = self.undo.pop() else {
             return false;
@@ -522,6 +535,9 @@ impl DraftSession {
     }
 
     pub fn keep_hunk(&mut self, id: u64) -> bool {
+        if self.send_lock.is_some() {
+            return false;
+        }
         let Some(index) = self.hunks.iter().position(|hunk| hunk.id == id) else {
             return false;
         };
@@ -540,6 +556,9 @@ impl DraftSession {
     /// Put back the text an agent edit replaced, at that edit's range and
     /// nowhere else. Refuses, with a notice, when that cannot be done.
     pub fn reject_hunk(&mut self, id: u64) -> bool {
+        if self.send_lock.is_some() {
+            return false;
+        }
         let Some(index) = self.hunks.iter().position(|hunk| hunk.id == id) else {
             return false;
         };
@@ -569,6 +588,7 @@ impl DraftSession {
     }
 
     pub fn edit(&mut self, base_revision: u64, old: &str, new: &str) -> Result<(), String> {
+        self.ensure_editable()?;
         let current = self.serialize();
         let _ = base_revision;
         let at = merge::find_unique(&current, old)
@@ -598,6 +618,7 @@ impl DraftSession {
     }
 
     pub fn replace_body(&mut self, body: &str) -> Result<(), String> {
+        self.ensure_editable()?;
         if body == self.body {
             return Ok(());
         }
@@ -905,6 +926,16 @@ impl DraftSession {
         self.send_lock
     }
 
+    /// Once a send starts the draft is read-only: what goes out, and what
+    /// the editor then shows as sent, is the text the checks ran on. It opens
+    /// again only if the send failed before the server had the message.
+    fn ensure_editable(&self) -> Result<(), String> {
+        match self.send_lock {
+            Some(lock) => Err(format!("{}; it cannot be edited", lock.reason())),
+            None => Ok(()),
+        }
+    }
+
     /// Claim this draft for one send. Fails while another send is running
     /// and after one went, or may have gone, out.
     pub fn begin_send(&mut self) -> Result<(), String> {
@@ -1005,6 +1036,15 @@ impl DraftSession {
     }
 
     fn merge_disk(&mut self, text: &str) {
+        if let Some(lock) = self.send_lock {
+            // What was sent (or is being sent) stays what is on disk.
+            self.notices.push(format!(
+                "draft.md changed, but {}; kept the sent text",
+                lock.reason()
+            ));
+            let _ = self.flush();
+            return;
+        }
         if parse_draft(text).is_err() {
             self.notices.push(
                 "draft.md could not be parsed; kept the open draft and rewrote the file".into(),
@@ -2382,6 +2422,33 @@ mod tests {
         // ...the next one the typing.
         assert!(session.undo());
         assert!(!session.body().contains("Typed."), "{}", session.body());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_draft_cannot_change_while_it_is_sent() {
+        let (root, mut session) = temp_session("body\n");
+        session.begin_send().unwrap();
+        let before = session.serialize();
+        session.set_body_from_user("typed during send\n".into());
+        session.set_subject_from_user("changed".into());
+        assert!(
+            session
+                .set_addresses_from_user("to", "eve@example.com")
+                .is_err()
+        );
+        assert!(session.edit(session.revision(), "body", "agent").is_err());
+        assert!(session.replace_body("agent rewrite\n").is_err());
+        assert!(!session.undo());
+        let mut disk = before.clone();
+        disk = disk.replace("body", "file edit");
+        session.push_disk(Some(disk), 0);
+        session.poll_disk(10_000);
+        assert_eq!(session.serialize(), before);
+        // A send that failed before the server had it opens the draft again.
+        session.end_send(None);
+        session.set_body_from_user("now editable\n".into());
+        assert_eq!(session.body(), "now editable\n");
         let _ = fs::remove_dir_all(root);
     }
 }

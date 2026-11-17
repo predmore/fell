@@ -643,6 +643,15 @@ impl ComposeView {
             return;
         }
         let key = event.keystroke.key.as_str();
+        // A draft being sent, or already sent, is read-only: what is on
+        // screen must stay what went out.
+        let id = self.draft_id.to_string();
+        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
+            && key != "escape"
+        {
+            self.status = lock.reason().into();
+            return;
+        }
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
