@@ -227,7 +227,7 @@ pub fn one_line(text: &str) -> String {
 pub fn relative_date(now: i64, then: i64) -> String {
     // A future timestamp is not "now". Compare first: saturating_sub never goes negative.
     if then > now {
-        return absolute_date(then);
+        return month_day(now, then);
     }
     let delta = now.saturating_sub(then);
     if delta < 45 {
@@ -250,12 +250,17 @@ pub fn relative_date(now: i64, then: i64) -> String {
     if delta < 7 * 24 * 60 * 60 {
         return weekday(tw).into();
     }
-    format!("{} {td}", month_name(tmo))
+    month_day(now, then)
 }
 
-fn absolute_date(unix: i64) -> String {
-    let (_, month, day, _, _, _) = local_parts(unix);
-    format!("{} {day}", month_name(month))
+fn month_day(now: i64, then: i64) -> String {
+    let (now_year, _, _, _, _, _) = local_parts(now);
+    let (year, month, day, _, _, _) = local_parts(then);
+    if year != now_year {
+        format!("{} {day}, {year}", month_name(month))
+    } else {
+        format!("{} {day}", month_name(month))
+    }
 }
 
 fn yesterday(year: i32, month: u8, day: u8) -> (i32, u8, u8) {
@@ -388,10 +393,17 @@ mod tests {
         assert_eq!(relative_date(now, now - 120), "2m");
         let soon = now + 180;
         let tomorrow = now + 86_400;
-        assert_eq!(relative_date(now, soon), absolute_date(soon));
-        assert_eq!(relative_date(now, tomorrow), absolute_date(tomorrow));
+        assert_eq!(relative_date(now, soon), month_day(now, soon));
+        assert_eq!(relative_date(now, tomorrow), month_day(now, tomorrow));
         assert_ne!(relative_date(now, soon), "now");
         assert_ne!(relative_date(now, tomorrow), "now");
+        let last_year = now - 400 * 86_400;
+        let next_year = now + 400 * 86_400;
+        let (past_year, _, _, _, _, _) = local_parts(last_year);
+        let (future_year, _, _, _, _, _) = local_parts(next_year);
+        assert!(relative_date(now, last_year).contains(&past_year.to_string()));
+        assert!(relative_date(now, next_year).contains(&future_year.to_string()));
+        assert!(!month_day(now, now).contains(&local_parts(now).0.to_string()));
     }
 
     #[test]

@@ -194,6 +194,12 @@ impl Inbox {
             return;
         };
         window.focus(&self.focus);
+        if self.session.chord.is_empty()
+            && self.session.pane == Pane::Conversation
+            && matches!(key, KeyId::Char('j' | 'k' | 'q'))
+        {
+            self.follow_visible_message();
+        }
         let page = self.page_rows();
         let message_before = self.session.message_cursor;
         let thread_before = self.session.cursor_id.clone();
@@ -254,6 +260,27 @@ impl Inbox {
             self.folder_scroll.scroll_to_item(self.session.folder_index);
         }
         cx.notify();
+    }
+
+    fn follow_visible_message(&mut self) {
+        let measured_y = f32::from(self.conv_scroll.offset().y);
+        let Some(index) = self.message_at_offset(measured_y) else {
+            return;
+        };
+        if index < self.session.messages.len() {
+            self.session.message_cursor = index;
+        }
+    }
+
+    fn message_at_offset(&self, offset_y: f32) -> Option<usize> {
+        let scrollport_top = f32::from(self.conv_scroll.bounds().top());
+        let mut item_bounds = Vec::new();
+        let mut index = 0;
+        while let Some(bounds) = self.conv_scroll.bounds_for_item(index) {
+            item_bounds.push((f32::from(bounds.top()), f32::from(bounds.bottom())));
+            index += 1;
+        }
+        present::message_after_page(&item_bounds, scrollport_top, offset_y, offset_y)
     }
 
     fn scroll_conversation(&mut self) {

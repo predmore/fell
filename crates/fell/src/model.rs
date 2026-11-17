@@ -270,11 +270,10 @@ impl Session {
         }
         self.picked
             .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
-        let anchor_here = self
-            .anchor_id
-            .as_ref()
-            .is_some_and(|id| self.threads.iter().any(|thread| &thread.id == id));
-        if self.visual && !anchor_here {
+        let still_here = |id: &String| self.threads.iter().any(|thread| &thread.id == id);
+        let anchor_here = self.anchor_id.as_ref().is_some_and(still_here);
+        let cursor_here = previous.as_ref().is_some_and(still_here);
+        if self.visual && (!anchor_here || !cursor_here) {
             self.visual = false;
             self.anchor_id = None;
         }
@@ -905,6 +904,19 @@ mod tests {
         let highlighted = session.highlighted();
         assert!(!highlighted.contains("a") || session.cursor_id.as_deref() == Some("a"));
         assert_eq!(highlighted.len(), usize::from(session.cursor_id.is_some()));
+    }
+
+    #[test]
+    fn visual_mode_ends_when_the_cursor_leaves_the_folder() {
+        let mut session = session();
+        session.visual = true;
+        session.anchor_id = Some("c".into());
+        session.cursor_id = Some("e".into());
+        session.set_threads(vec![row("a"), row("c"), row("d")]);
+        assert!(!session.visual);
+        assert!(session.anchor_id.is_none());
+        let highlighted = session.highlighted();
+        assert_eq!(highlighted.len(), 1);
     }
 
     #[test]
