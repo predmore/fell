@@ -1,6 +1,6 @@
 //! Leader chords, which-key, and the command palette index.
 //!
-//! `m` moves the thread out of the current folder. `u` undoes that.
+//! `m` moves the thread out of the current folder. `e` archives it. `u` undoes either.
 
 use std::fmt::Write as _;
 
@@ -34,6 +34,7 @@ pub enum Action {
     Drafts,
     FolderPicker,
     Move,
+    Archive,
     Undo,
     ToggleSelect,
     Visual,
@@ -59,6 +60,7 @@ impl Action {
             Self::Drafts => "Go to Drafts",
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
+            Self::Archive => "Archive",
             Self::Undo => "Undo",
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
@@ -74,7 +76,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 20] = [
+const ALL_ACTIONS: [Action; 21] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -88,6 +90,7 @@ const ALL_ACTIONS: [Action; 20] = [
     Action::Drafts,
     Action::FolderPicker,
     Action::Move,
+    Action::Archive,
     Action::Undo,
     Action::ToggleSelect,
     Action::Visual,
@@ -177,6 +180,7 @@ fn default_bindings() -> Vec<Binding> {
         Some("go"),
     );
     bind(&[KeyId::Char('m')], Action::Move, None);
+    bind(&[KeyId::Char('e')], Action::Archive, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);
@@ -448,6 +452,10 @@ mod tests {
         assert_eq!(
             match_seq(&keymap, &[KeyId::Char('m')]),
             SeqMatch::Action(Action::Move)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char('e')]),
+            SeqMatch::Action(Action::Archive)
         );
         assert_eq!(
             match_seq(&keymap, &[KeyId::Char('u')]),
