@@ -402,20 +402,7 @@ impl Render for Reader {
                             .set_remote_images_allowed(!this.model.remote_images_allowed());
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .rounded(px(4.))
-                                    .bg(paint(palette.dimmed)),
-                            )
-                            .child(status),
-                    )
+                    .child(status)
                     .child(
                         div()
                             .px_3()
