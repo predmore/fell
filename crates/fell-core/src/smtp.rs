@@ -134,7 +134,10 @@ pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<Stri
 /// failure from here on is [`Error::SendUncertain`]. Only an explicit `4xx`
 /// or `5xx` reply proves the message was not accepted.
 fn transfer(pipe: &mut Pipe, mime: &[u8]) -> Result<String> {
-    let reply = write_message(pipe, mime)
+    // A server queues nothing before the terminating dot, so a failure while
+    // the body is still going out means it was not sent.
+    write_body(pipe, mime)?;
+    let reply = write_all(pipe, b".\r\n")
         .and_then(|()| read_reply(pipe))
         .map_err(|err| uncertain(err.to_string()))?;
     let detail = reply.lines.last().cloned().unwrap_or_default();
@@ -151,7 +154,9 @@ fn transfer(pipe: &mut Pipe, mime: &[u8]) -> Result<String> {
 }
 
 fn uncertain(message: String) -> Error {
-    Error::SendUncertain(format!("{message}, after the server had the whole message"))
+    Error::SendUncertain(format!(
+        "{message}, after the whole message was handed to the server"
+    ))
 }
 
 fn sender(mime: &[u8]) -> Result<String> {
@@ -346,7 +351,8 @@ fn command(pipe: &mut Pipe, text: &str) -> Result<Reply> {
     read_reply(pipe)
 }
 
-fn write_message(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
+/// The dot-stuffed message, ending in CRLF, without the terminating dot.
+fn write_body(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
     let mut stuffed = Vec::with_capacity(mime.len() + 8);
     let mut line_start = true;
     for &byte in mime {
@@ -359,7 +365,6 @@ fn write_message(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
     if !stuffed.ends_with(b"\r\n") {
         stuffed.extend_from_slice(b"\r\n");
     }
-    stuffed.extend_from_slice(b".\r\n");
     write_all(pipe, &stuffed)
 }
 
@@ -671,7 +676,7 @@ Bcc: this is body text\r\n"
         let (result, got) = attempt(Wire::Clear, ImapSecurity::Plain, AfterData::Hangup);
         let err = result.unwrap_err();
         assert!(matches!(err, Error::SendUncertain(_)), "{err:?}");
-        assert!(err.to_string().contains("after the server had"), "{err}");
+        assert!(err.to_string().contains("after the whole message"), "{err}");
         assert_eq!(got.data, sample_mime());
     }
 

@@ -221,6 +221,7 @@ impl DraftSession {
             quoted: None,
             send_lock: None,
         };
+        session.send_lock = read_send_state(&session.folder);
         if let Some(email) = email_of(&session.fields.from) {
             session.identities.insert(email);
         }
@@ -943,6 +944,10 @@ impl DraftSession {
             return Err(lock.reason().into());
         }
         self.send_lock = Some(SendLock::InFlight);
+        // On disk a send in progress reads as "may have been sent": if Fell
+        // stops mid-send, the next start must not send the draft again
+        // without the person checking Sent.
+        write_send_state(&self.folder, Some(SendLock::MaybeSent));
         Ok(())
     }
 
@@ -951,6 +956,7 @@ impl DraftSession {
     pub fn end_send(&mut self, lock: Option<SendLock>) {
         debug_assert_ne!(lock, Some(SendLock::InFlight));
         self.send_lock = lock;
+        write_send_state(&self.folder, lock);
     }
 
     /// Keep the lock of the session this one replaces in the hub.
@@ -1219,6 +1225,33 @@ fn review_matches_row(text: &str, stored: &persist::StoredCompose) -> bool {
         && parsed.fields.cc == stored.fields.cc
         && parsed.fields.bcc == stored.fields.bcc
         && parsed.fields.subject == stored.fields.subject
+}
+
+/// Where a sent or possibly sent draft records it, so a restart keeps it
+/// from going out twice.
+const SEND_STATE: &str = "send-state";
+
+fn read_send_state(folder: &Path) -> Option<SendLock> {
+    let text = std::fs::read_to_string(workspace::control_dir(folder).join(SEND_STATE)).ok()?;
+    match text.trim() {
+        "sent" => Some(SendLock::Sent),
+        "maybe-sent" => Some(SendLock::MaybeSent),
+        _ => None,
+    }
+}
+
+fn write_send_state(folder: &Path, lock: Option<SendLock>) {
+    let path = workspace::control_dir(folder).join(SEND_STATE);
+    let value = match lock {
+        Some(SendLock::Sent) => "sent",
+        Some(SendLock::MaybeSent | SendLock::InFlight) => "maybe-sent",
+        None => {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+    };
+    let _ = std::fs::create_dir_all(workspace::control_dir(folder));
+    let _ = std::fs::write(path, value);
 }
 
 /// Path and version of each referenced file. Stats only.
@@ -2449,6 +2482,40 @@ mod tests {
         session.end_send(None);
         session.set_body_from_user("now editable\n".into());
         assert_eq!(session.body(), "now editable\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_sent_draft_stays_locked_after_a_restart() {
+        let (root, mut session) = temp_session("body\n");
+        let folder = session.folder().to_path_buf();
+        session.begin_send().unwrap();
+        // Fell stops mid-send.
+        drop(session);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            ..DraftFields::default()
+        };
+        let reopened = DraftSession::create(
+            folder.clone(),
+            "d1",
+            AccountId("local".into()),
+            fields,
+            "body\n",
+        )
+        .unwrap();
+        assert_eq!(reopened.send_lock(), Some(SendLock::MaybeSent));
+        // A send that failed before the server had it clears the record.
+        let mut reopened = reopened;
+        reopened.end_send(None);
+        drop(reopened);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            ..DraftFields::default()
+        };
+        let clean = DraftSession::create(folder, "d1", AccountId("local".into()), fields, "body\n")
+            .unwrap();
+        assert_eq!(clean.send_lock(), None);
         let _ = fs::remove_dir_all(root);
     }
 }

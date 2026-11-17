@@ -1311,8 +1311,8 @@ pub fn send_from_editor(
     backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, SendFailure> {
     let prepared = prepare_from_editor(session)?;
-    let revision = prepared.revision;
-    let result = prepared.transmit_checked(backend, || Some(revision));
+    // This call holds the session throughout, so the claim cannot be lost.
+    let result = prepared.transmit_checked(backend, || true);
     session.end_send(lock_after(&result));
     result
 }
@@ -1321,8 +1321,6 @@ pub fn send_from_editor(
 /// draft lock is held, so what was on screen is what goes out.
 pub struct PreparedSend {
     account: fell_core::AccountId,
-    /// The draft revision these checks passed on.
-    revision: u64,
     outgoing: fell_core::compose::Outgoing,
     files: Vec<fell_core::SubmittedFile>,
 }
@@ -1349,7 +1347,6 @@ pub fn prepare_from_editor(
     session.begin_send().map_err(SendFailure::NotSent)?;
     Ok(PreparedSend {
         account: session.account_id().clone(),
-        revision: session.revision(),
         outgoing,
         files,
     })
@@ -1371,9 +1368,13 @@ pub(crate) fn transmit_from_hub(
     prepared: PreparedSend,
     backend: impl FnOnce(&AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure>,
 ) -> Result<fell_core::SentMessage, SendFailure> {
+    // While the lock is held every edit path is refused, so the prepared
+    // message is still the draft. Only a send that lost its lock stops.
     let result = backend(&prepared.account).and_then(|backend| {
         prepared.transmit_checked(backend.as_ref(), || {
-            hub.with_session(id, |session| session.revision())
+            hub.with_session(id, |session| session.send_lock())
+                .flatten()
+                == Some(SendLock::InFlight)
         })
     });
     hub.with_session(id, |session| session.end_send(lock_after(&result)));
@@ -1381,20 +1382,20 @@ pub(crate) fn transmit_from_hub(
 }
 
 impl PreparedSend {
-    /// Submit and confirm through `backend`. Blocks on SMTP. `revision_now`
-    /// reads the draft's revision right before the message is handed to
-    /// SMTP; if anything changed since the checks, nothing is sent.
+    /// Submit and confirm through `backend`. Blocks on SMTP. `still_claimed`
+    /// is asked right before the message is handed to SMTP; if this send
+    /// no longer holds the draft's lock, nothing is sent.
     fn transmit_checked(
         self,
         backend: &dyn MailBackend,
-        revision_now: impl FnOnce() -> Option<u64>,
+        still_claimed: impl FnOnce() -> bool,
     ) -> Result<fell_core::SentMessage, SendFailure> {
         let pending = backend
             .submit_composed(self.outgoing.draft, self.outgoing.mime, self.files)
             .map_err(SendFailure::from_core)?;
-        if revision_now() != Some(self.revision) {
+        if !still_claimed() {
             return Err(SendFailure::NotSent(
-                "the draft changed while sending; nothing was sent".into(),
+                "the draft is no longer being sent; nothing was sent".into(),
             ));
         }
         let confirm = confirmation_from_ui(&pending);
