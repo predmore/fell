@@ -159,6 +159,23 @@ pub fn merge_folders(stored: &[String]) -> Vec<String> {
     out
 }
 
+/// Message whose box contains the top of the viewport.
+///
+/// `spans` are `(top, bottom)` in the same space as `viewport_top`. A page
+/// that stays inside one box keeps that message; the next message starts
+/// when the viewport top reaches its box.
+pub fn message_at_top(spans: &[(f32, f32)], viewport_top: f32) -> Option<usize> {
+    if spans.is_empty() {
+        return None;
+    }
+    Some(
+        spans
+            .iter()
+            .position(|(_, bottom)| viewport_top < *bottom)
+            .unwrap_or(spans.len() - 1),
+    )
+}
+
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -331,6 +348,17 @@ mod tests {
         assert_eq!(relative_date(now, tomorrow), absolute_date(tomorrow));
         assert_ne!(relative_date(now, soon), "now");
         assert_ne!(relative_date(now, tomorrow), "now");
+    }
+
+    #[test]
+    fn page_stays_on_a_tall_message_until_the_next_box() {
+        let spans = [(0.0, 2000.0), (2000.0, 2400.0)];
+        assert_eq!(message_at_top(&spans, 0.0), Some(0));
+        assert_eq!(message_at_top(&spans, 800.0), Some(0));
+        assert_eq!(message_at_top(&spans, 1999.0), Some(0));
+        assert_eq!(message_at_top(&spans, 2000.0), Some(1));
+        assert_eq!(message_at_top(&spans, 5000.0), Some(1));
+        assert_eq!(message_at_top(&[], 0.0), None);
     }
 
     #[test]

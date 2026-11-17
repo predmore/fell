@@ -57,6 +57,10 @@ pub struct Step {
     pub reload_threads: bool,
     pub reload_messages: bool,
     pub arm_which: bool,
+    /// Conversation pages, in viewport heights. Positive moves down.
+    pub scroll_pages: i32,
+    /// Conversation lines. Positive moves down.
+    pub scroll_lines: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +292,19 @@ impl Session {
             return self.overlay_key(key, page_rows);
         }
         let mut step = Step::default();
+        if self.chord.is_empty() && self.pane == Pane::Conversation {
+            match key {
+                KeyId::Up => {
+                    step.scroll_lines = -signed_count(self.take_count());
+                    return step;
+                }
+                KeyId::Down => {
+                    step.scroll_lines = signed_count(self.take_count());
+                    return step;
+                }
+                _ => {}
+            }
+        }
         if key == KeyId::Escape && !self.chord.is_empty() {
             self.clear_chord();
             step.arm_which = true;
@@ -324,6 +341,8 @@ impl Session {
                 let ran = self.run(action, page_rows);
                 step.reload_threads |= ran.reload_threads;
                 step.reload_messages |= ran.reload_messages;
+                step.scroll_pages = ran.scroll_pages;
+                step.scroll_lines = ran.scroll_lines;
             }
             SeqMatch::Prefix => {
                 self.chord = seq;
@@ -507,12 +526,20 @@ impl Session {
                 self.pane = Pane::List;
             }
             Action::PageDown => {
-                let steps = self.page_steps(page_rows);
-                step.reload_messages = self.move_cursor(Motion::Forward(steps));
+                if self.pane == Pane::Conversation {
+                    step.scroll_pages = signed_count(self.take_count());
+                } else {
+                    let steps = self.page_steps(page_rows);
+                    step.reload_messages = self.move_cursor(Motion::Forward(steps));
+                }
             }
             Action::PageUp => {
-                let steps = self.page_steps(page_rows);
-                step.reload_messages = self.move_cursor(Motion::Backward(steps));
+                if self.pane == Pane::Conversation {
+                    step.scroll_pages = -signed_count(self.take_count());
+                } else {
+                    let steps = self.page_steps(page_rows);
+                    step.reload_messages = self.move_cursor(Motion::Backward(steps));
+                }
             }
             Action::Inbox => step.reload_threads = self.go_folder("INBOX"),
             Action::Sent => step.reload_threads = self.go_folder("Sent"),
@@ -674,27 +701,37 @@ impl Session {
     }
 
     pub fn list_banner(&self) -> Option<Banner> {
-        if self.threads.is_empty() {
-            return Some(match self.sync {
-                SyncKind::FirstSync => Banner {
-                    title: "Waiting for the first sync".into(),
-                    hint: "The mailbox is on disk. Sync is not connected in this build.".into(),
-                },
-                SyncKind::StoreError => Banner {
-                    title: self
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Couldn't open the mailbox".into()),
-                    hint: "? details".into(),
-                },
-                SyncKind::FixtureOffline | SyncKind::LocalOffline => Banner {
-                    title: format!("No conversations in {}", self.folder_title()),
-                    hint: "gi inbox · gf folders".into(),
-                },
+        if !self.threads.is_empty() {
+            return None;
+        }
+        if let Some(error) = &self.error {
+            return Some(Banner {
+                title: error.clone(),
+                hint: "The folder could not be read.".into(),
             });
         }
-        None
+        Some(match self.sync {
+            SyncKind::FirstSync => Banner {
+                title: "Waiting for the first sync".into(),
+                hint: "The mailbox is on disk. Sync is not connected in this build.".into(),
+            },
+            SyncKind::StoreError => Banner {
+                title: self
+                    .startup_error
+                    .clone()
+                    .unwrap_or_else(|| "Couldn't open the mailbox".into()),
+                hint: "? details".into(),
+            },
+            SyncKind::FixtureOffline | SyncKind::LocalOffline => Banner {
+                title: format!("No conversations in {}", self.folder_title()),
+                hint: "gi inbox · gf folders".into(),
+            },
+        })
     }
+}
+
+fn signed_count(count: usize) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX).clamp(1, 10_000)
 }
 
 #[cfg(test)]
@@ -770,9 +807,17 @@ mod tests {
             empty_message(true),
         ];
         session.message_cursor = 0;
-        session.on_key(KeyId::Ctrl('d'), 2);
-        assert_eq!(session.message_cursor, 2);
-        session.on_key(KeyId::Ctrl('u'), 2);
+        let step = session.on_key(KeyId::Ctrl('d'), 2);
+        assert_eq!(step.scroll_pages, 1);
+        assert_eq!(step.scroll_lines, 0);
+        assert_eq!(session.message_cursor, 0);
+        let step = session.on_key(KeyId::Ctrl('u'), 2);
+        assert_eq!(step.scroll_pages, -1);
+        assert_eq!(session.message_cursor, 0);
+        let step = session.on_key(KeyId::Down, 2);
+        assert_eq!(step.scroll_lines, 1);
+        let step = session.on_key(KeyId::Up, 2);
+        assert_eq!(step.scroll_lines, -1);
         assert_eq!(session.message_cursor, 0);
         session.on_key(KeyId::Space, 2);
         assert_eq!(session.message_cursor, 0);
@@ -876,12 +921,14 @@ mod tests {
         for ch in "2147483648".chars() {
             session.on_key(KeyId::Char(ch), 1);
         }
-        session.on_key(KeyId::Ctrl('d'), 4);
-        assert_eq!(session.message_cursor, 1);
+        let step = session.on_key(KeyId::Ctrl('d'), 4);
+        assert_eq!(step.scroll_pages, 10_000);
+        assert_eq!(session.message_cursor, 0);
         for ch in "2147483648".chars() {
             session.on_key(KeyId::Char(ch), 1);
         }
-        session.on_key(KeyId::Ctrl('u'), 4);
+        let step = session.on_key(KeyId::Ctrl('u'), 4);
+        assert_eq!(step.scroll_pages, -10_000);
         assert_eq!(session.message_cursor, 0);
     }
 
@@ -896,6 +943,17 @@ mod tests {
         session.sync = SyncKind::FirstSync;
         let banner = session.list_banner().unwrap();
         assert!(banner.title.contains("first sync"));
+    }
+
+    #[test]
+    fn failed_read_is_not_an_empty_folder() {
+        let mut session = session();
+        session.threads.clear();
+        session.sync = SyncKind::LocalOffline;
+        session.fail_query(QueryFault::Folder, "database is locked".into());
+        let banner = session.list_banner().unwrap();
+        assert_eq!(banner.title, "database is locked");
+        assert!(!banner.title.contains("No conversations"));
     }
 
     #[test]

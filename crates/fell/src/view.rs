@@ -7,7 +7,7 @@ use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    WindowOptions, div, point, prelude::*, px, rgb, size,
 };
 
 use crate::keymap::KeyId;
@@ -238,7 +238,11 @@ impl Inbox {
         }
         // A tall message aligns to its top when scrolled into view. Skip that
         // unless the reader moved to another message, or a new thread loaded.
-        if loaded_messages || self.session.message_cursor != message_before {
+        // Paging already moved the viewport by pixels, so it must not jump
+        // the current message back to the top.
+        if step.scroll_pages != 0 || step.scroll_lines != 0 {
+            self.nudge_conversation(step.scroll_pages, step.scroll_lines);
+        } else if loaded_messages || self.session.message_cursor != message_before {
             self.scroll_conversation();
         }
         if self.session.overlay == Overlay::Palette {
@@ -254,6 +258,33 @@ impl Inbox {
     fn scroll_conversation(&mut self) {
         if !self.session.messages.is_empty() {
             self.conv_scroll.scroll_to_item(self.session.message_cursor);
+        }
+    }
+
+    fn nudge_conversation(&mut self, pages: i32, lines: i32) {
+        let viewport = f32::from(self.conv_scroll.bounds().size.height);
+        let viewport = if viewport < 1.0 { 640.0 } else { viewport };
+        let delta = pages as f32 * viewport + lines as f32 * 24.0;
+        let current = self.conv_scroll.offset();
+        let max = f32::from(self.conv_scroll.max_offset().height);
+        let next_y = (f32::from(current.y) - delta).clamp(-max, 0.0);
+        self.conv_scroll.set_offset(point(current.x, px(next_y)));
+        self.follow_paged_message();
+    }
+
+    fn follow_paged_message(&mut self) {
+        let mut spans = Vec::new();
+        let mut index = 0;
+        while let Some(bounds) = self.conv_scroll.bounds_for_item(index) {
+            spans.push((f32::from(bounds.top()), f32::from(bounds.bottom())));
+            index += 1;
+        }
+        let viewport_top =
+            f32::from(self.conv_scroll.bounds().top()) - f32::from(self.conv_scroll.offset().y);
+        if let Some(ix) = present::message_at_top(&spans, viewport_top)
+            && ix < self.session.messages.len()
+        {
+            self.session.message_cursor = ix;
         }
     }
 
