@@ -28,6 +28,7 @@ struct Palette {
     bg: u32,
     fg: u32,
     dim: u32,
+    marker: u32,
     accent: u32,
     selection: u32,
     error: u32,
@@ -42,6 +43,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
             dim: 0xa39e96,
+            marker: 0x6e6a64,
             accent: 0x7aa2f7,
             selection: 0x2a3344,
             error: 0xf7768e,
@@ -53,6 +55,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0xf7f5f2,
             fg: 0x1c1b19,
             dim: 0x5e5a55,
+            marker: 0x8d8680,
             accent: 0x1d4f91,
             selection: 0xd9e2f2,
             error: 0x9f1239,
@@ -99,8 +102,12 @@ impl Editor {
         if lines.is_empty() {
             lines.push(String::new());
         }
+        let row = lines
+            .iter()
+            .position(|line| line.starts_with("- Revenue"))
+            .unwrap_or(0);
         Self {
-            row: if lines.len() > 2 { 2 } else { 0 },
+            row,
             col: 0,
             lines,
             mode: Mode::Normal,
@@ -197,6 +204,81 @@ impl ComposeView {
             sent: false,
             watching: false,
         }
+    }
+
+    pub fn watch_live(&self, cx: &mut Context<Self>) {
+        let rx = Arc::new(std::sync::Mutex::new(self.hub.subscribe()));
+        cx.spawn(async move |this, cx| {
+            loop {
+                let rx = rx.clone();
+                let ok = cx
+                    .background_executor()
+                    .spawn(async move { rx.lock().ok().is_some_and(|inbox| inbox.recv().is_ok()) })
+                    .await;
+                if !ok {
+                    break;
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.sync_from_hub();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Types into the paragraph so a recording can show the cursor line and an edit.
+    pub fn play_edit(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(row) = this
+                    .editor
+                    .lines
+                    .iter()
+                    .position(|line| line.contains("**ahead**"))
+                {
+                    this.editor.row = row;
+                    this.editor.col = this.editor.lines[row].chars().count();
+                    this.editor.mode = Mode::Insert;
+                    this.status = "insert".into();
+                }
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(900))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.insert_str(" now");
+                this.push_body();
+                this.status = "insert".into();
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.editor.mode = Mode::Normal;
+                this.status = "normal".into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.editor.clamp();
+        let line = &mut self.editor.lines[self.editor.row];
+        let at = byte_index(line, self.editor.col);
+        line.insert_str(at, text);
+        self.editor.col += text.chars().count();
     }
 
     pub fn set_theme(&mut self, theme: ThemeKind) {
@@ -769,7 +851,7 @@ impl Render for ComposeView {
             .size_full()
             .bg(rgb(colors.bg))
             .text_color(rgb(colors.fg))
-            .font_family("sans-serif")
+            .font_family("Liberation Sans")
             .child(header(&snap, colors))
             .child(self.fields_view(&snap, colors))
             .child(self.body_view(&snap, colors))
@@ -1059,7 +1141,13 @@ fn raw_source_block(
 
 fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palette) -> gpui::Div {
     let styles = line_styles(line);
-    let mut row = div().flex().flex_row().min_h(px(22.)).items_center();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .w_full()
+        .min_h(px(22.))
+        .items_center();
     if styles.is_empty() {
         row = row.child(caret(colors));
         return row;
@@ -1071,13 +1159,13 @@ fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palet
         }
         let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
         let color = match span.kind {
-            StyleKind::Marker | StyleKind::LinkUrl => colors.dim,
+            StyleKind::Marker | StyleKind::LinkUrl => colors.marker,
             StyleKind::LinkText => colors.accent,
             _ => colors.fg,
         };
         let weight = match span.kind {
-            StyleKind::Strong => FontWeight(680.),
-            _ => FontWeight(420.),
+            StyleKind::Strong => FontWeight(700.),
+            _ => FontWeight(400.),
         };
         if let Some(cursor_byte) = cursor_byte
             && cursor_byte >= span.start
@@ -1109,6 +1197,9 @@ fn styled_span(text: &str, color: u32, weight: FontWeight, kind: StyleKind) -> g
     }
     if kind == StyleKind::Em {
         node = node.italic();
+    }
+    if kind == StyleKind::LinkText {
+        node = node.underline();
     }
     node.child(text.to_string())
 }
@@ -1178,6 +1269,7 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
             fell_core::compose::Inline::Strong(inner) => row.child(
                 div()
                     .font_weight(FontWeight(700.))
+                    .font_family("Liberation Sans")
                     .child(render_inlines(inner, colors)),
             ),
             fell_core::compose::Inline::Em(inner) => {
@@ -1186,9 +1278,12 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
             fell_core::compose::Inline::Code(text) => {
                 row.child(div().font_family("monospace").child(text.clone()))
             }
-            fell_core::compose::Inline::Link { text, .. } => {
-                row.child(div().text_color(rgb(colors.accent)).child(text.clone()))
-            }
+            fell_core::compose::Inline::Link { text, .. } => row.child(
+                div()
+                    .text_color(rgb(colors.accent))
+                    .underline()
+                    .child(text.clone()),
+            ),
             fell_core::compose::Inline::Image { alt, .. } => row.child(div().child(alt.clone())),
         };
     }
@@ -1392,7 +1487,7 @@ fn split_at_char_boundary(text: &str, at: usize) -> (&str, &str) {
 }
 
 pub fn demo_body() -> &'static str {
-    "# Q3 numbers\n\nThe quarter closed **ahead** of plan. See the [board note](https://example.com/q3).\n\n- Revenue up\n- Margin held\n\n> A quote from the last review\n\n![chart](chart.png)\n"
+    "# Q3 numbers\n\nThe quarter closed **ahead** of plan. See the [board note](https://example.com/q3).\n\nShip the `q3` figure, and keep it in *draft*.\n\n- Revenue up\n- Margin held\n\n> A quote from the last review\n\n![chart](chart.png)\n"
 }
 
 pub fn open_demo(

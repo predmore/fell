@@ -18,6 +18,7 @@ fn main() {
     let mut theme = ThemeKind::Dark;
     let mut width = 1100.0;
     let mut height = 760.0;
+    let mut play = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -41,6 +42,7 @@ fn main() {
                     height = value;
                 }
             }
+            "--play" => play = true,
             _ => {}
         }
     }
@@ -74,6 +76,10 @@ fn main() {
                     let mut compose =
                         ComposeView::new(hub.clone(), draft_id.clone(), folder.clone(), cx);
                     compose.set_theme(theme);
+                    compose.watch_live(cx);
+                    if play {
+                        compose.play_edit(cx);
+                    }
                     compose
                 })
             },
