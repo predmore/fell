@@ -161,6 +161,45 @@ fn ensure_control(folder: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+pub fn write_owner(folder: &Path, agent: &str) -> Result<(), String> {
+    if agent.is_empty() || agent.chars().any(|ch| ch.is_control()) {
+        return Err("draft owner is empty".into());
+    }
+    let control = ensure_control(folder)?;
+    atomic_write(&control.join("owner"), format!("{agent}\n").as_bytes())
+}
+
+pub fn read_owner(folder: &Path) -> Option<String> {
+    let text = fs::read_to_string(control_dir(folder).join("owner")).ok()?;
+    let owner = text.trim();
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner.to_string())
+    }
+}
+
+pub fn require_owner(folder: &Path, agent: &str) -> Result<(), String> {
+    match read_owner(folder) {
+        Some(owner) if owner == agent => Ok(()),
+        _ => Err("this draft belongs to another agent".into()),
+    }
+}
+
+pub fn write_store_link(folder: &Path, store: &Path) -> Result<(), String> {
+    let control = ensure_control(folder)?;
+    atomic_write(
+        &control.join("store"),
+        format!("{}\n", store.display()).as_bytes(),
+    )
+}
+
+pub fn read_store_link(folder: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(control_dir(folder).join("store")).ok()?;
+    let path = PathBuf::from(text.trim());
+    path.is_file().then_some(path)
+}
+
 pub fn read_draft_file(folder: &Path) -> Result<String, String> {
     let path = folder.join("draft.md");
     fs::read_to_string(&path).map_err(|err| format!("draft.md: {err}"))

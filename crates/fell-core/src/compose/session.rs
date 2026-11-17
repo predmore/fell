@@ -191,6 +191,14 @@ impl DraftSession {
             parsed.body,
         )?;
         session.issues = parsed.issues;
+        if let Some(path) = workspace::read_store_link(folder) {
+            session.store_path = Some(path.clone());
+            if let Ok(store) = crate::Store::open(path)
+                && let Ok(known) = store.mailed_addresses(session.account_id())
+            {
+                session.known = known;
+            }
+        }
         let _ = text;
         Ok(session)
     }
@@ -927,6 +935,96 @@ mod tests {
         let after = fs::read_to_string(&path).unwrap();
         assert!(after.contains("alpha beta"), "{after}");
         assert!(!session.poll_outbound(400));
+    }
+
+    #[test]
+    fn opening_a_draft_treats_mailed_addresses_as_known() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-known-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        let account = crate::Account {
+            id: AccountId("a".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: crate::BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let message_id = crate::MessageId::new("sent-1@example.com");
+        store
+            .upsert_message(&crate::Message {
+                account_id: account.id.clone(),
+                headers: crate::MessageHeaders {
+                    message_id: message_id.clone(),
+                    proton_conversation_id: None,
+                    in_reply_to: None,
+                    references: Vec::new(),
+                    from: crate::Address {
+                        name: Some("Jon".into()),
+                        email: "jon@example.com".into(),
+                    },
+                    subject: "Hello".into(),
+                    date_unix: 1,
+                },
+                remote_id: crate::RemoteId("a:sent-1".into()),
+                thread_id: crate::ThreadId::from_message_id(&message_id),
+                snippet: "hi".into(),
+                body_text: Some("hi".into()),
+                unread: false,
+                folders: vec!["Sent".into()],
+                labels: Vec::new(),
+                arrived_via: Vec::new(),
+                to: vec![crate::Address {
+                    name: None,
+                    email: "ada@example.com".into(),
+                }],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                starred: false,
+                has_attachment: false,
+                archived: false,
+                snooze_until: None,
+            })
+            .unwrap();
+        drop(store);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into(), "new@example.com".into()],
+            cc: vec!["jon@example.com".into()],
+            subject: "Hello".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "body\n", &account.id).unwrap();
+        workspace::write_store_link(&folder, &db).unwrap();
+        let session = DraftSession::open_folder(&folder, account.id).unwrap();
+        let snap = session.snapshot();
+        let ada = snap
+            .to
+            .iter()
+            .find(|address| address.email == "ada@example.com")
+            .unwrap();
+        let fresh = snap
+            .to
+            .iter()
+            .find(|address| address.email == "new@example.com")
+            .unwrap();
+        let own = snap
+            .cc
+            .iter()
+            .find(|address| address.email == "jon@example.com")
+            .unwrap();
+        assert!(!ada.fresh, "a mailed address is not new");
+        assert!(!own.fresh, "the account address is not new");
+        assert!(fresh.fresh, "an address this account has not mailed is new");
     }
 
     #[test]

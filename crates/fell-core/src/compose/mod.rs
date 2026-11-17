@@ -29,5 +29,5 @@ pub use persist::{StoredCompose, ensure_draft_folder, remember_compose_store};
 pub use session::{AddressView, AttachmentView, DraftSession, HunkView, Snapshot};
 pub use workspace::{
     draft_folder, draft_root, draft_socket_path, image_file, materialize_in, materialize_workspace,
-    resolve_inside,
+    read_owner, require_owner, resolve_inside, write_owner, write_store_link,
 };

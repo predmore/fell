@@ -262,8 +262,12 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
         &session.account_id,
     )
     .ok();
-    if let Some(path) = session.store.db_path() {
-        let _ = fell_core::compose::remember_compose_store(&compose_id, path);
+    if let Some(folder) = &cwd {
+        fell_core::compose::write_owner(folder, &actor_name(session))?;
+        if let Some(path) = session.store.db_path() {
+            let _ = fell_core::compose::write_store_link(folder, path);
+            let _ = fell_core::compose::remember_compose_store(&compose_id, path);
+        }
     }
     session
         .store
@@ -329,12 +333,14 @@ fn draft_rpc(op: &str, args: &Value, extra: Value) -> Result<Value, String> {
 }
 
 fn get_draft(session: &Session, args: &Value) -> Result<Value, String> {
+    let id = compose_id(args)?;
+    authorize_compose(session, &id)?;
     let mut extra = serde_json::Map::new();
     extra.insert("agent".into(), Value::String(actor_name(session)));
     match draft_rpc("get_draft", args, Value::Object(extra.clone())) {
         Ok(value) => Ok(value),
         Err(err) if err.contains("not running") => {
-            fell_core::compose::file_fallback_get(&compose_id(args)?).map(|mut value| {
+            fell_core::compose::file_fallback_get(&id, &actor_name(session)).map(|mut value| {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("transmitted".into(), Value::Bool(false));
                 }
@@ -346,6 +352,7 @@ fn get_draft(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn get_compose_context(session: &Session, args: &Value) -> Result<Value, String> {
+    authorize_compose(session, &compose_id(args)?)?;
     let mut extra = serde_json::Map::new();
     extra.insert("agent".into(), Value::String(actor_name(session)));
     match draft_rpc("get_compose_context", args, Value::Object(extra)) {
@@ -366,6 +373,8 @@ fn get_compose_context(session: &Session, args: &Value) -> Result<Value, String>
 }
 
 fn edit_draft(session: &Session, args: &Value) -> Result<Value, String> {
+    let id = compose_id(args)?;
+    authorize_compose(session, &id)?;
     let edits = args
         .get("edits")
         .cloned()
@@ -380,13 +389,12 @@ fn edit_draft(session: &Session, args: &Value) -> Result<Value, String> {
     match draft_rpc("edit_draft", args, Value::Object(extra)) {
         Ok(value) => Ok(value),
         Err(err) if err.contains("not running") => {
-            let id = compose_id(args)?;
             let list = edits.as_array().ok_or("edits must be a list")?;
             let mut last = json!({});
             for edit in list {
                 let old = edit.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = edit.get("new").and_then(Value::as_str).unwrap_or("");
-                last = fell_core::compose::file_fallback_edit(&id, old, new)?;
+                last = fell_core::compose::file_fallback_edit(&id, &actor_name(session), old, new)?;
             }
             Ok(last)
         }
@@ -395,20 +403,24 @@ fn edit_draft(session: &Session, args: &Value) -> Result<Value, String> {
 }
 
 fn replace_draft_body(session: &Session, args: &Value) -> Result<Value, String> {
+    authorize_compose(session, &compose_id(args)?)?;
     let body = require_string(args, "body")?;
     let mut extra = serde_json::Map::new();
     extra.insert("agent".into(), Value::String(actor_name(session)));
     extra.insert("body".into(), Value::String(body.clone()));
     match draft_rpc("replace_draft_body", args, Value::Object(extra)) {
         Ok(value) => Ok(value),
-        Err(err) if err.contains("not running") => {
-            fell_core::compose::file_fallback_replace_body(&compose_id(args)?, &body)
-        }
+        Err(err) if err.contains("not running") => fell_core::compose::file_fallback_replace_body(
+            &compose_id(args)?,
+            &actor_name(session),
+            &body,
+        ),
         Err(err) => Err(err),
     }
 }
 
 fn request_send(session: &Session, args: &Value) -> Result<Value, String> {
+    authorize_compose(session, &compose_id(args)?)?;
     let _ = args.get("send");
     let _ = args.get("confirm");
     let mut extra = serde_json::Map::new();
@@ -549,6 +561,51 @@ fn thread_arg(session: &Session, args: &Value) -> Result<ThreadId, String> {
 
 fn actor_name(session: &Session) -> String {
     format!("agent:{}", session.agent_id)
+}
+
+fn authorize_compose(session: &Session, compose_id: &str) -> Result<(), String> {
+    let caller = actor_name(session);
+    let row = review_actor(session, compose_id)?;
+    if let Some(owner) = &row
+        && owner != &caller
+    {
+        return Err("this draft belongs to another agent".into());
+    }
+    let Ok(folder) = fell_core::compose::draft_folder(compose_id) else {
+        return Ok(());
+    };
+    match fell_core::compose::read_owner(&folder) {
+        Some(owner) if owner == caller => Ok(()),
+        Some(_) => Err("this draft belongs to another agent".into()),
+        None if row.as_deref() == Some(caller.as_str()) => {
+            let _ = fell_core::compose::write_owner(&folder, &caller);
+            Ok(())
+        }
+        None if folder.join("draft.md").is_file() => {
+            Err("this draft belongs to another agent".into())
+        }
+        None => Ok(()),
+    }
+}
+
+fn review_actor(session: &Session, compose_id: &str) -> Result<Option<String>, String> {
+    let Some(number) = compose_id.strip_prefix('r') else {
+        return Ok(None);
+    };
+    if !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let id: i64 = number
+        .parse()
+        .map_err(|_| "draft id is not a review draft".to_string())?;
+    let drafts = session
+        .store
+        .list_review_drafts(&session.account_id)
+        .map_err(store_error)?;
+    Ok(drafts
+        .into_iter()
+        .find(|draft| draft.id == id)
+        .map(|draft| draft.actor))
 }
 
 fn authorize(session: &Session, scope: ToolScope) -> Result<(), String> {

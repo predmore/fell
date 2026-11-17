@@ -172,6 +172,23 @@ impl DraftHub {
             })
             .to_string();
         };
+        if matches!(
+            op,
+            "get_draft"
+                | "get_compose_context"
+                | "edit_draft"
+                | "replace_draft_body"
+                | "request_send"
+        ) && let Err(err) = workspace::require_owner(session.folder(), &agent)
+        {
+            return json!({
+                "id": id,
+                "ok": false,
+                "transmitted": false,
+                "error": err
+            })
+            .to_string();
+        }
         let mut reveal = None;
         let mut reply = match op {
             "get_draft" => ok_draft(id, session, &agent),
@@ -376,8 +393,9 @@ pub fn editor_is_running() -> bool {
     UnixStream::connect(draft_socket_path()).is_ok()
 }
 
-pub fn file_fallback_get(draft_id: &str) -> Result<Value, String> {
+pub fn file_fallback_get(draft_id: &str, agent: &str) -> Result<Value, String> {
     let folder = super::persist::ensure_draft_folder(draft_id)?;
+    workspace::require_owner(&folder, agent)?;
     let text = workspace::read_draft_file(&folder)?;
     Ok(json!({
         "ok": true,
@@ -389,8 +407,14 @@ pub fn file_fallback_get(draft_id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn file_fallback_edit(draft_id: &str, old: &str, new: &str) -> Result<Value, String> {
+pub fn file_fallback_edit(
+    draft_id: &str,
+    agent: &str,
+    old: &str,
+    new: &str,
+) -> Result<Value, String> {
     let folder = super::persist::ensure_draft_folder(draft_id)?;
+    workspace::require_owner(&folder, agent)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     session.edit(session.revision(), old, new)?;
     session.flush()?;
@@ -405,8 +429,13 @@ pub fn file_fallback_edit(draft_id: &str, old: &str, new: &str) -> Result<Value,
     }))
 }
 
-pub fn file_fallback_replace_body(draft_id: &str, body: &str) -> Result<Value, String> {
+pub fn file_fallback_replace_body(
+    draft_id: &str,
+    agent: &str,
+    body: &str,
+) -> Result<Value, String> {
     let folder = super::persist::ensure_draft_folder(draft_id)?;
+    workspace::require_owner(&folder, agent)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     let previous = session.body().to_string();
     session.replace_body(body)?;
@@ -457,6 +486,7 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
+        workspace::write_owner(&folder, "bot").unwrap();
         let session =
             DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
         let hub = DraftHub::new();
@@ -570,6 +600,7 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
+        workspace::write_owner(&folder, "bot").unwrap();
         let session =
             DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
         let hub = Arc::new(DraftHub::new());
@@ -592,5 +623,59 @@ mod tests {
         let requested: Value = serde_json::from_str(&requested).unwrap();
         assert_eq!(requested["opened"], true);
         assert_eq!(requested["transmitted"], false);
+    }
+
+    #[test]
+    fn another_agent_cannot_read_the_draft() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            bcc: vec!["secret-bcc@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder = workspace::materialize_in(
+            &root,
+            "d1",
+            &fields,
+            "hidden body\n",
+            &AccountId("a".into()),
+        )
+        .unwrap();
+        workspace::write_owner(&folder, "agent:ada").unwrap();
+        let session = DraftSession::create(
+            folder.clone(),
+            "d1",
+            AccountId("a".into()),
+            fields,
+            "hidden body\n",
+        )
+        .unwrap();
+        let hub = DraftHub::new();
+        hub.insert(session);
+        let denied = hub.handle_line(
+            &json!({
+                "id": 1,
+                "op": "get_draft",
+                "draft_id": "d1",
+                "agent": "agent:bob"
+            })
+            .to_string(),
+        );
+        assert!(denied.contains("another agent"), "{denied}");
+        assert!(!denied.contains("secret-bcc@example.com"));
+        assert!(!denied.contains("hidden body"));
+        let fallback = workspace::require_owner(&folder, "agent:bob").unwrap_err();
+        assert!(fallback.contains("another agent"));
+        assert!(workspace::require_owner(&folder, "agent:ada").is_ok());
     }
 }

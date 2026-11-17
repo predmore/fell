@@ -83,4 +83,47 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[test]
+    fn a_real_account_is_not_reported_as_sent() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-editor-real-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fields = fell_core::compose::DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hello".into(),
+            ..fell_core::compose::DraftFields::default()
+        };
+        let folder = fell_core::compose::materialize_in(
+            &root,
+            "real",
+            &fields,
+            "body\n",
+            &AccountId("mailbox".into()),
+        )
+        .unwrap();
+        let mut session = fell_core::compose::DraftSession::create(
+            folder,
+            "real",
+            AccountId("mailbox".into()),
+            fields,
+            "body\n",
+        )
+        .unwrap();
+        session.mark_seen();
+        let backend = fell_core::backend_for(session.account_id());
+        let err = send_from_editor(&mut session, backend.as_ref()).unwrap_err();
+        assert!(
+            err.contains("SMTP") || err.contains("not implemented"),
+            "{err}"
+        );
+        assert!(!err.contains("fixture-sent"), "{err}");
+    }
 }

@@ -495,7 +495,10 @@ impl ComposeView {
                 self.sent = true;
                 self.status = "Sent from the editor".into();
             }
-            Some(Err(err)) => self.status = err.into(),
+            Some(Err(err)) => {
+                self.sent = false;
+                self.status = format!("Not sent: {err}").into();
+            }
             None => self.status = "draft is not open".into(),
         }
     }
