@@ -76,7 +76,8 @@ impl StyledDocument {
         for block in &self.blocks {
             push_block(&mut out, block);
         }
-        out.trim().to_string()
+        out.trim_matches(|ch: char| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}'))
+            .to_string()
     }
 }
 

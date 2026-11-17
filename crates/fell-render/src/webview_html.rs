@@ -111,11 +111,7 @@ fn serialize_node(
                         _ => None,
                     })
                     .collect::<String>();
-                let css = if allow_remote_images {
-                    css
-                } else {
-                    strip_remote_css_urls(&css)
-                };
+                let css = sanitize_css(&css, allow_remote_images);
                 out.push_str("<style>");
                 out.push_str(&escape_style(&css));
                 out.push_str("</style>");
@@ -175,12 +171,22 @@ fn keep_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> b
             return false;
         }
     }
+    if image_attr_is_blocked(tag, &name_l, value, allow_remote_images) {
+        return false;
+    }
     allow_remote_images || !image_attr_is_remote(tag, &name_l, value)
 }
 
-fn rewrite_attr(_tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
-    if name.eq_ignore_ascii_case("style") && !allow_remote_images {
-        return strip_remote_css_urls(value);
+fn rewrite_attr(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> String {
+    if name.eq_ignore_ascii_case("style") {
+        return sanitize_css(value, allow_remote_images);
+    }
+    if name.eq_ignore_ascii_case("srcset") {
+        return value
+            .split(',')
+            .filter(|part| !image_attr_is_blocked(tag, "srcset", part, allow_remote_images))
+            .collect::<Vec<_>>()
+            .join(",");
     }
     value.to_string()
 }
@@ -363,6 +369,61 @@ fn is_css_whitespace(ch: char) -> bool {
 }
 
 pub fn strip_remote_css_urls(css: &str) -> String {
+    sanitize_css(css, false)
+}
+
+/// Decode CSS escapes first, then drop remote `@import` and any `url(` the
+/// reader is not allowed to fetch. A private or link-local host is never fetched.
+fn sanitize_css(css: &str, allow_remote_images: bool) -> String {
+    let decoded = decode_css_escapes(css);
+    let without_import = strip_css_imports(&decoded, allow_remote_images);
+    strip_css_urls(&without_import, allow_remote_images)
+}
+
+fn strip_css_imports(css: &str, allow_remote_images: bool) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(idx) = lower.find("@import") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + "@import".len()..];
+        let Some(semi) = after.find(';') else {
+            out.push_str(&rest[idx..]);
+            break;
+        };
+        let drop = import_target(&after[..semi])
+            .is_some_and(|target| resource_is_disallowed(&target, allow_remote_images));
+        if !drop {
+            out.push_str(&rest[idx..idx + "@import".len() + semi + 1]);
+        }
+        rest = &after[semi + 1..];
+    }
+    out
+}
+
+fn import_target(prelude: &str) -> Option<String> {
+    let prelude = prelude.trim();
+    let lower = prelude.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("url(") {
+        let end = rest.find(')')?;
+        let inside = rest[..end]
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
+        return Some(inside.to_string());
+    }
+    let quote = prelude.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = prelude[1..].find(quote)?;
+    Some(prelude[1..1 + end].to_string())
+}
+
+fn strip_css_urls(css: &str, allow_remote_images: bool) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
     loop {
@@ -380,7 +441,7 @@ pub fn strip_remote_css_urls(css: &str) -> String {
         let inside = after[..end]
             .trim()
             .trim_matches(|ch| ch == '"' || ch == '\'' || ch == ' ');
-        if is_remote_url(inside) {
+        if resource_is_disallowed(inside, allow_remote_images) {
             out.push_str("url(\"about:blank\")");
         } else {
             out.push_str(&rest[idx..idx + 4 + end + 1]);
@@ -388,6 +449,101 @@ pub fn strip_remote_css_urls(css: &str) -> String {
         rest = &after[end + 1..];
     }
     out
+}
+
+fn image_attr_is_blocked(tag: &str, name: &str, value: &str, allow_remote_images: bool) -> bool {
+    match name {
+        "src" | "poster" | "background" | "lowsrc" | "dynsrc" => {
+            resource_is_disallowed(value, allow_remote_images)
+        }
+        "srcset" => value
+            .split(',')
+            .any(|part| resource_is_disallowed(part, allow_remote_images)),
+        "href" | "xlink:href" if matches!(tag, "img" | "image" | "use" | "feimage") => {
+            resource_is_disallowed(value, allow_remote_images)
+        }
+        _ => false,
+    }
+}
+
+/// A remote image the reader has not allowed, or any loopback, private, or
+/// link-local host. The web view is never given the latter.
+fn resource_is_disallowed(value: &str, allow_remote_images: bool) -> bool {
+    if targets_private_network(value) {
+        return true;
+    }
+    !allow_remote_images && is_remote_url(value)
+}
+
+/// `true` when the URL names a loopback, private, or link-local host.
+pub fn targets_private_network(value: &str) -> bool {
+    let Some(host) = resource_host(value) else {
+        return false;
+    };
+    host_is_private(&host)
+}
+
+fn resource_host(value: &str) -> Option<String> {
+    let normalized = normalize_resource_url(value).to_ascii_lowercase();
+    let rest = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .or_else(|| normalized.strip_prefix("//"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next()?.to_string()
+    } else {
+        hostport.split(':').next()?.to_string()
+    };
+    let host = host.trim_end_matches('.').to_string();
+    (!host.is_empty()).then_some(host)
+}
+
+fn host_is_private(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Some(octets) = parse_ipv4(host) {
+        return ipv4_is_private(octets);
+    }
+    if host.contains(':') {
+        return ipv6_is_private(host);
+    }
+    false
+}
+
+fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut parts = host.split('.');
+    for octet in &mut octets {
+        *octet = parts.next()?.parse().ok()?;
+    }
+    parts.next().is_none().then_some(octets)
+}
+
+fn ipv4_is_private(octets: [u8; 4]) -> bool {
+    matches!(
+        octets,
+        [0, ..] | [10, ..] | [127, ..] | [169, 254, ..] | [172, 16..=31, ..] | [192, 168, ..]
+    )
+}
+
+fn ipv6_is_private(host: &str) -> bool {
+    let host = host.trim_matches(|ch| ch == '[' || ch == ']');
+    if host == "::" || host == "::1" {
+        return true;
+    }
+    if let Some(mapped) = host.strip_prefix("::ffff:")
+        && let Some(octets) = parse_ipv4(mapped)
+    {
+        return ipv4_is_private(octets);
+    }
+    let first = host.split(':').find(|part| !part.is_empty()).unwrap_or("");
+    let Ok(group) = u16::from_str_radix(first, 16) else {
+        return false;
+    };
+    (0xfc00..=0xfdff).contains(&group) || (0xfe80..=0xfebf).contains(&group)
 }
 
 /// `<` would close the style element. A CSS escape keeps the stylesheet and
@@ -450,6 +606,16 @@ mod tests {
         assert!(clean.contains("https://cdn.example/a.png"));
         assert!(clean.contains("https://cdn.example/bg.png"));
         assert!(clean.contains("https://cdn.example/poster.png"));
+        let local = sanitize_html(
+            r#"<img src="http://127.0.0.1/x" alt="a"><img src="http://169.254.169.254/latest" alt="b"><img src="http://10.1.2.3/c" alt="c"><img src="http://[::1]/d" alt="d"><style>@import "http://192.168.0.1/e.css"; i { background: \75 rl(http://172.16.0.1/f.png); }</style>"#,
+            true,
+        );
+        assert!(!local.contains("127.0.0.1"), "{local}");
+        assert!(!local.contains("169.254.169.254"), "{local}");
+        assert!(!local.contains("10.1.2.3"), "{local}");
+        assert!(!local.contains("::1"), "{local}");
+        assert!(!local.contains("192.168.0.1"), "{local}");
+        assert!(!local.contains("172.16.0.1"), "{local}");
     }
 
     #[test]
@@ -470,6 +636,9 @@ mod tests {
             r#"<video poster="https://tracker.example/c.png"></video>"#,
             r#"<source src="https://tracker.example/g.png">"#,
             r#"<style>b { background: url(\68 ttp://tracker.example/d.png); }</style>"#,
+            r#"<style>@import "https://tracker.example/a.css"; @import url(https://tracker.example/b.css); i { background: \75 rl(https://tracker.example/c.png); }</style>"#,
+            r#"<img src="http://127.0.0.1/secret" alt="loop">"#,
+            r#"<img src="http://169.254.169.254/latest" alt="meta">"#,
             r#"<p style="background:url(\68 ttp://tracker.example/e.png)">x</p>"#,
             r#"<image href="https://tracker.example/h.png"></image>"#,
             r#"<a href="https://example.com/read">Read</a>"#,

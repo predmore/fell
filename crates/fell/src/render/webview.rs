@@ -606,6 +606,9 @@ fn tighten(webview: &wry::WebView, allow_images: bool) {
 }
 
 fn remote_navigation(uri: &str) -> bool {
+    if fell_render::targets_private_network(uri) {
+        return true;
+    }
     let uri = uri.to_ascii_lowercase();
     uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("file:")
 }

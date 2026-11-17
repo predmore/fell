@@ -215,11 +215,12 @@ fn node_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
     match node.value() {
         Node::Text(text) => {
             let text = normalize_ws(text.deref());
-            if text.trim().is_empty() {
+            let text = text.trim_matches(is_ascii_html_ws);
+            if text.is_empty() {
                 Vec::new()
             } else {
                 vec![Block::Paragraph {
-                    inlines: vec![Inline::Text(text.trim().to_string())],
+                    inlines: vec![Inline::Text(text.to_string())],
                 }]
             }
         }
@@ -230,7 +231,7 @@ fn node_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
 
 fn text_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
     let text = normalize_ws(&raw_text(node));
-    let text = text.trim();
+    let text = text.trim_matches(is_ascii_html_ws);
     if text.is_empty() {
         Vec::new()
     } else {
@@ -471,8 +472,9 @@ fn collect_inlines(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Inline>
 fn push_inline(node: ego_tree::NodeRef<'_, Node>, depth: u32, out: &mut Vec<Inline>) {
     if depth >= MAX_HTML_DEPTH {
         let text = normalize_ws(&raw_text(node));
-        if !text.trim().is_empty() {
-            out.push(Inline::Text(text.trim().to_string()));
+        let text = text.trim_matches(is_ascii_html_ws);
+        if !text.is_empty() {
+            out.push(Inline::Text(text.to_string()));
         }
         return;
     }
@@ -506,13 +508,13 @@ fn push_inline(node: ego_tree::NodeRef<'_, Node>, depth: u32, out: &mut Vec<Inli
 
 fn trim_inlines(inlines: &mut Vec<Inline>) {
     if let Some(Inline::Text(text)) = inlines.first_mut() {
-        *text = text.trim_start().to_string();
+        *text = text.trim_start_matches(is_ascii_html_ws).to_string();
         if text.is_empty() {
             inlines.remove(0);
         }
     }
     if let Some(Inline::Text(text)) = inlines.last_mut() {
-        *text = text.trim_end().to_string();
+        *text = text.trim_end_matches(is_ascii_html_ws).to_string();
         if text.is_empty() {
             inlines.pop();
         }
@@ -636,14 +638,18 @@ fn raw_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     out
 }
 
+fn is_ascii_html_ws(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
+}
+
 fn normalize_ws(text: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
-    if text.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+    if text.chars().next().is_some_and(is_ascii_html_ws) {
         out.push(' ');
     }
     for ch in text.chars() {
-        if ch.is_whitespace() {
+        if is_ascii_html_ws(ch) {
             pending_space = true;
             continue;
         }
@@ -656,7 +662,7 @@ fn normalize_ws(text: &str) -> String {
     if pending_space && !out.is_empty() && !out.ends_with(' ') {
         out.push(' ');
     }
-    if out.trim().is_empty() {
+    if out.chars().all(is_ascii_html_ws) {
         String::new()
     } else {
         out
@@ -870,6 +876,21 @@ mod tests {
         assert!(!text.contains("<p>"), "{text}");
         assert!(!text.contains("Go"));
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn nbsp_is_kept_and_ascii_space_collapses() {
+        let only = html_to_document("<p>&nbsp;&nbsp;</p>");
+        assert!(
+            only.plain_text().contains('\u{00A0}'),
+            "a paragraph of only nbsp stays, got {:?}",
+            only.plain_text()
+        );
+        let mixed = html_to_document("<p>a&nbsp;b  c</p>");
+        let text = mixed.plain_text();
+        assert!(text.contains("a\u{00A0}b"), "{text:?}");
+        assert!(text.contains("b c"), "{text:?}");
+        assert!(!text.contains("b  c"), "{text:?}");
     }
 
     #[test]
