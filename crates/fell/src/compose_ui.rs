@@ -594,8 +594,19 @@ impl ComposeView {
         }
     }
 
+    /// An agent edit can land between frames. Rebase the editor on it before
+    /// a key changes the buffer, or the stale text would overwrite it.
+    fn pull_if_stale(&mut self) {
+        let id = self.draft_id.to_string();
+        let revision = self.hub.with_session(&id, |session| session.revision());
+        if revision.is_some_and(|revision| revision != self.applied_revision) {
+            self.pull_unpainted();
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        self.pull_if_stale();
         let key = event.keystroke.key.as_str();
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {

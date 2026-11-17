@@ -870,7 +870,10 @@ fn strip_block(html: &str, tag: &str) -> String {
                 let skip = rest.find('>').map(|pos| pos + 1).unwrap_or(0);
                 index = after + skip;
             } else {
-                break;
+                // No closing tag: drop only the opening tag, so a stray
+                // `<style` cannot blank everything after it.
+                let rest = &html[from..];
+                index = from + rest.find('>').map(|pos| pos + 1).unwrap_or(rest.len());
             }
         } else {
             out.push_str(&html[index..]);
@@ -1012,5 +1015,13 @@ mod tests {
         let flat = format!("{doc:?}");
         assert!(!flat.contains("alert"));
         assert!(flat.contains("Hi"));
+    }
+
+    #[test]
+    fn an_unclosed_style_tag_keeps_the_text_after_it() {
+        let kept = strip_block("<style>p{color:red}<p>Keep the margin.</p>", "style");
+        assert!(kept.contains("Keep the margin."), "{kept}");
+        assert!(!kept.contains("<style"), "{kept}");
+        assert_eq!(strip_block("a<script>x</script>b", "script"), "ab");
     }
 }

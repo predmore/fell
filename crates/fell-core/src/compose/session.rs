@@ -2278,4 +2278,28 @@ mod tests {
             session.snapshot().notices
         );
     }
+
+    #[test]
+    fn a_file_edit_during_an_insert_is_its_own_undo_step() {
+        let (root, mut session) = temp_session("First paragraph.\n\nSecond paragraph.\n");
+        session.begin_user_change();
+        session.set_body_from_user("First paragraph. Typed.\n\nSecond paragraph.\n".into());
+        // An agent's script rewrites the other paragraph while the person
+        // is still in insert mode.
+        let mut disk = session.serialize();
+        disk = disk.replace("Second paragraph.", "Second paragraph, edited.");
+        session.push_disk(Some(disk), 0);
+        assert!(session.poll_disk(10_000));
+        assert!(session.body().contains("Typed."));
+        assert!(session.body().contains("edited."));
+        session.end_user_change();
+        // One undo removes only the file edit...
+        assert!(session.undo());
+        assert!(session.body().contains("Typed."), "{}", session.body());
+        assert!(!session.body().contains("edited."), "{}", session.body());
+        // ...the next one the typing.
+        assert!(session.undo());
+        assert!(!session.body().contains("Typed."), "{}", session.body());
+        let _ = fs::remove_dir_all(root);
+    }
 }
