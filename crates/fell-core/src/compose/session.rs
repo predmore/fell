@@ -12,6 +12,7 @@ use super::frontmatter::{
 };
 use super::merge::{self, HunkKind};
 use super::mime::{self, Outgoing, ResolvedFile};
+use super::persist;
 use super::workspace::{self, Closure};
 
 const DEBOUNCE_MS: u64 = 150;
@@ -99,6 +100,10 @@ pub struct DraftSession {
     /// Serialized draft before the person's uncommitted edits. Agent edits
     /// that touch a line changed since this snapshot are refused.
     settled: String,
+    /// Mailbox database that should receive this draft on flush.
+    store_path: Option<PathBuf>,
+    /// When the latest unflushed editor change was armed. `None` when the file is current.
+    outbound_since: Option<u64>,
     pending: Option<String>,
     pending_delete: bool,
     pending_since: u64,
@@ -137,6 +142,8 @@ impl DraftSession {
             undo_open: false,
             last_written: String::new(),
             settled: String::new(),
+            store_path: None,
+            outbound_since: None,
             pending: None,
             pending_delete: false,
             pending_since: 0,
@@ -442,12 +449,56 @@ impl DraftSession {
         true
     }
 
+    /// Remember the mailbox file so a later flush can persist this draft.
+    pub fn bind_store(&mut self, path: impl Into<PathBuf>) {
+        self.store_path = Some(path.into());
+    }
+
+    /// Record an editor change that should hit disk after the outbound debounce.
+    pub fn arm_outbound(&mut self, now_ms: u64) {
+        self.outbound_since = Some(now_ms);
+    }
+
+    /// Write and fsync once the outbound debounce has elapsed.
+    pub fn poll_outbound(&mut self, now_ms: u64) -> bool {
+        let Some(since) = self.outbound_since else {
+            return false;
+        };
+        if now_ms.saturating_sub(since) < DEBOUNCE_MS {
+            return false;
+        }
+        self.flush().is_ok()
+    }
+
     pub fn flush(&mut self) -> Result<(), String> {
+        self.outbound_since = None;
         let text = self.serialize();
         workspace::write_draft_file(&self.folder, &text)?;
         self.last_written = text;
         self.save_hunks();
+        self.persist_mailbox();
         Ok(())
+    }
+
+    fn persist_mailbox(&self) {
+        let path = self
+            .store_path
+            .clone()
+            .or_else(|| persist::remembered_store_path(&self.id));
+        let Some(path) = path.filter(|path| path.is_file()) else {
+            return;
+        };
+        let Ok(store) = crate::Store::open(&path) else {
+            return;
+        };
+        let files = workspace::resolve_closure(&self.folder, &self.fields, &self.body).files;
+        let _ = store.save_compose(&persist::StoredCompose {
+            id: self.id.clone(),
+            account_id: self.account_id.clone(),
+            fields: self.fields.clone(),
+            body: self.body.clone(),
+            files,
+        });
     }
 
     pub fn closure(&self) -> Closure {
@@ -861,6 +912,21 @@ mod tests {
                 .any(|note| note.contains("kept your text") || note.contains("overlapped"))
         );
         let _ = agent;
+    }
+
+    #[test]
+    fn an_editor_change_is_not_fsynced_until_the_debounce() {
+        let (_root, mut session) = temp_session("alpha\n");
+        let path = session.folder().join("draft.md");
+        let before = fs::read_to_string(&path).unwrap();
+        session.set_body_from_user("alpha beta\n".into());
+        session.arm_outbound(0);
+        assert!(!session.poll_outbound(149));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(session.poll_outbound(150));
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("alpha beta"), "{after}");
+        assert!(!session.poll_outbound(400));
     }
 
     #[test]

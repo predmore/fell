@@ -262,6 +262,19 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
         &session.account_id,
     )
     .ok();
+    if let Some(path) = session.store.db_path() {
+        let _ = fell_core::compose::remember_compose_store(&compose_id, path);
+    }
+    session
+        .store
+        .save_compose(&fell_core::compose::StoredCompose {
+            id: compose_id.clone(),
+            account_id: session.account_id.clone(),
+            fields: fields.clone(),
+            body: saved.draft.body.clone(),
+            files: Vec::new(),
+        })
+        .map_err(store_error)?;
     Ok(json!({
         "draft_id": saved.draft.id,
         "compose_id": compose_id,
@@ -339,7 +352,7 @@ fn get_compose_context(session: &Session, args: &Value) -> Result<Value, String>
         Ok(value) => Ok(value),
         Err(err) if err.contains("not running") => {
             let id = compose_id(args)?;
-            let folder = fell_core::compose::draft_folder(&id)?;
+            let folder = fell_core::compose::ensure_draft_folder(&id)?;
             Ok(json!({
                 "ok": true,
                 "transmitted": false,

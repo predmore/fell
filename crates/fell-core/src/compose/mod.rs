@@ -25,7 +25,7 @@ pub use markdown::{
 };
 pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
-pub use persist::StoredCompose;
+pub use persist::{StoredCompose, ensure_draft_folder, remember_compose_store};
 pub use session::{AddressView, AttachmentView, DraftSession, HunkView, Snapshot};
 pub use workspace::{
     draft_folder, draft_root, draft_socket_path, image_file, materialize_in, materialize_workspace,

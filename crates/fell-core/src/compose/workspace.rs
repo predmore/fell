@@ -5,6 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use super::frontmatter::{DraftFields, DraftIssue, write_draft};
@@ -397,26 +398,16 @@ fn push_file(
     let inline = inline || inline_paths.iter().any(|item| item == path);
     match resolve_inside(folder, path) {
         Ok(abs) if abs.is_file() => {
-            let len = match fs::metadata(&abs) {
-                Ok(meta) => meta.len(),
-                Err(err) => {
-                    issues.push(DraftIssue {
-                        line,
-                        message: format!("{path}: {err}"),
-                        blocks_send: true,
-                    });
-                    return;
-                }
-            };
             seen.push(path.to_string());
-            *referenced += 1;
-            *stated += len;
-            if *referenced > MAX_ATTACHMENT_FILES || len > *budget {
-                return;
-            }
-            match read_within_budget(&abs, *budget) {
+            match read_from_root(folder, path, *budget) {
                 Ok(bytes) => {
-                    *budget = budget.saturating_sub(bytes.len() as u64);
+                    let len = bytes.len() as u64;
+                    *referenced += 1;
+                    *stated += len;
+                    if *referenced > MAX_ATTACHMENT_FILES {
+                        return;
+                    }
+                    *budget = budget.saturating_sub(len);
                     let display_name = name
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| {
@@ -433,7 +424,10 @@ fn push_file(
                         inline,
                     });
                 }
-                Err(ReadLimit::TooBig) => {}
+                Err(ReadLimit::TooBig(len)) => {
+                    *referenced += 1;
+                    *stated += len;
+                }
                 Err(ReadLimit::Io(err)) => issues.push(DraftIssue {
                     line,
                     message: format!("{path}: {err}"),
@@ -476,32 +470,128 @@ fn limit_issues(count: usize, total_bytes: u64) -> Vec<DraftIssue> {
     issues
 }
 
+#[derive(Debug)]
 enum ReadLimit {
-    TooBig,
+    TooBig(u64),
     Io(std::io::Error),
 }
 
-fn read_within_budget(path: &Path, budget: u64) -> Result<Vec<u8>, ReadLimit> {
-    let meta = fs::metadata(path).map_err(ReadLimit::Io)?;
-    if meta.len() > budget {
-        return Err(ReadLimit::TooBig);
+/// Linux `O_DIRECTORY`. Combined with `O_NOFOLLOW`, a swapped directory symlink fails the open.
+#[cfg(target_os = "linux")]
+const O_DIRECTORY: i32 = 0x10000;
+#[cfg(not(target_os = "linux"))]
+const O_DIRECTORY: i32 = 0x100000;
+
+fn read_from_root(folder: &Path, relative: &str, budget: u64) -> Result<Vec<u8>, ReadLimit> {
+    let root = folder.canonicalize().map_err(ReadLimit::Io)?;
+    let mut current = open_directory(&root)?;
+    if !descriptor_inside(&current, &root) {
+        return Err(ReadLimit::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "draft root left its folder",
+        )));
     }
-    let mut file = fs::File::open(path).map_err(ReadLimit::Io)?;
+    let mut parts = Vec::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(name) = part.to_str() else {
+                    return Err(ReadLimit::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "attachment path is not utf-8",
+                    )));
+                };
+                if name.is_empty() || name.contains('/') || name.contains('\0') {
+                    return Err(ReadLimit::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "attachment path is empty",
+                    )));
+                }
+                parts.push(name);
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(ReadLimit::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "attachment path leaves the draft folder",
+                )));
+            }
+        }
+    }
+    let Some((file_name, dirs)) = parts.split_last() else {
+        return Err(ReadLimit::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment path is empty",
+        )));
+    };
+    for name in dirs {
+        current = open_child(&current, name, true)?;
+        if !descriptor_inside(&current, &root) {
+            return Err(ReadLimit::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attachment left the draft folder",
+            )));
+        }
+    }
+    let mut file = open_child(&current, file_name, false)?;
+    if !descriptor_inside(&file, &root) {
+        return Err(ReadLimit::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "attachment left the draft folder",
+        )));
+    }
+    let len = file.metadata().map_err(ReadLimit::Io)?.len();
+    if len > budget {
+        return Err(ReadLimit::TooBig(len));
+    }
     let mut buf = Vec::new();
     Read::by_ref(&mut file)
         .take(budget)
         .read_to_end(&mut buf)
         .map_err(ReadLimit::Io)?;
-    if buf.len() as u64 > budget {
-        return Err(ReadLimit::TooBig);
+    if buf.len() as u64 > budget || (buf.len() as u64 == budget && len > budget) {
+        return Err(ReadLimit::TooBig(len.max(buf.len() as u64)));
     }
     if buf.len() as u64 == budget {
         let mut extra = [0u8; 1];
         if file.read(&mut extra).unwrap_or(0) > 0 {
-            return Err(ReadLimit::TooBig);
+            return Err(ReadLimit::TooBig(budget.saturating_add(1)));
         }
     }
     Ok(buf)
+}
+
+fn open_directory(path: &Path) -> Result<fs::File, ReadLimit> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+        .open(path)
+        .map_err(ReadLimit::Io)
+}
+
+fn open_child(dir: &fs::File, name: &str, directory: bool) -> Result<fs::File, ReadLimit> {
+    let proc_path = format!("/proc/self/fd/{}/{}", dir.as_raw_fd(), name);
+    let flags = if directory {
+        O_NOFOLLOW | O_DIRECTORY
+    } else {
+        O_NOFOLLOW
+    };
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(proc_path)
+        .map_err(ReadLimit::Io)
+}
+
+fn descriptor_inside(file: &fs::File, root: &Path) -> bool {
+    let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let Ok(target) = fs::read_link(&proc_path) else {
+        return false;
+    };
+    let text = target.to_string_lossy();
+    let text = text.trim_end_matches(" (deleted)");
+    let path = Path::new(text);
+    path == root || path.starts_with(root)
 }
 
 pub fn image_file(folder: &Path, src: &str) -> Option<PathBuf> {
@@ -847,6 +937,31 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.blocks_send && issue.message.contains("25 MB"))
+        );
+    }
+
+    #[test]
+    fn reading_an_attachment_does_not_follow_a_symlink() {
+        let root = isolated("nofollow");
+        let folder = materialize_in(
+            &root,
+            "d8",
+            &DraftFields::default(),
+            "![chart](chart.png)\n",
+            &AccountId("local".into()),
+        )
+        .unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"secret-bytes").unwrap();
+        symlink(&outside, folder.join("chart.png")).unwrap();
+        let err = read_from_root(&folder, "chart.png", 1024).unwrap_err();
+        assert!(matches!(err, ReadLimit::Io(_)), "{err:?}");
+        let closure = resolve_closure(&folder, &DraftFields::default(), "![chart](chart.png)\n");
+        assert!(
+            closure
+                .files
+                .iter()
+                .all(|file| file.bytes != b"secret-bytes")
         );
     }
 

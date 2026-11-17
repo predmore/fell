@@ -171,6 +171,8 @@ pub struct ComposeView {
     status: SharedString,
     sent: bool,
     watching: bool,
+    flush_pending: bool,
+    flush_gen: u64,
 }
 
 impl ComposeView {
@@ -209,6 +211,8 @@ impl ComposeView {
             status: "i insert".into(),
             sent: false,
             watching: false,
+            flush_pending: false,
+            flush_gen: 0,
         }
     }
 
@@ -264,6 +268,7 @@ impl ComposeView {
             let _ = this.update(cx, |this, cx| {
                 this.insert_str(" now");
                 this.push_body();
+                this.arm_debounced_flush(cx);
                 this.status = "esc normal".into();
                 cx.notify();
             });
@@ -392,11 +397,45 @@ impl ComposeView {
         if let Some(revision) = self.hub.with_session(&id, |session| {
             session.set_body_from_user(body);
             session.end_user_change();
-            let _ = session.flush();
+            session.arm_outbound(now_ms());
             session.revision()
         }) {
             self.applied_revision = revision;
+            self.flush_pending = true;
         }
+    }
+
+    fn arm_debounced_flush(&mut self, cx: &mut Context<Self>) {
+        if !self.flush_pending {
+            return;
+        }
+        self.flush_pending = false;
+        self.flush_gen = self.flush_gen.wrapping_add(1);
+        let generation = self.flush_gen;
+        let id = self.draft_id.to_string();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, _cx| {
+                if this.flush_gen != generation {
+                    return;
+                }
+                this.hub.with_session(&id, |session| {
+                    session.poll_outbound(now_ms());
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn flush_now(&mut self) {
+        let id = self.draft_id.to_string();
+        self.flush_pending = false;
+        self.flush_gen = self.flush_gen.wrapping_add(1);
+        self.hub.with_session(&id, |session| {
+            let _ = session.flush();
+        });
     }
 
     fn commit_field(&mut self, field: Field) -> bool {
@@ -438,6 +477,7 @@ impl ComposeView {
             self.status = "the draft changed; it is on screen before send".into();
             return;
         }
+        self.flush_now();
         let id = self.draft_id.to_string();
         let account = self
             .hub
@@ -527,6 +567,9 @@ impl ComposeView {
             Mode::Insert => self.insert_key(key, typed),
             Mode::Normal => self.normal_key(key, typed),
             Mode::Visual => self.visual_key(key),
+        }
+        if self.flush_pending {
+            self.arm_debounced_flush(cx);
         }
     }
 
@@ -1835,6 +1878,13 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
         byte += line.len();
     }
     text.len()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn split_at_char_boundary(text: &str, at: usize) -> (&str, &str) {

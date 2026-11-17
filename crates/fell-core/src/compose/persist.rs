@@ -4,7 +4,7 @@
 //! SQLite so a restart loses nothing.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
 
@@ -221,6 +221,75 @@ fn decode_address_line(raw: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn remember_compose_store(id: &str, store: &Path) -> std::result::Result<(), String> {
+    let Some(path) = compose_index_file(id) else {
+        return Err("no durable directory for the compose index".into());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    workspace::atomic_write(&path, store.display().to_string().as_bytes())
+}
+
+pub fn remembered_store_path(id: &str) -> Option<PathBuf> {
+    let path = compose_index_file(id)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let store = PathBuf::from(text.trim());
+    store.is_file().then_some(store)
+}
+
+pub fn mailbox_db_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FELL_STORE") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+        return Some(PathBuf::from(data).join("fell/mail.db"));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/fell/mail.db"))
+}
+
+fn compose_index_file(id: &str) -> Option<PathBuf> {
+    let root = if let Some(dir) = std::env::var_os("FELL_COMPOSE_INDEX") {
+        PathBuf::from(dir)
+    } else if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(data).join("fell/compose-stores")
+    } else {
+        PathBuf::from(std::env::var_os("HOME")?).join(".local/share/fell/compose-stores")
+    };
+    Some(root.join(id))
+}
+
+fn open_store_for(id: &str) -> Option<Store> {
+    let path = remembered_store_path(id).or_else(mailbox_db_path)?;
+    if !path.is_file() {
+        return None;
+    }
+    Store::open(path).ok()
+}
+
+/// Recreate the runtime folder from the mailbox when `draft.md` is gone.
+pub fn ensure_draft_folder(id: &str) -> std::result::Result<PathBuf, String> {
+    let folder = workspace::draft_folder(id)?;
+    if draft_file_is_regular(&folder) {
+        return Ok(folder);
+    }
+    let Some(store) = open_store_for(id) else {
+        return Err(format!("draft {id} is not open"));
+    };
+    match store
+        .restore_compose_folder(id, &folder)
+        .map_err(|err| err.to_string())?
+    {
+        Some(_) => Ok(folder),
+        None => Err(format!("draft {id} is not open")),
+    }
+}
+
+fn draft_file_is_regular(folder: &Path) -> bool {
+    std::fs::symlink_metadata(folder.join("draft.md"))
+        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,5 +335,63 @@ mod tests {
         assert_eq!(loaded.body, "![chart](chart.png)\n");
         assert_eq!(loaded.files[0].bytes, b"png");
         assert_eq!(loaded.fields.to, vec!["ada@example.com".to_string()]);
+    }
+
+    #[test]
+    fn a_flushed_edit_restores_when_the_runtime_folder_is_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let drafts = dir.join("drafts");
+        let db = dir.join("mail.db");
+        let store = Store::open(&db).unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hello".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&drafts, "keep", &fields, "original\n", &account.id).unwrap();
+        let mut session = super::super::session::DraftSession::create(
+            folder.clone(),
+            "keep",
+            account.id.clone(),
+            fields,
+            "original\n",
+        )
+        .unwrap();
+        session.bind_store(&db);
+        session.set_body_from_user("edited line\n![chart](chart.png)\n".into());
+        std::fs::write(folder.join("chart.png"), b"png-bytes").unwrap();
+        session.flush().unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(drafts.join(".keep.private"));
+        let store = Store::open(&db).unwrap();
+        store
+            .restore_compose_folder("keep", &drafts.join("keep"))
+            .unwrap()
+            .unwrap();
+        let text = std::fs::read_to_string(drafts.join("keep/draft.md")).unwrap();
+        assert!(text.contains("edited line"), "{text}");
+        assert_eq!(
+            std::fs::read(drafts.join("keep/chart.png")).unwrap(),
+            b"png-bytes"
+        );
     }
 }

@@ -145,7 +145,7 @@ impl DraftHub {
         let mut sessions = self.sessions.lock().expect("sessions");
         if !draft_id.is_empty()
             && !sessions.contains_key(&draft_id)
-            && let Ok(folder) = workspace::draft_folder(&draft_id)
+            && let Ok(folder) = super::persist::ensure_draft_folder(&draft_id)
             && folder.join("draft.md").is_file()
         {
             match DraftSession::open_folder(&folder, crate::AccountId("local".into())) {
@@ -377,7 +377,7 @@ pub fn editor_is_running() -> bool {
 }
 
 pub fn file_fallback_get(draft_id: &str) -> Result<Value, String> {
-    let folder = workspace::draft_folder(draft_id)?;
+    let folder = super::persist::ensure_draft_folder(draft_id)?;
     let text = workspace::read_draft_file(&folder)?;
     Ok(json!({
         "ok": true,
@@ -390,7 +390,7 @@ pub fn file_fallback_get(draft_id: &str) -> Result<Value, String> {
 }
 
 pub fn file_fallback_edit(draft_id: &str, old: &str, new: &str) -> Result<Value, String> {
-    let folder = workspace::draft_folder(draft_id)?;
+    let folder = super::persist::ensure_draft_folder(draft_id)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     session.edit(session.revision(), old, new)?;
     session.flush()?;
@@ -406,7 +406,7 @@ pub fn file_fallback_edit(draft_id: &str, old: &str, new: &str) -> Result<Value,
 }
 
 pub fn file_fallback_replace_body(draft_id: &str, body: &str) -> Result<Value, String> {
-    let folder = workspace::draft_folder(draft_id)?;
+    let folder = super::persist::ensure_draft_folder(draft_id)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     let previous = session.body().to_string();
     session.replace_body(body)?;
