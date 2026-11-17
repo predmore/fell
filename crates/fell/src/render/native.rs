@@ -528,16 +528,14 @@ fn image_el(
     };
     let mut placeholder = div()
         .px_2()
-        .py(px(6.))
+        .py(px(4.))
         .flex()
         .items_center()
-        .gap_2()
-        .border(px(1.))
-        .border_color(paint(palette.dimmed))
+        .gap(px(6.))
         .rounded(px(4.))
+        .bg(paint(palette.code_bg))
         .text_sm()
-        .text_color(paint(palette.foreground))
-        .child(picture_icon(palette))
+        .text_color(paint(palette.dimmed))
         .child(label);
     placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);
     placeholder.into_any_element()
@@ -550,43 +548,12 @@ pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
         .into_any_element()
 }
 
-/// A small picture mark. The blocked-image slot used to spell "img" inside a
-/// second box, which read as a placeholder glyph.
-fn picture_icon(palette: &Palette) -> gpui::Div {
-    div()
-        .w(px(16.))
-        .h(px(16.))
-        .flex()
-        .flex_col()
-        .justify_between()
-        .px(px(2.))
-        .py(px(2.))
-        .border(px(1.))
-        .border_color(paint(palette.dimmed))
-        .rounded(px(2.))
-        .child(
-            div().flex().justify_end().child(
-                div()
-                    .w(px(4.))
-                    .h(px(4.))
-                    .rounded(px(2.))
-                    .bg(paint(palette.dimmed)),
-            ),
-        )
-        .child(
-            div()
-                .w_full()
-                .h(px(2.))
-                .rounded(px(1.))
-                .bg(paint(palette.dimmed)),
-        )
-}
-
 /// Drop trailing rows that are a flat page color, so a short newsletter
-/// does not keep the empty viewport under the card. Enough of that color
-/// stays for the page to reach the bottom of the message pane.
+/// does not keep the empty viewport under the card. A short run of that
+/// color stays, matching the page's own top inset. The pane below the
+/// snapshot is painted the same color, so the page still fills the window.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 28;
+    const KEEP_FLAT_ROWS: usize = 12;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -685,6 +652,19 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     decode_rgba(bytes).map(render_frame)
 }
 
+/// A corner of a newsletter snapshot. The pane under the snapshot is painted
+/// this color so the page runs to the window edge.
+pub(crate) fn edge_color(bytes: &[u8]) -> Option<u32> {
+    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let rgba = image.to_rgba8();
+    let pixel = rgba.get_pixel(0, 0).0;
+    Some(u32::from(pixel[0]) << 16 | u32::from(pixel[1]) << 8 | u32::from(pixel[2]))
+}
+
 fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
     let mut header = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -713,8 +693,16 @@ fn theme_pair(rgba: &image::RgbaImage) -> (Arc<RenderImage>, Arc<RenderImage>, f
     let strokes = crop_to_marks(&strokes);
     let (width, height) = display_size(strokes.width(), strokes.height());
     (
-        render_frame(tint(&strokes, [0x1a, 0x1a, 0x1a])),
-        render_frame(tint(&strokes, [0xe8, 0xe8, 0xe8])),
+        render_frame(smooth_frame(
+            &tint(&strokes, [0x1a, 0x1a, 0x1a]),
+            width,
+            height,
+        )),
+        render_frame(smooth_frame(
+            &tint(&strokes, [0xc4, 0xc4, 0xc4]),
+            width,
+            height,
+        )),
         width,
         height,
     )
@@ -755,6 +743,17 @@ fn display_size(width: u32, height: u32) -> (f32, f32) {
     (width * scale, height * scale)
 }
 
+/// Scale the sketch with a filter before it is shown. A GPU stretch of a
+/// 1px line turns the roof into steps and a second edge.
+fn smooth_frame(src: &image::RgbaImage, width: f32, height: f32) -> image::RgbaImage {
+    let tw = width.round().max(1.) as u32;
+    let th = height.round().max(1.) as u32;
+    if tw == src.width() && th == src.height() {
+        return src.clone();
+    }
+    image::imageops::resize(src, tw, th, image::imageops::FilterType::CatmullRom)
+}
+
 fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
     let pixels: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
     let opaque: Vec<_> = pixels.iter().filter(|p| p[3] >= 16).copied().collect();
@@ -766,37 +765,58 @@ fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
         let key = (px[0] & !7, px[1] & !7, px[2] & !7);
         *counts.entry(key).or_default() += 1;
     }
-    let (&paper, &count) = counts.iter().max_by_key(|(_, n)| *n)?;
+    let (&paper_key, &count) = counts.iter().max_by_key(|(_, n)| *n)?;
     if count * 100 / opaque.len() < 80 {
         return None;
     }
-    let mut marks = Vec::new();
+    let mut sum = [0u64; 3];
+    let mut paper_pixels = 0u64;
     for px in &opaque {
         let key = (px[0] & !7, px[1] & !7, px[2] & !7);
-        let paper_pixel = key.0.abs_diff(paper.0) <= 8
-            && key.1.abs_diff(paper.1) <= 8
-            && key.2.abs_diff(paper.2) <= 8;
-        if !paper_pixel {
-            marks.push(*px);
+        if key == paper_key {
+            sum[0] += u64::from(px[0]);
+            sum[1] += u64::from(px[1]);
+            sum[2] += u64::from(px[2]);
+            paper_pixels += 1;
         }
     }
-    if marks.is_empty() || marks.iter().any(|px| !near_grayscale(px[0], px[1], px[2])) {
+    if paper_pixels == 0 {
         return None;
     }
+    let paper = [
+        (sum[0] / paper_pixels) as u8,
+        (sum[1] / paper_pixels) as u8,
+        (sum[2] / paper_pixels) as u8,
+    ];
+    let mut saw_ink = false;
     let mut out = rgba.clone();
     for px in out.pixels_mut() {
-        let key = (px[0] & !7, px[1] & !7, px[2] & !7);
-        let paper_pixel = px[3] < 16
-            || (key.0.abs_diff(paper.0) <= 8
-                && key.1.abs_diff(paper.1) <= 8
-                && key.2.abs_diff(paper.2) <= 8);
-        if paper_pixel {
+        let alpha = stroke_alpha(px.0, paper);
+        if alpha == 0 {
             *px = image::Rgba([0, 0, 0, 0]);
-        } else {
-            *px = image::Rgba([255, 255, 255, 255]);
+            continue;
         }
+        if !near_grayscale(px[0], px[1], px[2]) {
+            return None;
+        }
+        saw_ink = true;
+        // Coverage, not a hard mask. An anti-aliased roof pixel stays a soft
+        // edge of the same stroke instead of a second solid line.
+        *px = image::Rgba([255, 255, 255, alpha]);
     }
-    Some(out)
+    saw_ink.then_some(out)
+}
+
+fn stroke_alpha(pixel: [u8; 4], paper: [u8; 3]) -> u8 {
+    if pixel[3] < 16 {
+        return 0;
+    }
+    let dist = pixel[0]
+        .abs_diff(paper[0])
+        .max(pixel[1].abs_diff(paper[1]))
+        .max(pixel[2].abs_diff(paper[2]));
+    let span = dist.saturating_sub(18);
+    u8::try_from((u16::from(span) * 255) / 40).unwrap_or(255)
 }
 
 fn near_grayscale(red: u8, green: u8, blue: u8) -> bool {
@@ -941,7 +961,7 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 38);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 22);
         let short = &rgba[..width as usize * 18 * 4];
         assert_eq!(trim_uniform_bottom(short, width, 18), 18);
         let mut tall = vec![0u8; width as usize * 200 * 4];
@@ -955,7 +975,7 @@ mod decode_tests {
                 tall[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&tall, width, 200), 38);
+        assert_eq!(trim_uniform_bottom(&tall, width, 200), 22);
     }
 
     #[test]

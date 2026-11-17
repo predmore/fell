@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use body::BodyModel as Model;
-use native::{ImageGallery, decode_image};
+use native::{ImageGallery, decode_image, edge_color};
 use theme::{ThemeKind as Theme, paint};
 
 pub struct Reader {
@@ -44,6 +44,8 @@ pub struct Reader {
     web_images: bool,
     web_token: u64,
     web_image: Option<Arc<RenderImage>>,
+    /// Page color of the snapshot, so the pane below it is not window color.
+    web_page: u32,
     web_generation: u64,
     web_settled: bool,
     web_failed: bool,
@@ -82,6 +84,7 @@ impl Reader {
             web_images: false,
             web_token: 0,
             web_image: None,
+            web_page: 0,
             web_generation: 0,
             web_settled: false,
             web_failed: false,
@@ -111,6 +114,7 @@ impl Reader {
                     self.web_scheme = "";
                     self.web_images = false;
                     self.clear_web_image(window, cx);
+                    self.web_page = 0;
                     self.web_generation = 0;
                     self.web_settled = false;
                     self.web_failed = false;
@@ -143,6 +147,7 @@ impl Reader {
             );
             self.web_token = self.web_token.wrapping_add(1);
             self.clear_web_image(window, cx);
+            self.web_page = 0;
             self.web_generation = 0;
             self.web_settled = false;
             self.web_failed = false;
@@ -174,6 +179,7 @@ impl Reader {
             } => match decode_image(&png) {
                 Some(image) => {
                     self.clear_web_image(window, cx);
+                    self.web_page = edge_color(&png).unwrap_or(0);
                     self.web_image = Some(image);
                     self.web_generation = generation;
                     self.web_settled = settled;
@@ -344,14 +350,27 @@ impl Render for Reader {
                     .justify_between()
                     .child(
                         div()
+                            .w_full()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(self.title.clone()),
+                                    .flex()
+                                    .items_baseline()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(self.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(paint(palette.dimmed))
+                                            .child(self.date_line.clone()),
+                                    ),
                             )
                             .when(!self.from_line.is_empty(), |this| {
                                 this.child(
@@ -361,12 +380,6 @@ impl Render for Reader {
                                         .child(self.from_line.clone()),
                                 )
                             }),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(paint(palette.dimmed))
-                            .child(self.date_line.clone()),
                     ),
             )
             .child(
@@ -381,13 +394,27 @@ impl Render for Reader {
                     .border_color(paint(palette.border))
                     .bg(paint(palette.surface))
                     .text_sm()
+                    .text_color(paint(palette.dimmed))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                         this.model
                             .set_remote_images_allowed(!this.model.remote_images_allowed());
                         cx.notify();
                     }))
-                    .child(status)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .rounded(px(4.))
+                                    .bg(paint(palette.dimmed)),
+                            )
+                            .child(status),
+                    )
                     .child(
                         div()
                             .px_3()
@@ -405,14 +432,23 @@ impl Render for Reader {
 }
 
 fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpui::Div> {
-    let body = div()
+    let web = reader.model.mode() == RenderMode::Web;
+    let mut body = div()
         .id("message-body")
         .flex_1()
         .min_h(px(0.))
-        .overflow_y_scroll()
-        .px_4()
-        .py_4();
-    if reader.model.mode() == RenderMode::Web {
+        .overflow_y_scroll();
+    if web {
+        let page = if reader.web_page == 0 {
+            palette.background
+        } else {
+            reader.web_page
+        };
+        body = body.bg(paint(page));
+    } else {
+        body = body.px_4().py_4();
+    }
+    if web {
         if let Some(image) = reader.web_image.clone() {
             body.child(native::embedded_web(image))
         } else if reader.web_failed {
