@@ -683,6 +683,8 @@ fn theme_pair(rgba: &image::RgbaImage) -> (Arc<RenderImage>, Arc<RenderImage>, f
         let image = render_frame(rgba.clone());
         return (Arc::clone(&image), image, width, height);
     };
+    // One mask for both themes, so a diagonal is not lighter in one of them.
+    let strokes = even_stroke_weight(&strokes);
     let strokes = crop_to_marks(&strokes);
     let (width, height) = display_size(strokes.width(), strokes.height());
     (
@@ -816,6 +818,258 @@ fn near_grayscale(red: u8, green: u8, blue: u8) -> bool {
     red.max(green).max(blue) - red.min(green).min(blue) <= 24
 }
 
+/// A pixel this dark is the stroke itself, not the pale anti-aliased fringe.
+const STROKE_INK: u8 = 200;
+/// Distance from the centerline that still counts as ink. A two-pixel wall
+/// is centered on the crack, so its pixels sit 0.5 away and the next pixel
+/// sits 1.5 away. 1.25 keeps the wall and picks up the diagonal's shoulder.
+const STROKE_RADIUS: f32 = 1.25;
+
+/// Redraw a paper-lifted sketch so every edge has the same weight.
+///
+/// Anti-aliased roof diagonals otherwise stay a pale fringe and read thinner
+/// than the walls. A small rectangle of the same ink reads heavier. The
+/// centerline is snapped onto the pixel grid and stroked at about two pixels,
+/// the weight of the walls and the ground line. A filled mark is left as it
+/// is: thinning it would turn the fill into a spine.
+fn even_stroke_weight(src: &image::RgbaImage) -> image::RgbaImage {
+    let (width, height) = src.dimensions();
+    if width < 3 || height < 3 {
+        return src.clone();
+    }
+    let mut mask = vec![0u8; (width * height) as usize];
+    let mut ink = 0usize;
+    for (i, px) in src.pixels().enumerate() {
+        if px[3] >= STROKE_INK {
+            mask[i] = 1;
+            ink += 1;
+        }
+    }
+    if ink == 0 || !stroke_is_thin(&mask, width, height) {
+        return src.clone();
+    }
+    let body = mask.clone();
+    thin_to_centerline(&mut mask, width, height);
+    let mut centers: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
+    for y in 0..height {
+        for x in 0..width {
+            if mask[(y * width + x) as usize] == 1 {
+                centers.insert((x, y), stroke_centroid(&body, width, height, x, y));
+            }
+        }
+    }
+    if centers.is_empty() {
+        return src.clone();
+    }
+    let mut coverage = vec![0u8; mask.len()];
+    let points: Vec<(u32, u32)> = centers.keys().copied().collect();
+    for &(x, y) in &points {
+        let (cx, cy) = centers[&(x, y)];
+        stamp_disk(&mut coverage, width, height, cx, cy);
+        for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+            let nx = i32::try_from(x).unwrap_or(0) + dx;
+            let ny = i32::try_from(y).unwrap_or(0) + dy;
+            if nx < 0 || ny < 0 {
+                continue;
+            }
+            let (nx, ny) = (nx as u32, ny as u32);
+            if nx >= width || ny >= height {
+                continue;
+            }
+            let Some(&(ox, oy)) = centers.get(&(nx, ny)) else {
+                continue;
+            };
+            stamp_segment(&mut coverage, width, height, cx, cy, ox, oy);
+        }
+    }
+    let mut out = image::RgbaImage::new(width, height);
+    for (px, alpha) in out.pixels_mut().zip(coverage) {
+        if alpha > 0 {
+            *px = image::Rgba([255, 255, 255, alpha]);
+        }
+    }
+    out
+}
+
+/// A stroke a couple of pixels wide has paper inside every small window.
+/// A filled shape does not, and must not be reduced to its midline.
+fn stroke_is_thin(mask: &[u8], width: u32, height: u32) -> bool {
+    let w = width as i32;
+    let h = height as i32;
+    for y in 0..h {
+        for x in 0..w {
+            if mask[(y * w + x) as usize] == 0 {
+                continue;
+            }
+            let mut paper = false;
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let xx = x + dx;
+                    let yy = y + dy;
+                    if xx < 0 || yy < 0 || xx >= w || yy >= h || mask[(yy * w + xx) as usize] == 0 {
+                        paper = true;
+                    }
+                }
+            }
+            if !paper {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Zhang-Suen thinning. Endpoints stay, so a roof peak is not eaten.
+fn thin_to_centerline(mask: &mut [u8], width: u32, height: u32) {
+    let w = width as usize;
+    let h = height as usize;
+    if w < 3 || h < 3 {
+        return;
+    }
+    let mut guard = width.saturating_mul(height);
+    while guard > 0 {
+        guard -= 1;
+        let mut removed = false;
+        for step in 0..2 {
+            let mut kill = Vec::new();
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    if mask[y * w + x] == 0 {
+                        continue;
+                    }
+                    let n = [
+                        mask[(y - 1) * w + x],
+                        mask[(y - 1) * w + x + 1],
+                        mask[y * w + x + 1],
+                        mask[(y + 1) * w + x + 1],
+                        mask[(y + 1) * w + x],
+                        mask[(y + 1) * w + x - 1],
+                        mask[y * w + x - 1],
+                        mask[(y - 1) * w + x - 1],
+                    ];
+                    let neighbors: u8 = n.iter().sum();
+                    if !(2..=6).contains(&neighbors) {
+                        continue;
+                    }
+                    let mut turns = 0;
+                    for i in 0..8 {
+                        if n[i] == 0 && n[(i + 1) % 8] == 1 {
+                            turns += 1;
+                        }
+                    }
+                    if turns != 1 {
+                        continue;
+                    }
+                    let (p2, p4, p6, p8) = (n[0], n[2], n[4], n[6]);
+                    let blocked = if step == 0 {
+                        (p2 != 0 && p4 != 0 && p6 != 0) || (p4 != 0 && p6 != 0 && p8 != 0)
+                    } else {
+                        (p2 != 0 && p4 != 0 && p8 != 0) || (p2 != 0 && p6 != 0 && p8 != 0)
+                    };
+                    if blocked {
+                        continue;
+                    }
+                    kill.push(y * w + x);
+                }
+            }
+            if !kill.is_empty() {
+                removed = true;
+                for index in kill {
+                    mask[index] = 0;
+                }
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+}
+
+fn stroke_centroid(mask: &[u8], width: u32, height: u32, x: u32, y: u32) -> (f32, f32) {
+    let mut sx = 0.0f32;
+    let mut sy = 0.0f32;
+    let mut n = 0.0f32;
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let xx = i32::try_from(x).unwrap_or(0) + dx;
+            let yy = i32::try_from(y).unwrap_or(0) + dy;
+            if xx < 0 || yy < 0 {
+                continue;
+            }
+            let (xx, yy) = (xx as u32, yy as u32);
+            if xx >= width || yy >= height || mask[(yy * width + xx) as usize] == 0 {
+                continue;
+            }
+            sx += xx as f32 + 0.5;
+            sy += yy as f32 + 0.5;
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        (x as f32 + 0.5, y as f32 + 0.5)
+    } else {
+        (sx / n, sy / n)
+    }
+}
+
+fn stroke_cover(dist: f32) -> u8 {
+    if dist <= STROKE_RADIUS { 255 } else { 0 }
+}
+
+fn put_coverage(coverage: &mut [u8], width: u32, x: u32, y: u32, alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
+    let index = (y * width + x) as usize;
+    if alpha > coverage[index] {
+        coverage[index] = alpha;
+    }
+}
+
+fn stamp_disk(coverage: &mut [u8], width: u32, height: u32, cx: f32, cy: f32) {
+    let x0 = (cx - 3.0).floor().max(0.0) as u32;
+    let y0 = (cy - 3.0).floor().max(0.0) as u32;
+    let x1 = (cx + 3.0).ceil().min((width - 1) as f32).max(0.0) as u32;
+    let y1 = (cy + 3.0).ceil().min((height - 1) as f32).max(0.0) as u32;
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dist = (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy);
+            put_coverage(coverage, width, x, y, stroke_cover(dist));
+        }
+    }
+}
+
+fn stamp_segment(coverage: &mut [u8], width: u32, height: u32, ax: f32, ay: f32, bx: f32, by: f32) {
+    let x0 = (ax.min(bx) - 3.0).floor().max(0.0) as u32;
+    let y0 = (ay.min(by) - 3.0).floor().max(0.0) as u32;
+    let x1 = (ax.max(bx) + 3.0).ceil().min((width - 1) as f32).max(0.0) as u32;
+    let y1 = (ay.max(by) + 3.0).ceil().min((height - 1) as f32).max(0.0) as u32;
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dist = dist_to_segment(x as f32 + 0.5, y as f32 + 0.5, ax, ay, bx, by);
+            put_coverage(coverage, width, x, y, stroke_cover(dist));
+        }
+    }
+}
+
+fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let abx = bx - ax;
+    let aby = by - ay;
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1.0e-6 {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = ((px - ax) * abx + (py - ay) * aby) / len2;
+    let t = t.clamp(0.0, 1.0);
+    (px - (ax + t * abx)).hypot(py - (ay + t * aby))
+}
+
 fn tint(src: &image::RgbaImage, rgb: [u8; 3]) -> image::RgbaImage {
     let mut out = src.clone();
     for px in out.pixels_mut() {
@@ -874,6 +1128,61 @@ mod decode_tests {
             "a red mark is not a grayscale sketch"
         );
         assert_eq!(image.get_pixel(1, 1).0, [200, 16, 16, 255]);
+    }
+
+    #[test]
+    fn cabin_strokes_share_one_weight() {
+        use super::{even_stroke_weight, lift_paper};
+
+        let doc = html_to_document(include_str!(
+            "../../../fell-render/fixtures/native-personal-reply.html"
+        ));
+        let bytes = find_data(&doc.blocks).expect("fixture has a data image");
+        let rgba = super::decode_rgba(bytes).expect("png");
+        let lifted = lift_paper(&rgba).expect("sketch");
+        let even = even_stroke_weight(&lifted);
+
+        let wall = row_runs(&even, 60);
+        assert_eq!(
+            wall,
+            vec![2, 2, 2, 2],
+            "walls and the window are the same two-pixel stroke, got {wall:?}"
+        );
+        let ground = (0..even.height())
+            .filter(|&y| row_runs(&even, y).iter().any(|run| *run > 40))
+            .count();
+        assert_eq!(ground, 2, "the ground line is two pixels tall");
+        let roof = (0..40)
+            .filter(|&y| {
+                let runs = row_runs(&even, y);
+                runs.len() == 2 && runs.iter().all(|run| *run == 2 || *run == 3)
+            })
+            .count();
+        assert!(
+            roof > 8,
+            "roof diagonals stay a two-pixel stroke, snapped, not a pale fringe"
+        );
+        for px in even.pixels() {
+            assert!(
+                px[3] == 0 || px[3] == 255,
+                "a partial alpha would make one edge look lighter"
+            );
+        }
+    }
+
+    #[test]
+    fn filled_mark_is_not_reduced_to_a_spine() {
+        use super::even_stroke_weight;
+
+        let mut image = image::RgbaImage::new(24, 24);
+        for y in 4..20 {
+            for x in 4..20 {
+                image.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let even = even_stroke_weight(&image);
+        assert_eq!(even.get_pixel(12, 12).0[3], 255);
+        assert_eq!(even.get_pixel(6, 6).0[3], 255);
     }
 
     #[test]
@@ -1004,6 +1313,23 @@ mod decode_tests {
                 .any(|image| std::sync::Arc::ptr_eq(image, &on_dark))
         );
         assert!(!std::sync::Arc::ptr_eq(&on_light, &on_dark));
+    }
+
+    fn row_runs(image: &image::RgbaImage, y: u32) -> Vec<u32> {
+        let mut runs = Vec::new();
+        let mut run = 0u32;
+        for x in 0..image.width() {
+            if image.get_pixel(x, y).0[3] == 255 {
+                run += 1;
+            } else if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+        }
+        if run > 0 {
+            runs.push(run);
+        }
+        runs
     }
 
     fn find_data(blocks: &[fell_render::Block]) -> Option<&[u8]> {
