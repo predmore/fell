@@ -105,7 +105,9 @@ pub(crate) fn wait_for_inbox(
     }
     let Some(examined) = session.examine("INBOX")? else {
         session.logout();
-        return Ok(InboxWait::Unsupported);
+        // A refusal can be passing (a busy server). Only a missing IDLE
+        // capability turns idling off for good.
+        return Err(Error::Backend("imap: EXAMINE INBOX refused".into()));
     };
     let checkpoints = decode_cursor(cursor);
     let inbox = checkpoints

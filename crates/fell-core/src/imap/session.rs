@@ -303,8 +303,10 @@ impl Session {
         self.tag += 1;
         let tag = format!("a{}", self.tag);
         self.write_all(format!("{tag} IDLE\r\n").as_bytes())?;
+        // Untagged news can come before the continuation. It still counts.
+        let mut news = false;
         loop {
-            let line = String::from_utf8_lossy(&self.read_until_crlf()?).into_owned();
+            let (line, _) = self.read_logical()?;
             if line.starts_with('+') {
                 break;
             }
@@ -314,14 +316,39 @@ impl Session {
                     line[tag.len()..].trim()
                 )));
             }
+            if is_bye(line.as_bytes()) {
+                self.disconnect();
+                return Err(imap_err(format!("{} closed the connection", self.host)));
+            }
+            news |= idle_news(line.as_bytes());
         }
         self.set_read_timeout(IDLE_POLL)?;
         let started = std::time::Instant::now();
         let end = loop {
+            if news {
+                break Ok(IdleEnd::Changed);
+            }
             match self.idle_line() {
                 Ok(Some(line)) => {
-                    if idle_news(&line) {
-                        break Ok(IdleEnd::Changed);
+                    if text_starts_with_tag(&String::from_utf8_lossy(&line), &tag) {
+                        // The server ended IDLE itself; there is nothing to DONE.
+                        let _ = self.set_read_timeout(TIMEOUT);
+                        let text = String::from_utf8_lossy(&line).into_owned();
+                        return Err(imap_err(format!(
+                            "IDLE ended: {}",
+                            text[tag.len()..].trim()
+                        )));
+                    }
+                    if is_bye(&line) {
+                        self.disconnect();
+                        return Err(imap_err(format!("{} closed the connection", self.host)));
+                    }
+                    // A literal follows: news, and the reply read after DONE
+                    // consumes the literal instead of parsing it as lines.
+                    news = idle_news(&line)
+                        || !matches!(literal_marker(&line), LiteralMarker::NotLiteral);
+                    if news {
+                        continue;
                     }
                 }
                 Ok(None) => {}
@@ -1567,6 +1594,12 @@ impl Scan<'_> {
         }
         None
     }
+}
+
+fn is_bye(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line).to_ascii_uppercase();
+    let mut words = text.split_whitespace();
+    words.next() == Some("*") && words.next() == Some("BYE")
 }
 
 /// An untagged IDLE line that means the mailbox changed.

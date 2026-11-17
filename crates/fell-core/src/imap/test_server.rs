@@ -58,6 +58,10 @@ pub(super) struct TestState {
     pub idle: bool,
     /// While a client idles, send `* N EXISTS` once, then clear.
     pub idle_push: bool,
+    /// Send `* N EXISTS` in the same write as, and before, `+ idling`.
+    pub idle_news_first: bool,
+    /// End IDLE at once with a tagged BAD after the continuation.
+    pub idle_bad: bool,
 }
 
 pub(super) struct TestServer {
@@ -402,8 +406,21 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 let _ = write.write_all(format!("{tag} OK NOOP\r\n").as_bytes());
             }
             "IDLE" if state.lock().expect("state").idle => {
-                let _ = write.write_all(b"+ idling\r\n");
+                let (news_first, bad) = {
+                    let guard = state.lock().expect("state");
+                    (guard.idle_news_first, guard.idle_bad)
+                };
+                if news_first {
+                    let _ = write.write_all(b"* 9 EXISTS\r\n+ idling\r\n");
+                } else {
+                    let _ = write.write_all(b"+ idling\r\n");
+                }
                 let _ = write.flush();
+                if bad {
+                    let _ = write.write_all(format!("{tag} BAD idle over\r\n").as_bytes());
+                    let _ = write.flush();
+                    continue;
+                }
                 let _ = read
                     .get_ref()
                     .set_read_timeout(Some(Duration::from_millis(20)));

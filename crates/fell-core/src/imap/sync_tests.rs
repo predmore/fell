@@ -42,6 +42,8 @@ fn sample_state() -> TestState {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -524,6 +526,8 @@ fn star_range_does_not_reapply_the_highest_uid() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -584,6 +588,8 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -646,6 +652,8 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -756,6 +764,8 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -862,6 +872,8 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -999,6 +1011,8 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1089,6 +1103,8 @@ fn non_ascii_password_logs_in_as_a_literal() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1156,6 +1172,8 @@ fn fetch_batches_survive_a_dropped_connection() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1262,6 +1280,8 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1334,6 +1354,8 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1400,6 +1422,8 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1473,6 +1497,8 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         commands: Vec::new(),
         idle: false,
         idle_push: false,
+        idle_news_first: false,
+        idle_bad: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -1643,7 +1669,7 @@ fn idle_ends_quietly_or_when_asked() {
     let quiet = backend
         .wait_for_change(
             cursor.as_ref(),
-            std::time::Duration::from_millis(600),
+            std::time::Duration::from_millis(1500),
             &mut || false,
         )
         .unwrap();
@@ -1752,4 +1778,105 @@ fn a_uid_gap_does_not_keep_waking_sync() {
         )
         .unwrap();
     assert_eq!(outcome, InboxWait::Quiet, "no new mail, so no new pass");
+}
+
+/// Each setup leaves the stored cursor behind UIDNEXT with no new mail.
+/// The wait must still idle instead of reporting news at once.
+#[test]
+fn a_synced_mailbox_waits_even_when_the_cursor_trails_uidnext() {
+    let setups: Vec<(&str, Box<dyn Fn(&mut TestState)>)> = vec![
+        (
+            "a body the server never sent",
+            Box::new(|state: &mut TestState| {
+                let inbox = state
+                    .mailboxes
+                    .iter_mut()
+                    .find(|m| m.name == "INBOX")
+                    .unwrap();
+                inbox.messages[0].body_form = BodyForm::Absent;
+            }),
+        ),
+        (
+            "an empty INBOX with burned UIDs",
+            Box::new(|state: &mut TestState| {
+                let inbox = state
+                    .mailboxes
+                    .iter_mut()
+                    .find(|m| m.name == "INBOX")
+                    .unwrap();
+                inbox.messages.clear();
+                inbox.uidnext = Some(3);
+            }),
+        ),
+        (
+            "CONDSTORE with a UID gap",
+            Box::new(|state: &mut TestState| {
+                state.condstore = true;
+                let inbox = state
+                    .mailboxes
+                    .iter_mut()
+                    .find(|m| m.name == "INBOX")
+                    .unwrap();
+                let highest = inbox.messages.iter().map(|m| m.uid).max().unwrap();
+                inbox.uidnext = Some(highest + 2);
+            }),
+        ),
+    ];
+    for (name, setup) in setups {
+        let mut state = idle_state();
+        setup(&mut state);
+        let server = TestServer::spawn(state);
+        let (acct, backend) = idle_backend(&server);
+        let store = Store::open_in_memory().unwrap();
+        sync_once(&acct, &backend, &store).unwrap();
+        let cursor = store.sync_cursor(&acct.id).unwrap();
+        let outcome = backend
+            .wait_for_change(
+                cursor.as_ref(),
+                std::time::Duration::from_millis(800),
+                &mut || false,
+            )
+            .unwrap();
+        assert_eq!(outcome, InboxWait::Quiet, "{name}");
+    }
+}
+
+#[test]
+fn news_sent_before_the_continuation_still_wakes_sync() {
+    let server = TestServer::spawn(TestState {
+        idle_news_first: true,
+        ..idle_state()
+    });
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let outcome = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_secs(20),
+            &mut || false,
+        )
+        .unwrap();
+    assert_eq!(outcome, InboxWait::Changed);
+}
+
+#[test]
+fn a_server_that_ends_idle_with_bad_returns_promptly() {
+    let server = TestServer::spawn(TestState {
+        idle_bad: true,
+        ..idle_state()
+    });
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let started = std::time::Instant::now();
+    let outcome = backend.wait_for_change(
+        cursor.as_ref(),
+        std::time::Duration::from_secs(20),
+        &mut || false,
+    );
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
