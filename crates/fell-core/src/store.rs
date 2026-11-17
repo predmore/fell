@@ -875,7 +875,9 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
         path
     } else {
         file.lock_shared()?;
-        published_mailbox_path(&file, requested)
+        // The holder already chose one path. Using this caller's name would
+        // open a second WAL for the same inode.
+        shared_mailbox_path(&file)?
     };
     Ok(ClaimedMailbox { path, lock: file })
 }
@@ -886,37 +888,40 @@ fn adopt_mailbox_path(
     requested: &Path,
     canonical: &Path,
 ) -> Result<std::path::PathBuf> {
-    let stable = published_mailbox_path(file, canonical);
+    let stable = read_published_path(file).unwrap_or_else(|| canonical.to_path_buf());
     let requested = absolute_opened(requested)?;
     if requested != stable {
         let report = checkpoint_wal(&requested)?;
         // `busy=1` is a row, not an error. A blocked checkpoint must not
         // switch paths: frames would stay in the WAL we are about to leave.
         if report.busy != 0 || report.log != report.checkpointed {
-            let _ = publish_mailbox_path(file, &requested);
+            publish_mailbox_path(file, &requested)?;
             return Ok(requested);
         }
     }
-    if publish_mailbox_path(file, &stable).is_err() && requested != stable {
-        return Ok(requested);
-    }
+    // A path that cannot be recorded is not safe to open under another name.
+    publish_mailbox_path(file, &stable)?;
     Ok(stable)
 }
 
 #[cfg(unix)]
-fn published_mailbox_path(file: &std::fs::File, fallback: &Path) -> std::path::PathBuf {
+fn shared_mailbox_path(file: &std::fs::File) -> Result<std::path::PathBuf> {
+    read_published_path(file).ok_or_else(|| {
+        crate::Error::Invalid("mailbox is already open and its path was not published".into())
+    })
+}
+
+#[cfg(unix)]
+fn read_published_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     use xattr::FileExt;
 
-    let Ok(Some(bytes)) = file.get_xattr(OPEN_PATH_ATTR) else {
-        return fallback.to_path_buf();
-    };
-    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
-    if same_inode(file, &path) {
-        path
-    } else {
-        fallback.to_path_buf()
+    if reject_mailbox_xattr() {
+        return None;
     }
+    let bytes = file.get_xattr(OPEN_PATH_ATTR).ok()??;
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    same_inode(file, &path).then_some(path)
 }
 
 #[cfg(unix)]
@@ -924,8 +929,39 @@ fn publish_mailbox_path(file: &std::fs::File, path: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use xattr::FileExt;
 
-    file.set_xattr(OPEN_PATH_ATTR, path.as_os_str().as_bytes())?;
+    if reject_mailbox_xattr() {
+        return Err(crate::Error::Invalid(
+            "cannot publish the shared mailbox path".into(),
+        ));
+    }
+    file.set_xattr(OPEN_PATH_ATTR, path.as_os_str().as_bytes())
+        .map_err(|err| {
+            crate::Error::Invalid(format!("cannot publish the shared mailbox path: {err}"))
+        })?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn reject_mailbox_xattr() -> bool {
+    #[cfg(test)]
+    {
+        REJECT_MAILBOX_XATTR.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static REJECT_MAILBOX_XATTR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pretend this filesystem rejects the shared-path attribute.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_reject_mailbox_xattr(reject: bool) {
+    REJECT_MAILBOX_XATTR.with(|cell| cell.set(reject));
 }
 
 #[cfg(unix)]

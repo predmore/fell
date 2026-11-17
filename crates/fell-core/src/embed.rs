@@ -1457,6 +1457,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_missing_shared_path_does_not_open_another_name() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-noxattr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mail.sqlite");
+        drop(Store::open(&real).unwrap());
+        let alias = dir.join("alias.sqlite");
+        std::os::unix::fs::symlink("mail.sqlite", &alias).unwrap();
+        crate::store::testing_reject_mailbox_xattr(true);
+        let rejected = Store::open(&alias);
+        crate::store::testing_reject_mailbox_xattr(false);
+        assert!(rejected.is_err(), "unpublished alias opened");
+
+        let first = Store::open(&real).unwrap();
+        wait_until(|| first.embedding_indexer_running());
+        let link = dir.join("mail-link.sqlite");
+        std::fs::hard_link(&real, &link).unwrap();
+        crate::store::testing_reject_mailbox_xattr(true);
+        let via_alias = Store::open(&alias);
+        let via_link = Store::open(&link);
+        crate::store::testing_reject_mailbox_xattr(false);
+        assert!(via_alias.is_err(), "alias opened without the shared path");
+        assert!(
+            via_link.is_err(),
+            "hard link opened without the shared path"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_hard_link_joins_the_open_mailbox() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
