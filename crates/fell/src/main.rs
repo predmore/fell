@@ -15,11 +15,22 @@ use gpui::{
 use notify::{Event, RecursiveMode, Watcher};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let compose = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--theme" | "--narrow" | "--width" | "--height" | "--play"
+        )
+    });
+    if !compose {
+        fell::run();
+        return;
+    }
     let mut theme = ThemeKind::Dark;
     let mut width = 1100.0;
     let mut height = 760.0;
     let mut play = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--theme" => {
