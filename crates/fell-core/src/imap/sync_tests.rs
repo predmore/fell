@@ -813,6 +813,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         store
             .search(&acct.id, "oversizedmarker")
             .unwrap()
+            .hits
             .is_empty(),
         "the oversized body must not be stored"
     );

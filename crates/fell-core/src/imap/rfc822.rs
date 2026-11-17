@@ -127,7 +127,35 @@ pub(super) fn to_message(
         folders: vec![folder.to_string()],
         labels,
         arrived_via,
+        to: address_list(parsed.as_ref().and_then(|message| message.to())),
+        cc: address_list(parsed.as_ref().and_then(|message| message.cc())),
+        bcc: address_list(parsed.as_ref().and_then(|message| message.bcc())),
+        has_attachment: parsed
+            .as_ref()
+            .is_some_and(|message| message.has_attachments()),
     }
+}
+
+fn address_list(list: Option<mail_parser::AddressList<'_>>) -> Vec<Address> {
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    list.mailboxes()
+        .filter_map(|mailbox| {
+            let email = mailbox.address()?.trim();
+            if email.is_empty() {
+                return None;
+            }
+            let name = mailbox
+                .name()
+                .map(str::to_string)
+                .filter(|name| !name.is_empty());
+            Some(Address {
+                name,
+                email: email.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn proton_conversation(message: &mail_parser::Message<'_>) -> Option<String> {
