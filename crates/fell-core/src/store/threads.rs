@@ -45,8 +45,10 @@ CREATE TABLE IF NOT EXISTS thread_dirty_ids (
 /// Bump when [`THREAD_INDEX_TRIGGERS`] changes. Triggers are rebuilt only
 /// then, in one transaction, so no other connection writes while they are
 /// missing.
-const THREAD_TRIGGERS_VERSION: &str = "2";
+const THREAD_TRIGGERS_VERSION: &str = "3";
 
+// Inserts check NOT EXISTS instead of OR IGNORE: an UPSERT that fires a
+// trigger overrides the trigger's own conflict clause.
 const THREAD_INDEX_TRIGGERS: &str = r#"
 DROP TRIGGER IF EXISTS thread_dirty_insert;
 DROP TRIGGER IF EXISTS thread_dirty_update;
@@ -56,42 +58,68 @@ DROP TRIGGER IF EXISTS thread_dirty_alias_update;
 DROP TRIGGER IF EXISTS thread_dirty_alias_delete;
 
 CREATE TRIGGER thread_dirty_insert AFTER INSERT ON messages BEGIN
-    INSERT OR IGNORE INTO thread_dirty_rows (rowid) VALUES (new.rowid);
+    INSERT INTO thread_dirty_rows (rowid) SELECT new.rowid
+        WHERE NOT EXISTS (SELECT 1 FROM thread_dirty_rows WHERE rowid = new.rowid);
 END;
 
 CREATE TRIGGER thread_dirty_update AFTER UPDATE OF
     message_id, in_reply_to, references_header, proton_conversation_id
 ON messages BEGIN
-    INSERT OR IGNORE INTO thread_dirty_rows (rowid) VALUES (new.rowid);
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (old.account_id, old.message_id);
+    INSERT INTO thread_dirty_rows (rowid) SELECT new.rowid
+        WHERE NOT EXISTS (SELECT 1 FROM thread_dirty_rows WHERE rowid = new.rowid);
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT old.account_id, old.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = old.account_id AND message_id = old.message_id
+    );
 END;
 
 CREATE TRIGGER thread_dirty_delete AFTER DELETE ON messages BEGIN
     DELETE FROM message_refs WHERE child_rowid = old.rowid;
     DELETE FROM thread_dirty_rows WHERE rowid = old.rowid;
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (old.account_id, old.message_id);
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT old.account_id, old.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = old.account_id AND message_id = old.message_id
+    );
 END;
 
 CREATE TRIGGER thread_dirty_alias_insert AFTER INSERT ON message_aliases BEGIN
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (new.account_id, new.message_id);
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT new.account_id, new.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = new.account_id AND message_id = new.message_id
+    );
 END;
 
 CREATE TRIGGER thread_dirty_alias_update AFTER UPDATE OF
     message_id, canonical_message_id
 ON message_aliases BEGIN
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (old.account_id, old.message_id);
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (new.account_id, new.message_id);
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT old.account_id, old.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = old.account_id AND message_id = old.message_id
+    );
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT new.account_id, new.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = new.account_id AND message_id = new.message_id
+    );
 END;
 
 -- Replies stored under an alias id stop resolving through it.
 CREATE TRIGGER thread_dirty_alias_delete AFTER DELETE ON message_aliases BEGIN
-    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
-    VALUES (old.account_id, old.message_id);
+    INSERT INTO thread_dirty_ids (account_id, message_id)
+    SELECT old.account_id, old.message_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_dirty_ids
+        WHERE account_id = old.account_id AND message_id = old.message_id
+    );
 END;
 "#;
 
