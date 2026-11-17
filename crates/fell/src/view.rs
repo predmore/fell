@@ -206,6 +206,7 @@ impl Inbox {
             self.session.show_toast(archive_failure(&err), true);
             return;
         }
+        self.moved_thread = Some(id.clone());
         self.session.show_toast("Archived · u", false);
         if !self.reload_threads() {
             return;
@@ -849,12 +850,7 @@ fn names(
     } else {
         theme.dimmed
     };
-    let mut line = div()
-        .flex()
-        .flex_row()
-        .gap(px(6.))
-        .min_w(px(0.))
-        .overflow_hidden();
+    let mut line = div().flex().flex_row().min_w(px(0.)).overflow_hidden();
     for (index, span) in spans.iter().enumerate() {
         let span_weight = if weight == FontWeight::BOLD {
             FontWeight::BOLD
@@ -867,7 +863,7 @@ fn names(
         let text = if last {
             span.text.clone()
         } else {
-            format!("{},", span.text)
+            format!("{}, ", span.text)
         };
         line = line.child(
             div()
