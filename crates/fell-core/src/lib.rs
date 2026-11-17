@@ -8,6 +8,7 @@
 pub mod account;
 pub mod actions;
 pub mod backend;
+pub mod imap;
 pub mod message;
 pub mod search;
 pub mod send;
@@ -18,8 +19,10 @@ pub mod threading;
 pub use account::{Account, AccountId, BackendKind};
 pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use backend::{
-    BridgeBackend, FixtureBackend, MailBackend, MailboxDelta, ProtonApiBackend, SyncCursor,
+    BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
+    SyncCursor,
 };
+pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
@@ -27,7 +30,7 @@ pub use store::{Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
-/// Crate-wide error. IMAP/Proton failures will map here once those backends exist.
+/// Crate-wide error. IMAP failures use [`Error::Backend`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("store: {0}")]

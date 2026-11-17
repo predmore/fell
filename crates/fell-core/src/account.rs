@@ -11,8 +11,10 @@ impl AccountId {
 /// How this account reaches Proton Mail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Proton Mail Bridge over local IMAP/SMTP. Bridge is a separate GPL-3.0 process.
+    /// Proton Mail Bridge over local IMAP. Bridge is a separate GPL-3.0 process.
     Bridge,
+    /// Any other IMAP account. Same read-only client as Bridge.
+    Imap,
     /// Direct Proton API. Not implemented yet; same [`crate::MailBackend`] trait.
     ProtonApi,
 }
@@ -21,6 +23,7 @@ impl BackendKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bridge => "bridge",
+            Self::Imap => "imap",
             Self::ProtonApi => "proton_api",
         }
     }
@@ -28,6 +31,7 @@ impl BackendKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "bridge" => Some(Self::Bridge),
+            "imap" => Some(Self::Imap),
             "proton_api" => Some(Self::ProtonApi),
             _ => None,
         }

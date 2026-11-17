@@ -248,6 +248,17 @@ impl Store {
             };
             insert_message(&tx, &message)?;
         }
+        for flag in &delta.flags {
+            tx.execute(
+                "UPDATE messages SET unread = ?1
+                 WHERE account_id = ?2 AND remote_id = ?3",
+                params![
+                    i64::from(flag.unread),
+                    account_id.as_str(),
+                    flag.remote_id.0
+                ],
+            )?;
+        }
         if !delta.messages.is_empty() {
             rethread(&tx, account_id)?;
         }
@@ -1193,6 +1204,7 @@ mod tests {
                         msg("reply@x", None, Some("root@x"), "Re: Root", "reply"),
                     ],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1202,6 +1214,7 @@ mod tests {
                 &MailboxDelta {
                     messages: vec![msg("root@x", Some("conv-9"), None, "Root", "root")],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1224,6 +1237,7 @@ mod tests {
                         msg("reply@x", Some("conv"), Some("root@x"), "Re: Root", "reply"),
                     ],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1246,6 +1260,7 @@ mod tests {
                         msg("reply@x", None, Some("root@x"), "Re: Root", "reply"),
                     ],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1280,6 +1295,7 @@ mod tests {
                         account_key: "a1".into(),
                         token: "cursor-only".into(),
                     }),
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1310,6 +1326,7 @@ mod tests {
                         account_key: "a1".into(),
                         token: "should-not-stick".into(),
                     }),
+                    flags: Vec::new(),
                 },
             )
             .unwrap_err();
@@ -1345,6 +1362,7 @@ mod tests {
                         account_key: "a1".into(),
                         token: "must-not-advance".into(),
                     }),
+                    flags: Vec::new(),
                 },
             )
             .unwrap_err();
@@ -1495,6 +1513,7 @@ mod tests {
                         msg("reply-b@x", Some("conv-b"), Some("root@x"), "Re: Root", "b"),
                     ],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1562,6 +1581,7 @@ mod tests {
                 &MailboxDelta {
                     messages: vec![sent, alias_a, alias_b],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();

@@ -9,8 +9,14 @@ rust-version.workspace = true
 
 [dependencies]
 fell-confirm.workspace = true
+mail-parser = { version = "1.0.1", default-features = false, features = ["full_encoding"] }
 rusqlite.workspace = true
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 thiserror.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"

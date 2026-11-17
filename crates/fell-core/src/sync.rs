@@ -16,9 +16,11 @@ pub fn sync_once(
 ) -> Result<SyncReport> {
     store.upsert_account(account)?;
     let cursor = store.sync_cursor(&account.id)?;
-    let delta = backend.fetch_changes(cursor.as_ref())?;
-    let upserted = delta.messages.len();
-    store.apply_delta(&account.id, &delta)?;
+    let mut upserted = 0;
+    backend.sync_changes(cursor.as_ref(), &mut |delta| {
+        upserted += delta.messages.len();
+        store.apply_delta(&account.id, &delta)
+    })?;
     Ok(SyncReport { upserted })
 }
 

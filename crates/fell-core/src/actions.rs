@@ -1673,6 +1673,7 @@ mod tests {
                 &MailboxDelta {
                     messages: vec![message],
                     cursor: None,
+                    flags: Vec::new(),
                 },
             )
             .unwrap();
@@ -1904,6 +1905,7 @@ mod tests {
                         account_key: "a1".into(),
                         token: "cursor-2".into(),
                     }),
+                    flags: Vec::new(),
                 },
             )
             .unwrap();

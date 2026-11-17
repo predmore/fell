@@ -26,16 +26,21 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 
 ## Backends
 
-`MailBackend` is the seam. Two implementations are planned; both are stubs in this foundation:
+`MailBackend` is the seam.
 
-1. **Bridge** — local IMAP/SMTP against [Proton Mail Bridge](https://proton.me/mail/bridge). First backend.
-2. **Proton API** — direct Proton HTTP API. Same trait, later.
+1. **Bridge** — Proton Mail Bridge over local IMAP. Read-only sync uses the generic IMAP client with Bridge's usual host and port. Bridge stays a separate process. SMTP is not connected.
+2. **IMAP** — any other IMAP account. Same read-only client.
+3. **Proton API** — direct Proton HTTP API. Same trait, not implemented.
+
+Sync logs in, lists mailboxes, and `EXAMINE`s each one (read-only). New mail is `UID FETCH` with `BODY.PEEK`, so the server is not asked to mark mail read. A cursor stores UIDVALIDITY, the highest UID, and HIGHESTMODSEQ when the server advertises CONDSTORE. The next sync fetches only newer UIDs, or `CHANGEDSINCE` when a modseq is known. IDLE and removal of messages that vanished on the server are later. There is no SMTP, no OAuth, and no send command.
 
 The UI and MCP crates take `dyn MailBackend` (or a store already populated by sync). They do not import IMAP or Proton protocol code.
 
 ## Local store
 
 SQLite is the source of truth for the UI. Sync writes messages, threads, and an FTS5 index. Reads do not block on the network. If Bridge or the API is down, the last synced mailbox still renders.
+
+Each IMAP mailbox is one folder on the message. A message with no Message-ID is stored under a stable id from the mailbox, UIDVALIDITY, and UID. Copies with the same Message-ID stay one row; see Threading.
 
 ## Search
 
