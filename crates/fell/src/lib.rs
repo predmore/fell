@@ -82,7 +82,18 @@ mod tests {
             let blocked = send_from_editor(session, backend.as_ref()).unwrap_err();
             assert!(blocked.contains("on screen"), "{blocked}");
             session.mark_seen();
-            let sent = send_from_editor(session, backend.as_ref()).unwrap();
+            // The chart on screen is hashed off the editor's thread first;
+            // until then send asks to try again, as a person would.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let sent = loop {
+                match send_from_editor(session, backend.as_ref()) {
+                    Err(err) if err.contains("still checking") => {
+                        assert!(std::time::Instant::now() < deadline, "{err}");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => break other.unwrap(),
+                }
+            };
             assert_eq!(sent.remote_id.0, "fixture-sent");
         })
         .unwrap();
