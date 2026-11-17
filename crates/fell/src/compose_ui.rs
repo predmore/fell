@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fell_core::compose::{
-    BlockBody, DraftHub, HunkKind, Snapshot, StyleKind, StyledDoc, html_to_doc, line_styles,
-    markdown_to_doc,
+    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyledDoc, html_to_doc,
+    line_styles, markdown_to_doc,
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
@@ -532,10 +532,16 @@ impl ComposeView {
 
     /// Check and build the message under the draft lock, then talk to SMTP
     /// on a background thread. The window keeps painting while Bridge
-    /// answers, and a second send waits for the first to finish.
+    /// answers. The draft is claimed for the send before it starts, so a
+    /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
         if self.sending {
             self.status = "Sending…".into();
+            return;
+        }
+        let id = self.draft_id.to_string();
+        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
+            self.status = lock.reason().into();
             return;
         }
         if self.field != Field::Body && !self.commit_field(self.field) {
@@ -546,13 +552,11 @@ impl ComposeView {
             return;
         }
         self.flush_now();
-        let id = self.draft_id.to_string();
         let prepared = self.hub.with_session(&id, prepare_from_editor);
         let prepared = match prepared {
             Some(Ok(prepared)) => prepared,
             Some(Err(err)) => {
-                self.sent = false;
-                self.status = format!("Not sent: {err}").into();
+                self.status = err.to_string().into();
                 return;
             }
             None => {
@@ -566,9 +570,7 @@ impl ComposeView {
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    prepared.transmit(|| hub.with_session(&id, |session| session.revision()))
-                })
+                .spawn(async move { transmit_from_hub(&hub, &id, prepared, account_backend) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.sending = false;
@@ -578,8 +580,8 @@ impl ComposeView {
                         this.status = "Sent from the editor".into();
                     }
                     Err(err) => {
-                        this.sent = false;
-                        this.status = format!("Not sent: {err}").into();
+                        this.sent = matches!(err, SendFailure::MaybeSent(_));
+                        this.status = err.to_string().into();
                     }
                 }
                 cx.notify();
@@ -1246,13 +1248,64 @@ impl Drop for ComposeView {
     }
 }
 
+/// Why a send from the editor did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendFailure {
+    /// Another send of this draft is running, or one went or may have gone out.
+    Locked(SendLock),
+    /// Nothing was transmitted. The draft can be sent again.
+    NotSent(String),
+    /// The connection failed after the server had the whole message. The
+    /// draft stays locked so it is not sent twice.
+    MaybeSent(String),
+}
+
+impl SendFailure {
+    fn from_core(err: fell_core::Error) -> Self {
+        match err {
+            fell_core::Error::SendUncertain(detail) => Self::MaybeSent(detail),
+            other => Self::NotSent(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked(lock) => f.write_str(lock.reason()),
+            Self::NotSent(detail) => write!(f, "Not sent: {detail}"),
+            Self::MaybeSent(detail) => {
+                write!(
+                    f,
+                    "May have been sent: {detail}. Check Sent before sending again"
+                )
+            }
+        }
+    }
+}
+
+/// The lock a finished send leaves on its draft.
+fn lock_after(result: &Result<fell_core::SentMessage, SendFailure>) -> Option<SendLock> {
+    match result {
+        Ok(_) => Some(SendLock::Sent),
+        Err(SendFailure::MaybeSent(_)) => Some(SendLock::MaybeSent),
+        // A refused claim leaves the other send's lock in place.
+        Err(SendFailure::Locked(lock)) => Some(*lock),
+        Err(SendFailure::NotSent(_)) => None,
+    }
+}
+
 /// Check and send the draft on screen in one call. Blocks on SMTP, so the
 /// window uses [`prepare_from_editor`] and transmits off its thread.
 pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
-) -> Result<fell_core::SentMessage, String> {
-    prepare_from_editor(session)?.transmit_with(backend)
+) -> Result<fell_core::SentMessage, SendFailure> {
+    let prepared = prepare_from_editor(session)?;
+    let revision = prepared.revision;
+    let result = prepared.transmit_checked(backend, || Some(revision));
+    session.end_send(lock_after(&result));
+    result
 }
 
 /// The message the editor is about to send, checked and built while the
@@ -1265,11 +1318,16 @@ pub struct PreparedSend {
     files: Vec<fell_core::SubmittedFile>,
 }
 
-/// Run the editor's send checks and read the attachments. No network.
+/// Run the editor's send checks, read the attachments, and claim the draft
+/// for this send. No network. Every success must be followed by
+/// [`fell_core::compose::DraftSession::end_send`].
 pub fn prepare_from_editor(
     session: &mut fell_core::compose::DraftSession,
-) -> Result<PreparedSend, String> {
-    let outgoing = session.prepare_send()?;
+) -> Result<PreparedSend, SendFailure> {
+    if let Some(lock) = session.send_lock() {
+        return Err(SendFailure::Locked(lock));
+    }
+    let outgoing = session.prepare_send().map_err(SendFailure::NotSent)?;
     let files = session
         .resolved_files()
         .into_iter()
@@ -1279,6 +1337,7 @@ pub fn prepare_from_editor(
             inline: file.inline,
         })
         .collect();
+    session.begin_send().map_err(SendFailure::NotSent)?;
     Ok(PreparedSend {
         account: session.account_id().clone(),
         revision: session.revision(),
@@ -1287,38 +1346,52 @@ pub fn prepare_from_editor(
     })
 }
 
+/// The backend for a send from the window: the demo mailbox, or the account
+/// file's login and SMTP settings for this account id. Runs
+/// `password_command`, so call it off the UI thread.
+fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure> {
+    let config = crate::mailbox::send_account_config(account).map_err(SendFailure::NotSent)?;
+    fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)
+}
+
+/// Transmit a send [`prepare_from_editor`] claimed and record how it ended on
+/// the draft, even if the window closed meanwhile. Blocks on SMTP.
+pub(crate) fn transmit_from_hub(
+    hub: &DraftHub,
+    id: &str,
+    prepared: PreparedSend,
+    backend: impl FnOnce(&AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure>,
+) -> Result<fell_core::SentMessage, SendFailure> {
+    let result = backend(&prepared.account).and_then(|backend| {
+        prepared.transmit_checked(backend.as_ref(), || {
+            hub.with_session(id, |session| session.revision())
+        })
+    });
+    hub.with_session(id, |session| session.end_send(lock_after(&result)));
+    result
+}
+
 impl PreparedSend {
-    /// Submit and confirm through the account's backend. Blocks on SMTP.
-    /// `revision_now` reads the draft's revision right before the message is
-    /// handed to SMTP; if anything changed since the checks, nothing is sent.
-    pub fn transmit(
-        self,
-        revision_now: impl FnOnce() -> Option<u64>,
-    ) -> Result<fell_core::SentMessage, String> {
-        let backend = fell_core::backend_for(&self.account);
-        self.transmit_checked(backend.as_ref(), revision_now)
-    }
-
-    fn transmit_with(self, backend: &dyn MailBackend) -> Result<fell_core::SentMessage, String> {
-        let revision = self.revision;
-        self.transmit_checked(backend, || Some(revision))
-    }
-
+    /// Submit and confirm through `backend`. Blocks on SMTP. `revision_now`
+    /// reads the draft's revision right before the message is handed to
+    /// SMTP; if anything changed since the checks, nothing is sent.
     fn transmit_checked(
         self,
         backend: &dyn MailBackend,
         revision_now: impl FnOnce() -> Option<u64>,
-    ) -> Result<fell_core::SentMessage, String> {
+    ) -> Result<fell_core::SentMessage, SendFailure> {
         let pending = backend
             .submit_composed(self.outgoing.draft, self.outgoing.mime, self.files)
-            .map_err(|err| err.to_string())?;
+            .map_err(SendFailure::from_core)?;
         if revision_now() != Some(self.revision) {
-            return Err("the draft changed while sending; nothing was sent".into());
+            return Err(SendFailure::NotSent(
+                "the draft changed while sending; nothing was sent".into(),
+            ));
         }
         let confirm = confirmation_from_ui(&pending);
         backend
             .confirm_send(pending, confirm)
-            .map_err(|err| err.to_string())
+            .map_err(SendFailure::from_core)
     }
 }
 

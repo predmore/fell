@@ -53,10 +53,17 @@ impl DraftHub {
 
     /// Add a live draft. Its saves run on a writer thread from now on, so
     /// holding the session lock never waits for disk.
+    /// Replacing a session keeps its send lock, so reopening a draft that
+    /// was sent, or is being sent, does not make it sendable again.
     pub fn insert(&self, mut session: DraftSession) {
         session.attach_writer();
         let id = session.id().to_string();
-        self.sessions.lock().expect("sessions").insert(id, session);
+        let mut sessions = self.sessions.lock().expect("sessions");
+        if let Some(previous) = sessions.get(&id) {
+            session.inherit_send_lock(previous);
+        }
+        sessions.insert(id, session);
+        drop(sessions);
         self.emit();
     }
 
@@ -631,6 +638,52 @@ mod tests {
         assert!(requested.get("remote_id").is_none());
         let offline = request_send_without_editor();
         assert_eq!(offline["transmitted"], false);
+    }
+
+    #[test]
+    fn reopening_a_sent_draft_keeps_it_locked() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-sent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
+        let open = || {
+            DraftSession::create(
+                folder.clone(),
+                "d1",
+                AccountId("a".into()),
+                fields.clone(),
+                "alpha\n",
+            )
+            .unwrap()
+        };
+        let hub = DraftHub::new();
+        hub.insert(open());
+        hub.with_session("d1", |session| {
+            session.begin_send().unwrap();
+            session.end_send(Some(super::super::SendLock::Sent));
+        });
+        hub.insert(open());
+        let lock = hub.with_session("d1", |session| {
+            session.mark_seen();
+            assert!(session.prepare_send().is_err());
+            session.send_lock()
+        });
+        assert_eq!(lock, Some(Some(super::super::SendLock::Sent)));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

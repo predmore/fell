@@ -13,18 +13,23 @@
 //! # host = "127.0.0.1"
 //! # port = 1143
 //! # security = "starttls"       # "starttls", "tls", or "plain"
+//! # smtp_host = "127.0.0.1"     # defaults to host
+//! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
+//! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! ```
+//!
+//! Sending uses only this file's username and password, never anything in a
+//! draft folder. `smtp_security = "starttls"` (the default) refuses a server
+//! that does not offer STARTTLS rather than log in over cleartext.
 
 use std::fmt;
 use std::process::Command;
 
 use crate::account::{Account, AccountId, BackendKind};
-use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
+use crate::backend::{BridgeBackend, DEMO_ACCOUNT_IDS, ImapBackend, MailBackend};
 use crate::imap::{ImapConfig, ImapSecurity};
+use crate::smtp::SmtpConfig;
 use crate::{Error, Result};
-
-/// Ids that [`crate::backend_for`] maps to the in-process demo backend.
-const RESERVED_IDS: [&str; 3] = ["local", "fixture", "demo"];
 
 /// Where the IMAP password comes from.
 #[derive(Clone, PartialEq, Eq)]
@@ -54,6 +59,10 @@ pub struct AccountConfig {
     pub security: ImapSecurity,
     pub username: String,
     pub password: PasswordSource,
+    /// SMTP settings left unset use [`AccountConfig::smtp_config`]'s defaults.
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_security: Option<ImapSecurity>,
 }
 
 impl AccountConfig {
@@ -74,6 +83,9 @@ impl AccountConfig {
             security: ImapSecurity::StartTls,
             username: username.into(),
             password,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_security: None,
         }
     }
 
@@ -136,16 +148,7 @@ impl AccountConfig {
             .unwrap_or_else(|| default_host.to_string());
         let security = match get("security") {
             None => default_security,
-            Some(value) => match value.text("security")?.as_str() {
-                "starttls" => ImapSecurity::StartTls,
-                "tls" => ImapSecurity::Tls,
-                "plain" => ImapSecurity::Plain,
-                other => {
-                    return Err(invalid(format!(
-                        "security must be \"starttls\", \"tls\", or \"plain\", not {other:?}"
-                    )));
-                }
-            },
+            Some(value) => value.security("security")?,
         };
         let port = match get("port") {
             Some(value) => value.port()?,
@@ -161,6 +164,11 @@ impl AccountConfig {
             (None, Some(value)) => PasswordSource::Command(value.text("password_command")?),
             (None, None) => return Err(invalid("password or password_command is required")),
         };
+        let smtp_host = get("smtp_host").map(|v| v.text("smtp_host")).transpose()?;
+        let smtp_port = get("smtp_port").map(Value::port).transpose()?;
+        let smtp_security = get("smtp_security")
+            .map(|v| v.security("smtp_security"))
+            .transpose()?;
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -175,13 +183,16 @@ impl AccountConfig {
             security,
             username,
             password,
+            smtp_host,
+            smtp_port,
+            smtp_security,
         };
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
-        if self.id.is_empty() || RESERVED_IDS.contains(&self.id.as_str()) {
+        if self.id.is_empty() || DEMO_ACCOUNT_IDS.contains(&self.id.as_str()) {
             return Err(invalid(format!(
                 "id {:?} is reserved for the demo mailbox",
                 self.id
@@ -199,6 +210,15 @@ impl AccountConfig {
         if self.security == ImapSecurity::Plain && !self.is_loopback() {
             return Err(invalid(
                 "security = \"plain\" is only allowed for a loopback address like 127.0.0.1",
+            ));
+        }
+        if self.smtp_host.as_ref().is_some_and(|host| host.is_empty()) {
+            return Err(invalid("smtp_host is empty"));
+        }
+        let smtp = self.smtp_config();
+        if smtp.security == ImapSecurity::Plain && !literal_loopback(&smtp.host) {
+            return Err(invalid(
+                "smtp_security = \"plain\" is only allowed for a loopback address like 127.0.0.1",
             ));
         }
         match &self.password {
@@ -219,11 +239,7 @@ impl AccountConfig {
             BackendKind::Imap => "imap",
             _ => "bridge",
         };
-        let security = match self.security {
-            ImapSecurity::StartTls => "starttls",
-            ImapSecurity::Tls => "tls",
-            ImapSecurity::Plain => "plain",
-        };
+        let security = security_name(self.security);
         push(&mut out, "backend", backend);
         if self.id != "mail" {
             push(&mut out, "id", &self.id);
@@ -240,6 +256,15 @@ impl AccountConfig {
         push(&mut out, "host", &self.host);
         out.push_str(&format!("port = {}\n", self.port));
         push(&mut out, "security", security);
+        if let Some(host) = &self.smtp_host {
+            push(&mut out, "smtp_host", host);
+        }
+        if let Some(port) = self.smtp_port {
+            out.push_str(&format!("smtp_port = {port}\n"));
+        }
+        if let Some(security) = self.smtp_security {
+            push(&mut out, "smtp_security", security_name(security));
+        }
         out
     }
 
@@ -260,27 +285,51 @@ impl AccountConfig {
     /// does not count: it is resolved at connect time and may reach another
     /// machine, which must never get plaintext or an unchecked certificate.
     pub fn is_loopback(&self) -> bool {
-        self.host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        literal_loopback(&self.host)
+    }
+
+    /// Where this account submits mail. Unset keys default to `host`, then
+    /// Bridge's STARTTLS port 1025, or 587 (STARTTLS) / 465 (TLS) for imap.
+    /// Plaintext is never a default.
+    pub fn smtp_config(&self) -> SmtpConfig {
+        let host = self.smtp_host.clone().unwrap_or_else(|| self.host.clone());
+        let security = self
+            .smtp_security
+            .unwrap_or(match (self.backend, self.security) {
+                (BackendKind::Imap, ImapSecurity::Tls) => ImapSecurity::Tls,
+                _ => ImapSecurity::StartTls,
+            });
+        let port = self.smtp_port.unwrap_or(match (self.backend, security) {
+            (BackendKind::Imap, ImapSecurity::Tls) => 465,
+            (BackendKind::Imap, _) => 587,
+            _ => 1025,
+        });
+        SmtpConfig {
+            // Same rule as IMAP: only Bridge on this machine skips the
+            // certificate check.
+            accept_invalid_certs: self.backend == BackendKind::Bridge && literal_loopback(&host),
+            host,
+            port,
+            security,
+        }
     }
 
     /// Resolve the password (running `password_command` if set) and build the backend.
     pub fn backend(&self) -> Result<Box<dyn MailBackend + Send>> {
-        let imap = self.imap_config()?;
-        let account_id = AccountId(self.id.clone());
         Ok(match self.backend {
             BackendKind::Imap => Box::new(ImapBackend {
-                account_id,
-                config: imap,
+                account_id: AccountId(self.id.clone()),
+                config: self.imap_config()?,
             }),
-            _ => Box::new(BridgeBackend {
-                account_id,
-                imap,
-                ..BridgeBackend::default()
-            }),
+            _ => Box::new(self.bridge_backend()?),
+        })
+    }
+
+    pub(crate) fn bridge_backend(&self) -> Result<BridgeBackend> {
+        Ok(BridgeBackend {
+            account_id: AccountId(self.id.clone()),
+            imap: self.imap_config()?,
+            smtp: self.smtp_config(),
         })
     }
 
@@ -389,6 +438,17 @@ impl Value {
         }
     }
 
+    fn security(self, key: &str) -> Result<ImapSecurity> {
+        match self.text(key)?.as_str() {
+            "starttls" => Ok(ImapSecurity::StartTls),
+            "tls" => Ok(ImapSecurity::Tls),
+            "plain" => Ok(ImapSecurity::Plain),
+            other => Err(invalid(format!(
+                "{key} must be \"starttls\", \"tls\", or \"plain\", not {other:?}"
+            ))),
+        }
+    }
+
     fn port(self) -> Result<u16> {
         match self {
             Self::Number(number) => u16::try_from(number)
@@ -441,6 +501,22 @@ fn parse_value(raw: &str) -> std::result::Result<Value, String> {
         .map(Value::Number)
         // Never repeat the value: it may be a password typed without quotes.
         .map_err(|_| "the value must be a quoted string or a number".into())
+}
+
+/// A literal loopback address. A name such as `localhost` does not count.
+fn literal_loopback(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn security_name(security: ImapSecurity) -> &'static str {
+    match security {
+        ImapSecurity::StartTls => "starttls",
+        ImapSecurity::Tls => "tls",
+        ImapSecurity::Plain => "plain",
+    }
 }
 
 fn push(out: &mut String, key: &str, value: &str) {
@@ -646,6 +722,63 @@ mod tests {
         for (message, kind) in cases {
             assert_eq!(classify_sync_error(&Error::Backend(message.into())), kind);
         }
+    }
+
+    #[test]
+    fn smtp_defaults_never_choose_plaintext() {
+        let bridge = AccountConfig::parse("email = \"a@b\"\npassword = \"x\"\n").unwrap();
+        assert_eq!(bridge.smtp_config(), SmtpConfig::bridge_local());
+        let plain_imap = AccountConfig::parse(
+            "email = \"a@b\"\npassword = \"x\"\nhost = \"127.0.0.1\"\nsecurity = \"plain\"\n",
+        )
+        .unwrap();
+        assert_eq!(plain_imap.smtp_config().security, ImapSecurity::StartTls);
+        let imap = AccountConfig::parse(
+            "backend = \"imap\"\nemail = \"a@b\"\npassword = \"x\"\nhost = \"imap.b\"",
+        )
+        .unwrap();
+        let smtp = imap.smtp_config();
+        assert_eq!(
+            (smtp.host.as_str(), smtp.port, smtp.security),
+            ("imap.b", 465, ImapSecurity::Tls)
+        );
+        assert!(!smtp.accept_invalid_certs);
+    }
+
+    #[test]
+    fn smtp_keys_parse_round_trip_and_plain_needs_loopback() {
+        let config = AccountConfig::parse(
+            "email = \"a@b\"\npassword = \"x\"\nsmtp_host = \"::1\"\nsmtp_port = 2525\nsmtp_security = \"plain\"\n",
+        )
+        .unwrap();
+        let smtp = config.smtp_config();
+        assert_eq!(
+            (smtp.host.as_str(), smtp.port, smtp.security),
+            ("::1", 2525, ImapSecurity::Plain)
+        );
+        assert!(smtp.accept_invalid_certs);
+        assert_eq!(AccountConfig::parse(&config.render()).unwrap(), config);
+
+        for (extra, needle) in [
+            (
+                "smtp_host = \"localhost\"\nsmtp_security = \"plain\"",
+                "loopback",
+            ),
+            (
+                "smtp_host = \"smtp.b\"\nsmtp_security = \"plain\"",
+                "loopback",
+            ),
+            ("smtp_security = \"none\"", "smtp_security must be"),
+            ("smtp_host = \"\"", "smtp_host is empty"),
+            ("smtp_port = 0", "out of range"),
+        ] {
+            let text = format!("email = \"a@b\"\npassword = \"x\"\n{extra}\n");
+            let err = AccountConfig::parse(&text).unwrap_err().to_string();
+            assert!(err.contains(needle), "{extra:?}: {err}");
+        }
+        let mut remote = AccountConfig::bridge("a@b", "a@b", PasswordSource::Inline("x".into()));
+        remote.smtp_host = Some("smtp.example.com".into());
+        assert!(!remote.smtp_config().accept_invalid_certs);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use fell_core::{Account, AccountConfig, Store};
+use fell_core::{Account, AccountConfig, AccountId, Store};
 
 use crate::fixtures::{fixture_account, seed_if_empty};
 use crate::keymap::{self, Keymap};
@@ -110,6 +110,16 @@ fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, String> {
     AccountConfig::parse(&text)
         .map(Some)
         .map_err(|err| format!("{shown}: {err}"))
+}
+
+/// The account file a send from `account` takes its login and SMTP settings
+/// from, read now with the same mode check as at startup. Never the draft
+/// folder or anything an agent can write. The demo mailbox needs none.
+pub fn send_account_config(account: &AccountId) -> Result<Option<AccountConfig>, String> {
+    if fell_core::is_demo_account(account) {
+        return Ok(None);
+    }
+    load_account_config()
 }
 
 /// The account file for `fell account show|check`, with the same mode check
