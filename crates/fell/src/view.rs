@@ -110,6 +110,9 @@ struct Inbox {
     read_in_flight: bool,
     /// Asked for while a read was in flight. Issued when it lands.
     read_wanted: Option<ReadIntent>,
+    /// Threads taken out of the list whose archive or move has not landed.
+    /// A read that started before the write cannot paint them back.
+    pending_removals: std::collections::HashSet<String>,
     /// Bumped by every conversation read. The store thread skips a read that
     /// is already stale, so holding `j` does not build a backlog.
     conv_gen: Arc<AtomicU64>,
@@ -163,6 +166,7 @@ impl Inbox {
             list_folder: "INBOX".into(),
             read_in_flight: false,
             read_wanted: None,
+            pending_removals: std::collections::HashSet::new(),
             conv_gen: Arc::new(AtomicU64::new(0)),
         };
         let sync_with = config.zip(startup.path.ok());
@@ -307,7 +311,7 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) {
         self.session.loading = false;
-        let (rows, names) = match result {
+        let (mut rows, names) = match result {
             Ok(found) => found,
             Err(err) => {
                 if intent.switch {
@@ -323,6 +327,9 @@ impl Inbox {
             self.session.folders = names;
         }
         let switched = folder != self.list_folder;
+        if !switched {
+            rows.retain(|row| !self.pending_removals.contains(&row.id));
+        }
         self.list_folder = folder;
         if switched
             && let Some(id) = &self.session.cursor_id
@@ -440,7 +447,8 @@ impl Inbox {
                         // Sync adding to the thread being read must not pull a
                         // reader who scrolled up back to the bottom.
                         let follow = if same {
-                            inbox.session.refresh_messages(view)
+                            let bottom = inbox.conversation_at_bottom();
+                            inbox.session.refresh_messages(view, bottom)
                         } else {
                             inbox.session.set_messages(view);
                             true
@@ -547,6 +555,7 @@ impl Inbox {
             move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
             move |inbox, result| match result {
                 Ok(()) => {
+                    inbox.pending_removals.remove(&id);
                     inbox.moved_thread = Some(id);
                     inbox.session.show_toast("Archived · u", false);
                     Some(ReadIntent {
@@ -555,6 +564,7 @@ impl Inbox {
                     })
                 }
                 Err(err) => {
+                    inbox.pending_removals.remove(&id);
                     inbox.session.show_toast(archive_failure(&err), true);
                     Some(ReadIntent {
                         changed: true,
@@ -585,6 +595,7 @@ impl Inbox {
             move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
             move |inbox, result| match result {
                 Ok(()) => {
+                    inbox.pending_removals.remove(&id);
                     inbox.moved_thread = Some(id);
                     let label = present::folder_label(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
@@ -594,6 +605,7 @@ impl Inbox {
                     })
                 }
                 Err(err) => {
+                    inbox.pending_removals.remove(&id);
                     inbox.session.show_toast(err.to_string(), true);
                     Some(ReadIntent {
                         changed: true,
@@ -609,6 +621,7 @@ impl Inbox {
     /// Remove `id` from the rows on screen before its write lands and open
     /// the row that took its place.
     fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.pending_removals.insert(id.to_string());
         self.session.remove_thread(id);
         self.scroll_list_to_cursor();
         self.request_messages(true, cx);
@@ -753,6 +766,13 @@ impl Inbox {
         if index < self.session.messages.len() {
             self.session.message_cursor = index;
         }
+    }
+
+    /// The conversation viewport is scrolled to its end (or does not scroll).
+    fn conversation_at_bottom(&self) -> bool {
+        let max = f32::from(self.conv_scroll.max_offset().height);
+        let offset = f32::from(self.conv_scroll.offset().y);
+        max <= 1.0 || offset <= -max + 24.0
     }
 
     fn scroll_conversation(&mut self) {

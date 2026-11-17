@@ -471,11 +471,22 @@ impl Session {
     /// A reader on the last message follows to the new last one. A reader
     /// further up keeps their message and opened quotes. Returns whether the
     /// cursor moved to the end.
-    pub fn refresh_messages(&mut self, messages: Vec<ConvMessage>) -> bool {
-        let at_end = self.message_cursor + 1 >= self.messages.len();
+    ///
+    /// `viewport_at_end` is whether the conversation is scrolled to its
+    /// bottom: a reader who scrolled up with the wheel is not following.
+    /// Messages already on screen keep their open or closed state.
+    pub fn refresh_messages(
+        &mut self,
+        mut messages: Vec<ConvMessage>,
+        viewport_at_end: bool,
+    ) -> bool {
+        let at_end = viewport_at_end && self.message_cursor + 1 >= self.messages.len();
         if at_end {
             self.set_messages(messages);
             return true;
+        }
+        for (new, old) in messages.iter_mut().zip(&self.messages) {
+            new.expanded = old.expanded;
         }
         let cursor = self.message_cursor;
         let len = messages.len();
@@ -492,6 +503,14 @@ impl Session {
         let Some(index) = self.threads.iter().position(|thread| thread.id == id) else {
             return;
         };
+        // A visual range loses an end: end the range instead of letting the
+        // next row join it.
+        if self.visual
+            && (self.anchor_id.as_deref() == Some(id) || self.cursor_id.as_deref() == Some(id))
+        {
+            self.visual = false;
+            self.anchor_id = None;
+        }
         self.threads.remove(index);
         self.picked.remove(id);
         if self.cursor_id.as_deref() == Some(id) {
@@ -1348,6 +1367,19 @@ mod tests {
         session.cursor_id = Some(last.clone());
         session.remove_thread(&last);
         assert_eq!(session.cursor_id.as_deref(), Some(before_last.as_str()));
+    }
+
+    #[test]
+    fn removing_the_cursor_end_of_a_visual_range_ends_it() {
+        let mut session = session();
+        let ids: Vec<String> = session.threads.iter().map(|row| row.id.clone()).collect();
+        session.cursor_id = Some(ids[0].clone());
+        session.on_key(KeyId::Char('V'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        assert!(session.visual);
+        session.remove_thread(&ids[1]);
+        assert!(!session.visual);
+        assert_eq!(session.highlighted().len(), 1);
     }
 
     #[test]

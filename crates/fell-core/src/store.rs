@@ -309,11 +309,19 @@ impl Store {
     /// instead of holding writers back for the busy timeout. Returns the
     /// frames left in the log, or -1 when the reset was skipped.
     pub fn checkpoint(&self, truncate: bool) -> Result<i64> {
+        /// Puts the normal lock wait back however the checkpoint ends.
+        struct RestoreTimeout<'a>(&'a Connection);
+        impl Drop for RestoreTimeout<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.busy_timeout(Duration::from_secs(5));
+            }
+        }
         let sql = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE)"
         } else {
             "PRAGMA wal_checkpoint(PASSIVE)"
         };
+        let _restore = truncate.then(|| RestoreTimeout(&self.conn));
         if truncate {
             self.conn.busy_timeout(Duration::ZERO)?;
         }
@@ -324,9 +332,6 @@ impl Store {
                 row.get::<_, i64>(2)?,
             ))
         });
-        if truncate {
-            self.conn.busy_timeout(Duration::from_secs(5))?;
-        }
         match result {
             Ok((busy, _, _)) if busy != 0 => Ok(-1),
             Ok((_, log, done)) => Ok((log - done).max(0)),
