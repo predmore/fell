@@ -44,4 +44,6 @@ The MCP server is MIT like the rest of the workspace. It speaks stdio only. Agen
 
 ## WebKitGTK stays on the system
 
-The current nightly `fell` binary does not link WebKitGTK. `readelf -d` shows no `libwebkit2gtk` `NEEDED` entry, and `wry` is not in the crate graph, so `cargo deny` still sees no LGPL. The tarball and the AppImage do not bundle the library. Once the newsletter fallback is compiled in, that view uses WebKitGTK via `wry`, dynamically linked, and the distro package (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch) is a runtime requirement. See [packaging/linux/README.md](../packaging/linux/README.md).
+The newsletter view links WebKitGTK dynamically via `wry`. `readelf -d` on `fell` has a `NEEDED` entry for `libwebkit2gtk-4.1.so.0`. The dynamic loader resolves that before `main`, so the distro package is required to launch: `libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch. The crate graph stays MIT/Apache; cargo-deny still rejects LGPL. The tarball and the AppImage do not bundle the library.
+
+Building that link needs the dev package (`libwebkit2gtk-4.1-dev`), including on the nightly artifact job. That install is tracked in [issue #8](https://github.com/predmore/fell/issues/8). See [packaging/linux/README.md](../packaging/linux/README.md).

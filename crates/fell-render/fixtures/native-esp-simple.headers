@@ -1,0 +1,5 @@
+From: Workshop <receipts@workshop.example>
+Subject: Receipt
+X-MC-User: 100
+X-Mailchimp-Campaign: workshop
+Message-ID: <receipt@example.com>
