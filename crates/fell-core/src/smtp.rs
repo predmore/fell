@@ -3,23 +3,69 @@
 //! [`deliver`] is called from [`crate::backend::BridgeBackend::confirm_send`]
 //! after the editor's send confirmation matches. The bytes on the wire are
 //! [`crate::PendingSend::mime`]. Bcc addresses are envelope recipients only.
+//!
+//! A failure before the server has the whole message is a plain
+//! [`Error::Backend`]: nothing was sent. Once the message bytes start going
+//! out after `354`, a lost connection or a timeout is
+//! [`Error::SendUncertain`], because the server may already have queued it.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::imap::{TlsStream, host_is_loopback, wrap_tcp_as_tls};
+use crate::imap::{ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
 use crate::send::{Draft, PendingSend};
 use crate::{Error, Result};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Where and how an account submits mail. The login is the account's IMAP
+/// username and password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    /// [`ImapSecurity::StartTls`] refuses a server that does not offer
+    /// STARTTLS rather than log in over cleartext. [`ImapSecurity::Plain`] is
+    /// only allowed for a literal loopback address.
+    pub security: ImapSecurity,
+    /// Bridge signs its local listener with its own certificate. Only allowed
+    /// for a loopback host.
+    pub accept_invalid_certs: bool,
+}
+
+impl SmtpConfig {
+    /// Proton Mail Bridge defaults: local STARTTLS on 1025, certificate not public.
+    pub fn bridge_local() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 1025,
+            security: ImapSecurity::StartTls,
+            accept_invalid_certs: true,
+        }
+    }
+}
 
 pub(crate) struct Endpoint {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
+    pub security: ImapSecurity,
     pub accept_invalid_certs: bool,
+}
+
+impl Endpoint {
+    pub(crate) fn new(config: &SmtpConfig, username: &str, password: &str) -> Self {
+        Self {
+            host: config.host.clone(),
+            port: config.port,
+            username: username.to_string(),
+            password: password.to_string(),
+            security: config.security,
+            accept_invalid_certs: config.accept_invalid_certs,
+        }
+    }
 }
 
 pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
@@ -29,18 +75,39 @@ pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<Stri
     if pending.mime.is_empty() {
         return Err(smtp_err("smtp: message is empty"));
     }
+    let loopback = host_is_loopback(&endpoint.host);
+    if endpoint.accept_invalid_certs && !loopback {
+        return Err(smtp_err(
+            "smtp: accept_invalid_certs is only allowed for a loopback host",
+        ));
+    }
+    if endpoint.security == ImapSecurity::Plain && !loopback {
+        return Err(smtp_err(
+            "smtp: plaintext is only allowed for a loopback address like 127.0.0.1",
+        ));
+    }
     let from = sender(&pending.mime)?;
     let recipients = envelope(&pending.draft)?;
     let tcp = connect(&endpoint.host, endpoint.port)?;
-    let mut pipe = Pipe::plain(tcp);
+    let mut pipe = match endpoint.security {
+        ImapSecurity::Tls => Pipe::tls(wrap_tcp_as_tls(
+            tcp,
+            &endpoint.host,
+            endpoint.accept_invalid_certs,
+        )?),
+        ImapSecurity::StartTls | ImapSecurity::Plain => Pipe::plain(tcp),
+    };
     expect(read_reply(&mut pipe)?, 220, "greeting")?;
     let mut hello = expect(command(&mut pipe, "EHLO localhost")?, 250, "EHLO")?;
-    if offers(&hello, "STARTTLS") {
+    if endpoint.security == ImapSecurity::StartTls {
+        if !offers(&hello, "STARTTLS") {
+            return Err(smtp_err(
+                "smtp: the server does not offer STARTTLS and this account requires TLS",
+            ));
+        }
         expect(command(&mut pipe, "STARTTLS")?, 220, "STARTTLS")?;
         pipe.upgrade(&endpoint.host, endpoint.accept_invalid_certs)?;
         hello = expect(command(&mut pipe, "EHLO localhost")?, 250, "EHLO")?;
-    } else if !host_is_loopback(&endpoint.host) {
-        return Err(smtp_err("smtp: TLS is required off loopback"));
     }
     authenticate(&mut pipe, &hello, endpoint)?;
     let mail_from = if offers(&hello, "8BITMIME") {
@@ -57,10 +124,39 @@ pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<Stri
         )?;
     }
     expect(command(&mut pipe, "DATA")?, 354, "DATA")?;
-    write_message(&mut pipe, &pending.mime)?;
-    let accepted = expect(read_reply(&mut pipe)?, 250, "message")?;
-    let _ = command(&mut pipe, "QUIT");
-    Ok(reply_text(&accepted))
+    transfer(&mut pipe, &pending.mime)
+}
+
+/// Write the message after `354` and read the server's verdict.
+///
+/// The server queues the message when it reads the final `.` line, which can
+/// happen before a write error or a lost reply reaches us. So any I/O
+/// failure from here on is [`Error::SendUncertain`]. Only an explicit `4xx`
+/// or `5xx` reply proves the message was not accepted.
+fn transfer(pipe: &mut Pipe, mime: &[u8]) -> Result<String> {
+    // A server queues nothing before the terminating dot, so a failure while
+    // the body is still going out means it was not sent.
+    write_body(pipe, mime)?;
+    let reply = write_all(pipe, b".\r\n")
+        .and_then(|()| read_reply(pipe))
+        .map_err(|err| uncertain(err.to_string()))?;
+    let detail = reply.lines.last().cloned().unwrap_or_default();
+    match reply.code {
+        250 => {
+            let _ = command(pipe, "QUIT");
+            Ok(reply_text(&reply))
+        }
+        400..=599 => Err(smtp_err(format!("smtp: message rejected: {detail}"))),
+        _ => Err(uncertain(format!(
+            "smtp: unexpected reply to the message: {detail}"
+        ))),
+    }
+}
+
+fn uncertain(message: String) -> Error {
+    Error::SendUncertain(format!(
+        "{message}, after the whole message was handed to the server"
+    ))
 }
 
 fn sender(mime: &[u8]) -> Result<String> {
@@ -198,6 +294,13 @@ impl Pipe {
         }
     }
 
+    fn tls(stream: TlsStream) -> Self {
+        Self {
+            plain: None,
+            tls: Some(stream),
+        }
+    }
+
     fn upgrade(&mut self, host: &str, accept_invalid_certs: bool) -> Result<()> {
         let tcp = self
             .plain
@@ -248,7 +351,8 @@ fn command(pipe: &mut Pipe, text: &str) -> Result<Reply> {
     read_reply(pipe)
 }
 
-fn write_message(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
+/// The dot-stuffed message, ending in CRLF, without the terminating dot.
+fn write_body(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
     let mut stuffed = Vec::with_capacity(mime.len() + 8);
     let mut line_start = true;
     for &byte in mime {
@@ -261,7 +365,6 @@ fn write_message(pipe: &mut Pipe, mime: &[u8]) -> Result<()> {
     if !stuffed.ends_with(b"\r\n") {
         stuffed.extend_from_slice(b"\r\n");
     }
-    stuffed.extend_from_slice(b".\r\n");
     write_all(pipe, &stuffed)
 }
 
@@ -461,7 +564,7 @@ Bcc: this is body text\r\n"
         )
     }
 
-    fn backend(port: u16) -> BridgeBackend {
+    fn backend(port: u16, security: ImapSecurity) -> BridgeBackend {
         BridgeBackend {
             account_id: AccountId("mailbox".into()),
             imap: ImapConfig {
@@ -472,8 +575,12 @@ Bcc: this is body text\r\n"
                 security: crate::imap::ImapSecurity::Plain,
                 accept_invalid_certs: true,
             },
-            smtp_host: "127.0.0.1".into(),
-            smtp_port: port,
+            smtp: SmtpConfig {
+                host: "127.0.0.1".into(),
+                port,
+                security,
+                accept_invalid_certs: true,
+            },
         }
     }
 
@@ -491,6 +598,7 @@ Bcc: this is body text\r\n"
                     port: 1,
                     username: "bridge-user".into(),
                     password: "bridge-secret".into(),
+                    security: ImapSecurity::StartTls,
                     accept_invalid_certs: false,
                 },
                 &pending,
@@ -505,12 +613,11 @@ Bcc: this is body text\r\n"
     #[test]
     fn empty_username_does_not_open_smtp() {
         let pending = sample_pending();
-        let err = BridgeBackend {
-            smtp_port: 1,
-            ..BridgeBackend::default()
-        }
-        .confirm_send(pending.clone(), confirm(&pending))
-        .unwrap_err();
+        let mut bridge = BridgeBackend::default();
+        bridge.smtp.port = 1;
+        let err = bridge
+            .confirm_send(pending.clone(), confirm(&pending))
+            .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("SMTP"), "{text}");
         assert!(!text.contains("connect"), "{text}");
@@ -518,15 +625,77 @@ Bcc: this is body text\r\n"
 
     #[test]
     fn bridge_delivers_after_confirmation_with_bcc_on_the_envelope() {
-        let (sent, got) = exchange(false);
+        let (sent, got) = exchange(Wire::Clear, ImapSecurity::Plain);
         assert_eq!(sent.remote_id.0, "queued as test-id");
         assert_delivery(&got);
         assert!(got.clear.is_empty());
     }
 
     #[test]
+    fn implicit_tls_delivers() {
+        let (sent, got) = exchange(Wire::Tls, ImapSecurity::Tls);
+        assert_eq!(sent.remote_id.0, "queued as test-id");
+        assert_delivery(&got);
+    }
+
+    #[test]
+    fn required_tls_does_not_log_in_to_a_loopback_server_without_starttls() {
+        let (result, got) = attempt(Wire::Clear, ImapSecurity::StartTls, AfterData::Accept);
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Backend(_)), "{err:?}");
+        assert!(err.to_string().contains("STARTTLS"), "{err}");
+        assert!(got.auth.is_empty(), "the login went out: {}", got.auth);
+        assert!(got.data.is_empty());
+    }
+
+    #[test]
+    fn plaintext_and_unchecked_certificates_stay_on_loopback() {
+        for (security, accept_invalid_certs) in
+            [(ImapSecurity::Plain, false), (ImapSecurity::StartTls, true)]
+        {
+            let err = deliver(
+                &Endpoint {
+                    host: "mail.example.com".into(),
+                    port: 1,
+                    username: "bridge-user".into(),
+                    password: "bridge-secret".into(),
+                    security,
+                    accept_invalid_certs,
+                },
+                &sample_pending(),
+            )
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("loopback"), "{text}");
+            assert!(!text.contains("connect"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_lost_reply_after_the_message_may_have_been_sent() {
+        let (result, got) = attempt(Wire::Clear, ImapSecurity::Plain, AfterData::Hangup);
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SendUncertain(_)), "{err:?}");
+        assert!(err.to_string().contains("after the whole message"), "{err}");
+        assert_eq!(got.data, sample_mime());
+    }
+
+    #[test]
+    fn a_refusal_before_or_after_the_message_is_not_sent() {
+        for after in [
+            AfterData::Reject,
+            AfterData::RejectRcpt,
+            AfterData::HangupAtRcpt,
+        ] {
+            let (result, _) = attempt(Wire::Clear, ImapSecurity::Plain, after);
+            let err = result.unwrap_err();
+            assert!(matches!(err, Error::Backend(_)), "{after:?}: {err:?}");
+        }
+    }
+
+    #[test]
     fn starttls_hides_the_password_and_still_delivers() {
-        let (sent, got) = exchange(true);
+        let (sent, got) = exchange(Wire::StartTls, ImapSecurity::StartTls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
         assert_delivery(&got);
         let clear = String::from_utf8_lossy(&got.clear);
@@ -550,9 +719,9 @@ Bcc: this is body text\r\n"
         assert!(!headers.contains("bcc:"), "{headers}");
     }
 
-    fn exchange(starttls: bool) -> (crate::SentMessage, Captured) {
-        let (port, rx, join) = serve(starttls);
-        let backend = backend(port);
+    fn exchange(wire: Wire, security: ImapSecurity) -> (crate::SentMessage, Captured) {
+        let (port, rx, join) = serve(wire, AfterData::Accept);
+        let backend = backend(port, security);
         let pending = sample_pending();
         let mut other = pending.clone();
         other.id = PendingSendId("nope".into());
@@ -571,6 +740,45 @@ Bcc: this is body text\r\n"
         (sent, got)
     }
 
+    /// One confirmed send against a fake server.
+    fn attempt(
+        wire: Wire,
+        security: ImapSecurity,
+        after: AfterData,
+    ) -> (Result<crate::SentMessage>, Captured) {
+        let (port, rx, join) = serve(wire, after);
+        let pending = sample_pending();
+        let result = backend(port, security).confirm_send(pending.clone(), confirm(&pending));
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fake smtp finished");
+        join.join().expect("fake smtp thread");
+        (result, got)
+    }
+
+    /// How the fake server protects the session.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Wire {
+        /// Cleartext and no STARTTLS offered.
+        Clear,
+        StartTls,
+        /// TLS from the first byte.
+        Tls,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AfterData {
+        Accept,
+        /// `554` after reading the whole message.
+        Reject,
+        /// Close the socket after reading the message, without a reply.
+        Hangup,
+        /// `550` to the first RCPT TO.
+        RejectRcpt,
+        /// Close the socket at RCPT TO, before DATA.
+        HangupAtRcpt,
+    }
+
     struct Captured {
         auth: String,
         from: String,
@@ -579,7 +787,10 @@ Bcc: this is body text\r\n"
         clear: Vec<u8>,
     }
 
-    fn serve(starttls: bool) -> (u16, mpsc::Receiver<Captured>, thread::JoinHandle<()>) {
+    fn serve(
+        wire: Wire,
+        after: AfterData,
+    ) -> (u16, mpsc::Receiver<Captured>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
@@ -589,8 +800,14 @@ Bcc: this is body text\r\n"
             sock.set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let _ = sock.set_nodelay(true);
+            if wire == Wire::Tls {
+                let mut tls = server_tls(sock);
+                write_reply(&mut tls, "220 localhost ESMTP\r\n");
+                dialog(tls, tx, Vec::new(), after);
+                return;
+            }
             write_reply(&mut sock, "220 localhost ESMTP\r\n");
-            if starttls {
+            if wire == Wire::StartTls {
                 let mut clear = Vec::new();
                 let ehlo = read_cmd(&mut sock, &mut clear);
                 assert!(ehlo.to_ascii_uppercase().starts_with("EHLO"), "{ehlo}");
@@ -604,15 +821,20 @@ Bcc: this is body text\r\n"
                     "{start}"
                 );
                 write_reply(&mut sock, "220 ready\r\n");
-                dialog(server_tls(sock), tx, clear);
+                dialog(server_tls(sock), tx, clear, after);
             } else {
-                dialog(sock, tx, Vec::new());
+                dialog(sock, tx, Vec::new(), after);
             }
         });
         (port, rx, join)
     }
 
-    fn dialog(mut sock: impl Read + Write, tx: mpsc::Sender<Captured>, clear: Vec<u8>) {
+    fn dialog(
+        mut sock: impl Read + Write,
+        tx: mpsc::Sender<Captured>,
+        clear: Vec<u8>,
+        after: AfterData,
+    ) {
         let mut captured = Captured {
             auth: String::new(),
             from: String::new(),
@@ -636,11 +858,19 @@ Bcc: this is body text\r\n"
                 write_reply(&mut sock, "250 ok\r\n");
             } else if upper.starts_with("RCPT TO:") {
                 captured.rcpt.push(angles(&line));
-                write_reply(&mut sock, "250 ok\r\n");
+                match after {
+                    AfterData::RejectRcpt => write_reply(&mut sock, "550 no such user\r\n"),
+                    AfterData::HangupAtRcpt => break,
+                    _ => write_reply(&mut sock, "250 ok\r\n"),
+                }
             } else if upper == "DATA" {
                 write_reply(&mut sock, "354 go\r\n");
                 captured.data = read_data(&mut sock);
-                write_reply(&mut sock, "250 queued as test-id\r\n");
+                match after {
+                    AfterData::Hangup => break,
+                    AfterData::Reject => write_reply(&mut sock, "554 refused\r\n"),
+                    _ => write_reply(&mut sock, "250 queued as test-id\r\n"),
+                }
             } else if upper.starts_with("QUIT") {
                 write_reply(&mut sock, "221 bye\r\n");
                 break;

@@ -29,7 +29,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 
 `MailBackend` is the seam.
 
-1. **Bridge** — Proton Mail Bridge over local IMAP, plus SMTP submission on `smtp_host`:`smtp_port` (usually `127.0.0.1:1025` with STARTTLS) using the same username and password. Bridge stays a separate process. The message is `pending.mime`. Bcc is an envelope recipient only, and the socket opens only from `confirm_send` after the editor's send confirmation matches.
+1. **Bridge** — Proton Mail Bridge over local IMAP, plus SMTP submission on `smtp_host`:`smtp_port` (default `127.0.0.1:1025` with STARTTLS) using the same username and password. The login, password (or `password_command`), and SMTP settings come only from `~/.config/fell/account.toml` for the draft's account id, never from a draft folder. `smtp_security` defaults to `starttls`, which refuses a server that does not offer STARTTLS rather than log in over cleartext. `"plain"` must be set explicitly and is only allowed for a literal loopback address, like IMAP's `security`. Bridge stays a separate process. The message is `pending.mime`. Bcc is an envelope recipient only, and the socket opens only from `confirm_send` after the editor's send confirmation matches.
 2. **IMAP** — any other IMAP account. Same read-only client.
 3. **Proton API** — direct Proton HTTP API. Same trait, not implemented.
 
@@ -96,7 +96,7 @@ Proton conversation ids are preferred so Bridge and the future API stay consiste
 
 ## Sending mail
 
-Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, and body that were shown. Bridge `confirm_send` checks that token and then submits the pending MIME over SMTP. Bcc recipients are `RCPT TO` and are not a header of the message. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
+Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, body, reply parent (`in_reply_to`), attachments, and a SHA-256 of the exact MIME bytes that were shown. Bridge `confirm_send` checks that token and then submits the pending MIME over SMTP. A failure before the server has the whole message means nothing was sent. A lost connection or timeout after `DATA` is `Error::SendUncertain`: the editor says the message may have been sent. The editor claims a draft before a send starts and keeps it locked once the message was or may have been sent, so a second press, or the same draft reopened, does not send it again. That lock is in memory and does not survive a restart. Bcc recipients are `RCPT TO` and are not a header of the message. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
 
 An agent draft is a `review_drafts` row (`Store::list_review_drafts`), not a `PendingSend`. Fell reads that list when it is time to show the draft for review. Undo deletes it. `create_review_draft` never calls `submit_draft` or `confirm_send`.
 
@@ -108,7 +108,7 @@ Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a
 
 Search returns at most 20 hits per page: ids, sender address, date, and a short snippet. Thread bodies are plain text and truncated. Draft bodies are capped when they are saved. Text that came from mail is returned only as `untrusted_email_content`, with ids, sender address, and date outside that object. The model is told to treat that text as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`. See [agents.md](agents.md).
 
-The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server. Neither is binding `in_reply_to` into the send-confirmation snapshot.
+The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server.
 
 ## HTML mail
 

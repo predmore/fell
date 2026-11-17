@@ -68,8 +68,9 @@ impl PendingSend {
 
 /// Proof that the user confirmed send in the Fell UI.
 ///
-/// Bound to a specific pending id plus the account, recipients, subject, and
-/// body that were shown. Constructed only via
+/// Bound to a specific pending id plus the account, recipients, subject,
+/// body, reply parent, attachments, and a SHA-256 of the exact message bytes
+/// that were shown. Constructed only via
 /// [`UserSendConfirmation::from_interactive_ui`].
 ///
 /// ```compile_fail
@@ -98,13 +99,23 @@ pub struct UserSendConfirmation {
     bcc: Vec<String>,
     subject: String,
     body: String,
+    in_reply_to: Option<crate::MessageId>,
     attachments_digest: String,
+    /// SHA-256 of [`PendingSend::mime`], the bytes SMTP transmits.
+    mime_sha256: [u8; 32],
+}
+
+/// SHA-256 of the message bytes a confirmation covers.
+pub fn message_digest(mime: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(mime).into()
 }
 
 impl UserSendConfirmation {
     /// Call from the GPUI app after an explicit user Send action.
     ///
-    /// Snapshots the pending id, account, recipients, subject, and body.
+    /// Snapshots the pending id, account, recipients, subject, body, reply
+    /// parent, attachments, and a hash of the message bytes.
     /// `fell-mcp` cannot name [`fell_confirm::InteractiveUi`] without adding a
     /// Cargo dependency on `fell-confirm`. There is no send MCP tool.
     pub fn from_interactive_ui(_ui: &impl fell_confirm::UiProof, pending: &PendingSend) -> Self {
@@ -116,7 +127,9 @@ impl UserSendConfirmation {
             bcc: pending.draft.bcc.clone(),
             subject: pending.draft.subject.clone(),
             body: pending.draft.body.clone(),
+            in_reply_to: pending.draft.in_reply_to.clone(),
             attachments_digest: pending.draft.attachments_digest.clone(),
+            mime_sha256: message_digest(&pending.mime),
         }
     }
 
@@ -132,7 +145,8 @@ pub struct SentMessage {
 }
 
 /// Refuse a send unless the confirmation token names this pending send
-/// and still matches its account, recipients, subject, and body.
+/// and still matches its account, recipients, subject, body, reply parent,
+/// attachments, and message bytes.
 pub fn require_confirmation(
     pending: &PendingSend,
     confirmation: &UserSendConfirmation,
@@ -144,7 +158,9 @@ pub fn require_confirmation(
         && confirmation.bcc == pending.draft.bcc
         && confirmation.subject == pending.draft.subject
         && confirmation.body == pending.draft.body
+        && confirmation.in_reply_to == pending.draft.in_reply_to
         && confirmation.attachments_digest == pending.draft.attachments_digest
+        && confirmation.mime_sha256 == message_digest(&pending.mime)
     {
         Ok(())
     } else {
@@ -290,5 +306,64 @@ mod tests {
         swapped.draft.attachments_digest = "other-bytes".into();
         let err = backend.confirm_send(swapped, confirm).unwrap_err();
         assert!(matches!(err, crate::Error::SendUnconfirmed));
+    }
+
+    #[test]
+    fn confirmation_does_not_cover_a_retargeted_reply_parent() {
+        let backend = FixtureBackend::default();
+        let mut reply = draft("shown");
+        reply.in_reply_to = Some(crate::MessageId::new("<parent@x>"));
+        let pending = backend.submit_draft(reply).unwrap();
+        let confirm = mint(&pending);
+        for parent in [Some(crate::MessageId::new("<other@x>")), None] {
+            let mut swapped = pending.clone();
+            swapped.draft.in_reply_to = parent;
+            let err = backend.confirm_send(swapped, confirm.clone()).unwrap_err();
+            assert!(matches!(err, crate::Error::SendUnconfirmed));
+        }
+        let mut new_reply = backend.submit_draft(draft("shown")).unwrap();
+        let confirm = mint(&new_reply);
+        new_reply.draft.in_reply_to = Some(crate::MessageId::new("<parent@x>"));
+        let err = backend.confirm_send(new_reply, confirm).unwrap_err();
+        assert!(matches!(err, crate::Error::SendUnconfirmed));
+        backend
+            .confirm_send(pending.clone(), mint(&pending))
+            .unwrap();
+    }
+
+    #[test]
+    fn confirmation_does_not_cover_changed_message_bytes() {
+        let backend = FixtureBackend::default();
+        let pending = backend
+            .submit_composed(
+                draft("shown"),
+                b"From: a@x\r\nTo: b@x\r\n\r\nshown\r\n".to_vec(),
+                Vec::new(),
+            )
+            .unwrap();
+        let confirm = mint(&pending);
+        for mime in [
+            b"From: a@x\r\nTo: b@x\r\nBcc: c@x\r\n\r\nshown\r\n".to_vec(),
+            b"From: a@x\r\nTo: b@x\r\n\r\nshown\r\n ".to_vec(),
+            Vec::new(),
+        ] {
+            let mut swapped = pending.clone();
+            swapped.mime = mime;
+            let err = backend.confirm_send(swapped, confirm.clone()).unwrap_err();
+            assert!(matches!(err, crate::Error::SendUnconfirmed));
+        }
+        backend.confirm_send(pending, confirm).unwrap();
+    }
+
+    #[test]
+    fn message_digest_is_sha256() {
+        let hex: String = message_digest(b"abc")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

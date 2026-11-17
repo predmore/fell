@@ -1,9 +1,11 @@
 use crate::account::{AccountId, BackendKind};
+use crate::account_config::AccountConfig;
 use crate::imap::ImapConfig;
 use crate::message::Message;
 use crate::send::{
     Draft, PendingSend, SentMessage, SubmittedFile, UserSendConfirmation, require_confirmation,
 };
+use crate::smtp::SmtpConfig;
 use crate::{Error, Result};
 
 /// Opaque sync checkpoint from a backend (IMAP UIDVALIDITY/HIGHESTMODSEQ, Proton event id, …).
@@ -80,15 +82,14 @@ pub trait MailBackend {
 
 /// Proton Mail Bridge as a local IMAP account. Bridge stays a separate process.
 ///
-/// `confirm_send` submits [`PendingSend::mime`] to `smtp_host`:`smtp_port`
+/// `confirm_send` submits [`PendingSend::mime`] to [`BridgeBackend::smtp`]
 /// with this account's IMAP username and password. Bridge's usual SMTP port
 /// is 1025 and offers STARTTLS. Bcc is an envelope recipient only.
 #[derive(Debug, Clone)]
 pub struct BridgeBackend {
     pub account_id: AccountId,
     pub imap: ImapConfig,
-    pub smtp_host: String,
-    pub smtp_port: u16,
+    pub smtp: SmtpConfig,
 }
 
 impl Default for BridgeBackend {
@@ -96,8 +97,7 @@ impl Default for BridgeBackend {
         Self {
             account_id: AccountId("bridge".into()),
             imap: ImapConfig::bridge_local("", ""),
-            smtp_host: "127.0.0.1".into(),
-            smtp_port: 1025,
+            smtp: SmtpConfig::bridge_local(),
         }
     }
 }
@@ -139,13 +139,7 @@ impl MailBackend for BridgeBackend {
     ) -> Result<SentMessage> {
         require_confirmation(&pending, &confirmation)?;
         let remote = crate::smtp::deliver(
-            &crate::smtp::Endpoint {
-                host: self.smtp_host.clone(),
-                port: self.smtp_port,
-                username: self.imap.username.clone(),
-                password: self.imap.password.clone(),
-                accept_invalid_certs: self.imap.accept_invalid_certs,
-            },
+            &crate::smtp::Endpoint::new(&self.smtp, &self.imap.username, &self.imap.password),
             &pending,
         )?;
         Ok(SentMessage {
@@ -231,14 +225,33 @@ impl MailBackend for ProtonApiBackend {
     }
 }
 
-/// Backend for this account. The in-process fixture is only the local demo account.
-pub fn backend_for(account_id: &AccountId) -> Box<dyn MailBackend + Send> {
-    match account_id.as_str() {
-        "local" | "fixture" | "demo" => Box::new(FixtureBackend::default()),
-        _ => Box::new(BridgeBackend {
-            account_id: account_id.clone(),
-            ..BridgeBackend::default()
-        }),
+/// Ids served by the in-process demo backend. An account file may not use them.
+pub(crate) const DEMO_ACCOUNT_IDS: [&str; 3] = ["local", "fixture", "demo"];
+
+/// The demo mailbox, served in process with no network and no credentials.
+pub fn is_demo_account(account_id: &AccountId) -> bool {
+    DEMO_ACCOUNT_IDS.contains(&account_id.as_str())
+}
+
+/// Backend for this account. The in-process fixture is only the local demo
+/// account. Any other id needs the user's account file (`config`) with the
+/// same id: its credentials and SMTP settings are the only ones used, so a
+/// draft can never supply them.
+///
+/// Resolves `password_command`, so call it off the UI thread.
+pub fn backend_for(
+    account_id: &AccountId,
+    config: Option<&AccountConfig>,
+) -> Result<Box<dyn MailBackend + Send>> {
+    if is_demo_account(account_id) {
+        return Ok(Box::new(FixtureBackend::default()));
+    }
+    match config {
+        Some(config) if config.id == account_id.as_str() => config.backend(),
+        _ => Err(Error::UnknownAccount(format!(
+            "{}: no account file entry for it; run fell account setup",
+            account_id.as_str()
+        ))),
     }
 }
 
@@ -312,6 +325,36 @@ mod tests {
         assert_eq!(backend.imap.port, 1143);
         let err = backend.fetch_changes(None).unwrap_err();
         assert!(matches!(err, Error::Backend(message) if message.contains("username")));
+    }
+
+    #[test]
+    fn backend_for_takes_credentials_only_from_the_matching_account_file() {
+        use crate::account_config::PasswordSource;
+
+        assert_eq!(
+            backend_for(&AccountId("local".into()), None)
+                .unwrap()
+                .kind(),
+            BackendKind::Bridge
+        );
+        for (id, config) in [("mail", None), ("other", Some("mail"))] {
+            let file = config
+                .map(|_| AccountConfig::bridge("a@b", "a@b", PasswordSource::Inline("pw".into())));
+            let err = backend_for(&AccountId(id.into()), file.as_ref())
+                .err()
+                .expect("no backend without a matching account file");
+            assert!(matches!(err, Error::UnknownAccount(_)), "{err}");
+        }
+        let file = AccountConfig::bridge(
+            "a@b",
+            "a@b",
+            PasswordSource::Command("printf 'from-command'".into()),
+        );
+        assert!(backend_for(&AccountId("mail".into()), Some(&file)).is_ok());
+        let bridge = file.bridge_backend().unwrap();
+        assert_eq!(bridge.imap.username, "a@b");
+        assert_eq!(bridge.imap.password, "from-command");
+        assert_eq!(bridge.smtp, SmtpConfig::bridge_local());
     }
 
     #[test]

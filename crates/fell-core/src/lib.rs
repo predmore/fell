@@ -27,7 +27,7 @@ pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
-    SyncCursor, backend_for,
+    SyncCursor, backend_for, is_demo_account,
 };
 pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
@@ -38,7 +38,9 @@ pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
+    message_digest,
 };
+pub use smtp::SmtpConfig;
 pub use store::{
     FolderThread, Participant, SearchPage, Store, ThreadSummary, canonical_folder_name,
     folder_aliases,
@@ -61,6 +63,10 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    /// The server had the whole message before the failure, so it may have
+    /// been delivered. Every other send error means nothing went out.
+    #[error("{0}")]
+    SendUncertain(String),
     #[error("unknown account {0}")]
     UnknownAccount(String),
     #[error("unknown thread")]
