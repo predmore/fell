@@ -200,6 +200,101 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         && contrast(theme.accent, theme.background) >= MARK_CONTRAST
 }
 
+/// A thread watching the Omarchy theme, GTK settings, and Alacritty config.
+/// It sends `()` (at most every 100 ms) when one of them may have changed,
+/// and ends when the receiver is gone. `false` when inotify is unavailable,
+/// so the caller polls instead.
+pub fn watch(changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
+    watch_dirs(watched_dirs(), changed)
+}
+
+/// Each folder holding a file `load` reads, and that folder's parent, so a
+/// replaced folder (Omarchy rewrites `current/theme`) is noticed and
+/// watched again.
+fn watched_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for file in theme_candidates()
+        .into_iter()
+        .chain(gtk_settings_paths())
+        .chain(alacritty_paths())
+    {
+        let Some(dir) = file.parent() else {
+            continue;
+        };
+        dirs.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
+    use notify::{RecursiveMode, Watcher};
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let Ok(mut watcher) =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok_and(|event| changes_content(&event.kind)) {
+                let _ = tx.send(());
+            }
+        })
+    else {
+        return false;
+    };
+    let rewatch = move |watcher: &mut notify::RecommendedWatcher| {
+        let mut watched = 0;
+        for dir in &dirs {
+            if dir.is_dir() && watcher.watch(dir, RecursiveMode::NonRecursive).is_ok() {
+                watched += 1;
+            }
+        }
+        watched
+    };
+    // Out of inotify watches (or nothing to watch): let the caller poll.
+    if rewatch(&mut watcher) == 0 {
+        return false;
+    }
+    std::thread::Builder::new()
+        .name("fell-theme-watch".into())
+        .spawn(move || {
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) => {}
+                    // Nothing changed. Stop once the window is gone.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if changed.is_closed() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // A theme switch writes several files. Settle, then reload once.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                while rx.try_recv().is_ok() {}
+                rewatch(&mut watcher);
+                if changed.unbounded_send(()).is_err() {
+                    break;
+                }
+            }
+        })
+        .is_ok()
+}
+
+/// Events that can change what `load` reads. Opens, reads, and metadata
+/// changes are left out: `load` itself opens these files, so counting them
+/// would wake the watcher again after every reload.
+fn changes_content(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
 fn theme_candidates() -> Vec<PathBuf> {
     if let Ok(raw) = env::var("FELL_OMARCHY_THEME") {
         let path = PathBuf::from(raw);
@@ -744,5 +839,61 @@ mod tests {
         assert_ne!(dark.background, light.background);
         assert!(!dark.is_light());
         assert!(light.is_light());
+    }
+
+    #[test]
+    fn the_watch_sees_a_rewritten_and_a_replaced_theme_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-theme-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let theme = root.join("current/theme");
+        fs::create_dir_all(&theme).unwrap();
+        fs::write(theme.join("colors.toml"), "background = \"#000000\"\n").unwrap();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        assert!(watch_dirs(vec![theme.clone(), root.join("current")], tx));
+        let next = |rx: &mut futures::channel::mpsc::UnboundedReceiver<()>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if rx.try_recv().is_ok() {
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        fs::write(theme.join("colors.toml"), "background = \"#111111\"\n").unwrap();
+        assert!(next(&mut rx), "a rewritten colors.toml");
+        // Replace the folder the way a theme switch can.
+        let staged = root.join("current/theme.new");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("colors.toml"), "background = \"#222222\"\n").unwrap();
+        fs::remove_dir_all(&theme).unwrap();
+        fs::rename(&staged, &theme).unwrap();
+        assert!(next(&mut rx), "a replaced theme folder");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+        fs::write(theme.join("colors.toml"), "background = \"#333333\"\n").unwrap();
+        assert!(next(&mut rx), "the new folder is watched too");
+        // Reading the files, as a reload does, must not signal again.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+        for _ in 0..5 {
+            let _ = fs::read_to_string(theme.join("colors.toml"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            rx.try_recv().is_err(),
+            "a reload's own reads woke the watcher"
+        );
+        drop(rx);
+        let _ = fs::remove_dir_all(&root);
     }
 }
