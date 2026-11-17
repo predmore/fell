@@ -82,8 +82,6 @@ fn serialize_node(
                     | "textarea"
                     | "form"
                     | "noscript"
-                    | "svg"
-                    | "math"
                     | "head"
                     | "html"
                     | "body"
@@ -91,11 +89,6 @@ fn serialize_node(
                 if matches!(name, "html" | "body" | "head" | "form" | "noscript") {
                     for child in node.children() {
                         serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
-                    }
-                }
-                if name == "svg" || name == "math" {
-                    for child in node.children() {
-                        serialize_node(child, out, allow_remote_images, false, depth + 1);
                     }
                 }
                 return;
@@ -501,25 +494,95 @@ fn resource_host(value: &str) -> Option<String> {
 }
 
 fn host_is_private(host: &str) -> bool {
+    let host = percent_decode(host);
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
-    if let Some(octets) = parse_ipv4(host) {
+    if let Some(octets) = parse_ipv4_url(&host) {
         return ipv4_is_private(octets);
     }
-    if host.contains(':') {
-        return ipv6_is_private(host);
+    if host.contains(':')
+        && let Some(groups) = parse_ipv6(&host)
+    {
+        return ipv6_is_private(groups);
     }
     false
 }
 
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let mut octets = [0u8; 4];
-    let mut parts = host.split('.');
-    for octet in &mut octets {
-        *octet = parts.next()?.parse().ok()?;
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            let hex = &bytes[index + 1..index + 3];
+            let value =
+                u8::from_str_radix(std::str::from_utf8(hex).unwrap_or("00"), 16).unwrap_or(0);
+            out.push(value);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
     }
-    parts.next().is_none().then_some(octets)
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// [IPv4 parser](https://url.spec.whatwg.org/#concept-ipv4-parser): one to four
+/// parts, a trailing dot ignored, `0x` hex, and the last part filling the rest.
+fn parse_ipv4_url(host: &str) -> Option<[u8; 4]> {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(parts.len());
+    for part in &parts {
+        numbers.push(parse_ipv4_number(part)?);
+    }
+    let len = numbers.len();
+    if numbers[..len - 1].iter().any(|number| *number > 255) {
+        return None;
+    }
+    let limit = 256u64.pow(u32::try_from(5 - len).unwrap_or(4));
+    if numbers[len - 1] >= limit {
+        return None;
+    }
+    let mut ipv4 = numbers[len - 1];
+    for (counter, number) in numbers[..len - 1].iter().enumerate() {
+        let shift = u32::try_from(3 - counter).unwrap_or(0);
+        ipv4 += number * 256u64.pow(shift);
+    }
+    Some([
+        ((ipv4 >> 24) & 0xff) as u8,
+        ((ipv4 >> 16) & 0xff) as u8,
+        ((ipv4 >> 8) & 0xff) as u8,
+        (ipv4 & 0xff) as u8,
+    ])
+}
+
+fn parse_ipv4_number(input: &str) -> Option<u64> {
+    if input.is_empty() {
+        return None;
+    }
+    let (radix, digits) = if input.len() >= 2
+        && (input.as_bytes()[0] == b'0')
+        && (input.as_bytes()[1] == b'x' || input.as_bytes()[1] == b'X')
+    {
+        (16, &input[2..])
+    } else {
+        (10, input)
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
 }
 
 fn ipv4_is_private(octets: [u8; 4]) -> bool {
@@ -529,21 +592,88 @@ fn ipv4_is_private(octets: [u8; 4]) -> bool {
     )
 }
 
-fn ipv6_is_private(host: &str) -> bool {
-    let host = host.trim_matches(|ch| ch == '[' || ch == ']');
-    if host == "::" || host == "::1" {
+fn parse_ipv6(host: &str) -> Option<[u16; 8]> {
+    if host.matches("::").count() > 1 {
+        return None;
+    }
+    let (left, right) = if let Some((left, right)) = host.split_once("::") {
+        (left, Some(right))
+    } else {
+        (host, None)
+    };
+    let left_groups = ipv6_pieces(left)?;
+    let right_groups = if let Some(right) = right {
+        ipv6_pieces(right)?
+    } else {
+        Vec::new()
+    };
+    if right.is_none() {
+        if left_groups.len() != 8 {
+            return None;
+        }
+        let mut groups = [0u16; 8];
+        groups.copy_from_slice(&left_groups);
+        return Some(groups);
+    }
+    if left_groups.len() + right_groups.len() > 8 {
+        return None;
+    }
+    let zeros = 8 - left_groups.len() - right_groups.len();
+    let mut groups = [0u16; 8];
+    for (index, group) in left_groups.iter().enumerate() {
+        groups[index] = *group;
+    }
+    for (index, group) in right_groups.iter().enumerate() {
+        groups[left_groups.len() + zeros + index] = *group;
+    }
+    Some(groups)
+}
+
+fn ipv6_pieces(part: &str) -> Option<Vec<u16>> {
+    if part.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut pieces: Vec<&str> = part.split(':').collect();
+    let mut groups = Vec::new();
+    if pieces.last().is_some_and(|piece| piece.contains('.')) {
+        let ipv4 = parse_ipv4_url(pieces.pop()?)?;
+        for piece in &pieces {
+            groups.push(hextet(piece)?);
+        }
+        groups.push(u16::from(ipv4[0]) << 8 | u16::from(ipv4[1]));
+        groups.push(u16::from(ipv4[2]) << 8 | u16::from(ipv4[3]));
+        return Some(groups);
+    }
+    for piece in pieces {
+        groups.push(hextet(piece)?);
+    }
+    Some(groups)
+}
+
+fn hextet(piece: &str) -> Option<u16> {
+    if piece.is_empty() || piece.len() > 4 {
+        return None;
+    }
+    u16::from_str_radix(piece, 16).ok()
+}
+
+fn ipv6_is_private(groups: [u16; 8]) -> bool {
+    if groups == [0, 0, 0, 0, 0, 0, 0, 0] || groups == [0, 0, 0, 0, 0, 0, 0, 1] {
         return true;
     }
-    if let Some(mapped) = host.strip_prefix("::ffff:")
-        && let Some(octets) = parse_ipv4(mapped)
-    {
+    if groups[0] & 0xffc0 == 0xfe80 || groups[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    if groups[..5] == [0, 0, 0, 0, 0] && groups[5] == 0xffff {
+        let octets = [
+            (groups[6] >> 8) as u8,
+            groups[6] as u8,
+            (groups[7] >> 8) as u8,
+            groups[7] as u8,
+        ];
         return ipv4_is_private(octets);
     }
-    let first = host.split(':').find(|part| !part.is_empty()).unwrap_or("");
-    let Ok(group) = u16::from_str_radix(first, 16) else {
-        return false;
-    };
-    (0xfc00..=0xfdff).contains(&group) || (0xfe80..=0xfebf).contains(&group)
+    false
 }
 
 /// `<` would close the style element. A CSS escape keeps the stylesheet and
@@ -667,6 +797,43 @@ mod tests {
         assert!(deep.contains("Still here"), "{deep}");
         assert!(!deep.contains("&lt;div"), "{deep}");
         assert!(clean.contains(">x<") || clean.contains(">x</p>"), "{clean}");
+    }
+
+    #[test]
+    fn svg_and_math_keep_their_markup() {
+        let svg = sanitize_html(
+            r#"<svg viewBox="0 0 10 10"><path d="M0 0"></path><script>alert(1)</script></svg>"#,
+            false,
+        );
+        assert!(svg.contains("<svg"), "{svg}");
+        assert!(svg.contains("<path"), "{svg}");
+        assert!(!svg.to_ascii_lowercase().contains("<script"), "{svg}");
+        let math = sanitize_html("<math><mi>x</mi></math>", false);
+        assert!(math.contains("<math"), "{math}");
+        assert!(math.contains("<mi"), "{math}");
+        assert!(math.contains("</math>"), "{math}");
+    }
+
+    #[test]
+    fn private_loopback_forms_are_rejected() {
+        for url in [
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://127%2e0%2e0%2e1/",
+            "http://[::ffff:7f00:1]/",
+        ] {
+            assert!(targets_private_network(url), "{url}");
+            let clean = sanitize_html(&format!(r#"<img src="{url}" alt="x">"#), true);
+            assert!(
+                !clean.contains("127.1")
+                    && !clean.contains("2130706433")
+                    && !clean.contains("0x7f000001")
+                    && !clean.contains("127%2e")
+                    && !clean.contains("7f00"),
+                "{url} -> {clean}"
+            );
+        }
     }
 
     #[test]

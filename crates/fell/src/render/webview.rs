@@ -351,8 +351,13 @@ fn schedule_snapshot(token: u64, capture: u64, delay: Duration) {
         });
         if still {
             HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref() {
-                    let _ = host.pending.borrow_mut().take();
+                if let Some(host) = slot.borrow().as_ref()
+                    && let Some(id) = host.pending.borrow_mut().take()
+                {
+                    // Break retires this source. Forget the id so a Drop
+                    // that calls remove cannot retire it a second time.
+                    #[allow(clippy::forget_non_drop)]
+                    std::mem::forget(id);
                 }
             });
             snapshot(widget.clone(), token, capture, shot);
@@ -494,8 +499,11 @@ fn arm_fail_safe(token: u64, capture: u64) {
         // Take the id before GLib retires this source. A later Show must not
         // call remove on a source that has already finished.
         HOST.with(|slot| {
-            if let Some(host) = slot.borrow().as_ref() {
-                host.fail_safe.borrow_mut().take();
+            if let Some(host) = slot.borrow().as_ref()
+                && let Some(id) = host.fail_safe.borrow_mut().take()
+            {
+                #[allow(clippy::forget_non_drop)]
+                std::mem::forget(id);
             }
         });
         let should_stop = HOST.with(|slot| {
