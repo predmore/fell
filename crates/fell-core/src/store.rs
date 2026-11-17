@@ -278,12 +278,17 @@ pub struct ThreadSummary {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let requested = path.as_ref();
         // The mailbox holds message text. Create it owner-only before SQLite writes.
-        create_private_file(path)?;
+        create_private_file(requested)?;
         // One sidecar lock per file. A relative path, a symlink, and the
         // absolute path must not start two indexers.
-        let path = path.canonicalize()?;
+        let path = requested.canonicalize()?;
+        // SQLite names `-wal` beside the path string it was opened with. Replay
+        // that WAL before switching to the canonical path, or those frames are lost.
+        if requested != path {
+            checkpoint_wal(requested)?;
+        }
         let conn = Connection::open(&path)?;
         // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -813,6 +818,12 @@ fn page_offset(cursor: Option<&str>) -> Result<i64> {
             .filter(|offset| *offset >= 0)
             .ok_or_else(|| crate::Error::Invalid("cursor is not a page token".into())),
     }
+}
+
+fn checkpoint_wal(path: &Path) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
 }
 
 fn create_private_file(path: &Path) -> Result<()> {

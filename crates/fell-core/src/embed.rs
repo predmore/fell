@@ -375,8 +375,8 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn index_loop(path: &Path, stop: &AtomicBool, pause: &AtomicBool) {
-    let conn = loop {
+fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool) {
+    let mut conn = loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -385,6 +385,14 @@ fn index_loop(path: &Path, stop: &AtomicBool, pause: &AtomicBool) {
             Err(_) => sleep_unless_stopped(BUSY_RETRY, stop),
         }
     };
+    let stop_busy = Arc::clone(stop);
+    let _ = conn.busy_handler(Some(move |_| {
+        if stop_busy.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+        !stop_busy.load(Ordering::Relaxed)
+    }));
     let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
@@ -392,7 +400,7 @@ fn index_loop(path: &Path, stop: &AtomicBool, pause: &AtomicBool) {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
-        let kind = match scan.step(&conn, INDEX_BATCH) {
+        let kind = match scan.step(&conn, INDEX_BATCH, Some(stop.as_ref())) {
             Ok(IndexStep::Wrote(_)) => AfterBatch::Progress,
             Ok(IndexStep::Idle) => AfterBatch::Idle,
             // Busy and snapshot errors are not an empty index. Retry soon.
@@ -449,7 +457,7 @@ fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize> {
     delete_orphans(conn)?;
-    match Scan::default().step(conn, limit)? {
+    match Scan::default().step(conn, limit, None)? {
         IndexStep::Wrote(n) => Ok(n),
         IndexStep::Idle => Ok(0),
     }
@@ -632,13 +640,18 @@ struct Scan {
 }
 
 impl Scan {
-    fn step(&mut self, conn: &Connection, limit: usize) -> Result<IndexStep> {
+    fn step(
+        &mut self,
+        conn: &Connection,
+        limit: usize,
+        stop: Option<&AtomicBool>,
+    ) -> Result<IndexStep> {
         if limit == 0 {
             return Ok(IndexStep::Idle);
         }
         let queued = select_queued(conn, limit)?;
         if !queued.is_empty() {
-            let wrote = write_batch(conn, &queued)?;
+            let wrote = write_batch(conn, &queued, stop)?;
             return Ok(IndexStep::Wrote(wrote));
         }
         if let Some(high) = self.high {
@@ -651,7 +664,7 @@ impl Scan {
             };
             let newer = select_stale(conn, limit, bound)?;
             if !newer.is_empty() {
-                let wrote = write_batch(conn, &newer)?;
+                let wrote = write_batch(conn, &newer, stop)?;
                 if newer.len() == limit {
                     self.newer_before = newer.last().map(|row| row.key);
                 } else {
@@ -667,7 +680,7 @@ impl Scan {
         };
         let older = select_stale(conn, limit, bound)?;
         if !older.is_empty() {
-            let wrote = write_batch(conn, &older)?;
+            let wrote = write_batch(conn, &older, stop)?;
             if self.high.is_none() {
                 self.high = older.first().map(|row| row.key);
             }
@@ -682,7 +695,7 @@ impl Scan {
             if top.is_empty() {
                 return Ok(IndexStep::Idle);
             }
-            let wrote = write_batch(conn, &top)?;
+            let wrote = write_batch(conn, &top, stop)?;
             self.high = top.first().map(|row| row.key);
             self.before = top.last().map(|row| row.key);
             return Ok(IndexStep::Wrote(wrote));
@@ -803,11 +816,14 @@ struct Prepared {
     values: Vec<f32>,
 }
 
-fn write_batch(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
+fn write_batch(conn: &Connection, rows: &[StaleRow], stop: Option<&AtomicBool>) -> Result<usize> {
     // Hash outside the write lock. A multi-megabyte batch must not hold it
     // for the whole hash, or sync and triage outlive the 5s busy timeout.
     let mut prepared = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
+        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(crate::Error::Search("indexer stopped".into()));
+        }
         interrupt_rebuild(index)?;
         let body = message_body(conn, &row.account_id, &row.message_id)?;
         let values = match &body {
@@ -1366,6 +1382,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn opening_a_symlink_replays_its_wal() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-wal-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
+        let alias = dir.join("alias.sqlite");
+        let hold = rusqlite::Connection::open(&alias).unwrap();
+        hold.pragma_update(None, "journal_mode", "WAL").unwrap();
+        hold.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE marker (value TEXT NOT NULL);",
+        )
+        .unwrap();
+        hold.execute("INSERT INTO marker (value) VALUES ('from-alias')", [])
+            .unwrap();
+        // A reader keeps SQLite from checkpointing the alias WAL on close.
+        hold.execute_batch("BEGIN").unwrap();
+        let _ = hold
+            .query_row("SELECT value FROM marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let store = Store::open(&alias).unwrap();
+        let value: String = store
+            .conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "from-alias");
+        drop(store);
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_does_not_wait_out_the_busy_timeout() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-drop-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let store = Store::open(&path).unwrap();
+        wait_until(|| store.embedding_indexer_running());
+        store.upsert_account(&account("a1")).unwrap();
+        store
+            .upsert_message(&message("a1", "m@x", "please pay the invoice"))
+            .unwrap();
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held_writer = std::sync::Arc::clone(&held);
+        let release_writer = std::sync::Arc::clone(&release);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&writer_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+            while !release_writer.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = conn.execute_batch("ROLLBACK");
+        });
+        wait_until(|| held.load(std::sync::atomic::Ordering::Relaxed));
+        store.testing_pause_indexer(false);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        drop(store);
+        let elapsed = start.elapsed();
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "drop waited {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_symlink_and_a_dotdot_path_share_the_embed_lock() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
@@ -1767,7 +1875,7 @@ mod tests {
         }
         let mut scan = Scan::default();
         assert!(matches!(
-            scan.step(&store.conn, 1).unwrap(),
+            scan.step(&store.conn, 1, None).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert!(stored(&store, "a1", "new@x").model == EMBEDDING_MODEL);
@@ -1781,7 +1889,7 @@ mod tests {
         arrived.headers.date_unix = 40;
         store.upsert_message(&arrived).unwrap();
         assert!(matches!(
-            scan.step(&store.conn, 1).unwrap(),
+            scan.step(&store.conn, 1, None).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "later@x"), embed_body("later mail"));
@@ -1792,7 +1900,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            scan.step(&store.conn, 1).unwrap(),
+            scan.step(&store.conn, 1, None).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "mid@x").version, EMBEDDING_VERSION);
@@ -1812,7 +1920,7 @@ mod tests {
         store.upsert_message(&floor).unwrap();
         let mut scan = Scan::default();
         assert!(matches!(
-            scan.step(&store.conn, 1).unwrap(),
+            scan.step(&store.conn, 1, None).unwrap(),
             IndexStep::Wrote(1)
         ));
         for (id, date) in [("a@x", 10_i64), ("b@x", 20), ("c@x", 30)] {
@@ -1826,7 +1934,7 @@ mod tests {
             .execute("DELETE FROM embedding_queue", [])
             .unwrap();
         assert!(matches!(
-            scan.step(&store.conn, 2).unwrap(),
+            scan.step(&store.conn, 2, None).unwrap(),
             IndexStep::Wrote(2)
         ));
         assert_eq!(stored(&store, "a1", "c@x").version, EMBEDDING_VERSION);
@@ -1838,7 +1946,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            scan.step(&store.conn, 2).unwrap(),
+            scan.step(&store.conn, 2, None).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "a@x").version, EMBEDDING_VERSION);
