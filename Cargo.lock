@@ -1874,6 +1874,7 @@ version = "0.1.0"
 dependencies = [
  "fell-confirm",
  "fs4",
+ "libc",
  "mail-parser",
  "rcgen",
  "rusqlite",
@@ -1881,6 +1882,7 @@ dependencies = [
  "rustls-native-certs",
  "saphyr",
  "serde_json",
+ "sha2 0.10.9",
  "similar",
  "thiserror 2.0.21",
  "xattr",

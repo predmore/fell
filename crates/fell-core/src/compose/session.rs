@@ -2,31 +2,27 @@
 //!
 //! Agent edits and `draft.md` writes share this merge. Neither path transmits.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::AccountId;
 
+use super::digest::{self, Digests, Known};
 use super::frontmatter::{
-    DraftFields, DraftIssue, email_of, parse_address_line, parse_draft, write_draft,
+    DraftFields, DraftIssue, ParsedDraft, email_of, parse_address_line, parse_draft, write_draft,
 };
-use super::merge::{self, HunkKind};
+use super::merge::{self, HunkKind, MergeOutcome};
 use super::mime::{self, Outgoing, ResolvedFile};
-use super::persist;
-use super::workspace::{self, Closure};
+use super::persist::{self, StoredReview};
+use super::review::{self, Hunk};
+use super::workspace::{self, Closure, FileStamp, ListedFile};
 use super::writer::{DraftWriter, MailboxSave, OwnWrites, SaveCache, SaveJob, SaveWaiter};
 
 const DEBOUNCE_MS: u64 = 150;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Hunk {
-    id: u64,
-    kind: HunkKind,
-    previous: String,
-    inserted: String,
-    /// Byte start of `inserted` in the serialized draft, when it was applied.
-    at: Option<usize>,
-}
+const CHANGED_ATTACHMENT: &str = "an attachment changed after it was shown";
 
 #[derive(Debug, Clone)]
 struct Checkpoint {
@@ -92,12 +88,19 @@ pub struct DraftSession {
     body: String,
     revision: u64,
     seen_revision: u64,
-    /// Path and content hash of referenced files the person has accepted.
-    /// A later text edit does not replace a hash that is already recorded.
-    painted_files: Option<Vec<(String, u64)>>,
-    /// The next paint may replace accepted attachment hashes.
+    /// Referenced files the person has accepted: path and file version.
+    /// A later text edit does not replace a version that is already recorded.
+    painted_files: Option<Vec<(String, FileStamp)>>,
+    /// The next paint may replace accepted attachment versions.
     accept_files: bool,
+    /// SHA-256 of attachment versions, hashed off the paint path.
+    digests: Digests,
+    /// The attachment bytes [`Self::prepare_send`] checked, and the revision
+    /// it checked them for.
+    prepared: Mutex<Option<(u64, Vec<ResolvedFile>)>>,
     locked_reply: Option<String>,
+    /// Agent changes not yet reviewed. Ranges point into [`Self::serialize`]
+    /// and never overlap.
     hunks: Vec<Hunk>,
     next_hunk: u64,
     issues: Vec<DraftIssue>,
@@ -140,10 +143,21 @@ impl DraftSession {
         fields: DraftFields,
         body: impl Into<String>,
     ) -> Result<Self, String> {
-        let body = body.into();
+        let mut session = Self::unsaved(folder, id.into(), account_id, fields, body.into());
+        session.flush()?;
+        Ok(session)
+    }
+
+    fn unsaved(
+        folder: PathBuf,
+        id: String,
+        account_id: AccountId,
+        fields: DraftFields,
+        body: String,
+    ) -> Self {
         let locked_reply = fields.in_reply_to.clone();
         let mut session = Self {
-            id: id.into(),
+            id,
             folder,
             account_id,
             fields,
@@ -152,6 +166,8 @@ impl DraftSession {
             seen_revision: 0,
             painted_files: None,
             accept_files: false,
+            digests: Digests::default(),
+            prepared: Mutex::new(None),
             locked_reply,
             hunks: Vec::new(),
             next_hunk: 1,
@@ -178,14 +194,11 @@ impl DraftSession {
             agent_seen: HashMap::new(),
             quoted: None,
         };
-        session.locked_reply = session.fields.in_reply_to.clone();
         if let Some(email) = email_of(&session.fields.from) {
             session.identities.insert(email);
         }
-        session.load_hunks();
         session.settled = session.serialize();
-        session.flush()?;
-        Ok(session)
+        session
     }
 
     pub fn open_folder(folder: &Path, account_hint: AccountId) -> Result<Self, String> {
@@ -221,13 +234,17 @@ impl DraftSession {
         if parsed.fields.in_reply_to != stored.fields.in_reply_to {
             return Err("reply target does not match the mailbox".into());
         }
-        let mut session = Self::create(
+        let review = store
+            .load_compose_review(&id)
+            .map_err(|err| err.to_string())?
+            .filter(|review| review_matches_row(&review.text, &stored));
+        let mut session = Self::unsaved(
             folder.to_path_buf(),
             id,
             stored.account_id,
             parsed.fields,
             parsed.body,
-        )?;
+        );
         session.identities = stored.identities.into_iter().collect();
         session.owner = stored.owner;
         session.locked_reply = stored.fields.in_reply_to.clone();
@@ -239,7 +256,34 @@ impl DraftSession {
         if let Ok(known) = store.mailed_addresses(session.account_id()) {
             session.known = known;
         }
+        if let Some(review) = review {
+            session.resume_review(review);
+        }
+        session.settled = session.serialize();
+        session.flush()?;
         Ok(session)
+    }
+
+    /// Hunks come from the mailbox, never from the draft folder. Whatever
+    /// `draft.md` gained since Fell last saved was written while no editor
+    /// held the draft, so it is an agent change and is marked for review.
+    fn resume_review(&mut self, review: StoredReview) {
+        self.hunks = review::from_json(&review.hunks, &review.text);
+        self.next_hunk = self
+            .hunks
+            .iter()
+            .map(|hunk| hunk.id + 1)
+            .max()
+            .unwrap_or(1)
+            .max(review.next_hunk);
+        let current = self.serialize();
+        if review.text == current {
+            return;
+        }
+        let outcome = merge::merge_draft(&review.text, &review.text, &current);
+        if !self.apply_agent_merge(&review.text, outcome) {
+            review::carry(&mut self.hunks, &review.text, &current);
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -287,23 +331,45 @@ impl DraftSession {
         self.quoted = html;
     }
 
+    /// The window painted this revision. Records which version of each
+    /// referenced file was on screen. Stats files; never reads them.
     pub fn mark_seen(&mut self) {
         if self.seen_revision == self.revision && !self.accept_files {
             return;
         }
-        let current = referenced_file_hashes(&self.folder, &self.fields, &self.body);
-        if self.painted_files.is_none() || self.accept_files {
-            self.painted_files = Some(current);
-            self.accept_files = false;
+        let (listed, _) = workspace::list_closure(&self.folder, &self.fields, &self.body);
+        let current: Vec<(String, FileStamp)> = listed
+            .iter()
+            .map(|file| (file.path.clone(), file.stamp))
+            .collect();
+        let accept = self.painted_files.is_none() || self.accept_files;
+        self.accept_files = false;
+        let mut fresh = Vec::new();
+        if accept {
+            fresh = current.iter().map(|(path, _)| path.clone()).collect();
+            self.painted_files = Some(current.clone());
         } else if let Some(painted) = &mut self.painted_files {
             painted.retain(|(path, _)| current.iter().any(|(name, _)| name == path));
-            for (path, hash) in current {
-                if painted.iter().all(|(name, _)| name != &path) {
-                    painted.push((path, hash));
+            for (path, stamp) in &current {
+                if painted.iter().all(|(name, _)| name != path) {
+                    painted.push((path.clone(), *stamp));
+                    fresh.push(path.clone());
                 }
             }
             painted.sort();
         }
+        for path in &fresh {
+            self.digests.forget(path);
+        }
+        let painted = self.painted_files.clone().unwrap_or_default();
+        for (path, stamp) in &painted {
+            if current.contains(&(path.clone(), *stamp)) {
+                self.digests.request(&self.folder, path, *stamp);
+            }
+        }
+        let mut keep = painted;
+        keep.extend(current);
+        self.digests.retain(&keep);
         self.seen_revision = self.revision;
     }
 
@@ -349,9 +415,10 @@ impl DraftSession {
             return;
         }
         self.begin_user_change();
+        let before = self.hunk_base();
         self.body = body;
         self.bump();
-        self.reconcile_hunks();
+        self.follow_user_change(before);
         self.refresh_issues();
     }
 
@@ -360,8 +427,10 @@ impl DraftSession {
             return;
         }
         self.begin_user_change();
+        let before = self.hunk_base();
         self.fields.subject = subject;
         self.bump();
+        self.follow_user_change(before);
         self.refresh_issues();
     }
 
@@ -370,21 +439,27 @@ impl DraftSession {
             return;
         }
         self.begin_user_change();
+        let before = self.hunk_base();
         self.fields.from = from;
         self.bump();
+        self.follow_user_change(before);
         self.refresh_issues();
     }
 
     pub fn set_addresses_from_user(&mut self, field: &str, line: &str) -> Result<(), String> {
         let parsed = parse_address_line(line)?;
+        if !matches!(field, "to" | "cc" | "bcc") {
+            return Err("unknown address field".into());
+        }
         self.begin_user_change();
+        let before = self.hunk_base();
         match field {
             "to" => self.fields.to = parsed,
             "cc" => self.fields.cc = parsed,
-            "bcc" => self.fields.bcc = parsed,
-            _ => return Err("unknown address field".into()),
+            _ => self.fields.bcc = parsed,
         }
         self.bump();
+        self.follow_user_change(before);
         self.refresh_issues();
         Ok(())
     }
@@ -419,26 +494,34 @@ impl DraftSession {
         true
     }
 
+    /// Put back the text an agent edit replaced, at that edit's range and
+    /// nowhere else. Refuses, with a notice, when that cannot be done.
     pub fn reject_hunk(&mut self, id: u64) -> bool {
         let Some(index) = self.hunks.iter().position(|hunk| hunk.id == id) else {
             return false;
         };
         let hunk = self.hunks[index].clone();
         let text = self.serialize();
-        if hunk.inserted.is_empty() || !text.contains(&hunk.inserted) {
-            self.hunks.remove(index);
+        if !hunk.holds(&text) {
+            self.notices
+                .push("that agent edit is no longer where it was; nothing was reverted".into());
             return false;
         }
+        let (next, change) = review::apply(&text, &(hunk.at..hunk.end()), &hunk.previous);
+        let Ok(parsed) = parse_draft(&next) else {
+            self.notices.push(
+                "reverting that agent edit would break the draft header; nothing was reverted"
+                    .into(),
+            );
+            return false;
+        };
         self.begin_user_change();
         self.end_user_change();
-        let next = match revert_span(&text, &hunk) {
-            Some(next) => next,
-            None => return false,
-        };
-        if self.adopt_text(&next).is_err() {
-            return false;
-        }
-        self.hunks.retain(|item| item.id != id);
+        self.hunks.remove(index);
+        review::absorb(&mut self.hunks, &text, &next, &change, None);
+        self.adopt_parsed(parsed);
+        let now = self.serialize();
+        review::carry(&mut self.hunks, &next, &now);
         true
     }
 
@@ -453,15 +536,21 @@ impl DraftSession {
                 self.revision
             ));
         }
-        let mut next = current.clone();
-        next.replace_range(at..at + old.len(), new);
+        let (next, change) = review::apply(&current, &(at..at + old.len()), new);
+        let parsed = parse_draft(&next).map_err(|err| err.message)?;
         self.undo.push(self.checkpoint());
-        self.adopt_text(&next)?;
-        if old != new && self.serialize().contains(new) {
-            let at = span_after_edit(&self.serialize(), new, at);
-            self.push_hunk(HunkKind::Body, old.to_string(), new.to_string(), at);
+        // The person's next keystroke starts a new undo step, so undo
+        // takes back this edit and nothing typed after it.
+        self.undo_open = false;
+        if old != new {
+            let kind = review::kind_of(&next, change.new.start, change.new.end);
+            let id = self.take_hunk_id();
+            review::absorb(&mut self.hunks, &current, &next, &change, Some((id, kind)));
         }
-        self.settled = self.serialize();
+        self.adopt_parsed(parsed);
+        let now = self.serialize();
+        review::carry(&mut self.hunks, &next, &now);
+        self.settled = now;
         Ok(())
     }
 
@@ -470,9 +559,10 @@ impl DraftSession {
             return Ok(());
         }
         self.undo.push(self.checkpoint());
-        let previous = self.body.clone();
+        self.undo_open = false;
+        let before = self.serialize();
         self.body = body.to_string();
-        self.push_hunk(HunkKind::Body, previous, body.to_string(), None);
+        self.record_agent_rewrite(&before, Some(HunkKind::Body));
         self.bump();
         self.settled = self.serialize();
         Ok(())
@@ -570,7 +660,7 @@ impl DraftSession {
         self.flush().is_ok()
     }
 
-    /// Save the draft file, its hunks, and its mailbox row.
+    /// Save the draft file and its mailbox row, with the hunks.
     ///
     /// With a writer attached this only queues the save, so the caller's
     /// lock is not held across disk I/O; a failed write shows as a notice on
@@ -581,8 +671,7 @@ impl DraftSession {
         let job = SaveJob {
             folder: self.folder.clone(),
             text: text.clone(),
-            hunks_json: self.hunks_json(),
-            mailbox: Some(self.mailbox_save()),
+            mailbox: Some(self.mailbox_save(&text)),
         };
         self.last_written = text.clone();
         if let Some(writer) = &self.writer {
@@ -620,7 +709,7 @@ impl DraftSession {
         self.writer.is_some() && self.own_writes.contains(since, text)
     }
 
-    fn mailbox_save(&self) -> MailboxSave {
+    fn mailbox_save(&self, text: &str) -> MailboxSave {
         MailboxSave {
             store_path: self.store_path.clone(),
             draft: persist::StoredCompose {
@@ -632,6 +721,11 @@ impl DraftSession {
                 identities: self.identities.iter().cloned().collect(),
                 owner: self.owner.clone(),
             },
+            review: StoredReview {
+                text: text.to_string(),
+                hunks: review::to_json(&self.hunks),
+                next_hunk: self.next_hunk,
+            },
         }
     }
 
@@ -641,6 +735,9 @@ impl DraftSession {
         closure
     }
 
+    /// Check the draft and build the message. Reads the attachments once;
+    /// those bytes are compared with what was on screen and are the bytes
+    /// sent. [`Self::resolved_files`] hands the same bytes back.
     pub fn prepare_send(&self) -> Result<Outgoing, String> {
         if let Some(reason) = self.send_block() {
             return Err(reason);
@@ -649,18 +746,54 @@ impl DraftSession {
         if let Some(issue) = closure.issues.iter().find(|issue| issue.blocks_send) {
             return Err(issue.message.clone());
         }
-        Ok(mime::build_outgoing(
+        self.check_sent_files(&closure)?;
+        let outgoing = mime::build_outgoing(
             self.account_id.clone(),
             &self.fields,
             &self.body,
             &closure.files,
-        ))
+        );
+        *self.prepared.lock().expect("prepared send") = Some((self.revision, closure.files));
+        Ok(outgoing)
+    }
+
+    /// Each file about to be sent is the version the person saw. Its bytes
+    /// are hashed here and must match that version's digest; a file that
+    /// was not hashed yet must still be that exact version.
+    fn check_sent_files(&self, closure: &Closure) -> Result<(), String> {
+        let painted = self.painted_files.as_deref().unwrap_or(&[]);
+        for file in &closure.files {
+            let stamp = closure
+                .stamps
+                .iter()
+                .find(|(path, _)| path == &file.path)
+                .map(|(_, stamp)| *stamp);
+            let shown = painted
+                .iter()
+                .find(|(path, _)| path == &file.path)
+                .map(|(_, stamp)| *stamp);
+            let (Some(stamp), Some(shown)) = (stamp, shown) else {
+                return Err(CHANGED_ATTACHMENT.into());
+            };
+            let digest = digest::sha256(&file.bytes);
+            match self.digests.get(&file.path, shown) {
+                Some(Known::Digest(seen)) if seen == digest => {}
+                None if stamp == shown => {}
+                _ => return Err(CHANGED_ATTACHMENT.into()),
+            }
+            self.digests.record(&file.path, stamp, digest);
+            if self.digests.get(&file.path, stamp) == Some(Known::Conflict) {
+                return Err(CHANGED_ATTACHMENT.into());
+            }
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Snapshot {
         let text = self.serialize();
         let (listed, listed_issues) =
             workspace::list_closure(&self.folder, &self.fields, &self.body);
+        let send_block = self.send_block_listed(&listed, &listed_issues);
         let mut issues = self.issues.clone();
         issues.extend(listed_issues);
         let hunks = self
@@ -695,7 +828,7 @@ impl DraftSession {
             quoted: self.quoted.clone(),
             open: self.open,
             focused: self.focused,
-            send_block: self.send_block(),
+            send_block,
             text,
         }
     }
@@ -708,19 +841,36 @@ impl DraftSession {
         &self.body
     }
 
+    /// The attachments to submit. Right after [`Self::prepare_send`] these
+    /// are the bytes it checked and put in the message, not a second read.
     pub fn resolved_files(&self) -> Vec<ResolvedFile> {
+        let prepared = self.prepared.lock().expect("prepared send").take();
+        if let Some((revision, files)) = prepared
+            && revision == self.revision
+        {
+            return files;
+        }
         workspace::resolve_closure(&self.folder, &self.fields, &self.body).files
     }
 
     fn send_block(&self) -> Option<String> {
+        let (listed, issues) = workspace::list_closure(&self.folder, &self.fields, &self.body);
+        self.send_block_listed(&listed, &issues)
+    }
+
+    /// Runs on every paint. Stats files; never reads them.
+    fn send_block_listed(
+        &self,
+        listed: &[ListedFile],
+        listed_issues: &[DraftIssue],
+    ) -> Option<String> {
         if self.seen_revision != self.revision {
             return Some("the draft changed; it is on screen before send".into());
         }
-        if let Some(painted) = &self.painted_files {
-            let current = referenced_file_hashes(&self.folder, &self.fields, &self.body);
-            if current != *painted {
-                return Some("an attachment changed after it was shown".into());
-            }
+        if let Some(painted) = &self.painted_files
+            && self.files_changed(painted, listed)
+        {
+            return Some(CHANGED_ATTACHMENT.into());
         }
         if let Some(issue) = self.issues.iter().find(|issue| issue.blocks_send) {
             return Some(issue.message.clone());
@@ -735,11 +885,40 @@ impl DraftSession {
         {
             return Some("from is not one of your addresses".into());
         }
-        let (_files, issues) = workspace::list_closure(&self.folder, &self.fields, &self.body);
-        issues
+        listed_issues
             .iter()
             .find(|issue| issue.blocks_send)
             .map(|issue| issue.message.clone())
+    }
+
+    /// A referenced file is not the version that was on screen. A new
+    /// version whose digest matches the shown one (a `touch`, an identical
+    /// copy) is not a change once the hash thread has read it.
+    fn files_changed(&self, painted: &[(String, FileStamp)], listed: &[ListedFile]) -> bool {
+        let mut changed = painted
+            .iter()
+            .any(|(path, _)| listed.iter().all(|file| &file.path != path));
+        for file in listed {
+            let Some((_, shown)) = painted.iter().find(|(path, _)| path == &file.path) else {
+                changed = true;
+                continue;
+            };
+            if file.stamp == *shown {
+                continue;
+            }
+            match (
+                self.digests.get(&file.path, *shown),
+                self.digests.get(&file.path, file.stamp),
+            ) {
+                (Some(Known::Digest(before)), Some(Known::Digest(now))) if before == now => {}
+                (_, None) => {
+                    self.digests.request(&self.folder, &file.path, file.stamp);
+                    changed = true;
+                }
+                _ => changed = true,
+            }
+        }
+        changed
     }
 
     fn merge_disk(&mut self, text: &str) {
@@ -750,24 +929,76 @@ impl DraftSession {
             let _ = self.flush();
             return;
         }
-        let outcome = merge::merge_draft(&self.settled, &self.serialize(), text);
-        self.notices.extend(outcome.skipped);
-        if self.adopt_text(&outcome.text).is_err() {
+        let ours = self.serialize();
+        let outcome = merge::merge_draft(&self.settled, &ours, text);
+        let changed = outcome.text != merge::normalize(&ours);
+        let checkpoint = self.checkpoint();
+        if !self.apply_agent_merge(&ours, outcome) {
             self.notices.push(
                 "draft.md could not be parsed; kept the open draft and rewrote the file".into(),
             );
             let _ = self.flush();
             return;
         }
-        for hunk in outcome.hunks {
-            self.push_hunk(hunk.kind, hunk.previous, hunk.inserted, None);
+        if changed {
+            // Undo takes back this file edit, not the person's last change.
+            self.undo.push(checkpoint);
+            self.undo_open = false;
         }
         self.settled = self.serialize();
         let _ = self.flush();
     }
 
-    fn adopt_text(&mut self, text: &str) -> Result<(), String> {
-        let parsed = parse_draft(text).map_err(|err| err.message)?;
+    /// Adopt a merge whose hunk ranges point into `ours`, the text the
+    /// current hunks point into. Each merged region becomes an agent hunk.
+    fn apply_agent_merge(&mut self, ours: &str, outcome: MergeOutcome) -> bool {
+        let Ok(parsed) = parse_draft(&outcome.text) else {
+            return false;
+        };
+        self.notices.extend(outcome.skipped);
+        let mut text = merge::normalize(ours);
+        review::carry(&mut self.hunks, ours, &text);
+        let mut regions = outcome.hunks;
+        regions.sort_by_key(|region| Reverse(region.old_start));
+        for region in regions {
+            let range = region.old_start..region.old_end;
+            if text.get(range.clone()) != Some(region.previous.as_str()) {
+                continue;
+            }
+            let (next, change) = review::apply(&text, &range, &region.inserted);
+            let id = self.take_hunk_id();
+            review::absorb(
+                &mut self.hunks,
+                &text,
+                &next,
+                &change,
+                Some((id, region.kind)),
+            );
+            text = next;
+        }
+        review::carry(&mut self.hunks, &text, &outcome.text);
+        self.adopt_parsed(parsed);
+        let now = self.serialize();
+        review::carry(&mut self.hunks, &outcome.text, &now);
+        true
+    }
+
+    /// One agent hunk for everything that differs between `before` and now.
+    fn record_agent_rewrite(&mut self, before: &str, kind: Option<HunkKind>) {
+        let now = self.serialize();
+        let edits = review::diff(before, &now);
+        let (Some(first), Some(last)) = (edits.first(), edits.last()) else {
+            return;
+        };
+        let range = first.old.start..last.old.end;
+        let (next, change) = review::apply(before, &range, &now[first.new.start..last.new.end]);
+        debug_assert_eq!(next, now);
+        let kind = kind.unwrap_or_else(|| review::kind_of(&next, change.new.start, change.new.end));
+        let id = self.take_hunk_id();
+        review::absorb(&mut self.hunks, before, &next, &change, Some((id, kind)));
+    }
+
+    fn adopt_parsed(&mut self, parsed: ParsedDraft) {
         let mut fields = parsed.fields;
         if fields.in_reply_to != self.locked_reply {
             fields.in_reply_to = self.locked_reply.clone();
@@ -778,7 +1009,6 @@ impl DraftSession {
         self.body = parsed.body;
         self.issues = parsed.issues;
         self.bump();
-        Ok(())
     }
 
     fn refresh_issues(&mut self) {
@@ -787,40 +1017,38 @@ impl DraftSession {
         }
     }
 
-    fn push_hunk(&mut self, kind: HunkKind, previous: String, inserted: String, at: Option<usize>) {
-        if previous == inserted {
-            return;
-        }
+    fn take_hunk_id(&mut self) -> u64 {
         let id = self.next_hunk;
         self.next_hunk += 1;
-        self.hunks.push(Hunk {
-            id,
-            kind,
-            previous,
-            inserted,
-            at,
-        });
+        id
     }
 
-    fn reconcile_hunks(&mut self) {
-        let text = self.serialize();
-        let before = self.hunks.len();
-        self.hunks
-            .retain(|hunk| hunk.inserted.is_empty() || text.contains(&hunk.inserted));
-        if self.hunks.len() != before {
+    /// The text hunk ranges point into, when there are hunks to carry.
+    fn hunk_base(&self) -> Option<String> {
+        (!self.hunks.is_empty()).then(|| self.serialize())
+    }
+
+    /// The person changed the draft since `before`. Hunks move with the
+    /// text; one whose text the person rewrote is theirs now.
+    fn follow_user_change(&mut self, before: Option<String>) {
+        let Some(before) = before else {
+            return;
+        };
+        let after = self.serialize();
+        if review::follow_user(&mut self.hunks, &before, &after) > 0 {
             self.notices
                 .push("kept your text where it overlapped an agent edit".into());
         }
     }
 
+    /// The draft with every unreviewed agent edit taken back.
     fn user_serialized(&self) -> String {
         let mut text = self.serialize();
-        for hunk in self.hunks.iter().rev() {
-            if hunk.inserted.is_empty() {
-                continue;
-            }
-            if let Some(next) = revert_span(&text, hunk) {
-                text = next;
+        let mut hunks: Vec<&Hunk> = self.hunks.iter().collect();
+        hunks.sort_by_key(|hunk| Reverse(hunk.at));
+        for hunk in hunks {
+            if hunk.holds(&text) {
+                text.replace_range(hunk.at..hunk.end(), &hunk.previous);
             }
         }
         text
@@ -855,156 +1083,40 @@ impl DraftSession {
     }
 }
 
-impl DraftSession {
-    fn load_hunks(&mut self) {
-        let Ok(text) =
-            std::fs::read_to_string(workspace::control_dir(&self.folder).join("hunks.json"))
-        else {
-            return;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return;
-        };
-        let Some(items) = value.as_array() else {
-            return;
-        };
-        self.hunks.clear();
-        for item in items {
-            let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) else {
-                continue;
-            };
-            let kind = match item.get("kind").and_then(serde_json::Value::as_str) {
-                Some("recipients") => HunkKind::Recipients,
-                Some("subject") => HunkKind::Subject,
-                Some("attachments") => HunkKind::Attachments,
-                _ => HunkKind::Body,
-            };
-            self.hunks.push(Hunk {
-                id,
-                kind,
-                previous: item
-                    .get("previous")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                inserted: item
-                    .get("inserted")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                at: item
-                    .get("at")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|at| at as usize),
-            });
-        }
-        self.next_hunk = self.hunks.iter().map(|hunk| hunk.id).max().unwrap_or(0) + 1;
-    }
-
-    fn hunks_json(&self) -> String {
-        let items: Vec<serde_json::Value> = self
-            .hunks
-            .iter()
-            .map(|hunk| {
-                let kind = match hunk.kind {
-                    HunkKind::Body => "body",
-                    HunkKind::Recipients => "recipients",
-                    HunkKind::Subject => "subject",
-                    HunkKind::Attachments => "attachments",
-                };
-                serde_json::json!({
-                    "id": hunk.id,
-                    "kind": kind,
-                    "previous": hunk.previous,
-                    "inserted": hunk.inserted,
-                    "at": hunk.at,
-                })
-            })
-            .collect();
-        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
-    }
+/// A review row belongs to the compose row it was saved with. One left by
+/// another draft with this id, or by a save that did not reach the row, is
+/// not used.
+fn review_matches_row(text: &str, stored: &persist::StoredCompose) -> bool {
+    let Ok(parsed) = parse_draft(text) else {
+        return false;
+    };
+    parsed.body == stored.body
+        && parsed.fields.from == stored.fields.from
+        && parsed.fields.to == stored.fields.to
+        && parsed.fields.cc == stored.fields.cc
+        && parsed.fields.bcc == stored.fields.bcc
+        && parsed.fields.subject == stored.fields.subject
 }
 
-fn span_after_edit(text: &str, inserted: &str, at: usize) -> Option<usize> {
-    if text.get(at..at + inserted.len()) == Some(inserted) {
-        return Some(at);
-    }
-    text.match_indices(inserted)
-        .map(|(index, _)| index)
-        .min_by_key(|index| index.abs_diff(at))
-}
-
-fn revert_span(text: &str, hunk: &Hunk) -> Option<String> {
-    if let Some(at) = hunk.at
-        && text.get(at..at + hunk.inserted.len()) == Some(hunk.inserted.as_str())
-    {
-        let mut next = text.to_string();
-        next.replace_range(at..at + hunk.inserted.len(), &hunk.previous);
-        return Some(next);
-    }
-    if text.matches(hunk.inserted.as_str()).count() == 1 {
-        return Some(text.replacen(&hunk.inserted, &hunk.previous, 1));
-    }
-    None
-}
-
-fn referenced_file_hashes(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64)> {
-    let (files, _) = workspace::list_closure(folder, fields, body);
-    let mut stamp = Vec::new();
-    for file in files {
-        let Some(hash) = hash_file(folder, &file.path) else {
-            continue;
-        };
-        stamp.push((file.path, hash));
-    }
-    stamp.sort();
-    stamp
-}
-
-/// Hash the file bytes. Length and mtime are not part of the stamp.
-fn hash_file(folder: &Path, relative: &str) -> Option<u64> {
-    let path = workspace::resolve_inside(folder, relative).ok()?;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut buf = [0u8; 8192];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut buf).ok()?;
-        if read == 0 {
-            break;
-        }
-        for byte in &buf[..read] {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    Some(hash)
-}
-
+/// Path and version of each referenced file. Stats only.
 pub(crate) fn attachment_stamp(
     folder: &Path,
     fields: &DraftFields,
     body: &str,
-) -> Vec<(String, u64, u128)> {
+) -> Vec<(String, FileStamp)> {
     let (files, _) = workspace::list_closure(folder, fields, body);
-    let mut stamp = Vec::new();
-    for file in files {
-        let mtime = std::fs::metadata(folder.join(&file.path))
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        stamp.push((file.path, file.len, mtime));
-    }
+    let mut stamp: Vec<(String, FileStamp)> = files
+        .into_iter()
+        .map(|file| (file.path, file.stamp))
+        .collect();
     stamp.sort();
     stamp
 }
 
 fn hunk_view(hunk: &Hunk, text: &str) -> Option<HunkView> {
-    if hunk.inserted.is_empty() {
+    if hunk.inserted.is_empty() || !hunk.holds(text) {
         return None;
     }
-    let start = text.find(&hunk.inserted)?;
     let label = match hunk.kind {
         HunkKind::Recipients => "agent changed recipients",
         HunkKind::Subject => "agent changed the subject",
@@ -1014,8 +1126,8 @@ fn hunk_view(hunk: &Hunk, text: &str) -> Option<HunkView> {
     Some(HunkView {
         id: hunk.id,
         kind: hunk.kind,
-        start,
-        end: start + hunk.inserted.len(),
+        start: hunk.at,
+        end: hunk.end(),
         label: label.to_string(),
     })
 }
@@ -1770,6 +1882,309 @@ mod tests {
             expected
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn stored_session(body: &str) -> (PathBuf, crate::Store, DraftSession) {
+        let (root, mut session) = temp_session(body);
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: AccountId("local".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        session.bind_store(&db);
+        session.flush().unwrap();
+        (root, store, session)
+    }
+
+    fn reopen(session: DraftSession, store: &crate::Store) -> DraftSession {
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        DraftSession::open_with_store(&folder, AccountId("local".into()), store).unwrap()
+    }
+
+    fn only_hunk(session: &DraftSession) -> u64 {
+        let hunks = session.snapshot().hunks;
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        hunks[0].id
+    }
+
+    #[test]
+    fn painting_never_reads_an_attachment() {
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        fs::write(session.folder().join("chart.png"), b"one").unwrap();
+        session.mark_seen();
+        for _ in 0..50 {
+            let snap = session.snapshot();
+            assert!(snap.send_block.is_none(), "{:?}", snap.send_block);
+            session.mark_seen();
+        }
+        session.digests.wait_idle();
+        // One read, on the hash thread, for the one version of the file.
+        assert_eq!(session.digests.hashed(), 1);
+        for _ in 0..50 {
+            let _ = session.snapshot();
+        }
+        session.digests.wait_idle();
+        assert_eq!(session.digests.hashed(), 1);
+        assert!(session.prepare_send().is_ok());
+    }
+
+    #[test]
+    fn a_touched_attachment_with_the_same_bytes_still_sends() {
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let path = session.folder().join("chart.png");
+        fs::write(&path, b"same bytes").unwrap();
+        session.mark_seen();
+        session.digests.wait_idle();
+        fs::write(&path, b"same bytes").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(7))
+            .unwrap();
+        // The new version is unknown until the hash thread reads it.
+        assert!(session.snapshot().send_block.is_some());
+        session.digests.wait_idle();
+        assert_eq!(session.snapshot().send_block, None);
+        assert!(session.prepare_send().is_ok());
+    }
+
+    #[test]
+    fn send_blocks_when_painted_bytes_change_under_the_same_stamp() {
+        // A rewrite inside one timestamp tick leaves the stamp alone. The
+        // digest taken for that stamp still catches it at send.
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        fs::write(session.folder().join("chart.png"), b"on screen").unwrap();
+        session.mark_seen();
+        session.digests.wait_idle();
+        let (shown, stamp) = session.painted_files.clone().unwrap().remove(0);
+        session.digests.forget(&shown);
+        session
+            .digests
+            .record(&shown, stamp, digest::sha256(b"what the person saw"));
+        assert_eq!(session.snapshot().send_block, None);
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("attachment"), "{err}");
+    }
+
+    #[test]
+    fn the_files_handed_to_send_are_the_bytes_that_were_checked() {
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let path = session.folder().join("chart.png");
+        fs::write(&path, b"checked").unwrap();
+        session.mark_seen();
+        let outgoing = session.prepare_send().unwrap();
+        assert!(!outgoing.mime.is_empty());
+        fs::write(&path, b"swapped after the check").unwrap();
+        let files = session.resolved_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes, b"checked");
+    }
+
+    #[test]
+    fn a_hard_linked_attachment_blocks_send() {
+        let (root, mut session) = temp_session("![chart](chart.png)\n");
+        let outside = root.join("outside-secret.txt");
+        fs::write(&outside, b"secret").unwrap();
+        fs::hard_link(&outside, session.folder().join("chart.png")).unwrap();
+        session.mark_seen();
+        let snap = session.snapshot();
+        assert!(snap.attachments.is_empty(), "{:?}", snap.attachments);
+        let block = snap.send_block.unwrap_or_default();
+        assert!(block.contains("hard link"), "{block}");
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("hard link"), "{err}");
+    }
+
+    #[test]
+    fn reject_follows_the_hunk_past_edits_before_it() {
+        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        session.edit(session.revision(), "beta", "gamma").unwrap();
+        let id = only_hunk(&session);
+        // The person writes the same word earlier in the draft, so the
+        // text alone would not say which `gamma` is the agent's.
+        session.set_body_from_user("gamma first\nalpha\ngamma\n".into());
+        session.end_user_change();
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "gamma first\nalpha\nbeta\n");
+    }
+
+    #[test]
+    fn an_agent_edit_before_a_hunk_moves_it() {
+        let (_root, mut session) = temp_session("alpha\nbeta\nend\n");
+        session.edit(session.revision(), "beta", "BETA").unwrap();
+        session
+            .edit(session.revision(), "alpha", "a much longer alpha")
+            .unwrap();
+        let hunks = session.snapshot().hunks;
+        assert_eq!(hunks.len(), 2, "{hunks:?}");
+        let text = session.serialize();
+        for hunk in &hunks {
+            assert!(
+                ["BETA", "a much longer alpha"].contains(&&text[hunk.start..hunk.end]),
+                "{hunk:?}"
+            );
+        }
+        let beta = hunks
+            .iter()
+            .find(|hunk| &text[hunk.start..hunk.end] == "BETA")
+            .unwrap()
+            .id;
+        assert!(session.reject_hunk(beta));
+        assert_eq!(session.body(), "a much longer alpha\nbeta\nend\n");
+        let alpha = only_hunk(&session);
+        assert!(session.reject_hunk(alpha));
+        assert_eq!(session.body(), "alpha\nbeta\nend\n");
+        assert!(session.snapshot().hunks.is_empty());
+    }
+
+    #[test]
+    fn a_header_edit_by_the_person_moves_a_body_hunk() {
+        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        session.edit(session.revision(), "beta", "BETA").unwrap();
+        let id = only_hunk(&session);
+        session.set_subject_from_user("A much longer subject line".into());
+        session
+            .set_addresses_from_user("to", "ada@example.com, bob@example.com")
+            .unwrap();
+        session.end_user_change();
+        let snap = session.snapshot();
+        assert_eq!(&snap.text[snap.hunks[0].start..snap.hunks[0].end], "BETA");
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "alpha\nbeta\n");
+        assert_eq!(session.fields().subject, "A much longer subject line");
+    }
+
+    #[test]
+    fn an_agent_edit_over_its_own_edit_rejects_to_the_persons_text() {
+        let (_root, mut session) = temp_session("see you Monday\n");
+        session
+            .edit(session.revision(), "Monday", "Tuesday")
+            .unwrap();
+        session
+            .edit(session.revision(), "you Tuesday", "you on Wednesday")
+            .unwrap();
+        let id = only_hunk(&session);
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "see you Monday\n");
+    }
+
+    #[test]
+    fn typing_over_an_agent_edit_makes_it_the_persons() {
+        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        session
+            .edit(session.revision(), "beta", "agent words")
+            .unwrap();
+        let id = only_hunk(&session);
+        session.set_body_from_user("alpha\nagent's own words\n".into());
+        session.end_user_change();
+        assert!(session.snapshot().hunks.is_empty());
+        assert!(!session.reject_hunk(id));
+        assert_eq!(session.body(), "alpha\nagent's own words\n");
+    }
+
+    #[test]
+    fn undo_takes_back_the_agent_edit_and_nothing_typed_after_it() {
+        let (_root, mut session) = temp_session("alpha\nbeta\n");
+        // The person is mid-word: their undo step is still open.
+        session.set_body_from_user("alpha typed\nbeta\n".into());
+        session.edit(session.revision(), "beta", "BETA").unwrap();
+        session.set_body_from_user("alpha typed more\nBETA\n".into());
+        assert!(session.undo());
+        assert_eq!(session.body(), "alpha typed\nBETA\n");
+        assert!(session.undo());
+        assert_eq!(session.body(), "alpha typed\nbeta\n");
+        assert!(session.snapshot().hunks.is_empty());
+    }
+
+    #[test]
+    fn undo_takes_back_a_file_edit_on_its_own() {
+        let (_root, mut session) = temp_session("alpha\n\nbeta\n");
+        session.set_body_from_user("alpha!\n\nbeta\n".into());
+        let agent = session.serialize().replace("beta", "BETA");
+        session.push_disk(Some(agent), 0);
+        assert!(session.poll_disk(DEBOUNCE_MS));
+        assert!(session.body().contains("BETA"));
+        assert!(session.undo());
+        assert_eq!(session.body(), "alpha!\n\nbeta\n");
+    }
+
+    #[test]
+    fn hunks_survive_a_reopen_from_the_mailbox() {
+        let (_root, store, mut session) = stored_session("alpha\nbeta\n");
+        session.edit(session.revision(), "beta", "BETA").unwrap();
+        session.flush().unwrap();
+        let mut session = reopen(session, &store);
+        let id = only_hunk(&session);
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn a_tampered_hunk_file_is_not_trusted() {
+        let (_root, store, mut session) = stored_session("Pay invoice 12 today.\nThanks\n");
+        session
+            .edit(session.revision(), "Thanks", "Cheers")
+            .unwrap();
+        session.flush().unwrap();
+        let control = workspace::control_dir(session.folder());
+        let text = session.serialize();
+        let at = text.find("Pay invoice 12").unwrap();
+        // Hide the real agent change and dress up the person's sentence as
+        // an agent edit whose reject would write the attacker's text.
+        let forged = serde_json::json!([{
+            "id": 99,
+            "kind": "body",
+            "previous": "Pay invoice 12 to account 666.",
+            "inserted": "Pay invoice 12 today.",
+            "at": at,
+        }]);
+        fs::create_dir_all(&control).unwrap();
+        fs::write(control.join("hunks.json"), forged.to_string()).unwrap();
+        let mut session = reopen(session, &store);
+        let hunks = session.snapshot().hunks;
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert_ne!(hunks[0].id, 99);
+        assert_eq!(&session.serialize()[hunks[0].start..hunks[0].end], "Cheers");
+        assert!(!session.reject_hunk(99));
+        assert!(session.reject_hunk(hunks[0].id));
+        assert_eq!(session.body(), "Pay invoice 12 today.\nThanks\n");
+    }
+
+    #[test]
+    fn a_draft_file_edit_while_closed_is_marked_for_review() {
+        let (_root, store, session) = stored_session("alpha\nbeta\n");
+        let folder = session.folder().to_path_buf();
+        let text = session.serialize();
+        drop(session);
+        fs::write(folder.join("draft.md"), text.replace("beta", "BETA")).unwrap();
+        let mut session =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+        let id = only_hunk(&session);
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn an_edit_while_closed_cannot_hide_an_earlier_agent_change() {
+        let (_root, store, mut session) = stored_session("alpha\nbeta\n");
+        session.edit(session.revision(), "beta", "BETA").unwrap();
+        session.flush().unwrap();
+        let folder = session.folder().to_path_buf();
+        let text = session.serialize();
+        drop(session);
+        fs::write(folder.join("draft.md"), text.replace("BETA", "BETA!")).unwrap();
+        let mut session =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+        let id = only_hunk(&session);
+        assert!(session.reject_hunk(id));
+        assert_eq!(session.body(), "alpha\nbeta\n");
     }
 
     #[test]

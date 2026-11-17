@@ -13,6 +13,7 @@ fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 mail-parser = { version = "1.0.1", default-features = false, features = ["full_encoding"] }
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2 = { version = "0.10.9", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 saphyr = { version = "0.3.4", default-features = false }
@@ -26,4 +27,5 @@ rcgen = "0.13"
 unsafe_code = "forbid"
 
 [target."cfg(unix)".dependencies]
+libc = "0.2.191"
 xattr = "0.2"
