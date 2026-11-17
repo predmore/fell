@@ -188,7 +188,7 @@ pub fn document_column(
                 .child("This message has no body."),
         );
     }
-    for (start, end) in column_runs(&document.blocks, gallery) {
+    for (start, end) in column_runs(&document.blocks, allow_remote, gallery) {
         column = if end - start == 2 {
             column.child(sketch_with_caption(
                 &document.blocks[start],
@@ -229,11 +229,15 @@ fn sketch_with_caption(
 }
 
 /// Inclusive-exclusive ranges of blocks that share one column child.
-fn column_runs(blocks: &[Block], gallery: &ImageGallery) -> Vec<(usize, usize)> {
+fn column_runs(
+    blocks: &[Block],
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut index = 0;
     while index < blocks.len() {
-        if caption_under_sketch(&blocks[index], blocks.get(index + 1), gallery) {
+        if caption_under_sketch(&blocks[index], blocks.get(index + 1), allow_remote, gallery) {
             runs.push((index, index + 2));
             index += 2;
         } else {
@@ -244,11 +248,16 @@ fn column_runs(blocks: &[Block], gallery: &ImageGallery) -> Vec<(usize, usize)> 
     runs
 }
 
-fn caption_under_sketch(block: &Block, next: Option<&Block>, gallery: &ImageGallery) -> bool {
+fn caption_under_sketch(
+    block: &Block,
+    next: Option<&Block>,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> bool {
     let Some(next) = next else {
         return false;
     };
-    decoded_sketch(block, gallery) && placeholder_caption(next, gallery)
+    decoded_sketch(block, gallery) && placeholder_caption(next, allow_remote, gallery)
 }
 
 fn sole_image(block: &Block) -> Option<&ImageSource> {
@@ -269,10 +278,19 @@ fn decoded_sketch(block: &Block, gallery: &ImageGallery) -> bool {
     gallery.placed(bytes, false).is_some()
 }
 
-/// The plain gray line a blocked, missing, or undecoded image paints.
-/// A decoded picture is the sketch itself, not its caption.
-fn placeholder_caption(block: &Block, gallery: &ImageGallery) -> bool {
-    sole_image(block).is_some() && !decoded_sketch(block, gallery)
+/// The gray line for a blocked remote image, a missing cid, or data that
+/// did not decode. An allowed remote image is not that blocked line, so it
+/// keeps the paragraph gap.
+fn placeholder_caption(block: &Block, allow_remote: bool, gallery: &ImageGallery) -> bool {
+    sole_image(block).is_some_and(|source| paints_placeholder(source, allow_remote, gallery))
+}
+
+fn paints_placeholder(source: &ImageSource, allow_remote: bool, gallery: &ImageGallery) -> bool {
+    match source {
+        ImageSource::Data { bytes, .. } => gallery.placed(bytes, false).is_none(),
+        ImageSource::Remote(_) => !allow_remote,
+        ImageSource::Cid(_) => true,
+    }
 }
 
 fn render_block(
@@ -998,7 +1016,7 @@ mod decode_tests {
             .iter()
             .position(|block| super::decoded_sketch(block, &gallery))
             .expect("sketch");
-        let runs = column_runs(&doc.blocks, &gallery);
+        let runs = column_runs(&doc.blocks, false, &gallery);
         assert!(
             runs.contains(&(sketch, sketch + 2)),
             "caption stays with the sketch: {runs:?}"
@@ -1011,11 +1029,24 @@ mod decode_tests {
         assert!(caption_under_sketch(
             &doc.blocks[sketch],
             doc.blocks.get(sketch + 1),
+            false,
+            &gallery
+        ));
+        let allowed = column_runs(&doc.blocks, true, &gallery);
+        assert!(
+            allowed.contains(&(sketch, sketch + 1)),
+            "an allowed picture keeps the paragraph gap: {allowed:?}"
+        );
+        assert!(!caption_under_sketch(
+            &doc.blocks[sketch],
+            doc.blocks.get(sketch + 1),
+            true,
             &gallery
         ));
         assert!(!caption_under_sketch(
             &doc.blocks[sketch - 1],
             Some(&doc.blocks[sketch]),
+            false,
             &gallery
         ));
         match super::sole_image(&doc.blocks[sketch + 1]) {
@@ -1025,12 +1056,32 @@ mod decode_tests {
 
         let sketch_block = doc.blocks[sketch].clone();
         let doubled = fell_render::StyledDocument {
-            blocks: vec![sketch_block.clone(), sketch_block],
+            blocks: vec![sketch_block.clone(), sketch_block.clone()],
         };
         let both = super::ImageGallery::from_document(&doubled);
         assert!(
-            !caption_under_sketch(&doubled.blocks[0], Some(&doubled.blocks[1]), &both),
+            !caption_under_sketch(&doubled.blocks[0], Some(&doubled.blocks[1]), true, &both),
             "two sketches keep the paragraph gap"
+        );
+
+        let missing = fell_render::StyledDocument {
+            blocks: vec![
+                sketch_block,
+                Block::Image {
+                    source: ImageSource::Cid("photo".into()),
+                    alt: "photo".into(),
+                },
+            ],
+        };
+        let missing_gallery = super::ImageGallery::from_document(&missing);
+        assert!(
+            caption_under_sketch(
+                &missing.blocks[0],
+                Some(&missing.blocks[1]),
+                true,
+                &missing_gallery
+            ),
+            "a missing image stays the gray caption"
         );
     }
 
