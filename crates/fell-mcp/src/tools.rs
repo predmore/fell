@@ -91,7 +91,9 @@ fn search(session: &Session, args: &Value) -> Result<Value, String> {
         .store
         .search_page(&session.account_id, &query, cursor.as_deref())
         .map_err(store_error)?;
-    let hits = page.hits.iter()
+    let hits = page
+        .hits
+        .iter()
         .map(|hit| {
             json!({
                 "message_id": session.show_id(hit.message_id.as_str()),
