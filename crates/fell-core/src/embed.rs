@@ -1120,6 +1120,7 @@ mod tests {
             has_attachment: false,
             archived: false,
             snooze_until: None,
+            list_id: None,
         }
     }
 

@@ -324,6 +324,9 @@ impl Store {
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
         crate::search::rebuild_vocabulary_if_empty(&conn)?;
+        // The fingerprint merge invalidates body vectors, so the table has to
+        // exist before that backfill runs.
+        crate::embed::ensure_embedding_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
         if schema_version(&conn)?.as_deref() != Some("3") {
@@ -339,7 +342,6 @@ impl Store {
                 [],
             )?;
         }
-        crate::embed::ensure_embedding_schema(&conn)?;
         // 3 adds message_embeddings, the local body-vector index.
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
