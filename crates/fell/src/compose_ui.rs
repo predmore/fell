@@ -36,6 +36,7 @@ struct Palette {
     error: u32,
     fresh: u32,
     panel: u32,
+    rule: u32,
     hunk: u32,
 }
 
@@ -51,8 +52,9 @@ fn palette(kind: ThemeKind) -> Palette {
             code: 0x3a3834,
             selection: 0x2a3344,
             error: 0xf7768e,
-            fresh: 0x3a2e22,
+            fresh: 0x2c2926,
             panel: 0x242320,
+            rule: 0x6e675f,
             hunk: 0x243044,
         },
         ThemeKind::Light => Palette {
@@ -65,8 +67,9 @@ fn palette(kind: ThemeKind) -> Palette {
             code: 0xe4ddd4,
             selection: 0xd9e2f2,
             error: 0x9f1239,
-            fresh: 0xf3e6d4,
+            fresh: 0xf6eee4,
             panel: 0xfffdfb,
+            rule: 0xc4beb6,
             hunk: 0xe7eef8,
         },
     }
@@ -999,9 +1002,9 @@ impl ComposeView {
             .px_5()
             .py_2()
             .text_size(px(16.))
-            .text_color(rgb(colors.dim))
+            .text_color(rgb(colors.fg))
             .border_t_1()
-            .border_color(rgb(colors.selection))
+            .border_color(rgb(colors.rule))
             .child(label);
         if self.quote_open {
             let doc = html_to_doc(
@@ -1073,7 +1076,7 @@ fn field_row(
             .py_1()
             .bg(rgb(bg))
             .border_l(px(2.))
-            .border_color(rgb(if active { colors.accent } else { bg }))
+            .border_color(rgb(if active || fresh { colors.accent } else { bg }))
             .child(
                 div()
                     .w(px(88.))
@@ -1569,7 +1572,9 @@ fn attachment_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .py_2()
         .text_size(px(16.))
         .bg(rgb(colors.panel))
-        .text_color(rgb(colors.dim))
+        .text_color(rgb(colors.fg))
+        .border_t_1()
+        .border_color(rgb(colors.rule))
         .child(format!("Attachments  {names}"))
 }
 
@@ -1597,12 +1602,12 @@ fn status_bar(
         .flex_wrap()
         .items_center()
         .justify_between()
-        .gap_3()
+        .gap_4()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
         .border_t_1()
-        .border_color(rgb(colors.selection))
+        .border_color(rgb(colors.rule))
         .text_size(px(16.))
         .child(
             div()
@@ -1615,7 +1620,7 @@ fn status_bar(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().flex_shrink_0().child(send.to_string()))
+        .child(div().flex_shrink_0().pl_3().child(format!("·  {send}")))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
