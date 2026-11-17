@@ -4,7 +4,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use super::frontmatter::{DraftFields, DraftIssue, write_draft};
@@ -116,27 +116,48 @@ pub fn materialize_in(
         &folder.join("draft.md"),
         write_draft(fields, body).as_bytes(),
     )?;
-    if !folder.join("identities").exists()
+    let control = ensure_control(&folder)?;
+    if !control.join("identities").exists()
         && let Some(email) = super::frontmatter::email_of(&fields.from)
     {
-        atomic_write(&folder.join("identities"), email.as_bytes())?;
+        atomic_write(&control.join("identities"), email.as_bytes())?;
     }
-    if !folder.join("reply.lock").exists() {
+    if !control.join("reply.lock").exists() {
         let reply = fields.in_reply_to.clone().unwrap_or_default();
-        atomic_write(&folder.join("reply.lock"), format!("{reply}\n").as_bytes())?;
+        atomic_write(&control.join("reply.lock"), format!("{reply}\n").as_bytes())?;
     }
     let account_id = account.as_str().trim();
     if account_id.is_empty() || account_id.contains(['\n', '\r']) {
         return Err("draft account id is empty".into());
     }
     atomic_write(
-        &folder.join("account"),
+        &control.join("account"),
         format!("{account_id}\n").as_bytes(),
     )?;
     if folder.join("thread").exists() {
         return Err("draft folder must not contain a thread copy".into());
     }
     Ok(folder)
+}
+
+/// Account, reply lock, identities, and hunks live beside the draft folder,
+/// not in the directory given to an agent as its working directory.
+pub fn control_dir(folder: &Path) -> PathBuf {
+    let name = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("draft");
+    match folder.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(".{name}.private")),
+        _ => PathBuf::from(format!(".{name}.private")),
+    }
+}
+
+fn ensure_control(folder: &Path) -> Result<PathBuf, String> {
+    let dir = control_dir(folder);
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    set_dir_mode(&dir)?;
+    Ok(dir)
 }
 
 pub fn read_draft_file(folder: &Path) -> Result<String, String> {
@@ -208,6 +229,111 @@ pub fn resolve_closure(folder: &Path, fields: &DraftFields, body: &str) -> Closu
         files,
         issues,
         total_bytes,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedFile {
+    pub path: String,
+    pub display_name: String,
+    pub len: u64,
+    pub inline: bool,
+}
+
+/// Names and sizes for the compose window. Does not read file bytes.
+pub fn list_closure(
+    folder: &Path,
+    fields: &DraftFields,
+    body: &str,
+) -> (Vec<ListedFile>, Vec<DraftIssue>) {
+    let mut issues = Vec::new();
+    let mut files = Vec::new();
+    let mut seen = Vec::new();
+    let inline = inline_image_paths(body);
+    for attachment in &fields.attachments {
+        push_stat(
+            folder,
+            &attachment.path,
+            attachment.name.as_deref(),
+            false,
+            attachment.line,
+            &inline,
+            &mut files,
+            &mut seen,
+            &mut issues,
+        );
+    }
+    for path in &inline {
+        if seen.iter().any(|existing| existing == path) {
+            continue;
+        }
+        push_stat(
+            folder,
+            path,
+            None,
+            true,
+            0,
+            &inline,
+            &mut files,
+            &mut seen,
+            &mut issues,
+        );
+    }
+    (files, issues)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_stat(
+    folder: &Path,
+    path: &str,
+    name: Option<&str>,
+    inline: bool,
+    line: usize,
+    inline_paths: &[String],
+    files: &mut Vec<ListedFile>,
+    seen: &mut Vec<String>,
+    issues: &mut Vec<DraftIssue>,
+) {
+    if seen.iter().any(|existing| existing == path) {
+        return;
+    }
+    let inline = inline || inline_paths.iter().any(|item| item == path);
+    let display_name = name
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            Path::new(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(path)
+        })
+        .to_string();
+    match resolve_inside(folder, path) {
+        Ok(abs) if abs.is_file() => match fs::metadata(&abs) {
+            Ok(meta) => {
+                seen.push(path.to_string());
+                files.push(ListedFile {
+                    path: path.to_string(),
+                    display_name,
+                    len: meta.len(),
+                    inline,
+                });
+            }
+            Err(err) => issues.push(DraftIssue {
+                line,
+                message: format!("{path}: {err}"),
+                blocks_send: true,
+            }),
+        },
+        Ok(_) => issues.push(DraftIssue {
+            line,
+            message: format!("missing attachment `{path}`"),
+            blocks_send: true,
+        }),
+        Err(message) => issues.push(DraftIssue {
+            line,
+            message,
+            blocks_send: true,
+        }),
     }
 }
 
@@ -400,7 +526,21 @@ fn is_remote(src: &str) -> bool {
 }
 
 fn user_id() -> u32 {
-    std::process::id()
+    std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod uid_test {
+    use super::user_id;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn runtime_fallback_uses_the_numeric_user_id() {
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        assert_eq!(user_id(), uid);
+    }
 }
 
 #[cfg(test)]

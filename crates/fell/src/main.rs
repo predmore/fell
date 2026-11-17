@@ -12,7 +12,7 @@ use fell_core::compose::DraftHub;
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecursiveMode, Watcher};
 
 fn main() {
     let mut theme = ThemeKind::Dark;
@@ -106,29 +106,51 @@ fn watch_folder(
     hub: Arc<DraftHub>,
     draft_id: String,
     folder: PathBuf,
-) -> Option<RecommendedWatcher> {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Event, notify::Error>>();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = tx.send(event);
-    })
-    .ok()?;
-    watcher.watch(&folder, RecursiveMode::NonRecursive).ok()?;
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        while rx.recv().is_ok() {
-            let start = std::time::Instant::now();
-            while start.elapsed() < Duration::from_millis(150) {
-                let remaining = Duration::from_millis(150).saturating_sub(start.elapsed());
-                if rx.recv_timeout(remaining).is_err() {
-                    break;
-                }
-            }
-            let path = folder.join("draft.md");
-            let content = std::fs::read_to_string(&path).ok();
-            hub.with_session(&draft_id, |session| {
-                session.push_disk(content, 0);
-                session.poll_disk(150);
-            });
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Event, notify::Error>>();
+        let Ok(mut watcher) = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        }) else {
+            return;
+        };
+        let mut current_id = draft_id;
+        let mut current_folder = folder;
+        if watcher
+            .watch(&current_folder, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
         }
-    });
-    Some(watcher)
+        loop {
+            if let Some(id) = hub.focused_id()
+                && id != current_id
+                && let Some(next) = hub.with_session(&id, |session| session.folder().to_path_buf())
+                && watcher.unwatch(&current_folder).is_ok()
+                && watcher.watch(&next, RecursiveMode::NonRecursive).is_ok()
+            {
+                current_id = id;
+                current_folder = next;
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(150) {
+                        let remaining = Duration::from_millis(150).saturating_sub(start.elapsed());
+                        if rx.recv_timeout(remaining).is_err() {
+                            break;
+                        }
+                    }
+                    let content = std::fs::read_to_string(current_folder.join("draft.md")).ok();
+                    let id = current_id.clone();
+                    hub.with_session(&id, |session| {
+                        session.push_disk(content, 0);
+                        session.poll_disk(150);
+                    });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    })
 }

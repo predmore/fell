@@ -103,14 +103,12 @@ struct Editor {
 
 impl Editor {
     fn from_body(body: &str) -> Self {
-        let mut lines: Vec<String> = body
-            .trim_end_matches('\n')
-            .split('\n')
-            .map(str::to_string)
-            .collect();
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
+        let source = body.strip_suffix('\n').unwrap_or(body);
+        let lines: Vec<String> = if source.is_empty() {
+            vec![String::new()]
+        } else {
+            source.split('\n').map(str::to_string).collect()
+        };
         let row = lines
             .iter()
             .position(|line| line.contains("Ship the"))
@@ -129,9 +127,7 @@ impl Editor {
 
     fn text(&self) -> String {
         let mut text = self.lines.join("\n");
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
+        text.push('\n');
         text
     }
 
@@ -341,7 +337,7 @@ impl ComposeView {
             return false;
         };
         let mut changed = false;
-        if snap.body != self.editor.text() {
+        if canonical_body(&snap.body) != canonical_body(&self.editor.text()) {
             let row = self.editor.row;
             let col = self.editor.col;
             let mode = self.editor.mode;
@@ -384,7 +380,7 @@ impl ComposeView {
     fn mark_painted(&mut self) {
         let id = self.draft_id.to_string();
         let _ = self.hub.with_session(&id, |session| {
-            if session.body() == self.editor.text() {
+            if canonical_body(session.body()) == canonical_body(&self.editor.text()) {
                 session.mark_seen();
             }
         });
@@ -1811,6 +1807,17 @@ fn empty_snapshot(id: &str) -> Snapshot {
     }
 }
 
+fn canonical_body(body: &str) -> String {
+    if body.is_empty() || body == "\n" {
+        return "\n".to_string();
+    }
+    if body.ends_with('\n') {
+        body.to_string()
+    } else {
+        format!("{body}\n")
+    }
+}
+
 fn byte_index(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
@@ -1884,6 +1891,22 @@ pub fn open_demo(
 mod tests {
     use super::cursor_line_covered;
     use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn empty_and_trailing_blank_lines_match_the_session() {
+        assert_eq!(super::canonical_body(""), super::canonical_body("\n"));
+        let empty = super::Editor::from_body("");
+        assert_eq!(
+            super::canonical_body(&empty.text()),
+            super::canonical_body("")
+        );
+        let blank = super::Editor::from_body("hello\n\n");
+        assert_eq!(blank.text(), "hello\n\n");
+        assert_eq!(
+            super::canonical_body(&blank.text()),
+            super::canonical_body("hello\n\n")
+        );
+    }
 
     #[test]
     fn a_blank_cursor_line_is_not_inside_a_block() {

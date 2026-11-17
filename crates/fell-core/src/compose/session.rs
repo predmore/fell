@@ -143,7 +143,9 @@ impl DraftSession {
             agent_seen: HashMap::new(),
             quoted: None,
         };
-        let _ = std::fs::write(session.folder.join("account"), session.account_id.as_str());
+        let control = workspace::control_dir(&session.folder);
+        let _ = std::fs::create_dir_all(&control);
+        let _ = std::fs::write(control.join("account"), session.account_id.as_str());
         if let Some(locked) = read_reply_lock(&session.folder) {
             session.locked_reply = locked.clone();
             session.fields.in_reply_to = locked;
@@ -162,7 +164,7 @@ impl DraftSession {
             .and_then(|name| name.to_str())
             .unwrap_or("draft")
             .to_string();
-        let stored = std::fs::read_to_string(folder.join("account"))
+        let stored = std::fs::read_to_string(workspace::control_dir(folder).join("account"))
             .map_err(|_| "draft folder has no account file".to_string())?;
         let stored = stored.trim();
         if stored.is_empty() || stored.contains(['\n', '\r']) {
@@ -453,9 +455,10 @@ impl DraftSession {
 
     pub fn snapshot(&self) -> Snapshot {
         let text = self.serialize();
-        let closure = workspace::resolve_closure(&self.folder, &self.fields, &self.body);
+        let (listed, listed_issues) =
+            workspace::list_closure(&self.folder, &self.fields, &self.body);
         let mut issues = self.issues.clone();
-        issues.extend(closure.issues.clone());
+        issues.extend(listed_issues);
         let hunks = self
             .hunks
             .iter()
@@ -474,13 +477,12 @@ impl DraftSession {
             hunks,
             issues,
             notices: self.notices.clone(),
-            attachments: closure
-                .files
+            attachments: listed
                 .iter()
                 .map(|file| AttachmentView {
                     path: file.path.clone(),
                     name: file.display_name.clone(),
-                    bytes: file.bytes.len() as u64,
+                    bytes: file.len,
                     inline: file.inline,
                     missing: false,
                 })
@@ -523,9 +525,8 @@ impl DraftSession {
         {
             return Some("from is not one of your addresses".into());
         }
-        let closure = workspace::resolve_closure(&self.folder, &self.fields, &self.body);
-        closure
-            .issues
+        let (_files, issues) = workspace::list_closure(&self.folder, &self.fields, &self.body);
+        issues
             .iter()
             .find(|issue| issue.blocks_send)
             .map(|issue| issue.message.clone())
@@ -637,7 +638,8 @@ impl DraftSession {
 }
 
 fn read_identities(folder: &Path) -> HashSet<String> {
-    let Ok(text) = std::fs::read_to_string(folder.join("identities")) else {
+    let Ok(text) = std::fs::read_to_string(workspace::control_dir(folder).join("identities"))
+    else {
         return HashSet::new();
     };
     text.lines()
@@ -647,7 +649,7 @@ fn read_identities(folder: &Path) -> HashSet<String> {
 }
 
 fn read_reply_lock(folder: &Path) -> Option<Option<String>> {
-    let text = std::fs::read_to_string(folder.join("reply.lock")).ok()?;
+    let text = std::fs::read_to_string(workspace::control_dir(folder).join("reply.lock")).ok()?;
     let text = text.trim();
     if text.is_empty() {
         Some(None)
@@ -658,7 +660,9 @@ fn read_reply_lock(folder: &Path) -> Option<Option<String>> {
 
 impl DraftSession {
     fn load_hunks(&mut self) {
-        let Ok(text) = std::fs::read_to_string(self.folder.join("hunks.json")) else {
+        let Ok(text) =
+            std::fs::read_to_string(workspace::control_dir(&self.folder).join("hunks.json"))
+        else {
             return;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -715,8 +719,10 @@ impl DraftSession {
                 })
             })
             .collect();
+        let control = workspace::control_dir(&self.folder);
+        let _ = std::fs::create_dir_all(&control);
         let _ = std::fs::write(
-            self.folder.join("hunks.json"),
+            control.join("hunks.json"),
             serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
         );
     }
@@ -1005,12 +1011,35 @@ mod tests {
         let (root, session) = temp_session("body\n");
         let folder = session.folder().to_path_buf();
         drop(session);
-        std::fs::remove_file(folder.join("account")).unwrap();
+        std::fs::remove_file(workspace::control_dir(&folder).join("account")).unwrap();
         let err = match DraftSession::open_folder(&folder, AccountId("local".into())) {
             Ok(_) => panic!("opened a folder with no account file"),
             Err(err) => err,
         };
         assert!(err.contains("account"), "{err}");
+        let _ = root;
+    }
+
+    #[test]
+    fn control_files_are_outside_the_agent_folder() {
+        let (root, session) = temp_session("body\n");
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        assert!(!folder.join("account").exists());
+        assert!(!folder.join("reply.lock").exists());
+        assert!(!folder.join("identities").exists());
+        std::fs::write(folder.join("account"), "not-the-account\n").unwrap();
+        std::fs::write(folder.join("reply.lock"), "<evil@example.com>\n").unwrap();
+        let opened = DraftSession::open_folder(&folder, AccountId("local".into()));
+        let opened = match opened {
+            Ok(session) => session,
+            Err(err) => panic!("{err}"),
+        };
+        assert_eq!(opened.account_id().as_str(), "local");
+        assert_eq!(
+            opened.fields().in_reply_to.as_deref(),
+            Some("<abc@example.com>")
+        );
         let _ = root;
     }
 
