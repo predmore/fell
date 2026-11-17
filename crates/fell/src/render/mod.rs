@@ -342,17 +342,6 @@ impl Render for Reader {
                     .child(images),
             )
             .child(message_body(self, &palette))
-            .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_xs()
-                    .text_color(paint(palette.dimmed))
-                    .bg(paint(palette.surface))
-                    .border_t(px(1.))
-                    .border_color(paint(palette.border))
-                    .child("w  native / web view     t  dark / light     i  remote images"),
-            )
     }
 }
 
