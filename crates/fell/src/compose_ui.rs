@@ -1,9 +1,10 @@
 //! Compose window. The buffer is plain markdown. Styling is a view of that
 //! text, through the same document model the conversation renderer uses.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use fell_core::compose::{
     BlockBody, DraftHub, HunkKind, Snapshot, StyleKind, StyledDoc, html_to_doc, line_styles,
@@ -11,9 +12,11 @@ use fell_core::compose::{
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
-    Context, FocusHandle, FontWeight, KeyDownEvent, SharedString, StatefulInteractiveElement,
-    Window, div, prelude::*, px, rgb,
+    Context, FocusHandle, FontWeight, KeyDownEvent, RenderImage, SharedString,
+    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb,
 };
+use image::Frame;
+use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
 
@@ -1665,35 +1668,117 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
     row
 }
 
-fn checkerboard() -> gpui::Div {
-    let mut grid = div().flex().flex_col().w(px(240.)).h(px(105.));
-    for row in 0..5 {
-        let mut line = div().flex().flex_row().h(px(21.));
-        for column in 0..8 {
-            let color = if column % 2 == row % 2 {
-                0x7aa2f7
-            } else {
-                0x414854
-            };
-            line = line.child(div().w(px(30.)).h(px(21.)).flex_shrink_0().bg(rgb(color)));
-        }
-        grid = grid.child(line);
-    }
-    grid
+fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
+    let block = div().flex().flex_col().items_start().gap_1();
+    let Some(path) = fell_core::compose::image_file(folder, src) else {
+        return missing_image(block, alt, colors);
+    };
+    let Some(preview) = preview_file(&path) else {
+        return missing_image(block, alt, colors);
+    };
+    block.child(
+        img(preview.image)
+            .w(px(preview.width))
+            .h(px(preview.height))
+            .object_fit(gpui::ObjectFit::Contain),
+    )
 }
 
-fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
-    let path = fell_core::compose::image_file(folder, src);
-    let block = div().flex().flex_col().items_start().gap_1();
-    if path.is_some() {
-        return block.child(checkerboard());
-    }
+fn missing_image(block: gpui::Div, alt: &str, colors: Palette) -> gpui::Div {
     block.child(
         div()
             .text_size(px(16.))
             .text_color(rgb(colors.dim))
             .child(alt.to_string()),
     )
+}
+
+struct Preview {
+    image: Arc<RenderImage>,
+    width: f32,
+    height: f32,
+}
+
+struct StoredPreview {
+    stamp: SystemTime,
+    len: u64,
+    image: Arc<RenderImage>,
+    width: f32,
+    height: f32,
+}
+
+fn preview_cache() -> &'static Mutex<HashMap<PathBuf, StoredPreview>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, StoredPreview>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn preview_file(path: &Path) -> Option<Preview> {
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let len = meta.len();
+    let mut cache = preview_cache().lock().ok()?;
+    if let Some(hit) = cache.get(path)
+        && hit.stamp == stamp
+        && hit.len == len
+    {
+        return Some(Preview {
+            image: Arc::clone(&hit.image),
+            width: hit.width,
+            height: hit.height,
+        });
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let preview = preview_bytes(&bytes)?;
+    cache.insert(
+        path.to_path_buf(),
+        StoredPreview {
+            stamp,
+            len,
+            image: Arc::clone(&preview.image),
+            width: preview.width,
+            height: preview.height,
+        },
+    );
+    Some(preview)
+}
+
+fn preview_bytes(bytes: &[u8]) -> Option<Preview> {
+    const MAX_BYTES: usize = 4_000_000;
+    const MAX_EDGE: u32 = 2_048;
+    const MAX_WIDTH: f32 = 420.;
+    if bytes.is_empty() || bytes.len() > MAX_BYTES {
+        return None;
+    }
+    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE {
+        return None;
+    }
+    let scale = if width as f32 > MAX_WIDTH {
+        MAX_WIDTH / width as f32
+    } else {
+        1.
+    };
+    Some(Preview {
+        image: render_rgba(rgba),
+        width: width as f32 * scale,
+        height: height as f32 * scale,
+    })
+}
+
+fn render_rgba(mut data: image::RgbaImage) -> Arc<RenderImage> {
+    for pixel in data.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let frame = Frame::new(data);
+    let frames = SmallVec::<[Frame; 1]>::from_vec(vec![frame]);
+    Arc::new(RenderImage::new(frames))
 }
 
 fn attachment_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1975,6 +2060,19 @@ pub fn open_demo(
 mod tests {
     use super::cursor_line_covered;
     use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn an_attached_png_decodes_to_its_own_pixels() {
+        let preview = super::preview_bytes(&crate::png::chart_png()).expect("chart");
+        assert!((preview.width - 240.).abs() < 0.1);
+        assert!((preview.height - 105.).abs() < 0.1);
+        let image = image::load_from_memory(&crate::png::chart_png())
+            .unwrap()
+            .to_rgba8();
+        let tall = image.get_pixel(90, 20).0;
+        let short = image.get_pixel(20, 20).0;
+        assert_ne!(tall, short);
+    }
 
     #[test]
     fn a_substring_of_send_is_not_a_send_command() {

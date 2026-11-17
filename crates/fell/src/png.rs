@@ -3,12 +3,18 @@
 pub fn chart_png() -> Vec<u8> {
     let width = 240u32;
     let height = 105u32;
+    let bars = [18u32, 48, 78, 108, 150];
     let mut raw = Vec::with_capacity(((width * 3 + 1) * height) as usize);
     for y in 0..height {
         raw.push(0);
         for x in 0..width {
-            let bar = (x / 30) % 2 == (y / 21) % 2;
-            let (r, g, b) = if bar { (122, 162, 247) } else { (65, 72, 84) };
+            let from_bottom = height - 1 - y;
+            let (r, g, b) = bars
+                .iter()
+                .copied()
+                .find(|left| x >= *left && x < left + 28 && from_bottom < bars_height(*left))
+                .map(bar_color)
+                .unwrap_or((26, 28, 36));
             raw.extend_from_slice(&[r, g, b]);
         }
     }
@@ -22,6 +28,26 @@ pub fn chart_png() -> Vec<u8> {
     chunk(&mut png, b"IDAT", &zlib_store(&raw));
     chunk(&mut png, b"IEND", &[]);
     png
+}
+
+fn bars_height(left: u32) -> u32 {
+    match left {
+        18 => 36,
+        48 => 58,
+        78 => 88,
+        108 => 42,
+        _ => 96,
+    }
+}
+
+fn bar_color(left: u32) -> (u8, u8, u8) {
+    match left {
+        18 => (86, 166, 214),
+        48 => (122, 162, 247),
+        78 => (158, 206, 106),
+        108 => (224, 175, 104),
+        _ => (187, 154, 247),
+    }
 }
 
 fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
