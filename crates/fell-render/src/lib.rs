@@ -19,5 +19,6 @@ pub use fixtures::{Fixture, fixture, fixtures};
 pub use html::{document_from_body, html_to_document, looks_like_html, plain_to_document};
 pub use markdown::markdown_to_document;
 pub use webview_html::{
-    WebFrame, sanitize_html, strip_remote_css_urls, targets_private_network, wrap_for_webview,
+    WebFrame, request_is_blocked, request_is_blocked_with, sanitize_html, strip_remote_css_urls,
+    targets_private_network, wrap_for_webview,
 };

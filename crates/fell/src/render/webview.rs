@@ -80,7 +80,10 @@ pub enum WebStatus {
 pub fn show(request: WebRequest) {
     match boot() {
         WebTransport::Live(tx) => {
-            let _ = tx.send(Cmd::Show(request));
+            let token = request.token;
+            if tx.send(Cmd::Show(request)).is_err() {
+                publish_failed(token);
+            }
         }
         WebTransport::Failed => publish_failed(request.token),
     }
@@ -162,12 +165,19 @@ fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
     if ready.send(tx).is_err() {
         return;
     }
-    rx.attach(None, |cmd| {
+    // The returned id removes its source when dropped. It has to outlive
+    // gtk::main, or Show and Hide are never delivered.
+    let _source = rx.attach(None, |cmd| {
         match cmd {
             Cmd::Show(request) => present(request),
             Cmd::Hide => HOST.with(|slot| {
                 if let Some(host) = slot.borrow().as_ref() {
+                    cancel_source(&host.pending);
                     cancel_source(&host.fail_safe);
+                    host.capture.set(host.capture.get().wrapping_add(1));
+                    host.shot.set(host.shot.get().wrapping_add(1));
+                    let widget = host.webview.webview();
+                    webkit2gtk::WebViewExt::stop_loading(&widget);
                     host.window.hide();
                 }
             }),
@@ -248,7 +258,7 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
 }
 
 fn watch_loads(widget: &webkit2gtk::WebView) {
-    use webkit2gtk::{LoadEvent, WebViewExt};
+    use webkit2gtk::{LoadEvent, URIRequestExt, WebResourceExt, WebViewExt};
     widget.connect_load_changed(|_, event| {
         if event == LoadEvent::Finished {
             apply_progress(LoadProgress::document_finished);
@@ -263,7 +273,65 @@ fn watch_loads(widget: &webkit2gtk::WebView) {
     widget.connect_web_process_terminated(|_, _| {
         apply_progress(LoadProgress::timed_out);
     });
-    widget.connect_resource_load_started(|_, resource, _| track_resource(resource));
+    widget.connect_decide_policy(|_, decision, kind| deny_blocked_request(decision, kind));
+    widget.connect_resource_load_started(|_, resource, request| {
+        refuse_blocked_uri(request);
+        resource.connect_sent_request(|_, request, response| {
+            refuse_blocked_uri(request);
+            if let Some(uri) = webkit2gtk::URIResponseExt::uri(response)
+                && fell_render::request_is_blocked(uri.as_str())
+            {
+                request.set_uri("about:blank");
+            }
+        });
+        track_resource(resource);
+    });
+}
+
+fn deny_blocked_request(
+    decision: &webkit2gtk::PolicyDecision,
+    kind: webkit2gtk::PolicyDecisionType,
+) -> bool {
+    use webkit2gtk::{
+        NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType,
+        ResponsePolicyDecisionExt, URIRequestExt, URIResponseExt,
+    };
+    let uri = match kind {
+        PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => decision
+            .clone()
+            .downcast::<webkit2gtk::NavigationPolicyDecision>()
+            .ok()
+            .and_then(|decision| decision.navigation_action())
+            .and_then(|action| action.request())
+            .and_then(|request| request.uri()),
+        PolicyDecisionType::Response => decision
+            .clone()
+            .downcast::<webkit2gtk::ResponsePolicyDecision>()
+            .ok()
+            .and_then(|decision| {
+                decision
+                    .request()
+                    .and_then(|request| request.uri())
+                    .or_else(|| decision.response().and_then(|response| response.uri()))
+            }),
+        PolicyDecisionType::__Unknown(_) | _ => None,
+    };
+    if uri.as_deref().is_some_and(fell_render::request_is_blocked) {
+        decision.ignore();
+        return true;
+    }
+    false
+}
+
+fn refuse_blocked_uri(request: &webkit2gtk::URIRequest) {
+    use webkit2gtk::URIRequestExt;
+    if request
+        .uri()
+        .as_deref()
+        .is_some_and(fell_render::request_is_blocked)
+    {
+        request.set_uri("about:blank");
+    }
 }
 
 fn track_resource(resource: &webkit2gtk::WebResource) {
@@ -615,7 +683,7 @@ fn tighten(webview: &wry::WebView, allow_images: bool) {
 }
 
 fn remote_navigation(uri: &str) -> bool {
-    if fell_render::targets_private_network(uri) {
+    if fell_render::request_is_blocked(uri) || fell_render::targets_private_network(uri) {
         return true;
     }
     let uri = uri.to_ascii_lowercase();

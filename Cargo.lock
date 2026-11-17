@@ -1892,6 +1892,7 @@ dependencies = [
  "pulldown-cmark",
  "scraper",
  "tendril 0.4.3",
+ "url",
 ]
 
 [[package]]

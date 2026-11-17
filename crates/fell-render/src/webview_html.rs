@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 
 /// HTML handed to WebKit. Scripts are removed, remote images are stripped
@@ -468,6 +469,73 @@ fn resource_is_disallowed(value: &str, allow_remote_images: bool) -> bool {
     !allow_remote_images && is_remote_url(value)
 }
 
+/// Whether WebKit should be refused this request.
+///
+/// The host is the one in the parsed URL. A hostname is refused when any
+/// resolved address, or a failure to resolve, is loopback, link-local,
+/// private, unique-local, or unspecified. The same check applies to the
+/// request that follows a redirect.
+pub fn request_is_blocked(uri: &str) -> bool {
+    request_is_blocked_with(uri, resolve_host)
+}
+
+/// [`request_is_blocked`] with a caller-supplied resolver, so tests do not
+/// use the network.
+pub fn request_is_blocked_with(uri: &str, resolve: impl Fn(&str) -> Vec<IpAddr>) -> bool {
+    let Ok(url) = url::Url::parse(uri) else {
+        return false;
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ipv4_is_blocked(ip),
+        Some(url::Host::Ipv6(ip)) => ipv6_is_blocked(ip),
+        Some(url::Host::Domain(name)) => {
+            let addresses = resolve(name);
+            addresses.is_empty() || addresses.into_iter().any(ip_is_blocked)
+        }
+        None => false,
+    }
+}
+
+fn resolve_host(host: &str) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
+}
+
+fn ip_is_blocked(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_is_blocked(ip),
+        IpAddr::V6(ip) => ipv6_is_blocked(ip),
+    }
+}
+
+fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 0
+        || first == 10
+        || first == 127
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+}
+
+fn ipv6_is_blocked(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return ipv4_is_blocked(mapped);
+    }
+    if ip.is_unspecified() || ip.is_loopback() {
+        return true;
+    }
+    let [first, second, ..] = ip.octets();
+    // fe80::/10 link-local, fc00::/7 unique-local.
+    (first == 0xfe && (second & 0xc0) == 0x80) || (first & 0xfe) == 0xfc
+}
+
 /// `true` when the URL names a loopback, private, or link-local host.
 pub fn targets_private_network(value: &str) -> bool {
     let Some(host) = resource_host(value) else {
@@ -812,6 +880,60 @@ mod tests {
         assert!(math.contains("<math"), "{math}");
         assert!(math.contains("<mi"), "{math}");
         assert!(math.contains("</math>"), "{math}");
+    }
+
+    fn css_url_request(value: &str) -> Option<String> {
+        let mut stripped = String::new();
+        let mut rest = value;
+        while let Some(start) = rest.find("/*") {
+            stripped.push_str(&rest[..start]);
+            let after = &rest[start + 2..];
+            let end = after.find("*/")?;
+            rest = &after[end + 2..];
+        }
+        stripped.push_str(rest);
+        let open = stripped.find("url(")? + 4;
+        let close = stripped[open..].find(')')? + open;
+        let token = stripped[open..close]
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'');
+        (!token.is_empty()).then(|| token.to_string())
+    }
+
+    #[test]
+    fn comment_in_url_is_denied_when_the_request_is_issued() {
+        for css in [
+            r#"url(/*x*/"http://169.254.169.254/latest/meta-data")"#,
+            r#"url(/*x*/"http://127.0.0.1/x.png")"#,
+        ] {
+            let request = css_url_request(css).expect(css);
+            assert!(
+                super::request_is_blocked_with(&request, |_| Vec::new()),
+                "{css} -> {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_to_a_private_ip_is_denied() {
+        assert!(super::request_is_blocked_with(
+            "http://10.0.0.5/latest",
+            |_| Vec::new()
+        ));
+        assert!(super::request_is_blocked_with(
+            "https://cdn.example/img.png",
+            |_| vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))]
+        ));
+        assert!(!super::request_is_blocked_with(
+            "https://cdn.example/img.png",
+            |_| vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                93, 184, 216, 34
+            ))]
+        ));
+        assert!(!super::request_is_blocked_with(
+            "about:blank",
+            |_| Vec::new()
+        ));
     }
 
     #[test]
