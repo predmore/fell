@@ -32,6 +32,7 @@ pub struct Reader {
     did_focus: bool,
     title: SharedString,
     from_line: SharedString,
+    date_line: SharedString,
     model: Model,
     theme: Theme,
     web_open: bool,
@@ -51,6 +52,7 @@ pub struct Reader {
 pub struct Opened {
     pub title: SharedString,
     pub from_line: SharedString,
+    pub date_line: SharedString,
     pub model: Model,
     pub theme: Theme,
 }
@@ -69,6 +71,7 @@ impl Reader {
             did_focus: false,
             title: opened.title,
             from_line: opened.from_line,
+            date_line: opened.date_line,
             model: opened.model,
             theme: opened.theme,
             web_open: false,
@@ -206,6 +209,29 @@ fn display_address(addr: &fell_core::Address) -> String {
     }
 }
 
+fn format_unix_date(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{d} {} {y}",
+        MONTHS[usize::try_from(m).unwrap_or(1).saturating_sub(1)]
+    )
+}
+
 fn from_header(headers: &fell_render::MailHeaders) -> String {
     headers.get("From").map(str::trim).unwrap_or("").to_string()
 }
@@ -215,6 +241,7 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
         return Opened {
             title: format!("Unknown fixture {name}").into(),
             from_line: SharedString::default(),
+            date_line: SharedString::default(),
             model: Model::from_prepared(prepare(
                 &format!("<p>No fixture named {name}.</p>"),
                 &fell_render::MailHeaders::new(),
@@ -232,9 +259,11 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
             Ok(message) => {
                 let title = message.headers.subject.clone().into();
                 let from_line = display_address(&message.headers.from);
+                let date_line = format_unix_date(message.headers.date_unix);
                 Opened {
                     title,
                     from_line: from_line.into(),
+                    date_line: date_line.into(),
                     model: Model::from_stored(&message),
                     theme,
                 }
@@ -242,6 +271,7 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
             Err(_) => Opened {
                 title: subject.into(),
                 from_line: from_header(&fixture.headers).into(),
+                date_line: SharedString::default(),
                 model: Model::from_prepared(prepare(&fixture.html, &fixture.headers)),
                 theme,
             },
@@ -251,6 +281,7 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
         Opened {
             title: subject.into(),
             from_line: from_header(&fixture.headers).into(),
+            date_line: "14 Nov 2023".into(),
             model: Model::from_prepared(prepare(&fixture.html, &fixture.headers)),
             theme,
         }
@@ -268,10 +299,6 @@ impl Render for Reader {
             window.request_animation_frame();
         }
         let palette = self.theme.palette();
-        let mode = match self.model.mode() {
-            RenderMode::Native => "native",
-            RenderMode::Web => "web view",
-        };
         let images = if self.model.remote_images_allowed() {
             "Remote images allowed"
         } else {
@@ -315,8 +342,12 @@ impl Render for Reader {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().font_weight(gpui::FontWeight::BOLD).child("Fell"))
-                            .child(div().text_sm().child(self.title.clone()))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(self.title.clone()),
+                            )
                             .when(!self.from_line.is_empty(), |this| {
                                 this.child(
                                     div()
@@ -330,7 +361,7 @@ impl Render for Reader {
                         div()
                             .text_sm()
                             .text_color(paint(palette.dimmed))
-                            .child(format!("{mode} · {}", self.theme.label())),
+                            .child(self.date_line.clone()),
                     ),
             )
             .child(
