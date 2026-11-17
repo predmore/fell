@@ -982,14 +982,19 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
     {
         if !via_alias
             && !alias_points_at(conn, &message.account_id, &stored.canonical_id)?
-            && let Some(other) =
-                find_list_collapse(conn, message, &fingerprint, Some(&stored.canonical_id))?
+            && let Some(other) = find_list_collapse(
+                conn,
+                message,
+                &fingerprint,
+                Some(&stored.canonical_id),
+                false,
+            )?
         {
             return absorb_duplicate(conn, message, &stored, &other);
         }
         return write_kept(conn, message, &stored, via_alias, &[], &[]);
     }
-    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None)? {
+    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false)? {
         remember_alias(conn, message, &stored.canonical_id)?;
         return write_kept(conn, message, &stored, true, &[], &[]);
     }
@@ -1367,6 +1372,7 @@ fn find_list_collapse(
     message: &Message,
     fingerprint: &str,
     exclude: Option<&str>,
+    unlabeled_ok: bool,
 ) -> Result<Option<Arrival>> {
     if fingerprint.is_empty() {
         return Ok(None);
@@ -1386,7 +1392,7 @@ fn find_list_collapse(
         if exclude == Some(stored.canonical_id.as_str()) {
             continue;
         }
-        if is_fingerprint_echo(message, &stored) {
+        if is_fingerprint_echo(message, &stored, unlabeled_ok) {
             matches.push(stored);
         }
     }
@@ -1490,7 +1496,7 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
                 continue;
             }
             let Some(other) =
-                find_list_collapse(&tx, message, &fingerprint, Some(&stored.canonical_id))?
+                find_list_collapse(&tx, message, &fingerprint, Some(&stored.canonical_id), true)?
             else {
                 continue;
             };
@@ -1581,12 +1587,15 @@ fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str
     Ok(hit.is_some())
 }
 
-fn is_fingerprint_echo(incoming: &Message, stored: &Arrival) -> bool {
+fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool) -> bool {
     let incoming_list = clean_list_id(&incoming.list_id).is_some();
     let stored_list = list_is_set(&stored.list_id);
+    // Rows stored before `list_id` existed are all NULL. The one-time upgrade
+    // still joins that pair. Later mail still needs a list id on one side.
+    let listed = incoming_list || stored_list || unlabeled_ok;
     same_sender(&incoming.headers.from.email, &stored.from_email)
         && dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
-        && (incoming_list || stored_list)
+        && listed
         && proton_compatible(
             &stored.proton_conversation_id,
             &incoming.headers.proton_conversation_id,
@@ -5041,6 +5050,86 @@ mod tests {
         assert_eq!(kept.snooze_until, Some(1_893_456_000));
         assert_eq!(kept.labels, vec!["work".to_string()]);
         assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_joins_a_v2_pair_that_has_no_list_id() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-no-list.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    arrived_via TEXT NOT NULL DEFAULT '',
+                    to_line TEXT NOT NULL DEFAULT '',
+                    cc_line TEXT NOT NULL DEFAULT '',
+                    bcc_line TEXT NOT NULL DEFAULT '',
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    has_attachment INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    snooze_until INTEGER,
+                    body_fingerprint TEXT NOT NULL DEFAULT '',
+                    UNIQUE (account_id, message_id)
+                 );",
+            )
+            .unwrap();
+            for (id, subject, folder) in [
+                ("sent@x", "Hello", "Sent"),
+                ("list@x", "[list] Hello", "INBOX"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint
+                     ) VALUES (
+                        'a1', ?1, ?1, ?1, '', 'from@x', ?2, 1700000000, 'hello body',
+                        'hello body', 1, ?3, ?4
+                     )",
+                    params![id, subject, folder, fingerprint],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].list_id.is_none());
+        assert!(rows[0].folders.iter().any(|folder| folder == "Sent"));
+        assert!(rows[0].folders.iter().any(|folder| folder == "INBOX"));
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
