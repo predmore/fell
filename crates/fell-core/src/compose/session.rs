@@ -961,7 +961,9 @@ impl DraftSession {
 
     /// Keep the lock of the session this one replaces in the hub.
     pub(crate) fn inherit_send_lock(&mut self, previous: &DraftSession) {
-        if self.send_lock.is_none() {
+        // The live session's lock wins over the record on disk: a send in
+        // flight there must still find its claim here.
+        if previous.send_lock.is_some() {
             self.send_lock = previous.send_lock;
         }
     }
@@ -1232,11 +1234,15 @@ fn review_matches_row(text: &str, stored: &persist::StoredCompose) -> bool {
 const SEND_STATE: &str = "send-state";
 
 fn read_send_state(folder: &Path) -> Option<SendLock> {
-    let text = std::fs::read_to_string(workspace::control_dir(folder).join(SEND_STATE)).ok()?;
-    match text.trim() {
-        "sent" => Some(SendLock::Sent),
-        "maybe-sent" => Some(SendLock::MaybeSent),
-        _ => None,
+    let path = workspace::control_dir(folder).join(SEND_STATE);
+    if !path.exists() {
+        return None;
+    }
+    // Any record other than a clean "sent" (unreadable, empty, or partial)
+    // errs toward "may have been sent".
+    match std::fs::read_to_string(path).ok().as_deref().map(str::trim) {
+        Some("sent") => Some(SendLock::Sent),
+        _ => Some(SendLock::MaybeSent),
     }
 }
 
@@ -1251,7 +1257,11 @@ fn write_send_state(folder: &Path, lock: Option<SendLock>) {
         }
     };
     let _ = std::fs::create_dir_all(workspace::control_dir(folder));
-    let _ = std::fs::write(path, value);
+    // Replace by rename so a crash never leaves a truncated record.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, value).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Path and version of each referenced file. Stats only.
@@ -2516,6 +2526,48 @@ mod tests {
         let clean = DraftSession::create(folder, "d1", AccountId("local".into()), fields, "body\n")
             .unwrap();
         assert_eq!(clean.send_lock(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_damaged_send_record_still_locks_the_draft() {
+        let (root, session) = temp_session("body\n");
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        let control = workspace::control_dir(&folder);
+        fs::create_dir_all(&control).unwrap();
+        for damaged in ["", "se", "garbage"] {
+            fs::write(control.join(SEND_STATE), damaged).unwrap();
+            assert_eq!(
+                read_send_state(&folder),
+                Some(SendLock::MaybeSent),
+                "{damaged:?}"
+            );
+        }
+        fs::write(control.join(SEND_STATE), "sent").unwrap();
+        assert_eq!(read_send_state(&folder), Some(SendLock::Sent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reopen_during_a_send_keeps_the_live_claim() {
+        let (root, mut live) = temp_session("body\n");
+        let folder = live.folder().to_path_buf();
+        live.begin_send().unwrap();
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            ..DraftFields::default()
+        };
+        let mut reopened =
+            DraftSession::create(folder, "d1", AccountId("local".into()), fields, "body\n")
+                .unwrap();
+        assert_eq!(
+            reopened.send_lock(),
+            Some(SendLock::MaybeSent),
+            "the disk record"
+        );
+        reopened.inherit_send_lock(&live);
+        assert_eq!(reopened.send_lock(), Some(SendLock::InFlight));
         let _ = fs::remove_dir_all(root);
     }
 }
