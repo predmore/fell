@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
+use crate::embed::{Embedding, remove_message_embedding, sync_message_embedding};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses,
@@ -320,6 +321,13 @@ impl Store {
                 [],
             )?;
         }
+        crate::embed::ensure_embeddings(&conn)?;
+        // 3 adds message_embeddings, the local body-vector index.
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
         Ok(Self { conn, path: None })
     }
 
@@ -433,7 +441,7 @@ impl Store {
         Ok(thread_id)
     }
 
-    /// Remove one message and its search postings.
+    /// Remove one message, its search postings, and its body embedding.
     ///
     /// Document frequency drops the same way an insert raises it, inside the
     /// transaction that deletes the row. `false` means the message was not stored.
@@ -455,6 +463,7 @@ impl Store {
             labels: &stored.labels,
         });
         sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
+        remove_message_embedding(&tx, account_id.as_str(), message_id.as_str())?;
         let removed = tx.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), stored.canonical_id],
@@ -471,6 +480,19 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Vector stored for this message body.
+    ///
+    /// Computed on this machine from `body_text`, or from the snippet when the
+    /// body is null. This does not call a network. `None` means this account
+    /// has no embedding row for that message. Keyword search does not read it.
+    pub fn message_embedding(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<Embedding>> {
+        crate::embed::load_embedding(&self.conn, account_id.as_str(), message_id.as_str())
     }
 
     pub fn list_threads(&self, account_id: &AccountId) -> Result<Vec<ThreadSummary>> {
@@ -1069,6 +1091,12 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
         labels: &labels,
     });
     sync_terms(conn, message.account_id.as_str(), &HashSet::new(), &terms)?;
+    sync_message_embedding(
+        conn,
+        message.account_id.as_str(),
+        message.headers.message_id.as_str(),
+        body,
+    )?;
     Ok(thread_id)
 }
 
@@ -1263,6 +1291,12 @@ fn write_kept(
         ],
     )?;
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
+    sync_message_embedding(
+        conn,
+        message.account_id.as_str(),
+        message.headers.message_id.as_str(),
+        body,
+    )?;
     Ok(thread_id)
 }
 

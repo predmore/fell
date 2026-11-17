@@ -21,6 +21,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
+use crate::embed::{remove_message_embedding, sync_message_embedding};
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
@@ -512,6 +513,7 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
     let old_terms = terms_of(&plan.before);
     if plan.remove_row {
         sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
+        remove_message_embedding(conn, account_id.as_str(), &plan.before.message_id)?;
         let changed = conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), plan.before.message_id],
@@ -710,6 +712,12 @@ fn replace_message_row(
     )?;
     expect_one(changed, &snapshot.message_id)?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+    sync_message_embedding(
+        conn,
+        account_id.as_str(),
+        &snapshot.message_id,
+        snapshot.body_text.as_deref().unwrap_or(&snapshot.snippet),
+    )?;
     Ok(())
 }
 
@@ -1309,6 +1317,12 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )",
         params_from_iter(values),
+    )?;
+    sync_message_embedding(
+        conn,
+        account_id.as_str(),
+        &row.message_id,
+        row.body_text.as_deref().unwrap_or(&row.snippet),
     )?;
     Ok(())
 }

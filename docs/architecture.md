@@ -19,7 +19,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 
 | Crate | Role |
 | --- | --- |
-| `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
+| `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5 and a local body-embedding index), threading, search, send-confirmation types. No UI. |
 | `fell-render` | Styled document shared by received HTML and later markdown compose. Chooses native vs web view. No GPUI. |
 | `fell-confirm` | Sealed `InteractiveUi` (private field, not `Default`). Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
 | `fell` | GPUI application. Opens a Wayland window and paints one message with `fell::render::MessageBody`. Does not own the thread list, keymap, or command palette. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
@@ -49,7 +49,13 @@ Each IMAP mailbox is one folder on the message. A message with no Message-ID is 
 
 The query language is FTS5 BM25 plus operators: `from:`, `to:`, `subject:`, `in:`, `label:`, `has:attachment`, `is:unread`, `before:`, and `after:`. `from:`, `to:`, and `subject:` are FTS column filters (`to:` covers To, Cc, and Bcc). Folder, label, attachment, unread, and date operators filter the message row. Every operator on one query applies to the same message. Hits are then grouped to one row per thread, ordered by that message's BM25 score (subject weighted above sender, recipients, and body). A query that is only operators still runs.
 
-Misspellings use a character-trigram index of words from subject, sender, recipients, body, folders, and labels. Damerau-Levenshtein confirms a candidate. When the typed query matches nothing and the corrected query matches, the response carries those hits and `did_you_mean`. Semantic search is M5 and is not part of this path.
+Misspellings use a character-trigram index of words from subject, sender, recipients, body, folders, and labels. Damerau-Levenshtein confirms a candidate. When the typed query matches nothing and the corrected query matches, the response carries those hits and `did_you_mean`. Keyword search does not read the local embedding index.
+
+## Local embeddings
+
+Each message body has one row in `message_embeddings`. The vector is a 64-dimensional feature hash (`local-hash-v1`), computed in-process from `body_text`, or from the snippet when the body is null. The blob is little-endian `f32`. The row is written in the same transaction as the message, replaced when that text changes, and removed when the message is removed. Opening a store fills rows that are missing or stamped with another model id, and drops rows whose message is gone. Nothing leaves the machine. There is no cloud embedder.
+
+`Store::search` does not read this table. Hybrid ranking is later M5 work.
 
 ## Local actions
 
