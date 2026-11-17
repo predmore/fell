@@ -310,6 +310,8 @@ impl Render for Reader {
             window.request_animation_frame();
         }
         let palette = self.theme.palette();
+        let web = self.model.mode() == RenderMode::Web;
+        let edge = banner_edge(self.theme, web, palette.border);
         let (status, action) = if self.model.remote_images_allowed() {
             ("Remote images allowed", "Block sender")
         } else {
@@ -393,7 +395,7 @@ impl Render for Reader {
                     .justify_between()
                     .gap_2()
                     .border_b(px(1.))
-                    .border_color(paint(palette.border))
+                    .border_color(paint(edge))
                     .bg(paint(palette.code_bg))
                     .text_sm()
                     .cursor_pointer()
@@ -485,6 +487,21 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
     }
 }
 
+/// Divider under the remote-image banner.
+///
+/// In the dark theme the shared border is lighter than the banner, so it
+/// disappears where a beige newsletter starts. That edge is one flat
+/// hairline, darker than the banner, with no shade on the page. Light
+/// theme and native mail keep the shared border. The banner fill and the
+/// accent mark stay as they are.
+fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
+    if web && theme == Theme::Dark {
+        0x111111
+    } else {
+        border
+    }
+}
+
 fn channels(hex: u32) -> (u8, u8, u8) {
     (
         ((hex >> 16) & 0xff) as u8,
@@ -495,7 +512,18 @@ fn channels(hex: u32) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod cache_tests {
-    use super::web_frame_is_current;
+    use super::{Theme, banner_edge, web_frame_is_current};
+
+    #[test]
+    fn dark_newsletter_edge_is_darker_than_the_banner() {
+        let dark = Theme::Dark.palette();
+        let edge = banner_edge(Theme::Dark, true, dark.border);
+        assert!(edge < dark.surface);
+        assert!(edge < dark.border);
+        assert_eq!(banner_edge(Theme::Dark, false, dark.border), dark.border);
+        let light = Theme::Light.palette();
+        assert_eq!(banner_edge(Theme::Light, true, light.border), light.border);
+    }
 
     #[test]
     fn web_html_is_rebuilt_only_when_inputs_change() {
