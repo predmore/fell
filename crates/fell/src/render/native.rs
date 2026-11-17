@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -11,11 +12,130 @@ use smallvec::SmallVec;
 
 use super::theme::{Palette, ink, paint};
 
+/// Decoded inline images for one message.
+///
+/// Built once when the message is prepared. Rendering only looks up an entry,
+/// and [`ImageGallery::release`] drops the GPU textures.
+pub struct ImageGallery {
+    decoded: HashMap<usize, Arc<RenderImage>>,
+    held: Vec<Arc<RenderImage>>,
+}
+
+impl ImageGallery {
+    pub fn from_document(document: &StyledDocument) -> Self {
+        let mut gallery = Self {
+            decoded: HashMap::new(),
+            held: Vec::new(),
+        };
+        let mut used = 0u64;
+        let mut visit = |source: &ImageSource| {
+            let ImageSource::Data { bytes, .. } = source else {
+                return;
+            };
+            let key = bytes.as_ptr() as usize;
+            if gallery.decoded.contains_key(&key) {
+                return;
+            }
+            let Some(size) = image_rgba_len(bytes) else {
+                return;
+            };
+            if !fits_message_budget(used, size) {
+                return;
+            }
+            let Some(image) = decode_image(bytes) else {
+                return;
+            };
+            used += size;
+            gallery.held.push(Arc::clone(&image));
+            gallery.decoded.insert(key, image);
+        };
+        walk_sources(&document.blocks, &mut visit);
+        gallery
+    }
+
+    pub fn get(&self, bytes: &[u8]) -> Option<Arc<RenderImage>> {
+        self.decoded.get(&(bytes.as_ptr() as usize)).cloned()
+    }
+
+    /// Remove every cached texture from the sprite atlas.
+    pub fn release(&mut self, cx: &mut gpui::App) {
+        for image in self.held.drain(..) {
+            cx.drop_image(image, None);
+        }
+        self.decoded.clear();
+    }
+}
+
+/// A message may not decode more raster bytes than one image at the cap.
+pub(crate) fn fits_message_budget(used: u64, next: u64) -> bool {
+    next > 0
+        && used
+            .checked_add(next)
+            .is_some_and(|total| total <= MAX_IMAGE_BYTES)
+}
+
+fn image_rgba_len(bytes: &[u8]) -> Option<u64> {
+    let mut header = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    header.limits(image_limits());
+    let (width, height) = header.into_dimensions().ok()?;
+    if !raster_allowed(width, height) {
+        return None;
+    }
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)
+}
+
+fn walk_sources(blocks: &[Block], visit: &mut impl FnMut(&ImageSource)) {
+    for block in blocks {
+        match block {
+            Block::Heading { inlines, .. } | Block::Paragraph { inlines } => {
+                walk_inlines_sources(inlines, visit);
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    walk_sources(&item.blocks, visit);
+                }
+            }
+            Block::Quote { blocks } => walk_sources(blocks, visit),
+            Block::Table { header, rows } => {
+                for cell in header {
+                    walk_sources(cell, visit);
+                }
+                for row in rows {
+                    for cell in row {
+                        walk_sources(cell, visit);
+                    }
+                }
+            }
+            Block::Image { source, .. } => visit(source),
+            Block::Code { .. } | Block::ThematicBreak => {}
+        }
+    }
+}
+
+fn walk_inlines_sources(inlines: &[Inline], visit: &mut impl FnMut(&ImageSource)) {
+    for inline in inlines {
+        match inline {
+            Inline::Emphasis(children)
+            | Inline::Strong(children)
+            | Inline::Link { children, .. } => {
+                walk_inlines_sources(children, visit);
+            }
+            Inline::Image { source, .. } => visit(source),
+            Inline::Text(_) | Inline::Code(_) | Inline::LineBreak => {}
+        }
+    }
+}
+
 /// Native styled text. Compose paints markdown through this same function.
 pub fn document_column(
     document: &StyledDocument,
     palette: &Palette,
     allow_remote: bool,
+    gallery: &ImageGallery,
 ) -> gpui::Div {
     let mut column = div().flex().flex_col().gap_4();
     if document.is_empty() {
@@ -26,12 +146,17 @@ pub fn document_column(
         );
     }
     for block in &document.blocks {
-        column = column.child(render_block(block, palette, allow_remote));
+        column = column.child(render_block(block, palette, allow_remote, gallery));
     }
     column
 }
 
-fn render_block(block: &Block, palette: &Palette, allow_remote: bool) -> AnyElement {
+fn render_block(
+    block: &Block,
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> AnyElement {
     match block {
         Block::Heading { level, inlines } => {
             let mut heading = div().font_weight(FontWeight::BOLD);
@@ -44,14 +169,14 @@ fn render_block(block: &Block, palette: &Palette, allow_remote: bool) -> AnyElem
                 .flex()
                 .flex_col()
                 .gap_1()
-                .children(render_inlines(inlines, palette, allow_remote))
+                .children(render_inlines(inlines, palette, allow_remote, gallery))
                 .into_any_element()
         }
         Block::Paragraph { inlines } => div()
             .flex()
             .flex_col()
             .gap_2()
-            .children(render_inlines(inlines, palette, allow_remote))
+            .children(render_inlines(inlines, palette, allow_remote, gallery))
             .into_any_element(),
         Block::Quote { blocks } => div()
             .border_l(px(2.))
@@ -64,19 +189,16 @@ fn render_block(block: &Block, palette: &Palette, allow_remote: bool) -> AnyElem
             .children(
                 blocks
                     .iter()
-                    .map(|child| render_block(child, palette, allow_remote)),
+                    .map(|child| render_block(child, palette, allow_remote, gallery)),
             )
             .into_any_element(),
         Block::List { ordered, items } => div()
             .flex()
             .flex_col()
             .gap_2()
-            .children(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(index, item)| list_item(index, *ordered, item, palette, allow_remote)),
-            )
+            .children(items.iter().enumerate().map(|(index, item)| {
+                list_item(index, *ordered, item, palette, allow_remote, gallery)
+            }))
             .into_any_element(),
         Block::Code { text } => div()
             .font_family("Liberation Mono")
@@ -86,8 +208,8 @@ fn render_block(block: &Block, palette: &Palette, allow_remote: bool) -> AnyElem
             .rounded(px(4.))
             .child(text.clone())
             .into_any_element(),
-        Block::Table { header, rows } => render_table(header, rows, palette, allow_remote),
-        Block::Image { source, alt } => image_el(source, alt, palette, allow_remote),
+        Block::Table { header, rows } => render_table(header, rows, palette, allow_remote, gallery),
+        Block::Image { source, alt } => image_el(source, alt, palette, allow_remote, gallery),
         Block::ThematicBreak => div()
             .h(px(1.))
             .w_full()
@@ -102,6 +224,7 @@ fn list_item(
     item: &ListItem,
     palette: &Palette,
     allow_remote: bool,
+    gallery: &ImageGallery,
 ) -> AnyElement {
     let marker = if ordered {
         format!("{}.", index + 1)
@@ -121,7 +244,7 @@ fn list_item(
             div().flex_1().flex().flex_col().gap_1().children(
                 item.blocks
                     .iter()
-                    .map(|block| render_block(block, palette, allow_remote)),
+                    .map(|block| render_block(block, palette, allow_remote, gallery)),
             ),
         )
         .into_any_element()
@@ -132,6 +255,7 @@ fn render_table(
     rows: &[Vec<Vec<Block>>],
     palette: &Palette,
     allow_remote: bool,
+    gallery: &ImageGallery,
 ) -> AnyElement {
     let mut column = div()
         .flex()
@@ -140,10 +264,10 @@ fn render_table(
         .border_color(paint(palette.border))
         .rounded(px(4.));
     if !header.is_empty() {
-        column = column.child(table_row(header, palette, allow_remote, true));
+        column = column.child(table_row(header, palette, allow_remote, gallery, true));
     }
     for row in rows {
-        column = column.child(table_row(row, palette, allow_remote, false));
+        column = column.child(table_row(row, palette, allow_remote, gallery, false));
     }
     column.into_any_element()
 }
@@ -152,6 +276,7 @@ fn table_row(
     cells: &[Vec<Block>],
     palette: &Palette,
     allow_remote: bool,
+    gallery: &ImageGallery,
     header: bool,
 ) -> AnyElement {
     let mut row = div()
@@ -166,7 +291,7 @@ fn table_row(
     row.children(cells.iter().map(|cell| {
         div().flex_1().p_2().flex().flex_col().gap_2().children(
             cell.iter()
-                .map(|block| render_block(block, palette, allow_remote)),
+                .map(|block| render_block(block, palette, allow_remote, gallery)),
         )
     }))
     .into_any_element()
@@ -180,7 +305,12 @@ struct Mark {
     link: bool,
 }
 
-fn render_inlines(inlines: &[Inline], palette: &Palette, allow_remote: bool) -> Vec<AnyElement> {
+fn render_inlines(
+    inlines: &[Inline],
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> Vec<AnyElement> {
     let mut out = Vec::new();
     let mut text = String::new();
     let mut ranges: Vec<(Range<usize>, Mark)> = Vec::new();
@@ -194,6 +324,7 @@ fn render_inlines(inlines: &[Inline], palette: &Palette, allow_remote: bool) -> 
         },
         palette,
         allow_remote,
+        gallery,
         &mut text,
         &mut ranges,
         &mut out,
@@ -205,11 +336,13 @@ fn render_inlines(inlines: &[Inline], palette: &Palette, allow_remote: bool) -> 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_inlines(
     inlines: &[Inline],
     mark: &Mark,
     palette: &Palette,
     allow_remote: bool,
+    gallery: &ImageGallery,
     text: &mut String,
     ranges: &mut Vec<(Range<usize>, Mark)>,
     out: &mut Vec<AnyElement>,
@@ -226,21 +359,48 @@ fn walk_inlines(
             Inline::Emphasis(children) => {
                 let mut next = mark.clone();
                 next.emphasis = true;
-                walk_inlines(children, &next, palette, allow_remote, text, ranges, out);
+                walk_inlines(
+                    children,
+                    &next,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    text,
+                    ranges,
+                    out,
+                );
             }
             Inline::Strong(children) => {
                 let mut next = mark.clone();
                 next.strong = true;
-                walk_inlines(children, &next, palette, allow_remote, text, ranges, out);
+                walk_inlines(
+                    children,
+                    &next,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    text,
+                    ranges,
+                    out,
+                );
             }
             Inline::Link { children, .. } => {
                 let mut next = mark.clone();
                 next.link = true;
-                walk_inlines(children, &next, palette, allow_remote, text, ranges, out);
+                walk_inlines(
+                    children,
+                    &next,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    text,
+                    ranges,
+                    out,
+                );
             }
             Inline::Image { source, alt } => {
                 flush_text(text, ranges, palette, out);
-                out.push(image_el(source, alt, palette, allow_remote));
+                out.push(image_el(source, alt, palette, allow_remote, gallery));
             }
         }
     }
@@ -292,9 +452,15 @@ fn highlight(mark: &Mark, palette: &Palette) -> Option<HighlightStyle> {
     })
 }
 
-fn image_el(source: &ImageSource, alt: &str, palette: &Palette, allow_remote: bool) -> AnyElement {
+fn image_el(
+    source: &ImageSource,
+    alt: &str,
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> AnyElement {
     if let ImageSource::Data { bytes, .. } = source
-        && let Some(rendered) = decode_image(bytes)
+        && let Some(rendered) = gallery.get(bytes)
     {
         return div()
             .max_w(px(420.))
@@ -498,6 +664,79 @@ mod decode_tests {
         let (width, height) = fit_snapshot(880, 9_500);
         assert!(raster_allowed(width, height), "{width}x{height}");
         assert!(height > 4_000, "{width}x{height}");
+    }
+
+    #[test]
+    fn inline_images_are_decoded_once_under_a_message_cap() {
+        use super::{ImageGallery, fits_message_budget};
+        use fell_render::html_to_document;
+
+        assert!(fits_message_budget(0, 64));
+        assert!(!fits_message_budget(32 * 1024 * 1024, 1));
+        assert!(!fits_message_budget(u64::MAX - 1, 2));
+
+        let doc = html_to_document(include_str!(
+            "../../../fell-render/fixtures/native-personal-reply.html"
+        ));
+        let gallery = ImageGallery::from_document(&doc);
+        assert_eq!(gallery.held.len(), 1, "the sketch decodes once");
+        let again = gallery.get(match find_data(&doc.blocks) {
+            Some(bytes) => bytes,
+            None => panic!("fixture has a data image"),
+        });
+        let cached = again.expect("cached");
+        assert!(std::sync::Arc::ptr_eq(&cached, &gallery.held[0]));
+    }
+
+    fn find_data(blocks: &[fell_render::Block]) -> Option<&[u8]> {
+        for block in blocks {
+            match block {
+                fell_render::Block::Paragraph { inlines }
+                | fell_render::Block::Heading { inlines, .. } => {
+                    if let Some(bytes) = find_data_inline(inlines) {
+                        return Some(bytes);
+                    }
+                }
+                fell_render::Block::Quote { blocks } => {
+                    if let Some(bytes) = find_data(blocks) {
+                        return Some(bytes);
+                    }
+                }
+                fell_render::Block::List { items, .. } => {
+                    for item in items {
+                        if let Some(bytes) = find_data(&item.blocks) {
+                            return Some(bytes);
+                        }
+                    }
+                }
+                fell_render::Block::Image {
+                    source: fell_render::ImageSource::Data { bytes, .. },
+                    ..
+                } => return Some(bytes),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn find_data_inline(inlines: &[fell_render::Inline]) -> Option<&[u8]> {
+        for inline in inlines {
+            match inline {
+                fell_render::Inline::Image {
+                    source: fell_render::ImageSource::Data { bytes, .. },
+                    ..
+                } => return Some(bytes),
+                fell_render::Inline::Emphasis(children)
+                | fell_render::Inline::Strong(children)
+                | fell_render::Inline::Link { children, .. } => {
+                    if let Some(bytes) = find_data_inline(children) {
+                        return Some(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {

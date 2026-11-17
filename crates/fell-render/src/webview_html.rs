@@ -37,7 +37,7 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
 pub fn sanitize_html(html: &str, allow_remote_images: bool) -> String {
     let dom = crate::html::parse_html(html);
     let mut out = String::new();
-    serialize_children(dom.root_element(), &mut out, allow_remote_images, 0);
+    serialize_children(dom.root_element(), &mut out, allow_remote_images, true, 0);
     out
 }
 
@@ -45,10 +45,11 @@ fn serialize_children(
     node: scraper::ElementRef<'_>,
     out: &mut String,
     allow_remote_images: bool,
+    allow_style: bool,
     depth: u32,
 ) {
     for child in node.children() {
-        serialize_node(child, out, allow_remote_images, depth + 1);
+        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
     }
 }
 
@@ -56,6 +57,7 @@ fn serialize_node(
     node: ego_tree::NodeRef<'_, scraper::node::Node>,
     out: &mut String,
     allow_remote_images: bool,
+    allow_style: bool,
     depth: u32,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
@@ -81,18 +83,27 @@ fn serialize_node(
                     | "form"
                     | "noscript"
                     | "svg"
+                    | "math"
                     | "head"
                     | "html"
                     | "body"
             ) {
-                if matches!(name, "html" | "body" | "head" | "form" | "noscript" | "svg") {
+                if matches!(name, "html" | "body" | "head" | "form" | "noscript") {
                     for child in node.children() {
-                        serialize_node(child, out, allow_remote_images, depth + 1);
+                        serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
+                    }
+                }
+                if name == "svg" || name == "math" {
+                    for child in node.children() {
+                        serialize_node(child, out, allow_remote_images, false, depth + 1);
                     }
                 }
                 return;
             }
             if name == "style" {
+                if !allow_style {
+                    return;
+                }
                 let css = node
                     .children()
                     .filter_map(|child| match child.value() {
@@ -106,7 +117,7 @@ fn serialize_node(
                     strip_remote_css_urls(&css)
                 };
                 out.push_str("<style>");
-                out.push_str(&css.replace("</style", ""));
+                out.push_str(&escape_style(&css));
                 out.push_str("</style>");
                 return;
             }
@@ -125,8 +136,9 @@ fn serialize_node(
             }
             out.push('>');
             if !VOID.contains(&name) {
+                let child_style = allow_style && name != "svg" && name != "math";
                 for child in node.children() {
-                    serialize_node(child, out, allow_remote_images, depth + 1);
+                    serialize_node(child, out, allow_remote_images, child_style, depth + 1);
                 }
                 out.push_str("</");
                 out.push_str(name);
@@ -378,6 +390,12 @@ pub fn strip_remote_css_urls(css: &str) -> String {
     out
 }
 
+/// `<` would close the style element. A CSS escape keeps the stylesheet and
+/// cannot smuggle `</STYLE>` or an `<img>` into the document.
+fn escape_style(css: &str) -> String {
+    css.replace('<', "\\3C ")
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -480,5 +498,37 @@ mod tests {
         assert!(deep.contains("Still here"), "{deep}");
         assert!(!deep.contains("&lt;div"), "{deep}");
         assert!(clean.contains(">x<") || clean.contains(">x</p>"), "{clean}");
+    }
+
+    #[test]
+    fn style_inside_svg_cannot_smuggle_markup() {
+        for html in [
+            r#"<svg><style>x</STYLE><img src="https://tracker.example/p.png"></style></svg>"#,
+            r#"<math><style>x</STYLE><img src="https://tracker.example/p.png"></style></math>"#,
+        ] {
+            let clean = sanitize_html(html, false);
+            assert!(
+                !clean.to_ascii_lowercase().contains("tracker.example"),
+                "{html} -> {clean}"
+            );
+            assert!(!clean.contains("<style"), "{clean}");
+            assert!(
+                !clean.contains("src="),
+                "remote image must not keep a url: {clean}"
+            );
+        }
+        let broken = sanitize_html(
+            "<style>a</STYLE><img src=https://tracker.example/p.png></style>",
+            false,
+        );
+        assert!(
+            !broken.to_ascii_lowercase().contains("tracker.example"),
+            "{broken}"
+        );
+        assert!(!broken.contains("</STYLE>"), "{broken}");
+        let kept = sanitize_html("<style>p { color: red }</style><p>Hi</p>", false);
+        assert!(kept.contains("<style>"), "{kept}");
+        assert!(kept.contains("color: red"), "{kept}");
+        assert!(kept.contains("<p>Hi</p>"), "{kept}");
     }
 }

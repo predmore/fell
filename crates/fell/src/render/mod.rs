@@ -24,7 +24,7 @@ use gpui::{
 };
 
 use body::BodyModel as Model;
-use native::decode_image;
+use native::{ImageGallery, decode_image};
 use theme::{ThemeKind as Theme, paint};
 
 pub struct Reader {
@@ -44,6 +44,8 @@ pub struct Reader {
     web_generation: u64,
     web_settled: bool,
     web_failed: bool,
+    gallery: ImageGallery,
+    _release: gpui::Subscription,
 }
 
 pub struct Opened {
@@ -55,6 +57,13 @@ pub struct Opened {
 
 impl Reader {
     pub fn new(opened: Opened, cx: &mut Context<Self>) -> Self {
+        let gallery = ImageGallery::from_document(opened.model.document());
+        let release = cx.on_release(|this, app| {
+            this.gallery.release(app);
+            if let Some(image) = this.web_image.take() {
+                app.drop_image(image, None);
+            }
+        });
         Self {
             focus: cx.focus_handle(),
             did_focus: false,
@@ -71,10 +80,18 @@ impl Reader {
             web_generation: 0,
             web_settled: false,
             web_failed: false,
+            gallery,
+            _release: release,
         }
     }
 
-    fn sync_web(&mut self) {
+    fn clear_web_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(image) = self.web_image.take() {
+            cx.drop_image(image, Some(window));
+        }
+    }
+
+    fn sync_web(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(not(target_os = "linux"))]
         {
             return;
@@ -88,7 +105,7 @@ impl Reader {
                     self.web_source.clear();
                     self.web_scheme = "";
                     self.web_images = false;
-                    self.web_image = None;
+                    self.clear_web_image(window, cx);
                     self.web_generation = 0;
                     self.web_settled = false;
                     self.web_failed = false;
@@ -108,7 +125,7 @@ impl Reader {
                 allow_images,
             );
             if unchanged {
-                self.poll_web_frame();
+                self.poll_web_frame(window, cx);
                 return;
             }
             let source = self.model.source_html().to_string();
@@ -120,7 +137,7 @@ impl Reader {
                 },
             );
             self.web_token = self.web_token.wrapping_add(1);
-            self.web_image = None;
+            self.clear_web_image(window, cx);
             self.web_generation = 0;
             self.web_settled = false;
             self.web_failed = false;
@@ -139,7 +156,7 @@ impl Reader {
     }
 
     #[cfg(target_os = "linux")]
-    fn poll_web_frame(&mut self) {
+    fn poll_web_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.web_failed || self.web_settled {
             return;
         }
@@ -151,6 +168,7 @@ impl Reader {
                 settled,
             } => match decode_image(&png) {
                 Some(image) => {
+                    self.clear_web_image(window, cx);
                     self.web_image = Some(image);
                     self.web_generation = generation;
                     self.web_settled = settled;
@@ -228,7 +246,7 @@ impl Render for Reader {
             self.did_focus = true;
             self.focus.focus(window);
         }
-        self.sync_web();
+        self.sync_web(window, cx);
         if self.model.mode() == RenderMode::Web && !self.web_failed && !self.web_settled {
             window.request_animation_frame();
         }
@@ -342,6 +360,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
             reader.model.document(),
             palette,
             reader.model.remote_images_allowed(),
+            &reader.gallery,
         ))
     }
 }
