@@ -16,8 +16,13 @@ use super::theme::{Palette, ink, paint};
 ///
 /// Built once when the message is prepared. Rendering only looks up an entry,
 /// and [`ImageGallery::release`] drops the GPU textures.
+struct CachedImage {
+    on_light: Arc<RenderImage>,
+    on_dark: Arc<RenderImage>,
+}
+
 pub struct ImageGallery {
-    decoded: HashMap<usize, Arc<RenderImage>>,
+    decoded: HashMap<usize, CachedImage>,
     held: Vec<Arc<RenderImage>>,
 }
 
@@ -42,19 +47,30 @@ impl ImageGallery {
             if !fits_message_budget(used, size) {
                 return;
             }
-            let Some(image) = decode_image(bytes) else {
+            let Some(rgba) = decode_rgba(bytes) else {
                 return;
             };
+            let (on_light, on_dark) = theme_pair(&rgba);
             used += size;
-            gallery.held.push(Arc::clone(&image));
-            gallery.decoded.insert(key, image);
+            gallery.held.push(Arc::clone(&on_light));
+            if !Arc::ptr_eq(&on_light, &on_dark) {
+                gallery.held.push(Arc::clone(&on_dark));
+            }
+            gallery
+                .decoded
+                .insert(key, CachedImage { on_light, on_dark });
         };
         walk_sources(&document.blocks, &mut visit);
         gallery
     }
 
-    pub fn get(&self, bytes: &[u8]) -> Option<Arc<RenderImage>> {
-        self.decoded.get(&(bytes.as_ptr() as usize)).cloned()
+    pub fn get(&self, bytes: &[u8], dark_page: bool) -> Option<Arc<RenderImage>> {
+        let cached = self.decoded.get(&(bytes.as_ptr() as usize))?;
+        Some(if dark_page {
+            Arc::clone(&cached.on_dark)
+        } else {
+            Arc::clone(&cached.on_light)
+        })
     }
 
     /// Remove every cached texture from the sprite atlas.
@@ -461,7 +477,7 @@ fn image_el(
     gallery: &ImageGallery,
 ) -> AnyElement {
     if let ImageSource::Data { bytes, .. } = source
-        && let Some(rendered) = gallery.get(bytes)
+        && let Some(rendered) = gallery.get(bytes, palette.scheme() == "dark")
     {
         let mut frame = div()
             .border(px(1.))
@@ -620,6 +636,10 @@ fn image_limits() -> image::Limits {
 }
 
 pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    decode_rgba(bytes).map(render_frame)
+}
+
+fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
     let mut header = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -632,13 +652,73 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
         .with_guessed_format()
         .ok()?;
     reader.limits(image_limits());
-    let mut data = reader.decode().ok()?.into_rgba8();
+    reader.decode().ok().map(image::DynamicImage::into_rgba8)
+}
+
+/// A drawing on a flat paper color is stored twice, once per theme, from the
+/// same decode. The paper becomes transparent and the strokes take the text
+/// color, so a cream sketch does not sit as a light card on a dark page.
+fn theme_pair(rgba: &image::RgbaImage) -> (Arc<RenderImage>, Arc<RenderImage>) {
+    let Some(strokes) = lift_paper(rgba) else {
+        let image = render_frame(rgba.clone());
+        return (Arc::clone(&image), image);
+    };
+    (
+        render_frame(tint(&strokes, [0x1a, 0x1a, 0x1a])),
+        render_frame(tint(&strokes, [0xe8, 0xe8, 0xe8])),
+    )
+}
+
+fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
+    let pixels: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
+    let opaque: Vec<_> = pixels.iter().filter(|p| p[3] >= 16).copied().collect();
+    if opaque.is_empty() {
+        return None;
+    }
+    let mut counts: HashMap<(u8, u8, u8), usize> = HashMap::new();
+    for px in &opaque {
+        let key = (px[0] & !7, px[1] & !7, px[2] & !7);
+        *counts.entry(key).or_default() += 1;
+    }
+    let (&paper, &count) = counts.iter().max_by_key(|(_, n)| *n)?;
+    if count * 100 / opaque.len() < 80 {
+        return None;
+    }
+    let mut out = rgba.clone();
+    let mut strokes = 0usize;
+    for px in out.pixels_mut() {
+        let key = (px[0] & !7, px[1] & !7, px[2] & !7);
+        let paper_pixel = px[3] < 16
+            || (key.0.abs_diff(paper.0) <= 8
+                && key.1.abs_diff(paper.1) <= 8
+                && key.2.abs_diff(paper.2) <= 8);
+        if paper_pixel {
+            *px = image::Rgba([0, 0, 0, 0]);
+        } else {
+            *px = image::Rgba([255, 255, 255, 255]);
+            strokes += 1;
+        }
+    }
+    (strokes > 0).then_some(out)
+}
+
+fn tint(src: &image::RgbaImage, rgb: [u8; 3]) -> image::RgbaImage {
+    let mut out = src.clone();
+    for px in out.pixels_mut() {
+        if px[3] > 0 {
+            *px = image::Rgba([rgb[0], rgb[1], rgb[2], px[3]]);
+        }
+    }
+    out
+}
+
+fn render_frame(mut data: image::RgbaImage) -> Arc<RenderImage> {
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let frame = Frame::new(data);
     let frames = SmallVec::<[Frame; 1]>::from_vec(vec![frame]);
-    Some(Arc::new(RenderImage::new(frames)))
+    Arc::new(RenderImage::new(frames))
 }
 
 #[cfg(test)]
@@ -750,13 +830,26 @@ mod decode_tests {
             "../../../fell-render/fixtures/native-personal-reply.html"
         ));
         let gallery = ImageGallery::from_document(&doc);
-        assert_eq!(gallery.held.len(), 1, "the sketch decodes once");
-        let again = gallery.get(match find_data(&doc.blocks) {
+        assert_eq!(gallery.decoded.len(), 1, "the sketch decodes once");
+        let bytes = match find_data(&doc.blocks) {
             Some(bytes) => bytes,
             None => panic!("fixture has a data image"),
-        });
-        let cached = again.expect("cached");
-        assert!(std::sync::Arc::ptr_eq(&cached, &gallery.held[0]));
+        };
+        let on_light = gallery.get(bytes, false).expect("cached");
+        let on_dark = gallery.get(bytes, true).expect("cached");
+        assert!(
+            gallery
+                .held
+                .iter()
+                .any(|image| std::sync::Arc::ptr_eq(image, &on_light))
+        );
+        assert!(
+            gallery
+                .held
+                .iter()
+                .any(|image| std::sync::Arc::ptr_eq(image, &on_dark))
+        );
+        assert!(!std::sync::Arc::ptr_eq(&on_light, &on_dark));
     }
 
     fn find_data(blocks: &[fell_render::Block]) -> Option<&[u8]> {

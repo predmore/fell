@@ -226,8 +226,11 @@ fn format_unix_date(unix: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let clock = unix.rem_euclid(86_400);
+    let hour = clock / 3_600;
+    let minute = (clock % 3_600) / 60;
     format!(
-        "{d} {} {y}",
+        "{d} {} {y}, {hour:02}:{minute:02}",
         MONTHS[usize::try_from(m).unwrap_or(1).saturating_sub(1)]
     )
 }
@@ -281,7 +284,7 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
         Opened {
             title: subject.into(),
             from_line: from_header(&fixture.headers).into(),
-            date_line: "14 Nov 2023".into(),
+            date_line: format_unix_date(1_700_000_000).into(),
             model: Model::from_prepared(prepare(&fixture.html, &fixture.headers)),
             theme,
         }
