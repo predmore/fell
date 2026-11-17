@@ -182,7 +182,7 @@ fn render_block(
             .border_l(px(2.))
             .border_color(paint(palette.quote))
             .pl_3()
-            .text_color(paint(palette.dimmed))
+            .text_color(paint(palette.foreground))
             .flex()
             .flex_col()
             .gap_2()
@@ -237,7 +237,8 @@ fn list_item(
         .child(
             div()
                 .flex_shrink_0()
-                .text_color(paint(palette.dimmed))
+                .text_base()
+                .text_color(paint(palette.foreground))
                 .child(marker),
         )
         .child(
@@ -491,16 +492,17 @@ fn image_el(
             }
         }
     };
-    div()
+    let mut placeholder = div()
         .px_3()
         .py_2()
         .border(px(1.))
         .border_color(paint(palette.border))
         .rounded(px(4.))
         .text_sm()
-        .text_color(paint(palette.dimmed))
-        .child(label)
-        .into_any_element()
+        .text_color(paint(palette.foreground))
+        .child(label);
+    placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);
+    placeholder.into_any_element()
 }
 
 pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
