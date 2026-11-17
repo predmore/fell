@@ -218,7 +218,8 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
     window.set_focus_on_map(false);
     window.set_accept_focus(false);
     window.set_can_focus(false);
-    window.set_default_size(960, 1400);
+    // Match the message pane so the snapshot is not scaled, which softens type.
+    window.set_default_size(928, 1400);
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
     window.show_all();
