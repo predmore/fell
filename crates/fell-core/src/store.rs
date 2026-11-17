@@ -1738,10 +1738,12 @@ fn write_kept(
         ],
     )?;
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
+    // The vector belongs to the row that stays, not to the id this copy
+    // arrived under (which may be an alias).
     invalidate_message_embedding(
         conn,
         message.account_id.as_str(),
-        message.headers.message_id.as_str(),
+        &stored.canonical_id,
         indexed,
     )?;
     Ok(thread_id)
@@ -1928,6 +1930,9 @@ fn absorb_duplicate(
         "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
         params![message.account_id.as_str(), doomed.canonical_id],
     )?;
+    // The removed copy's vector and queue entry go with its row.
+    remove_message_embedding(conn, message.account_id.as_str(), &doomed.canonical_id)?;
+    dequeue_message(conn, message.account_id.as_str(), &doomed.canonical_id)?;
     conn.execute(
         "UPDATE message_aliases SET canonical_message_id = ?1
          WHERE account_id = ?2 AND canonical_message_id = ?3",
@@ -6153,6 +6158,76 @@ mod tests {
         assert!(kept.folders.iter().any(|folder| folder == "Sent"));
         assert!(kept.folders.iter().any(|folder| folder == "Archive"));
         assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn absorb_moves_the_embedding_to_the_kept_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        for (id, remote, subject, folders, list) in [
+            ("sent@x", "imap:sent", "Hello", "Sent", None),
+            (
+                "list@x",
+                "imap:inbox",
+                "[list] Hello",
+                "INBOX",
+                Some("list.example"),
+            ),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint, list_id
+                     ) VALUES (
+                        'a1', ?1, ?2, ?1, '', 'from@x', ?3, 1700000000, 'hello body',
+                        'hello body', 1, ?4, ?5, ?6
+                     )",
+                    params![id, remote, subject, folders, fingerprint, list],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO message_embeddings
+                        (account_id, message_id, model, model_version, dims, body_hash, vector)
+                     VALUES ('a1', ?1, 'local-hash-v1', '1', 1, 'old', x'00000000')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        again.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&again).unwrap();
+        assert_eq!(listed(&store)[0].headers.message_id.as_str(), "list@x");
+        let count = |sql: &str, id: &str| -> i64 {
+            store
+                .conn
+                .query_row(sql, params![id], |row| row.get(0))
+                .unwrap()
+        };
+        let vectors = "SELECT COUNT(*) FROM message_embeddings WHERE message_id = ?1";
+        let queued = "SELECT COUNT(*) FROM embedding_queue WHERE message_id = ?1";
+        assert_eq!(
+            count(vectors, "sent@x"),
+            0,
+            "no orphan vector for the removed copy"
+        );
+        assert_eq!(
+            count(queued, "sent@x"),
+            0,
+            "nothing queued under the removed id"
+        );
+        assert_eq!(
+            count(queued, "list@x"),
+            1,
+            "the kept row is queued for a new vector"
+        );
     }
 
     #[test]
