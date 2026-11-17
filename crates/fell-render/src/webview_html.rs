@@ -23,7 +23,7 @@ pub fn wrap_for_webview(source_html: &str, frame: &WebFrame) -> String {
 <meta name="color-scheme" content="{scheme}">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; {img_src} font-src data:; media-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
 <style>
-  html, body {{ margin: 0; padding: 0; }}
+  html, body {{ margin: 0; padding: 0; background: transparent; }}
 </style>
 </head>
 <body>{body}</body>

@@ -506,12 +506,41 @@ fn image_el(
 pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
     div()
         .w_full()
-        .child(
-            img(image)
-                .max_w(px(860.))
-                .object_fit(gpui::ObjectFit::Contain),
-        )
+        .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
         .into_any_element()
+}
+
+/// Drop trailing rows that are a flat page color, so a short newsletter
+/// does not keep the empty viewport under the card.
+pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
+    let row_bytes = width as usize * 4;
+    if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
+        return height;
+    }
+    let mut rows = height as usize;
+    while rows > 1 {
+        let start = (rows - 1) * row_bytes;
+        if !row_is_flat(&rgba[start..start + row_bytes]) {
+            break;
+        }
+        rows -= 1;
+    }
+    if rows == 1 && row_is_flat(&rgba[..row_bytes]) {
+        return height;
+    }
+    rows as u32
+}
+
+fn row_is_flat(row: &[u8]) -> bool {
+    let Some(first) = row.get(..4) else {
+        return true;
+    };
+    row.as_chunks::<4>().0.iter().all(|px| {
+        px[0].abs_diff(first[0]) <= 2
+            && px[1].abs_diff(first[1]) <= 2
+            && px[2].abs_diff(first[2]) <= 2
+            && px[3].abs_diff(first[3]) <= 2
+    })
 }
 
 /// A mail image or a web snapshot. Far below the image crate's 512MiB default,
@@ -664,6 +693,33 @@ mod decode_tests {
         let (width, height) = fit_snapshot(880, 9_500);
         assert!(raster_allowed(width, height), "{width}x{height}");
         assert!(height > 4_000, "{width}x{height}");
+    }
+
+    #[test]
+    fn uniform_page_color_under_a_card_is_trimmed() {
+        use super::trim_uniform_bottom;
+        let width = 4u32;
+        let height = 40u32;
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..10 {
+            for x in 0..width as usize {
+                let i = (y * width as usize + x) * 4;
+                rgba[i] = 20;
+                rgba[i + 1] = x as u8;
+                rgba[i + 2] = 40;
+                rgba[i + 3] = 255;
+            }
+        }
+        for y in 10..40 {
+            for x in 0..width as usize {
+                let i = (y * width as usize + x) * 4;
+                rgba[i] = 231;
+                rgba[i + 1] = 226;
+                rgba[i + 2] = 216;
+                rgba[i + 3] = 255;
+            }
+        }
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 10);
     }
 
     #[test]

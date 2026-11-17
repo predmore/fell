@@ -578,6 +578,8 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
             }
         }
     }
+    let dst_h = super::native::trim_uniform_bottom(&rgba, dst_w, dst_h);
+    rgba.truncate(dst_w as usize * dst_h as usize * 4);
     let buffer = image::RgbaImage::from_raw(dst_w, dst_h, rgba)?;
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(buffer)
