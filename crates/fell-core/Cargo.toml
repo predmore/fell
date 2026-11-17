@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 fell-confirm.workspace = true
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 mail-parser = { version = "1.0.1", default-features = false, features = ["full_encoding"] }
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -23,3 +24,6 @@ rcgen = "0.13"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[target."cfg(unix)".dependencies]
+xattr = "0.2"

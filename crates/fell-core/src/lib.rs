@@ -10,6 +10,7 @@ pub mod actions;
 pub mod agent;
 pub mod backend;
 pub mod compose;
+pub mod embed;
 pub mod imap;
 pub mod message;
 pub mod search;
@@ -24,6 +25,10 @@ pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, Saved
 pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
     SyncCursor, backend_for,
+};
+pub use embed::{
+    BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
+    LocalHashV1, embed_body,
 };
 pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};

@@ -129,7 +129,7 @@ impl crate::Store {
         grant: AgentGrant,
     ) -> Result<()> {
         let agent_id = require_token(agent_id, "agent id")?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
         tx.execute(
             "INSERT INTO agent_grants (
@@ -304,7 +304,7 @@ impl crate::Store {
         {
             return Err(Error::Invalid("in_reply_to is empty".into()));
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, &input.account_id)?;
         if let Some(thread_id) = &input.thread_id {
             let messages = load_thread(&tx, &input.account_id, thread_id)?;
@@ -435,7 +435,7 @@ impl crate::Store {
     }
 
     fn undo_inner(&self, account_id: &AccountId, actor: Option<&str>) -> Result<RecordedAction> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
         let Some(mut action) = find_open_action(&tx, account_id, actor)? else {
             return Err(Error::NothingToUndo);
@@ -465,7 +465,7 @@ impl crate::Store {
         mut mutate: impl FnMut(&mut Message),
     ) -> Result<Option<RecordedAction>> {
         let actor = require_token(actor, "actor")?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
         let mut messages = load_thread(&tx, account_id, thread_id)?;
         if messages.is_empty() {

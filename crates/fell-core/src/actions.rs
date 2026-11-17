@@ -21,6 +21,9 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
+use crate::embed::{
+    dequeue_message, enqueue_message, invalidate_message_embedding, remove_message_embedding,
+};
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
@@ -304,7 +307,7 @@ impl Store {
     /// Restore the latest archive, move, label, or delete on this account.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
-        let tx = self.connection().unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
@@ -412,7 +415,7 @@ impl Store {
         plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
         self.require_account(account_id)?;
-        let tx = self.connection().unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let rows = load_thread(&tx, account_id, thread_id)?;
         if rows.is_empty() {
@@ -512,6 +515,8 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
     let old_terms = terms_of(&plan.before);
     if plan.remove_row {
         sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
+        remove_message_embedding(conn, account_id.as_str(), &plan.before.message_id)?;
+        dequeue_message(conn, account_id.as_str(), &plan.before.message_id)?;
         let changed = conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), plan.before.message_id],
@@ -710,6 +715,12 @@ fn replace_message_row(
     )?;
     expect_one(changed, &snapshot.message_id)?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+    invalidate_message_embedding(
+        conn,
+        account_id.as_str(),
+        &snapshot.message_id,
+        snapshot.body_text.as_deref().unwrap_or(&snapshot.snippet),
+    )?;
     Ok(())
 }
 
@@ -1310,6 +1321,8 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
          )",
         params_from_iter(values),
     )?;
+    remove_message_embedding(conn, account_id.as_str(), &row.message_id)?;
+    enqueue_message(conn, account_id.as_str(), &row.message_id)?;
     Ok(())
 }
 

@@ -7,6 +7,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
+use crate::embed::{
+    Embedding, dequeue_message, enqueue_message, invalidate_message_embedding,
+    remove_message_embedding,
+};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses,
@@ -249,8 +253,16 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
+    /// File-backed stores fill body vectors here. In-memory stores leave this
+    /// empty so tests can index on the calling thread.
+    indexer: Option<crate::embed::Indexer>,
     pub(crate) conn: Connection,
     path: Option<std::path::PathBuf>,
+    /// Shared lock on the mailbox inode, held until this store is dropped.
+    /// Dropped after the SQLite connection so a new opener cannot migrate
+    /// the WAL while this connection still has the file.
+    #[cfg(unix)]
+    _mailbox_lock: Option<std::fs::File>,
 }
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
@@ -271,15 +283,22 @@ pub struct ThreadSummary {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let requested = path.as_ref();
         // The mailbox holds message text. Create it owner-only before SQLite writes.
-        create_private_file(path)?;
-        let conn = Connection::open(path)?;
-        // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        let mut store = Self::from_connection(conn)?;
-        store.path = Some(path.to_path_buf());
+        create_private_file(requested)?;
+        // One path string per inode. A symlink or a second hard link must not
+        // open a different `-wal` while another connection still has the file.
+        let claimed = claim_mailbox(requested)?;
+        let mut store = Self::from_connection(claimed.conn)?;
+        store.path = Some(claimed.path.clone());
+        #[cfg(unix)]
+        {
+            store._mailbox_lock = Some(claimed.lock);
+        }
         store.seal_private_files()?;
+        // Embeddings are filled off this thread, and only in one process.
+        // A lock problem skips the indexer. Open still returns the mailbox.
+        store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
         Ok(store)
     }
 
@@ -305,6 +324,9 @@ impl Store {
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
         crate::search::rebuild_vocabulary_if_empty(&conn)?;
+        // The fingerprint merge invalidates body vectors, so the table has to
+        // exist before that backfill runs.
+        crate::embed::ensure_embedding_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
         if schema_version(&conn)?.as_deref() != Some("3") {
@@ -320,7 +342,38 @@ impl Store {
                 [],
             )?;
         }
-        Ok(Self { conn, path: None })
+        // 3 adds message_embeddings, the local body-vector index.
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        Ok(Self {
+            indexer: None,
+            conn,
+            path: None,
+            #[cfg(unix)]
+            _mailbox_lock: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mailbox_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_pause_indexer(&self, paused: bool) {
+        if let Some(indexer) = &self.indexer {
+            indexer.pause(paused);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn embedding_indexer_running(&self) -> bool {
+        self.indexer
+            .as_ref()
+            .is_some_and(crate::embed::Indexer::is_running)
     }
 
     pub(crate) fn seal_private_files(&self) -> Result<()> {
@@ -376,7 +429,7 @@ impl Store {
     }
 
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -420,7 +473,7 @@ impl Store {
     }
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         insert_message(&tx, message)?;
         rethread(&tx, &message.account_id)?;
         let thread_id =
@@ -433,12 +486,12 @@ impl Store {
         Ok(thread_id)
     }
 
-    /// Remove one message and its search postings.
+    /// Remove one message, its search postings, and its body embedding.
     ///
     /// Document frequency drops the same way an insert raises it, inside the
     /// transaction that deletes the row. `false` means the message was not stored.
     pub fn delete_message(&self, account_id: &AccountId, message_id: &MessageId) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         let Some((stored, _)) = find_stored(&tx, account_id, message_id)? else {
             tx.rollback()?;
             return Ok(false);
@@ -455,6 +508,8 @@ impl Store {
             labels: &stored.labels,
         });
         sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
+        remove_message_embedding(&tx, account_id.as_str(), message_id.as_str())?;
+        dequeue_message(&tx, account_id.as_str(), message_id.as_str())?;
         let removed = tx.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), stored.canonical_id],
@@ -471,6 +526,20 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Vector stored for this message body, if the indexer has written one.
+    ///
+    /// The vector comes from `body_text`, or from the snippet when the body is
+    /// null. This read does not compute it and does not call a network. `None`
+    /// means this account has no embedding row yet. Keyword search does not
+    /// read the table.
+    pub fn message_embedding(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<Embedding>> {
+        crate::embed::load_embedding(&self.conn, account_id.as_str(), message_id.as_str())
     }
 
     pub fn list_threads(&self, account_id: &AccountId) -> Result<Vec<ThreadSummary>> {
@@ -758,6 +827,299 @@ fn page_offset(cursor: Option<&str>) -> Result<i64> {
             .ok()
             .filter(|offset| *offset >= 0)
             .ok_or_else(|| crate::Error::Invalid("cursor is not a page token".into())),
+    }
+}
+
+struct ClaimedMailbox {
+    path: std::path::PathBuf,
+    /// Opened before the exclusive lock is released.
+    conn: Connection,
+    #[cfg(unix)]
+    lock: std::fs::File,
+}
+
+/// Pick the one SQLite path for this inode and hold a shared lock on it.
+///
+/// SQLite names `-wal` and `-shm` from the path string. Once a path is
+/// published, every open uses that path and does not replace it. A published
+/// path is created only while this process alone holds the exclusive lock.
+fn claim_mailbox(requested: &Path) -> Result<ClaimedMailbox> {
+    #[cfg(unix)]
+    {
+        claim_mailbox_unix(requested)
+    }
+    #[cfg(not(unix))]
+    {
+        let path = requested.canonicalize()?;
+        let conn = open_mailbox_db(&path)?;
+        Ok(ClaimedMailbox { path, conn })
+    }
+}
+
+#[cfg(unix)]
+const OPEN_PATH_ATTR: &str = "user.fell.sqlite_path";
+
+#[cfg(unix)]
+fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
+    use std::os::unix::fs::MetadataExt;
+
+    use fs4::fs_std::FileExt;
+
+    let canonical = absolute_opened(&requested.canonicalize()?)?;
+    loop {
+        let db = std::fs::File::open(requested)?;
+        let nlink = db.metadata()?.nlink();
+        let exclusive = match db.try_lock_exclusive() {
+            Ok(held) => held,
+            // The filesystem cannot record a flock. A single name cannot split
+            // its WAL, so the canonical file still opens.
+            Err(_) if nlink <= 1 => {
+                let path = read_published_path(&db).unwrap_or_else(|| canonical.clone());
+                let conn = open_mailbox_db(&path)?;
+                return Ok(ClaimedMailbox {
+                    path,
+                    conn,
+                    lock: db,
+                });
+            }
+            Err(err) => {
+                return Err(crate::Error::Invalid(format!("cannot lock mailbox: {err}")));
+            }
+        };
+        if !exclusive {
+            // Block until the exclusive holder shares or exits. Replaying a
+            // large WAL can take longer than a short poll.
+            db.lock_shared()?;
+            if let Some(path) = read_published_path(&db) {
+                let conn = open_mailbox_db(&path)?;
+                if read_published_path(&db).as_ref() == Some(&path) {
+                    return Ok(ClaimedMailbox {
+                        path,
+                        conn,
+                        lock: db,
+                    });
+                }
+                drop(conn);
+                drop(db);
+                continue;
+            }
+            if nlink <= 1 {
+                let conn = open_mailbox_db(&canonical)?;
+                return Ok(ClaimedMailbox {
+                    path: canonical,
+                    conn,
+                    lock: db,
+                });
+            }
+            return Err(crate::Error::Invalid(
+                "mailbox is already open and its path was not published".into(),
+            ));
+        }
+        delay_publish_for_test();
+        let (path, conn) = if let Some(published) = read_published_path(&db) {
+            // Someone already chose the path. Do not checkpoint or open
+            // another name, and do not replace it.
+            let conn = open_mailbox_db(&published)?;
+            (published, conn)
+        } else {
+            let requested_abs = absolute_opened(requested)?;
+            if requested_abs == canonical {
+                (canonical.clone(), open_mailbox_db(&canonical)?)
+            } else {
+                // Alone, so this checkpoint is the only connection. Keep the
+                // requested path when a live reader makes the checkpoint busy.
+                open_requested_or_canonical(&requested_abs, &canonical)?
+            }
+        };
+        // A non-canonical path must be recorded. Otherwise a later open sees
+        // no attribute, and a symlink does not raise nlink, so it would guess
+        // the canonical file and start a second WAL.
+        if publish_mailbox_path(&db, &path).is_err() && path != canonical {
+            drop(conn);
+            return Err(crate::Error::Invalid(
+                "cannot publish the shared mailbox path".into(),
+            ));
+        }
+        // Every live store holds this shared lock, so a later open cannot
+        // take the exclusive lock and start a second WAL.
+        db.lock_shared()?;
+        divert_published_path_for_test(&db);
+        if let Some(now) = read_published_path(&db)
+            && now != path
+        {
+            drop(conn);
+            drop(db);
+            continue;
+        }
+        return Ok(ClaimedMailbox {
+            path,
+            conn,
+            lock: db,
+        });
+    }
+}
+
+#[cfg(unix)]
+fn open_requested_or_canonical(
+    requested: &Path,
+    canonical: &Path,
+) -> Result<(std::path::PathBuf, Connection)> {
+    // A non-empty canonical WAL already holds frames. Opening the symlink
+    // would checkpoint a different `-wal` and then recover the other one on top.
+    if canonical_wal_has_frames(canonical) {
+        return Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?));
+    }
+    // The canonical WAL is absent. Replay the alias WAL before any connection
+    // opens the canonical path.
+    let conn = Connection::open(requested)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let (busy, log, checkpointed): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy == 0 && log == checkpointed {
+        drop(conn);
+        Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?))
+    } else {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        Ok((requested.to_path_buf(), conn))
+    }
+}
+
+#[cfg(unix)]
+fn canonical_wal_has_frames(canonical: &Path) -> bool {
+    let mut wal = canonical.as_os_str().to_os_string();
+    wal.push("-wal");
+    std::fs::metadata(std::path::Path::new(&wal))
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
+}
+
+fn open_mailbox_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    Ok(conn)
+}
+
+#[cfg(unix)]
+fn read_published_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    use xattr::FileExt;
+
+    if reject_mailbox_xattr() {
+        return None;
+    }
+    let bytes = file.get_xattr(OPEN_PATH_ATTR).ok()??;
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    same_inode(file, &path).then_some(path)
+}
+
+#[cfg(unix)]
+fn publish_mailbox_path(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt;
+
+    if reject_mailbox_xattr() {
+        return Err(crate::Error::Invalid(
+            "cannot publish the shared mailbox path".into(),
+        ));
+    }
+    file.set_xattr(OPEN_PATH_ATTR, path.as_os_str().as_bytes())
+        .map_err(|err| {
+            crate::Error::Invalid(format!("cannot publish the shared mailbox path: {err}"))
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_mailbox_xattr() -> bool {
+    #[cfg(test)]
+    {
+        REJECT_MAILBOX_XATTR.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static REJECT_MAILBOX_XATTR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pretend this filesystem rejects the shared-path attribute.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_reject_mailbox_xattr(reject: bool) {
+    REJECT_MAILBOX_XATTR.with(|cell| cell.set(reject));
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static DIVERT_PUBLISHED_ONCE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// After the next open downgrades its lock, publish this path once.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_divert_published_path_once(path: std::path::PathBuf) {
+    DIVERT_PUBLISHED_ONCE.with(|cell| *cell.borrow_mut() = Some(path));
+}
+
+#[cfg(all(unix, test))]
+static DELAY_PUBLISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next exclusive open waits before it publishes the shared path.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_delay_publish_once(delay: bool) {
+    DELAY_PUBLISH.store(delay, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn delay_publish_for_test() {
+    #[cfg(test)]
+    {
+        if DELAY_PUBLISH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn divert_published_path_for_test(file: &std::fs::File) {
+    #[cfg(test)]
+    {
+        let next = DIVERT_PUBLISHED_ONCE.with(|cell| cell.borrow_mut().take());
+        if let Some(path) = next {
+            let _ = publish_mailbox_path(file, &path);
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = file;
+    }
+}
+
+#[cfg(unix)]
+fn same_inode(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(ours) = file.metadata() else {
+        return false;
+    };
+    let Ok(theirs) = std::fs::metadata(path) else {
+        return false;
+    };
+    ours.dev() == theirs.dev() && ours.ino() == theirs.ino()
+}
+
+#[cfg(unix)]
+fn absolute_opened(path: &Path) -> Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
     }
 }
 
@@ -1069,6 +1431,11 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
         labels: &labels,
     });
     sync_terms(conn, message.account_id.as_str(), &HashSet::new(), &terms)?;
+    enqueue_message(
+        conn,
+        message.account_id.as_str(),
+        message.headers.message_id.as_str(),
+    )?;
     Ok(thread_id)
 }
 
@@ -1263,6 +1630,12 @@ fn write_kept(
         ],
     )?;
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
+    invalidate_message_embedding(
+        conn,
+        message.account_id.as_str(),
+        message.headers.message_id.as_str(),
+        indexed,
+    )?;
     Ok(thread_id)
 }
 
@@ -2357,6 +2730,13 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write lock from the first statement, so an embedding commit cannot
+/// invalidate a snapshot this transaction already read.
+pub(crate) fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(Into::into)
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {
