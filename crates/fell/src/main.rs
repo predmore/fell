@@ -10,7 +10,10 @@ use gpui::{
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--fixture" || arg == "--theme" || arg == "--help") {
+    if args
+        .iter()
+        .any(|arg| arg == "--fixture" || arg == "--theme" || arg == "--help")
+    {
         preview();
     } else {
         fell::run();

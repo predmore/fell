@@ -164,6 +164,7 @@ pub fn round_trip_body(body: &str, subject: &str) -> fell_core::Result<Message> 
         folders: vec!["INBOX".into()],
         labels: Vec::new(),
         arrived_via: Vec::new(),
+        starred: false,
         to: Vec::new(),
         cc: Vec::new(),
         bcc: Vec::new(),
