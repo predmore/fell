@@ -1170,11 +1170,18 @@ fn thread_row(
                 cx.notify();
             }),
         )
-        .child(div().w(px(3.)).h_full().bg(rgb(if row.unread {
-            theme.accent
-        } else {
-            theme.background
-        })))
+        // Shorter than the row, so bars on adjacent unread rows stay apart.
+        .child(
+            div()
+                .w(px(3.))
+                .h(px(44.))
+                .rounded_r_sm()
+                .bg(rgb(if row.unread {
+                    theme.accent
+                } else {
+                    theme.background
+                })),
+        )
         .child(
             div()
                 .flex_1()
@@ -1423,7 +1430,9 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
         .flex_none()
         .flex()
         .items_center()
-        .justify_center()
+        // The line sits on the list's edge, so the selection meets it; the
+        // rest of the 7 px is grab area.
+        .justify_start()
         .cursor_col_resize()
         .on_mouse_down(
             MouseButton::Left,
@@ -1663,13 +1672,24 @@ fn expanded_message(
                         .child(present::relative_date(now_unix(), message.date_unix)),
                 ),
         )
-        .children(
+        .children({
+            // `q` opens every collapsed block in the message at once, so
+            // only the first one names the key.
+            let first_hidden = message
+                .body
+                .blocks
+                .iter()
+                .position(|block| !matches!(block, BodyBlock::Text(_)));
             message
                 .body
                 .blocks
                 .iter()
-                .map(|block| body_block(theme, block, quotes, index, cx)),
-        )
+                .enumerate()
+                .map(|(at, block)| {
+                    body_block(theme, block, quotes, Some(at) == first_hidden, index, cx)
+                })
+                .collect::<Vec<_>>()
+        })
         .into_any_element()
 }
 
@@ -1677,6 +1697,7 @@ fn body_block(
     theme: &Theme,
     block: &BodyBlock,
     quotes_open: bool,
+    show_key: bool,
     index: usize,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -1711,7 +1732,11 @@ fn body_block(
                     .flex()
                     .items_center()
                     .text_color(rgb(theme.dimmed))
-                    .child(format!("{label} · q"))
+                    .child(if show_key {
+                        format!("{label} · q")
+                    } else {
+                        label.to_string()
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |inbox, _, window, cx| {
