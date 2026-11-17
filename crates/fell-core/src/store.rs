@@ -987,11 +987,11 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
         {
             return absorb_duplicate(conn, message, &stored, &other);
         }
-        return write_kept(conn, message, &stored, via_alias);
+        return write_kept(conn, message, &stored, via_alias, &[], &[]);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        return write_kept(conn, message, &stored, true);
+        return write_kept(conn, message, &stored, true, &[], &[]);
     }
     insert_new(conn, message, &fingerprint)
 }
@@ -1080,6 +1080,8 @@ fn write_kept(
     message: &Message,
     stored: &Arrival,
     alias: bool,
+    extra_folders: &[String],
+    extra_labels: &[String],
 ) -> Result<ThreadId> {
     let stored_list = list_is_set(&stored.list_id);
     let incoming_list = clean_list_id(&message.list_id).is_some();
@@ -1126,11 +1128,18 @@ fn write_kept(
     // local triage, so a later copy must not clear them, and INBOX stays off
     // while the message is archived.
     let archived = stored.archived || message.archived;
-    let mut folders = union_tokens(&stored.folders, &message.folders, false);
+    let mut folder_in = message.folders.clone();
+    folder_in.extend(extra_folders.iter().cloned());
+    let mut label_in = message.labels.clone();
+    label_in.extend(extra_labels.iter().cloned());
+    // `extra_*` is the deleted copy. It belongs in the value written here, not
+    // in the previous terms, or those tokens are both sides of the diff and
+    // then disappear when the deleted row's postings are dropped.
+    let mut folders = union_tokens(&stored.folders, &folder_in, false);
     if archived {
         folders = strip_inbox_tokens(&folders);
     }
-    let labels = union_tokens(&stored.labels, &message.labels, false);
+    let labels = union_tokens(&stored.labels, &label_in, false);
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
     let to_line = union_addresses(&stored.to_line, &message.to);
     let cc_line = union_addresses(&stored.cc_line, &message.cc);
@@ -1402,8 +1411,10 @@ fn absorb_duplicate(
     doomed: &Arrival,
     keeper: &Arrival,
 ) -> Result<ThreadId> {
+    let extra_folders = split_field(&doomed.folders);
+    let extra_labels = split_field(&doomed.labels);
     let keeper = fold_doomed_local_state(keeper, doomed);
-    let thread = write_kept(conn, message, &keeper, true)?;
+    let thread = write_kept(conn, message, &keeper, true, &extra_folders, &extra_labels)?;
     let old_terms = terms_for_indexed(IndexedText {
         subject: &doomed.subject,
         from_name: doomed.from_name.as_deref(),
@@ -1528,12 +1539,12 @@ fn kept_snooze(stored: Option<i64>, incoming: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Union the deleted row's folders, labels, star, archive bit, and snooze
-/// onto the row that stays.
+/// Copy the deleted row's star, archive bit, and snooze onto the row that stays.
+///
+/// Folders and labels are not copied here. `write_kept` unions those into the
+/// stored value only, so the previous search terms stay the keeper's own.
 fn fold_doomed_local_state(keeper: &Arrival, doomed: &Arrival) -> Arrival {
     let mut keeper = keeper.clone();
-    keeper.folders = union_tokens(&keeper.folders, &split_field(&doomed.folders), false);
-    keeper.labels = union_tokens(&keeper.labels, &split_field(&doomed.labels), false);
     keeper.starred |= doomed.starred;
     keeper.archived |= doomed.archived;
     keeper.snooze_until = kept_snooze(keeper.snooze_until, doomed.snooze_until);
@@ -4808,6 +4819,53 @@ mod tests {
         assert!(kept.folders.iter().any(|folder| folder == "Sent"));
         assert!(kept.folders.iter().any(|folder| folder == "Archive"));
         assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn absorb_keeps_a_label_term_that_lived_only_on_the_deleted_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut sent = msg("sent@x", None, None, "Hello", "sent body");
+        sent.headers.date_unix = 1_700_000_000;
+        sent.labels = vec!["work".into()];
+        sent.folders = vec!["Sent".into()];
+        store.upsert_message(&sent).unwrap();
+        let mut list = msg("list@x", None, None, "[list] Hello", "list body");
+        list.headers.date_unix = 1_700_000_000;
+        list.list_id = Some("list.example".into());
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET body_text = 'hello body', snippet = 'hello body',
+                    body_fingerprint = ?1
+                 WHERE account_id = 'a1'",
+                params![fingerprint],
+            )
+            .unwrap();
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        store.upsert_message(&again).unwrap();
+        let work: i64 = store
+            .conn
+            .query_row(
+                "SELECT df FROM search_terms WHERE account_id = 'a1' AND term = 'work'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(work, 1);
+        assert_eq!(
+            store
+                .search(&AccountId("a1".into()), "label:work")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
     }
 
     #[test]
