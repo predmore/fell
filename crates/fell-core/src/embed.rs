@@ -1,13 +1,22 @@
 //! Local embedding index for message bodies.
 //!
-//! Each message stores one vector in `message_embeddings`. The vector is a
-//! feature hash of the body text, computed in this process. Nothing is sent
-//! off the machine. [`crate::Store::search`] does not read the table. Hybrid
-//! ranking and any cloud embedder are later work; a different [`EMBEDDING_MODEL`]
-//! replaces rows left by this one.
+//! Each message stores one vector in `message_embeddings`, in the same SQLite
+//! file as the mailbox and keyed by account. The vector is [`EMBEDDING_MODEL`],
+//! a feature hash implemented in this crate. There is no weight file, no
+//! extra embedding crate, and no network call.
+//!
+//! [`spawn_indexer`] fills missing rows on a background thread, recent mail
+//! first. Opening the store, listing threads, and [`crate::Store::search`] do
+//! not compute vectors. A different model id replaces rows left by this one.
 
 #[cfg(test)]
+#[cfg(test)]
 use std::cell::Cell;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -15,8 +24,9 @@ use crate::{Error, Result};
 
 /// Id stored on every vector this embedder writes.
 ///
+/// This is code in this crate, not a downloaded or bundled weight file.
 /// Changing the hash, the dimension, or the tokenization requires a new id.
-/// Opening the store rebuilds rows whose id, dimension, or byte length differ.
+/// The background indexer replaces rows whose id, dimension, or byte length differ.
 pub const EMBEDDING_MODEL: &str = "local-hash-v1";
 
 /// Length of [`embed_body`]. The stored blob is this many little-endian `f32`s.
@@ -73,24 +83,90 @@ pub fn embed_body(body: &str) -> Embedding {
     }
 }
 
-/// Create the index table, drop rows whose message is gone, and fill the rest.
-///
-/// A failure rolls the fill back, so a killed rebuild does not leave a partial
-/// index that looks complete.
-pub(crate) fn ensure_embeddings(conn: &Connection) -> Result<()> {
+/// Create the index table. This does not read message bodies.
+pub(crate) fn ensure_embedding_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBED_SCHEMA)?;
-    if orphan_count(conn)? == 0 && stale_count(conn)? == 0 {
-        return Ok(());
+    Ok(())
+}
+
+/// Background indexer for one mailbox file.
+///
+/// Dropping it asks the thread to stop and waits for the current batch. The
+/// batch is a few messages, so this does not sit on a large mailbox.
+pub(crate) struct Indexer {
+    stop: Arc<AtomicBool>,
+    /// Tests flip this so open can return before the thread writes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pause: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Indexer {
+    pub(crate) fn spawn(path: &Path) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(indexer_starts_paused()));
+        let stop_thread = Arc::clone(&stop);
+        let pause_thread = Arc::clone(&pause);
+        let path = path.to_path_buf();
+        let thread = thread::Builder::new()
+            .name("fell-embeddings".into())
+            .spawn(move || index_loop(path, stop_thread, pause_thread))
+            .map_err(crate::Error::from)?;
+        Ok(Self {
+            stop,
+            pause,
+            thread: Some(thread),
+        })
     }
-    let tx = conn.unchecked_transaction()?;
-    let outcome = repair_embeddings(&tx);
-    match outcome {
-        Ok(()) => tx.commit().map_err(crate::Error::from),
-        Err(err) => {
-            let _ = tx.rollback();
-            Err(err)
+
+    #[cfg(test)]
+    pub(crate) fn pause(&self, paused: bool) {
+        self.pause.store(paused, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Indexer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
+}
+
+fn index_loop(path: std::path::PathBuf, stop: Arc<AtomicBool>, pause: Arc<AtomicBool>) {
+    let Ok(conn) = Connection::open(&path) else {
+        return;
+    };
+    if conn.busy_timeout(Duration::from_secs(5)).is_err() {
+        return;
+    }
+    if ensure_embedding_schema(&conn).is_err() {
+        return;
+    }
+    let _ = delete_orphans(&conn);
+    while !stop.load(Ordering::Relaxed) {
+        if pause.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        match index_stale(&conn, INDEX_BATCH) {
+            Ok(0) | Err(_) => thread::sleep(Duration::from_millis(50)),
+            Ok(_) => {}
+        }
+    }
+}
+
+const INDEX_BATCH: usize = 32;
+
+/// Fill up to `limit` missing or outdated body vectors, recent mail first.
+///
+/// Also drops embedding rows whose message is gone. Callers that must not
+/// block the UI use [`Indexer`] instead of this function.
+#[cfg(test)]
+pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize> {
+    delete_orphans(conn)?;
+    index_stale(conn, limit)
 }
 
 /// Write the vector for the body text that is stored on the message.
@@ -144,6 +220,39 @@ pub(crate) fn sync_message_embedding(
     Ok(())
 }
 
+/// Drop a stored vector that no longer matches this body.
+///
+/// A missing row is left missing. The background indexer fills it. This does
+/// not compute a vector.
+pub(crate) fn invalidate_message_embedding(
+    conn: &Connection,
+    account_id: &str,
+    message_id: &str,
+    body: &str,
+) -> Result<()> {
+    let hash = body_hash(body);
+    let existing: Option<(String, i64, String, i64)> = conn
+        .query_row(
+            "SELECT model, dims, body_hash, length(vector)
+             FROM message_embeddings
+             WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((model, dims, stored_hash, nbytes)) = existing else {
+        return Ok(());
+    };
+    if model == EMBEDDING_MODEL
+        && dims == EMBEDDING_DIMS as i64
+        && stored_hash == hash
+        && nbytes == VECTOR_BYTES
+    {
+        return Ok(());
+    }
+    remove_message_embedding(conn, account_id, message_id)
+}
+
 pub(crate) fn remove_message_embedding(
     conn: &Connection,
     account_id: &str,
@@ -173,7 +282,7 @@ pub(crate) fn load_embedding(
         .transpose()
 }
 
-fn repair_embeddings(conn: &Connection) -> Result<()> {
+fn delete_orphans(conn: &Connection) -> Result<()> {
     conn.execute(
         "DELETE FROM message_embeddings
          WHERE NOT EXISTS (
@@ -183,8 +292,15 @@ fn repair_embeddings(conn: &Connection) -> Result<()> {
          )",
         [],
     )?;
+    Ok(())
+}
+
+fn index_stale(conn: &Connection, limit: usize) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
     let mut stmt = conn.prepare(
-        "SELECT m.account_id, m.message_id, COALESCE(m.body_text, m.snippet)
+        "SELECT m.account_id, m.message_id
          FROM messages m
          LEFT JOIN message_embeddings e
            ON e.account_id = m.account_id AND e.message_id = m.message_id
@@ -192,56 +308,75 @@ fn repair_embeddings(conn: &Connection) -> Result<()> {
             OR e.model != ?1
             OR e.dims != ?2
             OR length(e.vector) != ?3
-         ORDER BY m.rowid",
+         ORDER BY m.date_unix DESC, m.rowid DESC
+         LIMIT ?4",
     )?;
     let rows = stmt.query_map(
-        params![EMBEDDING_MODEL, EMBEDDING_DIMS as i64, VECTOR_BYTES],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        },
+        params![
+            EMBEDDING_MODEL,
+            EMBEDDING_DIMS as i64,
+            VECTOR_BYTES,
+            i64::try_from(limit).unwrap_or(i64::MAX)
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
     let mut pending = Vec::new();
     for row in rows {
         pending.push(row?);
     }
     drop(stmt);
-    for (index, (account_id, message_id, body)) in pending.into_iter().enumerate() {
+    let mut wrote = 0;
+    for (index, (account_id, message_id)) in pending.into_iter().enumerate() {
         interrupt_rebuild(index)?;
-        sync_message_embedding(conn, &account_id, &message_id, &body)?;
+        if write_current_body(conn, &account_id, &message_id)? {
+            wrote += 1;
+        }
     }
-    Ok(())
+    Ok(wrote)
 }
 
-fn orphan_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM message_embeddings e
-         WHERE NOT EXISTS (
-             SELECT 1 FROM messages m
-             WHERE m.account_id = e.account_id AND m.message_id = e.message_id
-         )",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+fn write_current_body(conn: &Connection, account_id: &str, message_id: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let body: Option<String> = tx
+        .query_row(
+            "SELECT COALESCE(body_text, snippet)
+             FROM messages
+             WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id, message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        remove_message_embedding(&tx, account_id, message_id)?;
+        tx.commit()?;
+        return Ok(false);
+    };
+    sync_message_embedding(&tx, account_id, message_id, &body)?;
+    tx.commit()?;
+    Ok(true)
 }
 
-fn stale_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM messages m
-         LEFT JOIN message_embeddings e
-           ON e.account_id = m.account_id AND e.message_id = m.message_id
-         WHERE e.message_id IS NULL
-            OR e.model != ?1
-            OR e.dims != ?2
-            OR length(e.vector) != ?3",
-        params![EMBEDDING_MODEL, EMBEDDING_DIMS as i64, VECTOR_BYTES],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+fn indexer_starts_paused() -> bool {
+    #[cfg(test)]
+    {
+        START_INDEXER_PAUSED.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static START_INDEXER_PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// When set, the next file-backed indexer starts paused so a test can observe
+/// that open returned before any vector was written.
+#[cfg(test)]
+pub(crate) fn testing_start_indexer_paused(paused: bool) {
+    START_INDEXER_PAUSED.with(|cell| cell.set(paused));
 }
 
 fn interrupt_rebuild(index: usize) -> Result<()> {
@@ -436,6 +571,40 @@ mod tests {
             .unwrap()
     }
 
+    fn index_all(store: &Store) {
+        loop {
+            let wrote = index_embeddings(&store.conn, 64).unwrap();
+            if wrote == 0 {
+                break;
+            }
+        }
+    }
+
+    fn wait_indexed(store: &Store, owner: &str, id: &str) -> Embedding {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(embedding) = store
+                .message_embedding(&AccountId(owner.into()), &MessageId::new(id))
+                .unwrap()
+                && embedding.model == EMBEDDING_MODEL
+            {
+                return embedding;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "background indexer did not store {id}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    struct PauseReset;
+    impl Drop for PauseReset {
+        fn drop(&mut self) {
+            testing_start_indexer_paused(false);
+        }
+    }
+
     #[test]
     fn embed_body_is_a_local_unit_vector() {
         let invoice = embed_body("Please pay the March invoice.");
@@ -459,8 +628,11 @@ mod tests {
         let mut message = message("a1", "m@x", "the real body");
         message.snippet = "snippet only".into();
         store.upsert_message(&message).unwrap();
-        let stored = stored(&store, "a1", "m@x");
-        assert_eq!(stored, embed_body("the real body"));
+        index_all(&store);
+        let vector = stored(&store, "a1", "m@x");
+        assert_eq!(vector, embed_body("the real body"));
+        store.upsert_message(&message).unwrap();
+        assert_eq!(stored(&store, "a1", "m@x"), vector);
         let blob: Vec<u8> = store
             .conn
             .query_row(
@@ -469,7 +641,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(blob, encode_vector(&stored.values));
+        assert_eq!(blob, encode_vector(&vector.values));
         assert_eq!(embedding_count(&store), 1);
     }
 
@@ -480,6 +652,7 @@ mod tests {
         message.body_text = None;
         message.snippet = "snippet only".into();
         store.upsert_message(&message).unwrap();
+        index_all(&store);
         assert_eq!(stored(&store, "a1", "m@x"), embed_body("snippet only"));
     }
 
@@ -490,13 +663,16 @@ mod tests {
         store
             .upsert_message(&message("a1", "m@x", "alpha invoice"))
             .unwrap();
+        index_all(&store);
         let mut updated = message("a1", "m@x", "beta calendar");
         updated.folders = vec![FOLDER_INBOX.into()];
         store.upsert_message(&updated).unwrap();
-        assert_eq!(embedding_count(&store), 1);
-        assert_eq!(stored(&store, "a1", "m@x"), embed_body("beta calendar"));
+        assert_eq!(embedding_count(&store), 0);
         assert_eq!(store.search(&id, "calendar").unwrap().hits.len(), 1);
         assert!(store.search(&id, "invoice").unwrap().hits.is_empty());
+        index_all(&store);
+        assert_eq!(embedding_count(&store), 1);
+        assert_eq!(stored(&store, "a1", "m@x"), embed_body("beta calendar"));
     }
 
     #[test]
@@ -508,6 +684,7 @@ mod tests {
         store
             .upsert_message(&message("a2", "same@x", "account two body"))
             .unwrap();
+        index_all(&store);
         assert!(
             store
                 .delete_message(&AccountId("a1".into()), &MessageId::new("same@x"))
@@ -533,6 +710,7 @@ mod tests {
         let thread = store
             .upsert_message(&message("a1", "m@x", "please pay the invoice"))
             .unwrap();
+        index_all(&store);
         let before = stored(&store, "a1", "m@x");
         store
             .archive_thread(&account_id, &thread, FOLDER_INBOX)
@@ -556,6 +734,7 @@ mod tests {
                 .is_none()
         );
         store.undo(&account_id).unwrap();
+        index_all(&store);
         assert_eq!(
             stored(&store, "a1", "gone@x"),
             embed_body("original secret body")
@@ -578,11 +757,13 @@ mod tests {
         store
             .upsert_message(&message("a1", "note@x", "replacement body"))
             .unwrap();
+        index_all(&store);
         assert_eq!(
             stored(&store, "a1", "note@x"),
             embed_body("replacement body")
         );
         store.undo(&account_id).unwrap();
+        index_all(&store);
         assert_eq!(
             stored(&store, "a1", "note@x"),
             embed_body("original secret body")
@@ -597,6 +778,7 @@ mod tests {
         store
             .upsert_message(&message("a1", "m@x", "please pay the invoice"))
             .unwrap();
+        index_all(&store);
         let before = store.search(&account_id, "invoice").unwrap();
         store
             .conn
@@ -606,6 +788,62 @@ mod tests {
         assert!(
             store
                 .message_embedding(&account_id, &MessageId::new("m@x"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn writes_do_not_embed_and_reads_do_not_wait() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-pause-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&account("a1")).unwrap();
+        let account_id = AccountId("a1".into());
+        store
+            .upsert_message(&message("a1", "m@x", "please pay the invoice"))
+            .unwrap();
+        assert!(
+            store
+                .message_embedding(&account_id, &MessageId::new("m@x"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.search(&account_id, "invoice").unwrap().hits.len(), 1);
+        assert_eq!(store.list_threads(&account_id).unwrap().len(), 1);
+        store.testing_pause_indexer(false);
+        assert_eq!(
+            wait_indexed(&store, "a1", "m@x"),
+            embed_body("please pay the invoice")
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_mail_is_indexed_first() {
+        let store = open(&["a1"]);
+        let mut older = message("a1", "old@x", "older invoice");
+        older.headers.date_unix = 10;
+        let mut newer = message("a1", "new@x", "newer calendar");
+        newer.headers.date_unix = 50;
+        store.upsert_message(&older).unwrap();
+        store.upsert_message(&newer).unwrap();
+        assert_eq!(index_embeddings(&store.conn, 1).unwrap(), 1);
+        assert_eq!(stored(&store, "a1", "new@x"), embed_body("newer calendar"));
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("old@x"))
                 .unwrap()
                 .is_none()
         );
@@ -624,6 +862,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.sqlite");
         {
+            let _reset = PauseReset;
+            testing_start_indexer_paused(true);
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account("a1")).unwrap();
             store
@@ -632,6 +872,7 @@ mod tests {
             store
                 .upsert_message(&message("a1", "drop@x", "goes away"))
                 .unwrap();
+            index_all(&store);
             store
                 .conn
                 .execute(
@@ -645,9 +886,10 @@ mod tests {
                 .unwrap();
             assert_eq!(embedding_count(&store), 1);
         }
+        testing_start_indexer_paused(false);
         let store = Store::open(&path).unwrap();
         assert_eq!(
-            stored(&store, "a1", "kept@x"),
+            wait_indexed(&store, "a1", "kept@x"),
             embed_body("please pay the invoice")
         );
         assert!(
@@ -674,11 +916,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.sqlite");
         {
+            let _reset = PauseReset;
+            testing_start_indexer_paused(true);
             let store = Store::open(&path).unwrap();
             store.upsert_account(&account("a1")).unwrap();
             store
                 .upsert_message(&message("a1", "m@x", "local body"))
                 .unwrap();
+            index_all(&store);
             store
                 .conn
                 .execute(
@@ -687,14 +932,15 @@ mod tests {
                 )
                 .unwrap();
         }
+        testing_start_indexer_paused(false);
         let store = Store::open(&path).unwrap();
-        assert_eq!(stored(&store, "a1", "m@x"), embed_body("local body"));
+        assert_eq!(wait_indexed(&store, "a1", "m@x"), embed_body("local body"));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn rebuild_rolls_back_a_partial_fill() {
+    fn interrupted_index_keeps_rows_already_written() {
         let store = open(&["a1"]);
         store
             .upsert_message(&message("a1", "a@x", "please pay the invoice"))
@@ -715,12 +961,12 @@ mod tests {
         }
         let _reset = Reset;
         testing_stop_embedding_rebuild_at(Some(1));
-        let err = ensure_embeddings(&store.conn).unwrap_err();
+        let err = index_embeddings(&store.conn, 64).unwrap_err();
         assert!(err.to_string().contains("interrupted"));
-        assert_eq!(embedding_count(&store), 0);
+        assert_eq!(embedding_count(&store), 1);
 
         testing_stop_embedding_rebuild_at(None);
-        ensure_embeddings(&store.conn).unwrap();
+        index_all(&store);
         assert_eq!(
             stored(&store, "a1", "a@x"),
             embed_body("please pay the invoice")

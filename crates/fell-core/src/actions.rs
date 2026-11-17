@@ -21,7 +21,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
-use crate::embed::{remove_message_embedding, sync_message_embedding};
+use crate::embed::{invalidate_message_embedding, remove_message_embedding};
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
@@ -712,7 +712,7 @@ fn replace_message_row(
     )?;
     expect_one(changed, &snapshot.message_id)?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
-    sync_message_embedding(
+    invalidate_message_embedding(
         conn,
         account_id.as_str(),
         &snapshot.message_id,
@@ -1318,12 +1318,7 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
          )",
         params_from_iter(values),
     )?;
-    sync_message_embedding(
-        conn,
-        account_id.as_str(),
-        &row.message_id,
-        row.body_text.as_deref().unwrap_or(&row.snippet),
-    )?;
+    remove_message_embedding(conn, account_id.as_str(), &row.message_id)?;
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
-use crate::embed::{Embedding, remove_message_embedding, sync_message_embedding};
+use crate::embed::{Embedding, invalidate_message_embedding, remove_message_embedding};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses,
@@ -250,6 +250,9 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
+    /// File-backed stores fill body vectors here. In-memory stores leave this
+    /// empty so tests can index on the calling thread.
+    indexer: Option<crate::embed::Indexer>,
     pub(crate) conn: Connection,
     path: Option<std::path::PathBuf>,
 }
@@ -281,6 +284,9 @@ impl Store {
         let mut store = Self::from_connection(conn)?;
         store.path = Some(path.to_path_buf());
         store.seal_private_files()?;
+        // Embeddings are filled off this thread. Open returns before a large
+        // mailbox is indexed.
+        store.indexer = Some(crate::embed::Indexer::spawn(path)?);
         Ok(store)
     }
 
@@ -321,14 +327,25 @@ impl Store {
                 [],
             )?;
         }
-        crate::embed::ensure_embeddings(&conn)?;
+        crate::embed::ensure_embedding_schema(&conn)?;
         // 3 adds message_embeddings, the local body-vector index.
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
-        Ok(Self { conn, path: None })
+        Ok(Self {
+            indexer: None,
+            conn,
+            path: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_pause_indexer(&self, paused: bool) {
+        if let Some(indexer) = &self.indexer {
+            indexer.pause(paused);
+        }
     }
 
     pub(crate) fn seal_private_files(&self) -> Result<()> {
@@ -482,11 +499,12 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// Vector stored for this message body.
+    /// Vector stored for this message body, if the indexer has written one.
     ///
-    /// Computed on this machine from `body_text`, or from the snippet when the
-    /// body is null. This does not call a network. `None` means this account
-    /// has no embedding row for that message. Keyword search does not read it.
+    /// The vector comes from `body_text`, or from the snippet when the body is
+    /// null. This read does not compute it and does not call a network. `None`
+    /// means this account has no embedding row yet. Keyword search does not
+    /// read the table.
     pub fn message_embedding(
         &self,
         account_id: &AccountId,
@@ -1091,12 +1109,6 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
         labels: &labels,
     });
     sync_terms(conn, message.account_id.as_str(), &HashSet::new(), &terms)?;
-    sync_message_embedding(
-        conn,
-        message.account_id.as_str(),
-        message.headers.message_id.as_str(),
-        body,
-    )?;
     Ok(thread_id)
 }
 
@@ -1291,7 +1303,7 @@ fn write_kept(
         ],
     )?;
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
-    sync_message_embedding(
+    invalidate_message_embedding(
         conn,
         message.account_id.as_str(),
         message.headers.message_id.as_str(),

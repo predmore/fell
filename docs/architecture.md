@@ -53,7 +53,9 @@ Misspellings use a character-trigram index of words from subject, sender, recipi
 
 ## Local embeddings
 
-Each message body has one row in `message_embeddings`. The vector is a 64-dimensional feature hash (`local-hash-v1`), computed in-process from `body_text`, or from the snippet when the body is null. The blob is little-endian `f32`. The row is written in the same transaction as the message, replaced when that text changes, and removed when the message is removed. Opening a store fills rows that are missing or stamped with another model id, and drops rows whose message is gone. Nothing leaves the machine. There is no cloud embedder.
+Each message body has one row in `message_embeddings` in the mailbox SQLite file (the same `mail.db` the account's messages already use), keyed by account id and message id. Deleting that file deletes the index. Deleting a message deletes its row in that transaction. A body change drops a stale row. The vector is a 64-dimensional feature hash (`local-hash-v1`) from `body_text`, or from the snippet when the body is null. The blob is little-endian `f32`. The hash is code in `fell-core`. There are no model weights, bundled or downloaded, and no extra embedding crate.
+
+`Store::open` starts a background thread that fills missing or outdated rows, recent mail first, in small batches. Open, listing threads, and keyword search do not compute vectors, so indexing a large mailbox does not block the UI. Nothing leaves the machine. There is no cloud embedder.
 
 `Store::search` does not read this table. Hybrid ranking is later M5 work.
 
