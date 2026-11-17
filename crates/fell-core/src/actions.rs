@@ -1075,16 +1075,21 @@ fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &st
 fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow) -> Result<()> {
     let mut values = vec![Value::Text(account_id.as_str().to_string())];
     values.extend(saved_values(row));
-    debug_assert_eq!(values.len(), 21);
+    let source = match row.body_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => row.snippet.as_str(),
+    };
+    values.push(Value::Text(crate::message::body_fingerprint(source)));
+    debug_assert_eq!(values.len(), 22);
     conn.execute(
         "INSERT INTO messages (
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment
+            to_line, cc_line, bcc_line, has_attachment, body_fingerprint
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
          )",
         params_from_iter(values),
     )?;
@@ -1186,6 +1191,7 @@ mod tests {
             has_attachment: false,
             archived: false,
             snooze_until: None,
+            list_id: None,
         }
     }
 
