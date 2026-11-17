@@ -108,6 +108,10 @@ struct Inbox {
     list_folder: String,
     /// One folder read at a time is on the store thread.
     read_in_flight: bool,
+    /// The read in flight was only a sync refresh, on the background lane.
+    refresh_in_flight: bool,
+    /// Bumped by every folder read. A read the user superseded is dropped.
+    read_gen: u64,
     /// Asked for while a read was in flight. Issued when it lands.
     read_wanted: Option<ReadIntent>,
     /// Threads taken out of the list whose archive or move has not landed.
@@ -165,6 +169,8 @@ impl Inbox {
             sync: None,
             list_folder: "INBOX".into(),
             read_in_flight: false,
+            refresh_in_flight: false,
+            read_gen: 0,
             read_wanted: None,
             pending_removals: std::collections::HashSet::new(),
             conv_gen: Arc::new(AtomicU64::new(0)),
@@ -243,7 +249,11 @@ impl Inbox {
     /// flight, further requests merge into a single follow-up, so a burst of
     /// sync batches is one read and never a queue.
     fn request_threads(&mut self, intent: ReadIntent, cx: &mut Context<Self>) {
-        if self.read_in_flight {
+        // A sync refresh in flight does not make the reader wait: their read
+        // starts now on the interactive lane, and the refresh is dropped
+        // when it lands. This read sees everything the refresh would have.
+        let supersede = self.read_in_flight && self.refresh_in_flight && !intent.is_refresh();
+        if self.read_in_flight && !supersede {
             self.read_wanted = Some(match self.read_wanted.take() {
                 Some(earlier) => earlier.merge(intent),
                 None => intent,
@@ -251,23 +261,35 @@ impl Inbox {
             return;
         }
         self.read_in_flight = true;
+        self.refresh_in_flight = intent.is_refresh();
+        self.read_gen += 1;
+        let generation = self.read_gen;
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let me = self.session.account_email.clone();
         let reading = folder.clone();
-        let reply = self.store.call(move |store| -> ThreadsResult {
+        let read = move |store: &fell_core::Store| -> ThreadsResult {
             let threads = store
                 .folder_threads(&account, &reading)
                 .map_err(|err| err.to_string())?;
             let names = store.folder_names(&account).unwrap_or_default();
             Ok((present::thread_rows(&threads, &me), names))
-        });
+        };
+        // Only sync asked: nobody is waiting, so keep the interactive lane
+        // free for the conversation the reader opens next.
+        let reply = if intent.is_refresh() {
+            self.store.call_background(read)
+        } else {
+            self.store.call(read)
+        };
         cx.spawn(async move |this, cx| {
             let Ok(result) = reply.await else {
                 return;
             };
             let _ = this.update(cx, |inbox, cx| {
-                inbox.read_landed(folder, result, intent, cx);
+                if inbox.read_gen == generation {
+                    inbox.read_landed(folder, result, intent, cx);
+                }
             });
         })
         .detach();
@@ -281,6 +303,7 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) {
         self.read_in_flight = false;
+        self.refresh_in_flight = false;
         let wanted = self.read_wanted.take();
         // A user action (switch, archive, move, undo) since this read started
         // makes it stale. Skip it and read again with both intents, so the
