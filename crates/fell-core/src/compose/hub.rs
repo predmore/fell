@@ -393,9 +393,8 @@ pub fn editor_is_running() -> bool {
     UnixStream::connect(draft_socket_path()).is_ok()
 }
 
-pub fn file_fallback_get(draft_id: &str, agent: &str) -> Result<Value, String> {
-    let folder = super::persist::ensure_draft_folder(draft_id)?;
-    workspace::require_owner(&folder, agent)?;
+pub fn file_fallback_get(draft_id: &str, agent: &str, account: &str) -> Result<Value, String> {
+    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
     let text = workspace::read_draft_file(&folder)?;
     Ok(json!({
         "ok": true,
@@ -410,11 +409,11 @@ pub fn file_fallback_get(draft_id: &str, agent: &str) -> Result<Value, String> {
 pub fn file_fallback_edit(
     draft_id: &str,
     agent: &str,
+    account: &str,
     old: &str,
     new: &str,
 ) -> Result<Value, String> {
-    let folder = super::persist::ensure_draft_folder(draft_id)?;
-    workspace::require_owner(&folder, agent)?;
+    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     session.edit(session.revision(), old, new)?;
     session.flush()?;
@@ -432,10 +431,10 @@ pub fn file_fallback_edit(
 pub fn file_fallback_replace_body(
     draft_id: &str,
     agent: &str,
+    account: &str,
     body: &str,
 ) -> Result<Value, String> {
-    let folder = super::persist::ensure_draft_folder(draft_id)?;
-    workspace::require_owner(&folder, agent)?;
+    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
     let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
     let previous = session.body().to_string();
     session.replace_body(body)?;

@@ -271,6 +271,49 @@ pub fn remembered_store_path(id: &str) -> Option<PathBuf> {
     store.is_file().then_some(store)
 }
 
+pub fn stored_compose_account(id: &str) -> Option<String> {
+    let store = open_store_for(id)?;
+    store
+        .load_compose(id)
+        .ok()
+        .flatten()
+        .map(|draft| draft.account_id.as_str().to_string())
+}
+
+pub fn open_owned_draft(
+    id: &str,
+    agent: &str,
+    account: &str,
+) -> std::result::Result<PathBuf, String> {
+    let folder = workspace::draft_folder(id)?;
+    if draft_file_is_regular(&folder) {
+        guard_open_folder(&folder, agent, account)?;
+        return Ok(folder);
+    }
+    let Some(store) = open_store_for(id) else {
+        return Err(format!("draft {id} is not open"));
+    };
+    let Some(stored) = store.load_compose(id).map_err(|err| err.to_string())? else {
+        return Err(format!("draft {id} is not open"));
+    };
+    if stored.account_id.as_str() != account {
+        return Err("this draft belongs to another account".into());
+    }
+    store
+        .restore_compose_folder(id, &folder)
+        .map_err(|err| err.to_string())?;
+    guard_open_folder(&folder, agent, account)?;
+    Ok(folder)
+}
+
+fn guard_open_folder(folder: &Path, agent: &str, account: &str) -> std::result::Result<(), String> {
+    match workspace::read_account(folder) {
+        Some(stored) if stored == account => {}
+        _ => return Err("this draft belongs to another account".into()),
+    }
+    workspace::require_owner(folder, agent)
+}
+
 pub fn mailbox_db_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FELL_STORE") {
         return Some(PathBuf::from(path));
@@ -426,5 +469,34 @@ mod tests {
             std::fs::read(drafts.join("keep/chart.png")).unwrap(),
             b"png-bytes"
         );
+    }
+
+    #[test]
+    fn another_account_or_agent_cannot_open_the_folder() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-owned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            bcc: vec!["secret@example.com".into()],
+            subject: "Hello".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&dir, "r1", &fields, "body\n", &AccountId("acct-a".into()))
+                .unwrap();
+        workspace::write_owner(&folder, "agent:ada").unwrap();
+        let other_account = guard_open_folder(&folder, "agent:ada", "acct-b").unwrap_err();
+        assert!(other_account.contains("another account"), "{other_account}");
+        let other_agent = guard_open_folder(&folder, "agent:bob", "acct-a").unwrap_err();
+        assert!(other_agent.contains("another agent"), "{other_agent}");
+        assert!(guard_open_folder(&folder, "agent:ada", "acct-a").is_ok());
     }
 }

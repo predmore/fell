@@ -441,6 +441,20 @@ impl ComposeView {
         });
     }
 
+    fn restore_header_row(&mut self, field: Field) {
+        let id = self.draft_id.to_string();
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return;
+        };
+        match field {
+            Field::To => self.to_line = join_addrs(&snap.to),
+            Field::Cc => self.cc_line = join_addrs(&snap.cc),
+            Field::Bcc => self.bcc_line = join_addrs(&snap.bcc),
+            Field::Subject => self.subject_line = snap.subject.clone(),
+            Field::Body => {}
+        }
+    }
+
     fn commit_field(&mut self, field: Field) -> bool {
         let id = self.draft_id.to_string();
         let result = self.hub.with_session(&id, |session| match field {
@@ -552,9 +566,17 @@ impl ComposeView {
         if key == "escape" {
             if self.field != Field::Body {
                 let field = self.field;
-                if !self.commit_field(field) {
-                    self.sync_from_hub();
+                let committed = self.commit_field(field);
+                if !committed {
+                    self.restore_header_row(field);
                 }
+                self.editor.mode = Mode::Normal;
+                self.editor.anchor = None;
+                self.field = Field::Body;
+                if committed {
+                    self.status = "normal".into();
+                }
+                return;
             }
             self.editor.mode = Mode::Normal;
             self.editor.anchor = None;

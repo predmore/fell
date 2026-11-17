@@ -89,6 +89,8 @@ pub struct DraftSession {
     body: String,
     revision: u64,
     seen_revision: u64,
+    /// Path and content hash of referenced files at the last paint.
+    painted_files: Option<Vec<(String, u64)>>,
     locked_reply: Option<String>,
     hunks: Vec<Hunk>,
     next_hunk: u64,
@@ -135,6 +137,7 @@ impl DraftSession {
             body,
             revision: 1,
             seen_revision: 0,
+            painted_files: None,
             locked_reply,
             hunks: Vec::new(),
             next_hunk: 1,
@@ -240,6 +243,11 @@ impl DraftSession {
 
     pub fn mark_seen(&mut self) {
         self.seen_revision = self.revision;
+        self.painted_files = Some(referenced_file_hashes(
+            &self.folder,
+            &self.fields,
+            &self.body,
+        ));
     }
 
     /// What the compose window repaints for. Seen-ness is not included, so
@@ -600,6 +608,12 @@ impl DraftSession {
         if self.seen_revision != self.revision {
             return Some("the draft changed; it is on screen before send".into());
         }
+        if let Some(painted) = &self.painted_files {
+            let current = referenced_file_hashes(&self.folder, &self.fields, &self.body);
+            if current != *painted {
+                return Some("an attachment changed after it was shown".into());
+            }
+        }
         if let Some(issue) = self.issues.iter().find(|issue| issue.blocks_send) {
             return Some(issue.message.clone());
         }
@@ -821,6 +835,25 @@ impl DraftSession {
             serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
         );
     }
+}
+
+fn referenced_file_hashes(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64)> {
+    let mut hashes = workspace::resolve_closure(folder, fields, body)
+        .files
+        .into_iter()
+        .map(|file| (file.path, content_hash(&file.bytes)))
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes
+}
+
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn attachment_stamp(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64, u128)> {
@@ -1367,5 +1400,16 @@ mod tests {
         assert!(session.body().contains("beta"));
         assert!(session.undo());
         assert!(session.body().contains("alpha"));
+    }
+
+    #[test]
+    fn send_blocks_when_a_painted_attachment_changes() {
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        fs::write(session.folder().join("chart.png"), b"one").unwrap();
+        session.mark_seen();
+        assert!(session.prepare_send().is_ok());
+        fs::write(session.folder().join("chart.png"), b"two").unwrap();
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("attachment"), "{err}");
     }
 }

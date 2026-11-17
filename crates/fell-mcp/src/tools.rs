@@ -339,14 +339,17 @@ fn get_draft(session: &Session, args: &Value) -> Result<Value, String> {
     extra.insert("agent".into(), Value::String(actor_name(session)));
     match draft_rpc("get_draft", args, Value::Object(extra.clone())) {
         Ok(value) => Ok(value),
-        Err(err) if err.contains("not running") => {
-            fell_core::compose::file_fallback_get(&id, &actor_name(session)).map(|mut value| {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("transmitted".into(), Value::Bool(false));
-                }
-                value
-            })
-        }
+        Err(err) if err.contains("not running") => fell_core::compose::file_fallback_get(
+            &id,
+            &actor_name(session),
+            session.account_id.as_str(),
+        )
+        .map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("transmitted".into(), Value::Bool(false));
+            }
+            value
+        }),
         Err(err) => Err(err),
     }
 }
@@ -359,7 +362,11 @@ fn get_compose_context(session: &Session, args: &Value) -> Result<Value, String>
         Ok(value) => Ok(value),
         Err(err) if err.contains("not running") => {
             let id = compose_id(args)?;
-            let folder = fell_core::compose::ensure_draft_folder(&id)?;
+            let folder = fell_core::compose::open_owned_draft(
+                &id,
+                &actor_name(session),
+                session.account_id.as_str(),
+            )?;
             Ok(json!({
                 "ok": true,
                 "transmitted": false,
@@ -394,7 +401,13 @@ fn edit_draft(session: &Session, args: &Value) -> Result<Value, String> {
             for edit in list {
                 let old = edit.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = edit.get("new").and_then(Value::as_str).unwrap_or("");
-                last = fell_core::compose::file_fallback_edit(&id, &actor_name(session), old, new)?;
+                last = fell_core::compose::file_fallback_edit(
+                    &id,
+                    &actor_name(session),
+                    session.account_id.as_str(),
+                    old,
+                    new,
+                )?;
             }
             Ok(last)
         }
@@ -413,6 +426,7 @@ fn replace_draft_body(session: &Session, args: &Value) -> Result<Value, String> 
         Err(err) if err.contains("not running") => fell_core::compose::file_fallback_replace_body(
             &compose_id(args)?,
             &actor_name(session),
+            session.account_id.as_str(),
             &body,
         ),
         Err(err) => Err(err),
@@ -565,26 +579,29 @@ fn actor_name(session: &Session) -> String {
 
 fn authorize_compose(session: &Session, compose_id: &str) -> Result<(), String> {
     let caller = actor_name(session);
-    let row = review_actor(session, compose_id)?;
-    if let Some(owner) = &row
-        && owner != &caller
+    let account = session.account_id.as_str();
+    if let Some(owner) = review_actor(session, compose_id)?
+        && owner != caller
     {
         return Err("this draft belongs to another agent".into());
     }
-    let Ok(folder) = fell_core::compose::draft_folder(compose_id) else {
-        return Ok(());
-    };
+    if let Some(stored) = fell_core::compose::stored_compose_account(compose_id)
+        && stored != account
+    {
+        return Err("this draft belongs to another account".into());
+    }
+    let folder = fell_core::compose::draft_folder(compose_id)
+        .map_err(|_| "this draft belongs to another agent".to_string())?;
+    if !folder.join("draft.md").is_file() {
+        return Err("this draft belongs to another agent".into());
+    }
+    match fell_core::compose::read_account(&folder) {
+        Some(stored) if stored == account => {}
+        _ => return Err("this draft belongs to another account".into()),
+    }
     match fell_core::compose::read_owner(&folder) {
         Some(owner) if owner == caller => Ok(()),
-        Some(_) => Err("this draft belongs to another agent".into()),
-        None if row.as_deref() == Some(caller.as_str()) => {
-            let _ = fell_core::compose::write_owner(&folder, &caller);
-            Ok(())
-        }
-        None if folder.join("draft.md").is_file() => {
-            Err("this draft belongs to another agent".into())
-        }
-        None => Ok(()),
+        _ => Err("this draft belongs to another agent".into()),
     }
 }
 

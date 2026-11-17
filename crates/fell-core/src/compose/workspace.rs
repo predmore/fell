@@ -169,6 +169,16 @@ pub fn write_owner(folder: &Path, agent: &str) -> Result<(), String> {
     atomic_write(&control.join("owner"), format!("{agent}\n").as_bytes())
 }
 
+pub fn read_account(folder: &Path) -> Option<String> {
+    let text = fs::read_to_string(control_dir(folder).join("account")).ok()?;
+    let account = text.trim();
+    if account.is_empty() {
+        None
+    } else {
+        Some(account.to_string())
+    }
+}
+
 pub fn read_owner(folder: &Path) -> Option<String> {
     let text = fs::read_to_string(control_dir(folder).join("owner")).ok()?;
     let owner = text.trim();
