@@ -12,6 +12,9 @@ mod mailbox;
 mod model;
 mod png;
 mod present;
+mod setup;
+mod store_actor;
+mod sync_worker;
 mod text_render;
 mod theme;
 mod view;
@@ -25,6 +28,7 @@ pub fn run() {
 }
 
 pub use compose_ui::{ComposeView, ThemeKind, open_demo, send_from_editor};
+pub use setup::account_command;
 
 /// Proof of an explicit Send click in the Fell window.
 ///

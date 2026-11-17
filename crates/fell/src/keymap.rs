@@ -36,6 +36,7 @@ pub enum Action {
     Move,
     Archive,
     Undo,
+    SyncNow,
     ToggleSelect,
     Visual,
     FullWidth,
@@ -62,6 +63,7 @@ impl Action {
             Self::Move => "Move",
             Self::Archive => "Archive",
             Self::Undo => "Undo",
+            Self::SyncNow => "Sync now",
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
@@ -76,7 +78,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 21] = [
+const ALL_ACTIONS: [Action; 22] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -92,6 +94,7 @@ const ALL_ACTIONS: [Action; 21] = [
     Action::Move,
     Action::Archive,
     Action::Undo,
+    Action::SyncNow,
     Action::ToggleSelect,
     Action::Visual,
     Action::FullWidth,
@@ -214,6 +217,7 @@ fn default_bindings() -> Vec<Binding> {
         Action::Move,
         Some("folders"),
     );
+    bind(&[KeyId::Leader, KeyId::Char('s')], Action::SyncNow, None);
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,

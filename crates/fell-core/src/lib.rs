@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod account_config;
 pub mod actions;
 pub mod agent;
 pub mod backend;
@@ -21,6 +22,7 @@ pub mod sync;
 pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
+pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
 pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
@@ -41,7 +43,7 @@ pub use store::{
     FolderThread, Participant, SearchPage, Store, ThreadSummary, canonical_folder_name,
     folder_aliases,
 };
-pub use sync::{SyncReport, sync_once};
+pub use sync::{SyncReport, sync_once, sync_with_progress};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 /// Crate-wide error. IMAP failures use [`Error::Backend`].

@@ -1063,9 +1063,8 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
+    // Only a literal address: a name such as `localhost` resolves at connect
+    // time and may reach a machine that must not get an unchecked certificate.
     host.parse::<std::net::IpAddr>()
         .is_ok_and(|addr| addr.is_loopback())
 }

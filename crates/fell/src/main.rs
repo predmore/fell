@@ -17,6 +17,9 @@ use notify::{Event, RecursiveMode, Watcher};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("account") {
+        std::process::exit(fell::account_command(&args[1..]));
+    }
     if args.iter().any(|arg| arg == "--fixture" || arg == "--help") {
         preview();
         return;
@@ -125,7 +128,9 @@ fn preview() {
             }
             "--help" => {
                 eprintln!(
-                    "fell --fixture <name> --theme dark|light\n\
+                    "fell                      open the inbox\n\
+                     fell account setup        connect Proton Mail Bridge or an IMAP account\n\
+                     fell --fixture <name> --theme dark|light\n\
                      fixtures live in crates/fell-render/fixtures"
                 );
             }

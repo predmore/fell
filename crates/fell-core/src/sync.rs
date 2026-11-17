@@ -14,14 +14,30 @@ pub fn sync_once(
     backend: &dyn MailBackend,
     store: &Store,
 ) -> Result<SyncReport> {
+    sync_with_progress(account, backend, store, &mut |_| {})
+}
+
+/// [`sync_once`], calling `progress` after each delta is committed with the
+/// running count of messages written so far.
+pub fn sync_with_progress(
+    account: &Account,
+    backend: &dyn MailBackend,
+    store: &Store,
+    progress: &mut dyn FnMut(&SyncReport),
+) -> Result<SyncReport> {
     store.upsert_account(account)?;
     let cursor = store.sync_cursor(&account.id)?;
-    let mut upserted = 0;
+    let mut report = SyncReport::default();
     backend.sync_changes(cursor.as_ref(), &mut |delta| {
-        upserted += delta.messages.len();
-        store.apply_delta(&account.id, &delta)
+        let count = delta.messages.len();
+        store.apply_delta(&account.id, &delta)?;
+        report.upserted += count;
+        if count > 0 || !delta.flags.is_empty() {
+            progress(&report);
+        }
+        Ok(())
     })?;
-    Ok(SyncReport { upserted })
+    Ok(report)
 }
 
 #[cfg(test)]

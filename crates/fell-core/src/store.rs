@@ -302,6 +302,49 @@ impl Store {
         Ok(store)
     }
 
+    /// Copy the write-ahead log into the database file. Neither form waits:
+    /// a passive checkpoint copies what no reader still needs, and `truncate`
+    /// also resets the log to zero bytes, but only if no other connection is
+    /// reading or writing at that moment. Otherwise it gives up at once
+    /// instead of holding writers back for the busy timeout. Returns the
+    /// frames left in the log, or -1 when the reset was skipped.
+    pub fn checkpoint(&self, truncate: bool) -> Result<i64> {
+        /// Puts the normal lock wait back however the checkpoint ends.
+        struct RestoreTimeout<'a>(&'a Connection);
+        impl Drop for RestoreTimeout<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.busy_timeout(Duration::from_secs(5));
+            }
+        }
+        let sql = if truncate {
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        } else {
+            "PRAGMA wal_checkpoint(PASSIVE)"
+        };
+        let _restore = truncate.then(|| RestoreTimeout(&self.conn));
+        if truncate {
+            self.conn.busy_timeout(Duration::ZERO)?;
+        }
+        let result = self.conn.query_row(sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        });
+        match result {
+            Ok((busy, _, _)) if busy != 0 => Ok(-1),
+            Ok((_, log, done)) => Ok((log - done).max(0)),
+            // Another connection held the lock: try again after the next pass.
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                Ok(-1)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -313,13 +356,21 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
+        // A first sync can push gigabytes through the log. SQLite reuses the
+        // file after a checkpoint but never shrinks it; this trims it back.
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
-                ON messages(account_id, body_fingerprint);",
+                ON messages(account_id, body_fingerprint);
+             -- Per-thread lookups ordered by date (folder lists pick each
+             -- thread's first subject and latest sender). Without it SQLite
+             -- walks every message in the account once per thread.
+             CREATE INDEX IF NOT EXISTS idx_messages_thread_date
+                ON messages(account_id, thread_id, date_unix);",
         )?;
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
@@ -3035,6 +3086,27 @@ mod tests {
         body: &str,
     ) -> Message {
         msg_for("a1", id, proton, in_reply_to, subject, body)
+    }
+
+    #[test]
+    fn per_thread_lookups_use_the_thread_date_index() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT subject FROM messages s
+                  WHERE s.account_id = ?1 AND s.thread_id = ?2
+                  ORDER BY s.date_unix ASC, s.rowid ASC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(["a1", "t1"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("idx_messages_thread_date"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]

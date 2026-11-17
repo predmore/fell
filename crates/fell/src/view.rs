@@ -2,7 +2,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fell_core::{AccountId, Store, ThreadId};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use fell_core::{AccountConfig, AccountId, ThreadId};
+use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
@@ -13,8 +17,10 @@ use gpui::{
 
 use crate::keymap::KeyId;
 use crate::mailbox;
-use crate::model::{Overlay, QueryFault, Session, Step};
+use crate::model::{Overlay, QueryFault, Session, Step, SyncKind};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
+use crate::store_actor::StoreClient;
+use crate::sync_worker::{self, SyncHandle};
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
 
@@ -48,9 +54,40 @@ pub fn run() {
     });
 }
 
+/// Why the folder is being reread. Requests made while a read is in flight
+/// merge into one, so a sync refresh can never drop what the user asked for.
+#[derive(Clone, Debug, Default)]
+struct ReadIntent {
+    /// The folder on screen changed. A failure goes back to `list_folder`; a
+    /// selected thread missing from the new folder gives way to the first row.
+    switch: bool,
+    /// Archive, move, or undo wrote to the store. Scroll to the selection
+    /// instead of holding the viewport still.
+    changed: bool,
+    /// Undo: select this thread when it is back in the folder.
+    select: Option<String>,
+}
+
+impl ReadIntent {
+    fn merge(mut self, later: ReadIntent) -> ReadIntent {
+        self.switch |= later.switch;
+        self.changed |= later.changed;
+        self.select = later.select.or(self.select);
+        self
+    }
+
+    /// Only sync asked: keep the selected row still on screen.
+    fn is_refresh(&self) -> bool {
+        !self.switch && !self.changed && self.select.is_none()
+    }
+}
+
+type ThreadsResult = Result<(Vec<ThreadRow>, Vec<String>), String>;
+
 struct Inbox {
     focus: FocusHandle,
-    store: Store,
+    /// The mailbox connection's own thread. The window never calls SQLite.
+    store: StoreClient,
     account_id: AccountId,
     session: Session,
     theme: Theme,
@@ -63,42 +100,398 @@ struct Inbox {
     open_thread: Option<String>,
     /// Thread `m` just moved. `u` selects it again when it returns to this folder.
     moved_thread: Option<String>,
+    /// Background sync for the account file. `None` for the demo mailbox.
+    sync: Option<SyncHandle>,
+    /// The folder the rows on screen came from. `session.folder` changes on
+    /// the key press; this changes when that folder's read lands. Archive and
+    /// move act on this one, the list the reader sees.
+    list_folder: String,
+    /// One folder read at a time is on the store thread.
+    read_in_flight: bool,
+    /// Asked for while a read was in flight. Issued when it lands.
+    read_wanted: Option<ReadIntent>,
+    /// Threads taken out of the list whose archive or move has not landed.
+    /// A read that started before the write cannot paint them back.
+    pending_removals: std::collections::HashSet<String>,
+    /// Bumped by every conversation read. The store thread skips a read that
+    /// is already stale, so holding `j` does not build a backlog.
+    conv_gen: Arc<AtomicU64>,
 }
 
 impl Inbox {
     fn new(cx: &mut Context<Self>) -> Self {
-        let mailbox = mailbox::open();
+        let startup = mailbox::startup();
         let theme = theme::load();
-        let mut inbox = Self {
+        let config = startup.config.clone();
+        let path = startup.path.clone();
+        let (store, ready) = StoreClient::spawn({
+            let config = config.clone();
+            move || mailbox::open_store(path, config.as_ref())
+        });
+        let (name, email) = match &config {
+            Some(config) => {
+                let account = config.account();
+                (account.display_name, account.email)
+            }
+            None => (String::new(), String::new()),
+        };
+        let initial = if config.is_some() {
+            SyncKind::Connecting
+        } else {
+            SyncKind::LocalOffline
+        };
+        let mut session = Session::new(name, email, initial, startup.keymap);
+        session.loading = true;
+        if let Some(error) = startup.error {
+            session.record_startup_error(error);
+        }
+        let inbox = Self {
             focus: cx.focus_handle(),
-            account_id: mailbox.account.id.clone(),
-            session: Session::new(
-                mailbox.account.display_name.clone(),
-                mailbox.account.email.clone(),
-                mailbox.sync,
-                mailbox.keymap,
-            ),
-            store: mailbox.store,
+            account_id: config
+                .as_ref()
+                .map(|config| config.account().id)
+                .unwrap_or_else(|| AccountId(String::new())),
+            session,
+            store,
             theme,
             list_scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
-            split: mailbox.split,
+            split: startup.split,
             dragging: false,
             open_thread: None,
             moved_thread: None,
+            sync: None,
+            list_folder: "INBOX".into(),
+            read_in_flight: false,
+            read_wanted: None,
+            pending_removals: std::collections::HashSet::new(),
+            conv_gen: Arc::new(AtomicU64::new(0)),
         };
-        if let Some(error) = mailbox.error {
-            inbox.session.record_startup_error(error);
-        }
-        if inbox.reload_threads() && !inbox.reload_messages(true) {
-            inbox.clear_open_message();
-        }
-        inbox.scroll_conversation();
+        let sync_with = config.zip(startup.path.ok());
+        cx.spawn(async move |this, cx| {
+            let Ok(opened) = ready.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
+        })
+        .detach();
         inbox.watch_theme(cx);
         inbox.watch_dates(cx);
         inbox
+    }
+
+    fn on_store_ready(
+        &mut self,
+        opened: mailbox::Opened,
+        sync_with: Option<(AccountConfig, std::path::PathBuf)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_id = opened.account.id.clone();
+        self.session.account_name = opened.account.display_name.clone();
+        self.session.account_email = opened.account.email.clone();
+        if let Some(error) = opened.error {
+            let joined = match self.session.startup_error.take() {
+                Some(earlier) => format!("{earlier}\n{error}"),
+                None => error,
+            };
+            self.session.record_startup_error(joined);
+        }
+        let store_failed = opened.sync == SyncKind::StoreError;
+        self.session.sync = opened.sync;
+        // Sync opens its own connection only after this one finished opening
+        // and migrating the file, so the two never race for the first lock.
+        if !store_failed && let Some((config, path)) = sync_with {
+            let (handle, events) = sync_worker::start(config, path);
+            self.sync = Some(handle);
+            self.watch_sync(events, cx);
+        }
+        self.request_threads(ReadIntent::default(), cx);
+        cx.notify();
+    }
+
+    /// Apply sync status as soon as it arrives. The sync thread writes the
+    /// store; the window only asks its store thread to reread the folder.
+    fn watch_sync(
+        &self,
+        mut events: futures::channel::mpsc::UnboundedReceiver<sync_worker::SyncEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some(kind) = events.next().await {
+                let alive = this
+                    .update(cx, |inbox, cx| {
+                        let wrote = matches!(kind, SyncKind::Syncing { .. })
+                            || matches!(kind, SyncKind::Synced { stored, .. } if stored > 0);
+                        inbox.session.sync = kind;
+                        if wrote {
+                            inbox.request_threads(ReadIntent::default(), cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Reread the folder on screen on the store thread. While one read is in
+    /// flight, further requests merge into a single follow-up, so a burst of
+    /// sync batches is one read and never a queue.
+    fn request_threads(&mut self, intent: ReadIntent, cx: &mut Context<Self>) {
+        if self.read_in_flight {
+            self.read_wanted = Some(match self.read_wanted.take() {
+                Some(earlier) => earlier.merge(intent),
+                None => intent,
+            });
+            return;
+        }
+        self.read_in_flight = true;
+        let account = self.account_id.clone();
+        let folder = self.session.folder.clone();
+        let me = self.session.account_email.clone();
+        let reading = folder.clone();
+        let reply = self.store.call(move |store| -> ThreadsResult {
+            let threads = store
+                .folder_threads(&account, &reading)
+                .map_err(|err| err.to_string())?;
+            let names = store.folder_names(&account).unwrap_or_default();
+            Ok((present::thread_rows(&threads, &me), names))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                inbox.read_landed(folder, result, intent, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn read_landed(
+        &mut self,
+        folder: String,
+        result: ThreadsResult,
+        intent: ReadIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.read_in_flight = false;
+        let wanted = self.read_wanted.take();
+        // A user action (switch, archive, move, undo) since this read started
+        // makes it stale. Skip it and read again with both intents, so the
+        // list never flashes a folder or a row the user already left.
+        let stale =
+            folder != self.session.folder || wanted.as_ref().is_some_and(|next| !next.is_refresh());
+        if stale {
+            let merged = match wanted {
+                Some(next) => intent.merge(next),
+                None => intent,
+            };
+            self.request_threads(merged, cx);
+            return;
+        }
+        self.show_threads(folder, result, intent, cx);
+        // Only sync wrote while that read ran. Show it first, then read once
+        // more, so a fast sync cannot starve the list.
+        if let Some(next) = wanted {
+            self.request_threads(next, cx);
+        }
+    }
+
+    fn show_threads(
+        &mut self,
+        folder: String,
+        result: ThreadsResult,
+        intent: ReadIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.loading = false;
+        let (mut rows, names) = match result {
+            Ok(found) => found,
+            Err(err) => {
+                if intent.switch {
+                    self.session.folder = self.list_folder.clone();
+                }
+                self.session.fail_query(QueryFault::Folder, err);
+                cx.notify();
+                return;
+            }
+        };
+        self.session.clear_query_fault(QueryFault::Folder);
+        if !names.is_empty() {
+            self.session.folders = names;
+        }
+        let switched = folder != self.list_folder;
+        if !switched {
+            rows.retain(|row| !self.pending_removals.contains(&row.id));
+        }
+        self.list_folder = folder;
+        if switched
+            && let Some(id) = &self.session.cursor_id
+            && !rows.iter().any(|row| &row.id == id)
+        {
+            // A new folder opens at its top, not at the old folder's index.
+            self.session.cursor_id = None;
+        }
+        let row_height = self.list_row_height();
+        let before_id = self.session.cursor_id.clone();
+        let before_index = before_id
+            .as_ref()
+            .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
+        let open_count = self.open_thread.as_ref().and_then(|id| {
+            rows.iter()
+                .find(|row| &row.id == id)
+                .map(|row| row.message_count)
+        });
+        self.session.set_threads(rows);
+        if let Some(id) = &intent.select {
+            self.session.select_if_present(id);
+        }
+        let after_index = self
+            .session
+            .cursor_id
+            .as_ref()
+            .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
+        let same_thread = self.session.cursor_id == before_id;
+        if intent.is_refresh() && !switched && same_thread {
+            // Rows sync put above the selection push it down. Scroll by the
+            // same amount so the selected row stays where the reader left it.
+            if let (Some(before), Some(after), Some(row)) = (before_index, after_index, row_height)
+            {
+                self.shift_list(after as i64 - before as i64, row);
+            }
+        } else {
+            self.scroll_list_to_cursor();
+        }
+        let open_changed = self.open_thread != self.session.cursor_id;
+        let grew = open_count.is_some_and(|count| count != self.session.messages.len());
+        if open_changed || grew {
+            self.request_messages(true, cx);
+        }
+        cx.notify();
+    }
+
+    /// One row's height as the list last laid it out. GPUI records the
+    /// viewport as `item` and the whole list as `contents`.
+    fn list_row_height(&self) -> Option<f32> {
+        let state = self.list_scroll.0.borrow();
+        let size = state.last_item_size?;
+        let rows = self.session.threads.len();
+        if rows == 0 {
+            return None;
+        }
+        let row = f32::from(size.contents.height) / rows as f32;
+        (row > 0.0).then_some(row)
+    }
+
+    /// Move the list viewport by `rows` rows of `row` pixels without moving
+    /// the selection. GPUI offsets grow more negative further down the list.
+    fn shift_list(&self, rows: i64, row: f32) {
+        if rows == 0 {
+            return;
+        }
+        let state = self.list_scroll.0.borrow();
+        let handle = &state.base_handle;
+        let offset = handle.offset();
+        let max = f32::from(handle.max_offset().height) + rows.max(0) as f32 * row;
+        let next = (f32::from(offset.y) - rows as f32 * row).clamp(-max, 0.0);
+        handle.set_offset(point(offset.x, px(next)));
+    }
+
+    /// Read the selected thread on the store thread. A read that is stale
+    /// by the time the store thread reaches it is skipped there.
+    fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.session.cursor_id.clone() else {
+            self.conv_gen.fetch_add(1, Ordering::SeqCst);
+            self.clear_open_message();
+            return;
+        };
+        if !force && self.open_thread.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = self.conv_gen.clone();
+        let account = self.account_id.clone();
+        let me = self.session.account_email.clone();
+        let thread = id.clone();
+        let reply = self.store.call(move |store| {
+            if current.load(Ordering::SeqCst) != generation {
+                return None;
+            }
+            Some(
+                store
+                    .thread_messages(&account, &ThreadId(thread))
+                    .map(|messages| present::conversation(&messages, &me))
+                    .map_err(|err| err.to_string()),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(result)) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.conv_gen.load(Ordering::SeqCst) != generation
+                    || inbox.session.cursor_id.as_deref() != Some(id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(view) => {
+                        inbox.session.clear_query_fault(QueryFault::Message);
+                        let same = inbox.open_thread.as_deref() == Some(id.as_str());
+                        // Sync adding to the thread being read must not pull a
+                        // reader who scrolled up back to the bottom.
+                        let follow = if same {
+                            let bottom = inbox.conversation_at_bottom();
+                            inbox.session.refresh_messages(view, bottom)
+                        } else {
+                            inbox.session.set_messages(view);
+                            true
+                        };
+                        inbox.open_thread = Some(id);
+                        if follow {
+                            inbox.scroll_conversation();
+                        }
+                    }
+                    Err(err) => {
+                        // Never leave another thread's body under this row.
+                        if inbox.open_thread.as_deref() != Some(id.as_str()) {
+                            inbox.clear_open_message();
+                        }
+                        inbox.session.fail_query(QueryFault::Message, err);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Run a mailbox change on the store thread, then reread the folder.
+    fn change_mailbox(
+        &mut self,
+        change: impl FnOnce(&fell_core::Store) -> Result<(), fell_core::Error> + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<(), fell_core::Error>) -> Option<ReadIntent> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let reply = self.store.call(change);
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                if let Some(after) = done(inbox, result) {
+                    inbox.request_threads(after, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn watch_theme(&self, cx: &mut Context<Self>) {
@@ -107,7 +500,10 @@ impl Inbox {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(300))
                     .await;
-                let next = theme::load();
+                let next = cx
+                    .background_executor()
+                    .spawn(async { theme::load() })
+                    .await;
                 let alive = this
                     .update(cx, |inbox, cx| {
                         if inbox.theme != next {
@@ -139,56 +535,10 @@ impl Inbox {
         .detach();
     }
 
-    fn reload_threads(&mut self) -> bool {
-        match self
-            .store
-            .folder_threads(&self.account_id, &self.session.folder)
-        {
-            Ok(threads) => {
-                self.session.clear_query_fault(QueryFault::Folder);
-                if let Ok(names) = self.store.folder_names(&self.account_id) {
-                    self.session.folders = names;
-                }
-                let rows = present::thread_rows(&threads, &self.session.account_email);
-                self.session.set_threads(rows);
-                true
-            }
-            Err(err) => {
-                self.session.fail_query(QueryFault::Folder, err.to_string());
-                false
-            }
-        }
-    }
-
-    fn reload_messages(&mut self, force: bool) -> bool {
-        let Some(id) = self.session.cursor_id.clone() else {
-            self.clear_open_message();
-            return true;
-        };
-        if !force && self.open_thread.as_deref() == Some(id.as_str()) {
-            return true;
-        }
-        match self
-            .store
-            .thread_messages(&self.account_id, &ThreadId(id.clone()))
-        {
-            Ok(messages) => {
-                self.session.clear_query_fault(QueryFault::Message);
-                let view = present::conversation(&messages, &self.session.account_email);
-                self.session.set_messages(view);
-                self.open_thread = Some(id);
-                true
-            }
-            Err(err) => {
-                self.session
-                    .fail_query(QueryFault::Message, err.to_string());
-                false
-            }
-        }
-    }
-
-    /// Move messages in the current folder to Archive. A Sent copy stays in Sent.
-    fn archive_current(&mut self) {
+    /// Move messages in the folder on screen to Archive. A Sent copy stays in
+    /// Sent. The row leaves the list at once and the row in its place is
+    /// selected, so a second `e` archives that one.
+    fn archive_current(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
             return;
@@ -197,97 +547,111 @@ impl Inbox {
             self.session.show_toast("No conversation", true);
             return;
         }
-        let index = self.session.cursor_index();
-        let folder = self.session.folder.clone();
-        if let Err(err) =
-            self.store
-                .archive_thread(&self.account_id, &ThreadId(id.clone()), &folder)
-        {
-            self.session.show_toast(archive_failure(&err), true);
-            return;
-        }
-        self.moved_thread = Some(id.clone());
-        self.session.show_toast("Archived · u", false);
-        if !self.reload_threads() {
-            return;
-        }
-        let next = self
-            .session
-            .threads
-            .get(index)
-            .or_else(|| self.session.threads.last());
-        self.session.cursor_id = next.map(|row| row.id.clone());
-        if !self.reload_messages(true) {
-            self.clear_open_message();
-        }
-        self.scroll_list_to_cursor();
-        self.scroll_conversation();
+        let folder = self.list_folder.clone();
+        let account = self.account_id.clone();
+        let thread = ThreadId(id.clone());
+        self.take_out_of_list(&id, cx);
+        self.change_mailbox(
+            move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
+            move |inbox, result| match result {
+                Ok(()) => {
+                    inbox.pending_removals.remove(&id);
+                    inbox.moved_thread = Some(id);
+                    inbox.session.show_toast("Archived · u", false);
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
+                }
+                Err(err) => {
+                    inbox.pending_removals.remove(&id);
+                    inbox.session.show_toast(archive_failure(&err), true);
+                    Some(ReadIntent {
+                        changed: true,
+                        select: Some(id),
+                        ..ReadIntent::default()
+                    })
+                }
+            },
+            cx,
+        );
     }
 
-    fn apply_move(&mut self, destination: String) {
+    fn apply_move(&mut self, destination: String, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
             return;
         };
-        let index = self.session.cursor_index();
-        match self.store.move_thread(
-            &self.account_id,
-            &ThreadId(id.clone()),
-            &self.session.folder,
-            &destination,
-        ) {
-            Ok(_) => {
-                self.moved_thread = Some(id.clone());
-                let label = present::folder_label(&destination);
-                self.session.show_toast(format!("Moved to {label}"), false);
-                if !self.reload_threads() {
-                    return;
-                }
-                if self.session.cursor_id.as_deref() != Some(id.as_str()) {
-                    let next = self
-                        .session
-                        .threads
-                        .get(index)
-                        .or_else(|| self.session.threads.last());
-                    if let Some(row) = next {
-                        self.session.cursor_id = Some(row.id.clone());
-                    }
-                }
-                if !self.reload_messages(true) {
-                    self.clear_open_message();
-                }
-                self.scroll_list_to_cursor();
-                self.scroll_conversation();
-            }
-            Err(err) => self.session.show_toast(err.to_string(), true),
+        if !self.session.threads.iter().any(|thread| thread.id == id) {
+            self.session.show_toast("No conversation", true);
+            return;
         }
+        let account = self.account_id.clone();
+        let thread = ThreadId(id.clone());
+        let from = self.list_folder.clone();
+        let to = destination.clone();
+        self.take_out_of_list(&id, cx);
+        self.change_mailbox(
+            move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
+            move |inbox, result| match result {
+                Ok(()) => {
+                    inbox.pending_removals.remove(&id);
+                    inbox.moved_thread = Some(id);
+                    let label = present::folder_label(&destination);
+                    inbox.session.show_toast(format!("Moved to {label}"), false);
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
+                }
+                Err(err) => {
+                    inbox.pending_removals.remove(&id);
+                    inbox.session.show_toast(err.to_string(), true);
+                    Some(ReadIntent {
+                        changed: true,
+                        select: Some(id),
+                        ..ReadIntent::default()
+                    })
+                }
+            },
+            cx,
+        );
     }
 
-    fn apply_undo(&mut self) {
-        match self.store.undo(&self.account_id) {
-            Ok(_) => {
-                self.session.show_toast("Undone", false);
-                let restored = self.moved_thread.take();
-                if self.reload_threads() {
-                    if let Some(id) = restored {
-                        self.session.select_if_present(&id);
-                    }
-                    if !self.reload_messages(true) {
-                        self.clear_open_message();
-                    }
+    /// Remove `id` from the rows on screen before its write lands and open
+    /// the row that took its place.
+    fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.pending_removals.insert(id.to_string());
+        self.session.remove_thread(id);
+        self.scroll_list_to_cursor();
+        self.request_messages(true, cx);
+    }
+
+    fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        let account = self.account_id.clone();
+        self.change_mailbox(
+            move |store| store.undo(&account).map(|_| ()),
+            |inbox, result| match result {
+                Ok(()) => {
+                    inbox.session.show_toast("Undone", false);
+                    Some(ReadIntent {
+                        changed: true,
+                        select: inbox.moved_thread.take(),
+                        ..ReadIntent::default()
+                    })
                 }
-                self.scroll_list_to_cursor();
-                self.scroll_conversation();
-            }
-            Err(err) => {
-                let raw = err.to_string();
-                if raw == "nothing to undo" {
-                    self.session.show_toast("Nothing to undo", false);
-                } else {
-                    self.session.show_toast(raw, true);
+                Err(err) => {
+                    let raw = err.to_string();
+                    if raw == "nothing to undo" {
+                        inbox.session.show_toast("Nothing to undo", false);
+                    } else {
+                        inbox.session.show_toast(raw, true);
+                    }
+                    None
                 }
-            }
-        }
+            },
+            cx,
+        );
     }
 
     fn clear_open_message(&mut self) {
@@ -334,38 +698,45 @@ impl Inbox {
         if step.apply_move
             && let Some(destination) = self.session.pending_move.take()
         {
-            self.apply_move(destination);
+            self.apply_move(destination, cx);
         }
         if step.undo {
-            self.apply_undo();
+            self.apply_undo(cx);
         }
         if step.archive {
-            self.archive_current();
+            self.archive_current(cx);
         }
-        let mut loaded_messages = false;
-        let mut loaded_threads = false;
-        if step.reload_threads {
-            if !self.reload_threads() {
-                self.session.folder = folder_before;
-            } else {
-                loaded_threads = true;
-                if !self.reload_messages(true) {
-                    self.clear_open_message();
+        if step.sync_now {
+            match &self.sync {
+                Some(handle) => {
+                    handle.sync_now();
+                    self.session.show_toast("Syncing…", false);
                 }
-                loaded_messages = true;
+                None => self
+                    .session
+                    .show_toast("No account is set up · run fell account setup", true),
             }
+        }
+        // Reads go to the store thread. The list moves on this frame; the
+        // conversation follows when its read lands.
+        if step.reload_threads && self.session.folder != folder_before {
+            self.request_threads(
+                ReadIntent {
+                    switch: true,
+                    ..ReadIntent::default()
+                },
+                cx,
+            );
+        } else if step.reload_threads {
+            self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
-            if !self.reload_messages(true) {
-                self.session.cursor_id = thread_before.clone();
-            } else {
-                loaded_messages = true;
-            }
+            self.request_messages(true, cx);
         }
         if step.arm_which {
             self.arm_which(cx);
         }
         let thread_moved = self.session.cursor_id != thread_before;
-        if loaded_threads || thread_moved {
+        if thread_moved {
             self.scroll_list_to_cursor();
         }
         // A tall message aligns to its top when scrolled into view. Skip that
@@ -374,7 +745,7 @@ impl Inbox {
         // the current message back to the top.
         if step.scroll_pages != 0 || step.scroll_lines != 0 {
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
-        } else if loaded_messages || self.session.message_cursor != message_before {
+        } else if self.session.message_cursor != message_before {
             self.scroll_conversation();
         }
         if self.session.overlay == Overlay::Palette {
@@ -395,6 +766,13 @@ impl Inbox {
         if index < self.session.messages.len() {
             self.session.message_cursor = index;
         }
+    }
+
+    /// The conversation viewport is scrolled to its end (or does not scroll).
+    fn conversation_at_bottom(&self) -> bool {
+        let max = f32::from(self.conv_scroll.max_offset().height);
+        let offset = f32::from(self.conv_scroll.offset().y);
+        max <= 1.0 || offset <= -max + 24.0
     }
 
     fn scroll_conversation(&mut self) {
@@ -473,18 +851,13 @@ impl Inbox {
             .scroll_to_item(self.session.cursor_index(), ScrollStrategy::Top);
     }
 
-    fn select_thread(&mut self, id: String) {
+    fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
         self.session.cancel_pending_keys();
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
-        let previous = self.session.cursor_id.clone();
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
         if changed {
-            if !self.reload_messages(true) {
-                self.session.cursor_id = previous;
-            } else {
-                self.scroll_conversation();
-            }
+            self.request_messages(true, cx);
         }
         self.scroll_list_to_cursor();
     }
@@ -550,10 +923,13 @@ fn shell(
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|inbox, _: &MouseUpEvent, _, _| {
+            cx.listener(|inbox, _: &MouseUpEvent, _, cx| {
                 if inbox.dragging {
                     inbox.dragging = false;
-                    mailbox::save_split(inbox.split);
+                    let split = inbox.split;
+                    cx.background_executor()
+                        .spawn(async move { mailbox::save_split(split) })
+                        .detach();
                 }
             }),
         )
@@ -757,7 +1133,7 @@ fn thread_row(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 window.focus(&inbox.focus);
-                inbox.select_thread(id.clone());
+                inbox.select_thread(id.clone(), cx);
                 cx.notify();
             }),
         )
@@ -1359,14 +1735,12 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
         .child(div().text_color(rgb(theme.dimmed)).child("·"))
         .child(
             div()
-                .text_color(rgb(
-                    if matches!(session.sync, crate::model::SyncKind::StoreError) {
-                        theme.error
-                    } else {
-                        theme.dimmed
-                    },
-                ))
-                .child(session.sync.status().to_string()),
+                .text_color(rgb(if session.sync.is_error() {
+                    theme.error
+                } else {
+                    theme.dimmed
+                }))
+                .child(session.sync.status()),
         )
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
