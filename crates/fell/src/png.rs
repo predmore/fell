@@ -9,10 +9,16 @@ pub fn chart_png() -> Vec<u8> {
         raw.push(0);
         for x in 0..width {
             let from_bottom = height - 1 - y;
+            let above_floor = from_bottom.saturating_sub(12);
             let (r, g, b) = bars
                 .iter()
                 .copied()
-                .find(|left| x >= *left && x < left + 28 && from_bottom < bars_height(*left))
+                .find(|left| {
+                    x >= *left
+                        && x < left + 28
+                        && from_bottom >= 12
+                        && above_floor < bars_height(*left)
+                })
                 .map(bar_color)
                 .unwrap_or((26, 28, 36));
             raw.extend_from_slice(&[r, g, b]);

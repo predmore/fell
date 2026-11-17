@@ -1680,7 +1680,8 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
         img(preview.image)
             .w(px(preview.width))
             .h(px(preview.height))
-            .object_fit(gpui::ObjectFit::Contain),
+            .object_fit(gpui::ObjectFit::Contain)
+            .mb(px(16.)),
     )
 }
 
