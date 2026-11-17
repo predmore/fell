@@ -206,8 +206,11 @@ fn watch_folder(
                             break;
                         }
                     }
-                    let content = std::fs::read_to_string(current_folder.join("draft.md")).ok();
                     let id = current_id.clone();
+                    if fell_core::compose::draft_file_is_symlink(&current_folder) {
+                        continue;
+                    }
+                    let content = std::fs::read_to_string(current_folder.join("draft.md")).ok();
                     hub.with_session(&id, |session| {
                         session.push_disk(content, 0);
                         session.poll_disk(150);

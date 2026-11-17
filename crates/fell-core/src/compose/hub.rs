@@ -405,12 +405,56 @@ pub fn rpc_call(request: &Value) -> Result<Value, String> {
     serde_json::from_str(line.trim()).map_err(|err| err.to_string())
 }
 
+fn session_from_folder(folder: &std::path::Path, account: &str) -> Result<DraftSession, String> {
+    let id = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("draft");
+    if let Some(store) = super::persist::open_store_for_draft(id) {
+        return DraftSession::open_with_store(
+            folder,
+            crate::AccountId(account.to_string()),
+            &store,
+        );
+    }
+    let text = workspace::read_draft_file(folder)?;
+    let parsed = super::frontmatter::parse_draft(&text).map_err(|err| err.message)?;
+    DraftSession::create(
+        folder.to_path_buf(),
+        id,
+        crate::AccountId(account.to_string()),
+        parsed.fields,
+        parsed.body,
+    )
+}
+
+fn open_draft_for_agent(
+    draft_id: &str,
+    agent: &str,
+    account: &str,
+) -> Result<std::path::PathBuf, String> {
+    let folder = workspace::draft_folder(draft_id)?;
+    if workspace::draft_file_is_symlink(&folder) {
+        return Err("draft.md is a symlink".into());
+    }
+    if folder.join("draft.md").is_file() {
+        workspace::require_owner(&folder, agent)?;
+        if let Some(stored) = workspace::read_account(&folder)
+            && stored != account
+        {
+            return Err("this draft belongs to another account".into());
+        }
+        return Ok(folder);
+    }
+    super::persist::open_owned_draft(draft_id, agent, account)
+}
+
 pub fn editor_is_running() -> bool {
     UnixStream::connect(draft_socket_path()).is_ok()
 }
 
 pub fn file_fallback_get(draft_id: &str, agent: &str, account: &str) -> Result<Value, String> {
-    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
+    let folder = open_draft_for_agent(draft_id, agent, account)?;
     let text = workspace::read_draft_file(&folder)?;
     Ok(json!({
         "ok": true,
@@ -429,8 +473,8 @@ pub fn file_fallback_edit(
     old: &str,
     new: &str,
 ) -> Result<Value, String> {
-    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
-    let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
+    let folder = open_draft_for_agent(draft_id, agent, account)?;
+    let mut session = session_from_folder(&folder, account)?;
     session.edit(session.revision(), old, new)?;
     session.flush()?;
     let snap = session.snapshot();
@@ -450,8 +494,8 @@ pub fn file_fallback_replace_body(
     account: &str,
     body: &str,
 ) -> Result<Value, String> {
-    let folder = super::persist::open_owned_draft(draft_id, agent, account)?;
-    let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
+    let folder = open_draft_for_agent(draft_id, agent, account)?;
+    let mut session = session_from_folder(&folder, account)?;
     let previous = session.body().to_string();
     session.replace_body(body)?;
     session.flush()?;

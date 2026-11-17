@@ -255,13 +255,12 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
             .map(|id| format!("<{}>", id.as_str())),
         attachments: Vec::new(),
     };
-    let cwd = fell_core::compose::materialize_workspace(
+    let cwd = Some(fell_core::compose::materialize_workspace(
         &compose_id,
         &fields,
         &saved.draft.body,
         &session.account_id,
-    )
-    .ok();
+    )?);
     if let Some(folder) = &cwd {
         fell_core::compose::write_owner(folder, &actor_name(session))?;
         if let Some(path) = session.store.db_path() {
@@ -277,6 +276,10 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
             fields: fields.clone(),
             body: saved.draft.body.clone(),
             files: Vec::new(),
+            identities: fell_core::compose::email_of(&fields.from)
+                .into_iter()
+                .collect(),
+            owner: actor_name(session),
         })
         .map_err(store_error)?;
     Ok(json!({
@@ -585,23 +588,30 @@ fn authorize_compose(session: &Session, compose_id: &str) -> Result<(), String> 
     {
         return Err("this draft belongs to another agent".into());
     }
-    if let Some(stored) = fell_core::compose::stored_compose_account(compose_id)
-        && stored != account
+    let recorded = session
+        .store
+        .load_compose(compose_id)
+        .map_err(store_error)?;
+    if let Some(stored) = &recorded
+        && stored.account_id.as_str() != account
     {
         return Err("this draft belongs to another account".into());
     }
     let folder = fell_core::compose::draft_folder(compose_id)
-        .map_err(|_| "this draft belongs to another agent".to_string())?;
+        .map_err(|_| "draft is not open".to_string())?;
+    let owner = recorded.as_ref().map(|draft| draft.owner.as_str());
+    let owner = owner.filter(|value| !value.is_empty());
     if !folder.join("draft.md").is_file() {
-        return Err("this draft belongs to another agent".into());
+        return match owner {
+            Some(name) if name == caller => Ok(()),
+            Some(_) => Err("this draft belongs to another agent".into()),
+            None => Err("draft is not open".into()),
+        };
     }
-    match fell_core::compose::read_account(&folder) {
-        Some(stored) if stored == account => {}
-        _ => return Err("this draft belongs to another account".into()),
-    }
-    match fell_core::compose::read_owner(&folder) {
-        Some(owner) if owner == caller => Ok(()),
-        _ => Err("this draft belongs to another agent".into()),
+    match owner {
+        Some(name) if name == caller => Ok(()),
+        Some(_) => Err("this draft belongs to another agent".into()),
+        None => Err("draft is not open".into()),
     }
 }
 

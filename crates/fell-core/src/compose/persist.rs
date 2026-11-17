@@ -22,6 +22,8 @@ pub struct StoredCompose {
     pub fields: DraftFields,
     pub body: String,
     pub files: Vec<ResolvedFile>,
+    pub identities: Vec<String>,
+    pub owner: String,
 }
 
 impl Store {
@@ -30,8 +32,8 @@ impl Store {
         tx.execute(
             "INSERT INTO compose_drafts (
                 id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                subject, body, in_reply_to, updated_unix
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                subject, body, in_reply_to, identities, owner, updated_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 from_addr = excluded.from_addr,
                 to_addrs = excluded.to_addrs,
@@ -40,6 +42,8 @@ impl Store {
                 subject = excluded.subject,
                 body = excluded.body,
                 in_reply_to = excluded.in_reply_to,
+                identities = excluded.identities,
+                owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
                 updated_unix = excluded.updated_unix",
             params![
                 draft.id,
@@ -51,6 +55,8 @@ impl Store {
                 draft.fields.subject,
                 draft.body,
                 draft.fields.in_reply_to,
+                join_list(&draft.identities),
+                draft.owner,
                 now_unix(),
             ],
         )?;
@@ -75,8 +81,8 @@ impl Store {
         self.conn.execute(
             "INSERT INTO compose_drafts (
                 id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                subject, body, in_reply_to, updated_unix
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                subject, body, in_reply_to, identities, owner, updated_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 from_addr = excluded.from_addr,
                 to_addrs = excluded.to_addrs,
@@ -85,6 +91,8 @@ impl Store {
                 subject = excluded.subject,
                 body = excluded.body,
                 in_reply_to = excluded.in_reply_to,
+                identities = excluded.identities,
+                owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
                 updated_unix = excluded.updated_unix",
             params![
                 draft.id,
@@ -96,6 +104,8 @@ impl Store {
                 draft.fields.subject,
                 draft.body,
                 draft.fields.in_reply_to,
+                join_list(&draft.identities),
+                draft.owner,
                 now_unix(),
             ],
         )?;
@@ -108,7 +118,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                        subject, body, in_reply_to
+                        subject, body, in_reply_to, identities, owner
                  FROM compose_drafts WHERE id = ?1",
                 params![id],
                 |row| {
@@ -121,11 +131,14 @@ impl Store {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((account, from, to, cc, bcc, subject, body, reply)) = row else {
+        let Some((account, from, to, cc, bcc, subject, body, reply, identities, owner)) = row
+        else {
             return Ok(None);
         };
         let mut stmt = self.conn.prepare(
@@ -162,7 +175,13 @@ impl Store {
             },
             body,
             files,
+            identities: split_list(&identities),
+            owner,
         }))
+    }
+
+    pub fn compose_owner(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.load_compose(id)?.map(|draft| draft.owner))
     }
 
     /// Addresses this account has already mailed, plus its own address.
@@ -277,6 +296,12 @@ pub fn stored_compose_account(id: &str) -> Option<String> {
         .map(|draft| draft.account_id.as_str().to_string())
 }
 
+pub fn stored_compose_owner(id: &str) -> Option<String> {
+    let store = open_store_for(id)?;
+    let owner = store.compose_owner(id).ok().flatten()?;
+    if owner.is_empty() { None } else { Some(owner) }
+}
+
 pub fn open_owned_draft(
     id: &str,
     agent: &str,
@@ -284,7 +309,6 @@ pub fn open_owned_draft(
 ) -> std::result::Result<PathBuf, String> {
     let folder = workspace::draft_folder(id)?;
     if draft_file_is_regular(&folder) {
-        guard_open_folder(&folder, agent, account)?;
         return Ok(folder);
     }
     let Some(store) = open_store_for(id) else {
@@ -296,14 +320,19 @@ pub fn open_owned_draft(
     if stored.account_id.as_str() != account {
         return Err("this draft belongs to another account".into());
     }
-    guard_open_folder(&folder, agent, account)?;
+    if stored.owner != agent {
+        if stored.owner.is_empty() {
+            return Err(format!("draft {id} is not open"));
+        }
+        return Err("this draft belongs to another agent".into());
+    }
     store
         .restore_compose_folder(id, &folder)
         .map_err(|err| err.to_string())?;
-    guard_open_folder(&folder, agent, account)?;
     Ok(folder)
 }
 
+#[cfg(test)]
 fn guard_open_folder(folder: &Path, agent: &str, account: &str) -> std::result::Result<(), String> {
     match workspace::read_account(folder) {
         Some(stored) if stored == account => {}
@@ -331,6 +360,10 @@ fn compose_index_file(id: &str) -> Option<PathBuf> {
         PathBuf::from(std::env::var_os("HOME")?).join(".local/share/fell/compose-stores")
     };
     Some(root.join(id))
+}
+
+pub(crate) fn open_store_for_draft(id: &str) -> Option<Store> {
+    open_store_for(id)
 }
 
 fn open_store_for(id: &str) -> Option<Store> {
@@ -403,6 +436,8 @@ mod tests {
                     bytes: b"png".to_vec(),
                     inline: true,
                 }],
+                identities: vec!["jon@example.com".into()],
+                owner: String::new(),
             })
             .unwrap();
         let loaded = store.load_compose("d1").unwrap().unwrap();
@@ -491,6 +526,8 @@ mod tests {
             workspace::materialize_in(&dir, "r1", &fields, "body\n", &AccountId("acct-a".into()))
                 .unwrap();
         workspace::write_owner(&folder, "agent:ada").unwrap();
+        let control = workspace::control_dir(&folder);
+        std::fs::write(control.join("account"), "acct-a\n").unwrap();
         let other_account = guard_open_folder(&folder, "agent:ada", "acct-b").unwrap_err();
         assert!(other_account.contains("another account"), "{other_account}");
         let other_agent = guard_open_folder(&folder, "agent:bob", "acct-a").unwrap_err();
@@ -542,6 +579,8 @@ mod tests {
                     bytes: b"local".to_vec(),
                     inline: false,
                 }],
+                identities: vec!["jon@example.com".into()],
+                owner: "agent:ada".into(),
             })
             .unwrap();
         let err = store.restore_compose_folder("keep", &folder).unwrap_err();

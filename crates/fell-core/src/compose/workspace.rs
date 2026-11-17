@@ -117,24 +117,10 @@ pub fn materialize_in(
         &folder.join("draft.md"),
         write_draft(fields, body).as_bytes(),
     )?;
-    let control = ensure_control(&folder)?;
-    if !control.join("identities").exists()
-        && let Some(email) = super::frontmatter::email_of(&fields.from)
-    {
-        atomic_write(&control.join("identities"), email.as_bytes())?;
-    }
-    if !control.join("reply.lock").exists() {
-        let reply = fields.in_reply_to.clone().unwrap_or_default();
-        atomic_write(&control.join("reply.lock"), format!("{reply}\n").as_bytes())?;
-    }
     let account_id = account.as_str().trim();
     if account_id.is_empty() || account_id.contains(['\n', '\r']) {
         return Err("draft account id is empty".into());
     }
-    atomic_write(
-        &control.join("account"),
-        format!("{account_id}\n").as_bytes(),
-    )?;
     if folder.join("thread").exists() {
         return Err("draft folder must not contain a thread copy".into());
     }
@@ -204,14 +190,15 @@ pub fn write_store_link(folder: &Path, store: &Path) -> Result<(), String> {
     )
 }
 
-pub fn read_store_link(folder: &Path) -> Option<PathBuf> {
-    let text = fs::read_to_string(control_dir(folder).join("store")).ok()?;
-    let path = PathBuf::from(text.trim());
-    path.is_file().then_some(path)
+pub fn draft_file_is_symlink(folder: &Path) -> bool {
+    fs::symlink_metadata(folder.join("draft.md")).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 pub fn read_draft_file(folder: &Path) -> Result<String, String> {
     let path = folder.join("draft.md");
+    if draft_file_is_symlink(folder) {
+        return Err("draft.md is a symlink".into());
+    }
     fs::read_to_string(&path).map_err(|err| format!("draft.md: {err}"))
 }
 

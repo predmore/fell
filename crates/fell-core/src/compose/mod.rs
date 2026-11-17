@@ -13,7 +13,8 @@ mod session;
 mod workspace;
 
 pub use frontmatter::{
-    AttachmentRef, DraftFields, DraftIssue, ParsedDraft, format_address_line, parse_address_line,
+    AttachmentRef, DraftFields, DraftIssue, ParsedDraft, email_of, format_address_line,
+    parse_address_line,
 };
 pub use hub::{
     DraftHub, HubEvent, editor_is_running, file_fallback_edit, file_fallback_get,
@@ -27,10 +28,11 @@ pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
 pub use persist::{
     StoredCompose, ensure_draft_folder, open_owned_draft, remember_compose_store,
-    stored_compose_account,
+    stored_compose_account, stored_compose_owner,
 };
 pub use session::{AddressView, AttachmentView, DraftSession, HunkView, Snapshot};
 pub use workspace::{
-    draft_folder, draft_root, draft_socket_path, image_file, materialize_in, materialize_workspace,
-    read_account, read_owner, require_owner, resolve_inside, write_owner, write_store_link,
+    draft_file_is_symlink, draft_folder, draft_root, draft_socket_path, image_file, materialize_in,
+    materialize_workspace, read_account, read_owner, require_owner, resolve_inside, write_owner,
+    write_store_link,
 };

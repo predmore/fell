@@ -137,6 +137,8 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
     in_reply_to TEXT,
+    identities TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
     updated_unix INTEGER NOT NULL,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -282,6 +284,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
+        ensure_compose_columns(&conn)?;
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
         crate::search::rebuild_vocabulary_if_empty(&conn)?;
@@ -1370,6 +1373,30 @@ fn union_tokens(existing: &str, incoming: &[String], address: bool) -> String {
         out.push(token);
     }
     out.join("\u{1e}")
+}
+
+fn ensure_compose_columns(conn: &Connection) -> Result<()> {
+    let have = column_names(conn, "compose_drafts")?;
+    for (name, ddl) in [
+        (
+            "identities",
+            "ALTER TABLE compose_drafts ADD COLUMN identities TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "owner",
+            "ALTER TABLE compose_drafts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        if have.iter().any(|column| column == name) {
+            continue;
+        }
+        if let Err(err) = conn.execute(ddl, [])
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
+    }
+    Ok(())
 }
 
 fn ensure_message_columns(conn: &Connection) -> Result<()> {

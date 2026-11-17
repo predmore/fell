@@ -23,6 +23,8 @@ struct Hunk {
     kind: HunkKind,
     previous: String,
     inserted: String,
+    /// Byte start of `inserted` in the serialized draft, when it was applied.
+    at: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,7 @@ pub struct DraftSession {
     focused: bool,
     known: HashSet<String>,
     identities: HashSet<String>,
+    owner: String,
     agent_seen: HashMap<String, String>,
     quoted: Option<String>,
 }
@@ -157,55 +160,71 @@ impl DraftSession {
             focused: false,
             known: HashSet::new(),
             identities: HashSet::new(),
+            owner: String::new(),
             agent_seen: HashMap::new(),
             quoted: None,
         };
-        let control = workspace::control_dir(&session.folder);
-        let _ = std::fs::create_dir_all(&control);
-        let _ = std::fs::write(control.join("account"), session.account_id.as_str());
-        if let Some(locked) = read_reply_lock(&session.folder) {
-            session.locked_reply = locked.clone();
-            session.fields.in_reply_to = locked;
+        session.locked_reply = session.fields.in_reply_to.clone();
+        if let Some(email) = email_of(&session.fields.from) {
+            session.identities.insert(email);
         }
-        session.identities = read_identities(&session.folder);
         session.load_hunks();
         session.settled = session.serialize();
         session.flush()?;
         Ok(session)
     }
 
-    pub fn open_folder(folder: &Path, _account_hint: AccountId) -> Result<Self, String> {
-        let text = workspace::read_draft_file(folder)?;
-        let parsed = parse_draft(&text).map_err(|err| err.message)?;
+    pub fn open_folder(folder: &Path, account_hint: AccountId) -> Result<Self, String> {
         let id = folder
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("draft")
             .to_string();
-        let stored = std::fs::read_to_string(workspace::control_dir(folder).join("account"))
-            .map_err(|_| "draft folder has no account file".to_string())?;
-        let stored = stored.trim();
-        if stored.is_empty() || stored.contains(['\n', '\r']) {
-            return Err("draft folder has no account file".into());
+        let Some(store) = persist::open_store_for_draft(&id) else {
+            return Err("draft has no mailbox record".into());
+        };
+        Self::open_with_store(folder, account_hint, &store)
+    }
+
+    pub fn open_with_store(
+        folder: &Path,
+        account_hint: AccountId,
+        store: &crate::Store,
+    ) -> Result<Self, String> {
+        let id = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("draft")
+            .to_string();
+        let Some(stored) = store.load_compose(&id).map_err(|err| err.to_string())? else {
+            return Err("draft has no mailbox record".into());
+        };
+        if account_hint.as_str() != stored.account_id.as_str() {
+            return Err("account does not match the mailbox".into());
         }
-        let account_id = AccountId(stored.to_string());
+        let text = workspace::read_draft_file(folder)?;
+        let parsed = parse_draft(&text).map_err(|err| err.message)?;
+        if parsed.fields.in_reply_to != stored.fields.in_reply_to {
+            return Err("reply target does not match the mailbox".into());
+        }
         let mut session = Self::create(
             folder.to_path_buf(),
             id,
-            account_id,
+            stored.account_id,
             parsed.fields,
             parsed.body,
         )?;
+        session.identities = stored.identities.into_iter().collect();
+        session.owner = stored.owner;
+        session.locked_reply = stored.fields.in_reply_to.clone();
+        session.fields.in_reply_to = session.locked_reply.clone();
         session.issues = parsed.issues;
-        if let Some(path) = workspace::read_store_link(folder) {
-            session.store_path = Some(path.clone());
-            if let Ok(store) = crate::Store::open(path)
-                && let Ok(known) = store.mailed_addresses(session.account_id())
-            {
-                session.known = known;
-            }
+        if let Some(path) = store.db_path() {
+            session.store_path = Some(path.to_path_buf());
         }
-        let _ = text;
+        if let Ok(known) = store.mailed_addresses(session.account_id()) {
+            session.known = known;
+        }
         Ok(session)
     }
 
@@ -373,7 +392,10 @@ impl DraftSession {
         }
         self.begin_user_change();
         self.end_user_change();
-        let next = text.replacen(&hunk.inserted, &hunk.previous, 1);
+        let next = match revert_span(&text, &hunk) {
+            Some(next) => next,
+            None => return false,
+        };
         if self.adopt_text(&next).is_err() {
             return false;
         }
@@ -397,7 +419,8 @@ impl DraftSession {
         self.undo.push(self.checkpoint());
         self.adopt_text(&next)?;
         if old != new && self.serialize().contains(new) {
-            self.push_hunk(HunkKind::Body, old.to_string(), new.to_string());
+            let at = span_after_edit(&self.serialize(), new, at);
+            self.push_hunk(HunkKind::Body, old.to_string(), new.to_string(), at);
         }
         self.settled = self.serialize();
         Ok(())
@@ -410,7 +433,7 @@ impl DraftSession {
         self.undo.push(self.checkpoint());
         let previous = self.body.clone();
         self.body = body.to_string();
-        self.push_hunk(HunkKind::Body, previous, body.to_string());
+        self.push_hunk(HunkKind::Body, previous, body.to_string(), None);
         self.bump();
         self.settled = self.serialize();
         Ok(())
@@ -519,6 +542,8 @@ impl DraftSession {
             fields: self.fields.clone(),
             body: self.body.clone(),
             files: Vec::new(),
+            identities: self.identities.iter().cloned().collect(),
+            owner: self.owner.clone(),
         };
         let stamp = attachment_stamp(&self.folder, &self.fields, &self.body);
         if stamp == self.attachment_stamp {
@@ -655,7 +680,7 @@ impl DraftSession {
             return;
         }
         for hunk in outcome.hunks {
-            self.push_hunk(hunk.kind, hunk.previous, hunk.inserted);
+            self.push_hunk(hunk.kind, hunk.previous, hunk.inserted, None);
         }
         self.settled = self.serialize();
         let _ = self.flush();
@@ -682,7 +707,7 @@ impl DraftSession {
         }
     }
 
-    fn push_hunk(&mut self, kind: HunkKind, previous: String, inserted: String) {
+    fn push_hunk(&mut self, kind: HunkKind, previous: String, inserted: String, at: Option<usize>) {
         if previous == inserted {
             return;
         }
@@ -693,6 +718,7 @@ impl DraftSession {
             kind,
             previous,
             inserted,
+            at,
         });
     }
 
@@ -713,8 +739,8 @@ impl DraftSession {
             if hunk.inserted.is_empty() {
                 continue;
             }
-            if let Some(at) = text.find(&hunk.inserted) {
-                text.replace_range(at..at + hunk.inserted.len(), &hunk.previous);
+            if let Some(next) = revert_span(&text, hunk) {
+                text = next;
             }
         }
         text
@@ -746,27 +772,6 @@ impl DraftSession {
 
     fn bump(&mut self) {
         self.revision = self.revision.saturating_add(1);
-    }
-}
-
-fn read_identities(folder: &Path) -> HashSet<String> {
-    let Ok(text) = std::fs::read_to_string(workspace::control_dir(folder).join("identities"))
-    else {
-        return HashSet::new();
-    };
-    text.lines()
-        .map(|line| line.trim().to_ascii_lowercase())
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-fn read_reply_lock(folder: &Path) -> Option<Option<String>> {
-    let text = std::fs::read_to_string(workspace::control_dir(folder).join("reply.lock")).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(text.to_string()))
     }
 }
 
@@ -807,6 +812,10 @@ impl DraftSession {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                at: item
+                    .get("at")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|at| at as usize),
             });
         }
         self.next_hunk = self.hunks.iter().map(|hunk| hunk.id).max().unwrap_or(0) + 1;
@@ -828,6 +837,7 @@ impl DraftSession {
                     "kind": kind,
                     "previous": hunk.previous,
                     "inserted": hunk.inserted,
+                    "at": hunk.at,
                 })
             })
             .collect();
@@ -838,6 +848,29 @@ impl DraftSession {
             serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
         );
     }
+}
+
+fn span_after_edit(text: &str, inserted: &str, at: usize) -> Option<usize> {
+    if text.get(at..at + inserted.len()) == Some(inserted) {
+        return Some(at);
+    }
+    text.match_indices(inserted)
+        .map(|(index, _)| index)
+        .min_by_key(|index| index.abs_diff(at))
+}
+
+fn revert_span(text: &str, hunk: &Hunk) -> Option<String> {
+    if let Some(at) = hunk.at
+        && text.get(at..at + hunk.inserted.len()) == Some(hunk.inserted.as_str())
+    {
+        let mut next = text.to_string();
+        next.replace_range(at..at + hunk.inserted.len(), &hunk.previous);
+        return Some(next);
+    }
+    if text.matches(hunk.inserted.as_str()).count() == 1 {
+        return Some(text.replacen(&hunk.inserted, &hunk.previous, 1));
+    }
+    None
 }
 
 fn referenced_file_hashes(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64)> {
@@ -1057,7 +1090,6 @@ mod tests {
                 snooze_until: None,
             })
             .unwrap();
-        drop(store);
         let fields = DraftFields {
             from: "jon@example.com".into(),
             to: vec!["ada@example.com".into(), "new@example.com".into()],
@@ -1067,8 +1099,12 @@ mod tests {
         };
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "body\n", &account.id).unwrap();
-        workspace::write_store_link(&folder, &db).unwrap();
-        let session = DraftSession::open_folder(&folder, account.id).unwrap();
+        let mut session =
+            DraftSession::create(folder.clone(), "d1", account.id.clone(), fields, "body\n")
+                .unwrap();
+        session.bind_store(&db);
+        session.flush().unwrap();
+        let session = DraftSession::open_with_store(&folder, account.id, &store).unwrap();
         let snap = session.snapshot();
         let ada = snap
             .to
@@ -1324,10 +1360,24 @@ mod tests {
 
     #[test]
     fn offline_edit_keeps_the_reply_lock_and_records_a_hunk() {
-        let (root, session) = temp_session("body\n");
+        let (root, mut session) = temp_session("body\n");
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: AccountId("local".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        session.bind_store(&db);
+        session.owner = "agent:test".into();
+        session.flush().unwrap();
         let folder = session.folder().to_path_buf();
         drop(session);
-        let mut again = DraftSession::open_folder(&folder, AccountId("local".into())).unwrap();
+        let mut again =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         again
             .edit(
                 again.revision(),
@@ -1342,7 +1392,13 @@ mod tests {
         let text = fs::read_to_string(folder.join("draft.md")).unwrap();
         assert!(text.contains("<abc@example.com>"), "{text}");
         assert!(!text.contains("<evil@example.com>"), "{text}");
-        let reopened = DraftSession::open_folder(&folder, AccountId("other".into())).unwrap();
+        let mismatch = DraftSession::open_with_store(&folder, AccountId("other".into()), &store);
+        match mismatch {
+            Ok(_) => panic!("opened with the wrong account"),
+            Err(err) => assert!(err.contains("account"), "{err}"),
+        }
+        let reopened =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(reopened.account_id().as_str(), "local");
         assert_eq!(
             reopened.fields().in_reply_to.as_deref(),
@@ -1354,16 +1410,15 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_a_folder_with_no_account_file() {
+    fn open_refuses_a_folder_with_no_mailbox_record() {
         let (root, session) = temp_session("body\n");
         let folder = session.folder().to_path_buf();
         drop(session);
-        std::fs::remove_file(workspace::control_dir(&folder).join("account")).unwrap();
         let err = match DraftSession::open_folder(&folder, AccountId("local".into())) {
-            Ok(_) => panic!("opened a folder with no account file"),
+            Ok(_) => panic!("opened a folder with no mailbox record"),
             Err(err) => err,
         };
-        assert!(err.contains("account"), "{err}");
+        assert!(err.contains("mailbox"), "{err}");
         let _ = root;
     }
 
@@ -1377,7 +1432,34 @@ mod tests {
         assert!(!folder.join("identities").exists());
         std::fs::write(folder.join("account"), "not-the-account\n").unwrap();
         std::fs::write(folder.join("reply.lock"), "<evil@example.com>\n").unwrap();
-        let opened = DraftSession::open_folder(&folder, AccountId("local".into()));
+        std::fs::write(folder.join("identities"), "evil@example.com\n").unwrap();
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: AccountId("local".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        let mut live = DraftSession::create(
+            folder.clone(),
+            "d1",
+            AccountId("local".into()),
+            DraftFields {
+                from: "jon@example.com".into(),
+                to: vec!["ada@example.com".into()],
+                subject: "Hello".into(),
+                in_reply_to: Some("<abc@example.com>".into()),
+                ..DraftFields::default()
+            },
+            "body\n",
+        )
+        .unwrap();
+        live.bind_store(&db);
+        live.flush().unwrap();
+        let opened = DraftSession::open_with_store(&folder, AccountId("local".into()), &store);
         let opened = match opened {
             Ok(session) => session,
             Err(err) => panic!("{err}"),
@@ -1387,7 +1469,21 @@ mod tests {
             opened.fields().in_reply_to.as_deref(),
             Some("<abc@example.com>")
         );
+        assert!(opened.identities.contains("jon@example.com"));
+        assert!(!opened.identities.contains("evil@example.com"));
         let _ = root;
+    }
+
+    #[test]
+    fn reject_reverts_the_edited_range_not_an_earlier_copy() {
+        let (_root, mut session) = temp_session("alpha\nbeta alpha\n");
+        session
+            .edit(session.revision(), "beta alpha", "alpha")
+            .unwrap();
+        assert_eq!(session.body(), "alpha\nalpha\n");
+        let hunk = session.snapshot().hunks[0].id;
+        assert!(session.reject_hunk(hunk));
+        assert_eq!(session.body(), "alpha\nbeta alpha\n");
     }
 
     #[test]
