@@ -192,23 +192,75 @@ pub fn valid_address(raw: &str) -> bool {
 }
 
 pub fn email_of(raw: &str) -> Option<String> {
+    mailbox_parts(raw).map(|(_name, email)| email)
+}
+
+/// A bare address, or one `Name <addr>` form.
+///
+/// A second `<...>` is not a display name, and a bare address glued in front
+/// of `<other@domain>` is not a name either.
+pub fn mailbox_parts(raw: &str) -> Option<(Option<String>, String)> {
     let text = raw.trim();
-    if text.is_empty() {
+    if text.is_empty() || text.chars().any(|ch| ch.is_control()) {
         return None;
     }
-    if let Some(start) = text.rfind('<') {
-        let after = &text[start + 1..];
-        let end = after.find('>')?;
-        let email = after[..end].trim();
-        if email.contains('@') && !email.contains(char::is_whitespace) {
-            return Some(email.to_ascii_lowercase());
+    let open = text.matches('<').count();
+    let close = text.matches('>').count();
+    if open == 0 && close == 0 {
+        return bare_email(text).map(|email| (None, email));
+    }
+    if open != 1 || close != 1 {
+        return None;
+    }
+    let start = text.find('<')?;
+    let end = text.find('>')?;
+    if end < start || end + 1 != text.len() {
+        return None;
+    }
+    let email = bare_email(text[start + 1..end].trim())?;
+    let name = text[..start].trim();
+    if name.is_empty() {
+        return Some((None, email));
+    }
+    if display_name_is_an_address(name) {
+        return None;
+    }
+    let name = name.trim_matches('"').trim();
+    if name.is_empty() {
+        Some((None, email))
+    } else {
+        Some((Some(name.to_string()), email))
+    }
+}
+
+fn bare_email(text: &str) -> Option<String> {
+    if text.contains('@')
+        && !text.contains(char::is_whitespace)
+        && !text.contains('<')
+        && !text.contains('>')
+    {
+        Some(text.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn display_name_is_an_address(name: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in name.chars() {
+        if escaped {
+            escaped = false;
+            continue;
         }
-        return None;
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '@' | '<' | '>' if !quoted => return true,
+            _ => {}
+        }
     }
-    if text.contains('@') && !text.contains(char::is_whitespace) && !text.contains('<') {
-        return Some(text.to_ascii_lowercase());
-    }
-    None
+    quoted || escaped
 }
 
 pub fn parse_address_line(line: &str) -> Result<Vec<String>, String> {
@@ -543,6 +595,27 @@ mod tests {
         );
         assert_eq!(parsed.body, "Body in markdown.\n");
         assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
+    }
+
+    #[test]
+    fn a_second_angle_address_is_not_a_display_name() {
+        for raw in [
+            "Ada <ada@example.com> <evil@example.com>",
+            "ada@example.com<evil@example.com>",
+            "Ada <ada@example.com> <evil@example.com>",
+        ] {
+            assert!(mailbox_parts(raw).is_none(), "{raw}");
+            assert!(!valid_address(raw), "{raw}");
+            assert!(parse_address_line(raw).is_err(), "{raw}");
+        }
+        assert_eq!(
+            mailbox_parts("Ada <ada@example.com>").unwrap().1,
+            "ada@example.com"
+        );
+        assert_eq!(
+            email_of("\"Predmore, Ada\" <ada@example.com>").as_deref(),
+            Some("ada@example.com")
+        );
     }
 
     #[test]

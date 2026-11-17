@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::send::Draft;
 
-use super::frontmatter::DraftFields;
+use super::frontmatter::{DraftFields, mailbox_parts};
 use super::markdown::{doc_to_html, markdown_to_doc};
 
 static TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -297,32 +297,14 @@ fn encode_addresses(addresses: &[String]) -> String {
 }
 
 fn encode_address(raw: &str) -> String {
-    let (name, email) = split_address(raw);
+    let Some((name, email)) = mailbox_parts(raw) else {
+        return encode_phrase(raw);
+    };
     let email = strip_breaks(&email);
     match name {
         Some(name) => format!("{} <{email}>", encode_phrase(&name)),
         None => email,
     }
-}
-
-fn split_address(raw: &str) -> (Option<String>, String) {
-    let text = raw.trim();
-    if let Some(start) = text.rfind('<') {
-        let after = &text[start + 1..];
-        if let Some(end) = after.find('>') {
-            let email = after[..end].trim().to_string();
-            let name = text[..start].trim().trim_matches('"').trim();
-            if email.contains('@') {
-                let name = if name.is_empty() {
-                    None
-                } else {
-                    Some(name.to_string())
-                };
-                return (name, email);
-            }
-        }
-    }
-    (None, text.to_string())
 }
 
 fn encode_phrase(name: &str) -> String {
@@ -530,6 +512,28 @@ mod tests {
     use super::*;
     use crate::AccountId;
     use mail_parser::MessageParser;
+
+    #[test]
+    fn a_second_angle_address_is_not_encoded_as_the_mailbox() {
+        for raw in [
+            "Ada <ada@example.com> <evil@example.com>",
+            "ada@example.com<evil@example.com>",
+        ] {
+            let encoded = encode_address(raw);
+            assert!(
+                encoded.starts_with('"') && encoded.ends_with('"'),
+                "{raw} -> {encoded}"
+            );
+            assert!(
+                !encoded.ends_with("<evil@example.com>"),
+                "{raw} -> {encoded}"
+            );
+        }
+        assert_eq!(
+            encode_address("Ada <ada@example.com>"),
+            "Ada <ada@example.com>"
+        );
+    }
 
     fn fields() -> DraftFields {
         DraftFields {

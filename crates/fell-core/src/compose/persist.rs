@@ -70,6 +70,39 @@ impl Store {
         Ok(())
     }
 
+    /// Update the draft text and leave stored attachment bytes in place.
+    pub fn save_compose_text(&self, draft: &StoredCompose) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO compose_drafts (
+                id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                subject, body, in_reply_to, updated_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                from_addr = excluded.from_addr,
+                to_addrs = excluded.to_addrs,
+                cc_addrs = excluded.cc_addrs,
+                bcc_addrs = excluded.bcc_addrs,
+                subject = excluded.subject,
+                body = excluded.body,
+                in_reply_to = excluded.in_reply_to,
+                updated_unix = excluded.updated_unix",
+            params![
+                draft.id,
+                draft.account_id.as_str(),
+                draft.fields.from,
+                join_list(&draft.fields.to),
+                join_list(&draft.fields.cc),
+                join_list(&draft.fields.bcc),
+                draft.fields.subject,
+                draft.body,
+                draft.fields.in_reply_to,
+                now_unix(),
+            ],
+        )?;
+        self.seal_private_files()?;
+        Ok(())
+    }
+
     pub fn load_compose(&self, id: &str) -> Result<Option<StoredCompose>> {
         let row = self
             .conn

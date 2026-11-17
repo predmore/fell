@@ -315,6 +315,9 @@ impl ComposeView {
         if id == self.draft_id.as_ref() {
             return;
         }
+        if self.field != Field::Body {
+            let _ = self.commit_field(self.field);
+        }
         let Some((folder, snap)) = self.hub.with_session(&id, |session| {
             session.open_for_edit();
             (session.folder().to_path_buf(), session.snapshot())
@@ -599,20 +602,7 @@ impl ComposeView {
     }
 
     fn run_palette(&mut self, query: &str) {
-        let query = query.trim().to_ascii_lowercase();
-        let action = [
-            ("send", "send"),
-            ("preview", "preview"),
-            ("raw", "raw"),
-            ("quote", "quote"),
-            ("theme", "theme"),
-            ("keep", "keep"),
-            ("reject", "reject"),
-            ("undo", "undo"),
-        ]
-        .into_iter()
-        .find(|(name, _)| name.contains(&query) || query.is_empty() && *name == "send");
-        if let Some((_, action)) = action {
+        if let Some(action) = palette_action(query) {
             self.run_action(action);
         }
     }
@@ -1883,6 +1873,25 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
+fn palette_action(query: &str) -> Option<&'static str> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for name in [
+        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo",
+    ] {
+        if name.starts_with(&query) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(name);
+        }
+    }
+    found
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1944,6 +1953,21 @@ pub fn open_demo(
 mod tests {
     use super::cursor_line_covered;
     use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn a_substring_of_send_is_not_a_send_command() {
+        assert_eq!(super::palette_action("d"), None);
+        assert_eq!(super::palette_action("e"), None);
+        assert_eq!(super::palette_action("n"), None);
+        assert_eq!(super::palette_action("end"), None);
+        assert_eq!(super::palette_action(""), None);
+        assert_eq!(super::palette_action("s"), Some("send"));
+        assert_eq!(super::palette_action("send"), Some("send"));
+        assert_eq!(super::palette_action("se"), Some("send"));
+        assert_eq!(super::palette_action("r"), None);
+        assert_eq!(super::palette_action("re"), Some("reject"));
+        assert_eq!(super::palette_action("raw"), Some("raw"));
+    }
 
     #[test]
     fn empty_and_trailing_blank_lines_match_the_session() {

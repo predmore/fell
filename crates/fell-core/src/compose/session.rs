@@ -104,6 +104,8 @@ pub struct DraftSession {
     store_path: Option<PathBuf>,
     /// When the latest unflushed editor change was armed. `None` when the file is current.
     outbound_since: Option<u64>,
+    /// Path, length, and mtime of attachments last copied into the mailbox.
+    attachment_stamp: Vec<(String, u64, u128)>,
     pending: Option<String>,
     pending_delete: bool,
     pending_since: u64,
@@ -144,6 +146,7 @@ impl DraftSession {
             settled: String::new(),
             store_path: None,
             outbound_since: None,
+            attachment_stamp: Vec::new(),
             pending: None,
             pending_delete: false,
             pending_since: 0,
@@ -488,7 +491,7 @@ impl DraftSession {
         Ok(())
     }
 
-    fn persist_mailbox(&self) {
+    fn persist_mailbox(&mut self) {
         let path = self
             .store_path
             .clone()
@@ -499,14 +502,21 @@ impl DraftSession {
         let Ok(store) = crate::Store::open(&path) else {
             return;
         };
-        let files = workspace::resolve_closure(&self.folder, &self.fields, &self.body).files;
-        let _ = store.save_compose(&persist::StoredCompose {
+        let draft = persist::StoredCompose {
             id: self.id.clone(),
             account_id: self.account_id.clone(),
             fields: self.fields.clone(),
             body: self.body.clone(),
-            files,
-        });
+            files: Vec::new(),
+        };
+        let stamp = attachment_stamp(&self.folder, &self.fields, &self.body);
+        if stamp == self.attachment_stamp {
+            let _ = store.save_compose_text(&draft);
+            return;
+        }
+        let files = workspace::resolve_closure(&self.folder, &self.fields, &self.body).files;
+        let _ = store.save_compose(&persist::StoredCompose { files, ..draft });
+        self.attachment_stamp = stamp;
     }
 
     pub fn closure(&self) -> Closure {
@@ -813,6 +823,22 @@ impl DraftSession {
     }
 }
 
+fn attachment_stamp(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64, u128)> {
+    let (files, _) = workspace::list_closure(folder, fields, body);
+    let mut stamp = Vec::new();
+    for file in files {
+        let mtime = std::fs::metadata(folder.join(&file.path))
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        stamp.push((file.path, file.len, mtime));
+    }
+    stamp.sort();
+    stamp
+}
+
 fn hunk_view(hunk: &Hunk, text: &str) -> Option<HunkView> {
     if hunk.inserted.is_empty() {
         return None;
@@ -1025,6 +1051,36 @@ mod tests {
         assert!(!ada.fresh, "a mailed address is not new");
         assert!(!own.fresh, "the account address is not new");
         assert!(fresh.fresh, "an address this account has not mailed is new");
+    }
+
+    #[test]
+    fn a_body_edit_does_not_reread_unchanged_attachments() {
+        let (root, mut session) = temp_session("see ![chart](chart.png)\n");
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: AccountId("local".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        fs::write(session.folder().join("chart.png"), b"png-bytes").unwrap();
+        session.bind_store(&db);
+        session.flush().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE compose_attachments SET bytes = ?1 WHERE draft_id = ?2",
+                rusqlite::params![b"stale".as_slice(), session.id()],
+            )
+            .unwrap();
+        session.set_body_from_user("edited ![chart](chart.png)\n".into());
+        session.flush().unwrap();
+        let loaded = store.load_compose(session.id()).unwrap().unwrap();
+        assert!(loaded.body.contains("edited"), "{}", loaded.body);
+        assert_eq!(loaded.files[0].bytes, b"stale");
     }
 
     #[test]
