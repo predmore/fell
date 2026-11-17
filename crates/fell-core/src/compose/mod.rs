@@ -3,12 +3,14 @@
 //! Nothing in this module transmits mail. The GPUI editor is the only caller
 //! that may turn a prepared draft into a [`crate::PendingSend`].
 
+mod digest;
 mod frontmatter;
 mod hub;
 mod markdown;
 mod merge;
 mod mime;
 mod persist;
+mod review;
 mod session;
 mod workspace;
 mod writer;

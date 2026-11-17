@@ -19,6 +19,10 @@ pub struct MergeHunk {
     pub kind: HunkKind,
     pub previous: String,
     pub inserted: String,
+    /// Byte range of `previous` in the normalized `ours` text. The merged
+    /// text puts `inserted` there; ranges do not overlap.
+    pub old_start: usize,
+    pub old_end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +89,10 @@ pub fn merge_draft(base: &str, ours: &str, theirs: &str) -> MergeOutcome {
             continue;
         }
         let previous_ours = slice_lines(&our_lines, start, end);
+        // Edits run from the end, so the lines before `start` are still
+        // the lines of `ours`.
+        let old_start: usize = our_lines[..start].iter().map(String::len).sum();
+        let old_end = old_start + previous_ours.len();
         let replacement = split_keep(&inserted);
         our_lines.splice(start..end, replacement);
         if previous_ours != inserted {
@@ -92,6 +100,8 @@ pub fn merge_draft(base: &str, ours: &str, theirs: &str) -> MergeOutcome {
                 kind: classify(&inserted),
                 previous: previous_ours,
                 inserted,
+                old_start,
+                old_end,
             });
         }
     }
@@ -169,7 +179,7 @@ pub fn find_unique(haystack: &str, needle: &str) -> Result<usize, &'static str> 
     found.ok_or("the text you tried to edit has changed")
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -260,7 +270,7 @@ fn slice_lines(lines: &[String], start: usize, end: usize) -> String {
     lines.get(start..end).unwrap_or(&[]).concat()
 }
 
-fn classify(inserted: &str) -> HunkKind {
+pub(crate) fn classify(inserted: &str) -> HunkKind {
     let mut kind = HunkKind::Body;
     for line in inserted.lines() {
         let trimmed = line.trim();
@@ -314,6 +324,21 @@ mod tests {
         assert!(merged.text.contains("ALPHA"), "{}", merged.text);
         assert!(merged.text.contains("BETA"), "{}", merged.text);
         assert_eq!(merged.hunks.len(), 1);
+    }
+
+    #[test]
+    fn hunk_ranges_point_into_ours() {
+        let base = "---\nsubject: \"a\"\n---\none\ntwo\nthree\nfour\n";
+        let ours = base.replace("one", "ONE ONE");
+        let theirs = base.replace("two", "2").replace("four", "4\n4");
+        let merged = merge_draft(base, &ours, &theirs);
+        assert_eq!(merged.hunks.len(), 2, "{merged:?}");
+        let mut rebuilt = ours.clone();
+        for hunk in merged.hunks.iter().rev() {
+            assert_eq!(&ours[hunk.old_start..hunk.old_end], hunk.previous);
+            rebuilt.replace_range(hunk.old_start..hunk.old_end, &hunk.inserted);
+        }
+        assert_eq!(rebuilt, merged.text);
     }
 
     #[test]

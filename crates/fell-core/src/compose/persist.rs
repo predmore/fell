@@ -26,25 +26,64 @@ pub struct StoredCompose {
     pub owner: String,
 }
 
+/// Agent hunks waiting for review, and the serialized draft their byte
+/// ranges point into. Kept in the mailbox, beside the compose row it is
+/// saved with, because the draft folder and its neighbours are writable by
+/// the agents being reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredReview {
+    pub text: String,
+    pub hunks: String,
+    pub next_hunk: u64,
+}
+
+const REVIEW_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS compose_review (
+    draft_id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    hunks TEXT NOT NULL,
+    next_hunk INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
+);
+";
+
+const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
+        id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
+        subject, body, in_reply_to, identities, owner, updated_unix
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+     ON CONFLICT(id) DO UPDATE SET
+        from_addr = excluded.from_addr,
+        to_addrs = excluded.to_addrs,
+        cc_addrs = excluded.cc_addrs,
+        bcc_addrs = excluded.bcc_addrs,
+        subject = excluded.subject,
+        body = excluded.body,
+        in_reply_to = excluded.in_reply_to,
+        identities = excluded.identities,
+        owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
+        updated_unix = excluded.updated_unix";
+
 impl Store {
     pub fn save_compose(&self, draft: &StoredCompose) -> Result<()> {
+        self.save_compose_parts(draft, Some(&draft.files), None)
+    }
+
+    /// Update the draft text and leave stored attachment bytes in place.
+    pub fn save_compose_text(&self, draft: &StoredCompose) -> Result<()> {
+        self.save_compose_parts(draft, None, None)
+    }
+
+    /// One transaction: the compose row, the attachment bytes when `files`
+    /// is given, and the review state when `review` is given.
+    pub(crate) fn save_compose_parts(
+        &self,
+        draft: &StoredCompose,
+        files: Option<&[ResolvedFile]>,
+        review: Option<&StoredReview>,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO compose_drafts (
-                id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                subject, body, in_reply_to, identities, owner, updated_unix
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET
-                from_addr = excluded.from_addr,
-                to_addrs = excluded.to_addrs,
-                cc_addrs = excluded.cc_addrs,
-                bcc_addrs = excluded.bcc_addrs,
-                subject = excluded.subject,
-                body = excluded.body,
-                in_reply_to = excluded.in_reply_to,
-                identities = excluded.identities,
-                owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
-                updated_unix = excluded.updated_unix",
+            UPSERT_COMPOSE,
             params![
                 draft.id,
                 draft.account_id.as_str(),
@@ -60,15 +99,34 @@ impl Store {
                 now_unix(),
             ],
         )?;
-        tx.execute(
-            "DELETE FROM compose_attachments WHERE draft_id = ?1",
-            params![draft.id],
-        )?;
-        for file in &draft.files {
+        if let Some(files) = files {
             tx.execute(
-                "INSERT INTO compose_attachments (draft_id, path, name, bytes)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![draft.id, file.path, file.display_name, file.bytes],
+                "DELETE FROM compose_attachments WHERE draft_id = ?1",
+                params![draft.id],
+            )?;
+            for file in files {
+                tx.execute(
+                    "INSERT INTO compose_attachments (draft_id, path, name, bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![draft.id, file.path, file.display_name, file.bytes],
+                )?;
+            }
+        }
+        if let Some(review) = review {
+            tx.execute_batch(REVIEW_SCHEMA)?;
+            tx.execute(
+                "INSERT INTO compose_review (draft_id, text, hunks, next_hunk)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(draft_id) DO UPDATE SET
+                    text = excluded.text,
+                    hunks = excluded.hunks,
+                    next_hunk = excluded.next_hunk",
+                params![
+                    draft.id,
+                    review.text,
+                    review.hunks,
+                    i64::try_from(review.next_hunk).unwrap_or(i64::MAX),
+                ],
             )?;
         }
         tx.commit()?;
@@ -76,41 +134,34 @@ impl Store {
         Ok(())
     }
 
-    /// Update the draft text and leave stored attachment bytes in place.
-    pub fn save_compose_text(&self, draft: &StoredCompose) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO compose_drafts (
-                id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                subject, body, in_reply_to, identities, owner, updated_unix
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET
-                from_addr = excluded.from_addr,
-                to_addrs = excluded.to_addrs,
-                cc_addrs = excluded.cc_addrs,
-                bcc_addrs = excluded.bcc_addrs,
-                subject = excluded.subject,
-                body = excluded.body,
-                in_reply_to = excluded.in_reply_to,
-                identities = excluded.identities,
-                owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
-                updated_unix = excluded.updated_unix",
-            params![
-                draft.id,
-                draft.account_id.as_str(),
-                draft.fields.from,
-                join_list(&draft.fields.to),
-                join_list(&draft.fields.cc),
-                join_list(&draft.fields.bcc),
-                draft.fields.subject,
-                draft.body,
-                draft.fields.in_reply_to,
-                join_list(&draft.identities),
-                draft.owner,
-                now_unix(),
-            ],
-        )?;
-        self.seal_private_files()?;
-        Ok(())
+    /// The review state saved with this draft, if Fell has saved one.
+    pub(crate) fn load_compose_review(&self, id: &str) -> Result<Option<StoredReview>> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compose_review'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT text, hunks, next_hunk FROM compose_review WHERE draft_id = ?1",
+                params![id],
+                |row| {
+                    Ok(StoredReview {
+                        text: row.get(0)?,
+                        hunks: row.get(1)?,
+                        next_hunk: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(1),
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn load_compose(&self, id: &str) -> Result<Option<StoredCompose>> {

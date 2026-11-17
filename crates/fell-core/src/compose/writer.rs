@@ -1,8 +1,8 @@
 //! Draft writes off the lock that the editor paints from.
 //!
 //! A live draft is shared by the compose window, the agent socket, and the
-//! file watcher through one mutex. Writing `draft.md` (with fsync), the hunk
-//! file, and the mailbox row under that mutex made the window wait for disk
+//! file watcher through one mutex. Writing `draft.md` (with fsync) and the
+//! mailbox row under that mutex made the window wait for disk
 //! on every save and on every agent edit. A [`DraftWriter`] owns one thread
 //! per live draft: [`super::DraftSession::flush`] serializes the draft under
 //! the lock and hands the text here, and this thread does the I/O in order.
@@ -14,14 +14,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use super::persist::{self, StoredCompose};
-use super::workspace;
+use super::persist::{self, StoredCompose, StoredReview};
+use super::workspace::{self, FileStamp};
 
 /// Everything one save writes. Built under the session lock, run without it.
 pub(crate) struct SaveJob {
     pub folder: PathBuf,
     pub text: String,
-    pub hunks_json: String,
     pub mailbox: Option<MailboxSave>,
 }
 
@@ -30,22 +29,24 @@ pub(crate) struct SaveJob {
 pub(crate) struct MailboxSave {
     pub store_path: Option<PathBuf>,
     pub draft: StoredCompose,
+    /// Hunks and the text they point into, saved in the same transaction.
+    pub review: StoredReview,
 }
 
 /// The attachment stamp last copied into the mailbox, kept between saves.
 #[derive(Default)]
 pub(crate) struct SaveCache {
-    attachment_stamp: Vec<(String, u64, u128)>,
+    attachment_stamp: Vec<(String, FileStamp)>,
 }
 
 impl SaveJob {
-    /// Write the draft file, the hunk file, then the mailbox row. `Err`
-    /// means `draft.md` was not replaced.
+    /// Write the draft file, then the mailbox row. `Err` means `draft.md`
+    /// was not replaced.
     pub(crate) fn run(self, cache: &mut SaveCache) -> Result<(), String> {
         workspace::write_draft_file(&self.folder, &self.text)?;
-        let control = workspace::control_dir(&self.folder);
-        let _ = std::fs::create_dir_all(&control);
-        let _ = std::fs::write(control.join("hunks.json"), self.hunks_json);
+        // Older builds kept hunks here, where agents can write. Nothing
+        // reads it now; the mailbox holds them.
+        let _ = std::fs::remove_file(workspace::control_dir(&self.folder).join("hunks.json"));
         if let Some(mailbox) = self.mailbox {
             persist_mailbox(&self.folder, mailbox, cache);
         }
@@ -67,13 +68,14 @@ fn persist_mailbox(folder: &Path, mailbox: MailboxSave, cache: &mut SaveCache) {
         return;
     };
     let draft = mailbox.draft;
+    let review = Some(&mailbox.review);
     let stamp = super::session::attachment_stamp(folder, &draft.fields, &draft.body);
     if stamp == cache.attachment_stamp {
-        let _ = store.save_compose_text(&draft);
+        let _ = store.save_compose_parts(&draft, None, review);
     } else {
         let files = workspace::resolve_closure(folder, &draft.fields, &draft.body).files;
         if store
-            .save_compose(&StoredCompose { files, ..draft })
+            .save_compose_parts(&draft, Some(&files), review)
             .is_ok()
         {
             cache.attachment_stamp = stamp;
