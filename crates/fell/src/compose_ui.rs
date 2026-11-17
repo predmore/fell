@@ -105,6 +105,28 @@ struct Editor {
 }
 
 impl Editor {
+    /// After the text under the editor changed, put the cursor back on the
+    /// line it was on: the same row if that row still holds `line`, else the
+    /// one row that does. False when there is no such single row.
+    fn follow_line(&mut self, line: &str) -> bool {
+        if self.lines.get(self.row).is_some_and(|row| row == line) {
+            return true;
+        }
+        let mut matches = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.as_str() == line);
+        match (matches.next(), matches.next()) {
+            (Some((row, _)), None) => {
+                self.row = row;
+                self.clamp();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn from_body(body: &str) -> Self {
         let source = body.strip_suffix('\n').unwrap_or(body);
         let lines: Vec<String> = if source.is_empty() {
@@ -283,6 +305,7 @@ impl ComposeView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.editor.mode = Mode::Normal;
+                this.end_insert();
                 this.status = "i insert".into();
                 cx.notify();
             });
@@ -324,6 +347,7 @@ impl ComposeView {
         if self.field != Field::Body {
             let _ = self.commit_field(self.field);
         }
+        self.end_insert();
         let Some((folder, snap)) = self.hub.with_session(&id, |session| {
             session.open_for_edit();
             (session.folder().to_path_buf(), session.snapshot())
@@ -343,6 +367,7 @@ impl ComposeView {
         self.bcc_line = join_addrs(&snap.bcc);
         self.subject_line = snap.subject;
         self.sent = false;
+        self.quote_open = false;
         self.status = "i insert".into();
     }
 
@@ -363,6 +388,8 @@ impl ComposeView {
             self.editor.col = col;
             self.editor.mode = mode;
             self.editor.clamp();
+            // Text from outside starts a new undo step for the next keystroke.
+            self.end_insert();
             changed = true;
         }
         if self.field != Field::To {
@@ -405,16 +432,24 @@ impl ComposeView {
 
     fn push_body(&mut self) {
         let body = self.editor.text();
+        let mode = self.editor.mode;
         let id = self.draft_id.to_string();
         if let Some(revision) = self.hub.with_session(&id, |session| {
-            session.set_body_from_user(body);
-            session.end_user_change();
+            record_body(session, body, mode);
             session.arm_outbound(now_ms());
             session.revision()
         }) {
             self.applied_revision = revision;
             self.flush_pending = true;
         }
+    }
+
+    /// Closes the undo group an insert burst kept open.
+    fn end_insert(&mut self) {
+        let id = self.draft_id.to_string();
+        let _ = self
+            .hub
+            .with_session(&id, |session| session.end_user_change());
     }
 
     fn arm_debounced_flush(&mut self, cx: &mut Context<Self>) {
@@ -581,8 +616,30 @@ impl ComposeView {
         }
     }
 
+    /// An agent edit can land between frames. Rebase the editor on it before
+    /// a key changes the buffer, or the stale text would overwrite it.
+    /// Returns false when the cursor's line is gone from the new text, so
+    /// the key must not be applied anywhere.
+    fn pull_if_stale(&mut self) -> bool {
+        let id = self.draft_id.to_string();
+        let revision = self.hub.with_session(&id, |session| session.revision());
+        if !revision.is_some_and(|revision| revision != self.applied_revision) {
+            return true;
+        }
+        let before = self.editor.lines.get(self.editor.row).cloned();
+        self.pull_unpainted();
+        match before {
+            Some(line) => self.editor.follow_line(&line),
+            None => true,
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        if self.field == Field::Body && !self.pull_if_stale() {
+            self.status = "the draft changed under the cursor; the key was not applied".into();
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
@@ -614,6 +671,7 @@ impl ComposeView {
             self.editor.mode = Mode::Normal;
             self.editor.anchor = None;
             self.field = Field::Body;
+            self.end_insert();
             self.status = "normal".into();
             return;
         }
@@ -678,7 +736,7 @@ impl ComposeView {
                 self.raw = !self.raw;
                 self.status = if self.raw { "raw markdown" } else { "styled" }.into();
             }
-            "quote" => self.quote_open = !self.quote_open,
+            "quote" => self.toggle_quote(),
             "theme" => {
                 self.theme = match self.theme {
                     ThemeKind::Dark => ThemeKind::Light,
@@ -778,6 +836,7 @@ impl ComposeView {
             "escape" => {
                 self.editor.mode = Mode::Normal;
                 self.push_body();
+                self.end_insert();
                 self.status = "normal".into();
             }
             "backspace" => {
@@ -1048,7 +1107,10 @@ impl Render for ComposeView {
             .child(header(&snap, colors).flex_shrink_0())
             .child(self.fields_view(&snap, colors).flex_shrink_0())
             .child(self.body_view(&snap, colors))
-            .child(self.quote_view(colors).flex_shrink_0())
+            .children(
+                self.quote_view(&snap, colors)
+                    .map(|quote| quote.flex_shrink_0()),
+            )
             .child(attachment_row(&snap, colors).flex_shrink_0())
             .child(status_bar(mode, &send_label, &hint, &snap, colors, wide).flex_shrink_0())
             .children(self.which_visible.then(|| which_key(colors)))
@@ -1141,7 +1203,9 @@ impl ComposeView {
         column.child(body)
     }
 
-    fn quote_view(&self, colors: Palette) -> gpui::Div {
+    /// The quoted part stored on the draft. Absent when nothing is quoted.
+    fn quote_view(&self, snap: &Snapshot, colors: Palette) -> Option<gpui::Div> {
+        let html = stored_quote(snap)?;
         let label = if self.quote_open {
             "Quoted original"
         } else {
@@ -1156,12 +1220,23 @@ impl ComposeView {
             .border_color(rgb(colors.rule))
             .child(label);
         if self.quote_open {
-            let doc = html_to_doc(
-                "<p>Earlier note on the quarter.</p><ul><li>Revenue</li></ul><blockquote><p>Keep the margin.</p></blockquote>",
-            );
-            block = block.child(render_doc(&doc, &self.folder, colors));
+            block = block.child(render_doc(&html_to_doc(html), &self.folder, colors));
         }
-        block
+        Some(block)
+    }
+
+    fn toggle_quote(&mut self) {
+        let id = self.draft_id.to_string();
+        let quoted = self
+            .hub
+            .with_session(&id, |session| stored_quote(&session.snapshot()).is_some())
+            .unwrap_or(false);
+        if quoted {
+            self.quote_open = !self.quote_open;
+        } else {
+            self.quote_open = false;
+            self.status = "nothing quoted".into();
+        }
     }
 }
 
@@ -1394,41 +1469,88 @@ fn styled_body(
 ) -> gpui::Div {
     let text = editor.text();
     let doc = markdown_to_doc(&text);
-    let cursor_at_col = cursor_byte(&text, editor.row, editor.col);
-    let cursor_at = cursor_byte(&text, editor.row, 0);
-    let mut caret_placed = cursor_line_covered(&text, editor.row, &doc);
-    let mut column = div().flex().flex_col().gap_2();
-    if doc.blocks.is_empty() {
-        return column.child(cursor_line_row(editor, colors));
-    }
-    for block in &doc.blocks {
-        if !caret_placed && block.source.is_some_and(|(start, _)| cursor_at < start) {
-            column = column.child(cursor_line_row(editor, colors));
-            caret_placed = true;
-        }
-        let on_cursor = block
-            .source
-            .is_some_and(|(start, end)| cursor_at_col >= start && cursor_at_col <= end);
-        let edited = block.source.is_some_and(|(start, end)| {
-            hunks
-                .iter()
-                .any(|(hunk_start, hunk_end)| start < *hunk_end && end > *hunk_start)
-        });
-        let painted = if on_cursor || block.source.is_none() && editor.row == 0 {
-            raw_source_block(block, &text, editor, colors)
-        } else {
-            render_block(block, folder, colors)
+    let mut column = div().flex().flex_col();
+    let mut previous: Option<&BlockBody> = None;
+    for (index, item) in body_layout(&text, editor.row, editor.col, &doc)
+        .into_iter()
+        .enumerate()
+    {
+        let (body, mut painted) = match item {
+            BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
+            BodyItem::Block { index, raw } => {
+                let block = &doc.blocks[index];
+                let edited = block.source.is_some_and(|(start, end)| {
+                    hunks
+                        .iter()
+                        .any(|(hunk_start, hunk_end)| start < *hunk_end && end > *hunk_start)
+                });
+                let painted = if raw {
+                    raw_source_block(block, &text, editor, colors)
+                } else {
+                    render_block(block, folder, colors)
+                };
+                let painted = if edited {
+                    div().w_full().bg(rgb(colors.hunk)).child(painted)
+                } else {
+                    painted
+                };
+                // A block in source form spaces like text, not like an image.
+                ((!raw).then_some(&block.body), painted)
+            }
         };
-        column = column.child(if edited {
-            div().w_full().bg(rgb(colors.hunk)).child(painted)
-        } else {
-            painted
-        });
-    }
-    if !caret_placed {
-        column = column.child(cursor_line_row(editor, colors));
+        if index > 0 && !joins_previous(previous, body) {
+            painted = painted.mt_2();
+        }
+        previous = body;
+        column = column.child(painted);
     }
     column
+}
+
+/// One row of the styled body, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyItem {
+    /// The cursor line when no block covers it, such as a blank line.
+    CaretRow,
+    /// A block of the document, in source form when it holds the cursor.
+    Block { index: usize, raw: bool },
+}
+
+fn body_layout(text: &str, row: usize, col: usize, doc: &StyledDoc) -> Vec<BodyItem> {
+    let cursor_at_col = cursor_byte(text, row, col);
+    let cursor_at = cursor_byte(text, row, 0);
+    let mut caret_placed = cursor_line_covered(text, row, doc);
+    let mut items = Vec::with_capacity(doc.blocks.len() + 1);
+    for (index, block) in doc.blocks.iter().enumerate() {
+        if !caret_placed && block.source.is_some_and(|(start, _)| cursor_at < start) {
+            items.push(BodyItem::CaretRow);
+            caret_placed = true;
+        }
+        let raw = match block.source {
+            Some(range) => block_holds_cursor(range, cursor_at_col, text.len()),
+            None => row == 0,
+        };
+        items.push(BodyItem::Block { index, raw });
+    }
+    if !caret_placed {
+        items.push(BodyItem::CaretRow);
+    }
+    items
+}
+
+/// A block's source range runs up to the first byte of the next line, so its
+/// end is exclusive: the cursor there belongs to the next line. The end byte
+/// counts only at the end of the buffer, where no next line exists.
+fn block_holds_cursor((start, end): (usize, usize), cursor: usize, len: usize) -> bool {
+    cursor >= start && (cursor < end || cursor == end && end == len)
+}
+
+/// An image directly under a quote sits against it, without the block gap.
+fn joins_previous(previous: Option<&BlockBody>, next: Option<&BlockBody>) -> bool {
+    matches!(
+        (previous, next),
+        (Some(BlockBody::Quote { .. }), Some(BlockBody::Image { .. }))
+    )
 }
 
 fn cursor_line_covered(text: &str, row: usize, doc: &StyledDoc) -> bool {
@@ -1668,9 +1790,15 @@ fn caret(colors: Palette, mode: Mode) -> gpui::Div {
 }
 
 fn render_doc(doc: &StyledDoc, folder: &Path, colors: Palette) -> gpui::Div {
-    let mut column = div().flex().flex_col().gap_2();
+    let mut column = div().flex().flex_col();
+    let mut previous = None;
     for block in &doc.blocks {
-        column = column.child(render_block(block, folder, colors));
+        let mut painted = render_block(block, folder, colors);
+        if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
+            painted = painted.mt_2();
+        }
+        previous = Some(&block.body);
+        column = column.child(painted);
     }
     column
 }
@@ -1748,12 +1876,19 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
                     .rounded_sm()
                     .child(text.clone()),
             ),
-            fell_core::compose::Inline::Link { text, .. } => row.child(
-                div()
-                    .text_color(rgb(colors.accent))
-                    .underline()
-                    .child(text.clone()),
-            ),
+            fell_core::compose::Inline::Link { text, href } => row
+                .child(
+                    div()
+                        .text_color(rgb(colors.accent))
+                        .underline()
+                        .child(text.clone()),
+                )
+                .children(link_target(text, href).map(|target| {
+                    div()
+                        .pl(px(4.))
+                        .text_color(rgb(colors.marker))
+                        .child(target)
+                })),
             fell_core::compose::Inline::Image { alt, .. } => row.child(div().child(alt.clone())),
         };
     }
@@ -2170,6 +2305,31 @@ fn empty_snapshot(id: &str) -> Snapshot {
     }
 }
 
+/// Stores the editor text. One insert burst is one undo step: the group the
+/// first keystroke opened stays open until the insert ends.
+fn record_body(session: &mut fell_core::compose::DraftSession, body: String, mode: Mode) {
+    session.set_body_from_user(body);
+    if mode != Mode::Insert {
+        session.end_user_change();
+    }
+}
+
+fn stored_quote(snap: &Snapshot) -> Option<&str> {
+    snap.quoted
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+}
+
+/// The destination shown after a link label, so a changed URL is visible
+/// before send. Omitted when the label already is the URL.
+fn link_target(text: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href == text.trim() {
+        return None;
+    }
+    Some(format!("({href})"))
+}
+
 fn canonical_body(body: &str) -> String {
     if body.is_empty() || body == "\n" {
         return "\n".to_string();
@@ -2239,6 +2399,11 @@ pub fn demo_body() -> &'static str {
     "# Q3 numbers\n\nThe quarter closed **ahead** of plan. See the [board note](https://example.com/q3).\n\nShip the `q3` figure, and keep it in *draft*.\n\n- Revenue up\n- Margin held\n\n> A quote from the last review\n\n![chart](chart.png)\n"
 }
 
+/// The demo draft's quoted part. Real drafts paint what the session stores.
+fn demo_quote() -> &'static str {
+    "<p>Earlier note on the quarter.</p><ul><li>Revenue</li></ul><blockquote><p>Keep the margin.</p></blockquote>"
+}
+
 pub fn open_demo(
     root: PathBuf,
     theme: ThemeKind,
@@ -2270,6 +2435,7 @@ pub fn open_demo(
     )?;
     session.open_for_edit();
     session.set_known_recipients(["jon@example.com".into()].into_iter().collect());
+    session.set_quote(Some(demo_quote().into()));
     let hub = Arc::new(DraftHub::new());
     hub.insert(session);
     let _ = theme;
@@ -2278,7 +2444,7 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_line_covered;
+    use super::{Editor, cursor_line_covered};
     use fell_core::compose::markdown_to_doc;
 
     fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -2309,6 +2475,20 @@ mod tests {
         let tall = image.get_pixel(90, 20).0;
         let short = image.get_pixel(20, 20).0;
         assert_ne!(tall, short);
+    }
+
+    #[test]
+    fn the_tallest_demo_bar_is_inset_from_the_top_edge() {
+        let image = image::load_from_memory(&crate::png::chart_png())
+            .unwrap()
+            .to_rgba8();
+        let background = image.get_pixel(0, 0).0;
+        for y in 0..12 {
+            assert_eq!(image.get_pixel(160, y).0, background, "row {y}");
+        }
+        assert_ne!(image.get_pixel(160, 12).0, background);
+        let bottom = image.height() - 1;
+        assert_eq!(image.get_pixel(160, bottom).0, background);
     }
 
     #[test]
@@ -2447,5 +2627,213 @@ mod tests {
         assert!(cursor_line_covered(text, 2, &doc));
         let blank = markdown_to_doc("\n");
         assert!(!cursor_line_covered("\n", 0, &blank));
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "fell-compose-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn plain_session(tag: &str, body: &str) -> fell_core::compose::DraftSession {
+        let fields = fell_core::compose::DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hello".into(),
+            ..fell_core::compose::DraftFields::default()
+        };
+        let account = fell_core::AccountId("local".into());
+        let folder =
+            fell_core::compose::materialize_in(&temp_root(tag), tag, &fields, body, &account)
+                .unwrap();
+        fell_core::compose::DraftSession::create(folder, tag, account, fields, body).unwrap()
+    }
+
+    #[test]
+    fn one_undo_takes_back_a_whole_insert_burst() {
+        let before = "Ship it.\n";
+        let mut session = plain_session("undo", before);
+        let mut editor = super::Editor::from_body(before);
+        editor.row = 0;
+        editor.col = editor.lines[0].chars().count();
+        editor.mode = super::Mode::Insert;
+        for ch in "hello".chars() {
+            editor.lines[0].push(ch);
+            editor.col += 1;
+            super::record_body(&mut session, editor.text(), editor.mode);
+        }
+        assert_eq!(session.body(), "Ship it.hello\n");
+        // Escape ends the insert.
+        editor.mode = super::Mode::Normal;
+        session.end_user_change();
+        assert!(session.undo());
+        assert_eq!(session.body(), before);
+        assert!(!session.undo(), "the burst was a single step");
+    }
+
+    #[test]
+    fn a_normal_mode_edit_is_its_own_undo_step() {
+        let mut session = plain_session("undo-normal", "abc\n");
+        super::record_body(&mut session, "bc\n".into(), super::Mode::Normal);
+        super::record_body(&mut session, "c\n".into(), super::Mode::Normal);
+        assert!(session.undo());
+        assert_eq!(session.body(), "bc\n");
+    }
+
+    #[test]
+    fn a_block_range_end_belongs_to_the_next_line() {
+        use super::block_holds_cursor;
+        // "# Q3\n" spans 0..5; byte 5 starts the next line.
+        assert!(block_holds_cursor((0, 5), 0, 12));
+        assert!(block_holds_cursor((0, 5), 4, 12));
+        assert!(!block_holds_cursor((0, 5), 5, 12));
+        assert!(!block_holds_cursor((6, 11), 5, 12));
+        // At the end of the buffer there is no next line to take the byte.
+        assert!(block_holds_cursor((0, 5), 5, 5));
+    }
+
+    #[test]
+    fn the_block_above_a_blank_cursor_line_keeps_its_style() {
+        use super::BodyItem::{Block, CaretRow};
+        let text = "# Q3\n\nNext\n";
+        let doc = markdown_to_doc(text);
+        assert_eq!(
+            super::body_layout(text, 1, 0, &doc),
+            vec![
+                Block {
+                    index: 0,
+                    raw: false
+                },
+                CaretRow,
+                Block {
+                    index: 1,
+                    raw: false
+                },
+            ]
+        );
+        assert_eq!(
+            super::body_layout(text, 0, 4, &doc),
+            vec![
+                Block {
+                    index: 0,
+                    raw: true
+                },
+                Block {
+                    index: 1,
+                    raw: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_byte_of_the_next_block_does_not_unstyle_the_one_above() {
+        use super::BodyItem::Block;
+        let text = "# Heading\nParagraph\n";
+        let doc = markdown_to_doc(text);
+        assert_eq!(doc.blocks.len(), 2);
+        assert_eq!(
+            super::body_layout(text, 1, 0, &doc),
+            vec![
+                Block {
+                    index: 0,
+                    raw: false
+                },
+                Block {
+                    index: 1,
+                    raw: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_and_empty_blank_lines_get_one_caret_row() {
+        use super::BodyItem::{Block, CaretRow};
+        let text = "hello\n\n";
+        let doc = markdown_to_doc(text);
+        assert_eq!(
+            super::body_layout(text, 1, 0, &doc),
+            vec![
+                Block {
+                    index: 0,
+                    raw: false
+                },
+                CaretRow
+            ]
+        );
+        let empty = markdown_to_doc("\n");
+        assert_eq!(super::body_layout("\n", 0, 0, &empty), vec![CaretRow]);
+    }
+
+    #[test]
+    fn an_image_under_a_quote_has_no_block_gap() {
+        let doc = markdown_to_doc("> A quote\n\n![chart](chart.png)\n\nAfter\n");
+        let [quote, image, after] = doc.blocks.as_slice() else {
+            panic!("three blocks");
+        };
+        assert!(super::joins_previous(Some(&quote.body), Some(&image.body)));
+        assert!(!super::joins_previous(Some(&image.body), Some(&after.body)));
+        assert!(!super::joins_previous(Some(&quote.body), Some(&after.body)));
+        assert!(!super::joins_previous(Some(&quote.body), None));
+        assert!(!super::joins_previous(None, Some(&image.body)));
+    }
+
+    #[test]
+    fn a_link_shows_where_it_goes() {
+        assert_eq!(
+            super::link_target("board note", "https://example.com/q3").as_deref(),
+            Some("(https://example.com/q3)")
+        );
+        assert_eq!(
+            super::link_target("https://example.com", "https://example.com"),
+            None
+        );
+        assert_eq!(super::link_target("empty", "  "), None);
+    }
+
+    #[test]
+    fn the_quoted_original_is_the_stored_quote() {
+        let mut session = plain_session("quote", "body\n");
+        assert_eq!(super::stored_quote(&session.snapshot()), None);
+        session.set_quote(Some("  \n".into()));
+        assert_eq!(super::stored_quote(&session.snapshot()), None);
+        session.set_quote(Some("<p>Original</p>".into()));
+        assert_eq!(
+            super::stored_quote(&session.snapshot()),
+            Some("<p>Original</p>")
+        );
+
+        let (hub, id, _) =
+            super::open_demo(temp_root("demo-quote"), super::ThemeKind::Dark).expect("demo draft");
+        let demo = hub.with_session(&id, |session| session.snapshot()).unwrap();
+        assert_eq!(super::stored_quote(&demo), Some(super::demo_quote()));
+    }
+
+    #[test]
+    fn the_cursor_follows_its_line_when_lines_appear_above() {
+        let mut editor = Editor::from_body("one\ntwo\nthree\n");
+        editor.row = 1;
+        editor.col = 2;
+        let line = editor.lines[editor.row].clone();
+        let mut moved = Editor::from_body("agent\nadded\none\ntwo\nthree\n");
+        moved.row = editor.row;
+        moved.col = editor.col;
+        assert!(moved.follow_line(&line));
+        assert_eq!(moved.lines[moved.row], "two");
+        // The line is gone, or now appears twice: do not guess.
+        let mut gone = Editor::from_body("one\nthree\n");
+        gone.row = 1;
+        assert!(!gone.follow_line("two"));
+        let mut twice = Editor::from_body("two\nx\ntwo\n");
+        twice.row = 1;
+        assert!(!twice.follow_line("two"));
     }
 }
