@@ -1,15 +1,15 @@
 //! Local embedding index for message bodies.
 //!
 //! Each message stores one vector in `message_embeddings`, in the same SQLite
-//! file as the mailbox and keyed by account. The vector is [`EMBEDDING_MODEL`],
-//! a feature hash implemented in this crate. There is no weight file, no
-//! extra embedding crate, and no network call.
+//! file as the mailbox and keyed by account. The active embedder is
+//! [`LocalHashV1`]. That is a placeholder: a lexical feature hash, not a
+//! semantic model. There is no weight file and no network call.
 //!
-//! [`spawn_indexer`] fills missing rows on a background thread, recent mail
-//! first. Opening the store, listing threads, and [`crate::Store::search`] do
-//! not compute vectors. A different model id replaces rows left by this one.
+//! Vectors store the embedder's model id and version. [`spawn_indexer`]
+//! replaces rows whose id or version differs, recent mail first, on a
+//! background thread. Opening the store, listing threads, and
+//! [`crate::Store::search`] do not compute vectors. This is not semantic search.
 
-#[cfg(test)]
 #[cfg(test)]
 use std::cell::Cell;
 use std::path::Path;
@@ -22,26 +22,90 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Error, Result};
 
-/// Id stored on every vector this embedder writes.
+/// Placeholder model id. This is a lexical feature hash, not a semantic model.
 ///
-/// This is code in this crate, not a downloaded or bundled weight file.
-/// Changing the hash, the dimension, or the tokenization requires a new id.
-/// The background indexer replaces rows whose id, dimension, or byte length differ.
+/// A real local model replaces this id. The indexer then rewrites stored rows.
 pub const EMBEDDING_MODEL: &str = "local-hash-v1";
 
-/// Length of [`embed_body`]. The stored blob is this many little-endian `f32`s.
+/// Placeholder version stored beside [`EMBEDDING_MODEL`].
+///
+/// Bump it when the hash or the dimension changes. Rows with another version
+/// are rewritten.
+pub const EMBEDDING_VERSION: &str = "1";
+
+/// Length of the [`LocalHashV1`] placeholder. The stored blob is this many
+/// little-endian `f32`s. A later model can use a different length.
 pub const EMBEDDING_DIMS: usize = 64;
+
+/// Model id and version stored on each vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedderId {
+    pub model: &'static str,
+    pub version: &'static str,
+}
+
+/// Turns one message body into a vector.
+///
+/// The index stores [`BodyEmbedder::id`] with the bytes. A new id or version
+/// makes the background indexer replace those rows.
+pub trait BodyEmbedder {
+    fn id(&self) -> EmbedderId;
+    fn dims(&self) -> usize;
+    fn embed(&self, body: &str) -> Vec<f32>;
+}
+
+/// Placeholder embedder. Lexical feature hash, not semantic search.
+///
+/// No weights, bundled or downloaded. The same letters produce the same vector.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalHashV1;
+
+impl BodyEmbedder for LocalHashV1 {
+    fn id(&self) -> EmbedderId {
+        EmbedderId {
+            model: EMBEDDING_MODEL,
+            version: EMBEDDING_VERSION,
+        }
+    }
+
+    fn dims(&self) -> usize {
+        EMBEDDING_DIMS
+    }
+
+    fn embed(&self, body: &str) -> Vec<f32> {
+        let mut values = vec![0.0f32; self.dims()];
+        let tokens = tokens(body);
+        for (index, token) in tokens.iter().enumerate() {
+            accumulate(&mut values, fnv_str(fnv_byte(FNV_OFFSET, 1), token));
+            accumulate_trigrams(&mut values, token);
+            if let Some(next) = tokens.get(index + 1) {
+                let hash = fnv_str(
+                    fnv_byte(fnv_str(fnv_byte(FNV_OFFSET, 2), token), 0xff),
+                    next,
+                );
+                accumulate(&mut values, hash);
+            }
+        }
+        normalize(&mut values);
+        values
+    }
+}
+
+fn active_embedder() -> LocalHashV1 {
+    LocalHashV1
+}
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
-const VECTOR_BYTES: i64 = (EMBEDDING_DIMS * 4) as i64;
 
 /// One stored body vector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embedding {
-    /// [`EMBEDDING_MODEL`] for vectors this crate writes.
+    /// [`EMBEDDING_MODEL`] for the placeholder. A later model stores its own id.
     pub model: String,
-    /// Little-endian `f32` values, length [`EMBEDDING_DIMS`] for the local model.
+    /// [`EMBEDDING_VERSION`] for the placeholder.
+    pub version: String,
+    /// Little-endian `f32` values.
     pub values: Vec<f32>,
 }
 
@@ -50,6 +114,7 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     account_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     model TEXT NOT NULL,
+    model_version TEXT NOT NULL DEFAULT '',
     dims INTEGER NOT NULL,
     body_hash TEXT NOT NULL,
     vector BLOB NOT NULL,
@@ -57,35 +122,48 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
 );
 "#;
 
-/// Feature-hash the body into a unit vector.
+/// Placeholder vector for `body`.
 ///
-/// Tokens are lowercase runs of letters and digits. The same letters produce
-/// the same vector. An empty body is the zero vector. This does not read the
-/// network or a model file.
+/// This is [`LocalHashV1`]: a lexical feature hash, not semantic search.
+/// Tokens are lowercase runs of letters and digits. An empty body is the zero
+/// vector. This does not read the network or a model file.
 pub fn embed_body(body: &str) -> Embedding {
-    let mut values = vec![0.0f32; EMBEDDING_DIMS];
-    let tokens = tokens(body);
-    for (index, token) in tokens.iter().enumerate() {
-        accumulate(&mut values, fnv_str(fnv_byte(FNV_OFFSET, 1), token));
-        accumulate_trigrams(&mut values, token);
-        if let Some(next) = tokens.get(index + 1) {
-            let hash = fnv_str(
-                fnv_byte(fnv_str(fnv_byte(FNV_OFFSET, 2), token), 0xff),
-                next,
-            );
-            accumulate(&mut values, hash);
-        }
-    }
-    normalize(&mut values);
+    let embedder = active_embedder();
+    let id = embedder.id();
     Embedding {
-        model: EMBEDDING_MODEL.to_string(),
-        values,
+        model: id.model.to_string(),
+        version: id.version.to_string(),
+        values: embedder.embed(body),
     }
 }
 
 /// Create the index table. This does not read message bodies.
 pub(crate) fn ensure_embedding_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBED_SCHEMA)?;
+    ensure_model_version_column(conn)?;
+    Ok(())
+}
+
+fn ensure_model_version_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(message_embeddings)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows {
+        if name? == "model_version" {
+            return Ok(());
+        }
+    }
+    drop(stmt);
+    if let Err(err) = conn.execute(
+        "ALTER TABLE message_embeddings
+         ADD COLUMN model_version TEXT NOT NULL DEFAULT ''",
+        [],
+    ) && !err
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate column")
+    {
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -179,42 +257,51 @@ pub(crate) fn sync_message_embedding(
     message_id: &str,
     body: &str,
 ) -> Result<()> {
+    let embedder = active_embedder();
+    let id = embedder.id();
     let hash = body_hash(body);
-    let existing: Option<(String, i64, String, i64)> = conn
+    let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
+    let expected_bytes = dims.saturating_mul(4);
+    let existing: Option<(String, String, i64, String, i64)> = conn
         .query_row(
-            "SELECT model, dims, body_hash, length(vector)
+            "SELECT model, model_version, dims, body_hash, length(vector)
              FROM message_embeddings
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    if let Some((model, dims, stored_hash, nbytes)) = existing
-        && model == EMBEDDING_MODEL
-        && dims == EMBEDDING_DIMS as i64
+    if let Some((model, version, stored_dims, stored_hash, nbytes)) = existing
+        && model == id.model
+        && version == id.version
+        && stored_dims == dims
         && stored_hash == hash
-        && nbytes == VECTOR_BYTES
+        && nbytes == expected_bytes
     {
         return Ok(());
     }
-    let embedding = embed_body(body);
-    let blob = encode_vector(&embedding.values);
+    let values = embedder.embed(body);
+    let blob = encode_vector(&values);
     conn.execute(
         "INSERT INTO message_embeddings (
-            account_id, message_id, model, dims, body_hash, vector
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            account_id, message_id, model, model_version, dims, body_hash, vector
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(account_id, message_id) DO UPDATE SET
             model = excluded.model,
+            model_version = excluded.model_version,
             dims = excluded.dims,
             body_hash = excluded.body_hash,
             vector = excluded.vector",
         params![
-            account_id,
-            message_id,
-            EMBEDDING_MODEL,
-            EMBEDDING_DIMS as i64,
-            hash,
-            blob
+            account_id, message_id, id.model, id.version, dims, hash, blob
         ],
     )?;
     Ok(())
@@ -230,23 +317,36 @@ pub(crate) fn invalidate_message_embedding(
     message_id: &str,
     body: &str,
 ) -> Result<()> {
+    let embedder = active_embedder();
+    let id = embedder.id();
     let hash = body_hash(body);
-    let existing: Option<(String, i64, String, i64)> = conn
+    let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
+    let expected_bytes = dims.saturating_mul(4);
+    let existing: Option<(String, String, i64, String, i64)> = conn
         .query_row(
-            "SELECT model, dims, body_hash, length(vector)
+            "SELECT model, model_version, dims, body_hash, length(vector)
              FROM message_embeddings
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((model, dims, stored_hash, nbytes)) = existing else {
+    let Some((model, version, stored_dims, stored_hash, nbytes)) = existing else {
         return Ok(());
     };
-    if model == EMBEDDING_MODEL
-        && dims == EMBEDDING_DIMS as i64
+    if model == id.model
+        && version == id.version
+        && stored_dims == dims
         && stored_hash == hash
-        && nbytes == VECTOR_BYTES
+        && nbytes == expected_bytes
     {
         return Ok(());
     }
@@ -270,15 +370,15 @@ pub(crate) fn load_embedding(
     account_id: &str,
     message_id: &str,
 ) -> Result<Option<Embedding>> {
-    let row: Option<(String, i64, Vec<u8>)> = conn
+    let row: Option<(String, String, i64, Vec<u8>)> = conn
         .query_row(
-            "SELECT model, dims, vector FROM message_embeddings
+            "SELECT model, model_version, dims, vector FROM message_embeddings
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(|(model, dims, blob)| decode_embedding(model, dims, &blob))
+    row.map(|(model, version, dims, blob)| decode_embedding(model, version, dims, &blob))
         .transpose()
 }
 
@@ -306,16 +406,21 @@ fn index_stale(conn: &Connection, limit: usize) -> Result<usize> {
            ON e.account_id = m.account_id AND e.message_id = m.message_id
          WHERE e.message_id IS NULL
             OR e.model != ?1
-            OR e.dims != ?2
-            OR length(e.vector) != ?3
+            OR e.model_version != ?2
+            OR e.dims != ?3
+            OR length(e.vector) != ?4
          ORDER BY m.date_unix DESC, m.rowid DESC
-         LIMIT ?4",
+         LIMIT ?5",
     )?;
+    let embedder = active_embedder();
+    let id = embedder.id();
+    let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
     let rows = stmt.query_map(
         params![
-            EMBEDDING_MODEL,
-            EMBEDDING_DIMS as i64,
-            VECTOR_BYTES,
+            id.model,
+            id.version,
+            dims,
+            dims.saturating_mul(4),
             i64::try_from(limit).unwrap_or(i64::MAX)
         ],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -405,7 +510,7 @@ pub(crate) fn testing_stop_embedding_rebuild_at(index: Option<usize>) {
     REBUILD_STOP_AT.with(|cell| cell.set(index));
 }
 
-fn decode_embedding(model: String, dims: i64, blob: &[u8]) -> Result<Embedding> {
+fn decode_embedding(model: String, version: String, dims: i64, blob: &[u8]) -> Result<Embedding> {
     let dims =
         usize::try_from(dims).map_err(|_| Error::Search("embedding dims are negative".into()))?;
     let (chunks, rest) = blob.as_chunks::<4>();
@@ -418,7 +523,11 @@ fn decode_embedding(model: String, dims: i64, blob: &[u8]) -> Result<Embedding> 
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
-    Ok(Embedding { model, values })
+    Ok(Embedding {
+        model,
+        version,
+        values,
+    })
 }
 
 fn encode_vector(values: &[f32]) -> Vec<u8> {
@@ -587,6 +696,7 @@ mod tests {
                 .message_embedding(&AccountId(owner.into()), &MessageId::new(id))
                 .unwrap()
                 && embedding.model == EMBEDDING_MODEL
+                && embedding.version == EMBEDDING_VERSION
             {
                 return embedding;
             }
@@ -612,6 +722,7 @@ mod tests {
         let near = embed_body("please pay the invoice");
         let other = embed_body("team offsite calendar invite");
         assert_eq!(invoice.model, EMBEDDING_MODEL);
+        assert_eq!(invoice.version, EMBEDDING_VERSION);
         assert_eq!(invoice.values.len(), EMBEDDING_DIMS);
         assert_eq!(invoice, again);
         assert_ne!(invoice, other);
@@ -937,6 +1048,53 @@ mod tests {
         assert_eq!(wait_indexed(&store, "a1", "m@x"), embed_body("local body"));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_different_model_version_is_rewritten() {
+        let store = open(&["a1"]);
+        store
+            .upsert_message(&message("a1", "m@x", "local body"))
+            .unwrap();
+        index_all(&store);
+        store
+            .conn
+            .execute(
+                "UPDATE message_embeddings SET model_version = '0' WHERE message_id = 'm@x'",
+                [],
+            )
+            .unwrap();
+        index_all(&store);
+        let stored = stored(&store, "a1", "m@x");
+        assert_eq!(stored.version, EMBEDDING_VERSION);
+        assert_eq!(stored, embed_body("local body"));
+    }
+
+    #[test]
+    fn model_version_column_is_added_to_an_older_index() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_embeddings (
+                account_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dims INTEGER NOT NULL,
+                body_hash TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (account_id, message_id)
+             );",
+        )
+        .unwrap();
+        ensure_embedding_schema(&conn).unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(message_embeddings)")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        assert!(names.iter().any(|name| name == "model_version"));
     }
 
     #[test]

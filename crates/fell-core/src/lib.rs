@@ -26,7 +26,10 @@ pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
     SyncCursor, backend_for,
 };
-pub use embed::{EMBEDDING_DIMS, EMBEDDING_MODEL, Embedding, embed_body};
+pub use embed::{
+    BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
+    LocalHashV1, embed_body,
+};
 pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
