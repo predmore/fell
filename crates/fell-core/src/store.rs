@@ -836,14 +836,11 @@ struct ClaimedMailbox {
     lock: std::fs::File,
 }
 
-/// Pick the SQLite path for this inode and hold a shared lock on it.
+/// Pick the one SQLite path for this inode and hold a shared lock on it.
 ///
-/// SQLite names `-wal` and `-shm` from the path string. Two strings for one
-/// inode (a symlink and its target, or two hard links) do not share locks.
-/// Replay the requested path's WAL only while this process holds an exclusive
-/// lock on the inode, and open the canonical path only when that checkpoint
-/// reports `busy=0` and every frame was copied. Otherwise keep the path that
-/// was requested so an existing connection keeps its WAL.
+/// SQLite names `-wal` and `-shm` from the path string. Once a path is
+/// published, every open uses that path and does not replace it. A published
+/// path is created only while this process alone holds the exclusive lock.
 fn claim_mailbox(requested: &Path) -> Result<ClaimedMailbox> {
     #[cfg(unix)]
     {
@@ -867,7 +864,7 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
     use fs4::fs_std::FileExt;
 
     let canonical = absolute_opened(&requested.canonicalize()?)?;
-    for attempt in 0..8 {
+    loop {
         let db = std::fs::File::open(requested)?;
         let nlink = db.metadata()?.nlink();
         let exclusive = match db.try_lock_exclusive() {
@@ -875,9 +872,10 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             // The filesystem cannot record a flock. A single name cannot split
             // its WAL, so the canonical file still opens.
             Err(_) if nlink <= 1 => {
-                let conn = open_mailbox_db(&canonical)?;
+                let path = read_published_path(&db).unwrap_or_else(|| canonical.clone());
+                let conn = open_mailbox_db(&path)?;
                 return Ok(ClaimedMailbox {
-                    path: canonical,
+                    path,
                     conn,
                     lock: db,
                 });
@@ -887,6 +885,9 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             }
         };
         if !exclusive {
+            // Block until the exclusive holder shares or exits. Replaying a
+            // large WAL can take longer than a short poll.
+            db.lock_shared()?;
             if let Some(path) = read_published_path(&db) {
                 let conn = open_mailbox_db(&path)?;
                 if read_published_path(&db).as_ref() == Some(&path) {
@@ -900,11 +901,7 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
                 drop(db);
                 continue;
             }
-            // The holder may still be publishing. Retry while the lock is held
-            // and the attribute is absent. The only name can still open after that.
-            drop(db);
-            if attempt == 7 && nlink <= 1 && absolute_opened(requested)? == canonical {
-                let db = std::fs::File::open(requested)?;
+            if nlink <= 1 {
                 let conn = open_mailbox_db(&canonical)?;
                 return Ok(ClaimedMailbox {
                     path: canonical,
@@ -912,21 +909,30 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
                     lock: db,
                 });
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            continue;
+            return Err(crate::Error::Invalid(
+                "mailbox is already open and its path was not published".into(),
+            ));
         }
         delay_publish_for_test();
-        let requested_abs = absolute_opened(requested)?;
-        let (path, conn) = if requested_abs == canonical {
-            (canonical.clone(), open_mailbox_db(&canonical)?)
+        let (path, conn) = if let Some(published) = read_published_path(&db) {
+            // Someone already chose the path. Do not checkpoint or open
+            // another name, and do not replace it.
+            let conn = open_mailbox_db(&published)?;
+            (published, conn)
         } else {
-            // Frames committed under the requested name live in its WAL.
-            // Switch only when that checkpoint copied every frame.
-            open_requested_or_canonical(&requested_abs, &canonical)?
+            let requested_abs = absolute_opened(requested)?;
+            if requested_abs == canonical {
+                (canonical.clone(), open_mailbox_db(&canonical)?)
+            } else {
+                // Alone, so this checkpoint is the only connection. Keep the
+                // requested path when a live reader makes the checkpoint busy.
+                open_requested_or_canonical(&requested_abs, &canonical)?
+            }
         };
         let _ = publish_mailbox_path(&db, &path);
-        // The exclusive lock stays granted. Converting it to shared drops it
-        // on Linux before the shared lock exists.
+        // Every live store holds this shared lock, so a later open cannot
+        // take the exclusive lock and start a second WAL.
+        db.lock_shared()?;
         divert_published_path_for_test(&db);
         if let Some(now) = read_published_path(&db)
             && now != path
@@ -941,9 +947,6 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             lock: db,
         });
     }
-    Err(crate::Error::Invalid(
-        "mailbox is already open and its path was not published".into(),
-    ))
 }
 
 #[cfg(unix)]

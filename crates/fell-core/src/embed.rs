@@ -1519,10 +1519,8 @@ mod tests {
         std::os::unix::fs::symlink("mail.sqlite", &alias).unwrap();
         crate::store::testing_divert_published_path_once(alias.clone());
         let store = Store::open(&real).unwrap();
-        assert_eq!(
-            store.mailbox_path(),
-            Some(real.canonicalize().unwrap().as_path())
-        );
+        // The published path wins. This open must not replace it.
+        assert_eq!(store.mailbox_path(), Some(alias.as_path()));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
