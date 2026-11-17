@@ -236,7 +236,7 @@ fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSend
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let Ok(mut watcher) =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if event.is_ok() {
+            if event.is_ok_and(|event| changes_content(&event.kind)) {
                 let _ = tx.send(());
             }
         })
@@ -244,17 +244,33 @@ fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSend
         return false;
     };
     let rewatch = move |watcher: &mut notify::RecommendedWatcher| {
+        let mut watched = 0;
         for dir in &dirs {
-            if dir.is_dir() {
-                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            if dir.is_dir() && watcher.watch(dir, RecursiveMode::NonRecursive).is_ok() {
+                watched += 1;
             }
         }
+        watched
     };
-    rewatch(&mut watcher);
+    // Out of inotify watches (or nothing to watch): let the caller poll.
+    if rewatch(&mut watcher) == 0 {
+        return false;
+    }
     std::thread::Builder::new()
         .name("fell-theme-watch".into())
         .spawn(move || {
-            while rx.recv().is_ok() {
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) => {}
+                    // Nothing changed. Stop once the window is gone.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if changed.is_closed() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
                 // A theme switch writes several files. Settle, then reload once.
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 while rx.try_recv().is_ok() {}
@@ -265,6 +281,18 @@ fn watch_dirs(dirs: Vec<PathBuf>, changed: futures::channel::mpsc::UnboundedSend
             }
         })
         .is_ok()
+}
+
+/// Events that can change what `load` reads. Opens, reads, and metadata
+/// changes are left out: `load` itself opens these files, so counting them
+/// would wake the watcher again after every reload.
+fn changes_content(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }
 
 fn theme_candidates() -> Vec<PathBuf> {
@@ -853,6 +881,18 @@ mod tests {
         while rx.try_recv().is_ok() {}
         fs::write(theme.join("colors.toml"), "background = \"#333333\"\n").unwrap();
         assert!(next(&mut rx), "the new folder is watched too");
+        // Reading the files, as a reload does, must not signal again.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+        for _ in 0..5 {
+            let _ = fs::read_to_string(theme.join("colors.toml"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            rx.try_recv().is_err(),
+            "a reload's own reads woke the watcher"
+        );
         drop(rx);
         let _ = fs::remove_dir_all(&root);
     }
