@@ -7,6 +7,12 @@
 //! found through `message_refs`. The cost of a sync batch follows the batch,
 //! not the mailbox.
 //!
+//! A reply whose sender dropped `In-Reply-To` and `References` still joins
+//! its original when the subjects match after reply markers, the two
+//! senders appear in each other's participants, and the original is at most
+//! [`SUBJECT_WINDOW_SECS`] older. `subject_index` finds those candidates in
+//! both directions, so it works whichever copy syncs first.
+//!
 //! The merge rules are the ones [`rethread_all`] applies to a whole account,
 //! in the same row order. Every row a write did not touch already sits on the
 //! thread those rules give it, so leaving it out changes nothing. The upgrade
@@ -19,8 +25,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{immediate_transaction, load_aliases, parse_references};
 use crate::Result;
 use crate::account::AccountId;
-use crate::message::{Address, MessageHeaders, MessageId};
-use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
+use crate::message::{Address, MessageHeaders, MessageId, decode_addresses};
+use crate::threading::{
+    SUBJECT_WINDOW_SECS, ThreadId, header_parent_thread_id, resolve_thread_id, subject_is_generic,
+    thread_subject,
+};
 
 /// Tables behind [`rethread_dirty`]. Safe to run on every open.
 const THREAD_INDEX_TABLES: &str = r#"
@@ -33,6 +42,25 @@ CREATE TABLE IF NOT EXISTS message_refs (
 CREATE INDEX IF NOT EXISTS idx_message_refs_child ON message_refs(child_rowid);
 CREATE INDEX IF NOT EXISTS idx_message_aliases_canonical
     ON message_aliases(account_id, canonical_message_id);
+
+-- Non-generic subjects with reply markers stripped, for replies that lost
+-- their threading headers.
+CREATE TABLE IF NOT EXISTS subject_index (
+    account_id TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    date_unix INTEGER NOT NULL,
+    message_rowid INTEGER NOT NULL,
+    PRIMARY KEY (account_id, subject_key, date_unix, message_rowid)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_subject_index_row ON subject_index(message_rowid);
+
+-- Subjects of deleted rows. Replies that matched them may match another.
+CREATE TABLE IF NOT EXISTS thread_dirty_subjects (
+    account_id TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    date_unix INTEGER NOT NULL,
+    PRIMARY KEY (account_id, subject_key, date_unix)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS thread_dirty_rows (
     rowid INTEGER PRIMARY KEY
@@ -47,7 +75,7 @@ CREATE TABLE IF NOT EXISTS thread_dirty_ids (
 /// Bump when [`THREAD_INDEX_TRIGGERS`] changes. Triggers are rebuilt only
 /// then, in one transaction, so no other connection writes while they are
 /// missing.
-const THREAD_TRIGGERS_VERSION: &str = "3";
+const THREAD_TRIGGERS_VERSION: &str = "4";
 
 // Inserts check NOT EXISTS instead of OR IGNORE: an UPSERT that fires a
 // trigger overrides the trigger's own conflict clause.
@@ -65,7 +93,8 @@ CREATE TRIGGER thread_dirty_insert AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER thread_dirty_update AFTER UPDATE OF
-    message_id, in_reply_to, references_header, proton_conversation_id
+    message_id, in_reply_to, references_header, proton_conversation_id,
+    subject, date_unix, from_email, to_line, cc_line
 ON messages BEGIN
     INSERT INTO thread_dirty_rows (rowid) SELECT new.rowid
         WHERE NOT EXISTS (SELECT 1 FROM thread_dirty_rows WHERE rowid = new.rowid);
@@ -79,6 +108,15 @@ END;
 
 CREATE TRIGGER thread_dirty_delete AFTER DELETE ON messages BEGIN
     DELETE FROM message_refs WHERE child_rowid = old.rowid;
+    INSERT INTO thread_dirty_subjects (account_id, subject_key, date_unix)
+        SELECT s.account_id, s.subject_key, s.date_unix FROM subject_index s
+        WHERE s.message_rowid = old.rowid
+          AND NOT EXISTS (
+              SELECT 1 FROM thread_dirty_subjects d
+              WHERE d.account_id = s.account_id AND d.subject_key = s.subject_key
+                AND d.date_unix = s.date_unix
+          );
+    DELETE FROM subject_index WHERE message_rowid = old.rowid;
     DELETE FROM thread_dirty_rows WHERE rowid = old.rowid;
     INSERT INTO thread_dirty_ids (account_id, message_id)
     SELECT old.account_id, old.message_id
@@ -125,6 +163,18 @@ CREATE TRIGGER thread_dirty_alias_delete AFTER DELETE ON message_aliases BEGIN
 END;
 "#;
 
+/// Tables and triggers only. Runs before any upgrade that re-resolves
+/// threads, since the whole-account pass reads `subject_index`.
+pub(super) fn ensure_thread_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(THREAD_INDEX_TABLES)?;
+    super::ensure_triggers(
+        conn,
+        "thread_triggers",
+        THREAD_TRIGGERS_VERSION,
+        THREAD_INDEX_TRIGGERS,
+    )
+}
+
 /// Rows read per batch while the upgrade fills `message_refs`.
 const BACKFILL_BATCH: i64 = 2_000;
 
@@ -134,21 +184,31 @@ const BACKFILL_BATCH: i64 = 2_000;
 /// The fill re-resolves every account once with [`rethread_all`] so later
 /// writes can rely on untouched rows already being on their final thread.
 pub(super) fn ensure_thread_index(conn: &Connection) -> Result<()> {
-    conn.execute_batch(THREAD_INDEX_TABLES)?;
-    super::ensure_triggers(
-        conn,
-        "thread_triggers",
-        THREAD_TRIGGERS_VERSION,
-        THREAD_INDEX_TRIGGERS,
-    )?;
-    if index_is_current(conn)? {
+    ensure_thread_schema(conn)?;
+    let current = |conn: &Connection| -> Result<bool> {
+        Ok(flag_is_set(conn, "thread_index")? && flag_is_set(conn, "thread_subjects")?)
+    };
+    if current(conn)? {
         return Ok(());
     }
     let tx = immediate_transaction(conn)?;
     // Another connection may have finished the fill while this one waited.
-    if index_is_current(&tx)? {
+    if current(&tx)? {
         return Ok(());
     }
+    // Fill what is missing, then re-resolve every account once.
+    if !flag_is_set(&tx, "thread_index")? {
+        fill_refs(&tx)?;
+    }
+    if !flag_is_set(&tx, "thread_subjects")? {
+        fill_subjects(&tx)?;
+    }
+    settle_all(&tx, &["thread_index", "thread_subjects"])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn fill_refs(tx: &Connection) -> Result<()> {
     tx.execute("DELETE FROM message_refs", [])?;
     let mut after = 0i64;
     loop {
@@ -172,37 +232,165 @@ pub(super) fn ensure_thread_index(conn: &Connection) -> Result<()> {
         };
         after = last.0;
         for (rowid, account, in_reply_to, references) in &batch {
-            index_refs(&tx, account, *rowid, in_reply_to.as_deref(), references)?;
+            index_refs(tx, account, *rowid, in_reply_to.as_deref(), references)?;
         }
     }
+    Ok(())
+}
+
+fn fill_subjects(tx: &Connection) -> Result<()> {
+    tx.execute("DELETE FROM subject_index", [])?;
+    let mut after = 0i64;
+    loop {
+        let batch = {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, account_id, subject, date_unix
+                 FROM messages WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, BACKFILL_BATCH], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let Some(last) = batch.last() else {
+            break;
+        };
+        after = last.0;
+        for (rowid, account, subject, date) in &batch {
+            index_subject(tx, account, *rowid, subject, *date)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-resolve every account once, empty the queues, and record `flags`.
+fn settle_all(conn: &Connection, flags: &[&str]) -> Result<()> {
     let accounts = {
-        let mut stmt = tx.prepare("SELECT DISTINCT account_id FROM messages")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT account_id FROM messages")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     for account in accounts {
-        rethread_all(&tx, &AccountId(account))?;
+        rethread_all(conn, &AccountId(account))?;
     }
-    tx.execute("DELETE FROM thread_dirty_rows", [])?;
-    tx.execute("DELETE FROM thread_dirty_ids", [])?;
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('thread_index', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-    )?;
-    tx.commit()?;
+    conn.execute("DELETE FROM thread_dirty_rows", [])?;
+    conn.execute("DELETE FROM thread_dirty_ids", [])?;
+    conn.execute("DELETE FROM thread_dirty_subjects", [])?;
+    for flag in flags {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![flag],
+        )?;
+    }
     Ok(())
 }
 
-fn index_is_current(conn: &Connection) -> Result<bool> {
+fn flag_is_set(conn: &Connection, flag: &str) -> Result<bool> {
     let value: Option<String> = conn
         .query_row(
-            "SELECT value FROM meta WHERE key = 'thread_index'",
-            [],
+            "SELECT value FROM meta WHERE key = ?1",
+            params![flag],
             |row| row.get(0),
         )
         .optional()?;
     Ok(value.as_deref() == Some("1"))
+}
+
+/// Replace the `subject_index` entry for one row. Generic subjects and empty
+/// ones get none, so they never join anything. Returns the entry it
+/// replaced, if any, so replies that matched the old subject are checked.
+fn index_subject(
+    conn: &Connection,
+    account: &str,
+    rowid: i64,
+    subject: &str,
+    date: i64,
+) -> Result<Option<(String, i64)>> {
+    let old: Option<(String, i64)> = conn
+        .prepare_cached(
+            "SELECT subject_key, date_unix FROM subject_index WHERE message_rowid = ?1",
+        )?
+        .query_row(params![rowid], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    conn.prepare_cached("DELETE FROM subject_index WHERE message_rowid = ?1")?
+        .execute(params![rowid])?;
+    let (key, _) = thread_subject(subject);
+    if !subject_is_generic(&key) {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO subject_index (account_id, subject_key, date_unix, message_rowid)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![account, key, date, rowid])?;
+    }
+    Ok(old)
+}
+
+/// The thread a reply with no stored header parent joins by subject: the
+/// latest message in the window with the same subject whose sender and the
+/// reply's sender appear in each other's participants.
+fn subject_parent(
+    conn: &Connection,
+    account: &str,
+    row: &ThreadingRow,
+) -> Result<Option<ThreadId>> {
+    let (key, reply) = thread_subject(&row.headers.subject);
+    if !reply || subject_is_generic(&key) {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT m.thread_id, m.from_email, m.to_line, m.cc_line
+         FROM subject_index s
+         JOIN messages m ON m.rowid = s.message_rowid
+         WHERE s.account_id = ?1 AND s.subject_key = ?2
+           AND s.date_unix BETWEEN ?3 AND ?4 AND s.message_rowid != ?5
+         ORDER BY s.date_unix DESC, s.message_rowid DESC",
+    )?;
+    let date = row.headers.date_unix;
+    let mut rows = stmt.query(params![
+        account,
+        key,
+        date.saturating_sub(SUBJECT_WINDOW_SECS),
+        date,
+        row.rowid
+    ])?;
+    while let Some(candidate) = rows.next()? {
+        let thread: String = candidate.get(0)?;
+        let from = candidate.get::<_, String>(1)?.to_ascii_lowercase();
+        let to: String = candidate.get(2)?;
+        let cc: String = candidate.get(3)?;
+        let theirs = participants(&from, &to, &cc);
+        if !theirs.contains(&row.from) || !row.participants.contains(&from) {
+            continue;
+        }
+        // One sender writing twice: the notes are one conversation only when
+        // they also share someone else, or "me to Ada" would join "me to Bob".
+        if from == row.from
+            && !row
+                .participants
+                .iter()
+                .any(|address| address != &from && theirs.contains(address))
+        {
+            continue;
+        }
+        return Ok(Some(ThreadId(thread)));
+    }
+    Ok(None)
+}
+
+fn participants(from: &str, to: &str, cc: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = decode_addresses(to)
+        .into_iter()
+        .chain(decode_addresses(cc))
+        .map(|address| address.email.to_ascii_lowercase())
+        .collect();
+    out.insert(from.to_ascii_lowercase());
+    out
 }
 
 /// Replace the parent ids `message_refs` lists for one row.
@@ -240,7 +428,8 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
     let account = account_id.as_str();
     let dirty = {
         let mut stmt = conn.prepare_cached(
-            "SELECT m.rowid, m.message_id, m.in_reply_to, m.references_header
+            "SELECT m.rowid, m.message_id, m.in_reply_to, m.references_header,
+                    m.subject, m.date_unix
              FROM thread_dirty_rows d
              JOIN messages m ON m.rowid = d.rowid
              WHERE m.account_id = ?1
@@ -252,6 +441,8 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -262,6 +453,17 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         let rows = stmt.query_map(params![account], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<HashSet<_>, _>>()?
     };
+    // Subject and date of every message that came, went, or changed: later
+    // replies without headers in its window may now match differently.
+    let mut subjects: HashSet<(String, i64)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT subject_key, date_unix FROM thread_dirty_subjects WHERE account_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![account], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()?
+    };
+    conn.prepare_cached("DELETE FROM thread_dirty_subjects WHERE account_id = ?1")?
+        .execute(params![account])?;
     let mut affected = BTreeSet::new();
     {
         let mut clear = conn.prepare_cached("DELETE FROM thread_dirty_rows WHERE rowid = ?1")?;
@@ -271,16 +473,38 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
             "SELECT message_id FROM message_aliases
              WHERE account_id = ?1 AND canonical_message_id = ?2",
         )?;
-        for (rowid, message_id, in_reply_to, references) in &dirty {
+        for (rowid, message_id, in_reply_to, references, subject, date) in &dirty {
             index_refs(conn, account, *rowid, in_reply_to.as_deref(), references)?;
-            ids.insert(message_id.clone());
             for alias in
                 aliases.query_map(params![account, message_id], |row| row.get::<_, String>(0))?
             {
                 ids.insert(alias?);
             }
+            if let Some(old) = index_subject(conn, account, *rowid, subject, *date)? {
+                subjects.insert(old);
+            }
+            let (key, _) = thread_subject(subject);
+            if !subject_is_generic(&key) {
+                subjects.insert((key, *date));
+            }
+            ids.insert(message_id.clone());
             affected.insert(*rowid);
             clear.execute(params![rowid])?;
+        }
+    }
+    {
+        let mut later = conn.prepare_cached(
+            "SELECT message_rowid FROM subject_index
+             WHERE account_id = ?1 AND subject_key = ?2 AND date_unix BETWEEN ?3 AND ?4",
+        )?;
+        for (key, date) in &subjects {
+            let rows = later.query_map(
+                params![account, key, date, date.saturating_add(SUBJECT_WINDOW_SECS)],
+                |row| row.get::<_, i64>(0),
+            )?;
+            for row in rows {
+                affected.insert(row?);
+            }
         }
     }
     conn.prepare_cached("DELETE FROM thread_dirty_ids WHERE account_id = ?1")?
@@ -325,7 +549,9 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         parents.insert(parent.clone(), found.clone());
         Ok(found)
     };
-    let edges = thread_edges(&rows, &mut lookup)?;
+    let edges = thread_edges(&rows, &mut lookup, &mut |row| {
+        subject_parent(conn, account, row)
+    })?;
 
     let mut union = ThreadUnion::default();
     let mut rank = conn.prepare_cached(
@@ -347,6 +573,31 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
         &mut union,
         nodes.iter().map(String::as_str),
     )
+}
+
+/// Index the subjects of queued rows without resolving anything. The test
+/// oracle runs this before [`rethread_all`], which reads the index.
+#[cfg(test)]
+pub(super) fn index_queued_subjects(conn: &Connection) -> Result<()> {
+    let queued = {
+        let mut stmt = conn.prepare(
+            "SELECT m.rowid, m.account_id, m.subject, m.date_unix
+             FROM thread_dirty_rows d JOIN messages m ON m.rowid = d.rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (rowid, account, subject, date) in queued {
+        index_subject(conn, &account, rowid, &subject, date)?;
+    }
+    Ok(())
 }
 
 /// The thread a stored parent wears, the way [`rethread_all`] reads it: an
@@ -397,7 +648,12 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
     for row in &rows {
         union.note(row.thread_id.as_str(), row.rowid);
     }
-    let edges = thread_edges(&rows, &mut |parent| Ok(by_message.get(parent).cloned()))?;
+    let account = account_id.as_str();
+    let edges = thread_edges(
+        &rows,
+        &mut |parent| Ok(by_message.get(parent).cloned()),
+        &mut |row| subject_parent(conn, account, row),
+    )?;
     for (member, preferred) in &edges {
         union.union_prefer(member, preferred);
     }
@@ -412,17 +668,35 @@ pub(super) fn rethread_all(conn: &Connection, account_id: &AccountId) -> Result<
 
 /// Merges to apply, in row order: each row's thread onto the thread its
 /// headers resolve to, and its header parent's thread onto that same one.
+///
+/// A row with no Proton id and no stored header parent may also join by
+/// subject (see [`subject_parent`]).
 fn thread_edges(
     rows: &[ThreadingRow],
     lookup: &mut dyn FnMut(&MessageId) -> Result<Option<ThreadId>>,
+    by_subject: &mut dyn FnMut(&ThreadingRow) -> Result<Option<ThreadId>>,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = Vec::with_capacity(rows.len() * 2);
     for row in rows {
         let onto = resolve_thread_id(&row.headers, &mut *lookup)?;
         let header = header_parent_thread_id(&row.headers, &mut *lookup)?;
         edges.push((row.thread_id.0.clone(), onto.0.clone()));
-        if let Some(header) = header {
-            edges.push((header.0, onto.0));
+        let proton = row
+            .headers
+            .proton_conversation_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        // A reply that names any parent waits for that parent instead: a
+        // subject join cannot be undone when the real parent arrives later.
+        let headerless = row.headers.parent_ids().next().is_none();
+        match header {
+            Some(header) => edges.push((header.0, onto.0)),
+            None if !proton && headerless => {
+                if let Some(original) = by_subject(row)? {
+                    edges.push((row.thread_id.0.clone(), original.0));
+                }
+            }
+            None => {}
         }
     }
     Ok(edges)
@@ -462,11 +736,16 @@ fn relabel<'a>(
 struct ThreadingRow {
     rowid: i64,
     thread_id: ThreadId,
+    /// `subject` and `date_unix` are filled for the subject fallback.
     headers: MessageHeaders,
+    /// Sender, lowercased.
+    from: String,
+    /// Sender, To, and Cc, lowercased.
+    participants: HashSet<String>,
 }
 
-const THREADING_COLS: &str =
-    "rowid, message_id, thread_id, proton_conversation_id, in_reply_to, references_header";
+const THREADING_COLS: &str = "rowid, message_id, thread_id, proton_conversation_id, in_reply_to,
+    references_header, subject, date_unix, from_email, to_line, cc_line";
 
 fn threading_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadingRow> {
     let rowid: i64 = row.get(0)?;
@@ -475,9 +754,16 @@ fn threading_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadingRow> {
     let proton_conversation_id: Option<String> = row.get(3)?;
     let in_reply_to: Option<String> = row.get(4)?;
     let references: String = row.get(5)?;
+    let subject: String = row.get(6)?;
+    let date_unix: i64 = row.get(7)?;
+    let from = row.get::<_, String>(8)?.to_ascii_lowercase();
+    let to: String = row.get(9)?;
+    let cc: String = row.get(10)?;
     Ok(ThreadingRow {
         rowid,
         thread_id: ThreadId(thread_id),
+        participants: participants(&from, &to, &cc),
+        from,
         headers: MessageHeaders {
             message_id: MessageId(message_id),
             proton_conversation_id,
@@ -487,8 +773,8 @@ fn threading_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadingRow> {
                 name: None,
                 email: String::new(),
             },
-            subject: String::new(),
-            date_unix: 0,
+            subject,
+            date_unix,
         },
     })
 }
@@ -697,9 +983,10 @@ mod tests {
             let proton = rng.chance(15).then(|| format!("conv{}", rng.below(4)));
             let sender = format!("s{}@x", rng.below(5));
             let body = format!("body of {id} {}", rng.next());
-            let date = 1_700_000_000 + index as i64 * 600;
+            // Hours apart, so some originals fall outside the subject window.
+            let date = 1_700_000_000 + index as i64 * 3_600 * (1 + rng.below(12) as i64);
             let folder = folders[rng.below(folders.len())];
-            pending.push(message(
+            let mut sent = message(
                 &id,
                 in_reply_to.as_deref(),
                 &references,
@@ -709,7 +996,25 @@ mod tests {
                 &body,
                 date,
                 None,
-            ));
+            );
+            // A few topics shared by many messages, some as replies that
+            // lost their headers, sent among a few people.
+            let topic = format!("topic {}", rng.below(6));
+            sent.headers.subject = match rng.below(4) {
+                0 => topic,
+                1 => format!("Re: {topic}"),
+                2 => format!("AW: [list] {topic}"),
+                _ => format!("subject {id}"),
+            };
+            if rng.chance(50) {
+                sent.headers.in_reply_to = None;
+                sent.headers.references.clear();
+            }
+            sent.to = vec![Address {
+                name: None,
+                email: format!("s{}@x", rng.below(5)),
+            }];
+            pending.push(sent);
             made.push(id.clone());
             if rng.chance(8) {
                 // A list rewrites the Message-ID of the same post.
@@ -1087,6 +1392,151 @@ mod tests {
         }
     }
 
+    fn mail(id: &str, subject: &str, from: &str, to: &str, date: i64) -> Message {
+        let mut sent = message(
+            id,
+            None,
+            &[],
+            None,
+            "INBOX",
+            from,
+            &format!("body {id}"),
+            date,
+            None,
+        );
+        sent.headers.subject = subject.into();
+        sent.to = vec![Address {
+            name: None,
+            email: to.into(),
+        }];
+        sent
+    }
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    #[test]
+    fn a_reply_without_headers_joins_its_original_by_subject() {
+        for reply_first in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            store.upsert_account(&account()).unwrap();
+            let original = mail("q3@x", "Q3 numbers", "me@x", "ada@x", 1_700_000_000);
+            let reply = mail(
+                "re@x",
+                "RE: Q3 numbers",
+                "ada@x",
+                "me@x",
+                1_700_000_000 + DAY,
+            );
+            let batches = if reply_first {
+                [vec![reply], vec![original]]
+            } else {
+                [vec![original], vec![reply]]
+            };
+            for batch in batches {
+                run(&store, &Op::Batch(batch));
+            }
+            assert_eq!(
+                thread_of(&store, "q3@x"),
+                thread_of(&store, "re@x"),
+                "reply first: {reply_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subject_alone_does_not_join_strangers_old_mail_or_stock_subjects() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        run(
+            &store,
+            &Op::Batch(vec![
+                mail("orig@x", "Q3 numbers", "me@x", "ada@x", start),
+                // Someone the original never involved.
+                mail(
+                    "stranger@x",
+                    "Re: Q3 numbers",
+                    "bob@x",
+                    "carol@x",
+                    start + DAY,
+                ),
+                // The right people, but long after the window.
+                mail(
+                    "late@x",
+                    "Re: Q3 numbers",
+                    "ada@x",
+                    "me@x",
+                    start + 60 * DAY,
+                ),
+                // Not a reply.
+                mail("same@x", "Q3 numbers", "ada@x", "me@x", start + 2 * DAY),
+                mail("hi@x", "Hi", "me@x", "ada@x", start),
+                mail("rehi@x", "Re: Hi", "ada@x", "me@x", start + DAY),
+            ]),
+        );
+        let orig = thread_of(&store, "orig@x");
+        for id in ["stranger@x", "late@x", "same@x"] {
+            assert_ne!(thread_of(&store, id), orig, "{id}");
+        }
+        assert_ne!(thread_of(&store, "hi@x"), thread_of(&store, "rehi@x"));
+    }
+
+    #[test]
+    fn headers_and_proton_ids_win_over_a_subject() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        let mut proton = mail("p@x", "Re: Q3 numbers", "ada@x", "me@x", start + DAY);
+        proton.headers.proton_conversation_id = Some("conv-9".into());
+        let mut headed = mail("h@x", "Re: Q3 numbers", "ada@x", "me@x", start + DAY);
+        headed.headers.in_reply_to = Some(MessageId::new("other@x"));
+        run(
+            &store,
+            &Op::Batch(vec![
+                mail("q3@x", "Q3 numbers", "me@x", "ada@x", start),
+                mail("other@x", "Budget", "me@x", "ada@x", start),
+                proton,
+                headed,
+            ]),
+        );
+        assert_ne!(thread_of(&store, "p@x"), thread_of(&store, "q3@x"));
+        assert_eq!(thread_of(&store, "h@x"), thread_of(&store, "other@x"));
+        assert_ne!(thread_of(&store, "h@x"), thread_of(&store, "q3@x"));
+    }
+
+    #[test]
+    fn deleting_a_replys_match_lets_it_join_the_next_one() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        run(
+            &store,
+            &Op::Batch(vec![
+                mail("first@x", "Q3 numbers", "me@x", "ada@x", start),
+                mail("second@x", "Q3 numbers", "me@x", "ada@x", start + DAY),
+            ]),
+        );
+        // Lands on the later of the two originals.
+        run(
+            &store,
+            &Op::Batch(vec![mail(
+                "re@x",
+                "Re: Q3 numbers",
+                "ada@x",
+                "me@x",
+                start + 2 * DAY,
+            )]),
+        );
+        assert_eq!(thread_of(&store, "re@x"), thread_of(&store, "second@x"));
+        run(&store, &Op::Delete("second@x".into()));
+        // The next sync batch re-checks replies that matched the deleted one.
+        run(
+            &store,
+            &Op::Batch(vec![mail("other@x", "Budget", "bob@x", "me@x", start)]),
+        );
+        assert_eq!(thread_of(&store, "re@x"), thread_of(&store, "first@x"));
+    }
+
     #[test]
     fn a_resynced_alias_takes_replies_that_cite_the_alias_along() {
         let start = 1_700_000_000;
@@ -1160,5 +1610,52 @@ mod tests {
             run(store, &Op::Batch(vec![resync.clone()]));
         }
         assert_eq!(threads_of(&incremental), threads_of(&full));
+    }
+
+    #[test]
+    fn a_real_parent_arriving_later_does_not_drag_the_subject_original() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        let original = mail("q3@x", "Q3 numbers", "me@x", "ada@x", start);
+        // Names a parent that has not synced yet.
+        let mut reply = mail("re@x", "Re: Q3 numbers", "ada@x", "me@x", start + DAY);
+        reply.headers.in_reply_to = Some(MessageId::new("real@x"));
+        let real = mail("real@x", "Budget draft", "me@x", "ada@x", start + 10);
+        run(&store, &Op::Batch(vec![original]));
+        run(&store, &Op::Batch(vec![reply]));
+        run(&store, &Op::Batch(vec![real]));
+        assert_eq!(thread_of(&store, "re@x"), thread_of(&store, "real@x"));
+        assert_ne!(thread_of(&store, "q3@x"), thread_of(&store, "real@x"));
+    }
+
+    #[test]
+    fn one_sender_writing_to_two_people_stays_two_threads() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        run(
+            &store,
+            &Op::Batch(vec![
+                mail("ada@x", "Lunch on Friday", "me@x", "ada@ex", start),
+                mail(
+                    "bob@x",
+                    "Re: Lunch on Friday",
+                    "me@x",
+                    "bob@ex",
+                    start + DAY,
+                ),
+                // A second note to the same person is one conversation.
+                mail(
+                    "ada2@x",
+                    "Re: Lunch on Friday",
+                    "me@x",
+                    "ada@ex",
+                    start + 2 * DAY,
+                ),
+            ]),
+        );
+        assert_ne!(thread_of(&store, "ada@x"), thread_of(&store, "bob@x"));
+        assert_eq!(thread_of(&store, "ada@x"), thread_of(&store, "ada2@x"));
     }
 }
