@@ -1153,6 +1153,7 @@ mod tests {
             to: Vec::new(),
             cc: Vec::new(),
             bcc: Vec::new(),
+            starred: false,
             has_attachment: false,
             archived: false,
             snooze_until: None,
