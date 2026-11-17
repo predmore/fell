@@ -106,9 +106,14 @@ impl Editor {
             .iter()
             .position(|line| line.starts_with("- Revenue"))
             .unwrap_or(0);
+        let col = lines
+            .get(row)
+            .filter(|line| line.starts_with("- ") || line.starts_with("* "))
+            .map(|_| 2)
+            .unwrap_or(0);
         Self {
             row,
-            col: 0,
+            col,
             lines,
             mode: Mode::Normal,
             anchor: None,
@@ -849,15 +854,16 @@ impl Render for ComposeView {
             .flex()
             .flex_col()
             .size_full()
+            .overflow_hidden()
             .bg(rgb(colors.bg))
             .text_color(rgb(colors.fg))
             .font_family("Liberation Sans")
-            .child(header(&snap, colors))
-            .child(self.fields_view(&snap, colors))
+            .child(header(&snap, colors).flex_shrink_0())
+            .child(self.fields_view(&snap, colors).flex_shrink_0())
             .child(self.body_view(&snap, colors))
-            .child(self.quote_view(colors))
-            .child(attachment_row(&snap, colors))
-            .child(status_bar(mode, &send_label, &self.status, &snap, colors))
+            .child(self.quote_view(colors).flex_shrink_0())
+            .child(attachment_row(&snap, colors).flex_shrink_0())
+            .child(status_bar(mode, &send_label, &self.status, &snap, colors).flex_shrink_0())
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
@@ -908,6 +914,7 @@ impl ComposeView {
         let body = div()
             .id("compose-body")
             .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
             .px_5()
             .py_3()
@@ -916,7 +923,12 @@ impl ComposeView {
             } else {
                 styled_body(&self.editor, &self.folder, colors)
             });
-        let mut column = div().flex().flex_col().flex_1();
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_hidden();
         if !snap.hunks.is_empty() {
             column = column.child(hunk_banner(snap, colors));
         }
@@ -1155,6 +1167,9 @@ fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palet
     let cursor_byte = cursor.map(|col| byte_index(line, col));
     for span in styles {
         if !show_markers && span.kind == StyleKind::Marker {
+            if span.start == 0 {
+                row = row.child(folded_marker(line, colors));
+            }
             continue;
         }
         let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
@@ -1188,6 +1203,32 @@ fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palet
         row = row.child(caret(colors));
     }
     row
+}
+
+fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
+    let trimmed = line.trim_start();
+    let indent = " ".repeat(line.len() - trimmed.len());
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return styled_span(
+            &format!("{indent}• "),
+            colors.accent,
+            FontWeight(400.),
+            StyleKind::Plain,
+        );
+    }
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && trimmed.as_bytes().get(digits) == Some(&b'.') {
+        return styled_span(
+            &format!("{indent}{}. ", &trimmed[..digits]),
+            colors.accent,
+            FontWeight(400.),
+            StyleKind::Plain,
+        );
+    }
+    if trimmed.starts_with('>') {
+        return styled_span("│ ", colors.dim, FontWeight(400.), StyleKind::Plain);
+    }
+    div()
 }
 
 fn styled_span(text: &str, color: u32, weight: FontWeight, kind: StyleKind) -> gpui::Div {
