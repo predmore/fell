@@ -876,7 +876,7 @@ impl Render for ComposeView {
 
 impl ComposeView {
     fn fields_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
-        let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_2();
+        let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         column = field_row(
             column,
             "To",
@@ -917,7 +917,7 @@ impl ComposeView {
             .min_h(px(0.))
             .overflow_y_scroll()
             .px_5()
-            .py_3()
+            .py_2()
             .child(if self.raw {
                 raw_body(&self.editor, colors)
             } else {
@@ -1335,7 +1335,7 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
     let path = folder.join(src);
     let mut block = div().flex().flex_col().gap_1();
     if path.is_file() {
-        block = block.child(img(path).w(px(280.)).h(px(88.)));
+        block = block.child(img(path).w(px(220.)).h(px(64.)));
     }
     block.child(
         div()
