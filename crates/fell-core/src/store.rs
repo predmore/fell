@@ -288,8 +288,8 @@ impl Store {
         store.path = Some(path.to_path_buf());
         store.seal_private_files()?;
         // Embeddings are filled off this thread, and only in one process.
-        // Open returns before a large mailbox is indexed.
-        store.indexer = crate::embed::Indexer::try_spawn(path)?;
+        // A lock problem skips the indexer. Open still returns the mailbox.
+        store.indexer = crate::embed::Indexer::try_spawn(path);
         Ok(store)
     }
 

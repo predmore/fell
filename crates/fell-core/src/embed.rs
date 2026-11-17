@@ -184,34 +184,40 @@ pub(crate) struct Indexer {
     #[cfg_attr(not(test), allow(dead_code))]
     pause: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// Held for the life of the thread. Dropped after the thread is joined.
-    _lock: Connection,
 }
 
 impl Indexer {
     /// Start the indexer when this process can take the mailbox's embed lock.
     ///
-    /// `Ok(None)` means another process already holds it. That open still
-    /// succeeds; it just does not scan or write embeddings.
-    pub(crate) fn try_spawn(path: &Path) -> Result<Option<Self>> {
-        let Some(lock) = try_embed_lock(path)? else {
-            return Ok(None);
+    /// `None` means no worker was started. The mailbox still opens. The lock
+    /// is held inside the worker and dropped when that worker returns, so a
+    /// dead thread does not block every other process.
+    pub(crate) fn try_spawn(path: &Path) -> Option<Self> {
+        let lock = match try_embed_lock(path) {
+            Ok(Some(lock)) => lock,
+            _ => return None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(indexer_starts_paused()));
         let stop_thread = Arc::clone(&stop);
         let pause_thread = Arc::clone(&pause);
         let path = path.to_path_buf();
+        let abort = abort_this_indexer();
         let thread = thread::Builder::new()
             .name("fell-embeddings".into())
-            .spawn(move || index_loop(path, stop_thread, pause_thread))
-            .map_err(crate::Error::from)?;
-        Ok(Some(Self {
+            .spawn(move || {
+                if abort {
+                    drop(lock);
+                    return;
+                }
+                index_loop(path, stop_thread, pause_thread, lock);
+            })
+            .ok()?;
+        Some(Self {
             stop,
             pause,
             thread: Some(thread),
-            _lock: lock,
-        }))
+        })
     }
 
     #[cfg(test)]
@@ -232,6 +238,36 @@ impl Drop for Indexer {
             let _ = thread.join();
         }
     }
+}
+
+fn open_index_conn(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    ensure_embedding_schema(&conn)?;
+    delete_orphans(&conn)?;
+    Ok(conn)
+}
+
+fn abort_this_indexer() -> bool {
+    #[cfg(test)]
+    {
+        ABORT_THIS_INDEXER.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ABORT_THIS_INDEXER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The next file-backed worker exits immediately and drops its embed lock.
+#[cfg(test)]
+pub(crate) fn testing_abort_next_indexer(abort: bool) {
+    ABORT_THIS_INDEXER.with(|cell| cell.set(abort));
 }
 
 fn try_embed_lock(db: &Path) -> Result<Option<Connection>> {
@@ -319,17 +355,21 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn index_loop(path: std::path::PathBuf, stop: Arc<AtomicBool>, pause: Arc<AtomicBool>) {
-    let Ok(conn) = Connection::open(&path) else {
-        return;
+fn index_loop(
+    path: std::path::PathBuf,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    _lock: Connection,
+) {
+    let conn = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match open_index_conn(&path) {
+            Ok(conn) => break conn,
+            Err(_) => sleep_unless_stopped(BUSY_RETRY, &stop),
+        }
     };
-    if conn.busy_timeout(Duration::from_secs(5)).is_err() {
-        return;
-    }
-    if ensure_embedding_schema(&conn).is_err() {
-        return;
-    }
-    let _ = delete_orphans(&conn);
     let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
@@ -1304,6 +1344,75 @@ mod tests {
         assert!(third.embedding_indexer_running());
         drop(second);
         drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_skips_the_indexer_when_the_lock_file_cannot_be_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-bad-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        std::fs::create_dir(embed_lock_path(&path)).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(!store.embedding_indexer_running());
+        store.upsert_account(&account("a1")).unwrap();
+        assert!(
+            store
+                .list_threads(&AccountId("a1".into()))
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_worker_that_exits_releases_the_embed_lock() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                testing_abort_next_indexer(false);
+            }
+        }
+        let _reset = Reset;
+        testing_abort_next_indexer(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-release-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let store = Store::open(&path).unwrap();
+        assert!(store.embedding_indexer_running());
+        let lock_path = embed_lock_path(&path);
+        let start = std::time::Instant::now();
+        loop {
+            let conn = rusqlite::Connection::open(&lock_path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            match conn.execute_batch("BEGIN EXCLUSIVE") {
+                Ok(()) => break,
+                Err(err) if sqlite_lock_held(&err) => {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(2),
+                        "embed lock stayed held after the worker exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
