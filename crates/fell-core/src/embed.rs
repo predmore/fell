@@ -464,10 +464,11 @@ pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize>
     }
 }
 
-/// Drop a stored vector that no longer matches this body.
+/// Drop a stored vector that no longer matches this body, and queue the row.
 ///
-/// A missing row is left missing. The background indexer fills it. This does
-/// not compute a vector.
+/// A missing vector is queued too. A date change can move that mail into the
+/// part of the catch-up the walker has already passed. This does not compute
+/// a vector.
 pub(crate) fn invalidate_message_embedding(
     conn: &Connection,
     account_id: &str,
@@ -497,7 +498,7 @@ pub(crate) fn invalidate_message_embedding(
         )
         .optional()?;
     let Some((model, version, stored_dims, stored_hash, nbytes)) = existing else {
-        return Ok(());
+        return enqueue_message(conn, account_id, message_id);
     };
     if model == id.model
         && version == id.version
@@ -2104,6 +2105,48 @@ mod tests {
         assert!(
             store
                 .message_embedding(&AccountId("a1".into()), &MessageId::new("old@x"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_date_move_into_the_gap_is_queued() {
+        let store = open(&["a1"]);
+        for (id, date) in [
+            ("top@x", 50_i64),
+            ("next@x", 40),
+            ("low@x", 20),
+            ("moved@x", 10),
+        ] {
+            let mut message = message("a1", id, id);
+            message.headers.date_unix = date;
+            store.upsert_message(&message).unwrap();
+        }
+        store
+            .conn
+            .execute("DELETE FROM embedding_queue", [])
+            .unwrap();
+        let mut scan = Scan::default();
+        assert!(matches!(
+            scan.step(&store.conn, 1, None).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert!(matches!(
+            scan.step(&store.conn, 1, None).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        let mut moved = message("a1", "moved@x", "moved@x");
+        moved.headers.date_unix = 45;
+        store.upsert_message(&moved).unwrap();
+        assert!(matches!(
+            scan.step(&store.conn, 1, None).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert_eq!(stored(&store, "a1", "moved@x").version, EMBEDDING_VERSION);
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("low@x"))
                 .unwrap()
                 .is_none()
         );
