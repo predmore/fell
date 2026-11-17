@@ -46,7 +46,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
             dim: 0xe7e2db,
-            marker: 0xe8e4dc,
+            marker: 0x9c958c,
             accent: 0x7aa2f7,
             caret: 0xffffff,
             code: 0x3a3834,
@@ -61,7 +61,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0xf7f5f2,
             fg: 0x1c1b19,
             dim: 0x3a3632,
-            marker: 0x2c2926,
+            marker: 0x6e675f,
             accent: 0x1d4f91,
             caret: 0x111111,
             code: 0xe4ddd4,
@@ -946,7 +946,11 @@ impl ComposeView {
                 self.field == Field::Subject,
                 colors,
             ))
-            .child(reply_row(snap, colors))
+            .child(if snap.hunks.is_empty() {
+                reply_row(snap, colors)
+            } else {
+                hunk_banner(snap, colors)
+            })
     }
 
     fn body_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -968,9 +972,6 @@ impl ComposeView {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden();
-        if !snap.hunks.is_empty() {
-            column = column.child(hunk_banner(snap, colors));
-        }
         for issue in &snap.issues {
             column = column.child(
                 div()
@@ -1151,8 +1152,9 @@ fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
         })
         .unwrap_or("agent edit");
     div()
-        .px_5()
-        .py_2()
+        .flex()
+        .px_1()
+        .py_1()
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
@@ -1204,7 +1206,7 @@ fn styled_body(
             render_block(block, folder, colors)
         };
         column = column.child(if edited {
-            div().bg(rgb(colors.hunk)).px_2().py_1().child(painted)
+            div().w_full().bg(rgb(colors.hunk)).child(painted)
         } else {
             painted
         });
@@ -1293,8 +1295,8 @@ fn raw_line(
             row = row.child(
                 div()
                     .text_size(px(16.))
-                    .font_weight(FontWeight(700.))
-                    .text_color(rgb(colors.fg))
+                    .font_weight(FontWeight(400.))
+                    .text_color(rgb(colors.marker))
                     .pr(px(6.))
                     .child(slice.trim().to_string()),
             );
@@ -1306,7 +1308,7 @@ fn raw_line(
             _ => colors.fg,
         };
         let weight = match span.kind {
-            StyleKind::Strong | StyleKind::Marker => FontWeight(700.),
+            StyleKind::Strong => FontWeight(700.),
             _ => FontWeight(400.),
         };
         if let Some(cursor_byte) = cursor_byte
