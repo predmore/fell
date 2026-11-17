@@ -11,8 +11,8 @@ use fell_core::compose::{
 };
 use fell_core::{AccountId, FixtureBackend, MailBackend};
 use gpui::{
-    Context, FocusHandle, FontWeight, KeyDownEvent, SharedString, StatefulInteractiveElement,
-    Window, div, img, prelude::*, px, rgb,
+    Context, FocusHandle, FontWeight, KeyDownEvent, ObjectFit, SharedString,
+    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb,
 };
 
 use crate::confirmation_from_ui;
@@ -31,6 +31,7 @@ struct Palette {
     marker: u32,
     accent: u32,
     caret: u32,
+    code: u32,
     selection: u32,
     error: u32,
     fresh: u32,
@@ -43,10 +44,11 @@ fn palette(kind: ThemeKind) -> Palette {
         ThemeKind::Dark => Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
-            dim: 0xa39e96,
-            marker: 0x6e6a64,
+            dim: 0xd2ccc4,
+            marker: 0xc8c2ba,
             accent: 0x7aa2f7,
-            caret: 0xd6e4ff,
+            caret: 0xffffff,
+            code: 0x3a3834,
             selection: 0x2a3344,
             error: 0xf7768e,
             fresh: 0x3a2e22,
@@ -56,10 +58,11 @@ fn palette(kind: ThemeKind) -> Palette {
         ThemeKind::Light => Palette {
             bg: 0xf7f5f2,
             fg: 0x1c1b19,
-            dim: 0x5e5a55,
-            marker: 0x5c564e,
+            dim: 0x3a3632,
+            marker: 0x4a453f,
             accent: 0x1d4f91,
-            caret: 0x1d4f91,
+            caret: 0x111111,
+            code: 0xe4ddd4,
             selection: 0xd9e2f2,
             error: 0x9f1239,
             fresh: 0xe4c9a4,
@@ -256,7 +259,7 @@ impl ComposeView {
                     this.editor.row = row;
                     this.editor.col = this.editor.lines[row].chars().count();
                     this.editor.mode = Mode::Insert;
-                    this.status = "i insert".into();
+                    this.status = "esc normal".into();
                 }
                 cx.notify();
             });
@@ -266,7 +269,7 @@ impl ComposeView {
             let _ = this.update(cx, |this, cx| {
                 this.insert_str(" now");
                 this.push_body();
-                this.status = "i insert".into();
+                this.status = "esc normal".into();
                 cx.notify();
             });
             cx.background_executor()
@@ -842,6 +845,11 @@ impl Render for ComposeView {
             Mode::Insert => "INSERT",
             Mode::Visual => "VISUAL",
         };
+        let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
+            (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
+            (Mode::Normal, "esc normal") => "i insert".into(),
+            _ => self.status.clone(),
+        };
         let unreviewed = snap.unreviewed;
         let send_label = if let Some(reason) = &snap.send_block {
             format!("send blocked · {reason}")
@@ -866,7 +874,7 @@ impl Render for ComposeView {
             .child(self.body_view(&snap, colors))
             .child(self.quote_view(colors).flex_shrink_0())
             .child(attachment_row(&snap, colors).flex_shrink_0())
-            .child(status_bar(mode, &send_label, &self.status, &snap, colors).flex_shrink_0())
+            .child(status_bar(mode, &send_label, &hint, &snap, colors).flex_shrink_0())
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
@@ -924,7 +932,7 @@ impl ComposeView {
             .child(if self.raw {
                 raw_body(&self.editor, colors)
             } else {
-                styled_body(&self.editor, &self.folder, colors)
+                styled_body(&self.editor, &self.folder, &body_edit_ranges(snap), colors)
             });
         let mut column = div()
             .flex()
@@ -965,7 +973,7 @@ impl ComposeView {
         let mut block = div()
             .px_5()
             .py_2()
-            .text_sm()
+            .text_size(px(16.))
             .text_color(rgb(colors.dim))
             .border_t_1()
             .border_color(rgb(colors.selection))
@@ -1007,7 +1015,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .child(div().font_weight(FontWeight(620.)).child("Compose"))
         .child(
             div()
-                .text_sm()
+                .text_size(px(16.))
                 .text_color(rgb(colors.dim))
                 .child(format!("{}   {}", snap.from, snap.id)),
         )
@@ -1034,8 +1042,8 @@ fn field_row(
             .border_color(rgb(if active { colors.accent } else { bg }))
             .child(
                 div()
-                    .w(px(52.))
-                    .text_sm()
+                    .w(px(64.))
+                    .text_size(px(16.))
                     .text_color(rgb(colors.dim))
                     .child(label.to_string()),
             )
@@ -1044,7 +1052,12 @@ fn field_row(
             } else {
                 SharedString::from(value.to_string())
             }))
-            .children(fresh.then(|| div().text_sm().text_color(rgb(colors.accent)).child("new"))),
+            .children(fresh.then(|| {
+                div()
+                    .text_size(px(16.))
+                    .text_color(rgb(colors.accent))
+                    .child("new")
+            })),
     )
 }
 
@@ -1058,8 +1071,8 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
         .border_color(rgb(if active { colors.accent } else { colors.panel }))
         .child(
             div()
-                .w(px(52.))
-                .text_sm()
+                .w(px(64.))
+                .text_size(px(16.))
                 .text_color(rgb(colors.dim))
                 .child("Subject"),
         )
@@ -1077,7 +1090,7 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .filter(|value| !value.is_empty())
         .unwrap_or("new message");
     div()
-        .text_sm()
+        .text_size(px(16.))
         .text_color(rgb(colors.dim))
         .px_1()
         .child(format!("Reply to  {reply}"))
@@ -1096,15 +1109,36 @@ fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .unwrap_or("agent edit");
     div()
         .px_5()
-        .py_1()
+        .py_2()
         .bg(rgb(colors.hunk))
-        .text_sm()
+        .text_size(px(16.))
+        .text_color(rgb(colors.fg))
         .child(format!(
             "{label}  ·  u undo  ·  space a k keep  ·  space a x reject"
         ))
 }
 
-fn styled_body(editor: &Editor, folder: &Path, colors: Palette) -> gpui::Div {
+fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize)> {
+    snap.hunks
+        .iter()
+        .filter(|hunk| hunk.kind == HunkKind::Body)
+        .filter_map(|hunk| {
+            let slice = snap.text.get(hunk.start..hunk.end)?.trim();
+            if slice.is_empty() {
+                return None;
+            }
+            let at = snap.body.find(slice)?;
+            Some((at, at + slice.len()))
+        })
+        .collect()
+}
+
+fn styled_body(
+    editor: &Editor,
+    folder: &Path,
+    hunks: &[(usize, usize)],
+    colors: Palette,
+) -> gpui::Div {
     let text = editor.text();
     let doc = markdown_to_doc(&text);
     let cursor_byte = cursor_byte(&text, editor.row, editor.col);
@@ -1116,11 +1150,27 @@ fn styled_body(editor: &Editor, folder: &Path, colors: Palette) -> gpui::Div {
         let on_cursor = block
             .source
             .is_some_and(|(start, end)| cursor_byte >= start && cursor_byte <= end);
-        if on_cursor || block.source.is_none() && editor.row == 0 {
-            column = column.child(raw_source_block(block, &text, editor, colors));
+        let edited = block.source.is_some_and(|(start, end)| {
+            hunks
+                .iter()
+                .any(|(hunk_start, hunk_end)| start < *hunk_end && end > *hunk_start)
+        });
+        let painted = if on_cursor || block.source.is_none() && editor.row == 0 {
+            raw_source_block(block, &text, editor, colors)
         } else {
-            column = column.child(render_block(block, folder, colors));
-        }
+            render_block(block, folder, colors)
+        };
+        column = column.child(if edited {
+            div()
+                .bg(rgb(colors.hunk))
+                .border_l(px(3.))
+                .border_color(rgb(colors.accent))
+                .px_2()
+                .py_1()
+                .child(painted)
+        } else {
+            painted
+        });
     }
     column
 }
@@ -1129,7 +1179,13 @@ fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
     for (index, line) in editor.lines.iter().enumerate() {
         let cursor = (editor.mode != Mode::Normal || true) && index == editor.row;
-        column = column.child(raw_line(line, cursor.then_some(editor.col), true, colors));
+        column = column.child(raw_line(
+            line,
+            cursor.then_some(editor.col),
+            true,
+            editor.mode,
+            colors,
+        ));
     }
     column
 }
@@ -1149,22 +1205,36 @@ fn raw_source_block(
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
         let cursor = (row == editor.row).then_some(editor.col);
-        column = column.child(raw_line(line, cursor, cursor.is_some(), colors));
+        column = column.child(raw_line(
+            line,
+            cursor,
+            cursor.is_some(),
+            editor.mode,
+            colors,
+        ));
     }
     column
 }
 
-fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palette) -> gpui::Div {
+fn raw_line(
+    line: &str,
+    cursor: Option<usize>,
+    show_markers: bool,
+    mode: Mode,
+    colors: Palette,
+) -> gpui::Div {
     let styles = line_styles(line);
     let mut row = div()
         .flex()
         .flex_row()
         .flex_wrap()
         .w_full()
-        .min_h(px(22.))
+        .min_h(px(24.))
         .items_center();
     if styles.is_empty() {
-        row = row.child(caret(colors));
+        if cursor.is_some() {
+            row = row.child(caret(colors, mode));
+        }
         return row;
     }
     let cursor_byte = cursor.map(|col| byte_index(line, col));
@@ -1192,18 +1262,18 @@ fn raw_line(line: &str, cursor: Option<usize>, show_markers: bool, colors: Palet
             let at = cursor_byte - span.start;
             let (left, right) = split_at_char_boundary(slice, at);
             if !left.is_empty() {
-                row = row.child(styled_span(left, color, weight, span.kind));
+                row = row.child(styled_span(left, color, weight, span.kind, colors.code));
             }
-            row = row.child(caret(colors));
+            row = row.child(caret(colors, mode));
             if !right.is_empty() {
-                row = row.child(styled_span(right, color, weight, span.kind));
+                row = row.child(styled_span(right, color, weight, span.kind, colors.code));
             }
             continue;
         }
-        row = row.child(styled_span(slice, color, weight, span.kind));
+        row = row.child(styled_span(slice, color, weight, span.kind, colors.code));
     }
     if cursor_byte.is_some_and(|at| at >= line.len()) {
-        row = row.child(caret(colors));
+        row = row.child(caret(colors, mode));
     }
     row
 }
@@ -1217,6 +1287,7 @@ fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
             colors.accent,
             FontWeight(400.),
             StyleKind::Plain,
+            colors.code,
         );
     }
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
@@ -1226,18 +1297,35 @@ fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
             colors.accent,
             FontWeight(400.),
             StyleKind::Plain,
+            colors.code,
         );
     }
     if trimmed.starts_with('>') {
-        return styled_span("│ ", colors.dim, FontWeight(400.), StyleKind::Plain);
+        return styled_span(
+            "│ ",
+            colors.dim,
+            FontWeight(400.),
+            StyleKind::Plain,
+            colors.code,
+        );
     }
     div()
 }
 
-fn styled_span(text: &str, color: u32, weight: FontWeight, kind: StyleKind) -> gpui::Div {
+fn styled_span(
+    text: &str,
+    color: u32,
+    weight: FontWeight,
+    kind: StyleKind,
+    code_bg: u32,
+) -> gpui::Div {
     let mut node = div().text_color(rgb(color)).font_weight(weight);
     if kind == StyleKind::Code {
-        node = node.font_family("monospace");
+        node = node
+            .font_family("monospace")
+            .bg(rgb(code_bg))
+            .px_1()
+            .rounded_sm();
     }
     if kind == StyleKind::Em {
         node = node.italic();
@@ -1248,8 +1336,13 @@ fn styled_span(text: &str, color: u32, weight: FontWeight, kind: StyleKind) -> g
     node.child(text.to_string())
 }
 
-fn caret(colors: Palette) -> gpui::Div {
-    div().w(px(3.)).h(px(20.)).bg(rgb(colors.caret))
+fn caret(colors: Palette, mode: Mode) -> gpui::Div {
+    let width = if mode == Mode::Insert { 5. } else { 12. };
+    div()
+        .w(px(width))
+        .h(px(22.))
+        .flex_shrink_0()
+        .bg(rgb(colors.caret))
 }
 
 fn render_doc(doc: &StyledDoc, folder: &Path, colors: Palette) -> gpui::Div {
@@ -1319,9 +1412,14 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
             fell_core::compose::Inline::Em(inner) => {
                 row.child(div().italic().child(render_inlines(inner, colors)))
             }
-            fell_core::compose::Inline::Code(text) => {
-                row.child(div().font_family("monospace").child(text.clone()))
-            }
+            fell_core::compose::Inline::Code(text) => row.child(
+                div()
+                    .font_family("monospace")
+                    .bg(rgb(colors.code))
+                    .px_1()
+                    .rounded_sm()
+                    .child(text.clone()),
+            ),
             fell_core::compose::Inline::Link { text, .. } => row.child(
                 div()
                     .text_color(rgb(colors.accent))
@@ -1336,14 +1434,20 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
 
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
     let path = folder.join(src);
-    let mut block = div().flex().flex_col().gap_1();
+    let mut block = div().flex().flex_col().items_start().gap_1();
     if path.is_file() {
-        block = block.child(img(path).w(px(220.)).h(px(64.)));
+        block = block.child(
+            img(path)
+                .w(px(210.))
+                .h(px(92.))
+                .object_fit(ObjectFit::Fill)
+                .flex_shrink_0(),
+        );
     }
     block.child(
         div()
             .pb_3()
-            .text_sm()
+            .text_size(px(16.))
             .text_color(rgb(colors.dim))
             .child(alt.to_string()),
     )
@@ -1368,7 +1472,7 @@ fn attachment_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
     div()
         .px_5()
         .py_2()
-        .text_sm()
+        .text_size(px(16.))
         .bg(rgb(colors.panel))
         .text_color(rgb(colors.dim))
         .child(format!("Attachments  {names}"))
@@ -1386,7 +1490,13 @@ fn status_bar(
         .iter()
         .chain(&snap.cc)
         .chain(&snap.bcc)
-        .any(|item| item.fresh);
+        .filter(|item| item.fresh)
+        .count();
+    let fresh_label = match fresh {
+        0 => None,
+        1 => Some("1 new recipient".to_string()),
+        count => Some(format!("{count} new recipients")),
+    };
     div()
         .flex()
         .justify_between()
@@ -1395,7 +1505,7 @@ fn status_bar(
         .bg(rgb(colors.panel))
         .border_t_1()
         .border_color(rgb(colors.selection))
-        .text_sm()
+        .text_size(px(16.))
         .child(
             div()
                 .flex()
@@ -1403,7 +1513,7 @@ fn status_bar(
                 .child(div().text_color(rgb(colors.accent)).child(mode.to_string()))
                 .child(div().text_color(rgb(colors.dim)).child(status.to_string()))
                 .children(
-                    fresh.then(|| div().text_color(rgb(colors.accent)).child("new recipient")),
+                    fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
         .child(div().child(send.to_string()))
