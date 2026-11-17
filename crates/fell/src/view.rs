@@ -265,27 +265,23 @@ impl Inbox {
         let viewport = f32::from(self.conv_scroll.bounds().size.height);
         let viewport = if viewport < 1.0 { 640.0 } else { viewport };
         let delta = pages as f32 * viewport + lines as f32 * 24.0;
-        let current = self.conv_scroll.offset();
-        let max = f32::from(self.conv_scroll.max_offset().height);
-        let next_y = (f32::from(current.y) - delta).clamp(-max, 0.0);
-        self.conv_scroll.set_offset(point(current.x, px(next_y)));
-        self.follow_paged_message();
-    }
-
-    fn follow_paged_message(&mut self) {
-        let mut spans = Vec::new();
+        let measured = self.conv_scroll.offset();
+        let scrollport_top = f32::from(self.conv_scroll.bounds().top());
+        let mut item_bounds = Vec::new();
         let mut index = 0;
         while let Some(bounds) = self.conv_scroll.bounds_for_item(index) {
-            spans.push((f32::from(bounds.top()), f32::from(bounds.bottom())));
+            item_bounds.push((f32::from(bounds.top()), f32::from(bounds.bottom())));
             index += 1;
         }
-        let viewport_top =
-            f32::from(self.conv_scroll.bounds().top()) - f32::from(self.conv_scroll.offset().y);
-        if let Some(ix) = present::message_at_top(&spans, viewport_top)
+        let max = f32::from(self.conv_scroll.max_offset().height);
+        let next_y = (f32::from(measured.y) - delta).clamp(-max, 0.0);
+        if let Some(ix) =
+            present::message_after_page(&item_bounds, scrollport_top, f32::from(measured.y), next_y)
             && ix < self.session.messages.len()
         {
             self.session.message_cursor = ix;
         }
+        self.conv_scroll.set_offset(point(measured.x, px(next_y)));
     }
 
     fn arm_which(&mut self, cx: &mut Context<Self>) {

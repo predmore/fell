@@ -176,6 +176,28 @@ pub fn message_at_top(spans: &[(f32, f32)], viewport_top: f32) -> Option<usize> 
     )
 }
 
+/// Message under the viewport after a page, using one frame's measurements.
+///
+/// `item_bounds` are window positions from the layout that ran while
+/// `measured_offset` was the scroll offset. GPUI records those positions
+/// before it applies the offset, so they are not shifted by it. The page
+/// distance is `measured_offset - new_offset`, and that is added to the
+/// content position of the measured frame (`-measured_offset`). The new
+/// offset is never subtracted from the previous frame's boxes.
+pub fn message_after_page(
+    item_bounds: &[(f32, f32)],
+    scrollport_top: f32,
+    measured_offset: f32,
+    new_offset: f32,
+) -> Option<usize> {
+    let content_top = -measured_offset + (measured_offset - new_offset);
+    let spans: Vec<(f32, f32)> = item_bounds
+        .iter()
+        .map(|(top, bottom)| (top - scrollport_top, bottom - scrollport_top))
+        .collect();
+    message_at_top(&spans, content_top)
+}
+
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -359,6 +381,38 @@ mod tests {
         assert_eq!(message_at_top(&spans, 2000.0), Some(1));
         assert_eq!(message_at_top(&spans, 5000.0), Some(1));
         assert_eq!(message_at_top(&[], 0.0), None);
+    }
+
+    #[test]
+    fn second_page_uses_the_offset_from_the_measured_frame() {
+        let scrollport = 180.0;
+        let measured = -720.0;
+        // Window boxes from the layout. They are not shifted by `measured`.
+        let bounds = [
+            (scrollport, scrollport + 1600.0),
+            (scrollport + 1600.0, scrollport + 2000.0),
+        ];
+        // Already 720px down. Another 500px stays inside the 1600px message.
+        let next = measured - 500.0;
+        assert_eq!(
+            message_after_page(&bounds, scrollport, measured, next),
+            Some(0)
+        );
+        // 1000px more reaches content y 1720, the following message.
+        let past = measured - 1000.0;
+        assert_eq!(
+            message_after_page(&bounds, scrollport, measured, past),
+            Some(1)
+        );
+        // Mixing the new offset with boxes that still include the old offset
+        // lands in the next message while the real content top is still in
+        // the first one.
+        let shifted = [
+            (bounds[0].0 + measured, bounds[0].1 + measured),
+            (bounds[1].0 + measured, bounds[1].1 + measured),
+        ];
+        assert_eq!(message_at_top(&shifted, scrollport - next), Some(1));
+        assert_eq!(message_after_page(&[], scrollport, measured, next), None);
     }
 
     #[test]
