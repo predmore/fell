@@ -249,6 +249,7 @@ fn list_item(
     };
     div()
         .flex()
+        .items_center()
         .gap_2()
         .child(
             div()
@@ -533,7 +534,7 @@ pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
     div()
         .w_full()
         .border(px(1.))
-        .border_color(paint(0x6e6a64))
+        .border_color(paint(0x2e2c2a))
         .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
         .into_any_element()
 }
