@@ -53,9 +53,9 @@ Misspellings use a character-trigram index of words from subject, sender, recipi
 
 ## Local actions
 
-Archive, label, delete, and undo update this SQLite file only. There is no socket, no IMAP session, and no send.
+Archive, move, label, delete, and undo update this SQLite file only. There is no socket, no IMAP session, and no send.
 
-The thread is the unit. Archive moves the folder the caller names (the folder on screen) to `Archive` on each message in the thread that has it. Any other folder on that row, such as `Sent`, stays. Delete moves that folder to `Trash`. Delete from `Trash` drops `Trash`, and removes the row when it was the last folder. Labels are a separate list. Each successful call stores the previous folders and labels on that account's undo stack. `Store::undo` restores the latest entry for that account and leaves other accounts as they are.
+The thread is the unit. Archive moves the folder the caller names (the folder on screen) to `Archive` on each message in the thread that has it. Move does the same to the folder the caller names. Any other folder on that row, such as `Sent`, stays. Delete moves that folder to `Trash`. Delete from `Trash` drops `Trash`, and removes the row when it was the last folder. Labels are a separate list. Each successful call stores the previous folders and labels on that account's undo stack. `Store::undo` restores the latest entry for that account and leaves other accounts as they are.
 
 `in:` and `label:` read the columns those calls write. Folder and label words enter and leave the trigram vocabulary with the change. `apply_delta` still unions other folders and labels for the same Message-ID, and leaves out a folder archive or delete removed. Undo restores that folder and then drops the saved message copy, including the body and BCC. Outbound sync of these edits is separate.
 

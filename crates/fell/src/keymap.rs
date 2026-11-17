@@ -1,6 +1,6 @@
 //! Leader chords, which-key, and the command palette index.
 //!
-//! `m` is reserved for move and ships in M3. Nothing in this keymap binds it.
+//! `m` moves the thread out of the current folder. `u` undoes that.
 
 use std::fmt::Write as _;
 
@@ -33,6 +33,8 @@ pub enum Action {
     Sent,
     Drafts,
     FolderPicker,
+    Move,
+    Undo,
     ToggleSelect,
     Visual,
     FullWidth,
@@ -56,6 +58,8 @@ impl Action {
             Self::Sent => "Go to Sent",
             Self::Drafts => "Go to Drafts",
             Self::FolderPicker => "Choose folder",
+            Self::Move => "Move",
+            Self::Undo => "Undo",
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
@@ -70,7 +74,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 18] = [
+const ALL_ACTIONS: [Action; 20] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -83,6 +87,8 @@ const ALL_ACTIONS: [Action; 18] = [
     Action::Sent,
     Action::Drafts,
     Action::FolderPicker,
+    Action::Move,
+    Action::Undo,
     Action::ToggleSelect,
     Action::Visual,
     Action::FullWidth,
@@ -170,6 +176,8 @@ fn default_bindings() -> Vec<Binding> {
         Action::FolderPicker,
         Some("go"),
     );
+    bind(&[KeyId::Char('m')], Action::Move, None);
+    bind(&[KeyId::Char('u')], Action::Undo, None);
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);
     bind(&[KeyId::Char('z')], Action::FullWidth, None);
@@ -195,6 +203,11 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('f')],
         Action::FolderPicker,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('m')],
+        Action::Move,
         Some("folders"),
     );
     bind(
@@ -428,13 +441,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leader_defaults_to_space_and_m_is_free() {
+    fn leader_defaults_to_space_and_m_moves() {
         let keymap = Keymap::default();
         assert_eq!(keymap.leader, KeyId::Space);
         assert_eq!(keymap.which_key_ms, 300);
-        assert_eq!(match_seq(&keymap, &[KeyId::Char('m')]), SeqMatch::None);
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char('m')]),
+            SeqMatch::Action(Action::Move)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char('u')]),
+            SeqMatch::Action(Action::Undo)
+        );
         let root = which_key(&keymap, &[]);
-        assert!(root.iter().all(|item| item.key != "m"));
+        assert!(
+            root.iter()
+                .any(|item| item.key == "m" && item.label == "Move")
+        );
         let leader = which_key(&keymap, &[KeyId::Leader]);
         assert!(
             leader
@@ -449,7 +472,11 @@ mod tests {
         assert!(leader.iter().all(|item| item.key != "m"));
         let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
         assert!(folders.iter().any(|item| item.key == "i"));
-        assert!(folders.iter().all(|item| item.key != "m"));
+        assert!(
+            folders
+                .iter()
+                .any(|item| item.key == "m" && item.label == "Move")
+        );
     }
 
     #[test]
@@ -492,10 +519,15 @@ mod tests {
         let items = palette_items(&keymap, "", &[Action::Sent, Action::Inbox]);
         assert_eq!(items[0].action, Action::Sent);
         assert_eq!(items[1].action, Action::Inbox);
+        let move_item = items
+            .iter()
+            .find(|item| item.action == Action::Move)
+            .expect("move is in the palette");
+        assert!(move_item.binding.contains('m'));
         assert!(
             items
                 .iter()
-                .all(|item| !item.label.to_lowercase().contains("move"))
+                .any(|item| item.action == Action::Undo && item.binding.contains('u'))
         );
         let inbox = palette_items(&keymap, "inbox", &[]);
         assert_eq!(inbox[0].action, Action::Inbox);

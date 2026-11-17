@@ -61,6 +61,8 @@ struct Inbox {
     split: f32,
     dragging: bool,
     open_thread: Option<String>,
+    /// Thread `m` just moved. `u` selects it again when it returns to this folder.
+    moved_thread: Option<String>,
 }
 
 impl Inbox {
@@ -85,6 +87,7 @@ impl Inbox {
             split: mailbox.split,
             dragging: false,
             open_thread: None,
+            moved_thread: None,
         };
         if let Some(error) = mailbox.error {
             inbox.session.record_startup_error(error);
@@ -184,6 +187,72 @@ impl Inbox {
         }
     }
 
+    fn apply_move(&mut self, destination: String) {
+        let Some(id) = self.session.cursor_id.clone() else {
+            self.session.show_toast("No conversation", true);
+            return;
+        };
+        let index = self.session.cursor_index();
+        match self.store.move_thread(
+            &self.account_id,
+            &ThreadId(id.clone()),
+            &self.session.folder,
+            &destination,
+        ) {
+            Ok(_) => {
+                self.moved_thread = Some(id.clone());
+                let label = present::folder_label(&destination);
+                self.session.show_toast(format!("Moved to {label}"), false);
+                if !self.reload_threads() {
+                    return;
+                }
+                if self.session.cursor_id.as_deref() != Some(id.as_str()) {
+                    let next = self
+                        .session
+                        .threads
+                        .get(index)
+                        .or_else(|| self.session.threads.last());
+                    if let Some(row) = next {
+                        self.session.cursor_id = Some(row.id.clone());
+                    }
+                }
+                if !self.reload_messages(true) {
+                    self.clear_open_message();
+                }
+                self.scroll_list_to_cursor();
+                self.scroll_conversation();
+            }
+            Err(err) => self.session.show_toast(err.to_string(), true),
+        }
+    }
+
+    fn apply_undo(&mut self) {
+        match self.store.undo(&self.account_id) {
+            Ok(_) => {
+                self.session.show_toast("Undone", false);
+                let restored = self.moved_thread.take();
+                if self.reload_threads() {
+                    if let Some(id) = restored {
+                        self.session.select_if_present(&id);
+                    }
+                    if !self.reload_messages(true) {
+                        self.clear_open_message();
+                    }
+                }
+                self.scroll_list_to_cursor();
+                self.scroll_conversation();
+            }
+            Err(err) => {
+                let raw = err.to_string();
+                if raw == "nothing to undo" {
+                    self.session.show_toast("Nothing to undo", false);
+                } else {
+                    self.session.show_toast(raw, true);
+                }
+            }
+        }
+    }
+
     fn clear_open_message(&mut self) {
         self.session.messages.clear();
         self.open_thread = None;
@@ -211,6 +280,7 @@ impl Inbox {
         let message_before = self.session.message_cursor;
         let thread_before = self.session.cursor_id.clone();
         let folder_before = self.session.folder.clone();
+        self.session.clear_toast();
         let step = self.session.on_key(key, page);
         self.apply_step(step, message_before, thread_before, folder_before, cx);
         cx.stop_propagation();
@@ -224,6 +294,14 @@ impl Inbox {
         folder_before: String,
         cx: &mut Context<Self>,
     ) {
+        if step.apply_move
+            && let Some(destination) = self.session.pending_move.take()
+        {
+            self.apply_move(destination);
+        }
+        if step.undo {
+            self.apply_undo();
+        }
         let mut loaded_messages = false;
         let mut loaded_threads = false;
         if step.reload_threads {
@@ -1176,7 +1254,26 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
-        .child(div().flex_1())
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(rgb(match &session.toast {
+                    Some(toast) if toast.error => theme.error,
+                    Some(_) => theme.foreground,
+                    None => theme.dimmed,
+                }))
+                .child(
+                    session
+                        .toast
+                        .as_ref()
+                        .map(|toast| toast.text.clone())
+                        .unwrap_or_default(),
+                ),
+        )
         .child(
             div()
                 .font_family_opt(theme.mono_family.clone())
@@ -1400,7 +1497,17 @@ fn folder_picker(
                 .gap(px(8.))
                 .border_b(px(1.))
                 .border_color(rgb(theme.border))
-                .child(div().text_color(rgb(theme.dimmed)).child("Folder"))
+                .child(
+                    div()
+                        .text_color(rgb(
+                            if session.folder_intent == crate::model::FolderIntent::Move {
+                                theme.accent
+                            } else {
+                                theme.dimmed
+                            },
+                        ))
+                        .child(session.folder_prompt()),
+                )
                 .child(div().child(session.folder_query.clone()))
                 .child(div().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))),
         )
@@ -1438,21 +1545,19 @@ fn folder_picker(
                             cx.listener(move |inbox, _, window, cx| {
                                 cx.stop_propagation();
                                 window.focus(&inbox.focus);
-                                inbox.session.overlay = Overlay::None;
-                                if inbox.session.folder != name {
-                                    let previous = inbox.session.folder.clone();
-                                    inbox.session.folder = name.clone();
-                                    if !inbox.reload_threads() {
-                                        inbox.session.folder = previous;
-                                    } else {
-                                        if !inbox.reload_messages(true) {
-                                            inbox.clear_open_message();
-                                        }
-                                        inbox.scroll_list_to_cursor();
-                                        inbox.scroll_conversation();
-                                    }
-                                }
-                                cx.notify();
+                                inbox.session.clear_toast();
+                                inbox.session.folder_index = index;
+                                let message_before = inbox.session.message_cursor;
+                                let thread_before = inbox.session.cursor_id.clone();
+                                let folder_before = inbox.session.folder.clone();
+                                let step = inbox.session.confirm_folder();
+                                inbox.apply_step(
+                                    step,
+                                    message_before,
+                                    thread_before,
+                                    folder_before,
+                                    cx,
+                                );
                             }),
                         )
                         .child(label)

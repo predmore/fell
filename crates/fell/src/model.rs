@@ -34,6 +34,22 @@ pub enum Overlay {
     Help,
 }
 
+/// What confirming the folder picker does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderIntent {
+    /// `gf` switches the list to the chosen folder.
+    Go,
+    /// `m` moves the open thread out of the folder on screen.
+    Move,
+}
+
+/// One-line result of the last move or undo. The next key clears it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Toast {
+    pub text: String,
+    pub error: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Motion {
     Forward(usize),
@@ -61,6 +77,10 @@ pub struct Step {
     pub scroll_pages: i32,
     /// Conversation lines. Positive moves down.
     pub scroll_lines: i32,
+    /// The view moves the thread to [`Session::pending_move`].
+    pub apply_move: bool,
+    /// `u` restores the latest local action.
+    pub undo: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +129,10 @@ pub struct Session {
     pub palette_index: usize,
     pub folder_query: String,
     pub folder_index: usize,
+    pub folder_intent: FolderIntent,
+    pub toast: Option<Toast>,
+    /// Destination chosen by `m`, consumed when the view applies the move.
+    pub pending_move: Option<String>,
 }
 
 impl Session {
@@ -148,6 +172,27 @@ impl Session {
             palette_index: 0,
             folder_query: String::new(),
             folder_index: 0,
+            folder_intent: FolderIntent::Go,
+            toast: None,
+            pending_move: None,
+        }
+    }
+
+    pub fn show_toast(&mut self, text: impl Into<String>, error: bool) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error,
+        });
+    }
+
+    pub fn clear_toast(&mut self) {
+        self.toast = None;
+    }
+
+    pub fn folder_prompt(&self) -> &'static str {
+        match self.folder_intent {
+            FolderIntent::Move => "Move to",
+            FolderIntent::Go => "Folder",
         }
     }
 
@@ -211,11 +256,16 @@ impl Session {
     pub fn folder_choices(&self) -> Vec<String> {
         let all = merge_folders(&self.folders);
         let query = self.folder_query.trim();
-        if query.is_empty() {
-            return all;
-        }
         all.into_iter()
             .filter(|name| {
+                if self.folder_intent == FolderIntent::Move
+                    && name.eq_ignore_ascii_case(&self.folder)
+                {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
                 folder_label(name)
                     .to_ascii_lowercase()
                     .contains(&query.to_ascii_lowercase())
@@ -253,6 +303,18 @@ impl Session {
             ids.insert(thread.id.clone());
         }
         ids
+    }
+
+    /// Select `id` when that thread is in the current list.
+    ///
+    /// Undo uses this so the thread that just came back is the one on screen.
+    pub fn select_if_present(&mut self, id: &str) -> bool {
+        if self.threads.iter().any(|thread| thread.id == id) {
+            self.cursor_id = Some(id.to_string());
+            true
+        } else {
+            false
+        }
     }
 
     /// Keep the same thread selected when the list is replaced.
@@ -380,6 +442,8 @@ impl Session {
                 step.reload_messages |= ran.reload_messages;
                 step.scroll_pages = ran.scroll_pages;
                 step.scroll_lines = ran.scroll_lines;
+                step.apply_move |= ran.apply_move;
+                step.undo |= ran.undo;
             }
             SeqMatch::Prefix => {
                 self.chord = seq;
@@ -471,26 +535,10 @@ impl Session {
         match key {
             KeyId::Escape => {
                 self.overlay = Overlay::None;
+                self.folder_intent = FolderIntent::Go;
                 Step::default()
             }
-            KeyId::Enter => {
-                let choices = self.folder_choices();
-                let Some(chosen) = choices.get(self.folder_index).cloned() else {
-                    self.overlay = Overlay::None;
-                    self.folder_query.clear();
-                    return Step::default();
-                };
-                self.overlay = Overlay::None;
-                self.folder_query.clear();
-                if self.folder != chosen {
-                    self.folder = chosen;
-                    return Step {
-                        reload_threads: true,
-                        ..Step::default()
-                    };
-                }
-                Step::default()
-            }
+            KeyId::Enter => self.confirm_folder(),
             KeyId::Backspace => {
                 self.folder_query.pop();
                 self.folder_index = 0;
@@ -523,6 +571,41 @@ impl Session {
                 Step::default()
             }
             _ => Step::default(),
+        }
+    }
+
+    /// Enter or a click on the highlighted folder.
+    pub fn confirm_folder(&mut self) -> Step {
+        let choices = self.folder_choices();
+        let Some(chosen) = choices.get(self.folder_index).cloned() else {
+            self.overlay = Overlay::None;
+            self.folder_query.clear();
+            self.folder_intent = FolderIntent::Go;
+            return Step::default();
+        };
+        let intent = self.folder_intent;
+        self.overlay = Overlay::None;
+        self.folder_query.clear();
+        self.folder_intent = FolderIntent::Go;
+        match intent {
+            FolderIntent::Move => {
+                self.pending_move = Some(chosen);
+                Step {
+                    apply_move: true,
+                    ..Step::default()
+                }
+            }
+            FolderIntent::Go => {
+                if self.folder != chosen {
+                    self.folder = chosen;
+                    Step {
+                        reload_threads: true,
+                        ..Step::default()
+                    }
+                } else {
+                    Step::default()
+                }
+            }
         }
     }
 
@@ -583,6 +666,7 @@ impl Session {
             Action::Drafts => step.reload_threads = self.go_folder("Drafts"),
             Action::FolderPicker => {
                 self.count.clear();
+                self.folder_intent = FolderIntent::Go;
                 self.overlay = Overlay::Folders;
                 self.folder_query.clear();
                 self.folder_index = self
@@ -590,6 +674,24 @@ impl Session {
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(&self.folder))
                     .unwrap_or(0);
+            }
+            Action::Move => {
+                self.count.clear();
+                if self.cursor_id.is_none() {
+                    self.show_toast("No conversation", true);
+                    return Step::default();
+                }
+                self.folder_intent = FolderIntent::Move;
+                self.overlay = Overlay::Folders;
+                self.folder_query.clear();
+                self.folder_index = 0;
+            }
+            Action::Undo => {
+                self.count.clear();
+                return Step {
+                    undo: true,
+                    ..Step::default()
+                };
             }
             Action::ToggleSelect => {
                 self.count.clear();
@@ -838,12 +940,38 @@ mod tests {
     }
 
     #[test]
-    fn m_does_not_move_and_paging_is_ctrl() {
+    fn undo_selects_the_thread_that_came_back() {
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        assert!(session.select_if_present("a"));
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
+        assert!(!session.select_if_present("missing"));
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn m_opens_the_move_picker_and_paging_is_ctrl() {
         let mut session = session();
         let before = session.folder.clone();
         let step = session.on_key(KeyId::Char('m'), 4);
-        assert!(!step.reload_threads);
+        assert!(!step.apply_move);
+        assert!(!step.undo);
+        assert_eq!(session.overlay, Overlay::Folders);
+        assert_eq!(session.folder_intent, FolderIntent::Move);
+        assert_eq!(session.folder_prompt(), "Move to");
+        assert!(
+            session
+                .folder_choices()
+                .iter()
+                .all(|name| !name.eq_ignore_ascii_case("INBOX"))
+        );
+        let step = session.on_key(KeyId::Enter, 4);
+        assert!(step.apply_move);
+        assert_eq!(session.pending_move.as_deref(), Some("Sent"));
         assert_eq!(session.folder, before);
+        assert_eq!(session.overlay, Overlay::None);
+        let step = session.on_key(KeyId::Char('u'), 4);
+        assert!(step.undo);
         assert!(session.chord.is_empty());
         session.pane = Pane::Conversation;
         session.messages = vec![
