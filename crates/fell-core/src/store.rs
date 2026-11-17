@@ -1742,9 +1742,10 @@ const LIST_ECHO_WINDOW_SECS: u64 = 6 * 60 * 60;
 /// Same sender, exact body fingerprint, and a delivery this close.
 ///
 /// One side must be a list rewrite, and Proton conversation ids must be absent
-/// or equal. Subject is not an identity for a longer body. A short body also
-/// has to share that subject, and two list posts stay apart. More than one
-/// candidate stays as separate rows.
+/// or equal. A short reply joins only when it is the same post. A longer list
+/// copy joins a Sent copy only when the subject key matches; a different
+/// parent is still that post. Any other pair must share the subject key and
+/// parent. More than one candidate stays as separate rows.
 fn find_list_collapse(
     conn: &Connection,
     message: &Message,
@@ -1984,12 +1985,13 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
         return false;
     }
     // `+1` from the same sender is not one send. A Sent copy and its echo of
-    // that short text still join when they are the same post.
+    // that short text still join when they are the same post. A longer body
+    // joins a Sent copy only when the subject key matches.
     match incoming.body_text.as_deref() {
         Some(body) if is_short_reply_body(body) => {
             short_reply_is_one_post(incoming, stored, incoming_list, stored_list)
         }
-        _ => true,
+        _ => list_echo_matches(incoming, stored, incoming_list, stored_list),
     }
 }
 
@@ -2050,14 +2052,73 @@ fn short_parents_match(incoming: &Message, stored: &Arrival) -> bool {
     }
 }
 
+/// A list copy joins a Sent copy when the subject key matches. A different
+/// parent does not block that join. Any other pair must share the subject
+/// key and the same parent (or both omit it).
+fn list_echo_matches(
+    incoming: &Message,
+    stored: &Arrival,
+    incoming_list: bool,
+    stored_list: bool,
+) -> bool {
+    let same_subject = subject_key(&incoming.headers.subject) == subject_key(&stored.subject);
+    if list_copy_joins_sent_copy(incoming, stored, incoming_list, stored_list) {
+        return same_subject;
+    }
+    same_subject && parents_match(incoming, stored)
+}
+
+/// The non-Sent side is the list copy, and the other side is in Sent.
+///
+/// Two rows that both carry a list id are not a send and its echo. A subject
+/// that still wears a list tag counts as a list copy for rows stored before
+/// `list_id`.
+fn list_copy_joins_sent_copy(
+    incoming: &Message,
+    stored: &Arrival,
+    incoming_list: bool,
+    stored_list: bool,
+) -> bool {
+    if incoming_list && stored_list {
+        return false;
+    }
+    let incoming_sent = copy_in_sent(&incoming.folders);
+    let stored_sent = copy_in_sent(&split_field(&stored.folders));
+    if incoming_sent == stored_sent {
+        return false;
+    }
+    if stored_sent {
+        incoming_list || subject_has_list_prefix(&incoming.headers.subject)
+    } else {
+        stored_list || subject_has_list_prefix(&stored.subject)
+    }
+}
+
+/// Both copies name the same `In-Reply-To`, or both have none.
+fn parents_match(incoming: &Message, stored: &Arrival) -> bool {
+    let stored_parent = stored.in_reply_to.as_deref().filter(|id| !id.is_empty());
+    let incoming_parent = incoming
+        .headers
+        .in_reply_to
+        .as_ref()
+        .map(MessageId::as_str)
+        .filter(|id| !id.is_empty());
+    match (stored_parent, incoming_parent) {
+        (Some(stored_id), Some(incoming_id)) => stored_id == incoming_id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn copy_in_sent(folders: &[String]) -> bool {
+    folders
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"))
+}
+
 fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival) -> bool {
-    let incoming_sent = incoming
-        .folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
-    let stored_sent = split_field(&stored.folders)
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    let incoming_sent = copy_in_sent(&incoming.folders);
+    let stored_sent = copy_in_sent(&split_field(&stored.folders));
     if incoming_sent == stored_sent {
         return false;
     }
@@ -4752,18 +4813,408 @@ mod tests {
 
         let mut near = msg("near@x", None, None, "Hello", "near body");
         near.headers.date_unix = 1_700_000_000;
+        near.folders = vec!["INBOX".into()];
         let near_thread = store.upsert_message(&near).unwrap();
         let mut echo = msg("near-list@x", None, None, "unrelated subject", "near body");
         echo.list_id = Some("list.example".into());
         echo.headers.date_unix = near.headers.date_unix + (5 * 60 * 60);
-        assert_eq!(store.upsert_message(&echo).unwrap(), near_thread);
-        assert_eq!(
-            store
-                .thread_messages(&AccountId("a1".into()), &near_thread)
-                .unwrap()
-                .len(),
-            1
+        echo.folders = vec!["INBOX".into()];
+        let echo_thread = store.upsert_message(&echo).unwrap();
+        // Not a Sent copy, and the subject key differs, so the list post stays.
+        assert_ne!(echo_thread, near_thread);
+        assert_eq!(listed(&store).len(), 4);
+    }
+
+    /// Inbox "Sounds good to me" on Patch, and a list post of that body on
+    /// another subject and parent. Both orders, then a resync of each id.
+    fn deliver_sounds_good(list_first: bool) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let at = 1_700_000_000;
+        store
+            .upsert_message(&msg("patch@x", None, None, "Patch", "patch notes"))
+            .unwrap();
+        store
+            .upsert_message(&msg("budget@x", None, None, "Budget", "budget notes"))
+            .unwrap();
+        let mut inbox = msg(
+            "sounds-inbox@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Sounds good to me",
         );
+        inbox.headers.date_unix = at;
+        inbox.folders = vec!["INBOX".into()];
+        let mut list = msg(
+            "sounds-list@x",
+            None,
+            Some("budget@x"),
+            "[list] Re: Budget",
+            "Sounds good to me",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = at + 10 * 60;
+        list.folders = vec!["INBOX".into()];
+        if list_first {
+            store.upsert_message(&list).unwrap();
+            store.upsert_message(&inbox).unwrap();
+        } else {
+            store.upsert_message(&inbox).unwrap();
+            store.upsert_message(&list).unwrap();
+        }
+        store
+    }
+
+    fn assert_sounds_good_keeps_both_threads(store: &Store) {
+        let rows = listed(store);
+        let inbox = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "sounds-inbox@x")
+            .unwrap();
+        let list = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "sounds-list@x")
+            .unwrap();
+        let patch = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "patch@x")
+            .unwrap();
+        let budget = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "budget@x")
+            .unwrap();
+        assert_eq!(
+            inbox.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("patch@x")
+        );
+        assert_eq!(
+            list.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("budget@x")
+        );
+        assert_eq!(inbox.thread_id, patch.thread_id);
+        assert_eq!(list.thread_id, budget.thread_id);
+        assert_ne!(inbox.thread_id, list.thread_id);
+    }
+
+    #[test]
+    fn long_body_list_post_keeps_its_thread_beside_a_different_inbox_message() {
+        for list_first in [false, true] {
+            let store = deliver_sounds_good(list_first);
+            assert_sounds_good_keeps_both_threads(&store);
+        }
+    }
+
+    #[test]
+    fn resync_does_not_absorb_a_long_body_list_post_into_a_different_inbox() {
+        for list_first in [false, true] {
+            let store = deliver_sounds_good(list_first);
+            let at = 1_700_000_000;
+            let mut inbox = msg(
+                "sounds-inbox@x",
+                None,
+                Some("patch@x"),
+                "Re: Patch",
+                "Sounds good to me",
+            );
+            inbox.headers.date_unix = at;
+            inbox.folders = vec!["INBOX".into()];
+            let mut list = msg(
+                "sounds-list@x",
+                None,
+                Some("budget@x"),
+                "[list] Re: Budget",
+                "Sounds good to me",
+            );
+            list.list_id = Some("list.example".into());
+            list.headers.date_unix = at + 10 * 60;
+            list.folders = vec!["INBOX".into()];
+            store.upsert_message(&inbox).unwrap();
+            store.upsert_message(&list).unwrap();
+            assert_sounds_good_keeps_both_threads(&store);
+        }
+    }
+
+    #[test]
+    fn long_body_same_subject_different_parent_stays_apart() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let at = 1_700_000_000;
+        store
+            .upsert_message(&msg("patch@x", None, None, "Patch", "patch notes"))
+            .unwrap();
+        store
+            .upsert_message(&msg("other@x", None, None, "Other", "other notes"))
+            .unwrap();
+        let mut inbox = msg(
+            "inbox@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Sounds good to me",
+        );
+        inbox.headers.date_unix = at;
+        inbox.folders = vec!["INBOX".into()];
+        let mut list = msg(
+            "list@x",
+            None,
+            Some("other@x"),
+            "[list] Re: Patch",
+            "Sounds good to me",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = at + 10 * 60;
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        store.upsert_message(&inbox).unwrap();
+        store.upsert_message(&list).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 4);
+        let inbox_row = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "inbox@x")
+            .unwrap();
+        let list_row = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "list@x")
+            .unwrap();
+        assert_eq!(
+            inbox_row
+                .headers
+                .in_reply_to
+                .as_ref()
+                .map(MessageId::as_str),
+            Some("patch@x")
+        );
+        assert_eq!(
+            list_row.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("other@x")
+        );
+        assert_ne!(inbox_row.thread_id, list_row.thread_id);
+    }
+
+    /// Sent copy A and list copy B share a long body and a sender. The subjects
+    /// do not. A different parent is allowed on the Sent path; the subject is not.
+    fn sent_a_and_list_b() -> (Message, Message) {
+        let at = 1_700_000_000;
+        let mut sent = msg(
+            "sent-a@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Sounds good to me",
+        );
+        sent.headers.date_unix = at;
+        sent.folders = vec!["Sent".into()];
+        let mut list = msg(
+            "list-b@x",
+            None,
+            Some("budget@x"),
+            "[list] Re: Budget",
+            "Sounds good to me",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = at + 10 * 60;
+        list.folders = vec!["INBOX".into()];
+        (sent, list)
+    }
+
+    fn message_row_present(store: &Store, message_id: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE account_id = 'a1' AND message_id = ?1",
+                params![message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
+    }
+
+    fn alias_target(store: &Store, message_id: &str) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT canonical_message_id FROM message_aliases
+                 WHERE account_id = 'a1' AND message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    #[test]
+    fn long_list_copy_second_does_not_alias_a_sent_copy_on_another_subject() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (sent, list) = sent_a_and_list_b();
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&list).unwrap();
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert!(message_row_present(&store, "list-b@x"));
+        assert_eq!(alias_target(&store, "list-b@x"), None);
+    }
+
+    #[test]
+    fn long_list_copy_first_does_not_fold_in_a_sent_copy_on_another_subject() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (sent, list) = sent_a_and_list_b();
+        store.upsert_message(&list).unwrap();
+        store.upsert_message(&sent).unwrap();
+        assert!(message_row_present(&store, "list-b@x"));
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert_eq!(alias_target(&store, "sent-a@x"), None);
+    }
+
+    #[test]
+    fn resync_does_not_delete_a_sent_copy_beside_a_list_post_on_another_subject() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("Sounds good to me");
+        let at = 1_700_000_000_i64;
+        for (id, subject, parent, folder, list_id, date) in [
+            ("sent-a@x", "Re: Patch", "patch@x", "Sent", None, at),
+            (
+                "list-b@x",
+                "[list] Re: Budget",
+                "budget@x",
+                "INBOX",
+                Some("list.example"),
+                at + 10 * 60,
+            ),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, in_reply_to,
+                        references_header, from_email, subject, date_unix, snippet, body_text,
+                        unread, folders, body_fingerprint, list_id
+                     ) VALUES (
+                        'a1', ?1, ?1, ?2, ?3, ?3, 'from@x', ?4, ?5, 'Sounds good to me',
+                        'Sounds good to me', 1, ?6, ?7, ?8
+                     )",
+                    params![
+                        id,
+                        format!("msgid:{id}"),
+                        parent,
+                        subject,
+                        date,
+                        folder,
+                        fingerprint,
+                        list_id
+                    ],
+                )
+                .unwrap();
+        }
+        let mut again = msg(
+            "sent-a@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Sounds good to me",
+        );
+        again.headers.date_unix = at;
+        again.folders = vec!["Sent".into()];
+        store.upsert_message(&again).unwrap();
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert!(message_row_present(&store, "list-b@x"));
+    }
+
+    #[test]
+    fn upgrade_keeps_a_sent_copy_beside_a_list_post_on_another_subject() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-sent-subject.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = crate::message::body_fingerprint("Sounds good to me");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    arrived_via TEXT NOT NULL DEFAULT '',
+                    to_line TEXT NOT NULL DEFAULT '',
+                    cc_line TEXT NOT NULL DEFAULT '',
+                    bcc_line TEXT NOT NULL DEFAULT '',
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    has_attachment INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    snooze_until INTEGER,
+                    body_fingerprint TEXT NOT NULL DEFAULT '',
+                    list_id TEXT,
+                    UNIQUE (account_id, message_id)
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, in_reply_to, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    body_fingerprint
+                 ) VALUES (
+                    'a1', 'sent-a@x', 'imap:sent', 'msgid:sent-a@x', 'patch@x', 'patch@x',
+                    'from@x', 'Re: Patch', 1700000000, 'Sounds good to me', 'Sounds good to me',
+                    1, 'Sent', ?1
+                 )",
+                params![fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, in_reply_to, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', 'list-b@x', 'imap:inbox', 'msgid:list-b@x', 'budget@x', 'budget@x',
+                    'from@x', '[list] Re: Budget', 1700000600, 'Sounds good to me',
+                    'Sounds good to me', 1, 'INBOX', ?1, 'list.example'
+                 )",
+                params![fingerprint],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert!(message_row_present(&store, "list-b@x"));
+        let rows = listed(&store);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "sent-a@x")
+        );
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.subject == "Re: Patch")
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
