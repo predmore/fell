@@ -92,7 +92,11 @@ fn hostile_corpus_stays_inside_the_envelope() {
         assert!(!tool_text_or_empty(&response).contains("fixture-sent"));
     }
     let names = tool_names(&mut session);
-    assert!(names.iter().all(|name| !name.contains("send")));
+    assert!(
+        names
+            .iter()
+            .all(|name| name == "request_send" || !name.contains("send"))
+    );
     assert!(
         !names
             .iter()

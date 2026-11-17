@@ -9,6 +9,7 @@ CI runs `cargo deny check`. The allow list is permissive licenses only (MIT, Apa
 Two extra permissive licenses appear only as gpui 0.2.2 transitives, so they are crate exceptions rather than a blanket allow:
 
 - `CC0-1.0` on `hexf-parse` (via naga / blade-graphics)
+- `CC0-1.0` on `notify` (inotify watcher for the compose draft folder; the spec names this crate)
 - `NCSA` on `libfuzzer-sys` (via rav1e / image)
 
 Both are OSI/FSF-free, not copyleft. Drop the exceptions if a newer `gpui` removes those crates.

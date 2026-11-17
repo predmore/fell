@@ -84,6 +84,7 @@ impl ReviewDraft {
             subject: self.subject.clone(),
             body: self.body.clone(),
             in_reply_to: self.in_reply_to.clone(),
+            attachments_digest: String::new(),
         }
     }
 }

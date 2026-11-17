@@ -9,6 +9,7 @@ pub mod account;
 pub mod actions;
 pub mod agent;
 pub mod backend;
+pub mod compose;
 pub mod imap;
 pub mod message;
 pub mod search;
@@ -22,12 +23,14 @@ pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
-    SyncCursor,
+    SyncCursor, backend_for,
 };
 pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
-pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
+pub use send::{
+    Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
+};
 pub use store::{
     FolderThread, Participant, SearchPage, Store, ThreadSummary, canonical_folder_name,
     folder_aliases,

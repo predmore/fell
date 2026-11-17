@@ -126,6 +126,31 @@ CREATE TABLE IF NOT EXISTS review_drafts (
     created_unix INTEGER NOT NULL,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS compose_drafts (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    from_addr TEXT NOT NULL,
+    to_addrs TEXT NOT NULL,
+    cc_addrs TEXT NOT NULL,
+    bcc_addrs TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    in_reply_to TEXT,
+    identities TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    updated_unix INTEGER NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS compose_attachments (
+    draft_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (draft_id, path),
+    FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
+);
 "#;
 
 const FTS_TABLE: &str = r#"
@@ -246,6 +271,10 @@ impl Store {
         Ok(store)
     }
 
+    pub fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::from_connection(conn)
@@ -255,6 +284,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
+        ensure_compose_columns(&conn)?;
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
         crate::search::rebuild_vocabulary_if_empty(&conn)?;
@@ -1343,6 +1373,30 @@ fn union_tokens(existing: &str, incoming: &[String], address: bool) -> String {
         out.push(token);
     }
     out.join("\u{1e}")
+}
+
+fn ensure_compose_columns(conn: &Connection) -> Result<()> {
+    let have = column_names(conn, "compose_drafts")?;
+    for (name, ddl) in [
+        (
+            "identities",
+            "ALTER TABLE compose_drafts ADD COLUMN identities TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "owner",
+            "ALTER TABLE compose_drafts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        if have.iter().any(|column| column == name) {
+            continue;
+        }
+        if let Err(err) = conn.execute(ddl, [])
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
+    }
+    Ok(())
 }
 
 fn ensure_message_columns(conn: &Connection) -> Result<()> {

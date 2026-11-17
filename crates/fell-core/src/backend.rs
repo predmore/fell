@@ -1,7 +1,9 @@
 use crate::account::{AccountId, BackendKind};
 use crate::imap::ImapConfig;
 use crate::message::Message;
-use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
+use crate::send::{
+    Draft, PendingSend, SentMessage, SubmittedFile, UserSendConfirmation, require_confirmation,
+};
 use crate::{Error, Result};
 
 /// Opaque sync checkpoint from a backend (IMAP UIDVALIDITY/HIGHESTMODSEQ, Proton event id, …).
@@ -43,6 +45,18 @@ pub trait MailBackend {
 
     /// Accept a draft for later send. Must not transmit.
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend>;
+
+    /// Accept the MIME body and the files the editor resolved. Must not transmit.
+    ///
+    /// The default keeps [`submit_draft`] and attaches the message the editor built.
+    fn submit_composed(
+        &self,
+        draft: Draft,
+        mime: Vec<u8>,
+        files: Vec<SubmittedFile>,
+    ) -> Result<PendingSend> {
+        Ok(self.submit_draft(draft)?.with_message(mime, files))
+    }
 
     /// Transmit only after [`UserSendConfirmation`] from the GPUI app.
     fn confirm_send(
@@ -173,6 +187,17 @@ impl MailBackend for ProtonApiBackend {
     }
 }
 
+/// Backend for this account. The in-process fixture is only the local demo account.
+pub fn backend_for(account_id: &AccountId) -> Box<dyn MailBackend + Send> {
+    match account_id.as_str() {
+        "local" | "fixture" | "demo" => Box::new(FixtureBackend::default()),
+        _ => Box::new(BridgeBackend {
+            account_id: account_id.clone(),
+            ..BridgeBackend::default()
+        }),
+    }
+}
+
 fn collect_imap(
     account_id: &AccountId,
     config: &ImapConfig,
@@ -257,6 +282,7 @@ mod tests {
                 subject: "s".into(),
                 body: "b".into(),
                 in_reply_to: None,
+                attachments_digest: String::new(),
             })
             .unwrap();
         let confirm = UserSendConfirmation::from_interactive_ui(
