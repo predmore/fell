@@ -130,6 +130,7 @@ pub(super) fn to_message(
         to: address_list(parsed.as_ref().and_then(|message| message.to())),
         cc: address_list(parsed.as_ref().and_then(|message| message.cc())),
         bcc: address_list(parsed.as_ref().and_then(|message| message.bcc())),
+        starred: false,
         has_attachment: parsed
             .as_ref()
             .is_some_and(|message| message.has_attachments()),
