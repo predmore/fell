@@ -525,16 +525,30 @@ fn image_el(
         .rounded(px(4.))
         .text_sm()
         .text_color(paint(palette.foreground))
-        .child(label);
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(28.))
+                        .h(px(28.))
+                        .border(px(1.))
+                        .border_color(paint(palette.border))
+                        .rounded(px(2.)),
+                )
+                .child(label),
+        );
     placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);
     placeholder.into_any_element()
 }
 
-pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
+pub(crate) fn embedded_web(image: Arc<RenderImage>, frame: u32) -> AnyElement {
     div()
         .w_full()
         .border(px(1.))
-        .border_color(paint(0x2e2c2a))
+        .border_color(paint(frame))
         .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
         .into_any_element()
 }

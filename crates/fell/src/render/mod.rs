@@ -394,8 +394,9 @@ impl Render for Reader {
                                 .px_2()
                                 .py_1()
                                 .rounded(px(4.))
-                                .bg(paint(palette.accent))
-                                .text_color(paint(palette.background))
+                                .border(px(1.))
+                                .border_color(paint(palette.accent))
+                                .text_color(paint(palette.accent))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .child(action),
                         ),
@@ -415,7 +416,12 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
         .py_4();
     if reader.model.mode() == RenderMode::Web {
         if let Some(image) = reader.web_image.clone() {
-            body.child(native::embedded_web(image))
+            let frame = if palette.scheme() == "dark" {
+                0x5c5c5c
+            } else {
+                palette.border
+            };
+            body.child(native::embedded_web(image, frame))
         } else if reader.web_failed {
             body.child(
                 div()
