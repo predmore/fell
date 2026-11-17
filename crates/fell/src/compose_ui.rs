@@ -46,7 +46,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
             dim: 0xe7e2db,
-            marker: 0x9c958c,
+            marker: 0x8d8680,
             accent: 0x7aa2f7,
             caret: 0xffffff,
             code: 0x3a3834,
@@ -69,7 +69,7 @@ fn palette(kind: ThemeKind) -> Palette {
             error: 0x9f1239,
             fresh: 0xf6eee4,
             panel: 0xfffdfb,
-            rule: 0xc4beb6,
+            rule: 0x8f877e,
             hunk: 0xe7eef8,
         },
     }
@@ -113,13 +113,9 @@ impl Editor {
         }
         let row = lines
             .iter()
-            .position(|line| line.starts_with("- Revenue"))
+            .position(|line| line.contains("Ship the"))
             .unwrap_or(0);
-        let col = lines
-            .get(row)
-            .filter(|line| line.starts_with("- ") || line.starts_with("* "))
-            .map(|_| 2)
-            .unwrap_or(0);
+        let col = 0;
         Self {
             row,
             col,
@@ -1700,7 +1696,7 @@ fn status_bar(
         .items_center()
         .justify_between()
         .gap_4()
-        .px_4()
+        .px(px(16.))
         .py_2()
         .bg(rgb(colors.panel))
         .border_t_1()
@@ -1717,7 +1713,7 @@ fn status_bar(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().flex_shrink_0().pl_3().child(format!("·  {send}")))
+        .child(div().flex_shrink_0().pl(px(16.)).child(send.to_string()))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
