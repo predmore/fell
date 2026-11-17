@@ -492,8 +492,8 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
 /// In the dark theme the shared border is lighter than the banner, so it
 /// disappears where a beige newsletter starts. That edge is one flat
 /// hairline, darker than the banner, with no shade on the page. Light
-/// theme and native mail keep the shared border. The banner fill, accent
-/// mark, and every other border stay as they are.
+/// theme and native mail keep the shared border. The banner fill and the
+/// accent mark stay as they are.
 fn banner_edge(theme: Theme, web: bool, border: u32) -> u32 {
     if web && theme == Theme::Dark {
         0x111111
