@@ -537,6 +537,9 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
         return Ok(());
     }
+    if aliased_message(conn, account_id, &saved.message_id)? {
+        return Ok(());
+    }
     insert_message_row(conn, account_id, saved)?;
     let terms = terms_of(saved);
     sync_terms(conn, account_id.as_str(), &HashSet::new(), &terms)?;
@@ -1061,10 +1064,36 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<bool> {
+pub(crate) fn message_row_exists(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<bool> {
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2
+             UNION ALL
+             SELECT 1 FROM message_aliases
+             WHERE account_id = ?1 AND message_id = ?2
+               AND canonical_message_id IN (
+                   SELECT message_id FROM messages WHERE account_id = ?1
+               )
+             LIMIT 1",
+            params![account_id.as_str(), message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn aliased_message(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM message_aliases a
+             JOIN messages m
+               ON m.account_id = a.account_id AND m.message_id = a.canonical_message_id
+             WHERE a.account_id = ?1 AND a.message_id = ?2
+             LIMIT 1",
             params![account_id.as_str(), message_id],
             |row| row.get(0),
         )
@@ -1767,6 +1796,68 @@ mod tests {
         store.undo(&owner).unwrap();
         assert!(messages(&store, "a1", &thread)[0].labels.is_empty());
         assert_eq!(text(store.undo(&owner)), "nothing to undo");
+    }
+
+    #[test]
+    fn restoring_an_aliased_id_does_not_insert_a_second_row() {
+        let store = open(&[("a1", "c@x")]);
+        let mut echo = sample("a1", "list@x", "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.remote_id = RemoteId("imap:inbox".into());
+        echo.folders = vec!["INBOX".into()];
+        let mut sent = sample("a1", "orig@x", "Hello", "hello body");
+        sent.remote_id = RemoteId("imap:sent".into());
+        sent.folders = vec!["Sent".into()];
+        store.upsert_message(&echo).unwrap();
+        store.upsert_message(&sent).unwrap();
+        assert_eq!(
+            store
+                .thread_messages(
+                    &account("a1"),
+                    &ThreadId::from_message_id(&MessageId::new("list@x"))
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        restore_row(
+            store.connection(),
+            &account("a1"),
+            &Snapshot {
+                removed: true,
+                row: SavedRow {
+                    message_id: "orig@x".into(),
+                    remote_id: "imap:sent".into(),
+                    thread_id: "msgid:orig@x".into(),
+                    proton_conversation_id: None,
+                    in_reply_to: None,
+                    references_header: String::new(),
+                    from_name: None,
+                    from_email: "from@x".into(),
+                    subject: "Hello".into(),
+                    date_unix: 1,
+                    snippet: "hello body".into(),
+                    body_text: Some("hello body".into()),
+                    unread: 1,
+                    folders: "Sent".into(),
+                    labels: String::new(),
+                    arrived_via: String::new(),
+                    to_line: String::new(),
+                    cc_line: String::new(),
+                    bcc_line: String::new(),
+                    has_attachment: 0,
+                },
+                after_folders: String::new(),
+                after_labels: String::new(),
+            },
+        )
+        .unwrap();
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(message_row_exists(store.connection(), &account("a1"), "orig@x").unwrap());
     }
 
     fn apply(store: &Store, message: Message) {

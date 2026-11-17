@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS message_aliases (
     account_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     canonical_message_id TEXT NOT NULL,
+    remote_id TEXT NOT NULL DEFAULT '',
+    folder TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account_id, message_id)
 );
 
@@ -295,6 +297,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
+        ensure_alias_columns(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
                 ON messages(account_id, body_fingerprint);",
@@ -302,16 +305,15 @@ impl Store {
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
         crate::search::rebuild_vocabulary_if_empty(&conn)?;
-        // Version 3 is stamped only after stored bodies have fingerprints.
+        // Version 3 is stamped only after the fingerprint backfill finishes.
+        // Batches commit on their own so a large mailbox is not one transaction.
         if schema_version(&conn)?.as_deref() != Some("3") {
-            let tx = conn.unchecked_transaction()?;
-            backfill_fingerprints(&tx)?;
-            tx.execute(
+            backfill_fingerprints(&conn)?;
+            conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [],
             )?;
-            tx.commit()?;
         }
         Ok(Self { conn, path: None })
     }
@@ -387,7 +389,13 @@ impl Store {
         for flag in &delta.flags {
             tx.execute(
                 "UPDATE messages SET unread = ?1
-                 WHERE account_id = ?2 AND remote_id = ?3",
+                 WHERE account_id = ?2 AND (
+                     remote_id = ?3
+                     OR message_id IN (
+                         SELECT canonical_message_id FROM message_aliases
+                         WHERE account_id = ?2 AND remote_id = ?3
+                     )
+                 )",
                 params![
                     i64::from(flag.unread),
                     account_id.as_str(),
@@ -970,12 +978,7 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
         return write_kept(conn, message, &stored, via_alias);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint)? {
-        remember_alias(
-            conn,
-            &message.account_id,
-            message.headers.message_id.as_str(),
-            &stored.canonical_id,
-        )?;
+        remember_alias(conn, message, &stored.canonical_id)?;
         return write_kept(conn, message, &stored, true);
     }
     insert_new(conn, message, &fingerprint)
@@ -1134,7 +1137,10 @@ fn write_kept(
     } else {
         message.headers.date_unix
     };
+    // The message row keeps the first copy's server id. The other copy's id
+    // and folder live on the alias, so neither is discarded.
     let remote_id = if alias && !stored.remote_id.is_empty() {
+        remember_alias(conn, message, &stored.canonical_id)?;
         stored.remote_id.clone()
     } else {
         message.remote_id.0.clone()
@@ -1379,20 +1385,26 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival) -> bool {
         )
 }
 
-fn remember_alias(
-    conn: &Connection,
-    account_id: &AccountId,
-    alias_id: &str,
-    canonical_id: &str,
-) -> Result<()> {
+fn remember_alias(conn: &Connection, message: &Message, canonical_id: &str) -> Result<()> {
+    let alias_id = message.headers.message_id.as_str();
     if alias_id == canonical_id {
         return Ok(());
     }
+    let folder = union_tokens("", &message.folders, false);
     conn.execute(
-        "INSERT INTO message_aliases (account_id, message_id, canonical_message_id)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(account_id, message_id) DO NOTHING",
-        params![account_id.as_str(), alias_id, canonical_id],
+        "INSERT INTO message_aliases (
+            account_id, message_id, canonical_message_id, remote_id, folder
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+            remote_id = excluded.remote_id,
+            folder = excluded.folder",
+        params![
+            message.account_id.as_str(),
+            alias_id,
+            canonical_id,
+            message.remote_id.0,
+            folder,
+        ],
     )?;
     Ok(())
 }
@@ -1667,26 +1679,43 @@ fn schema_version(conn: &Connection) -> Result<Option<String>> {
     Ok(value)
 }
 
+const FINGERPRINT_BATCH: usize = 32;
+
+/// Hash bodies in small batches. Each batch commits before the next is read,
+/// and rows with no body are skipped by rowid so they are not loaded again.
 fn backfill_fingerprints(conn: &Connection) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT rowid, body_text FROM messages WHERE body_fingerprint = ''")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
-    let mut pending = Vec::new();
-    for row in rows {
-        pending.push(row?);
-    }
-    drop(stmt);
-    for (rowid, body) in pending {
-        let fingerprint = fingerprint_of(body.as_deref());
-        if fingerprint.is_empty() {
-            continue;
-        }
-        conn.execute(
-            "UPDATE messages SET body_fingerprint = ?1 WHERE rowid = ?2",
-            params![fingerprint, rowid],
+    let mut after = 0i64;
+    loop {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, body_text FROM messages
+             WHERE body_fingerprint = '' AND rowid > ?1
+             ORDER BY rowid
+             LIMIT ?2",
         )?;
+        let rows = stmt.query_map(params![after, FINGERPRINT_BATCH as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut batch = Vec::new();
+        for row in rows {
+            batch.push(row?);
+        }
+        drop(stmt);
+        if batch.is_empty() {
+            break;
+        }
+        let tx = conn.unchecked_transaction()?;
+        for (rowid, body) in &batch {
+            after = *rowid;
+            let fingerprint = fingerprint_of(body.as_deref());
+            if fingerprint.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE messages SET body_fingerprint = ?1 WHERE rowid = ?2",
+                params![fingerprint, rowid],
+            )?;
+        }
+        tx.commit()?;
     }
     Ok(())
 }
@@ -1955,6 +1984,30 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
         (
             "owner",
             "ALTER TABLE compose_drafts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        if have.iter().any(|column| column == name) {
+            continue;
+        }
+        if let Err(err) = conn.execute(ddl, [])
+            && !duplicate_column(&err)
+        {
+            return Err(err.into());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_alias_columns(conn: &Connection) -> Result<()> {
+    let have = column_names(conn, "message_aliases")?;
+    for (name, ddl) in [
+        (
+            "remote_id",
+            "ALTER TABLE message_aliases ADD COLUMN remote_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "folder",
+            "ALTER TABLE message_aliases ADD COLUMN folder TEXT NOT NULL DEFAULT ''",
         ),
     ] {
         if have.iter().any(|column| column == name) {
@@ -4113,6 +4166,68 @@ mod tests {
     }
 
     #[test]
+    fn alias_keeps_the_other_remote_id_and_folder() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut inbox = with_arrival(
+            msg("list-rewrite@x", None, None, "[list] Hello", "hello body"),
+            "INBOX",
+            "",
+            "list@x.com",
+        );
+        inbox.list_id = Some("list.example".into());
+        inbox.remote_id = RemoteId("imap:inbox".into());
+        inbox.unread = true;
+        store.upsert_message(&inbox).unwrap();
+        let mut sent = with_arrival(
+            msg("orig@x", None, None, "Hello", "hello body"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        sent.remote_id = RemoteId("imap:sent".into());
+        sent.unread = true;
+        store.upsert_message(&sent).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].remote_id.0, "imap:inbox");
+        let (remote, folder): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT remote_id, folder FROM message_aliases WHERE message_id = 'orig@x'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(remote, "imap:sent");
+        assert_eq!(folder, "Sent");
+        store
+            .apply_delta(
+                &AccountId("a1".into()),
+                &MailboxDelta {
+                    messages: Vec::new(),
+                    flags: vec![crate::backend::FlagUpdate {
+                        remote_id: RemoteId("imap:sent".into()),
+                        unread: false,
+                    }],
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].unread);
+        assert!(
+            crate::actions::message_row_exists(
+                store.connection(),
+                &AccountId("a1".into()),
+                "orig@x",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn list_first_prefers_the_sent_display_name() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
@@ -4277,6 +4392,98 @@ mod tests {
         assert_eq!(rows[0].headers.subject, "Hello");
         assert_eq!(rows[0].folders, vec!["Sent", "INBOX"]);
         assert_eq!(rows[0].list_id.as_deref(), Some("list.example"));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backfill_hashes_bodies_in_batches_before_version_3() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-batch.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    UNIQUE (account_id, message_id)
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');",
+            )
+            .unwrap();
+            for n in 0..40 {
+                conn.execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread
+                     ) VALUES ('a1', ?1, ?1, ?1, '', 'from@x', 'S', 1, ?2, ?2, 1)",
+                    params![format!("m{n}@x"), format!("body {n}")],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread
+                 ) VALUES ('a1', 'empty@x', 'empty@x', 'empty@x', '', 'from@x', 'Empty', 1, 'Empty', NULL, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "3");
+        let filled: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE body_fingerprint != ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filled, 40);
+        let empty: String = store
+            .conn
+            .query_row(
+                "SELECT body_fingerprint FROM messages WHERE message_id = 'empty@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(empty.is_empty());
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
