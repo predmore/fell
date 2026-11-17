@@ -1073,7 +1073,7 @@ fn write_kept(
         filled_body_canonical(stored, message)
     };
     let fingerprint = fingerprint_of(body_text.as_deref());
-    let (in_reply_to, references) = union_parents(stored, message);
+    let (in_reply_to, references) = parents_for_write(stored, message, alias);
     let subject = merged_subject(
         &stored.subject,
         stored_list,
@@ -1118,19 +1118,13 @@ fn write_kept(
     } else {
         prefer_nonempty(&message.headers.from.email, &stored.from_email)
     };
-    let from_name = if alias {
-        stored
-            .from_name
-            .clone()
-            .or_else(|| message.headers.from.name.clone())
-    } else {
-        message
-            .headers
-            .from
-            .name
-            .clone()
-            .or_else(|| stored.from_name.clone())
-    };
+    let from_name = merged_display_name(
+        &stored.from_name,
+        stored_list,
+        &message.headers.from.name,
+        incoming_list,
+        !alias,
+    );
     let date_unix = if alias || (incoming_list && stored.date_unix != 0) {
         if stored.date_unix != 0 {
             stored.date_unix
@@ -1346,11 +1340,31 @@ fn find_list_collapse(
             matches.push(stored);
         }
     }
-    if matches.len() == 1 {
-        Ok(matches.pop())
-    } else {
-        Ok(None)
+    let Some(only) = matches.pop() else {
+        return Ok(None);
+    };
+    if !matches.is_empty() {
+        return Ok(None);
     }
+    // A row that already absorbed another Message-ID is not a unique target.
+    // A later message with the same body stays its own row.
+    if alias_points_at(conn, &message.account_id, &only.canonical_id)? {
+        return Ok(None);
+    }
+    Ok(Some(only))
+}
+
+fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str) -> Result<bool> {
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM message_aliases
+             WHERE account_id = ?1 AND canonical_message_id = ?2
+             LIMIT 1",
+            params![account_id.as_str(), canonical_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
 }
 
 fn is_fingerprint_echo(incoming: &Message, stored: &Arrival) -> bool {
@@ -1512,6 +1526,47 @@ fn push_parent_id(ids: &mut Vec<String>, raw: &str) {
         return;
     }
     ids.push(id.as_str().to_string());
+}
+
+fn merged_display_name(
+    stored_name: &Option<String>,
+    stored_list: bool,
+    incoming_name: &Option<String>,
+    incoming_list: bool,
+    replace_non_list: bool,
+) -> Option<String> {
+    let chosen = merged_subject(
+        stored_name.as_deref().unwrap_or("").trim(),
+        stored_list,
+        incoming_name.as_deref().unwrap_or("").trim(),
+        incoming_list,
+        replace_non_list,
+    );
+    let chosen = chosen.trim();
+    if chosen.is_empty() {
+        None
+    } else {
+        Some(chosen.to_string())
+    }
+}
+
+/// Same-id resync replaces parents when the incoming copy has any. An alias
+/// merge still unions them and prefers the non-list `In-Reply-To`.
+fn parents_for_write(stored: &Arrival, message: &Message, alias: bool) -> (Option<String>, String) {
+    if !alias {
+        let incoming_primary = message
+            .headers
+            .in_reply_to
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+            .filter(|id| !id.is_empty());
+        if incoming_primary.is_some() || !message.headers.references.is_empty() {
+            return (incoming_primary, references_header(&message.headers));
+        }
+        let stored_primary = stored.in_reply_to.clone().filter(|id| !id.is_empty());
+        return (stored_primary, stored.references_header.clone());
+    }
+    union_parents(stored, message)
 }
 
 /// Keep every parent id. When they disagree, `In-Reply-To` is the non-list copy.
@@ -3867,8 +3922,8 @@ mod tests {
         assert_eq!(collapsed.body_text.as_deref(), Some("hello body"));
 
         echo.body_text = None;
-        echo.headers.in_reply_to = Some(MessageId::new("rewritten@x"));
-        echo.headers.references = vec![MessageId::new("rewritten@x")];
+        echo.headers.in_reply_to = None;
+        echo.headers.references.clear();
         store.upsert_message(&echo).unwrap();
         let collapsed = listed(&store)
             .into_iter()
@@ -3980,6 +4035,103 @@ mod tests {
         undated_echo.headers.date_unix = 0;
         store.upsert_message(&undated_echo).unwrap();
         assert_eq!(listed(&store).len(), 4);
+    }
+
+    #[test]
+    fn later_same_body_stays_beside_an_aliased_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut first = msg("thanks-a@x", None, None, "First thanks", "Thanks");
+        first.headers.date_unix = sent_at;
+        store.upsert_message(&first).unwrap();
+        let mut echo = msg("thanks-list@x", None, None, "[list] First thanks", "Thanks");
+        echo.list_id = Some("list.example".into());
+        echo.headers.date_unix = sent_at + 60;
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+
+        let mut later = msg("thanks-b@x", None, None, "Second thanks", "Thanks");
+        later.headers.date_unix = sent_at + (2 * 60 * 60);
+        store.upsert_message(&later).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let kept = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "thanks-a@x")
+            .unwrap();
+        assert_eq!(kept.headers.subject, "First thanks");
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "thanks-b@x")
+        );
+    }
+
+    #[test]
+    fn same_id_resync_replaces_a_different_parent() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let old_thread = store
+            .upsert_message(&msg("old@x", None, None, "Old", "old body"))
+            .unwrap();
+        let new_thread = store
+            .upsert_message(&msg("new@x", None, None, "New", "new body"))
+            .unwrap();
+        let mut note = msg("note@x", None, Some("old@x"), "Note", "note body");
+        store.upsert_message(&note).unwrap();
+        note.headers.in_reply_to = Some(MessageId::new("new@x"));
+        note.headers.references = vec![MessageId::new("new@x")];
+        assert_eq!(store.upsert_message(&note).unwrap(), new_thread);
+        let stored = listed(&store)
+            .into_iter()
+            .find(|message| message.headers.message_id.as_str() == "note@x")
+            .unwrap();
+        assert_eq!(
+            stored.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("new@x")
+        );
+        assert_eq!(stored.headers.references, vec![MessageId::new("new@x")]);
+        assert!(
+            !store
+                .thread_messages(&AccountId("a1".into()), &old_thread)
+                .unwrap()
+                .iter()
+                .any(|message| message.headers.message_id.as_str() == "note@x")
+        );
+
+        note.headers.in_reply_to = None;
+        note.headers.references.clear();
+        store.upsert_message(&note).unwrap();
+        let stored = listed(&store)
+            .into_iter()
+            .find(|message| message.headers.message_id.as_str() == "note@x")
+            .unwrap();
+        assert_eq!(
+            stored.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("new@x")
+        );
+    }
+
+    #[test]
+    fn list_first_prefers_the_sent_display_name() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut echo = msg("list-rewrite@x", None, None, "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.headers.from.name = Some("Ann via Dev".into());
+        store.upsert_message(&echo).unwrap();
+        let mut sent = msg("orig@x", None, None, "Hello", "hello body");
+        sent.headers.from.name = Some("Ann".into());
+        store.upsert_message(&sent).unwrap();
+        let collapsed = listed(&store);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].headers.from.name.as_deref(), Some("Ann"));
+
+        sent.headers.from.name = Some("Ann".into());
+        store.upsert_message(&sent).unwrap();
+        let collapsed = listed(&store);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].headers.from.name.as_deref(), Some("Ann"));
     }
 
     #[test]
