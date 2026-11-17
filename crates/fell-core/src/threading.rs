@@ -109,7 +109,13 @@ fn strip_marker(subject: &str) -> Option<&str> {
             }
         }
     }
-    let lower = subject.get(..subject.len().min(8))?.to_ascii_lowercase();
+    // Markers are short ASCII. Look at the first few bytes, cut on a
+    // character boundary so a multibyte letter right after `Re: ` is fine.
+    let mut end = subject.len().min(8);
+    while !subject.is_char_boundary(end) {
+        end -= 1;
+    }
+    let lower = subject[..end].to_ascii_lowercase();
     for marker in REPLY_MARKERS {
         if !lower.starts_with(marker) {
             continue;
@@ -133,10 +139,14 @@ fn strip_marker(subject: &str) -> Option<&str> {
     None
 }
 
+/// A leading `[team]` list tag. A tag with a digit is kept: it is usually a
+/// ticket or patch id (`[PROJ-12]`, `[PATCH v2]`), and stripping it would join
+/// different tickets that share a title.
 fn strip_list_tag(subject: &str) -> Option<&str> {
     let inner = subject.strip_prefix('[')?;
     let end = inner.find(']')?;
-    (end > 0 && end <= 80).then(|| &inner[end + 1..])
+    let tag = &inner[..end];
+    (end > 0 && end <= 80 && !tag.chars().any(|ch| ch.is_ascii_digit())).then(|| &inner[end + 1..])
 }
 
 /// Subjects too common to join two messages on their own.
@@ -280,5 +290,30 @@ mod tests {
         assert!(subject_is_generic("thanks"));
         assert!(subject_is_generic(&thread_subject("Re: Quick question").0));
         assert!(!subject_is_generic("q3 numbers"));
+    }
+
+    #[test]
+    fn reply_marker_survives_a_multibyte_character_at_byte_eight() {
+        assert_eq!(
+            thread_subject("Re: 中文邮件"),
+            ("中文邮件".to_string(), true)
+        );
+        assert_eq!(
+            thread_subject("RE[2]: 中文邮件"),
+            ("中文邮件".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn ticket_tags_stay_part_of_the_subject() {
+        assert_eq!(
+            thread_subject("[PROJ-1] Login fails").0,
+            "[proj-1] login fails"
+        );
+        assert_eq!(
+            thread_subject("Re: [PROJ-2] Login fails").0,
+            "[proj-2] login fails"
+        );
+        assert_eq!(thread_subject("[team] Login fails").0, "login fails");
     }
 }

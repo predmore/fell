@@ -185,19 +185,30 @@ const BACKFILL_BATCH: i64 = 2_000;
 /// writes can rely on untouched rows already being on their final thread.
 pub(super) fn ensure_thread_index(conn: &Connection) -> Result<()> {
     ensure_thread_schema(conn)?;
-    ensure_refs(conn)?;
-    ensure_subjects(conn)
-}
-
-fn ensure_refs(conn: &Connection) -> Result<()> {
-    if flag_is_set(conn, "thread_index")? {
+    let current = |conn: &Connection| -> Result<bool> {
+        Ok(flag_is_set(conn, "thread_index")? && flag_is_set(conn, "thread_subjects")?)
+    };
+    if current(conn)? {
         return Ok(());
     }
     let tx = immediate_transaction(conn)?;
     // Another connection may have finished the fill while this one waited.
-    if flag_is_set(&tx, "thread_index")? {
+    if current(&tx)? {
         return Ok(());
     }
+    // Fill what is missing, then re-resolve every account once.
+    if !flag_is_set(&tx, "thread_index")? {
+        fill_refs(&tx)?;
+    }
+    if !flag_is_set(&tx, "thread_subjects")? {
+        fill_subjects(&tx)?;
+    }
+    settle_all(&tx, &["thread_index", "thread_subjects"])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn fill_refs(tx: &Connection) -> Result<()> {
     tx.execute("DELETE FROM message_refs", [])?;
     let mut after = 0i64;
     loop {
@@ -221,23 +232,13 @@ fn ensure_refs(conn: &Connection) -> Result<()> {
         };
         after = last.0;
         for (rowid, account, in_reply_to, references) in &batch {
-            index_refs(&tx, account, *rowid, in_reply_to.as_deref(), references)?;
+            index_refs(tx, account, *rowid, in_reply_to.as_deref(), references)?;
         }
     }
-    settle_all(&tx, "thread_index")?;
-    tx.commit()?;
     Ok(())
 }
 
-/// Fill `subject_index` once, then join the replies it finds.
-fn ensure_subjects(conn: &Connection) -> Result<()> {
-    if flag_is_set(conn, "thread_subjects")? {
-        return Ok(());
-    }
-    let tx = immediate_transaction(conn)?;
-    if flag_is_set(&tx, "thread_subjects")? {
-        return Ok(());
-    }
+fn fill_subjects(tx: &Connection) -> Result<()> {
     tx.execute("DELETE FROM subject_index", [])?;
     let mut after = 0i64;
     loop {
@@ -261,16 +262,14 @@ fn ensure_subjects(conn: &Connection) -> Result<()> {
         };
         after = last.0;
         for (rowid, account, subject, date) in &batch {
-            index_subject(&tx, account, *rowid, subject, *date)?;
+            index_subject(tx, account, *rowid, subject, *date)?;
         }
     }
-    settle_all(&tx, "thread_subjects")?;
-    tx.commit()?;
     Ok(())
 }
 
-/// Re-resolve every account once, empty the queues, and record `flag`.
-fn settle_all(conn: &Connection, flag: &str) -> Result<()> {
+/// Re-resolve every account once, empty the queues, and record `flags`.
+fn settle_all(conn: &Connection, flags: &[&str]) -> Result<()> {
     let accounts = {
         let mut stmt = conn.prepare("SELECT DISTINCT account_id FROM messages")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -282,11 +281,13 @@ fn settle_all(conn: &Connection, flag: &str) -> Result<()> {
     conn.execute("DELETE FROM thread_dirty_rows", [])?;
     conn.execute("DELETE FROM thread_dirty_ids", [])?;
     conn.execute("DELETE FROM thread_dirty_subjects", [])?;
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![flag],
-    )?;
+    for flag in flags {
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![flag],
+        )?;
+    }
     Ok(())
 }
 
@@ -364,9 +365,20 @@ fn subject_parent(
         let to: String = candidate.get(2)?;
         let cc: String = candidate.get(3)?;
         let theirs = participants(&from, &to, &cc);
-        if theirs.contains(&row.from) && row.participants.contains(&from) {
-            return Ok(Some(ThreadId(thread)));
+        if !theirs.contains(&row.from) || !row.participants.contains(&from) {
+            continue;
         }
+        // One sender writing twice: the notes are one conversation only when
+        // they also share someone else, or "me to Ada" would join "me to Bob".
+        if from == row.from
+            && !row
+                .participants
+                .iter()
+                .any(|address| address != &from && theirs.contains(address))
+        {
+            continue;
+        }
+        return Ok(Some(ThreadId(thread)));
     }
     Ok(None)
 }
@@ -674,9 +686,12 @@ fn thread_edges(
             .proton_conversation_id
             .as_deref()
             .is_some_and(|id| !id.trim().is_empty());
+        // A reply that names any parent waits for that parent instead: a
+        // subject join cannot be undone when the real parent arrives later.
+        let headerless = row.headers.parent_ids().next().is_none();
         match header {
             Some(header) => edges.push((header.0, onto.0)),
-            None if !proton => {
+            None if !proton && headerless => {
                 if let Some(original) = by_subject(row)? {
                     edges.push((row.thread_id.0.clone(), original.0));
                 }
@@ -1595,5 +1610,52 @@ mod tests {
             run(store, &Op::Batch(vec![resync.clone()]));
         }
         assert_eq!(threads_of(&incremental), threads_of(&full));
+    }
+
+    #[test]
+    fn a_real_parent_arriving_later_does_not_drag_the_subject_original() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        let original = mail("q3@x", "Q3 numbers", "me@x", "ada@x", start);
+        // Names a parent that has not synced yet.
+        let mut reply = mail("re@x", "Re: Q3 numbers", "ada@x", "me@x", start + DAY);
+        reply.headers.in_reply_to = Some(MessageId::new("real@x"));
+        let real = mail("real@x", "Budget draft", "me@x", "ada@x", start + 10);
+        run(&store, &Op::Batch(vec![original]));
+        run(&store, &Op::Batch(vec![reply]));
+        run(&store, &Op::Batch(vec![real]));
+        assert_eq!(thread_of(&store, "re@x"), thread_of(&store, "real@x"));
+        assert_ne!(thread_of(&store, "q3@x"), thread_of(&store, "real@x"));
+    }
+
+    #[test]
+    fn one_sender_writing_to_two_people_stays_two_threads() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let start = 1_700_000_000;
+        run(
+            &store,
+            &Op::Batch(vec![
+                mail("ada@x", "Lunch on Friday", "me@x", "ada@ex", start),
+                mail(
+                    "bob@x",
+                    "Re: Lunch on Friday",
+                    "me@x",
+                    "bob@ex",
+                    start + DAY,
+                ),
+                // A second note to the same person is one conversation.
+                mail(
+                    "ada2@x",
+                    "Re: Lunch on Friday",
+                    "me@x",
+                    "ada@ex",
+                    start + 2 * DAY,
+                ),
+            ]),
+        );
+        assert_ne!(thread_of(&store, "ada@x"), thread_of(&store, "bob@x"));
+        assert_eq!(thread_of(&store, "ada@x"), thread_of(&store, "ada2@x"));
     }
 }
