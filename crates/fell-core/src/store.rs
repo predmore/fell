@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use crate::message::{
 use crate::search::{
     IndexedText, SearchHit, SearchResults, fts5_phrase, sync_terms, terms_for_indexed,
 };
-use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
+use crate::threading::{ThreadId, resolve_thread_id};
+
+mod threads;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -263,6 +265,9 @@ pub struct Store {
     /// the WAL while this connection still has the file.
     #[cfg(unix)]
     _mailbox_lock: Option<std::fs::File>,
+    /// Tests compare incremental threading against the whole-account pass.
+    #[cfg(test)]
+    full_rethread: std::cell::Cell<bool>,
 }
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
@@ -393,6 +398,9 @@ impl Store {
                 [],
             )?;
         }
+        // Reply-to index and write queues for incremental threading. The
+        // first open fills the index and re-resolves every account once.
+        threads::ensure_thread_index(&conn)?;
         // 3 adds message_embeddings, the local body-vector index.
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
@@ -403,6 +411,8 @@ impl Store {
             indexer: None,
             conn,
             path: None,
+            #[cfg(test)]
+            full_rethread: std::cell::Cell::new(false),
             #[cfg(unix)]
             _mailbox_lock: None,
         })
@@ -513,7 +523,7 @@ impl Store {
             )?;
         }
         if !delta.messages.is_empty() {
-            rethread(&tx, account_id)?;
+            self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
             set_sync_cursor_on(&tx, account_id, cursor)?;
@@ -523,10 +533,21 @@ impl Store {
         Ok(())
     }
 
+    /// Re-resolve the threads this transaction's writes touched.
+    fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
+        #[cfg(test)]
+        if self.full_rethread.get() {
+            threads::rethread_all(conn, account_id)?;
+            conn.execute_batch("DELETE FROM thread_dirty_rows; DELETE FROM thread_dirty_ids;")?;
+            return Ok(());
+        }
+        threads::rethread_dirty(conn, account_id)
+    }
+
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
         let tx = immediate_transaction(&self.conn)?;
         insert_message(&tx, message)?;
-        rethread(&tx, &message.account_id)?;
+        self.rethread_written(&tx, &message.account_id)?;
         let thread_id =
             thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
                 .ok_or_else(|| {
@@ -1999,7 +2020,7 @@ fn rethread_accounts(conn: &Connection) -> Result<()> {
     }
     drop(stmt);
     for account_id in accounts {
-        rethread(conn, &AccountId(account_id))?;
+        threads::rethread_all(conn, &AccountId(account_id))?;
     }
     Ok(())
 }
@@ -2571,173 +2592,6 @@ fn union_addresses(existing: &str, incoming: &[Address]) -> String {
     encode_addresses(&out)
 }
 
-/// Threading columns only — bodies stay on disk.
-struct ThreadingRow {
-    rowid: i64,
-    thread_id: ThreadId,
-    headers: MessageHeaders,
-}
-
-/// Re-resolve thread ids for an account in one in-memory pass.
-///
-/// A proton id absorbs a non-proton header thread. Two different proton ids
-/// stay apart. Non-proton merges keep the earliest already-assigned id.
-fn rethread(conn: &Connection, account_id: &AccountId) -> Result<()> {
-    let rows = load_threading_rows(conn, account_id)?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let mut by_message: HashMap<MessageId, ThreadId> = rows
-        .iter()
-        .map(|row| (row.headers.message_id.clone(), row.thread_id.clone()))
-        .collect();
-    for (alias, canonical) in load_aliases(conn, account_id)? {
-        if let Some(thread) = by_message.get(&canonical).cloned() {
-            by_message.insert(alias, thread);
-        }
-    }
-
-    let mut union = ThreadUnion::default();
-    for row in &rows {
-        union.note(row.thread_id.as_str(), row.rowid);
-    }
-    for row in &rows {
-        let onto = resolve_thread_id(&row.headers, |parent| {
-            Ok::<_, crate::Error>(by_message.get(parent).cloned())
-        })?;
-        let header = header_parent_thread_id(&row.headers, |parent| {
-            Ok::<_, crate::Error>(by_message.get(parent).cloned())
-        })?;
-        union.union_prefer(row.thread_id.as_str(), onto.as_str());
-        if let Some(header) = header {
-            union.union_prefer(header.as_str(), onto.as_str());
-        }
-    }
-
-    let mut written = HashSet::new();
-    for row in &rows {
-        let from = row.thread_id.as_str();
-        let onto = union.find(from);
-        if from == onto || !written.insert(from.to_string()) {
-            continue;
-        }
-        conn.execute(
-            "UPDATE messages SET thread_id = ?1 WHERE account_id = ?2 AND thread_id = ?3",
-            params![onto.as_str(), account_id.as_str(), from],
-        )?;
-    }
-    Ok(())
-}
-
-fn load_threading_rows(conn: &Connection, account_id: &AccountId) -> Result<Vec<ThreadingRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT rowid, message_id, thread_id, proton_conversation_id, in_reply_to, references_header
-         FROM messages WHERE account_id = ?1
-         ORDER BY rowid ASC",
-    )?;
-    let rows = stmt.query_map(params![account_id.as_str()], |row| {
-        let rowid: i64 = row.get(0)?;
-        let message_id: String = row.get(1)?;
-        let thread_id: String = row.get(2)?;
-        let proton_conversation_id: Option<String> = row.get(3)?;
-        let in_reply_to: Option<String> = row.get(4)?;
-        let references: String = row.get(5)?;
-        Ok(ThreadingRow {
-            rowid,
-            thread_id: ThreadId(thread_id),
-            headers: MessageHeaders {
-                message_id: MessageId(message_id),
-                proton_conversation_id,
-                in_reply_to: in_reply_to.map(MessageId),
-                references: parse_references(&references),
-                from: Address {
-                    name: None,
-                    email: String::new(),
-                },
-                subject: String::new(),
-                date_unix: 0,
-            },
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-#[derive(Default)]
-struct ThreadUnion {
-    parent: HashMap<String, String>,
-    /// Lowest message rowid currently wearing this thread id.
-    earliest: HashMap<String, i64>,
-}
-
-impl ThreadUnion {
-    fn note(&mut self, thread_id: &str, rowid: i64) {
-        self.earliest
-            .entry(thread_id.to_string())
-            .and_modify(|rank| *rank = (*rank).min(rowid))
-            .or_insert(rowid);
-    }
-
-    fn find(&mut self, id: &str) -> String {
-        let parent = self
-            .parent
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| id.to_string());
-        if parent == id {
-            self.parent.entry(id.to_string()).or_insert(id.to_string());
-            return parent;
-        }
-        let root = self.find(&parent);
-        self.parent.insert(id.to_string(), root.clone());
-        root
-    }
-
-    fn rank(&self, root: &str) -> i64 {
-        self.earliest.get(root).copied().unwrap_or(i64::MAX)
-    }
-
-    /// Merge `member` with `preferred`.
-    ///
-    /// Two different `proton:` roots stay apart. A proton root absorbs a
-    /// non-proton one. Otherwise the earliest already-assigned id wins, so a
-    /// caller that saved the first id still lists the messages.
-    fn union_prefer(&mut self, member: &str, preferred: &str) {
-        let member_root = self.find(member);
-        let preferred_root = self.find(preferred);
-        if member_root == preferred_root {
-            return;
-        }
-        let member_proton = member_root.starts_with("proton:");
-        let preferred_proton = preferred_root.starts_with("proton:");
-        if member_proton && preferred_proton {
-            return;
-        }
-        if preferred_proton || member_proton {
-            let (from, onto) = if preferred_proton {
-                (member_root, preferred_root)
-            } else {
-                (preferred_root, member_root)
-            };
-            self.parent.insert(from, onto);
-            return;
-        }
-        let member_rank = self.rank(&member_root);
-        let preferred_rank = self.rank(&preferred_root);
-        let (keep, drop, rank) = if member_rank <= preferred_rank {
-            (member_root, preferred_root, member_rank)
-        } else {
-            (preferred_root, member_root, preferred_rank)
-        };
-        self.parent.insert(drop, keep.clone());
-        self.earliest.insert(keep, rank);
-    }
-}
-
 fn parse_references(raw: &str) -> Vec<MessageId> {
     if raw.is_empty() {
         Vec::new()
@@ -2914,6 +2768,45 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
             return Err(err.into());
         }
     }
+    Ok(())
+}
+
+/// Rebuild a set of triggers when `version` differs from `meta.key`.
+///
+/// Dropping and creating triggers outside a transaction leaves a moment with
+/// no trigger, and another connection's write in that moment is never
+/// queued. Here the drop, the create, and the version stamp commit together
+/// under a write lock, and a current mailbox does no trigger DDL at all.
+pub(crate) fn ensure_triggers(
+    conn: &Connection,
+    key: &str,
+    version: &str,
+    sql: &str,
+) -> Result<()> {
+    let current = |conn: &Connection| -> Result<bool> {
+        let stamped: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stamped.as_deref() == Some(version))
+    };
+    if current(conn)? {
+        return Ok(());
+    }
+    let tx = immediate_transaction(conn)?;
+    if current(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, version],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
