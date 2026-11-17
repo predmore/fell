@@ -3,7 +3,7 @@
 //! Context is not copied here. Agents read threads through `fell-mcp`.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -166,13 +166,39 @@ pub fn read_draft_file(folder: &Path) -> Result<String, String> {
 }
 
 pub fn write_draft_file(folder: &Path, text: &str) -> Result<(), String> {
-    atomic_write(&folder.join("draft.md"), text.as_bytes())
+    let dest = folder.join("draft.md");
+    if is_symlink(&dest) {
+        return Err("draft.md is a symlink; refused to replace it".into());
+    }
+    let control = ensure_control(folder)?;
+    let tmp = control.join(format!(
+        "draft.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    write_exclusive(&tmp, text.as_bytes())?;
+    if is_symlink(&dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err("draft.md is a symlink; refused to replace it".into());
+    }
+    if let Err(err) = fs::rename(&tmp, &dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 pub fn resolve_closure(folder: &Path, fields: &DraftFields, body: &str) -> Closure {
     let mut issues = Vec::new();
     let mut files = Vec::new();
     let mut seen = Vec::new();
+    let mut referenced = 0usize;
+    let mut stated = 0u64;
+    let mut budget = MAX_ATTACHMENT_BYTES;
     let inline = inline_image_paths(body);
     for attachment in &fields.attachments {
         push_file(
@@ -185,6 +211,9 @@ pub fn resolve_closure(folder: &Path, fields: &DraftFields, body: &str) -> Closu
             &mut files,
             &mut seen,
             &mut issues,
+            &mut referenced,
+            &mut stated,
+            &mut budget,
         );
     }
     for path in &inline {
@@ -201,6 +230,9 @@ pub fn resolve_closure(folder: &Path, fields: &DraftFields, body: &str) -> Closu
             &mut files,
             &mut seen,
             &mut issues,
+            &mut referenced,
+            &mut stated,
+            &mut budget,
         );
     }
     for file in &mut files {
@@ -208,27 +240,11 @@ pub fn resolve_closure(folder: &Path, fields: &DraftFields, body: &str) -> Closu
             file.inline = true;
         }
     }
-    let total_bytes = files.iter().map(|file| file.bytes.len() as u64).sum();
-    const MAX_BYTES: u64 = 25 * 1024 * 1024;
-    const MAX_FILES: usize = 20;
-    if files.len() > MAX_FILES {
-        issues.push(DraftIssue {
-            line: 0,
-            message: format!("this account allows {MAX_FILES} attachments"),
-            blocks_send: true,
-        });
-    }
-    if total_bytes > MAX_BYTES {
-        issues.push(DraftIssue {
-            line: 0,
-            message: "attachments exceed this account's 25 MB sending limit".into(),
-            blocks_send: true,
-        });
-    }
+    issues.extend(limit_issues(referenced, stated));
     Closure {
         files,
         issues,
-        total_bytes,
+        total_bytes: stated,
     }
 }
 
@@ -279,6 +295,8 @@ pub fn list_closure(
             &mut issues,
         );
     }
+    let total = files.iter().map(|file| file.len).sum();
+    issues.extend(limit_issues(files.len(), total));
     (files, issues)
 }
 
@@ -369,37 +387,60 @@ fn push_file(
     files: &mut Vec<ResolvedFile>,
     seen: &mut Vec<String>,
     issues: &mut Vec<DraftIssue>,
+    referenced: &mut usize,
+    stated: &mut u64,
+    budget: &mut u64,
 ) {
     if seen.iter().any(|existing| existing == path) {
         return;
     }
     let inline = inline || inline_paths.iter().any(|item| item == path);
     match resolve_inside(folder, path) {
-        Ok(abs) if abs.is_file() => match fs::read(&abs) {
-            Ok(bytes) => {
-                seen.push(path.to_string());
-                let display_name = name
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| {
-                        Path::new(path)
-                            .file_name()
-                            .and_then(|value| value.to_str())
-                            .unwrap_or(path)
-                    })
-                    .to_string();
-                files.push(ResolvedFile {
-                    path: path.to_string(),
-                    display_name,
-                    bytes,
-                    inline,
-                });
+        Ok(abs) if abs.is_file() => {
+            let len = match fs::metadata(&abs) {
+                Ok(meta) => meta.len(),
+                Err(err) => {
+                    issues.push(DraftIssue {
+                        line,
+                        message: format!("{path}: {err}"),
+                        blocks_send: true,
+                    });
+                    return;
+                }
+            };
+            seen.push(path.to_string());
+            *referenced += 1;
+            *stated += len;
+            if *referenced > MAX_ATTACHMENT_FILES || len > *budget {
+                return;
             }
-            Err(err) => issues.push(DraftIssue {
-                line,
-                message: format!("{path}: {err}"),
-                blocks_send: true,
-            }),
-        },
+            match read_within_budget(&abs, *budget) {
+                Ok(bytes) => {
+                    *budget = budget.saturating_sub(bytes.len() as u64);
+                    let display_name = name
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| {
+                            Path::new(path)
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or(path)
+                        })
+                        .to_string();
+                    files.push(ResolvedFile {
+                        path: path.to_string(),
+                        display_name,
+                        bytes,
+                        inline,
+                    });
+                }
+                Err(ReadLimit::TooBig) => {}
+                Err(ReadLimit::Io(err)) => issues.push(DraftIssue {
+                    line,
+                    message: format!("{path}: {err}"),
+                    blocks_send: true,
+                }),
+            }
+        }
         Ok(_) => issues.push(DraftIssue {
             line,
             message: format!("missing attachment `{path}`"),
@@ -411,6 +452,56 @@ fn push_file(
             blocks_send: true,
         }),
     }
+}
+
+const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_ATTACHMENT_FILES: usize = 20;
+
+fn limit_issues(count: usize, total_bytes: u64) -> Vec<DraftIssue> {
+    let mut issues = Vec::new();
+    if count > MAX_ATTACHMENT_FILES {
+        issues.push(DraftIssue {
+            line: 0,
+            message: format!("this account allows {MAX_ATTACHMENT_FILES} attachments"),
+            blocks_send: true,
+        });
+    }
+    if total_bytes > MAX_ATTACHMENT_BYTES {
+        issues.push(DraftIssue {
+            line: 0,
+            message: "attachments exceed this account's 25 MB sending limit".into(),
+            blocks_send: true,
+        });
+    }
+    issues
+}
+
+enum ReadLimit {
+    TooBig,
+    Io(std::io::Error),
+}
+
+fn read_within_budget(path: &Path, budget: u64) -> Result<Vec<u8>, ReadLimit> {
+    let meta = fs::metadata(path).map_err(ReadLimit::Io)?;
+    if meta.len() > budget {
+        return Err(ReadLimit::TooBig);
+    }
+    let mut file = fs::File::open(path).map_err(ReadLimit::Io)?;
+    let mut buf = Vec::new();
+    Read::by_ref(&mut file)
+        .take(budget)
+        .read_to_end(&mut buf)
+        .map_err(ReadLimit::Io)?;
+    if buf.len() as u64 > budget {
+        return Err(ReadLimit::TooBig);
+    }
+    if buf.len() as u64 == budget {
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra).unwrap_or(0) > 0 {
+            return Err(ReadLimit::TooBig);
+        }
+    }
+    Ok(buf)
 }
 
 pub fn image_file(folder: &Path, src: &str) -> Option<PathBuf> {
@@ -483,24 +574,60 @@ pub fn resolve_inside(folder: &Path, raw: &str) -> Result<PathBuf, String> {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if is_symlink(path) {
+        return Err(format!(
+            "{} is a symlink; refused to replace it",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         set_dir_mode(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|err| err.to_string())?;
-        file.write_all(bytes).map_err(|err| err.to_string())?;
-        file.sync_all().map_err(|err| err.to_string())?;
+    if let Ok(meta) = fs::symlink_metadata(&tmp) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&tmp).map_err(|err| err.to_string())?;
+        } else {
+            return Err(format!("cannot replace {}", tmp.display()));
+        }
     }
-    fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    write_exclusive(&tmp, bytes)?;
+    if is_symlink(path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "{} is a symlink; refused to replace it",
+            path.display()
+        ));
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// Linux `O_NOFOLLOW`. Opening a symlink fails instead of truncating its target.
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0x20000;
+#[cfg(not(target_os = "linux"))]
+const O_NOFOLLOW: i32 = 0x100;
+
+fn write_exclusive(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    file.write_all(bytes).map_err(|err| err.to_string())?;
+    file.sync_all().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -654,6 +781,124 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.blocks_send && issue.message.contains("gone.bin"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_attachment_is_rejected_without_keeping_its_bytes() {
+        let root = isolated("oversize");
+        let fields = DraftFields {
+            attachments: vec![AttachmentRef {
+                path: "big.bin".into(),
+                name: None,
+                line: 1,
+            }],
+            ..DraftFields::default()
+        };
+        let folder =
+            materialize_in(&root, "d4", &fields, "x\n", &AccountId("local".into())).unwrap();
+        let file = fs::File::create(folder.join("big.bin")).unwrap();
+        file.set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
+        let closure = resolve_closure(&folder, &fields, "x\n");
+        assert!(closure.files.is_empty());
+        assert!(closure.total_bytes > MAX_ATTACHMENT_BYTES);
+        assert!(
+            closure
+                .issues
+                .iter()
+                .any(|issue| issue.blocks_send && issue.message.contains("25 MB"))
+        );
+    }
+
+    #[test]
+    fn a_file_past_the_remaining_budget_is_not_read() {
+        let root = isolated("budget");
+        let fields = DraftFields {
+            attachments: vec![
+                AttachmentRef {
+                    path: "a.bin".into(),
+                    name: None,
+                    line: 1,
+                },
+                AttachmentRef {
+                    path: "b.bin".into(),
+                    name: None,
+                    line: 2,
+                },
+            ],
+            ..DraftFields::default()
+        };
+        let folder =
+            materialize_in(&root, "d5", &fields, "x\n", &AccountId("local".into())).unwrap();
+        fs::File::create(folder.join("a.bin"))
+            .unwrap()
+            .set_len(20 * 1024 * 1024)
+            .unwrap();
+        fs::File::create(folder.join("b.bin"))
+            .unwrap()
+            .set_len(10 * 1024 * 1024)
+            .unwrap();
+        let closure = resolve_closure(&folder, &fields, "x\n");
+        assert_eq!(closure.files.len(), 1);
+        assert_eq!(closure.files[0].path, "a.bin");
+        assert_eq!(closure.files[0].bytes.len() as u64, 20 * 1024 * 1024);
+        assert!(
+            closure
+                .issues
+                .iter()
+                .any(|issue| issue.blocks_send && issue.message.contains("25 MB"))
+        );
+    }
+
+    #[test]
+    fn saving_draft_does_not_follow_a_temp_symlink() {
+        let root = isolated("symlink-tmp");
+        let folder = materialize_in(
+            &root,
+            "d6",
+            &DraftFields::default(),
+            "body\n",
+            &AccountId("local".into()),
+        )
+        .unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"keep-me").unwrap();
+        symlink(&outside, folder.join("draft.tmp")).unwrap();
+        write_draft_file(&folder, "kept body\n").unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"keep-me");
+        let meta = fs::symlink_metadata(folder.join("draft.md")).unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
+        assert!(
+            fs::read_to_string(folder.join("draft.md"))
+                .unwrap()
+                .contains("kept body")
+        );
+    }
+
+    #[test]
+    fn saving_draft_refuses_to_replace_a_symlink() {
+        let root = isolated("symlink-draft");
+        let folder = materialize_in(
+            &root,
+            "d7",
+            &DraftFields::default(),
+            "body\n",
+            &AccountId("local".into()),
+        )
+        .unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"keep-me").unwrap();
+        let draft = folder.join("draft.md");
+        fs::remove_file(&draft).unwrap();
+        symlink(&outside, &draft).unwrap();
+        let err = write_draft_file(&folder, "new body\n").unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read(&outside).unwrap(), b"keep-me");
+        assert!(
+            fs::symlink_metadata(&draft)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 }

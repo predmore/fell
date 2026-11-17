@@ -559,7 +559,7 @@ impl DraftSession {
             let _ = self.flush();
             return;
         }
-        let outcome = merge::merge_draft(&self.last_written, &self.serialize(), text);
+        let outcome = merge::merge_draft(&self.settled, &self.serialize(), text);
         self.notices.extend(outcome.skipped);
         if self.adopt_text(&outcome.text).is_err() {
             self.notices.push(
@@ -861,6 +861,36 @@ mod tests {
                 .any(|note| note.contains("kept your text") || note.contains("overlapped"))
         );
         let _ = agent;
+    }
+
+    #[test]
+    fn a_flushed_keystroke_is_not_replaced_from_disk() {
+        let (_root, mut session) = temp_session("Please send the report\n");
+        let original = session.serialize();
+        session.set_body_from_user("Please send the report today\n".into());
+        session.flush().unwrap();
+        let stale = original.replace("Please send the report", "Please file the report");
+        session.push_disk(Some(stale), 0);
+        assert!(session.poll_disk(DEBOUNCE_MS));
+        assert!(
+            session.body().contains("Please send the report today"),
+            "{}",
+            session.body()
+        );
+        assert!(!session.body().contains("file the report"));
+    }
+
+    #[test]
+    fn a_flushed_keystroke_still_accepts_a_disjoint_file_edit() {
+        let (_root, mut session) = temp_session("Please send the report\n\nThanks\n");
+        let original = session.serialize();
+        session.set_body_from_user("Please send the report today\n\nThanks\n".into());
+        session.flush().unwrap();
+        let agent = original.replace("Thanks", "Regards");
+        session.push_disk(Some(agent), 0);
+        assert!(session.poll_disk(DEBOUNCE_MS));
+        assert!(session.body().contains("today"), "{}", session.body());
+        assert!(session.body().contains("Regards"), "{}", session.body());
     }
 
     #[test]
