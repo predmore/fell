@@ -937,12 +937,13 @@ impl Render for ComposeView {
             _ => self.status.clone(),
         };
         let unreviewed = snap.unreviewed;
+        let wide = window.viewport_size().width > px(640.);
         let send_label = if let Some(reason) = &snap.send_block {
             format!("send blocked · {reason}")
         } else if unreviewed == 0 {
-            "send  space m s".to_string()
+            "send space m s".to_string()
         } else {
-            format!("send  space m s  ·  {unreviewed} unreviewed")
+            format!("send space m s · {unreviewed} unreviewed")
         };
         div()
             .id("compose")
@@ -962,7 +963,7 @@ impl Render for ComposeView {
             .child(self.body_view(&snap, colors))
             .child(self.quote_view(colors).flex_shrink_0())
             .child(attachment_row(&snap, colors).flex_shrink_0())
-            .child(status_bar(mode, &send_label, &hint, &snap, colors).flex_shrink_0())
+            .child(status_bar(mode, &send_label, &hint, &snap, colors, wide).flex_shrink_0())
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
@@ -1214,6 +1215,8 @@ fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .flex()
         .px_1()
         .py_1()
+        .border_l(px(2.))
+        .border_color(rgb(colors.hunk))
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
@@ -1477,11 +1480,7 @@ fn styled_span(
 ) -> gpui::Div {
     let mut node = div().text_color(rgb(color)).font_weight(weight);
     if kind == StyleKind::Code {
-        node = node
-            .font_family("monospace")
-            .bg(rgb(code_bg))
-            .px_1()
-            .rounded_sm();
+        node = node.font_family("monospace").bg(rgb(code_bg)).rounded_sm();
     }
     if kind == StyleKind::Em {
         node = node.italic();
@@ -1631,13 +1630,12 @@ fn checkerboard() -> gpui::Div {
 
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
     let path = fell_core::compose::image_file(folder, src);
-    let mut block = div().flex().flex_col().items_start().gap_1();
+    let block = div().flex().flex_col().items_start().gap_1();
     if path.is_some() {
-        block = block.child(checkerboard());
+        return block.child(checkerboard());
     }
     block.child(
         div()
-            .pb_3()
             .text_size(px(16.))
             .text_color(rgb(colors.dim))
             .child(alt.to_string()),
@@ -1677,6 +1675,7 @@ fn status_bar(
     status: &SharedString,
     snap: &Snapshot,
     colors: Palette,
+    wide: bool,
 ) -> gpui::Div {
     let fresh = snap
         .to
@@ -1685,10 +1684,12 @@ fn status_bar(
         .chain(&snap.bcc)
         .filter(|item| item.fresh)
         .count();
-    let fresh_label = match fresh {
-        0 => None,
-        1 => Some("1 new recipient".to_string()),
-        count => Some(format!("{count} new recipients")),
+    let fresh_label = match (fresh, wide) {
+        (0, _) => None,
+        (1, true) => Some("1 new recipient".to_string()),
+        (1, false) => Some("1 new".to_string()),
+        (count, true) => Some(format!("{count} new recipients")),
+        (count, false) => Some(format!("{count} new")),
     };
     div()
         .flex()
@@ -1713,7 +1714,7 @@ fn status_bar(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().flex_shrink_0().pl(px(16.)).child(send.to_string()))
+        .child(div().flex_shrink_0().child(send.to_string()))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
