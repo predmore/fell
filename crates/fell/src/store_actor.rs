@@ -96,21 +96,41 @@ fn send<R: Send + 'static>(
     rx
 }
 
-/// Open the second connection on its own thread. If it cannot open, the
-/// lane stays unset and background jobs keep using the interactive lane.
+/// Waits between attempts to open the second connection. Until one
+/// succeeds, background jobs run on the interactive lane.
+const BACKGROUND_RETRIES: [std::time::Duration; 4] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(30),
+];
+
+/// Open the second connection on its own thread, retrying a few times. If
+/// it never opens, background jobs keep using the interactive lane.
 fn spawn_background(path: std::path::PathBuf, lane: Arc<OnceLock<mpsc::Sender<Job>>>) {
     let _ = std::thread::Builder::new()
         .name("fell-store-background".into())
         .spawn(move || {
-            let Ok(store) = Store::open(&path) else {
-                return;
+            let mut waits = BACKGROUND_RETRIES.iter();
+            let store = loop {
+                match Store::open(&path) {
+                    Ok(store) => break store,
+                    Err(_) => match waits.next() {
+                        // Nobody is left to serve once the window is gone.
+                        Some(_) if Arc::strong_count(&lane) == 1 => return,
+                        Some(wait) => std::thread::sleep(*wait),
+                        None => return,
+                    },
+                }
             };
             let (jobs, rx) = mpsc::channel::<Job>();
             if lane.set(jobs).is_err() {
                 return;
             }
-            // Jobs reach this lane only after it is set, and the loop ends
-            // when the window drops its clients.
+            // The clients' handle now owns the only sender. Keeping this one
+            // would hold the channel open after the window drops its clients,
+            // and this thread, its connection, and its indexer would outlive it.
+            drop(lane);
             while let Ok(job) = rx.recv() {
                 job(&store);
             }
@@ -167,17 +187,65 @@ mod tests {
             assert!(Instant::now() < deadline, "background lane never opened");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let started = Instant::now();
-        let slow = client.call_background(|_| std::thread::sleep(Duration::from_millis(400)));
+        // Hold the background lane busy until the reader has its answer.
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let slow = client.call_background(move |_| {
+            entered_tx.send(()).unwrap();
+            let _ = gate.recv();
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (answer_tx, answer) = std::sync::mpsc::channel();
         let quick = client.call(|store| store.list_accounts().map(|accounts| accounts.len()));
-        assert_eq!(futures::executor::block_on(quick).unwrap().unwrap(), 0);
-        assert!(
-            started.elapsed() < Duration::from_millis(300),
-            "the reader waited {:?} behind a background job",
-            started.elapsed()
-        );
+        std::thread::spawn(move || {
+            let _ = answer_tx.send(futures::executor::block_on(quick));
+        });
+        let got = answer.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
         futures::executor::block_on(slow).unwrap();
+        assert_eq!(
+            got.expect("the reader waited behind a background job")
+                .unwrap()
+                .unwrap(),
+            0
+        );
         drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_background_lane_ends_with_its_clients() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-lanes-end-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let opened = path.clone();
+        let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
+        futures::executor::block_on(ready).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !client.has_background_lane() {
+            assert!(Instant::now() < deadline, "background lane never opened");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lane = Arc::clone(&client.background);
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&lane) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the background thread kept the lane"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Only this handle is left, so dropping it closes the job channel
+        // and the background thread's recv loop ends.
+        assert_eq!(Arc::strong_count(&lane), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
