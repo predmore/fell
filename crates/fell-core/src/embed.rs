@@ -184,45 +184,65 @@ pub(crate) struct Indexer {
     #[cfg_attr(not(test), allow(dead_code))]
     pause: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// True only while this worker holds the embed lock.
+    #[cfg_attr(not(test), allow(dead_code))]
+    active: Arc<AtomicBool>,
 }
 
 impl Indexer {
-    /// Start the indexer when this process can take the mailbox's embed lock.
+    /// Watch the embed lock and index once this process can take it.
     ///
-    /// `None` means no worker was started. The mailbox still opens. The lock
-    /// is held inside the worker and dropped when that worker returns, so a
-    /// dead thread does not block every other process.
+    /// `None` means the thread could not be started. The mailbox still opens.
+    /// If another process holds the lock, this worker waits and starts when
+    /// the lock is free. The lock is dropped when the worker stops.
     pub(crate) fn try_spawn(path: &Path) -> Option<Self> {
-        let lock = match try_embed_lock(path) {
-            Ok(Some(lock)) => lock,
-            _ => return None,
-        };
         let stop = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(indexer_starts_paused()));
+        let active = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let pause_thread = Arc::clone(&pause);
+        let active_thread = Arc::clone(&active);
         let path = path.to_path_buf();
         let abort = abort_this_indexer();
         let thread = thread::Builder::new()
             .name("fell-embeddings".into())
             .spawn(move || {
                 if abort {
-                    drop(lock);
+                    if let Ok(Some(lock)) = try_embed_lock(&path) {
+                        active_thread.store(true, Ordering::Relaxed);
+                        drop(lock);
+                        active_thread.store(false, Ordering::Relaxed);
+                    }
                     return;
                 }
-                index_loop(path, stop_thread, pause_thread, lock);
+                loop {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match try_embed_lock(&path) {
+                        Ok(Some(lock)) => {
+                            active_thread.store(true, Ordering::Relaxed);
+                            index_loop(&path, &stop_thread, &pause_thread);
+                            active_thread.store(false, Ordering::Relaxed);
+                            drop(lock);
+                            return;
+                        }
+                        _ => sleep_unless_stopped(BUSY_RETRY, &stop_thread),
+                    }
+                }
             })
             .ok()?;
         Some(Self {
             stop,
             pause,
             thread: Some(thread),
+            active,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
-        self.thread.is_some()
+        self.active.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -355,19 +375,14 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn index_loop(
-    path: std::path::PathBuf,
-    stop: Arc<AtomicBool>,
-    pause: Arc<AtomicBool>,
-    _lock: Connection,
-) {
+fn index_loop(path: &Path, stop: &AtomicBool, pause: &AtomicBool) {
     let conn = loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        match open_index_conn(&path) {
+        match open_index_conn(path) {
             Ok(conn) => break conn,
-            Err(_) => sleep_unless_stopped(BUSY_RETRY, &stop),
+            Err(_) => sleep_unless_stopped(BUSY_RETRY, stop),
         }
     };
     let mut scan = Scan::default();
@@ -385,7 +400,7 @@ fn index_loop(
         };
         let (next_idle_wait, delay) = pause_after(kind, idle);
         idle = next_idle_wait;
-        sleep_unless_stopped(delay, &stop);
+        sleep_unless_stopped(delay, stop);
     }
 }
 
@@ -781,14 +796,36 @@ fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<Sta
     Ok(pending)
 }
 
+struct Prepared {
+    account_id: String,
+    message_id: String,
+    body: Option<String>,
+    values: Vec<f32>,
+}
+
 fn write_batch(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
-    // A failed commit must not leave this connection holding the write lock.
+    // Hash outside the write lock. A multi-megabyte batch must not hold it
+    // for the whole hash, or sync and triage outlive the 5s busy timeout.
+    let mut prepared = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        interrupt_rebuild(index)?;
+        let body = message_body(conn, &row.account_id, &row.message_id)?;
+        let values = match &body {
+            Some(body) => active_embedder().embed(body),
+            None => Vec::new(),
+        };
+        prepared.push(Prepared {
+            account_id: row.account_id.clone(),
+            message_id: row.message_id.clone(),
+            body,
+            values,
+        });
+    }
     if !conn.is_autocommit() {
         conn.execute_batch("ROLLBACK")?;
     }
-    // Immediate, so the re-read and the insert share one write lock.
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let wrote = write_batch_locked(conn, rows);
+    let wrote = store_prepared(conn, &prepared);
     match wrote {
         Ok(n) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(n),
@@ -804,17 +841,24 @@ fn write_batch(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
     }
 }
 
-fn write_batch_locked(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
+fn store_prepared(conn: &Connection, rows: &[Prepared]) -> Result<usize> {
     let mut wrote = 0;
-    for (index, row) in rows.iter().enumerate() {
-        interrupt_rebuild(index)?;
-        let Some(body) = message_body(conn, &row.account_id, &row.message_id)? else {
+    for row in rows {
+        let Some(hashed) = row.body.as_deref() else {
             remove_message_embedding(conn, &row.account_id, &row.message_id)?;
             dequeue_message(conn, &row.account_id, &row.message_id)?;
             continue;
         };
-        let values = active_embedder().embed(&body);
-        store_embedding(conn, &row.account_id, &row.message_id, &body, &values)?;
+        let Some(current) = message_body(conn, &row.account_id, &row.message_id)? else {
+            remove_message_embedding(conn, &row.account_id, &row.message_id)?;
+            dequeue_message(conn, &row.account_id, &row.message_id)?;
+            continue;
+        };
+        if current != hashed {
+            enqueue_message(conn, &row.account_id, &row.message_id)?;
+            continue;
+        }
+        store_embedding(conn, &row.account_id, &row.message_id, hashed, &row.values)?;
         dequeue_message(conn, &row.account_id, &row.message_id)?;
         wrote += 1;
     }
@@ -1085,6 +1129,17 @@ mod tests {
             .unwrap()
     }
 
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !ready() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "timed out waiting for the embedding indexer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn index_all(store: &Store) {
         loop {
             let wrote = index_embeddings(&store.conn, 64).unwrap();
@@ -1324,8 +1379,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.sqlite");
         let first = Store::open(&path).unwrap();
-        assert!(first.embedding_indexer_running());
+        wait_until(|| first.embedding_indexer_running());
         let second = Store::open(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!second.embedding_indexer_running());
         second.upsert_account(&account("a1")).unwrap();
         second
@@ -1340,8 +1396,10 @@ mod tests {
             1
         );
         drop(first);
+        wait_until(|| second.embedding_indexer_running());
         let third = Store::open(&path).unwrap();
-        assert!(third.embedding_indexer_running());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!third.embedding_indexer_running());
         drop(second);
         drop(third);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1441,7 +1499,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.sqlite");
         let store = Store::open(&path).unwrap();
-        assert!(store.embedding_indexer_running());
         let lock_path = embed_lock_path(&path);
         let start = std::time::Instant::now();
         loop {
@@ -1459,6 +1516,7 @@ mod tests {
                 Err(err) => panic!("{err}"),
             }
         }
+        wait_until(|| !store.embedding_indexer_running());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
