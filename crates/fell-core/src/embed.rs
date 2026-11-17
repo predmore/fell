@@ -1497,6 +1497,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_path_published_during_the_lock_gap_is_claimed_again() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-lock-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mail.sqlite");
+        drop(Store::open(&real).unwrap());
+        let alias = dir.join("alias.sqlite");
+        std::os::unix::fs::symlink("mail.sqlite", &alias).unwrap();
+        crate::store::testing_divert_published_path_once(alias.clone());
+        let store = Store::open(&real).unwrap();
+        assert_eq!(store.mailbox_path(), Some(alias.as_path()));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_hard_link_joins_the_open_mailbox() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);

@@ -289,10 +289,7 @@ impl Store {
         // One path string per inode. A symlink or a second hard link must not
         // open a different `-wal` while another connection still has the file.
         let claimed = claim_mailbox(requested)?;
-        let conn = Connection::open(&claimed.path)?;
-        // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        let mut store = Self::from_connection(conn)?;
+        let mut store = Self::from_connection(claimed.conn)?;
         store.path = Some(claimed.path.clone());
         #[cfg(unix)]
         {
@@ -833,6 +830,8 @@ fn page_offset(cursor: Option<&str>) -> Result<i64> {
 
 struct ClaimedMailbox {
     path: std::path::PathBuf,
+    /// Opened before the exclusive lock is released.
+    conn: Connection,
     #[cfg(unix)]
     lock: std::fs::File,
 }
@@ -852,9 +851,9 @@ fn claim_mailbox(requested: &Path) -> Result<ClaimedMailbox> {
     }
     #[cfg(not(unix))]
     {
-        Ok(ClaimedMailbox {
-            path: requested.canonicalize()?,
-        })
+        let path = requested.canonicalize()?;
+        let conn = open_mailbox_db(&path)?;
+        Ok(ClaimedMailbox { path, conn })
     }
 }
 
@@ -866,20 +865,45 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
     use fs4::fs_std::FileExt;
 
     let canonical = requested.canonicalize()?;
-    let file = std::fs::File::open(requested)?;
-    let path = if file.try_lock_exclusive()? {
-        let path = adopt_mailbox_path(&file, requested, &canonical)?;
-        // Convert exclusive to shared with no gap. Another opener can join,
-        // but it cannot start its own migration while this store is alive.
-        file.lock_shared()?;
-        path
-    } else {
-        file.lock_shared()?;
-        // The holder already chose one path. Using this caller's name would
-        // open a second WAL for the same inode.
-        shared_mailbox_path(&file)?
-    };
-    Ok(ClaimedMailbox { path, lock: file })
+    // Linux `flock` drops the exclusive lock before the shared lock is granted.
+    // Open the chosen path first. If another open publishes a different path
+    // in that gap, close and claim again.
+    for _ in 0..8 {
+        let file = std::fs::File::open(requested)?;
+        let (path, conn) = if file.try_lock_exclusive()? {
+            let path = adopt_mailbox_path(&file, requested, &canonical)?;
+            let conn = open_mailbox_db(&path)?;
+            file.lock_shared()?;
+            (path, conn)
+        } else {
+            file.lock_shared()?;
+            // The holder already chose one path. Using this caller's name would
+            // open a second WAL for the same inode.
+            let path = shared_mailbox_path(&file)?;
+            let conn = open_mailbox_db(&path)?;
+            (path, conn)
+        };
+        divert_published_path_for_test(&file);
+        if read_published_path(&file).as_ref() == Some(&path) {
+            return Ok(ClaimedMailbox {
+                path,
+                conn,
+                lock: file,
+            });
+        }
+        drop(conn);
+        drop(file);
+    }
+    Err(crate::Error::Invalid(
+        "mailbox path changed while it was opening".into(),
+    ))
+}
+
+fn open_mailbox_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    Ok(conn)
 }
 
 #[cfg(unix)]
@@ -962,6 +986,33 @@ thread_local! {
 #[cfg(all(unix, test))]
 pub(crate) fn testing_reject_mailbox_xattr(reject: bool) {
     REJECT_MAILBOX_XATTR.with(|cell| cell.set(reject));
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static DIVERT_PUBLISHED_ONCE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// After the next open downgrades its lock, publish this path once.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_divert_published_path_once(path: std::path::PathBuf) {
+    DIVERT_PUBLISHED_ONCE.with(|cell| *cell.borrow_mut() = Some(path));
+}
+
+#[cfg(unix)]
+fn divert_published_path_for_test(file: &std::fs::File) {
+    #[cfg(test)]
+    {
+        let next = DIVERT_PUBLISHED_ONCE.with(|cell| cell.borrow_mut().take());
+        if let Some(path) = next {
+            let _ = publish_mailbox_path(file, &path);
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = file;
+    }
 }
 
 #[cfg(unix)]
