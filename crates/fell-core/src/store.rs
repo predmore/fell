@@ -411,7 +411,7 @@ impl Store {
     }
 
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -455,7 +455,7 @@ impl Store {
     }
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         insert_message(&tx, message)?;
         rethread(&tx, &message.account_id)?;
         let thread_id =
@@ -473,7 +473,7 @@ impl Store {
     /// Document frequency drops the same way an insert raises it, inside the
     /// transaction that deletes the row. `false` means the message was not stored.
     pub fn delete_message(&self, account_id: &AccountId, message_id: &MessageId) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = immediate_transaction(&self.conn)?;
         let Some((stored, _)) = find_stored(&tx, account_id, message_id)? else {
             tx.rollback()?;
             return Ok(false);
@@ -2419,6 +2419,13 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write lock from the first statement, so an embedding commit cannot
+/// invalidate a snapshot this transaction already read.
+pub(crate) fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(Into::into)
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {

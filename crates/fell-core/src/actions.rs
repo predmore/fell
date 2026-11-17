@@ -307,7 +307,7 @@ impl Store {
     /// Restore the latest archive, move, label, or delete on this account.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
-        let tx = self.connection().unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
@@ -415,7 +415,7 @@ impl Store {
         plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
         self.require_account(account_id)?;
-        let tx = self.connection().unchecked_transaction()?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let rows = load_thread(&tx, account_id, thread_id)?;
         if rows.is_empty() {

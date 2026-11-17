@@ -1348,6 +1348,53 @@ mod tests {
     }
 
     #[test]
+    fn upsert_survives_a_concurrent_writer_on_wal() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-wal-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&account("a1")).unwrap();
+        let path = path.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_writer = std::sync::Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_millis(50))
+                .unwrap();
+            while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
+                if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+                    continue;
+                }
+                let _ = conn.execute("UPDATE messages SET snippet = snippet", []);
+                let _ = conn.execute_batch("COMMIT");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        for n in 0..30 {
+            let mut message = message("a1", &format!("m{n}@x"), "body");
+            message.headers.date_unix = n;
+            store.upsert_message(&message).unwrap();
+        }
+        assert_eq!(
+            store.list_threads(&AccountId("a1".into())).unwrap().len(),
+            30
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn open_skips_the_indexer_when_the_lock_file_cannot_be_created() {
         let dir = std::env::temp_dir().join(format!(
             "fell-embed-bad-lock-{}-{}",
