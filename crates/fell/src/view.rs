@@ -194,9 +194,17 @@ impl Inbox {
             return;
         };
         window.focus(&self.focus);
-        // The wheel moves the viewport without touching message_cursor. j, k,
-        // and q must aim at the message now on screen, in either pane.
-        if self.session.chord.is_empty() && matches!(key, KeyId::Char('j' | 'k' | 'q')) {
+        // The wheel moves the viewport without moving message_cursor. j, k,
+        // and q aim at the message now on screen in either pane. Enter and o
+        // do that only while the conversation is focused, so they expand the
+        // message on screen. An open palette, folder filter, or help card
+        // types those keys and must leave the cursor alone.
+        if should_follow_visible(
+            &self.session.overlay,
+            self.session.chord.is_empty(),
+            self.session.pane,
+            key,
+        ) {
             self.follow_visible_message();
         }
         let page = self.page_rows();
@@ -1530,11 +1538,12 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
     if stroke.modifiers.control && stroke.modifiers.shift && bare == "p" {
         return Some(KeyId::CtrlShiftP);
     }
-    if stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.platform {
-        let ch = bare.chars().next()?;
-        if ch.is_ascii_alphabetic() {
-            return Some(KeyId::Ctrl(ch));
-        }
+    if stroke.modifiers.control
+        && !stroke.modifiers.alt
+        && !stroke.modifiers.platform
+        && let Some(ch) = ctrl_letter(&stroke.key)
+    {
+        return Some(KeyId::Ctrl(ch));
     }
     if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
         return None;
@@ -1576,6 +1585,26 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
             }
         }
     }
+}
+
+fn should_follow_visible(overlay: &Overlay, chord_empty: bool, pane: Pane, key: KeyId) -> bool {
+    if *overlay != Overlay::None || !chord_empty {
+        return false;
+    }
+    match key {
+        KeyId::Char('j' | 'k' | 'q') => true,
+        KeyId::Enter | KeyId::Char('o') => pane == Pane::Conversation,
+        _ => false,
+    }
+}
+
+fn ctrl_letter(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    let ch = chars.next()?.to_ascii_lowercase();
+    if chars.next().is_some() || !ch.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(ch)
 }
 
 fn physical_letter(key: &str) -> Option<char> {
@@ -1644,8 +1673,10 @@ impl<T: Styled> FontOpt for T {
 
 #[cfg(test)]
 mod tests {
-    use super::key_from;
+    use super::{ctrl_letter, key_from, should_follow_visible};
     use crate::keymap::KeyId;
+    use crate::model::Overlay;
+    use crate::present::Pane;
     use gpui::{Keystroke, Modifiers};
 
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
@@ -1669,5 +1700,90 @@ mod tests {
             key_from(&stroke("slash", "?", true)),
             Some(KeyId::Char('?'))
         );
+    }
+
+    fn controlled(key: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_letter_is_only_a_single_character_name() {
+        assert_eq!(ctrl_letter("d"), Some('d'));
+        assert_eq!(ctrl_letter("U"), Some('u'));
+        assert_eq!(ctrl_letter("down"), None);
+        assert_eq!(ctrl_letter("up"), None);
+        assert_eq!(ctrl_letter("delete"), None);
+        assert_eq!(key_from(&controlled("d")), Some(KeyId::Ctrl('d')));
+        assert_eq!(key_from(&controlled("u")), Some(KeyId::Ctrl('u')));
+        assert_eq!(key_from(&controlled("down")), None);
+        assert_eq!(key_from(&controlled("up")), None);
+        assert_eq!(key_from(&controlled("delete")), None);
+    }
+
+    #[test]
+    fn visible_message_follow_skips_overlays() {
+        assert!(should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::List,
+            KeyId::Char('j')
+        ));
+        assert!(should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::Conversation,
+            KeyId::Char('q')
+        ));
+        assert!(should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::Conversation,
+            KeyId::Enter
+        ));
+        assert!(should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::Conversation,
+            KeyId::Char('o')
+        ));
+        assert!(!should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::List,
+            KeyId::Enter
+        ));
+        assert!(!should_follow_visible(
+            &Overlay::None,
+            true,
+            Pane::List,
+            KeyId::Char('o')
+        ));
+        for overlay in [&Overlay::Palette, &Overlay::Folders, &Overlay::Help] {
+            assert!(!should_follow_visible(
+                overlay,
+                true,
+                Pane::Conversation,
+                KeyId::Char('j')
+            ));
+            assert!(!should_follow_visible(
+                overlay,
+                true,
+                Pane::Conversation,
+                KeyId::Enter
+            ));
+        }
+        assert!(!should_follow_visible(
+            &Overlay::None,
+            false,
+            Pane::Conversation,
+            KeyId::Char('k')
+        ));
     }
 }
