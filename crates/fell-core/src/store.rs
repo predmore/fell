@@ -384,6 +384,8 @@ impl Store {
         // The fingerprint merge invalidates body vectors, so the table has to
         // exist before that backfill runs.
         crate::embed::ensure_embedding_schema(&conn)?;
+        // Threading tables first: the version 3 upgrade re-resolves threads.
+        threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
         if schema_version(&conn)?.as_deref() != Some("3") {
@@ -540,6 +542,7 @@ impl Store {
     fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
         #[cfg(test)]
         if self.full_rethread.get() {
+            threads::index_queued_subjects(conn)?;
             threads::rethread_all(conn, account_id)?;
             conn.execute_batch("DELETE FROM thread_dirty_rows; DELETE FROM thread_dirty_ids;")?;
             return Ok(());
