@@ -205,7 +205,7 @@ impl ComposeView {
             leader_at: None,
             which_visible: false,
             palette: None,
-            status: "compose".into(),
+            status: "i insert".into(),
             sent: false,
             watching: false,
         }
@@ -253,7 +253,7 @@ impl ComposeView {
                     this.editor.row = row;
                     this.editor.col = this.editor.lines[row].chars().count();
                     this.editor.mode = Mode::Insert;
-                    this.status = "insert".into();
+                    this.status = "i insert".into();
                 }
                 cx.notify();
             });
@@ -263,7 +263,7 @@ impl ComposeView {
             let _ = this.update(cx, |this, cx| {
                 this.insert_str(" now");
                 this.push_body();
-                this.status = "insert".into();
+                this.status = "i insert".into();
                 cx.notify();
             });
             cx.background_executor()
@@ -271,7 +271,7 @@ impl ComposeView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.editor.mode = Mode::Normal;
-                this.status = "normal".into();
+                this.status = "i insert".into();
                 cx.notify();
             });
         })
@@ -1335,10 +1335,11 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
     let path = folder.join(src);
     let mut block = div().flex().flex_col().gap_1();
     if path.is_file() {
-        block = block.child(img(path).w(px(320.)).h(px(140.)));
+        block = block.child(img(path).w(px(280.)).h(px(88.)));
     }
     block.child(
         div()
+            .pb_3()
             .text_sm()
             .text_color(rgb(colors.dim))
             .child(alt.to_string()),
