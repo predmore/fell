@@ -303,9 +303,9 @@ impl Render for Reader {
         }
         let palette = self.theme.palette();
         let (status, action) = if self.model.remote_images_allowed() {
-            ("Remote images allowed", "Block")
+            ("Remote images allowed", "Block sender")
         } else {
-            ("Remote images blocked", "Allow")
+            ("Remote images blocked", "Allow sender")
         };
         div()
             .id("fell-reader")
@@ -412,7 +412,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
         .py_4();
     if reader.model.mode() == RenderMode::Web {
         if let Some(image) = reader.web_image.clone() {
-            body.child(native::embedded_web(image, palette.border))
+            body.child(native::embedded_web(image))
         } else if reader.web_failed {
             body.child(
                 div()

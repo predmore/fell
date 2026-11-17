@@ -545,14 +545,9 @@ fn image_el(
     placeholder.into_any_element()
 }
 
-pub(crate) fn embedded_web(image: Arc<RenderImage>, frame: u32) -> AnyElement {
-    // A light page border has to read against both the cream email and the
-    // off-white message pane. The dark border already does.
-    let frame = if frame > 0x808080 { 0xb7b1a6 } else { frame };
+pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
     div()
         .w_full()
-        .border(px(1.))
-        .border_color(paint(frame))
         .child(
             img(image)
                 .w_full()
