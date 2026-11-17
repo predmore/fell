@@ -1418,11 +1418,11 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "from-alias");
-        // The reader blocks TRUNCATE (`busy=1`). Stay on the alias so its WAL
-        // is not abandoned for the canonical path.
+        // Opening the alias to checkpoint would create a second WAL. The store
+        // uses the canonical file instead.
         assert_eq!(
             store.mailbox_path().and_then(|path| path.file_name()),
-            Some(std::ffi::OsStr::new("alias.sqlite"))
+            Some(std::ffi::OsStr::new("mail.sqlite"))
         );
         drop(store);
         drop(hold);
@@ -1474,9 +1474,13 @@ mod tests {
         let alias = dir.join("alias.sqlite");
         std::os::unix::fs::symlink("mail.sqlite", &alias).unwrap();
         crate::store::testing_reject_mailbox_xattr(true);
-        let rejected = Store::open(&alias);
+        let opened = Store::open(&alias).unwrap();
         crate::store::testing_reject_mailbox_xattr(false);
-        assert!(rejected.is_err(), "unpublished alias opened");
+        assert_eq!(
+            opened.mailbox_path().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("mail.sqlite"))
+        );
+        drop(opened);
 
         let first = Store::open(&real).unwrap();
         wait_until(|| first.embedding_indexer_running());
@@ -1515,7 +1519,10 @@ mod tests {
         std::os::unix::fs::symlink("mail.sqlite", &alias).unwrap();
         crate::store::testing_divert_published_path_once(alias.clone());
         let store = Store::open(&real).unwrap();
-        assert_eq!(store.mailbox_path(), Some(alias.as_path()));
+        assert_eq!(
+            store.mailbox_path(),
+            Some(real.canonicalize().unwrap().as_path())
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
