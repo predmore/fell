@@ -54,6 +54,10 @@ pub(super) struct TestState {
     pub close_after_body_fetches: Option<u32>,
     pub mailboxes: Vec<FixtureMailbox>,
     pub commands: Vec<String>,
+    /// Advertise IDLE and answer it.
+    pub idle: bool,
+    /// While a client idles, send `* N EXISTS` once, then clear.
+    pub idle_push: bool,
 }
 
 pub(super) struct TestServer {
@@ -397,6 +401,45 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
             "NOOP" => {
                 let _ = write.write_all(format!("{tag} OK NOOP\r\n").as_bytes());
             }
+            "IDLE" if state.lock().expect("state").idle => {
+                let _ = write.write_all(b"+ idling\r\n");
+                let _ = write.flush();
+                let _ = read
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_millis(20)));
+                let mut pending = String::new();
+                loop {
+                    {
+                        let mut guard = state.lock().expect("state");
+                        if guard.idle_push {
+                            guard.idle_push = false;
+                            let exists = guard
+                                .mailboxes
+                                .iter()
+                                .find(|mailbox| mailbox.name == "INBOX")
+                                .map_or(0, |mailbox| mailbox.messages.len());
+                            let _ = write.write_all(format!("* {exists} EXISTS\r\n").as_bytes());
+                            let _ = write.flush();
+                        }
+                    }
+                    match read.read_line(&mut pending) {
+                        Ok(0) => return,
+                        Ok(_) if pending.trim().eq_ignore_ascii_case("DONE") => break,
+                        Ok(_) => pending.clear(),
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => return,
+                    }
+                }
+                state.lock().expect("state").commands.push("DONE".into());
+                let _ = read
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = write.write_all(format!("{tag} OK IDLE terminated\r\n").as_bytes());
+            }
             _ => {
                 let _ = write.write_all(format!("{tag} BAD unsupported\r\n").as_bytes());
             }
@@ -471,6 +514,9 @@ fn capability_text(state: &TestState) -> String {
     }
     if state.utf8_accept {
         caps.push_str(" UTF8=ACCEPT");
+    }
+    if state.idle {
+        caps.push_str(" IDLE");
     }
     caps
 }

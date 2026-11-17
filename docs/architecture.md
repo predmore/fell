@@ -33,7 +33,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 2. **IMAP** — any other IMAP account. Same read-only client.
 3. **Proton API** — direct Proton HTTP API. Same trait, not implemented.
 
-Sync logs in, lists mailboxes, and `EXAMINE`s each one (read-only). New mail is `UID FETCH` with `BODY.PEEK`, so the server is not asked to mark mail read. A cursor stores UIDVALIDITY, the highest UID, and HIGHESTMODSEQ when the server advertises CONDSTORE. The next sync fetches only newer UIDs, or `CHANGEDSINCE` when a modseq is known. IDLE and removal of messages that vanished on the server are later. The IMAP session has no send command and no OAuth. Bridge SMTP is a separate socket.
+Sync logs in, lists mailboxes, and `EXAMINE`s each one (read-only). New mail is `UID FETCH` with `BODY.PEEK`, so the server is not asked to mark mail read. A cursor stores UIDVALIDITY, the highest UID, and HIGHESTMODSEQ when the server advertises CONDSTORE. The next sync fetches only newer UIDs, or `CHANGEDSINCE` when a modseq is known. Between passes the sync thread waits on INBOX with IDLE (RFC 2177) on a read-only `EXAMINE`, so new mail starts a pass within moments. A full pass still runs at least every 60 seconds to catch up other folders. Mail that arrived after the last pass but before IDLE began counts as news, so nothing waits out the interval. A server without IDLE falls back to the 60-second timer. Removal of messages that vanished on the server is later. The IMAP session has no send command and no OAuth. Bridge SMTP is a separate socket.
 
 The UI and MCP crates take `dyn MailBackend` (or a store already populated by sync). They do not import IMAP or Proton protocol code.
 

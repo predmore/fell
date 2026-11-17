@@ -2,21 +2,26 @@
 //!
 //! One OS thread owns its own [`Store`] connection on the mailbox file and runs
 //! read-only IMAP passes: one at startup, then one every [`INTERVAL`], sooner
-//! when the window asks. The window never waits on it: status arrives on an
-//! async channel, and the window rereads the store on its own store thread.
+//! when the window asks. Between passes it waits on INBOX with IDLE, so new
+//! mail starts a pass within moments instead of up to a minute later. A
+//! server without IDLE falls back to the timer. The window never waits on
+//! it: status arrives on an async channel, and the window rereads the store
+//! on its own store thread.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    AccountConfig, BackendKind, Store, SyncFailureKind, classify_sync_error, sync_with_progress,
+    Account, AccountConfig, BackendKind, InboxWait, Store, SyncFailureKind, classify_sync_error,
+    sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 use crate::model::{SyncFailure, SyncKind};
 
-/// Time between passes after a pass succeeds. IDLE is later work.
+/// Longest time between passes after a pass succeeds. IDLE on INBOX starts
+/// one sooner when mail arrives; other folders are caught up on this timer.
 const INTERVAL: Duration = Duration::from_secs(60);
 /// Waits after consecutive failures. The last one repeats.
 const BACKOFF: [Duration; 4] = [
@@ -109,6 +114,8 @@ fn run(
     };
     let account = config.account();
     failures = 0;
+    // Cleared for good once the server says it has no IDLE.
+    let mut idle = true;
     loop {
         let mut alive = true;
         let mut last_progress: Option<Instant> = None;
@@ -132,6 +139,7 @@ fn run(
         }
         // Fold the log back into the file between passes so readers stay fast.
         let _ = store.checkpoint(true);
+        let synced = result.is_ok();
         let delay = match result {
             Ok(report) => {
                 failures = 0;
@@ -152,16 +160,86 @@ fn run(
                 delay
             }
         };
-        match wake.recv_timeout(delay) {
-            Ok(()) => {
+        let woke = if synced && idle {
+            wait_on_inbox(&config, &store, &account, delay, &wake, &mut idle)
+        } else {
+            wait_on_timer(&wake, delay)
+        };
+        match woke {
+            Woke::Asked => {
                 while wake.try_recv().is_ok() {}
                 if !send(SyncKind::Connecting) {
                     return;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Woke::Mail | Woke::Timer => {}
+            Woke::Closed => return,
         }
+    }
+}
+
+/// Why the wait between passes ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Woke {
+    /// The window asked for a pass now.
+    Asked,
+    /// IDLE saw INBOX change.
+    Mail,
+    Timer,
+    /// The window is gone.
+    Closed,
+}
+
+fn wait_on_timer(wake: &Receiver<()>, delay: Duration) -> Woke {
+    match wake.recv_timeout(delay) {
+        Ok(()) => Woke::Asked,
+        Err(RecvTimeoutError::Timeout) => Woke::Timer,
+        Err(RecvTimeoutError::Disconnected) => Woke::Closed,
+    }
+}
+
+/// IDLE on INBOX for up to `delay`. A server without IDLE clears `idle` and
+/// waits on the timer instead. A dropped connection waits out the rest of
+/// the delay on the timer; the next pass reports the failure.
+fn wait_on_inbox(
+    config: &AccountConfig,
+    store: &Store,
+    account: &Account,
+    delay: Duration,
+    wake: &Receiver<()>,
+    idle: &mut bool,
+) -> Woke {
+    let started = Instant::now();
+    let cursor = store.sync_cursor(&account.id).ok().flatten();
+    let mut asked = false;
+    let mut closed = false;
+    let outcome = config.backend().and_then(|backend| {
+        backend.wait_for_change(cursor.as_ref(), delay, &mut || match wake.try_recv() {
+            Ok(()) => {
+                asked = true;
+                true
+            }
+            Err(TryRecvError::Disconnected) => {
+                closed = true;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        })
+    });
+    if closed {
+        return Woke::Closed;
+    }
+    if asked {
+        return Woke::Asked;
+    }
+    match outcome {
+        Ok(InboxWait::Changed) => Woke::Mail,
+        Ok(InboxWait::Quiet | InboxWait::Stopped) => Woke::Timer,
+        Ok(InboxWait::Unsupported) => {
+            *idle = false;
+            wait_on_timer(wake, delay.saturating_sub(started.elapsed()))
+        }
+        Err(_) => wait_on_timer(wake, delay.saturating_sub(started.elapsed())),
     }
 }
 

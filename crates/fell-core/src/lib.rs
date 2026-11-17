@@ -33,7 +33,7 @@ pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
     LocalHashV1, embed_body,
 };
-pub use imap::{ImapConfig, ImapSecurity};
+pub use imap::{ImapConfig, ImapSecurity, InboxWait};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{

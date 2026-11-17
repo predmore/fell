@@ -2,7 +2,8 @@
 //!
 //! The session lists mailboxes, examines them, and fetches with `BODY.PEEK`
 //! so the server is not asked to mark mail read. There is no SMTP, no OAuth,
-//! and no send command. IDLE and removal of vanished messages are later work.
+//! and no send command. INBOX IDLE is read-only too. Removal of vanished
+//! messages is later work.
 
 mod rfc822;
 mod session;
@@ -69,6 +70,86 @@ pub(crate) fn check_login(config: &ImapConfig) -> Result<usize, Error> {
     let count = session.list_selectable()?.len();
     session.logout();
     Ok(count)
+}
+
+/// How [`wait_for_inbox`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxWait {
+    /// INBOX changed since the cursor, or while waiting.
+    Changed,
+    /// `max` passed with no news.
+    Quiet,
+    /// The caller asked to stop.
+    Stopped,
+    /// The server has no IDLE.
+    Unsupported,
+}
+
+/// Wait on INBOX with IDLE until it changes, `max` passes, or `stop` is true.
+///
+/// Read-only: `EXAMINE`, `IDLE`, `DONE`, `LOGOUT`. Mail that arrived after
+/// the last sync (`cursor`) but before IDLE started counts as a change, so
+/// nothing waits a whole interval. IDLE is renewed every 20 minutes,
+/// under the 29 minutes RFC 2177 allows.
+pub(crate) fn wait_for_inbox(
+    config: &ImapConfig,
+    cursor: Option<&SyncCursor>,
+    max: std::time::Duration,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<InboxWait, Error> {
+    const RENEW: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+    let mut session = session::Session::open(config)?;
+    if !session.has_idle() {
+        session.logout();
+        return Ok(InboxWait::Unsupported);
+    }
+    let Some(examined) = session.examine("INBOX")? else {
+        session.logout();
+        return Ok(InboxWait::Unsupported);
+    };
+    let checkpoints = decode_cursor(cursor);
+    let inbox = checkpoints
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("INBOX"))
+        .map(|(_, checkpoint)| checkpoint);
+    if inbox_moved_since(inbox, &examined) {
+        session.logout();
+        return Ok(InboxWait::Changed);
+    }
+    let started = std::time::Instant::now();
+    let outcome = loop {
+        let left = max.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break InboxWait::Quiet;
+        }
+        match session.idle(left.min(RENEW), stop)? {
+            session::IdleEnd::Changed => break InboxWait::Changed,
+            session::IdleEnd::Stopped => break InboxWait::Stopped,
+            session::IdleEnd::Quiet => continue,
+        }
+    };
+    session.logout();
+    Ok(outcome)
+}
+
+/// INBOX has mail the last sync did not see.
+fn inbox_moved_since(checkpoint: Option<&MailboxCheckpoint>, examined: &session::Examined) -> bool {
+    let Some(checkpoint) = checkpoint else {
+        return true;
+    };
+    if checkpoint.uidvalidity != examined.uidvalidity {
+        return true;
+    }
+    if examined
+        .uidnext
+        .is_some_and(|next| next > checkpoint.uid.saturating_add(1))
+    {
+        return true;
+    }
+    matches!(
+        (checkpoint.modseq, examined.highest_modseq),
+        (Some(seen), Some(now)) if now > seen
+    )
 }
 
 pub(crate) fn fetch_imap(

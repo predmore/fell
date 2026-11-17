@@ -1,6 +1,6 @@
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
-use crate::imap::{ImapConfig, ImapSecurity};
+use crate::imap::{ImapConfig, ImapSecurity, InboxWait};
 use crate::store::Store;
 use crate::sync::sync_once;
 use crate::threading::ThreadId;
@@ -40,6 +40,8 @@ fn sample_state() -> TestState {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -520,6 +522,8 @@ fn star_range_does_not_reapply_the_highest_uid() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -578,6 +582,8 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -638,6 +644,8 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -746,6 +754,8 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -850,6 +860,8 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -985,6 +997,8 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1073,6 +1087,8 @@ fn non_ascii_password_logs_in_as_a_literal() {
         require_utf8_for_login: true,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1138,6 +1154,8 @@ fn fetch_batches_survive_a_dropped_connection() {
         require_utf8_for_login: false,
         close_after_body_fetches: Some(2),
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1242,6 +1260,8 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1312,6 +1332,8 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1376,6 +1398,8 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1447,6 +1471,8 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         require_utf8_for_login: false,
         close_after_body_fetches: None,
         commands: Vec::new(),
+        idle: false,
+        idle_push: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -1547,4 +1573,153 @@ fn account_file_logs_in_syncs_and_reports_bad_logins() {
         SyncFailureKind::Unreachable,
         "{err}"
     );
+}
+
+fn idle_backend(server: &TestServer) -> (Account, ImapBackend) {
+    let acct = account("idle", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    (acct, backend)
+}
+
+fn idle_state() -> TestState {
+    TestState {
+        idle: true,
+        ..sample_state()
+    }
+}
+
+/// IDLE never asks the server to change anything.
+fn assert_read_only(server: &TestServer) {
+    for command in commands(server) {
+        let upper = command.to_ascii_uppercase();
+        for verb in [" SELECT", " STORE", " EXPUNGE", " APPEND", " COPY", " MOVE"] {
+            assert!(!upper.contains(verb), "{command}");
+        }
+    }
+}
+
+#[test]
+fn idle_wakes_when_new_mail_arrives() {
+    let server = TestServer::spawn(idle_state());
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let state = std::sync::Arc::clone(&server.state);
+    let pusher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        state.lock().expect("state").idle_push = true;
+    });
+    let started = std::time::Instant::now();
+    let outcome = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_secs(20),
+            &mut || false,
+        )
+        .unwrap();
+    pusher.join().unwrap();
+    assert_eq!(outcome, InboxWait::Changed);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let sent = commands(&server);
+    assert!(
+        sent.iter().any(|command| command.ends_with(" IDLE")),
+        "{sent:?}"
+    );
+    assert!(sent.iter().any(|command| command == "DONE"), "{sent:?}");
+    assert_read_only(&server);
+}
+
+#[test]
+fn idle_ends_quietly_or_when_asked() {
+    let server = TestServer::spawn(idle_state());
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let quiet = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_millis(600),
+            &mut || false,
+        )
+        .unwrap();
+    assert_eq!(quiet, InboxWait::Quiet);
+    let started = std::time::Instant::now();
+    let asked = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_secs(20),
+            &mut || started.elapsed() > std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+    assert_eq!(asked, InboxWait::Stopped);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let done = commands(&server)
+        .iter()
+        .filter(|command| command.as_str() == "DONE")
+        .count();
+    assert_eq!(done, 2, "every IDLE ends with DONE");
+    assert_read_only(&server);
+}
+
+#[test]
+fn mail_since_the_last_sync_counts_without_idling() {
+    let server = TestServer::spawn(idle_state());
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        let next = inbox
+            .messages
+            .iter()
+            .map(|message| message.uid)
+            .max()
+            .unwrap()
+            + 1;
+        let raw = inbox.messages[0].raw.clone();
+        inbox.messages.push(FixtureMessage {
+            uid: next,
+            flags: Vec::new(),
+            modseq: 1,
+            raw,
+            body_form: BodyForm::Literal,
+        });
+        state.commands.clear();
+    }
+    let outcome = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_secs(20),
+            &mut || false,
+        )
+        .unwrap();
+    assert_eq!(outcome, InboxWait::Changed);
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|command| command.ends_with(" IDLE")),
+        "no need to idle: {:?}",
+        commands(&server)
+    );
+}
+
+#[test]
+fn a_server_without_idle_says_so() {
+    let server = TestServer::spawn(sample_state());
+    let (_, backend) = idle_backend(&server);
+    let outcome = backend
+        .wait_for_change(None, std::time::Duration::from_secs(1), &mut || false)
+        .unwrap();
+    assert_eq!(outcome, InboxWait::Unsupported);
 }
