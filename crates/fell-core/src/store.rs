@@ -1993,11 +1993,12 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
     }
 }
 
-/// A short list echo shares the subject with the copy it rewrites.
+/// A short list echo shares the subject and parent with the copy it rewrites.
 ///
-/// Two posts that both carry a list id are two messages. So are two replies
-/// whose `In-Reply-To` values disagree. A missing parent does not block the
-/// join: a list can omit the header it rewrote.
+/// Two posts that both carry a list id are two messages. Parents match only
+/// when both name the same `In-Reply-To`, or both omit it. A parent on only
+/// one side is a different reply. A Sent copy joins only when the kept row
+/// is not already in Sent.
 fn short_reply_is_one_post(
     incoming: &Message,
     stored: &Arrival,
@@ -2010,6 +2011,21 @@ fn short_reply_is_one_post(
     if subject_key(&incoming.headers.subject) != subject_key(&stored.subject) {
         return false;
     }
+    if !short_parents_match(incoming, stored) {
+        return false;
+    }
+    let incoming_sent = incoming
+        .folders
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    let stored_sent = split_field(&stored.folders)
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    !(incoming_sent && stored_sent)
+}
+
+/// Both copies name the same parent, or both have none.
+fn short_parents_match(incoming: &Message, stored: &Arrival) -> bool {
     let stored_parent = stored.in_reply_to.as_deref().filter(|id| !id.is_empty());
     let incoming_parent = incoming
         .headers
@@ -2019,7 +2035,8 @@ fn short_reply_is_one_post(
         .filter(|id| !id.is_empty());
     match (stored_parent, incoming_parent) {
         (Some(stored_id), Some(incoming_id)) => stored_id == incoming_id,
-        _ => true,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -4933,6 +4950,93 @@ mod tests {
         assert_eq!(collapsed[0].headers.message_id.as_str(), "plus-a@x");
         assert!(collapsed[0].folders.iter().any(|folder| folder == "Sent"));
         assert!(collapsed[0].folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn second_sent_short_reply_stays_after_the_echo_joins() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut list = msg(
+            "plus-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Re: Patch",
+            "+1",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at;
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let mut first = with_arrival(
+            msg("plus-sent-1@x", None, Some("patch@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        first.headers.date_unix = sent_at + 30;
+        first.remote_id = RemoteId("imap:sent-1".into());
+        store.upsert_message(&first).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+
+        let mut second = with_arrival(
+            msg("plus-sent-2@x", None, Some("patch@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        second.headers.date_unix = sent_at + (60 * 60);
+        second.remote_id = RemoteId("imap:sent-2".into());
+        store.upsert_message(&second).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let kept = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-list@x")
+            .unwrap();
+        let later = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-sent-2@x")
+            .unwrap();
+        assert!(later.folders.iter().any(|folder| folder == "Sent"));
+        assert_eq!(later.remote_id.0, "imap:sent-2");
+        assert_ne!(kept.remote_id.0, "imap:sent-2");
+    }
+
+    #[test]
+    fn list_short_reply_without_a_parent_does_not_absorb_a_sent_reply() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut list = msg("plus-list@x", None, None, "[list] Re: Patch", "+1");
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at;
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let mut sent = with_arrival(
+            msg("plus-sent@x", None, Some("other@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        sent.headers.date_unix = sent_at + 60;
+        sent.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&sent).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-list@x")
+        );
+        let sent_row = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-sent@x")
+            .unwrap();
+        assert_eq!(sent_row.remote_id.0, "imap:sent");
+        assert_eq!(
+            sent_row.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("other@x")
+        );
     }
 
     #[test]
