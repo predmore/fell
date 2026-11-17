@@ -70,6 +70,10 @@ pub enum WebStatus {
         generation: u64,
         settled: bool,
     },
+    /// The reader already holds this generation, so the PNG is not cloned.
+    Unchanged {
+        settled: bool,
+    },
     Failed,
 }
 
@@ -91,17 +95,26 @@ pub fn hide() {
 /// Latest full-document PNG for `token`, or a terminal failure.
 ///
 /// `Pending` means the load is still settling. The reader polls this on its
-/// own; it does not rebuild the HTML to find out.
-pub fn status_for(token: u64) -> WebStatus {
+/// own; it does not rebuild the HTML to find out. Pass the generation already
+/// on screen so an unchanged frame is not cloned.
+pub fn status_for(token: u64, seen_generation: Option<u64>) -> WebStatus {
     let Ok(slot) = FRAME.lock() else {
         return WebStatus::Pending;
     };
     match slot.as_ref() {
-        Some((got, StoredFrame::Png(png))) if *got == token => WebStatus::Ready {
-            png: Arc::clone(&png.bytes),
-            generation: png.generation,
-            settled: png.settled,
-        },
+        Some((got, StoredFrame::Png(png))) if *got == token => {
+            if seen_generation == Some(png.generation) {
+                WebStatus::Unchanged {
+                    settled: png.settled,
+                }
+            } else {
+                WebStatus::Ready {
+                    png: Arc::clone(&png.bytes),
+                    generation: png.generation,
+                    settled: png.settled,
+                }
+            }
+        }
         Some((got, StoredFrame::Failed)) if *got == token => WebStatus::Failed,
         _ => WebStatus::Pending,
     }
@@ -741,5 +754,54 @@ mod settle_tests {
         assert_eq!(retry.snapshot_empty(), Settle::Snapshot { delay_ms: 600 });
         assert_eq!(retry.snapshot_empty(), Settle::Failed);
         assert_eq!(retry.snapshot_empty(), Settle::Wait);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use std::sync::Arc;
+
+    use super::{FRAME, StoredFrame, StoredPng, WebStatus, status_for};
+
+    #[test]
+    fn unchanged_generation_does_not_clone_the_png() {
+        let bytes: Arc<[u8]> = Arc::from(&b"not-a-real-png"[..]);
+        let token = 9_001_001_u64;
+        {
+            let mut slot = FRAME.lock().expect("frame lock");
+            *slot = Some((
+                token,
+                StoredFrame::Png(StoredPng {
+                    bytes: Arc::clone(&bytes),
+                    generation: 4,
+                    settled: false,
+                }),
+            ));
+        }
+        let WebStatus::Ready {
+            png,
+            generation,
+            settled,
+        } = status_for(token, None)
+        else {
+            panic!("first poll should hand over the arc");
+        };
+        assert_eq!(generation, 4);
+        assert!(!settled);
+        assert!(Arc::ptr_eq(&png, &bytes));
+        let holders = Arc::strong_count(&bytes);
+        match status_for(token, Some(4)) {
+            WebStatus::Unchanged { settled } => assert!(!settled),
+            WebStatus::Pending => panic!("expected no copy, got pending"),
+            WebStatus::Ready { .. } => panic!("expected no copy, got another png"),
+            WebStatus::Failed => panic!("expected no copy, got failure"),
+        }
+        assert_eq!(Arc::strong_count(&bytes), holders);
+        drop(png);
+        if let Ok(mut slot) = FRAME.lock()
+            && slot.as_ref().is_some_and(|(got, _)| *got == token)
+        {
+            *slot = None;
+        }
     }
 }

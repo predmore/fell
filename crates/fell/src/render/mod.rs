@@ -143,26 +143,21 @@ impl Reader {
         if self.web_failed || self.web_settled {
             return;
         }
-        match webview::status_for(self.web_token) {
+        let seen = self.web_image.is_some().then_some(self.web_generation);
+        match webview::status_for(self.web_token, seen) {
             webview::WebStatus::Ready {
                 png,
                 generation,
                 settled,
-            } => {
-                if generation != self.web_generation {
-                    match decode_image(&png) {
-                        Some(image) => {
-                            self.web_image = Some(image);
-                            self.web_generation = generation;
-                        }
-                        None => {
-                            self.web_failed = true;
-                            return;
-                        }
-                    }
+            } => match decode_image(&png) {
+                Some(image) => {
+                    self.web_image = Some(image);
+                    self.web_generation = generation;
+                    self.web_settled = settled;
                 }
-                self.web_settled = settled;
-            }
+                None => self.web_failed = true,
+            },
+            webview::WebStatus::Unchanged { settled } => self.web_settled = settled,
             webview::WebStatus::Failed => self.web_failed = true,
             webview::WebStatus::Pending => {}
         }
