@@ -40,7 +40,7 @@ pub const FOLDER_SENT: &str = "Sent";
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
     in_reply_to, references_header, from_name, from_email, subject,
     date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-    to_line, cc_line, bcc_line, has_attachment";
+    to_line, cc_line, bcc_line, has_attachment, list_id";
 
 const ACTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_actions (
@@ -80,10 +80,20 @@ CREATE TABLE IF NOT EXISTS local_action_messages (
     cc_line TEXT NOT NULL,
     bcc_line TEXT NOT NULL,
     has_attachment INTEGER NOT NULL,
+    list_id TEXT,
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_local_action_messages ON local_action_messages(action_id);
+
+CREATE TABLE IF NOT EXISTS local_action_aliases (
+    action_id INTEGER NOT NULL,
+    canonical_message_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    remote_id TEXT NOT NULL DEFAULT '',
+    folder TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(action_id) REFERENCES local_actions(id)
+);
 
 CREATE TABLE IF NOT EXISTS local_folder_tombstones (
     action_id INTEGER NOT NULL,
@@ -165,6 +175,14 @@ struct SavedRow {
     cc_line: String,
     bcc_line: String,
     has_attachment: i64,
+    list_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct SavedAlias {
+    message_id: String,
+    remote_id: String,
+    folder: String,
 }
 
 struct Planned {
@@ -306,6 +324,10 @@ impl Store {
             "DELETE FROM local_action_messages WHERE action_id = ?1",
             params![action.id],
         )?;
+        tx.execute(
+            "DELETE FROM local_action_aliases WHERE action_id = ?1",
+            params![action.id],
+        )?;
         let changed = tx.execute(
             "UPDATE local_actions SET undone = 1
              WHERE id = ?1 AND account_id = ?2 AND undone = 0",
@@ -428,6 +450,10 @@ fn ensure_snapshot_columns(conn: &Connection) -> Result<()> {
             "after_labels",
             "ALTER TABLE local_action_messages ADD COLUMN after_labels TEXT NOT NULL DEFAULT ''",
         ),
+        (
+            "list_id",
+            "ALTER TABLE local_action_messages ADD COLUMN list_id TEXT",
+        ),
     ];
     for (name, ddl) in missing {
         if !names.iter().any(|column| column == name) {
@@ -451,7 +477,7 @@ fn record_and_apply(
     )?;
     let id = conn.last_insert_rowid();
     for plan in plans {
-        insert_snapshot(conn, id, plan)?;
+        insert_snapshot(conn, id, account_id, plan)?;
         record_tombstones(conn, id, account_id, plan)?;
         apply_plan(conn, account_id, plan)?;
     }
@@ -490,7 +516,14 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), plan.before.message_id],
         )?;
-        return expect_one(changed, &plan.before.message_id);
+        expect_one(changed, &plan.before.message_id)?;
+        conn.execute(
+            "DELETE FROM message_aliases
+             WHERE account_id = ?1
+               AND (message_id = ?2 OR canonical_message_id = ?2)",
+            params![account_id.as_str(), plan.before.message_id],
+        )?;
+        return Ok(());
     }
     let new_terms = terms_with(&plan.before, &plan.folders, &plan.labels);
     let changed = conn.execute(
@@ -512,7 +545,9 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
     let saved = &snapshot.row;
     if let Some(current) = load_one(conn, account_id, &saved.message_id)? {
         if snapshot.removed {
-            return replace_message_row(conn, account_id, &current, saved);
+            replace_message_row(conn, account_id, &current, saved)?;
+            restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
+            return Ok(());
         }
         let folders = join_tokens(&invert_tokens(
             &split_tokens(&current.folders),
@@ -537,9 +572,95 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
         return Ok(());
     }
+    if let Some(canonical_id) = live_alias_target(conn, account_id, &saved.message_id)? {
+        let Some(current) = load_one(conn, account_id, &canonical_id)? else {
+            return Ok(());
+        };
+        // The snapshot is the other copy. Put its folders and labels back on
+        // the survivor and reattach the alias. Subject, body, and unread stay.
+        let folders = join_tokens(&invert_tokens(
+            &split_tokens(&current.folders),
+            &split_tokens(&saved.folders),
+            &split_tokens(&snapshot.after_folders),
+            true,
+        ));
+        let labels = join_tokens(&invert_tokens(
+            &split_tokens(&current.labels),
+            &split_tokens(&saved.labels),
+            &split_tokens(&snapshot.after_labels),
+            false,
+        ));
+        let old_terms = terms_of(&current);
+        let new_terms = terms_with(&current, &folders, &labels);
+        let changed = conn.execute(
+            "UPDATE messages SET folders = ?1, labels = ?2
+             WHERE account_id = ?3 AND message_id = ?4",
+            params![folders, labels, account_id.as_str(), canonical_id],
+        )?;
+        expect_one(changed, &canonical_id)?;
+        sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+        let mut aliases = snapshot.aliases.clone();
+        aliases.push(SavedAlias {
+            message_id: saved.message_id.clone(),
+            remote_id: saved.remote_id.clone(),
+            folder: saved.folders.clone(),
+        });
+        restore_aliases(conn, account_id, &canonical_id, &aliases)?;
+        return Ok(());
+    }
     insert_message_row(conn, account_id, saved)?;
+    restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
     let terms = terms_of(saved);
     sync_terms(conn, account_id.as_str(), &HashSet::new(), &terms)?;
+    Ok(())
+}
+
+fn live_alias_target(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Option<String>> {
+    let canonical: Option<String> = conn
+        .query_row(
+            "SELECT a.canonical_message_id FROM message_aliases a
+             JOIN messages m
+               ON m.account_id = a.account_id AND m.message_id = a.canonical_message_id
+             WHERE a.account_id = ?1 AND a.message_id = ?2
+             LIMIT 1",
+            params![account_id.as_str(), message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(canonical)
+}
+
+fn restore_aliases(
+    conn: &Connection,
+    account_id: &AccountId,
+    canonical_id: &str,
+    aliases: &[SavedAlias],
+) -> Result<()> {
+    for alias in aliases {
+        if alias.message_id == canonical_id {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO message_aliases (
+                account_id, message_id, canonical_message_id, remote_id, folder
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, message_id) DO UPDATE SET
+                canonical_message_id = excluded.canonical_message_id,
+                remote_id = excluded.remote_id,
+                folder = excluded.folder",
+            params![
+                account_id.as_str(),
+                alias.message_id,
+                canonical_id,
+                alias.remote_id,
+                alias.folder,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -551,11 +672,16 @@ fn replace_message_row(
 ) -> Result<()> {
     let old_terms = terms_of(current);
     let new_terms = terms_of(snapshot);
+    let fingerprint = match snapshot.body_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => crate::message::body_fingerprint(text),
+        _ => String::new(),
+    };
     let mut values = saved_values(snapshot);
     let message_id = values.remove(0);
+    values.push(Value::Text(fingerprint));
     values.push(Value::Text(account_id.as_str().to_string()));
     values.push(message_id);
-    debug_assert_eq!(values.len(), 21);
+    debug_assert_eq!(values.len(), 23);
     let changed = conn.execute(
         "UPDATE messages SET
             remote_id = ?1,
@@ -576,8 +702,10 @@ fn replace_message_row(
             to_line = ?16,
             cc_line = ?17,
             bcc_line = ?18,
-            has_attachment = ?19
-         WHERE account_id = ?20 AND message_id = ?21",
+            has_attachment = ?19,
+            list_id = ?20,
+            body_fingerprint = ?21
+         WHERE account_id = ?22 AND message_id = ?23",
         params_from_iter(values),
     )?;
     expect_one(changed, &snapshot.message_id)?;
@@ -793,6 +921,7 @@ struct Snapshot {
     row: SavedRow,
     after_folders: String,
     after_labels: String,
+    aliases: Vec<SavedAlias>,
 }
 
 fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<Snapshot>> {
@@ -807,6 +936,41 @@ fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<Snapshot>> {
     for row in rows {
         out.push(row?);
     }
+    drop(stmt);
+    let mut aliases = load_saved_aliases(conn, action_id)?;
+    for snapshot in &mut out {
+        if let Some(found) = aliases.remove(&snapshot.row.message_id) {
+            snapshot.aliases = found;
+        }
+    }
+    Ok(out)
+}
+
+fn load_saved_aliases(
+    conn: &Connection,
+    action_id: i64,
+) -> Result<std::collections::HashMap<String, Vec<SavedAlias>>> {
+    let mut stmt = conn.prepare(
+        "SELECT canonical_message_id, message_id, remote_id, folder
+         FROM local_action_aliases
+         WHERE action_id = ?1
+         ORDER BY message_id ASC",
+    )?;
+    let rows = stmt.query_map(params![action_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SavedAlias {
+                message_id: row.get(1)?,
+                remote_id: row.get(2)?,
+                folder: row.get(3)?,
+            },
+        ))
+    })?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (canonical, alias) = row?;
+        out.entry(canonical).or_insert_with(Vec::new).push(alias);
+    }
     Ok(out)
 }
 
@@ -814,8 +978,9 @@ fn read_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     Ok(Snapshot {
         removed: row.get::<_, i64>(0)? != 0,
         row: read_saved_from(row, 1)?,
-        after_folders: row.get(21)?,
-        after_labels: row.get(22)?,
+        after_folders: row.get(22)?,
+        after_labels: row.get(23)?,
+        aliases: Vec::new(),
     })
 }
 
@@ -845,10 +1010,16 @@ fn read_saved_from(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Saved
         cc_line: row.get(at + 17)?,
         bcc_line: row.get(at + 18)?,
         has_attachment: row.get(at + 19)?,
+        list_id: row.get(at + 20)?,
     })
 }
 
-fn insert_snapshot(conn: &Connection, action_id: i64, plan: &Planned) -> Result<()> {
+fn insert_snapshot(
+    conn: &Connection,
+    action_id: i64,
+    account_id: &AccountId,
+    plan: &Planned,
+) -> Result<()> {
     let mut values = vec![
         Value::Integer(action_id),
         Value::Integer(i64::from(plan.remove_row)),
@@ -856,19 +1027,54 @@ fn insert_snapshot(conn: &Connection, action_id: i64, plan: &Planned) -> Result<
     values.extend(saved_values(&plan.before));
     values.push(Value::Text(plan.folders.clone()));
     values.push(Value::Text(plan.labels.clone()));
-    debug_assert_eq!(values.len(), 24);
+    debug_assert_eq!(values.len(), 25);
     conn.execute(
         "INSERT INTO local_action_messages (
             action_id, removed, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment, after_folders, after_labels
+            to_line, cc_line, bcc_line, has_attachment, list_id, after_folders, after_labels
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
          )",
         params_from_iter(values),
     )?;
+    let aliases = {
+        let mut stmt = conn.prepare(
+            "SELECT message_id, remote_id, folder FROM message_aliases
+             WHERE account_id = ?1 AND canonical_message_id = ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id.as_str(), plan.before.message_id],
+            |row| {
+                Ok(SavedAlias {
+                    message_id: row.get(0)?,
+                    remote_id: row.get(1)?,
+                    folder: row.get(2)?,
+                })
+            },
+        )?;
+        let mut aliases = Vec::new();
+        for row in rows {
+            aliases.push(row?);
+        }
+        aliases
+    };
+    for alias in aliases {
+        conn.execute(
+            "INSERT INTO local_action_aliases (
+                action_id, canonical_message_id, message_id, remote_id, folder
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                action_id,
+                plan.before.message_id,
+                alias.message_id,
+                alias.remote_id,
+                alias.folder,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1061,10 +1267,21 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<bool> {
+pub(crate) fn message_row_exists(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<bool> {
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2
+             UNION ALL
+             SELECT 1 FROM message_aliases
+             WHERE account_id = ?1 AND message_id = ?2
+               AND canonical_message_id IN (
+                   SELECT message_id FROM messages WHERE account_id = ?1
+               )
+             LIMIT 1",
             params![account_id.as_str(), message_id],
             |row| row.get(0),
         )
@@ -1075,16 +1292,21 @@ fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &st
 fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow) -> Result<()> {
     let mut values = vec![Value::Text(account_id.as_str().to_string())];
     values.extend(saved_values(row));
-    debug_assert_eq!(values.len(), 21);
+    let fingerprint = match row.body_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => crate::message::body_fingerprint(text),
+        _ => String::new(),
+    };
+    values.push(Value::Text(fingerprint));
+    debug_assert_eq!(values.len(), 23);
     conn.execute(
         "INSERT INTO messages (
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment
+            to_line, cc_line, bcc_line, has_attachment, list_id, body_fingerprint
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )",
         params_from_iter(values),
     )?;
@@ -1113,6 +1335,7 @@ fn saved_values(row: &SavedRow) -> Vec<Value> {
         Value::Text(row.cc_line.clone()),
         Value::Text(row.bcc_line.clone()),
         Value::Integer(row.has_attachment),
+        opt_text(&row.list_id),
     ]
 }
 
@@ -1186,6 +1409,7 @@ mod tests {
             has_attachment: false,
             archived: false,
             snooze_until: None,
+            list_id: None,
         }
     }
 
@@ -1761,6 +1985,163 @@ mod tests {
         store.undo(&owner).unwrap();
         assert!(messages(&store, "a1", &thread)[0].labels.is_empty());
         assert_eq!(text(store.undo(&owner)), "nothing to undo");
+    }
+
+    #[test]
+    fn restoring_an_aliased_id_does_not_insert_a_second_row() {
+        let store = open(&[("a1", "c@x")]);
+        let mut echo = sample("a1", "list@x", "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.remote_id = RemoteId("imap:inbox".into());
+        echo.folders = vec!["INBOX".into()];
+        let mut sent = sample("a1", "orig@x", "Hello", "hello body");
+        sent.remote_id = RemoteId("imap:sent".into());
+        sent.folders = vec!["Sent".into()];
+        store.upsert_message(&echo).unwrap();
+        store.upsert_message(&sent).unwrap();
+        assert_eq!(
+            store
+                .thread_messages(
+                    &account("a1"),
+                    &ThreadId::from_message_id(&MessageId::new("list@x"))
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        restore_row(
+            store.connection(),
+            &account("a1"),
+            &Snapshot {
+                removed: true,
+                row: SavedRow {
+                    message_id: "orig@x".into(),
+                    remote_id: "imap:sent".into(),
+                    thread_id: "msgid:orig@x".into(),
+                    proton_conversation_id: None,
+                    in_reply_to: None,
+                    references_header: String::new(),
+                    from_name: None,
+                    from_email: "from@x".into(),
+                    subject: "OLD SENT".into(),
+                    date_unix: 1,
+                    snippet: "old body".into(),
+                    body_text: Some("old body".into()),
+                    unread: 0,
+                    folders: "Sent".into(),
+                    labels: String::new(),
+                    arrived_via: String::new(),
+                    to_line: String::new(),
+                    cc_line: String::new(),
+                    bcc_line: String::new(),
+                    has_attachment: 0,
+                    list_id: None,
+                },
+                after_folders: String::new(),
+                after_labels: String::new(),
+                aliases: Vec::new(),
+            },
+        )
+        .unwrap();
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let kept = messages(
+            &store,
+            "a1",
+            &ThreadId::from_message_id(&MessageId::new("list@x")),
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].headers.subject, "Hello");
+        assert_eq!(kept[0].body_text.as_deref(), Some("hello body"));
+        assert!(kept[0].unread);
+        assert!(kept[0].folders.iter().any(|folder| folder == "INBOX"));
+        assert!(kept[0].folders.iter().any(|folder| folder == "Sent"));
+        let remote: String = store
+            .connection()
+            .query_row(
+                "SELECT remote_id FROM message_aliases
+                 WHERE account_id = 'a1' AND message_id = 'orig@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remote, "imap:sent");
+    }
+
+    #[test]
+    fn replacing_a_row_updates_the_body_fingerprint() {
+        let store = open(&[("a1", "c@x")]);
+        let message = sample("a1", "a@x", "Hello", "first body");
+        store.upsert_message(&message).unwrap();
+        let current = load_one(store.connection(), &account("a1"), "a@x")
+            .unwrap()
+            .unwrap();
+        let mut snapshot = current.clone();
+        snapshot.body_text = Some("second body".into());
+        snapshot.snippet = "second body".into();
+        replace_message_row(store.connection(), &account("a1"), &current, &snapshot).unwrap();
+        let fingerprint: String = store
+            .connection()
+            .query_row(
+                "SELECT body_fingerprint FROM messages WHERE message_id = 'a@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fingerprint, crate::message::body_fingerprint("second body"));
+    }
+
+    #[test]
+    fn undo_of_collapsed_delete_restores_the_alias_and_list_id() {
+        let store = open(&[("a1", "c@x")]);
+        let mut echo = sample("a1", "list@x", "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.remote_id = RemoteId("imap:inbox".into());
+        echo.folders = vec![FOLDER_INBOX.into()];
+        let mut sent = sample("a1", "orig@x", "Hello", "hello body");
+        sent.remote_id = RemoteId("imap:sent".into());
+        sent.folders = vec![FOLDER_SENT.into()];
+        store.upsert_message(&echo).unwrap();
+        let thread = store.upsert_message(&sent).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE messages SET folders = ?1 WHERE message_id = 'list@x'",
+                params![FOLDER_TRASH],
+            )
+            .unwrap();
+        store
+            .delete_thread(&account("a1"), &thread, FOLDER_TRASH)
+            .unwrap();
+        let gone: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(gone, 0);
+        let aliases: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM message_aliases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(aliases, 0);
+        store.undo(&account("a1")).unwrap();
+        let restored = messages(&store, "a1", &thread);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].headers.message_id.as_str(), "list@x");
+        assert_eq!(restored[0].list_id.as_deref(), Some("list.example"));
+        let (remote, folder): (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT remote_id, folder FROM message_aliases
+                 WHERE account_id = 'a1' AND message_id = 'orig@x'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(remote, "imap:sent");
+        assert_eq!(folder, FOLDER_SENT);
     }
 
     fn apply(store: &Store, message: Message) {

@@ -172,6 +172,7 @@ fn message(id: &str, name: &str, email: &str, body: &str, date_unix: i64) -> Mes
         has_attachment: false,
         archived: false,
         snooze_until: None,
+        list_id: None,
     }
 }
 

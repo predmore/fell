@@ -97,6 +97,7 @@ pub(super) fn to_message(
         .cloned()
         .collect();
     let arrived_via = parsed.as_ref().map(arrival_addresses).unwrap_or_default();
+    let list_id = parsed.as_ref().and_then(list_id_header);
     let thread_id = ThreadId::from_message_id(&message_id);
 
     Message {
@@ -136,6 +137,7 @@ pub(super) fn to_message(
             .is_some_and(|message| message.has_attachments()),
         archived: false,
         snooze_until: None,
+        list_id,
     }
 }
 
@@ -205,6 +207,20 @@ fn arrival_addresses(message: &mail_parser::Message<'_>) -> Vec<String> {
     out
 }
 
+fn list_id_header(message: &mail_parser::Message<'_>) -> Option<String> {
+    let address = message
+        .list_id()?
+        .mailboxes()
+        .find_map(|mailbox| mailbox.address())
+        .unwrap_or("")
+        .trim();
+    if address.is_empty() {
+        None
+    } else {
+        Some(address.to_string())
+    }
+}
+
 fn snippet(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut end = collapsed.len().min(160);
@@ -212,4 +228,33 @@ fn snippet(text: &str) -> String {
         end -= 1;
     }
     collapsed[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::AccountId;
+
+    #[test]
+    fn list_id_is_the_angle_addr_and_cjk_subject_parses() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Subject: [list] 会議\r\n\
+                   Message-ID: <a@x>\r\n\
+                   List-ID: Dev list <dev.example>\r\n\
+                   Date: Mon, 16 Nov 2026 12:00:00 +0000\r\n\
+                   \r\n\
+                   hello\r\n";
+        let message = to_message(
+            &AccountId("a1".into()),
+            "INBOX",
+            "INBOX",
+            1,
+            1,
+            &[],
+            raw.as_bytes(),
+        );
+        assert_eq!(message.list_id.as_deref(), Some("dev.example"));
+        assert_eq!(message.headers.subject, "[list] 会議");
+        assert_eq!(message.body_text.as_deref().map(str::trim), Some("hello"));
+    }
 }

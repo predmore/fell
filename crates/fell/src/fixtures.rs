@@ -353,6 +353,7 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
         has_attachment: row.attachment,
         archived: false,
         snooze_until: None,
+        list_id: None,
     }
 }
 

@@ -73,6 +73,8 @@ pub struct Message {
     pub archived: bool,
     /// Unix seconds until which this message stays snoozed. `None` is not snoozed.
     pub snooze_until: Option<i64>,
+    /// Set when a mailing list rewrote this copy (`List-Id`).
+    pub list_id: Option<String>,
 }
 
 pub(crate) fn encode_addresses(addrs: &[Address]) -> String {
@@ -116,6 +118,49 @@ pub(crate) fn normalize_message_id(raw: &str) -> &str {
     raw.trim().trim_start_matches('<').trim_end_matches('>')
 }
 
+/// Exact identity of a body. Two copies match only when this string is equal.
+///
+/// Whitespace runs collapse so a list that reflows the same text still matches.
+/// Empty text has no fingerprint and never collapses. Subject is not an input.
+pub(crate) fn body_fingerprint(body: &str) -> String {
+    let normalized = normalize_body(body);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let bytes = normalized.as_bytes();
+    let hi = fnv1a64(bytes, 0xcbf29ce484222325);
+    let lo = fnv1a64(bytes, 0x8422_2325_cbf2_9ce4);
+    format!("{hi:016x}{lo:016x}")
+}
+
+fn normalize_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut pending_space = false;
+    for ch in body.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn fnv1a64(bytes: &[u8], offset: u64) -> u64 {
+    let mut hash = offset;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +169,16 @@ mod tests {
     fn strips_angle_brackets() {
         assert_eq!(MessageId::new("<a@b>").as_str(), "a@b");
         assert_eq!(MessageId::new(" a@b ").as_str(), "a@b");
+    }
+
+    #[test]
+    fn fingerprint_is_exact_after_whitespace_and_empty_has_none() {
+        assert_eq!(
+            body_fingerprint("hello   body\n"),
+            body_fingerprint("hello body")
+        );
+        assert!(body_fingerprint("  \n").is_empty());
+        assert_ne!(body_fingerprint("hello"), body_fingerprint("hello!"));
+        assert_eq!(body_fingerprint("会議"), body_fingerprint("会議"));
     }
 }
