@@ -168,7 +168,7 @@ pub fn document_column(
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
-    let mut column = div().flex().flex_col().line_height(px(22.));
+    let mut column = div().flex().flex_col().gap(px(24.)).line_height(px(22.));
     if document.is_empty() {
         return column.child(
             div()
@@ -176,39 +176,10 @@ pub fn document_column(
                 .child("This message has no body."),
         );
     }
-    let last = document.blocks.len().saturating_sub(1);
-    for (index, block) in document.blocks.iter().enumerate() {
-        let next = document.blocks.get(index + 1);
-        // A blocked photo sits under the drawing. The column gap made that
-        // caption float away from the sketch.
-        let gap = if index == last {
-            0.
-        } else if is_figure(block) && next.is_some_and(is_figure) {
-            10.
-        } else {
-            24.
-        };
-        column = column.child(div().mb(px(gap)).child(render_block(
-            block,
-            palette,
-            allow_remote,
-            gallery,
-        )));
+    for block in &document.blocks {
+        column = column.child(render_block(block, palette, allow_remote, gallery));
     }
     column
-}
-
-fn is_figure(block: &Block) -> bool {
-    match block {
-        Block::Image { .. } => true,
-        Block::Paragraph { inlines } => {
-            !inlines.is_empty()
-                && inlines
-                    .iter()
-                    .all(|inline| matches!(inline, Inline::Image { .. }))
-        }
-        _ => false,
-    }
 }
 
 fn render_block(
@@ -294,11 +265,10 @@ fn list_item(
     div()
         .flex()
         .items_center()
-        .gap_2()
         .child(
             div()
+                .w(px(19.))
                 .flex_shrink_0()
-                .text_lg()
                 .text_color(paint(palette.foreground))
                 .child(marker),
         )

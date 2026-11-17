@@ -323,7 +323,7 @@ impl Render for Reader {
             .flex_col()
             .bg(paint(palette.background))
             .text_color(paint(palette.foreground))
-            .font_family("Liberation Sans")
+            .font_family("Inter")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let mods = &event.keystroke.modifiers;
                 if mods.control || mods.alt || mods.platform || mods.shift {
@@ -369,6 +369,7 @@ impl Render for Reader {
                                         div()
                                             .text_sm()
                                             .text_color(paint(palette.dimmed))
+                                            .mt(px(-2.))
                                             .child(self.date_line.clone()),
                                     ),
                             )
@@ -423,7 +424,7 @@ impl Render for Reader {
                             .border(px(1.))
                             .border_color(paint(palette.accent))
                             .text_color(paint(palette.accent))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .child(action),
                     ),
             )
