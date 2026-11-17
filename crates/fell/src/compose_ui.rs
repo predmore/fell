@@ -105,6 +105,28 @@ struct Editor {
 }
 
 impl Editor {
+    /// After the text under the editor changed, put the cursor back on the
+    /// line it was on: the same row if that row still holds `line`, else the
+    /// one row that does. False when there is no such single row.
+    fn follow_line(&mut self, line: &str) -> bool {
+        if self.lines.get(self.row).is_some_and(|row| row == line) {
+            return true;
+        }
+        let mut matches = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.as_str() == line);
+        match (matches.next(), matches.next()) {
+            (Some((row, _)), None) => {
+                self.row = row;
+                self.clamp();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn from_body(body: &str) -> Self {
         let source = body.strip_suffix('\n').unwrap_or(body);
         let lines: Vec<String> = if source.is_empty() {
@@ -596,17 +618,28 @@ impl ComposeView {
 
     /// An agent edit can land between frames. Rebase the editor on it before
     /// a key changes the buffer, or the stale text would overwrite it.
-    fn pull_if_stale(&mut self) {
+    /// Returns false when the cursor's line is gone from the new text, so
+    /// the key must not be applied anywhere.
+    fn pull_if_stale(&mut self) -> bool {
         let id = self.draft_id.to_string();
         let revision = self.hub.with_session(&id, |session| session.revision());
-        if revision.is_some_and(|revision| revision != self.applied_revision) {
-            self.pull_unpainted();
+        if !revision.is_some_and(|revision| revision != self.applied_revision) {
+            return true;
+        }
+        let before = self.editor.lines.get(self.editor.row).cloned();
+        self.pull_unpainted();
+        match before {
+            Some(line) => self.editor.follow_line(&line),
+            None => true,
         }
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        self.pull_if_stale();
+        if self.field == Field::Body && !self.pull_if_stale() {
+            self.status = "the draft changed under the cursor; the key was not applied".into();
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
@@ -2411,7 +2444,7 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_line_covered;
+    use super::{Editor, cursor_line_covered};
     use fell_core::compose::markdown_to_doc;
 
     fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -2782,5 +2815,25 @@ mod tests {
             super::open_demo(temp_root("demo-quote"), super::ThemeKind::Dark).expect("demo draft");
         let demo = hub.with_session(&id, |session| session.snapshot()).unwrap();
         assert_eq!(super::stored_quote(&demo), Some(super::demo_quote()));
+    }
+
+    #[test]
+    fn the_cursor_follows_its_line_when_lines_appear_above() {
+        let mut editor = Editor::from_body("one\ntwo\nthree\n");
+        editor.row = 1;
+        editor.col = 2;
+        let line = editor.lines[editor.row].clone();
+        let mut moved = Editor::from_body("agent\nadded\none\ntwo\nthree\n");
+        moved.row = editor.row;
+        moved.col = editor.col;
+        assert!(moved.follow_line(&line));
+        assert_eq!(moved.lines[moved.row], "two");
+        // The line is gone, or now appears twice: do not guess.
+        let mut gone = Editor::from_body("one\nthree\n");
+        gone.row = 1;
+        assert!(!gone.follow_line("two"));
+        let mut twice = Editor::from_body("two\nx\ntwo\n");
+        twice.row = 1;
+        assert!(!twice.follow_line("two"));
     }
 }
