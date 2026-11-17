@@ -7,6 +7,8 @@
 
 mod body;
 mod native;
+#[cfg(target_os = "linux")]
+mod proxy;
 mod theme;
 #[cfg(target_os = "linux")]
 mod webview;

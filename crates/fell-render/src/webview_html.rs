@@ -507,11 +507,15 @@ fn resolve_host(host: &str) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
-fn ip_is_blocked(ip: IpAddr) -> bool {
+pub fn address_is_blocked(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ipv4_is_blocked(ip),
         IpAddr::V6(ip) => ipv6_is_blocked(ip),
     }
+}
+
+fn ip_is_blocked(ip: IpAddr) -> bool {
+    address_is_blocked(ip)
 }
 
 fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
@@ -519,21 +523,37 @@ fn ipv4_is_blocked(ip: Ipv4Addr) -> bool {
     first == 0
         || first == 10
         || first == 127
+        || (first == 100 && (64..=127).contains(&second))
         || (first == 169 && second == 254)
         || (first == 172 && (16..=31).contains(&second))
         || (first == 192 && second == 168)
 }
 
 fn ipv6_is_blocked(ip: Ipv6Addr) -> bool {
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return ipv4_is_blocked(mapped);
-    }
     if ip.is_unspecified() || ip.is_loopback() {
         return true;
     }
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return ipv4_is_blocked(mapped);
+    }
+    // IPv4-compatible ::a.b.c.d. The mapped form was handled above.
+    if ip.to_ipv4().is_some() {
+        return true;
+    }
+    let segments = ip.segments();
     let [first, second, ..] = ip.octets();
     // fe80::/10 link-local, fc00::/7 unique-local.
-    (first == 0xfe && (second & 0xc0) == 0x80) || (first & 0xfe) == 0xfc
+    if (first == 0xfe && (second & 0xc0) == 0x80) || (first & 0xfe) == 0xfc {
+        return true;
+    }
+    // NAT64 64:ff9b::/96 and 6to4 2002::/16.
+    (segments[0] == 0x64
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0)
+        || segments[0] == 0x2002
 }
 
 /// `true` when the URL names a loopback, private, or link-local host.
@@ -912,6 +932,27 @@ mod tests {
                 "{css} -> {request}"
             );
         }
+    }
+
+    #[test]
+    fn cgnat_and_transition_addresses_are_blocked() {
+        for uri in [
+            "http://100.64.0.1/",
+            "http://100.127.255.1/",
+            "http://[::192.0.2.1]/",
+            "http://[64:ff9b::192.0.2.1]/",
+            "http://[2002:c000:201::]/",
+            "http://[::ffff:10.1.2.3]/",
+        ] {
+            assert!(super::request_is_blocked_with(uri, |_| Vec::new()), "{uri}");
+        }
+        assert!(!super::request_is_blocked_with(
+            "http://100.63.0.1/",
+            |_| Vec::new()
+        ));
+        assert!(!super::request_is_blocked_with("http://1.1.1.1/", |_| {
+            Vec::new()
+        }));
     }
 
     #[test]

@@ -235,7 +235,7 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
     window.show_all();
     let (red, green, blue) = request.background;
     let webview = wry::WebViewBuilder::new()
-        .with_html(&request.html)
+        .with_html("<!DOCTYPE html><html><body></body></html>")
         .with_javascript_disabled()
         .with_autoplay(false)
         .with_clipboard(false)
@@ -244,6 +244,7 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
         .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
         .build_gtk(&vbox)?;
     tighten(&webview, request.allow_images);
+    install_proxy(&webview.webview())?;
     watch_loads(&webview.webview());
     Ok(Host {
         window,
@@ -257,8 +258,28 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
     })
 }
 
+fn install_proxy(widget: &webkit2gtk::WebView) -> wry::Result<()> {
+    use gtk::glib::translate::{IntoGlib, ToGlibPtr, ToGlibPtrMut};
+    use webkit2gtk::{NetworkProxyMode, WebViewExt};
+    let port = super::proxy::port();
+    let uri = format!("http://127.0.0.1:{port}");
+    let mut settings = webkit2gtk::NetworkProxySettings::new(Some(&uri), &[]);
+    let Some(context) = widget.context() else {
+        return Err(wry::Error::InitScriptError);
+    };
+    // WebContextExtManual is not re-exported by webkit2gtk 2.0.2.
+    unsafe {
+        webkit2gtk::ffi::webkit_web_context_set_network_proxy_settings(
+            context.to_glib_none().0,
+            NetworkProxyMode::Custom.into_glib(),
+            settings.to_glib_none_mut().0,
+        );
+    }
+    Ok(())
+}
+
 fn watch_loads(widget: &webkit2gtk::WebView) {
-    use webkit2gtk::{LoadEvent, URIRequestExt, WebResourceExt, WebViewExt};
+    use webkit2gtk::{LoadEvent, WebViewExt};
     widget.connect_load_changed(|_, event| {
         if event == LoadEvent::Finished {
             apply_progress(LoadProgress::document_finished);
@@ -274,18 +295,7 @@ fn watch_loads(widget: &webkit2gtk::WebView) {
         apply_progress(LoadProgress::timed_out);
     });
     widget.connect_decide_policy(|_, decision, kind| deny_blocked_request(decision, kind));
-    widget.connect_resource_load_started(|_, resource, request| {
-        refuse_blocked_uri(request);
-        resource.connect_sent_request(|_, request, response| {
-            refuse_blocked_uri(request);
-            if let Some(uri) = webkit2gtk::URIResponseExt::uri(response)
-                && fell_render::request_is_blocked(uri.as_str())
-            {
-                request.set_uri("about:blank");
-            }
-        });
-        track_resource(resource);
-    });
+    widget.connect_resource_load_started(|_, resource, _| track_resource(resource));
 }
 
 fn deny_blocked_request(
@@ -321,17 +331,6 @@ fn deny_blocked_request(
         return true;
     }
     false
-}
-
-fn refuse_blocked_uri(request: &webkit2gtk::URIRequest) {
-    use webkit2gtk::URIRequestExt;
-    if request
-        .uri()
-        .as_deref()
-        .is_some_and(fell_render::request_is_blocked)
-    {
-        request.set_uri("about:blank");
-    }
 }
 
 fn track_resource(resource: &webkit2gtk::WebResource) {
@@ -889,5 +888,104 @@ mod frame_tests {
         {
             *slot = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod fetch_proof {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use gtk::prelude::*;
+    use wry::WebViewExtUnix;
+
+    use super::{WebRequest, open_host};
+
+    /// Remote images are allowed. The mail names 127.0.0.1 from an img, a
+    /// comment-wrapped CSS url(), an @import, and a font, and it also names a
+    /// public-looking host that redirects there. Neither server is allowed to
+    /// see the private target.
+    #[test]
+    fn private_targets_receive_no_requests() {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("skip private_targets_receive_no_requests: no DISPLAY");
+            return;
+        }
+        let _ = std::process::Command::new("sudo")
+            .args(["/usr/bin/ip", "addr", "add", "192.0.2.1/32", "dev", "lo"])
+            .status();
+        let private_hits = Arc::new(AtomicUsize::new(0));
+        let private_port = serve_private(Arc::clone(&private_hits));
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let redirect_port = serve_redirect(private_port, Arc::clone(&redirect_hits));
+        let html = format!(
+            r#"<!DOCTYPE html><html><head><style>
+@import url("http://127.0.0.1:{private_port}/import.css");
+@font-face {{ font-family: Probe; src: url("http://127.0.0.1:{private_port}/font.woff"); }}
+body {{ background-image: url(/*x*/"http://127.0.0.1:{private_port}/bg.png"); }}
+</style></head><body>
+<img src="http://127.0.0.1:{private_port}/img.png">
+<img src="http://192.0.2.1:{redirect_port}/go">
+</body></html>"#
+        );
+        gtk::init().expect("gtk");
+        let host = open_host(&WebRequest {
+            html: html.clone(),
+            token: 1,
+            background: (255, 255, 255),
+            allow_images: true,
+        })
+        .expect("webview");
+        host.window.show_all();
+        let widget = host.webview.webview();
+        webkit2gtk::WebViewExt::load_html(&widget, &html, None);
+        super::tighten_widget(&widget, true);
+        let _timer = gtk::glib::timeout_add_local(Duration::from_secs(4), || {
+            gtk::main_quit();
+            gtk::glib::ControlFlow::Break
+        });
+        gtk::main();
+        let private = private_hits.load(Ordering::SeqCst);
+        let redirect = redirect_hits.load(Ordering::SeqCst);
+        eprintln!("proof private_hits={private} redirect_hits={redirect}");
+        assert_eq!(private, 0, "127.0.0.1 received a request");
+        assert!(
+            redirect > 0,
+            "the public-looking redirect host was never asked"
+        );
+    }
+
+    fn serve_private(hits: Arc<AtomicUsize>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut conn = conn;
+                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        port
+    }
+
+    fn serve_redirect(private_port: u16, hits: Arc<AtomicUsize>) -> u16 {
+        let listener = TcpListener::bind("192.0.2.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{private_port}/from-redirect\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = conn.write_all(body.as_bytes());
+            }
+        });
+        port
     }
 }
