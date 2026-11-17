@@ -384,7 +384,10 @@ impl Store {
         // The fingerprint merge invalidates body vectors, so the table has to
         // exist before that backfill runs.
         crate::embed::ensure_embedding_schema(&conn)?;
-        // Threading tables first: the version 3 upgrade re-resolves threads.
+        // Summaries first: every write transaction refreshes them on commit,
+        // including the one that installs the threading triggers. Then the
+        // threading tables, which the version 3 upgrade below already reads.
+        summaries::ensure_thread_summaries(&conn)?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -401,10 +404,8 @@ impl Store {
                 [],
             )?;
         }
-        // Reply-to index and write queues for incremental threading. The
-        // first open fills the index and re-resolves every account once.
-        // Per-thread rows for folder lists. The first open fills them.
-        summaries::ensure_thread_summaries(&conn)?;
+        // Reply-to and subject indexes for incremental threading. The first
+        // open fills them and re-resolves every account once.
         threads::ensure_thread_index(&conn)?;
         // 3 adds message_embeddings, the local body-vector index.
         conn.execute(
