@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::AccountId;
 
 use super::frontmatter::{
-    DraftFields, DraftIssue, email_of, parse_address_line, parse_draft, valid_address, write_draft,
+    DraftFields, DraftIssue, email_of, parse_address_line, parse_draft, write_draft,
 };
 use super::merge::{self, HunkKind};
 use super::mime::{self, Outgoing, ResolvedFile};
@@ -102,6 +102,7 @@ pub struct DraftSession {
     open: bool,
     focused: bool,
     known: HashSet<String>,
+    identities: HashSet<String>,
     agent_seen: HashMap<String, String>,
     quoted: Option<String>,
 }
@@ -138,10 +139,17 @@ impl DraftSession {
             open: false,
             focused: false,
             known: HashSet::new(),
+            identities: HashSet::new(),
             agent_seen: HashMap::new(),
             quoted: None,
         };
         let _ = std::fs::write(session.folder.join("account"), session.account_id.as_str());
+        if let Some(locked) = read_reply_lock(&session.folder) {
+            session.locked_reply = locked.clone();
+            session.fields.in_reply_to = locked;
+        }
+        session.identities = read_identities(&session.folder);
+        session.load_hunks();
         session.flush()?;
         Ok(session)
     }
@@ -410,6 +418,7 @@ impl DraftSession {
         let text = self.serialize();
         workspace::write_draft_file(&self.folder, &text)?;
         self.last_written = text;
+        self.save_hunks();
         Ok(())
     }
 
@@ -500,7 +509,11 @@ impl DraftSession {
         if self.fields.to.is_empty() {
             return Some("add at least one recipient".into());
         }
-        if !valid_address(&self.fields.from) {
+        let from_email = email_of(&self.fields.from);
+        if from_email
+            .as_ref()
+            .is_none_or(|email| !self.identities.contains(email))
+        {
             return Some("from is not one of your addresses".into());
         }
         let closure = workspace::resolve_closure(&self.folder, &self.fields, &self.body);
@@ -613,6 +626,92 @@ impl DraftSession {
 
     fn bump(&mut self) {
         self.revision = self.revision.saturating_add(1);
+    }
+}
+
+fn read_identities(folder: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(folder.join("identities")) else {
+        return HashSet::new();
+    };
+    text.lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn read_reply_lock(folder: &Path) -> Option<Option<String>> {
+    let text = std::fs::read_to_string(folder.join("reply.lock")).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(text.to_string()))
+    }
+}
+
+impl DraftSession {
+    fn load_hunks(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.folder.join("hunks.json")) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Some(items) = value.as_array() else {
+            return;
+        };
+        self.hunks.clear();
+        for item in items {
+            let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let kind = match item.get("kind").and_then(serde_json::Value::as_str) {
+                Some("recipients") => HunkKind::Recipients,
+                Some("subject") => HunkKind::Subject,
+                Some("attachments") => HunkKind::Attachments,
+                _ => HunkKind::Body,
+            };
+            self.hunks.push(Hunk {
+                id,
+                kind,
+                previous: item
+                    .get("previous")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                inserted: item
+                    .get("inserted")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+        self.next_hunk = self.hunks.iter().map(|hunk| hunk.id).max().unwrap_or(0) + 1;
+    }
+
+    fn save_hunks(&self) {
+        let items: Vec<serde_json::Value> = self
+            .hunks
+            .iter()
+            .map(|hunk| {
+                let kind = match hunk.kind {
+                    HunkKind::Body => "body",
+                    HunkKind::Recipients => "recipients",
+                    HunkKind::Subject => "subject",
+                    HunkKind::Attachments => "attachments",
+                };
+                serde_json::json!({
+                    "id": hunk.id,
+                    "kind": kind,
+                    "previous": hunk.previous,
+                    "inserted": hunk.inserted,
+                })
+            })
+            .collect();
+        let _ = std::fs::write(
+            self.folder.join("hunks.json"),
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
+        );
     }
 }
 
@@ -847,6 +946,47 @@ mod tests {
         assert!(mime.contains("chart.png"));
         assert!(!mime.contains("secret.txt"));
         assert!(!mime.contains("nope"));
+        let _ = root;
+    }
+
+    #[test]
+    fn from_outside_the_account_blocks_send() {
+        let (_root, mut session) = temp_session("body\n");
+        session
+            .edit(session.revision(), "jon@example.com", "evil@example.com")
+            .unwrap();
+        session.mark_seen();
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("from"), "{err}");
+    }
+
+    #[test]
+    fn offline_edit_keeps_the_reply_lock_and_records_a_hunk() {
+        let (root, session) = temp_session("body\n");
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        let mut again = DraftSession::open_folder(&folder, AccountId("local".into())).unwrap();
+        again
+            .edit(
+                again.revision(),
+                "in_reply_to: \"<abc@example.com>\"",
+                "in_reply_to: \"<evil@example.com>\"",
+            )
+            .unwrap();
+        again
+            .edit(again.revision(), "ada@example.com", "new@example.com")
+            .unwrap();
+        again.flush().unwrap();
+        let text = fs::read_to_string(folder.join("draft.md")).unwrap();
+        assert!(text.contains("<abc@example.com>"), "{text}");
+        assert!(!text.contains("<evil@example.com>"), "{text}");
+        let reopened = DraftSession::open_folder(&folder, AccountId("local".into())).unwrap();
+        assert_eq!(
+            reopened.fields().in_reply_to.as_deref(),
+            Some("<abc@example.com>")
+        );
+        assert!(reopened.snapshot().unreviewed >= 1);
+        assert!(text.contains("new@example.com"), "{text}");
         let _ = root;
     }
 

@@ -817,12 +817,19 @@ fn image_html(alt: &str, src: &str) -> String {
             escape(alt)
         );
     }
-    let cid = src.trim_start_matches("./");
+    let cid = content_id(src);
     format!(
         "<img src=\"cid:{cid}\" alt=\"{alt}\" style=\"max-width:100%\">",
-        cid = escape(cid),
+        cid = escape(&cid),
         alt = escape(alt)
     )
+}
+
+pub(crate) fn content_id(src: &str) -> String {
+    src.trim_start_matches("./")
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n' | '<' | '>'))
+        .collect()
 }
 
 fn is_remote_url(src: &str) -> bool {

@@ -147,7 +147,7 @@ fn alternative_part(boundary: &str, plain: &str, html: &str) -> String {
 }
 
 fn inline_part(file: &ResolvedFile) -> String {
-    let cid = file.path.trim_start_matches("./");
+    let cid = super::markdown::content_id(&file.path);
     format!(
         "Content-Type: {mime}\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <{cid}>\r\nContent-Disposition: inline; filename=\"{name}\"\r\n\r\n{data}\r\n",
         mime = mime_type(&file.path),
@@ -296,6 +296,18 @@ mod tests {
         let mime = String::from_utf8(outgoing.mime).unwrap();
         assert!(mime.contains("multipart/related"));
         assert!(mime.contains("Content-ID: <chart.png>"));
+        let injected = sample(
+            "![x](a.png)\n",
+            vec![ResolvedFile {
+                path: "a.png\r\nBcc: evil@example.com".into(),
+                display_name: "a.png".into(),
+                bytes: b"png".to_vec(),
+                inline: true,
+            }],
+        );
+        let injected_mime = String::from_utf8(injected.mime).unwrap();
+        assert!(!injected_mime.contains("\r\nBcc: evil@example.com"));
+        assert!(injected_mime.contains("Content-ID: <a.pngBcc: evil@example.com>"));
         assert!(!outgoing.html.contains("evil.example"));
         assert!(outgoing.html.contains("cid:chart.png"));
         assert!(outgoing.plain.contains("![chart](chart.png)"));

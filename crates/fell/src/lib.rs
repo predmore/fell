@@ -74,7 +74,8 @@ mod tests {
         let (hub, id, _) = open_demo(root, ThemeKind::Dark).unwrap();
         hub.with_session(&id, |session| {
             assert!(!session.request_send());
-            let sent = send_from_editor(session, &FixtureBackend::default()).unwrap();
+            let backend = fell_core::backend_for(session.account_id());
+            let sent = send_from_editor(session, backend.as_ref()).unwrap();
             assert_eq!(sent.remote_id.0, "fixture-sent");
         })
         .unwrap();

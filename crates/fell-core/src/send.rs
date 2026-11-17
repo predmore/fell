@@ -30,11 +30,22 @@ pub struct Draft {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PendingSendId(pub String);
 
+/// One file the editor resolved from `draft.md` and included in the MIME body.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubmittedFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub inline: bool,
+}
+
 /// Draft accepted by a backend, waiting on UI confirmation before SMTP/API send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSend {
     pub id: PendingSendId,
     pub draft: Draft,
+    /// Full MIME message, including the HTML alternative and inline images.
+    pub mime: Vec<u8>,
+    pub files: Vec<SubmittedFile>,
 }
 
 impl PendingSend {
@@ -43,7 +54,15 @@ impl PendingSend {
         Self {
             id: PendingSendId(format!("{kind}-{n}")),
             draft,
+            mime: Vec::new(),
+            files: Vec::new(),
         }
+    }
+
+    pub fn with_message(mut self, mime: Vec<u8>, files: Vec<SubmittedFile>) -> Self {
+        self.mime = mime;
+        self.files = files;
+        self
     }
 }
 
@@ -166,6 +185,8 @@ mod tests {
         let other = mint(&PendingSend {
             id: PendingSendId("nope".into()),
             draft: draft("body"),
+            mime: Vec::new(),
+            files: Vec::new(),
         });
         let err = backend.confirm_send(pending, other).unwrap_err();
         assert!(matches!(err, crate::Error::SendUnconfirmed));

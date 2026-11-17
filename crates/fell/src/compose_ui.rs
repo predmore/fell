@@ -9,7 +9,7 @@ use fell_core::compose::{
     BlockBody, DraftHub, HunkKind, Snapshot, StyleKind, StyledDoc, html_to_doc, line_styles,
     markdown_to_doc,
 };
-use fell_core::{AccountId, FixtureBackend, MailBackend};
+use fell_core::{AccountId, MailBackend};
 use gpui::{
     Context, FocusHandle, FontWeight, KeyDownEvent, ObjectFit, SharedString,
     StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb,
@@ -339,7 +339,7 @@ impl ComposeView {
         }
     }
 
-    fn push_field(&mut self, field: Field) {
+    fn commit_field(&mut self, field: Field) -> bool {
         let id = self.draft_id.to_string();
         let result = self.hub.with_session(&id, |session| match field {
             Field::To => session.set_addresses_from_user("to", &self.to_line),
@@ -351,25 +351,41 @@ impl ComposeView {
             }
             Field::Body => Ok(()),
         });
-        if let Some(Ok(())) = result {
-            if let Some(revision) = self.hub.with_session(&id, |session| {
-                let _ = session.flush();
-                session.revision()
-            }) {
-                self.applied_revision = revision;
+        match result {
+            Some(Ok(())) => {
+                if let Some(revision) = self.hub.with_session(&id, |session| {
+                    let _ = session.flush();
+                    session.revision()
+                }) {
+                    self.applied_revision = revision;
+                }
+                self.status = "draft".into();
+                true
             }
-            self.status = "draft".into();
-        } else if let Some(Err(err)) = result {
-            self.status = err.into();
+            Some(Err(err)) => {
+                self.status = err.into();
+                false
+            }
+            None => false,
         }
     }
 
     fn send(&mut self) {
+        if self.field != Field::Body && !self.commit_field(self.field) {
+            return;
+        }
         let id = self.draft_id.to_string();
+        let account = self
+            .hub
+            .with_session(&id, |session| session.account_id().clone());
+        let Some(account) = account else {
+            self.status = "draft is not open".into();
+            return;
+        };
+        let backend = fell_core::backend_for(&account);
         let outcome = self.hub.with_session(&id, |session| {
             session.mark_seen();
-            let backend = FixtureBackend::default();
-            send_from_editor(session, &backend)
+            send_from_editor(session, backend.as_ref())
         });
         match outcome {
             Some(Ok(_)) => {
@@ -425,6 +441,12 @@ impl ComposeView {
             return;
         }
         if key == "escape" {
+            if self.field != Field::Body {
+                let field = self.field;
+                if !self.commit_field(field) {
+                    self.sync_from_hub();
+                }
+            }
             self.editor.mode = Mode::Normal;
             self.editor.anchor = None;
             self.field = Field::Body;
@@ -578,15 +600,16 @@ impl ComposeView {
             }
             "tab" | "enter" => {
                 let field = self.field;
-                self.push_field(field);
-                self.field = match self.field {
-                    Field::To => Field::Cc,
-                    Field::Cc => Field::Bcc,
-                    Field::Bcc => Field::Subject,
-                    _ => Field::Body,
-                };
+                if self.commit_field(field) {
+                    self.field = match self.field {
+                        Field::To => Field::Cc,
+                        Field::Cc => Field::Bcc,
+                        Field::Bcc => Field::Subject,
+                        _ => Field::Body,
+                    };
+                }
             }
-            "j" | "k" if typed.is_none() || key == "j" => {}
+            "j" | "k" if typed.is_none() => {}
             _ => {
                 if let Some(ch) = typed {
                     line.push_str(ch);
@@ -990,12 +1013,21 @@ impl ComposeView {
 
 pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
-    backend: &impl MailBackend,
+    backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, String> {
     session.mark_seen();
     let outgoing = session.prepare_send()?;
+    let files = session
+        .resolved_files()
+        .into_iter()
+        .map(|file| fell_core::SubmittedFile {
+            name: file.display_name,
+            bytes: file.bytes,
+            inline: file.inline,
+        })
+        .collect();
     let pending = backend
-        .submit_draft(outgoing.draft)
+        .submit_composed(outgoing.draft, outgoing.mime, files)
         .map_err(|err| err.to_string())?;
     let confirm = confirmation_from_ui(&pending);
     backend
@@ -1473,9 +1505,9 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
 }
 
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
-    let path = folder.join(src);
+    let path = fell_core::compose::image_file(folder, src);
     let mut block = div().flex().flex_col().items_start().gap_1();
-    if path.is_file() {
+    if let Some(path) = path {
         block = block.child(
             img(path)
                 .w(px(240.))

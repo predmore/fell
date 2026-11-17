@@ -113,6 +113,15 @@ pub fn materialize_in(
         &folder.join("draft.md"),
         write_draft(fields, body).as_bytes(),
     )?;
+    if !folder.join("identities").exists()
+        && let Some(email) = super::frontmatter::email_of(&fields.from)
+    {
+        atomic_write(&folder.join("identities"), email.as_bytes())?;
+    }
+    if !folder.join("reply.lock").exists() {
+        let reply = fields.in_reply_to.clone().unwrap_or_default();
+        atomic_write(&folder.join("reply.lock"), format!("{reply}\n").as_bytes())?;
+    }
     if folder.join("thread").exists() {
         return Err("draft folder must not contain a thread copy".into());
     }
@@ -265,6 +274,11 @@ fn push_file(
             blocks_send: true,
         }),
     }
+}
+
+pub fn image_file(folder: &Path, src: &str) -> Option<PathBuf> {
+    let path = resolve_inside(folder, src).ok()?;
+    path.is_file().then_some(path)
 }
 
 pub fn resolve_inside(folder: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -446,6 +460,7 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("fell-outside-{}", std::process::id()));
         fs::write(&outside, b"secret").unwrap();
         symlink(&outside, folder.join("leak")).unwrap();
+        assert!(image_file(&folder, "../secret").is_none());
         let err = resolve_inside(&folder, "../secret").unwrap_err();
         assert!(err.contains("draft folder"));
         let err = resolve_inside(&folder, "leak").unwrap_err();

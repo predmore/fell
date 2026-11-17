@@ -331,40 +331,33 @@ pub fn file_fallback_get(draft_id: &str) -> Result<Value, String> {
 
 pub fn file_fallback_edit(draft_id: &str, old: &str, new: &str) -> Result<Value, String> {
     let folder = workspace::draft_folder(draft_id)?;
-    let text = workspace::read_draft_file(&folder)?;
-    let at = super::merge::find_unique(&text, old)?;
-    let mut next = text.clone();
-    next.replace_range(at..at + old.len(), new);
-    if super::frontmatter::parse_draft(&next).is_err() {
-        return Err("edit would make draft.md unreadable; the file was left unchanged".into());
-    }
-    workspace::write_draft_file(&folder, &next)?;
+    let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
+    session.edit(session.revision(), old, new)?;
+    session.flush()?;
+    let snap = session.snapshot();
     Ok(json!({
         "ok": true,
         "transmitted": false,
         "draft_id": draft_id,
-        "draft_md": next,
+        "draft_md": snap.text,
+        "in_reply_to": snap.in_reply_to,
+        "unreviewed": snap.unreviewed,
     }))
 }
 
 pub fn file_fallback_replace_body(draft_id: &str, body: &str) -> Result<Value, String> {
     let folder = workspace::draft_folder(draft_id)?;
-    let text = workspace::read_draft_file(&folder)?;
-    let mut parsed = super::frontmatter::parse_draft(&text).map_err(|err| err.message)?;
-    let previous = parsed.body.clone();
-    parsed.body = if body.ends_with('\n') || body.is_empty() {
-        body.to_string()
-    } else {
-        format!("{body}\n")
-    };
-    let next = super::frontmatter::write_draft(&parsed.fields, &parsed.body);
-    workspace::write_draft_file(&folder, &next)?;
+    let mut session = DraftSession::open_folder(&folder, crate::AccountId("local".into()))?;
+    let previous = session.body().to_string();
+    session.replace_body(body)?;
+    session.flush()?;
     Ok(json!({
         "ok": true,
         "transmitted": false,
         "draft_id": draft_id,
-        "draft_md": next,
+        "draft_md": session.serialize(),
         "previous_body": previous,
+        "in_reply_to": session.fields().in_reply_to,
     }))
 }
 

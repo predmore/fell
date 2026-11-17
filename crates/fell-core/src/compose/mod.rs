@@ -28,5 +28,6 @@ pub use mime::{Outgoing, ResolvedFile};
 pub use persist::StoredCompose;
 pub use session::{AddressView, AttachmentView, DraftSession, HunkView, Snapshot};
 pub use workspace::{
-    draft_folder, draft_root, draft_socket_path, materialize_in, materialize_workspace,
+    draft_folder, draft_root, draft_socket_path, image_file, materialize_in, materialize_workspace,
+    resolve_inside,
 };

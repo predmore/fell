@@ -289,7 +289,11 @@ fn split_frontmatter(text: &str) -> Option<(String, String, usize)> {
         if stripped[..line_end].trim() != "---" {
             return None;
         }
-        stripped[line_end + 1..].to_string()
+        if line_end >= stripped.len() {
+            String::new()
+        } else {
+            stripped[line_end + 1..].to_string()
+        }
     } else if after_yaml.trim() == "---" {
         String::new()
     } else {
@@ -562,6 +566,14 @@ mod tests {
                 .any(|issue| issue.message.contains("not-an-email"))
         );
         assert_eq!(parsed.body, "Body\n");
+    }
+
+    #[test]
+    fn closing_delimiter_without_a_newline_is_an_empty_body() {
+        let text = "---\nfrom: a@b.com\nto: []\ncc: []\nbcc: []\nsubject: \"hi\"\nin_reply_to: \"\"\nattachments: []\n---";
+        let parsed = parse_draft(text).unwrap();
+        assert_eq!(parsed.body, "");
+        assert_eq!(parsed.fields.subject, "hi");
     }
 
     #[test]
