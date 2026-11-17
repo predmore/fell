@@ -26,7 +26,7 @@ pub struct ThreadRow {
     pub message_count: usize,
     pub starred: bool,
     pub has_attachment: bool,
-    pub date: String,
+    pub date_unix: i64,
     pub subject: String,
     pub snippet: String,
     pub labels: Vec<String>,
@@ -38,7 +38,7 @@ pub struct ConvMessage {
     pub sender: String,
     pub email: String,
     pub folders: String,
-    pub date: String,
+    pub date_unix: i64,
     pub snippet: String,
     pub body: RenderedBody,
     pub expanded: bool,
@@ -54,7 +54,7 @@ pub fn visible_panes(width: f32, pane: Pane, full_width: bool) -> (bool, bool) {
     (true, true)
 }
 
-pub fn thread_rows(threads: &[FolderThread], me: &str, now: i64) -> Vec<ThreadRow> {
+pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
     threads
         .iter()
         .map(|thread| ThreadRow {
@@ -64,7 +64,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str, now: i64) -> Vec<ThreadRo
             message_count: thread.message_count,
             starred: thread.starred,
             has_attachment: thread.has_attachment,
-            date: relative_date(now, thread.last_date_unix),
+            date_unix: thread.last_date_unix,
             subject: one_line(&thread.subject),
             snippet: one_line(&thread.snippet),
             labels: thread.labels.clone(),
@@ -73,7 +73,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str, now: i64) -> Vec<ThreadRo
         .collect()
 }
 
-pub fn conversation(messages: &[Message], me: &str, now: i64) -> Vec<ConvMessage> {
+pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {
     let last = messages.len().saturating_sub(1);
     messages
         .iter()
@@ -89,7 +89,7 @@ pub fn conversation(messages: &[Message], me: &str, now: i64) -> Vec<ConvMessage
                     .map(|folder| folder_label(folder))
                     .collect::<Vec<_>>()
                     .join(" · "),
-                date: relative_date(now, message.headers.date_unix),
+                date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
                 body: render_stored_body(message.body_text.as_deref(), &message.snippet),
                 expanded: message.unread || index == last,
@@ -309,13 +309,14 @@ mod tests {
             starred: true,
             has_attachment: false,
         };
-        let rows = thread_rows(&[thread], "me@x", 1_700_000_120);
+        let rows = thread_rows(&[thread], "me@x");
         assert_eq!(rows[0].spans[0].text, "Jon");
         assert!(rows[0].spans[0].emphasis);
         assert_eq!(rows[0].spans[1].text, "me");
         assert!(!rows[0].spans[1].emphasis);
         assert_eq!(rows[0].snippet, "hello there friend");
-        assert_eq!(rows[0].date, "2m");
+        assert_eq!(rows[0].date_unix, 1_700_000_000);
+        assert_eq!(relative_date(1_700_000_120, rows[0].date_unix), "2m");
     }
 
     #[test]
@@ -386,7 +387,6 @@ mod tests {
                 message("c", true, "INBOX"),
             ],
             "me@x",
-            100,
         );
         assert!(!messages[0].expanded);
         assert!(!messages[1].expanded);

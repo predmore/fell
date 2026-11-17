@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::keymap::KeyId;
 use crate::mailbox;
-use crate::model::{Overlay, Session, Step};
+use crate::model::{Overlay, QueryFault, Session, Step};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
@@ -86,13 +86,14 @@ impl Inbox {
             open_thread: None,
         };
         if let Some(error) = mailbox.error {
-            inbox.session.error = Some(error);
+            inbox.session.record_startup_error(error);
         }
         if inbox.reload_threads() && !inbox.reload_messages(true) {
             inbox.clear_open_message();
         }
         inbox.scroll_conversation();
         inbox.watch_theme(cx);
+        inbox.watch_dates(cx);
         inbox
     }
 
@@ -119,22 +120,37 @@ impl Inbox {
         .detach();
     }
 
+    fn watch_dates(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(15))
+                    .await;
+                let alive = this.update(cx, |_, cx| cx.notify()).is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn reload_threads(&mut self) -> bool {
         match self
             .store
             .folder_threads(&self.account_id, &self.session.folder)
         {
             Ok(threads) => {
-                self.session.error = None;
+                self.session.clear_query_fault(QueryFault::Folder);
                 if let Ok(names) = self.store.folder_names(&self.account_id) {
                     self.session.folders = names;
                 }
-                let rows = present::thread_rows(&threads, &self.session.account_email, now_unix());
+                let rows = present::thread_rows(&threads, &self.session.account_email);
                 self.session.set_threads(rows);
                 true
             }
             Err(err) => {
-                self.session.error = Some(err.to_string());
+                self.session.fail_query(QueryFault::Folder, err.to_string());
                 false
             }
         }
@@ -153,15 +169,15 @@ impl Inbox {
             .thread_messages(&self.account_id, &ThreadId(id.clone()))
         {
             Ok(messages) => {
-                self.session.error = None;
-                let view =
-                    present::conversation(&messages, &self.session.account_email, now_unix());
+                self.session.clear_query_fault(QueryFault::Message);
+                let view = present::conversation(&messages, &self.session.account_email);
                 self.session.set_messages(view);
                 self.open_thread = Some(id);
                 true
             }
             Err(err) => {
-                self.session.error = Some(err.to_string());
+                self.session
+                    .fail_query(QueryFault::Message, err.to_string());
                 false
             }
         }
@@ -612,7 +628,7 @@ fn thread_line_one(
             div()
                 .text_color(rgb(dim))
                 .text_size(px(theme.ui_px - 1.0))
-                .child(row.date.clone()),
+                .child(present::relative_date(now_unix(), row.date_unix)),
         )
 }
 
@@ -901,7 +917,7 @@ fn collapsed_message(
                 } else {
                     theme.dimmed
                 }))
-                .child(message.date.clone()),
+                .child(present::relative_date(now_unix(), message.date_unix)),
         )
         .into_any_element()
 }
@@ -963,7 +979,11 @@ fn expanded_message(
                     )
                 })
                 .child(div().flex_1())
-                .child(div().text_color(rgb(dim)).child(message.date.clone())),
+                .child(
+                    div()
+                        .text_color(rgb(dim))
+                        .child(present::relative_date(now_unix(), message.date_unix)),
+                ),
         )
         .children(
             message
@@ -1078,7 +1098,7 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
                 ))
                 .child(session.sync.status().to_string()),
         )
-        .when(session.error.is_some(), |bar| {
+        .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
         .child(div().flex_1())
@@ -1404,7 +1424,7 @@ fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div 
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Keys"),
         )
-        .when_some(session.error.clone(), |card, error| {
+        .when_some(session.detail_text(), |card, error| {
             card.child(
                 div()
                     .px(px(14.))
@@ -1454,6 +1474,13 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
     if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
         return None;
     }
+    if let Some(ch) = physical_letter(&stroke.key) {
+        return Some(KeyId::Char(if stroke.modifiers.shift {
+            ch.to_ascii_uppercase()
+        } else {
+            ch.to_ascii_lowercase()
+        }));
+    }
     let typed = stroke
         .key_char
         .clone()
@@ -1484,6 +1511,15 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
             }
         }
     }
+}
+
+fn physical_letter(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || !ch.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(ch)
 }
 
 fn named_key(key: &str, shift: bool) -> Option<KeyId> {
@@ -1538,5 +1574,35 @@ impl<T: Styled> FontOpt for T {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_from;
+    use crate::keymap::KeyId;
+    use gpui::{Keystroke, Modifiers};
+
+    fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+            key: key.into(),
+            key_char: Some(key_char.into()),
+        }
+    }
+
+    #[test]
+    fn caps_lock_uses_the_physical_letter() {
+        assert_eq!(key_from(&stroke("j", "J", false)), Some(KeyId::Char('j')));
+        assert_eq!(key_from(&stroke("k", "K", false)), Some(KeyId::Char('k')));
+        assert_eq!(key_from(&stroke("g", "G", false)), Some(KeyId::Char('g')));
+        assert_eq!(key_from(&stroke("g", "G", true)), Some(KeyId::Char('G')));
+        assert_eq!(
+            key_from(&stroke("slash", "?", true)),
+            Some(KeyId::Char('?'))
+        );
     }
 }

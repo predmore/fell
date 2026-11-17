@@ -65,6 +65,13 @@ pub struct Banner {
     pub hint: String,
 }
 
+/// Which read produced `Session::error`. A later success clears only its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryFault {
+    Folder,
+    Message,
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub account_name: String,
@@ -88,7 +95,11 @@ pub struct Session {
     pub count: String,
     pub keymap: Keymap,
     pub sync: SyncKind,
+    /// Mailbox or keymap failure from startup. Folder and message reads do not clear it.
+    pub startup_error: Option<String>,
+    /// Failure from the latest folder or message read.
     pub error: Option<String>,
+    pub error_fault: Option<QueryFault>,
     pub recent: Vec<Action>,
     pub palette_query: String,
     pub palette_index: usize,
@@ -125,12 +136,40 @@ impl Session {
             count: String::new(),
             keymap,
             sync,
+            startup_error: None,
             error: None,
+            error_fault: None,
             recent: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
             folder_query: String::new(),
             folder_index: 0,
+        }
+    }
+
+    pub fn record_startup_error(&mut self, error: String) {
+        self.startup_error = Some(error);
+    }
+
+    pub fn fail_query(&mut self, fault: QueryFault, error: String) {
+        self.error = Some(error);
+        self.error_fault = Some(fault);
+    }
+
+    /// Drop a query error only when this read is the one that recorded it.
+    pub fn clear_query_fault(&mut self, fault: QueryFault) {
+        if self.error_fault == Some(fault) {
+            self.error = None;
+            self.error_fault = None;
+        }
+    }
+
+    pub fn detail_text(&self) -> Option<String> {
+        match (&self.startup_error, &self.error) {
+            (Some(startup), Some(query)) => Some(format!("{startup}\n{query}")),
+            (Some(startup), None) => Some(startup.clone()),
+            (None, Some(query)) => Some(query.clone()),
+            (None, None) => None,
         }
     }
 
@@ -379,11 +418,12 @@ impl Session {
                 Step::default()
             }
             KeyId::Enter => {
-                let chosen = self
-                    .folder_choices()
-                    .get(self.folder_index)
-                    .cloned()
-                    .unwrap_or_else(|| "INBOX".into());
+                let choices = self.folder_choices();
+                let Some(chosen) = choices.get(self.folder_index).cloned() else {
+                    self.overlay = Overlay::None;
+                    self.folder_query.clear();
+                    return Step::default();
+                };
                 self.overlay = Overlay::None;
                 self.folder_query.clear();
                 if self.folder != chosen {
@@ -674,7 +714,7 @@ mod tests {
             message_count: 1,
             starred: false,
             has_attachment: false,
-            date: "now".into(),
+            date_unix: 0,
             subject: id.into(),
             snippet: "snippet".into(),
             labels: vec![],
@@ -858,12 +898,39 @@ mod tests {
         assert!(banner.title.contains("first sync"));
     }
 
+    #[test]
+    fn startup_error_survives_a_folder_read() {
+        let mut session = session();
+        session.record_startup_error("keymap: which_key_ms = nope".into());
+        session.fail_query(QueryFault::Folder, "database is locked".into());
+        session.clear_query_fault(QueryFault::Message);
+        assert_eq!(session.error.as_deref(), Some("database is locked"));
+        session.clear_query_fault(QueryFault::Folder);
+        assert!(session.error.is_none());
+        assert_eq!(
+            session.detail_text().as_deref(),
+            Some("keymap: which_key_ms = nope")
+        );
+    }
+
+    #[test]
+    fn empty_folder_query_leaves_the_current_folder() {
+        let mut session = session();
+        session.folder = "Sent".into();
+        session.overlay = Overlay::Folders;
+        session.folder_query = "zzzz-no-such".into();
+        let step = session.on_key(KeyId::Enter, 4);
+        assert!(!step.reload_threads);
+        assert_eq!(session.folder, "Sent");
+        assert_eq!(session.overlay, Overlay::None);
+    }
+
     fn empty_message(expanded: bool) -> ConvMessage {
         ConvMessage {
             sender: "Jon".into(),
             email: "jon@x".into(),
             folders: "Inbox".into(),
-            date: "now".into(),
+            date_unix: 0,
             snippet: "snip".into(),
             body: crate::text_render::render_stored_body(Some("body"), "snip"),
             expanded,
