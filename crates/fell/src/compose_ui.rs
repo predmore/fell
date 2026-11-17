@@ -30,6 +30,7 @@ struct Palette {
     dim: u32,
     marker: u32,
     accent: u32,
+    caret: u32,
     selection: u32,
     error: u32,
     fresh: u32,
@@ -45,6 +46,7 @@ fn palette(kind: ThemeKind) -> Palette {
             dim: 0xa39e96,
             marker: 0x6e6a64,
             accent: 0x7aa2f7,
+            caret: 0xd6e4ff,
             selection: 0x2a3344,
             error: 0xf7768e,
             fresh: 0x3a2e22,
@@ -55,11 +57,12 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0xf7f5f2,
             fg: 0x1c1b19,
             dim: 0x5e5a55,
-            marker: 0x8d8680,
+            marker: 0x5c564e,
             accent: 0x1d4f91,
+            caret: 0x1d4f91,
             selection: 0xd9e2f2,
             error: 0x9f1239,
-            fresh: 0xf3e1c8,
+            fresh: 0xe4c9a4,
             panel: 0xfffdfb,
             hunk: 0xe7eef8,
         },
@@ -1246,7 +1249,7 @@ fn styled_span(text: &str, color: u32, weight: FontWeight, kind: StyleKind) -> g
 }
 
 fn caret(colors: Palette) -> gpui::Div {
-    div().w(px(2.)).h(px(18.)).bg(rgb(colors.accent))
+    div().w(px(3.)).h(px(20.)).bg(rgb(colors.caret))
 }
 
 fn render_doc(doc: &StyledDoc, folder: &Path, colors: Palette) -> gpui::Div {
