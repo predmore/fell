@@ -20,6 +20,7 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
+mod summaries;
 mod threads;
 
 const SCHEMA: &str = r#"
@@ -400,6 +401,8 @@ impl Store {
         }
         // Reply-to index and write queues for incremental threading. The
         // first open fills the index and re-resolves every account once.
+        // Per-thread rows for folder lists. The first open fills them.
+        summaries::ensure_thread_summaries(&conn)?;
         threads::ensure_thread_index(&conn)?;
         // 3 adds message_embeddings, the local body-vector index.
         conn.execute(
@@ -773,10 +776,34 @@ impl Store {
     }
 
     /// Distinct folder names stored for this account, in first-seen order.
+    ///
+    /// Reads the per-thread folder index, not every message.
     pub fn folder_names(&self, account_id: &AccountId) -> Result<Vec<String>> {
+        summaries::folder_names(&self.conn, account_id)
+    }
+
+    /// Threads with at least one message in `folder`, newest activity first.
+    ///
+    /// A message with no folder is Inbox only when it is not archived. Matching
+    /// is case-insensitive. `message_count` is the whole thread, including
+    /// copies in other folders. Reads the per-thread summaries, so the cost
+    /// follows the folder, not the mailbox.
+    pub fn folder_threads(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+    ) -> Result<Vec<FolderThread>> {
+        summaries::folder_threads(&self.conn, account_id, folder)
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// The scan `folder_names` replaced. Tests compare against it.
+    pub(crate) fn folder_names_scan(&self, account_id: &AccountId) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT folders FROM messages WHERE account_id = ?1")?;
+            .prepare("SELECT folders FROM messages WHERE account_id = ?1 ORDER BY rowid")?;
         let rows = stmt.query_map(params![account_id.as_str()], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -791,12 +818,12 @@ impl Store {
         Ok(out)
     }
 
-    /// Threads with at least one message in `folder`, newest activity first.
+    /// The scan `folder_threads` replaced. Tests compare against it.
     ///
     /// A message with no folder is Inbox only when it is not archived. Matching
     /// is case-insensitive. `message_count` is the whole thread, including
     /// copies in other folders. SQLite returns one row per matching thread.
-    pub fn folder_threads(
+    pub(crate) fn folder_threads_scan(
         &self,
         account_id: &AccountId,
         folder: &str,
@@ -1300,6 +1327,7 @@ fn folder_query_names(folder: &str) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn folder_predicate(
     folders: &str,
     archived: &str,
@@ -2812,9 +2840,33 @@ pub(crate) fn ensure_triggers(
 
 /// Write lock from the first statement, so an embedding commit cannot
 /// invalidate a snapshot this transaction already read.
-pub(crate) fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+pub(crate) fn immediate_transaction(conn: &Connection) -> Result<WriteTx<'_>> {
     rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map(WriteTx)
         .map_err(Into::into)
+}
+
+/// A write transaction that brings folder-list summaries up to date for the
+/// threads it touched before it commits. Use it for every write to `messages`.
+pub(crate) struct WriteTx<'a>(rusqlite::Transaction<'a>);
+
+impl<'a> std::ops::Deref for WriteTx<'a> {
+    type Target = rusqlite::Transaction<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl WriteTx<'_> {
+    pub(crate) fn commit(self) -> Result<()> {
+        summaries::refresh_dirty(&self.0)?;
+        self.0.commit().map_err(Into::into)
+    }
+
+    pub(crate) fn rollback(self) -> Result<()> {
+        self.0.rollback().map_err(Into::into)
+    }
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {
