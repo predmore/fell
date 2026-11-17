@@ -132,24 +132,21 @@ pub(crate) fn wait_for_inbox(
     Ok(outcome)
 }
 
-/// INBOX has mail the last sync did not see.
+/// INBOX has mail the last finished pass did not see.
+///
+/// Compares with the `UIDNEXT` that pass recorded, never with the highest
+/// stored UID: UIDs have gaps (expunged mail, skipped oversized messages),
+/// so that comparison would claim news forever and sync would never pause.
+/// Without a recorded `UIDNEXT` this says no, and the interval catches up.
 fn inbox_moved_since(checkpoint: Option<&MailboxCheckpoint>, examined: &session::Examined) -> bool {
     let Some(checkpoint) = checkpoint else {
-        return true;
+        return false;
     };
-    if checkpoint.uidvalidity != examined.uidvalidity {
-        return true;
-    }
-    if examined
-        .uidnext
-        .is_some_and(|next| next > checkpoint.uid.saturating_add(1))
-    {
-        return true;
-    }
-    matches!(
-        (checkpoint.modseq, examined.highest_modseq),
-        (Some(seen), Some(now)) if now > seen
-    )
+    let Some(seen) = checkpoint.uidnext else {
+        return false;
+    };
+    checkpoint.uidvalidity != examined.uidvalidity
+        || examined.uidnext.is_some_and(|now| now != seen)
 }
 
 pub(crate) fn fetch_imap(
@@ -233,6 +230,8 @@ pub(crate) fn fetch_imap(
                 uidvalidity,
                 uid,
                 modseq,
+                // Mid-pass: the mailbox is not caught up yet.
+                uidnext: None,
             };
             emit_progress(
                 persist,
@@ -379,6 +378,8 @@ pub(crate) fn fetch_imap(
             uidvalidity,
             uid,
             modseq,
+            // What a finished pass saw, so IDLE can tell later mail apart.
+            uidnext: if finished { uidnext } else { None },
         };
         emit_progress(
             &mut persist,
@@ -617,6 +618,10 @@ pub struct MailboxCheckpoint {
     pub uidvalidity: u32,
     pub uid: u32,
     pub modseq: Option<u64>,
+    /// `UIDNEXT` when a pass last finished this mailbox. UIDs can have gaps,
+    /// so `uid + 1` is not a stand-in. `None` for cursors from before this
+    /// field and for passes that stopped early.
+    pub uidnext: Option<u32>,
 }
 
 /// Decode a sync cursor written by [`encode_cursor`].
@@ -654,6 +659,14 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
             },
             None => return Vec::new(),
         };
+        // Optional, so cursors written before the field still decode.
+        let uidnext = match parts.next() {
+            None | Some("-") => None,
+            Some(raw) => match raw.parse().ok() {
+                Some(value) => Some(value),
+                None => return Vec::new(),
+            },
+        };
         if parts.next().is_some() {
             return Vec::new();
         }
@@ -663,6 +676,7 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 uidvalidity,
                 uid,
                 modseq,
+                uidnext,
             },
         ));
     }
@@ -684,6 +698,13 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
         token.push_str(&checkpoint.uid.to_string());
         token.push('\t');
         token.push_str(&modseq);
+        token.push('\t');
+        token.push_str(
+            &checkpoint
+                .uidnext
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
     }
     SyncCursor {
         account_key: account_key.to_string(),
@@ -739,6 +760,7 @@ mod tests {
                     uidvalidity: 9,
                     uid: 40,
                     modseq: Some(12),
+                    uidnext: None,
                 },
             ),
             (
@@ -747,12 +769,36 @@ mod tests {
                     uidvalidity: 3,
                     uid: 0,
                     modseq: None,
+                    uidnext: None,
                 },
             ),
         ];
         let cursor = encode_cursor("acct", &mailboxes);
         assert_eq!(cursor.account_key, "acct");
         assert_eq!(decode_cursor(Some(&cursor)), mailboxes);
+    }
+
+    #[test]
+    fn uidnext_round_trips_and_older_cursors_still_decode() {
+        let mailboxes = vec![(
+            "INBOX".to_string(),
+            MailboxCheckpoint {
+                uidvalidity: 9,
+                uid: 40,
+                modseq: None,
+                uidnext: Some(77),
+            },
+        )];
+        let cursor = encode_cursor("acct", &mailboxes);
+        assert_eq!(decode_cursor(Some(&cursor)), mailboxes);
+        let older = SyncCursor {
+            account_key: "acct".into(),
+            token: "fell-imap/1\nINBOX\t9\t40\t12".into(),
+        };
+        let decoded = decode_cursor(Some(&older));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].1.uid, 40);
+        assert_eq!(decoded[0].1.uidnext, None);
     }
 
     #[test]

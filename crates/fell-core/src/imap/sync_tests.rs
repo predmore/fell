@@ -1723,3 +1723,33 @@ fn a_server_without_idle_says_so() {
         .unwrap();
     assert_eq!(outcome, InboxWait::Unsupported);
 }
+
+#[test]
+fn a_uid_gap_does_not_keep_waking_sync() {
+    // Expunged or skipped mail leaves UIDNEXT above the highest stored UID.
+    let mut state = idle_state();
+    for mailbox in &mut state.mailboxes {
+        if mailbox.name == "INBOX" {
+            let highest = mailbox
+                .messages
+                .iter()
+                .map(|message| message.uid)
+                .max()
+                .unwrap();
+            mailbox.uidnext = Some(highest + 50);
+        }
+    }
+    let server = TestServer::spawn(state);
+    let (acct, backend) = idle_backend(&server);
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let outcome = backend
+        .wait_for_change(
+            cursor.as_ref(),
+            std::time::Duration::from_millis(500),
+            &mut || false,
+        )
+        .unwrap();
+    assert_eq!(outcome, InboxWait::Quiet, "no new mail, so no new pass");
+}
