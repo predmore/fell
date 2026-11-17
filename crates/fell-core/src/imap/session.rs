@@ -897,6 +897,51 @@ fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Cleartext TCP wrapped for SMTP STARTTLS. The caller has already read the
+/// SMTP `220` that answered STARTTLS, so no prefix bytes are pending.
+pub(crate) struct TlsStream {
+    inner: StreamOwned<ClientConnection, Prefixed<TcpStream>>,
+}
+
+impl Read for TlsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for TlsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub(crate) fn wrap_tcp_as_tls(
+    tcp: TcpStream,
+    host: &str,
+    accept_invalid_certs: bool,
+) -> Result<TlsStream, Error> {
+    if accept_invalid_certs && !is_loopback_host(host) {
+        return Err(imap_err(
+            "accept_invalid_certs is only allowed for a loopback host",
+        ));
+    }
+    let config = ImapConfig {
+        host: host.to_string(),
+        port: 0,
+        username: String::new(),
+        password: String::new(),
+        security: ImapSecurity::Tls,
+        accept_invalid_certs,
+    };
+    Ok(TlsStream {
+        inner: wrap_tls(tcp, Vec::new(), &config)?,
+    })
+}
+
 fn tls_config(config: &ImapConfig) -> Result<Arc<ClientConfig>, Error> {
     let provider = ring_provider();
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -1012,7 +1057,7 @@ fn literal_bytes(literals: &[LiteralBytes]) -> usize {
         .sum()
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     let host = host
         .strip_prefix('[')

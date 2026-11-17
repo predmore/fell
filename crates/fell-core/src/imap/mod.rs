@@ -8,6 +8,8 @@ mod rfc822;
 mod session;
 mod utf7;
 
+pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_tcp_as_tls};
+
 #[cfg(test)]
 mod sync_tests;
 #[cfg(test)]
