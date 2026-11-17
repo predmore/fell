@@ -236,7 +236,7 @@ fn list_item(
         .gap_2()
         .child(
             div()
-                .w(px(28.))
+                .flex_shrink_0()
                 .text_color(paint(palette.dimmed))
                 .child(marker),
         )
@@ -511,8 +511,10 @@ pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
 }
 
 /// Drop trailing rows that are a flat page color, so a short newsletter
-/// does not keep the empty viewport under the card.
+/// does not keep the empty viewport under the card. A short run of that
+/// color is the email's own padding and stays, so the card is not clipped.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
+    const KEEP_FLAT_ROWS: usize = 24;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -528,7 +530,8 @@ pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
     if rows == 1 && row_is_flat(&rgba[..row_bytes]) {
         return height;
     }
-    rows as u32
+    let flat = height as usize - rows;
+    (rows + flat.min(KEEP_FLAT_ROWS)) as u32
 }
 
 fn row_is_flat(row: &[u8]) -> bool {
@@ -719,7 +722,9 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 10);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 34);
+        let short = &rgba[..width as usize * 18 * 4];
+        assert_eq!(trim_uniform_bottom(short, width, 18), 18);
     }
 
     #[test]

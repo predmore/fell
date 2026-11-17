@@ -31,7 +31,7 @@ pub struct Reader {
     focus: FocusHandle,
     did_focus: bool,
     title: SharedString,
-    source: SharedString,
+    from_line: SharedString,
     model: Model,
     theme: Theme,
     web_open: bool,
@@ -50,7 +50,7 @@ pub struct Reader {
 
 pub struct Opened {
     pub title: SharedString,
-    pub source: SharedString,
+    pub from_line: SharedString,
     pub model: Model,
     pub theme: Theme,
 }
@@ -68,7 +68,7 @@ impl Reader {
             focus: cx.focus_handle(),
             did_focus: false,
             title: opened.title,
-            source: opened.source,
+            from_line: opened.from_line,
             model: opened.model,
             theme: opened.theme,
             web_open: false,
@@ -194,11 +194,27 @@ fn web_frame_is_current(
     open && cached_source == source && cached_scheme == scheme && cached_images == allow_images
 }
 
+fn display_address(addr: &fell_core::Address) -> String {
+    match addr
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => format!("{name} <{}>", addr.email),
+        None => addr.email.clone(),
+    }
+}
+
+fn from_header(headers: &fell_render::MailHeaders) -> String {
+    headers.get("From").map(str::trim).unwrap_or("").to_string()
+}
+
 pub fn open_fixture(name: &str, theme: Theme) -> Opened {
     let Some(fixture) = fixture(name) else {
         return Opened {
             title: format!("Unknown fixture {name}").into(),
-            source: "fixture".into(),
+            from_line: SharedString::default(),
             model: Model::from_prepared(prepare(
                 &format!("<p>No fixture named {name}.</p>"),
                 &fell_render::MailHeaders::new(),
@@ -215,16 +231,17 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
         match round_trip_body(&fixture.html, &subject) {
             Ok(message) => {
                 let title = message.headers.subject.clone().into();
+                let from_line = display_address(&message.headers.from);
                 Opened {
                     title,
-                    source: "local store".into(),
+                    from_line: from_line.into(),
                     model: Model::from_stored(&message),
                     theme,
                 }
             }
-            Err(err) => Opened {
+            Err(_) => Opened {
                 title: subject.into(),
-                source: format!("store error: {err}").into(),
+                from_line: from_header(&fixture.headers).into(),
                 model: Model::from_prepared(prepare(&fixture.html, &fixture.headers)),
                 theme,
             },
@@ -233,7 +250,7 @@ pub fn open_fixture(name: &str, theme: Theme) -> Opened {
         let _ = round_trip_body(&fixture.html, &subject);
         Opened {
             title: subject.into(),
-            source: "fixture headers".into(),
+            from_line: from_header(&fixture.headers).into(),
             model: Model::from_prepared(prepare(&fixture.html, &fixture.headers)),
             theme,
         }
@@ -256,9 +273,9 @@ impl Render for Reader {
             RenderMode::Web => "web view",
         };
         let images = if self.model.remote_images_allowed() {
-            "remote images allowed"
+            "Remote images allowed"
         } else {
-            "remote images blocked"
+            "Remote images blocked. Press i to allow them."
         };
         div()
             .id("fell-reader")
@@ -299,13 +316,21 @@ impl Render for Reader {
                             .flex_col()
                             .gap_1()
                             .child(div().font_weight(gpui::FontWeight::BOLD).child("Fell"))
-                            .child(div().text_sm().child(self.title.clone())),
+                            .child(div().text_sm().child(self.title.clone()))
+                            .when(!self.from_line.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(paint(palette.dimmed))
+                                        .child(self.from_line.clone()),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(paint(palette.dimmed))
-                            .child(format!("{mode} · {} · {}", self.theme.label(), self.source)),
+                            .child(format!("{mode} · {}", self.theme.label())),
                     ),
             )
             .child(
