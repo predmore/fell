@@ -310,6 +310,10 @@ impl Store {
         if schema_version(&conn)?.as_deref() != Some("3") {
             backfill_fingerprints(&conn)?;
             merge_backfilled_duplicates(&conn)?;
+            // Replies to a copy deleted by the merge stay on its old thread
+            // until this runs. Do it before version 3 is stamped so a crash
+            // retries the join and the rethread together.
+            rethread_accounts(&conn)?;
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1067,7 +1071,8 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
 ///
 /// `alias` is a list-echo collapse, or a later sync of an id that already
 /// collapsed. That path fills gaps only: a stored body, parent, subject,
-/// proton id, folder, label, or address is never replaced. A same-id resync
+/// proton id, folder, label, address, star, archive bit, or snooze is never
+/// replaced. A same-id resync
 /// (`alias == false`) may replace a non-list subject and a non-empty body, and
 /// still keeps a stored body or parent when the incoming copy has none.
 fn write_kept(
@@ -1120,8 +1125,9 @@ fn write_kept(
     // Duplicate copies union arrival folders and labels. Archive and snooze are
     // local triage, so a later copy must not clear them, and INBOX stays off
     // while the message is archived.
+    let archived = stored.archived || message.archived;
     let mut folders = union_tokens(&stored.folders, &message.folders, false);
-    if stored.archived {
+    if archived {
         folders = strip_inbox_tokens(&folders);
     }
     let labels = union_tokens(&stored.labels, &message.labels, false);
@@ -1205,9 +1211,11 @@ fn write_kept(
             bcc_line = ?18,
             starred = ?19,
             has_attachment = ?20,
-            body_fingerprint = ?21,
-            list_id = ?22
-         WHERE account_id = ?23 AND message_id = ?24",
+            archived = ?21,
+            snooze_until = ?22,
+            body_fingerprint = ?23,
+            list_id = ?24
+         WHERE account_id = ?25 AND message_id = ?26",
         params![
             remote_id,
             thread_id.as_str(),
@@ -1229,6 +1237,8 @@ fn write_kept(
             bcc_line,
             i64::from(stored.starred || message.starred),
             i64::from(has_attachment),
+            i64::from(stored.archived || message.archived),
+            kept_snooze(stored.snooze_until, message.snooze_until),
             fingerprint,
             list_id,
             message.account_id.as_str(),
@@ -1239,6 +1249,7 @@ fn write_kept(
     Ok(thread_id)
 }
 
+#[derive(Clone)]
 struct Arrival {
     canonical_id: String,
     remote_id: String,
@@ -1261,13 +1272,14 @@ struct Arrival {
     starred: bool,
     has_attachment: bool,
     archived: bool,
+    snooze_until: Option<i64>,
     list_id: Option<String>,
 }
 
 const ARRIVAL_COLS: &str = "m.message_id, m.remote_id, m.proton_conversation_id, m.in_reply_to,
     m.references_header, m.from_name, m.from_email, m.subject, m.date_unix, m.snippet,
     m.body_text, m.folders, m.labels, m.arrived_via, m.to_line, m.cc_line, m.bcc_line,
-    m.has_attachment, m.archived, m.starred, m.list_id";
+    m.has_attachment, m.archived, m.starred, m.list_id, m.snooze_until";
 
 fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
     let snippet: String = row.get(9)?;
@@ -1299,6 +1311,7 @@ fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
         archived: row.get::<_, i64>(18)? != 0,
         starred: row.get::<_, i64>(19)? != 0,
         list_id: row.get(20)?,
+        snooze_until: row.get(21)?,
     })
 }
 
@@ -1322,7 +1335,7 @@ fn find_stored(
     let hit = stmt
         .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
             let stored = map_arrival(row)?;
-            let via_alias: i64 = row.get(21)?;
+            let via_alias: i64 = row.get(22)?;
             Ok((stored, via_alias != 0))
         })
         .optional()?;
@@ -1380,13 +1393,17 @@ fn find_list_collapse(
 }
 
 /// Fold `message`'s existing row into `keeper`, then drop the duplicate row.
+///
+/// Local triage lives on the stored row. The sync payload only carries the
+/// folder being fetched and `starred: false`, so the doomed row is read here.
 fn absorb_duplicate(
     conn: &Connection,
     message: &Message,
     doomed: &Arrival,
     keeper: &Arrival,
 ) -> Result<ThreadId> {
-    let thread = write_kept(conn, message, keeper, true)?;
+    let keeper = fold_doomed_local_state(keeper, doomed);
+    let thread = write_kept(conn, message, &keeper, true)?;
     let old_terms = terms_for_indexed(IndexedText {
         subject: &doomed.subject,
         from_name: doomed.from_name.as_deref(),
@@ -1420,34 +1437,119 @@ fn absorb_duplicate(
     Ok(thread)
 }
 
+/// Join fingerprint groups that occur more than once.
+///
+/// Each batch loads only those groups' rows, then commits. A mailbox is not
+/// held in one `Vec` of bodies, and schema version 3 is stamped only after
+/// this returns.
 fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {SELECT_MESSAGE_COLS} FROM messages
+    let mut after = 0i64;
+    loop {
+        let groups = duplicate_fingerprint_groups(conn, after)?;
+        if groups.is_empty() {
+            break;
+        }
+        let mut batch = Vec::new();
+        for group in &groups {
+            after = group.min_rowid;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SELECT_MESSAGE_COLS} FROM messages
+                 WHERE account_id = ?1 AND body_fingerprint = ?2
+                 ORDER BY rowid"
+            ))?;
+            let rows =
+                stmt.query_map(params![group.account_id, group.fingerprint], row_to_message)?;
+            for row in rows {
+                batch.push(row?);
+            }
+            drop(stmt);
+        }
+        let tx = conn.unchecked_transaction()?;
+        for message in &batch {
+            let fingerprint = message_fingerprint(message);
+            let Some((stored, via_alias)) =
+                find_stored(&tx, &message.account_id, &message.headers.message_id)?
+            else {
+                continue;
+            };
+            if via_alias || alias_points_at(&tx, &message.account_id, &stored.canonical_id)? {
+                continue;
+            }
+            let Some(other) =
+                find_list_collapse(&tx, message, &fingerprint, Some(&stored.canonical_id))?
+            else {
+                continue;
+            };
+            absorb_duplicate(&tx, message, &stored, &other)?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+struct FingerprintGroup {
+    account_id: String,
+    fingerprint: String,
+    min_rowid: i64,
+}
+
+fn duplicate_fingerprint_groups(conn: &Connection, after: i64) -> Result<Vec<FingerprintGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, body_fingerprint, MIN(rowid)
+         FROM messages
          WHERE body_fingerprint != ''
-         ORDER BY rowid"
-    ))?;
-    let rows = stmt.query_map([], row_to_message)?;
-    let mut pending = Vec::new();
+         GROUP BY account_id, body_fingerprint
+         HAVING COUNT(*) > 1 AND MIN(rowid) > ?1
+         ORDER BY MIN(rowid)
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after, FINGERPRINT_BATCH as i64], |row| {
+        Ok(FingerprintGroup {
+            account_id: row.get(0)?,
+            fingerprint: row.get(1)?,
+            min_rowid: row.get(2)?,
+        })
+    })?;
+    let mut groups = Vec::new();
     for row in rows {
-        pending.push(row?);
+        groups.push(row?);
+    }
+    Ok(groups)
+}
+
+/// Keep a snooze that is set on either copy. A missing incoming snooze does
+/// not clear one already stored.
+fn kept_snooze(stored: Option<i64>, incoming: Option<i64>) -> Option<i64> {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => Some(stored.max(incoming)),
+        (Some(stored), None) => Some(stored),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
+/// Union the deleted row's folders, labels, star, archive bit, and snooze
+/// onto the row that stays.
+fn fold_doomed_local_state(keeper: &Arrival, doomed: &Arrival) -> Arrival {
+    let mut keeper = keeper.clone();
+    keeper.folders = union_tokens(&keeper.folders, &split_field(&doomed.folders), false);
+    keeper.labels = union_tokens(&keeper.labels, &split_field(&doomed.labels), false);
+    keeper.starred |= doomed.starred;
+    keeper.archived |= doomed.archived;
+    keeper.snooze_until = kept_snooze(keeper.snooze_until, doomed.snooze_until);
+    keeper
+}
+
+fn rethread_accounts(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT DISTINCT account_id FROM messages")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut accounts = Vec::new();
+    for row in rows {
+        accounts.push(row?);
     }
     drop(stmt);
-    for message in pending {
-        let fingerprint = message_fingerprint(&message);
-        let Some((stored, via_alias)) =
-            find_stored(conn, &message.account_id, &message.headers.message_id)?
-        else {
-            continue;
-        };
-        if via_alias || alias_points_at(conn, &message.account_id, &stored.canonical_id)? {
-            continue;
-        }
-        let Some(other) =
-            find_list_collapse(conn, &message, &fingerprint, Some(&stored.canonical_id))?
-        else {
-            continue;
-        };
-        absorb_duplicate(conn, &message, &stored, &other)?;
+    for account_id in accounts {
+        rethread(conn, &AccountId(account_id))?;
     }
     Ok(())
 }
@@ -4651,6 +4753,175 @@ mod tests {
             )
             .unwrap();
         assert!(empty.is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn absorb_keeps_local_state_from_the_deleted_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        let folders = join_tokens(&["Sent".into(), "Archive".into()]);
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    labels, starred, archived, snooze_until, body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', 'sent@x', 'imap:sent', 'sent-thread', '', 'from@x', 'Hello',
+                    1700000000, 'hello body', 'hello body', 1, ?1, 'work', 1, 1, 1893456000,
+                    ?2, NULL
+                 )",
+                params![folders, fingerprint],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', 'list@x', 'imap:inbox', 'list-thread', '', 'from@x', '[list] Hello',
+                    1700000000, 'hello body', 'hello body', 1, 'INBOX', ?1, 'list.example'
+                 )",
+                params![fingerprint],
+            )
+            .unwrap();
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        again.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&again).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        let kept = &rows[0];
+        assert_eq!(kept.headers.message_id.as_str(), "list@x");
+        assert!(kept.starred);
+        assert!(kept.archived);
+        assert_eq!(kept.snooze_until, Some(1_893_456_000));
+        assert_eq!(kept.labels, vec!["work".to_string()]);
+        assert!(kept.folders.iter().any(|folder| folder == "Sent"));
+        assert!(kept.folders.iter().any(|folder| folder == "Archive"));
+        assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn upgrade_joins_a_stored_pair_and_rethreads_the_reply() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-rethread.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    snooze_until INTEGER,
+                    body_fingerprint TEXT NOT NULL DEFAULT '',
+                    list_id TEXT,
+                    UNIQUE (account_id, message_id)
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    labels, starred, archived, snooze_until, body_fingerprint
+                 ) VALUES (
+                    'a1', 'sent@x', 'imap:sent', 'sent-thread', '', 'from@x', 'Hello',
+                    1700000000, 'hello body', 'hello body', 1, 'Sent', 'work', 1, 1,
+                    1893456000, ?1
+                 )",
+                params![fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', 'list@x', 'imap:inbox', 'list-thread', '', 'from@x', '[list] Hello',
+                    1700000000, 'hello body', 'hello body', 1, 'INBOX', ?1, 'list.example'
+                 )",
+                params![fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, in_reply_to, references_header,
+                    from_email, subject, date_unix, snippet, body_text, unread, folders,
+                    body_fingerprint
+                 ) VALUES (
+                    'a1', 'reply@x', 'imap:reply', 'reply-thread', 'sent@x', 'sent@x',
+                    'from@x', 'Re: Hello', 1700001000, 'thanks', 'thanks', 1, 'INBOX', ''
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "3");
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let kept = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "list@x")
+            .unwrap();
+        let reply = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "reply@x")
+            .unwrap();
+        assert_eq!(reply.thread_id, kept.thread_id);
+        assert!(kept.starred);
+        assert!(kept.archived);
+        assert_eq!(kept.snooze_until, Some(1_893_456_000));
+        assert_eq!(kept.labels, vec!["work".to_string()]);
+        assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
