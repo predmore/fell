@@ -88,7 +88,7 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let sent = loop {
                 match send_from_editor(session, backend.as_ref()) {
-                    Err(err) if err.contains("still checking") => {
+                    Err(err) if err.to_string().contains("still checking") => {
                         assert!(std::time::Instant::now() < deadline, "{err}");
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
