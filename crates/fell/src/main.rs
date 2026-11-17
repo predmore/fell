@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
 use fell_core::compose::DraftHub;
 use gpui::{
@@ -16,6 +17,10 @@ use notify::{Event, RecursiveMode, Watcher};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--fixture" || arg == "--help") {
+        preview();
+        return;
+    }
     let compose = args.iter().any(|arg| {
         matches!(
             arg.as_str(),
@@ -94,6 +99,55 @@ fn main() {
                     compose
                 })
             },
+        )
+        .expect("open Fell window");
+        cx.activate(true);
+    });
+}
+
+fn preview() {
+    let mut fixture = "native-personal-reply".to_string();
+    let mut theme = render::ThemeKind::Dark;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                if let Some(name) = args.next() {
+                    fixture = name;
+                }
+            }
+            "--theme" => {
+                theme = if args.next().as_deref() == Some("light") {
+                    render::ThemeKind::Light
+                } else {
+                    render::ThemeKind::Dark
+                };
+            }
+            "--help" => {
+                eprintln!(
+                    "fell --fixture <name> --theme dark|light\n\
+                     fixtures live in crates/fell-render/fixtures"
+                );
+            }
+            _ => {}
+        }
+    }
+    let opened = render::open_fixture(&fixture, theme);
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(960.), px(720.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Fell".into()),
+                    ..Default::default()
+                }),
+                app_id: Some("dev.predmore.fell".into()),
+                focus: true,
+                show: true,
+                ..Default::default()
+            },
+            move |_window, cx| cx.new(|cx| Reader::new(opened, cx)),
         )
         .expect("open Fell window");
         cx.activate(true);
