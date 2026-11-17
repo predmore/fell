@@ -281,15 +281,18 @@ impl Store {
         let path = path.as_ref();
         // The mailbox holds message text. Create it owner-only before SQLite writes.
         create_private_file(path)?;
-        let conn = Connection::open(path)?;
+        // One sidecar lock per file. A relative path, a symlink, and the
+        // absolute path must not start two indexers.
+        let path = path.canonicalize()?;
+        let conn = Connection::open(&path)?;
         // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut store = Self::from_connection(conn)?;
-        store.path = Some(path.to_path_buf());
+        store.path = Some(path.clone());
         store.seal_private_files()?;
         // Embeddings are filled off this thread, and only in one process.
         // A lock problem skips the indexer. Open still returns the mailbox.
-        store.indexer = crate::embed::Indexer::try_spawn(path);
+        store.indexer = crate::embed::Indexer::try_spawn(&path);
         Ok(store)
     }
 

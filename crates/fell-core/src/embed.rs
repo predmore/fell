@@ -1364,6 +1364,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_and_a_dotdot_path_share_the_embed_lock() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let path = dir.join("mail.sqlite");
+        let first = Store::open(&path).unwrap();
+        wait_until(|| first.embedding_indexer_running());
+        std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
+        let via_symlink = Store::open(dir.join("alias.sqlite")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!via_symlink.embedding_indexer_running());
+        let via_dotdot = Store::open(dir.join("sub/../mail.sqlite")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!via_dotdot.embedding_indexer_running());
+        drop(first);
+        drop(via_symlink);
+        drop(via_dotdot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_second_open_does_not_start_another_indexer() {
         let _reset = PauseReset;
