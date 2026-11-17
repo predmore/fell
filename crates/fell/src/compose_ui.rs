@@ -44,7 +44,7 @@ fn palette(kind: ThemeKind) -> Palette {
         ThemeKind::Dark => Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
-            dim: 0xd2ccc4,
+            dim: 0xe7e2db,
             marker: 0xc8c2ba,
             accent: 0x7aa2f7,
             caret: 0xffffff,
@@ -1044,7 +1044,7 @@ fn field_row(
                 div()
                     .w(px(64.))
                     .text_size(px(16.))
-                    .text_color(rgb(colors.dim))
+                    .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
             .child(div().flex_1().child(if value.is_empty() {
@@ -1073,7 +1073,7 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
             div()
                 .w(px(64.))
                 .text_size(px(16.))
-                .text_color(rgb(colors.dim))
+                .text_color(rgb(colors.fg))
                 .child("Subject"),
         )
         .child(
@@ -1091,7 +1091,7 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .unwrap_or("new message");
     div()
         .text_size(px(16.))
-        .text_color(rgb(colors.dim))
+        .text_color(rgb(colors.fg))
         .px_1()
         .child(format!("Reply to  {reply}"))
 }
@@ -1161,13 +1161,7 @@ fn styled_body(
             render_block(block, folder, colors)
         };
         column = column.child(if edited {
-            div()
-                .bg(rgb(colors.hunk))
-                .border_l(px(3.))
-                .border_color(rgb(colors.accent))
-                .px_2()
-                .py_1()
-                .child(painted)
+            div().bg(rgb(colors.hunk)).px_2().py_1().child(painted)
         } else {
             painted
         });
@@ -1223,6 +1217,12 @@ fn raw_line(
     mode: Mode,
     colors: Palette,
 ) -> gpui::Div {
+    let line_chars = line.chars().count();
+    let cursor = match (mode, cursor) {
+        (Mode::Insert, col) => col,
+        (_, Some(col)) if line_chars > 0 && col >= line_chars => Some(line_chars - 1),
+        (_, col) => col,
+    };
     let styles = line_styles(line);
     let mut row = div()
         .flex()
@@ -1257,16 +1257,27 @@ fn raw_line(
         };
         if let Some(cursor_byte) = cursor_byte
             && cursor_byte >= span.start
-            && cursor_byte <= span.end
+            && cursor_byte < span.end
         {
             let at = cursor_byte - span.start;
             let (left, right) = split_at_char_boundary(slice, at);
             if !left.is_empty() {
                 row = row.child(styled_span(left, color, weight, span.kind, colors.code));
             }
-            row = row.child(caret(colors, mode));
-            if !right.is_empty() {
-                row = row.child(styled_span(right, color, weight, span.kind, colors.code));
+            if mode != Mode::Insert
+                && let Some(ch) = right.chars().next()
+            {
+                let split = ch.len_utf8();
+                let (glyph, rest) = right.split_at(split);
+                row = row.child(inverted_span(glyph, weight, span.kind, colors));
+                if !rest.is_empty() {
+                    row = row.child(styled_span(rest, color, weight, span.kind, colors.code));
+                }
+            } else {
+                row = row.child(caret(colors, mode));
+                if !right.is_empty() {
+                    row = row.child(styled_span(right, color, weight, span.kind, colors.code));
+                }
             }
             continue;
         }
@@ -1326,6 +1337,24 @@ fn styled_span(
             .bg(rgb(code_bg))
             .px_1()
             .rounded_sm();
+    }
+    if kind == StyleKind::Em {
+        node = node.italic();
+    }
+    if kind == StyleKind::LinkText {
+        node = node.underline();
+    }
+    node.child(text.to_string())
+}
+
+fn inverted_span(text: &str, weight: FontWeight, kind: StyleKind, colors: Palette) -> gpui::Div {
+    let mut node = div()
+        .bg(rgb(colors.caret))
+        .text_color(rgb(colors.bg))
+        .font_weight(weight)
+        .px_1();
+    if kind == StyleKind::Code {
+        node = node.font_family("monospace");
     }
     if kind == StyleKind::Em {
         node = node.italic();
@@ -1438,9 +1467,9 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
     if path.is_file() {
         block = block.child(
             img(path)
-                .w(px(210.))
-                .h(px(92.))
-                .object_fit(ObjectFit::Fill)
+                .w(px(224.))
+                .h(px(98.))
+                .object_fit(ObjectFit::Contain)
                 .flex_shrink_0(),
         );
     }
@@ -1499,7 +1528,10 @@ fn status_bar(
     };
     div()
         .flex()
+        .flex_wrap()
+        .items_center()
         .justify_between()
+        .gap_3()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
@@ -1509,14 +1541,15 @@ fn status_bar(
         .child(
             div()
                 .flex()
-                .gap_4()
+                .flex_shrink_0()
+                .gap_3()
                 .child(div().text_color(rgb(colors.accent)).child(mode.to_string()))
-                .child(div().text_color(rgb(colors.dim)).child(status.to_string()))
+                .child(div().text_color(rgb(colors.fg)).child(status.to_string()))
                 .children(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().child(send.to_string()))
+        .child(div().flex_shrink_0().child(send.to_string()))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {

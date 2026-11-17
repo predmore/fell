@@ -8,13 +8,7 @@ pub fn chart_png() -> Vec<u8> {
         raw.push(0);
         for x in 0..width {
             let bar = (x / 40) % 2 == (y / 28) % 2;
-            let (r, g, b) = if y > height - 18 {
-                (90, 98, 110)
-            } else if bar {
-                (122, 162, 247)
-            } else {
-                (65, 72, 84)
-            };
+            let (r, g, b) = if bar { (122, 162, 247) } else { (65, 72, 84) };
             raw.extend_from_slice(&[r, g, b]);
         }
     }
