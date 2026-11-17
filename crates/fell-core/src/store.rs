@@ -576,8 +576,9 @@ impl Store {
 
     /// Threads with at least one message in `folder`, newest activity first.
     ///
-    /// A message with no folder is treated as Inbox. Matching is case-insensitive.
-    /// `message_count` is the whole thread, including copies in other folders.
+    /// A message with no folder is Inbox only when it is not archived. Matching
+    /// is case-insensitive. `message_count` is the whole thread, including
+    /// copies in other folders. Only threads in `folder` are read.
     pub fn folder_threads(
         &self,
         account_id: &AccountId,
@@ -585,12 +586,27 @@ impl Store {
     ) -> Result<Vec<FolderThread>> {
         let mut stmt = self.conn.prepare(
             "SELECT thread_id, from_name, from_email, subject, date_unix, snippet,
-                    unread, folders, labels, starred, has_attachment
+                    unread, folders, labels, starred, has_attachment, archived
              FROM messages
              WHERE account_id = ?1
+               AND thread_id IN (
+                   SELECT thread_id FROM messages
+                   WHERE account_id = ?1
+                     AND (
+                         instr(
+                             char(30) || lower(folders) || char(30),
+                             char(30) || lower(?2) || char(30)
+                         ) > 0
+                         OR (
+                             lower(?2) = 'inbox'
+                             AND archived = 0
+                             AND folders = ''
+                         )
+                     )
+               )
              ORDER BY date_unix ASC, rowid ASC",
         )?;
-        let rows = stmt.query_map(params![account_id.as_str()], |row| {
+        let rows = stmt.query_map(params![account_id.as_str(), folder], |row| {
             Ok(HeaderRow {
                 thread_id: row.get(0)?,
                 from_name: row.get(1)?,
@@ -603,6 +619,7 @@ impl Store {
                 labels: row.get(8)?,
                 starred: row.get::<_, i64>(9)? != 0,
                 has_attachment: row.get::<_, i64>(10)? != 0,
+                archived: row.get::<_, i64>(11)? != 0,
             })
         })?;
         let mut grouped: Vec<FolderAcc> = Vec::new();
@@ -654,7 +671,7 @@ impl Store {
                     acc.labels.push(label);
                 }
             }
-            if folder_contains(&row.folders, folder) {
+            if folder_contains(&row.folders, row.archived, folder) {
                 acc.in_folder = true;
                 acc.unread |= row.unread;
             }
@@ -792,6 +809,7 @@ struct HeaderRow {
     labels: String,
     starred: bool,
     has_attachment: bool,
+    archived: bool,
 }
 
 struct FolderAcc {
@@ -812,10 +830,10 @@ struct FolderAcc {
     has_attachment: bool,
 }
 
-fn folder_contains(stored: &str, want: &str) -> bool {
+fn folder_contains(stored: &str, archived: bool, want: &str) -> bool {
     let parts = split_field(stored);
     if parts.is_empty() {
-        return want.eq_ignore_ascii_case("inbox");
+        return !archived && want.eq_ignore_ascii_case("inbox");
     }
     parts.iter().any(|name| name.eq_ignore_ascii_case(want))
 }
@@ -3002,5 +3020,30 @@ mod tests {
             .unwrap();
         assert!(msgs.iter().any(|message| message.folders == ["Sent"]));
         assert!(msgs.iter().any(|message| message.starred));
+    }
+
+    #[test]
+    fn archived_inbox_only_mail_is_not_inbox() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut kept = msg("kept@x", None, None, "Still here", "inbox body");
+        kept.folders = vec!["INBOX".into()];
+        let mut archived = msg("gone@x", None, None, "Archived", "gone body");
+        archived.folders = vec!["INBOX".into()];
+        archived.archived = true;
+        store.upsert_message(&kept).unwrap();
+        store.upsert_message(&archived).unwrap();
+
+        let inbox = store
+            .folder_threads(&AccountId("a1".into()), "INBOX")
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "Still here");
+        assert!(
+            store
+                .folder_threads(&AccountId("a1".into()), "Archive")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -162,17 +162,26 @@ impl Inbox {
         window.focus(&self.focus);
         let page = self.page_rows();
         let message_before = self.session.message_cursor;
+        let thread_before = self.session.cursor_id.clone();
         let step = self.session.on_key(key, page);
-        self.apply_step(step, message_before, cx);
+        self.apply_step(step, message_before, thread_before, cx);
         cx.stop_propagation();
     }
 
-    fn apply_step(&mut self, step: Step, message_before: usize, cx: &mut Context<Self>) {
+    fn apply_step(
+        &mut self,
+        step: Step,
+        message_before: usize,
+        thread_before: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let mut loaded_messages = false;
+        let mut loaded_threads = false;
         if step.reload_threads {
             self.reload_threads();
             self.reload_messages(true);
             loaded_messages = true;
+            loaded_threads = true;
         } else if step.reload_messages {
             self.reload_messages(true);
             loaded_messages = true;
@@ -180,7 +189,10 @@ impl Inbox {
         if step.arm_which {
             self.arm_which(cx);
         }
-        self.list_scroll.scroll_to_item(self.session.cursor_index());
+        let thread_moved = self.session.cursor_id != thread_before;
+        if loaded_threads || thread_moved {
+            self.list_scroll.scroll_to_item(self.session.cursor_index());
+        }
         // A tall message aligns to its top when scrolled into view. Skip that
         // unless the reader moved to another message, or a new thread loaded.
         if loaded_messages || self.session.message_cursor != message_before {
@@ -1186,8 +1198,9 @@ fn palette(
                                 inbox.session.overlay = Overlay::None;
                                 let page = inbox.page_rows();
                                 let message_before = inbox.session.message_cursor;
+                                let thread_before = inbox.session.cursor_id.clone();
                                 let step = inbox.session.perform(action, page);
-                                inbox.apply_step(step, message_before, cx);
+                                inbox.apply_step(step, message_before, thread_before, cx);
                             }),
                         )
                         .child(div().flex_1().child(item.label.clone()))
