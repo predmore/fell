@@ -463,14 +463,14 @@ fn image_el(
     if let ImageSource::Data { bytes, .. } = source
         && let Some(rendered) = gallery.get(bytes)
     {
-        return div()
-            .max_w(px(420.))
+        let mut frame = div()
             .border(px(1.))
             .border_color(paint(palette.border))
             .rounded(px(4.))
             .overflow_hidden()
-            .child(img(rendered).max_w(px(420.)).max_h(px(240.)))
-            .into_any_element();
+            .child(img(rendered).max_w(px(420.)).max_h(px(240.)));
+        frame.style().align_self = Some(gpui::AlignItems::FlexStart);
+        return frame.into_any_element();
     }
     let label = match source {
         ImageSource::Remote(_) if !allow_remote => {
