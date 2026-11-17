@@ -514,8 +514,8 @@ fn image_el(
         }
     };
     let mut placeholder = div()
-        .w(px(280.))
-        .h(px(120.))
+        .w(px(220.))
+        .h(px(72.))
         .px_3()
         .flex()
         .items_center()
@@ -532,11 +532,16 @@ fn image_el(
                 .gap_2()
                 .child(
                     div()
-                        .w(px(36.))
-                        .h(px(36.))
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .border(px(1.))
                         .border_color(paint(palette.dimmed))
-                        .rounded(px(2.)),
+                        .rounded(px(2.))
+                        .text_xs()
+                        .child("img"),
                 )
                 .child(label),
         );

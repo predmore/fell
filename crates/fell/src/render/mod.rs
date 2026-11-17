@@ -368,39 +368,44 @@ impl Render for Reader {
                     ),
             )
             .child(
-                div().px_4().py_2().child(
-                    div()
-                        .id("remote-images")
-                        .w_full()
-                        .px_3()
-                        .py_1()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .border(px(1.))
-                        .border_color(paint(palette.border))
-                        .rounded(px(4.))
-                        .bg(paint(palette.surface))
-                        .text_sm()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                            this.model
-                                .set_remote_images_allowed(!this.model.remote_images_allowed());
-                            cx.notify();
-                        }))
-                        .child(status)
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded(px(4.))
-                                .border(px(1.))
-                                .border_color(paint(palette.accent))
-                                .text_color(paint(palette.accent))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(action),
-                        ),
-                ),
+                div()
+                    .px_4()
+                    .py_2()
+                    .border_b(px(1.))
+                    .border_color(paint(palette.border))
+                    .child(
+                        div()
+                            .id("remote-images")
+                            .w_full()
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border(px(1.))
+                            .border_color(paint(palette.border))
+                            .rounded(px(4.))
+                            .bg(paint(palette.surface))
+                            .text_sm()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                                this.model
+                                    .set_remote_images_allowed(!this.model.remote_images_allowed());
+                                cx.notify();
+                            }))
+                            .child(status)
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .border(px(1.))
+                                    .border_color(paint(palette.accent))
+                                    .text_color(paint(palette.accent))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(action),
+                            ),
+                    ),
             )
             .child(message_body(self, &palette))
     }
