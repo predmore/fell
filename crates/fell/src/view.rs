@@ -187,6 +187,42 @@ impl Inbox {
         }
     }
 
+    /// Move messages in the current folder to Archive. A Sent copy stays in Sent.
+    fn archive_current(&mut self) {
+        let Some(id) = self.session.cursor_id.clone() else {
+            self.session.show_toast("No conversation", true);
+            return;
+        };
+        if !self.session.threads.iter().any(|thread| thread.id == id) {
+            self.session.show_toast("No conversation", true);
+            return;
+        }
+        let index = self.session.cursor_index();
+        let folder = self.session.folder.clone();
+        if let Err(err) =
+            self.store
+                .archive_thread(&self.account_id, &ThreadId(id.clone()), &folder)
+        {
+            self.session.show_toast(archive_failure(&err), true);
+            return;
+        }
+        self.session.show_toast("Archived · u", false);
+        if !self.reload_threads() {
+            return;
+        }
+        let next = self
+            .session
+            .threads
+            .get(index)
+            .or_else(|| self.session.threads.last());
+        self.session.cursor_id = next.map(|row| row.id.clone());
+        if !self.reload_messages(true) {
+            self.clear_open_message();
+        }
+        self.scroll_list_to_cursor();
+        self.scroll_conversation();
+    }
+
     fn apply_move(&mut self, destination: String) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
@@ -301,6 +337,9 @@ impl Inbox {
         }
         if step.undo {
             self.apply_undo();
+        }
+        if step.archive {
+            self.archive_current();
         }
         let mut loaded_messages = false;
         let mut loaded_threads = false;
@@ -626,14 +665,7 @@ fn thread_list(
                 range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
-                        thread_row(
-                            &theme_for_rows,
-                            &inbox.session,
-                            &row,
-                            index,
-                            &highlighted,
-                            cx,
-                        )
+                        thread_row(&theme_for_rows, &row, index, &highlighted, cx)
                     })
                     .collect::<Vec<_>>()
             })
@@ -650,11 +682,7 @@ fn thread_list(
         .min_w(px(0.))
         .overflow_hidden()
         .border_l(px(2.))
-        .border_color(rgb(if session.pane == Pane::List {
-            theme.accent
-        } else {
-            theme.background
-        }));
+        .border_color(rgb(theme.border));
     pane = if beside {
         pane.w(px(list_width)).flex_none()
     } else {
@@ -669,13 +697,11 @@ fn thread_list(
 
 fn thread_row(
     theme: &Theme,
-    session: &Session,
     row: &ThreadRow,
     index: usize,
     highlighted: &std::collections::HashSet<String>,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let cursor = session.cursor_id.as_deref() == Some(row.id.as_str());
     let selected = highlighted.contains(&row.id);
     let id = row.id.clone();
     let weight = if row.unread {
@@ -709,7 +735,7 @@ fn thread_row(
                 cx.notify();
             }),
         )
-        .child(div().w(px(3.)).h_full().bg(rgb(if row.unread || cursor {
+        .child(div().w(px(3.)).h_full().bg(rgb(if row.unread {
             theme.accent
         } else {
             theme.background
@@ -742,11 +768,13 @@ fn thread_line_one(
         theme.dimmed
     };
     div()
+        .h(px(22.))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.))
         .min_w(px(0.))
+        .overflow_hidden()
         .child(names(theme, &row.spans, row.extra, weight, selected))
         .when(row.message_count > 1, |line| {
             line.child(
@@ -843,15 +871,18 @@ fn thread_line_two(
         theme.dimmed
     };
     div()
+        .w_full()
         .flex()
         .flex_row()
+        .items_center()
         .gap(px(8.))
         .min_w(px(0.))
         .overflow_hidden()
         .child(
             div()
                 .font_weight(weight)
-                .flex_shrink_0()
+                .flex_shrink()
+                .min_w(px(0.))
                 .max_w(px(280.))
                 .overflow_hidden()
                 .whitespace_nowrap()
@@ -1009,11 +1040,14 @@ fn collapsed_message(
     div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
+        .w_full()
+        .min_w(px(0.))
         .px(px(8.))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(12.))
+        .overflow_hidden()
         .rounded_md()
         .bg(rgb(if cursor {
             theme.selection
@@ -1063,6 +1097,7 @@ fn collapsed_message(
         )
         .child(
             div()
+                .flex_none()
                 .text_color(rgb(if cursor {
                     theme.on_selection
                 } else {
@@ -1636,6 +1671,21 @@ fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div 
                         )
                 })),
         )
+}
+
+fn archive_failure(err: &fell_core::Error) -> String {
+    match err {
+        fell_core::Error::Action(message) if message.contains("into Archive") => {
+            "Already in Archive".into()
+        }
+        fell_core::Error::Action(message) if message.starts_with("no messages") => {
+            "Nothing here to archive".into()
+        }
+        fell_core::Error::Action(message) if message.contains("no such thread") => {
+            "No conversation".into()
+        }
+        other => other.to_string(),
+    }
 }
 
 fn key_from(stroke: &Keystroke) -> Option<KeyId> {

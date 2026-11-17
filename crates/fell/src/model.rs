@@ -81,6 +81,8 @@ pub struct Step {
     pub apply_move: bool,
     /// `u` restores the latest local action.
     pub undo: bool,
+    /// `e` archives the open thread out of the folder on screen.
+    pub archive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +446,7 @@ impl Session {
                 step.scroll_lines = ran.scroll_lines;
                 step.apply_move |= ran.apply_move;
                 step.undo |= ran.undo;
+                step.archive |= ran.archive;
             }
             SeqMatch::Prefix => {
                 self.chord = seq;
@@ -685,6 +688,17 @@ impl Session {
                 self.overlay = Overlay::Folders;
                 self.folder_query.clear();
                 self.folder_index = 0;
+            }
+            Action::Archive => {
+                self.count.clear();
+                if self.cursor_id.is_none() {
+                    self.show_toast("No conversation", true);
+                    return Step::default();
+                }
+                return Step {
+                    archive: true,
+                    ..Step::default()
+                };
             }
             Action::Undo => {
                 self.count.clear();
@@ -937,6 +951,18 @@ mod tests {
         assert!(step.reload_threads);
         assert_eq!(session.folder, "INBOX");
         assert!(session.chord.is_empty());
+    }
+
+    #[test]
+    fn e_asks_to_archive_without_leaving_the_folder() {
+        let mut session = session();
+        let folder = session.folder.clone();
+        let step = session.on_key(KeyId::Char('e'), 4);
+        assert!(step.archive);
+        assert!(!step.undo);
+        assert!(!step.apply_move);
+        assert_eq!(session.folder, folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
     }
 
     #[test]
