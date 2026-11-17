@@ -527,13 +527,6 @@ fn image_el(
         }
     };
     let mut placeholder = div()
-        .px_2()
-        .py(px(4.))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .rounded(px(4.))
-        .bg(paint(palette.code_bg))
         .text_sm()
         .text_color(paint(palette.dimmed))
         .child(label);
@@ -542,9 +535,10 @@ fn image_el(
 }
 
 pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
+    // Native pixels. Stretching the snapshot to the pane softens the type.
     div()
         .w_full()
-        .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
+        .child(img(image).object_fit(gpui::ObjectFit::None))
         .into_any_element()
 }
 

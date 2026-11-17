@@ -228,8 +228,10 @@ fn open_host(request: &WebRequest) -> wry::Result<Host> {
     window.set_focus_on_map(false);
     window.set_accept_focus(false);
     window.set_can_focus(false);
-    // Match the message pane so the snapshot is not scaled, which softens type.
-    window.set_default_size(928, 1400);
+    // The preview pane is 960 wide. A narrower snapshot is scaled up on
+    // screen, which softens the type. The height covers the pane, so the
+    // visible page is the bitmap itself and not a painted strip under it.
+    window.set_default_size(960, 1400);
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
     window.show_all();
@@ -658,7 +660,11 @@ fn surface_png(surface: gtk::cairo::Surface) -> Option<Vec<u8>> {
             }
         }
     }
-    let dst_h = super::native::trim_uniform_bottom(&rgba, dst_w, dst_h);
+    // A short page still has to cover the pane. Cutting it shorter leaves a
+    // join, and that join reads as a band of a different color.
+    let dst_h = super::native::trim_uniform_bottom(&rgba, dst_w, dst_h)
+        .max(640)
+        .min(dst_h);
     rgba.truncate(dst_w as usize * dst_h as usize * 4);
     let buffer = image::RgbaImage::from_raw(dst_w, dst_h, rgba)?;
     let mut png = Vec::new();
