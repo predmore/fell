@@ -5,7 +5,11 @@
 //! that model. The HTML milestone replaces this function; the inbox should
 //! keep consuming [`RenderedBody`].
 
+use gpui::SharedString;
+
 /// A message body the conversation view can paint.
+///
+/// Block text is shared. Redraws clone the handle, not the body bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedBody {
     pub blocks: Vec<BodyBlock>,
@@ -14,11 +18,15 @@ pub struct RenderedBody {
 /// One piece of stored plain text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BodyBlock {
-    Text(String),
+    Text(SharedString),
     /// Quoted history. Collapsed until the reader expands it.
-    Quote(String),
+    Quote(SharedString),
     /// A signature block. Collapsed until the reader expands it.
-    Signature(String),
+    Signature(SharedString),
+}
+
+fn shared(text: &str) -> SharedString {
+    SharedString::from(text.to_string())
 }
 
 /// Turn stored plain text into blocks. Markup is not interpreted.
@@ -26,7 +34,7 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str) -> RenderedBod
     let raw = body_text.unwrap_or(snippet).replace("\r\n", "\n");
     if raw.trim().is_empty() {
         return RenderedBody {
-            blocks: vec![BodyBlock::Text(snippet.trim().to_string())],
+            blocks: vec![BodyBlock::Text(shared(snippet.trim()))],
         };
     }
     RenderedBody {
@@ -45,7 +53,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
         let joined = text.join("\n");
         text.clear();
         if !joined.trim().is_empty() {
-            blocks.push(BodyBlock::Text(joined.trim().to_string()));
+            blocks.push(BodyBlock::Text(shared(joined.trim())));
         }
     };
     let flush_quote = |quote: &mut Vec<&str>, blocks: &mut Vec<BodyBlock>| {
@@ -59,7 +67,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
             .join("\n");
         quote.clear();
         if !joined.trim().is_empty() {
-            blocks.push(BodyBlock::Quote(joined.trim().to_string()));
+            blocks.push(BodyBlock::Quote(shared(joined.trim())));
         }
     };
     let flush_signature = |signature: &mut Vec<&str>, blocks: &mut Vec<BodyBlock>| {
@@ -69,7 +77,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
         let joined = signature.join("\n");
         signature.clear();
         if !joined.trim().is_empty() {
-            blocks.push(BodyBlock::Signature(joined.trim().to_string()));
+            blocks.push(BodyBlock::Signature(shared(joined.trim())));
         }
     };
 
@@ -99,7 +107,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
     flush_quote(&mut quote, &mut blocks);
     flush_signature(&mut signature, &mut blocks);
     if blocks.is_empty() {
-        blocks.push(BodyBlock::Text(raw.trim().to_string()));
+        blocks.push(BodyBlock::Text(shared(raw.trim())));
     }
     blocks
 }

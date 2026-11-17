@@ -6,8 +6,9 @@ use fell_core::{AccountId, Store, ThreadId};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, point, prelude::*, px, rgb, size,
+    ScrollHandle, ScrollStrategy, StatefulInteractiveElement, Styled, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
+    size, uniform_list,
 };
 
 use crate::keymap::KeyId;
@@ -53,7 +54,7 @@ struct Inbox {
     account_id: AccountId,
     session: Session,
     theme: Theme,
-    list_scroll: ScrollHandle,
+    list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
@@ -77,7 +78,7 @@ impl Inbox {
             ),
             store: mailbox.store,
             theme,
-            list_scroll: ScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
@@ -234,7 +235,7 @@ impl Inbox {
         }
         let thread_moved = self.session.cursor_id != thread_before;
         if loaded_threads || thread_moved {
-            self.list_scroll.scroll_to_item(self.session.cursor_index());
+            self.scroll_list_to_cursor();
         }
         // A tall message aligns to its top when scrolled into view. Skip that
         // unless the reader moved to another message, or a new thread loaded.
@@ -312,7 +313,7 @@ impl Inbox {
 
     fn page_rows(&self) -> usize {
         let height = match self.session.pane {
-            Pane::List => f32::from(self.list_scroll.bounds().size.height),
+            Pane::List => f32::from(self.list_scroll.0.borrow().base_handle.bounds().size.height),
             Pane::Conversation => f32::from(self.conv_scroll.bounds().size.height),
         };
         let height = if height < 1.0 { 640.0 } else { height };
@@ -323,7 +324,13 @@ impl Inbox {
         ((height / row).floor() as usize).max(1)
     }
 
+    fn scroll_list_to_cursor(&self) {
+        self.list_scroll
+            .scroll_to_item(self.session.cursor_index(), ScrollStrategy::Top);
+    }
+
     fn select_thread(&mut self, id: String) {
+        self.session.cancel_pending_keys();
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
         let previous = self.session.cursor_id.clone();
         self.session.cursor_id = Some(id);
@@ -335,7 +342,7 @@ impl Inbox {
                 self.scroll_conversation();
             }
         }
-        self.list_scroll.scroll_to_item(self.session.cursor_index());
+        self.scroll_list_to_cursor();
     }
 }
 
@@ -343,7 +350,7 @@ impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = f32::from(window.viewport_size().width);
         let theme = self.theme.clone();
-        let session = self.session.clone();
+        let session = &self.session;
         let list_scroll = self.list_scroll.clone();
         let conv_scroll = self.conv_scroll.clone();
         let palette_scroll = self.palette_scroll.clone();
@@ -368,10 +375,10 @@ impl Render for Inbox {
 #[allow(clippy::too_many_arguments)]
 fn shell(
     theme: Theme,
-    session: Session,
+    session: &Session,
     width: f32,
     split: f32,
-    list_scroll: ScrollHandle,
+    list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
@@ -412,7 +419,7 @@ fn shell(
         .text_size(px(theme.ui_px))
         .font_family_opt(theme.ui_family.clone())
         .overflow_hidden()
-        .child(header(&theme, &session))
+        .child(header(&theme, session))
         .child(
             div()
                 .flex_1()
@@ -423,7 +430,7 @@ fn shell(
                 .when(show_list, |row| {
                     row.child(thread_list(
                         &theme,
-                        &session,
+                        session,
                         show_conv,
                         list_width,
                         list_scroll,
@@ -434,18 +441,18 @@ fn shell(
                     row.child(splitter(&theme, cx))
                 })
                 .when(show_conv, |row| {
-                    row.child(conversation(&theme, &session, conv_scroll, cx))
+                    row.child(conversation(&theme, session, conv_scroll, cx))
                 }),
         )
-        .child(status_bar(&theme, &session))
+        .child(status_bar(&theme, session))
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
-            |root| root.child(which_key_popup(&theme, &session)),
+            |root| root.child(which_key_popup(&theme, session)),
         )
         .when(session.overlay != Overlay::None, |root| {
             root.child(overlay(
                 &theme,
-                &session,
+                session,
                 &palette_scroll,
                 &folder_scroll,
                 cx,
@@ -501,16 +508,36 @@ fn thread_list(
     session: &Session,
     beside: bool,
     list_width: f32,
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
-    let highlighted = session.highlighted();
-    let rows: Vec<_> = session
-        .threads
-        .iter()
-        .enumerate()
-        .map(|(index, row)| thread_row(theme, session, row, index, &highlighted, cx))
-        .collect();
+    let entity = cx.entity();
+    let theme_for_rows = theme.clone();
+    let rows = uniform_list(
+        "thread-rows",
+        session.threads.len(),
+        move |range, _window, app| {
+            entity.update(app, |inbox, cx| {
+                let highlighted = inbox.session.highlighted();
+                range
+                    .map(|index| {
+                        let row = inbox.session.threads[index].clone();
+                        thread_row(
+                            &theme_for_rows,
+                            &inbox.session,
+                            &row,
+                            index,
+                            &highlighted,
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        },
+    )
+    .flex_1()
+    .min_h(px(0.))
+    .track_scroll(scroll);
     let mut pane = div()
         .id("thread-list")
         .flex()
@@ -532,15 +559,7 @@ fn thread_list(
     if session.threads.is_empty() {
         pane.child(empty_state(theme, session))
     } else {
-        pane.child(
-            div()
-                .id("thread-scroll")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .track_scroll(&scroll)
-                .children(rows),
-        )
+        pane.child(rows)
     }
 }
 
@@ -906,6 +925,7 @@ fn collapsed_message(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 window.focus(&inbox.focus);
+                inbox.session.cancel_pending_keys();
                 inbox.session.pane = Pane::Conversation;
                 inbox.session.message_cursor = index;
                 if let Some(message) = inbox.session.messages.get_mut(index) {
@@ -974,6 +994,7 @@ fn expanded_message(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 window.focus(&inbox.focus);
+                inbox.session.cancel_pending_keys();
                 inbox.session.pane = Pane::Conversation;
                 inbox.session.message_cursor = index;
                 cx.notify();
@@ -1065,6 +1086,7 @@ fn body_block(
                         MouseButton::Left,
                         cx.listener(move |inbox, _, window, cx| {
                             window.focus(&inbox.focus);
+                            inbox.session.cancel_pending_keys();
                             inbox.session.pane = Pane::Conversation;
                             inbox.session.message_cursor = index;
                             if !inbox.session.quotes_open.remove(&index) {
@@ -1400,9 +1422,7 @@ fn folder_picker(
                                         if !inbox.reload_messages(true) {
                                             inbox.clear_open_message();
                                         }
-                                        inbox
-                                            .list_scroll
-                                            .scroll_to_item(inbox.session.cursor_index());
+                                        inbox.scroll_list_to_cursor();
                                         inbox.scroll_conversation();
                                     }
                                 }

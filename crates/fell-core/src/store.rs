@@ -584,9 +584,10 @@ impl Store {
         account_id: &AccountId,
         folder: &str,
     ) -> Result<Vec<FolderThread>> {
-        let in_folder =
-            "instr(char(30) || lower(folders) || char(30), char(30) || lower(?2) || char(30)) > 0
-            OR (lower(?2) = 'inbox' AND archived = 0 AND folders = '')";
+        let names = folder_query_names(folder);
+        let inbox = names.iter().any(|name| name.eq_ignore_ascii_case("inbox"));
+        let in_folder = folder_predicate("folders", "archived", 2, names.len(), inbox);
+        let in_message = folder_predicate("m.folders", "m.archived", 2, names.len(), inbox);
         let sql = format!(
             "SELECT
                 m.thread_id,
@@ -598,10 +599,7 @@ impl Store {
                   ORDER BY s.date_unix DESC, s.rowid DESC LIMIT 1),
                 MAX(m.date_unix),
                 COUNT(*),
-                MAX(CASE WHEN (
-                    instr(char(30) || lower(m.folders) || char(30), char(30) || lower(?2) || char(30)) > 0
-                    OR (lower(?2) = 'inbox' AND m.archived = 0 AND m.folders = '')
-                ) THEN m.unread ELSE 0 END),
+                MAX(CASE WHEN {in_message} THEN m.unread ELSE 0 END),
                 MAX(m.starred),
                 MAX(m.has_attachment),
                 (SELECT from_email FROM messages s
@@ -633,8 +631,11 @@ impl Store {
              GROUP BY m.thread_id
              ORDER BY MAX(m.date_unix) DESC, m.thread_id ASC"
         );
+        let mut bind = Vec::with_capacity(1 + names.len());
+        bind.push(account_id.as_str().to_string());
+        bind.extend(names);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![account_id.as_str(), folder], |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind.iter()), |row| {
             let participants: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             let labels: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
             Ok(FolderThread {
@@ -752,6 +753,63 @@ pub struct FolderThread {
     pub labels: Vec<String>,
     pub starred: bool,
     pub has_attachment: bool,
+}
+
+/// Names that count as the same folder. Unknown names match only themselves.
+pub fn folder_aliases(name: &str) -> &'static [&'static str] {
+    match name.to_ascii_lowercase().as_str() {
+        "inbox" => &["inbox"],
+        "sent" => &["sent"],
+        "drafts" => &["drafts"],
+        "archive" | "archived" => &["archive", "archived"],
+        "spam" | "junk" => &["spam", "junk"],
+        "trash" | "deleted" => &["trash", "deleted"],
+        _ => &[],
+    }
+}
+
+/// Picker name for a stored folder. Aliases share one row.
+pub fn canonical_folder_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "inbox" => Some("INBOX"),
+        "sent" => Some("Sent"),
+        "drafts" => Some("Drafts"),
+        "archive" | "archived" => Some("Archive"),
+        "spam" | "junk" => Some("Spam"),
+        "trash" | "deleted" => Some("Trash"),
+        _ => None,
+    }
+}
+
+fn folder_query_names(folder: &str) -> Vec<String> {
+    let aliases = folder_aliases(folder);
+    if aliases.is_empty() {
+        vec![folder.to_string()]
+    } else {
+        aliases.iter().map(|name| (*name).to_string()).collect()
+    }
+}
+
+fn folder_predicate(
+    folders: &str,
+    archived: &str,
+    param_start: usize,
+    alias_count: usize,
+    inbox: bool,
+) -> String {
+    let mut parts = Vec::with_capacity(alias_count);
+    for index in 0..alias_count {
+        let param = param_start + index;
+        parts.push(format!(
+            "instr(char(30) || lower({folders}) || char(30), char(30) || lower(?{param}) || char(30)) > 0"
+        ));
+    }
+    let joined = parts.join(" OR ");
+    if inbox {
+        format!("({joined} OR ({archived} = 0 AND {folders} = ''))")
+    } else {
+        format!("({joined})")
+    }
 }
 
 fn decode_participants(raw: &str) -> Vec<Participant> {
@@ -2994,6 +3052,26 @@ mod tests {
         assert!(
             store
                 .folder_threads(&AccountId("a1".into()), "Archive")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn junk_mail_opens_with_spam() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut junk = msg("junk@x", None, None, "Filtered", "junk body");
+        junk.folders = vec!["Junk".into()];
+        store.upsert_message(&junk).unwrap();
+        let spam = store
+            .folder_threads(&AccountId("a1".into()), "Spam")
+            .unwrap();
+        assert_eq!(spam.len(), 1);
+        assert_eq!(spam[0].subject, "Filtered");
+        assert!(
+            store
+                .folder_threads(&AccountId("a1".into()), "INBOX")
                 .unwrap()
                 .is_empty()
         );

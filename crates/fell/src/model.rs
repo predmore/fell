@@ -687,6 +687,14 @@ impl Session {
         n
     }
 
+    /// Drop a typed count and an unfinished chord. Mouse selection calls this
+    /// so the next key does not finish the prefix.
+    pub fn cancel_pending_keys(&mut self) {
+        self.count.clear();
+        self.chord.clear();
+        self.note_chord();
+    }
+
     fn clear_chord(&mut self) {
         if self.chord.is_empty() && !self.which_visible {
             return;
@@ -981,6 +989,21 @@ mod tests {
         assert!(!step.reload_threads);
         assert_eq!(session.folder, "Sent");
         assert_eq!(session.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn click_cancels_a_folder_prefix() {
+        let mut session = session();
+        session.folder = "Sent".into();
+        session.on_key(KeyId::Char('g'), 4);
+        session.count = "3".into();
+        session.cancel_pending_keys();
+        assert!(session.chord.is_empty());
+        assert!(session.count.is_empty());
+        assert!(!session.which_visible);
+        let step = session.on_key(KeyId::Char('i'), 4);
+        assert!(!step.reload_threads);
+        assert_eq!(session.folder, "Sent");
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

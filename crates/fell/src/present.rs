@@ -151,10 +151,13 @@ pub fn merge_folders(stored: &[String]) -> Vec<String> {
     let standard = ["INBOX", "Sent", "Drafts", "Archive", "Spam", "Trash"];
     let mut out: Vec<String> = standard.iter().map(|name| (*name).to_string()).collect();
     for name in stored {
-        if out.iter().any(|have| have.eq_ignore_ascii_case(name)) {
+        let canonical = fell_core::canonical_folder_name(name)
+            .map(str::to_string)
+            .unwrap_or_else(|| name.clone());
+        if out.iter().any(|have| have.eq_ignore_ascii_case(&canonical)) {
             continue;
         }
-        out.push(name.clone());
+        out.push(canonical);
     }
     out
 }
@@ -413,6 +416,31 @@ mod tests {
         ];
         assert_eq!(message_at_top(&shifted, scrollport - next), Some(1));
         assert_eq!(message_after_page(&[], scrollport, measured, next), None);
+    }
+
+    #[test]
+    fn alias_folders_share_one_picker_row() {
+        let folders = merge_folders(&[
+            "Junk".into(),
+            "Deleted".into(),
+            "Archived".into(),
+            "Projects".into(),
+        ]);
+        assert_eq!(
+            folders
+                .iter()
+                .filter(|name| folder_label(name) == "Spam")
+                .count(),
+            1
+        );
+        assert!(folders.iter().any(|name| name == "Spam"));
+        assert!(!folders.iter().any(|name| name.eq_ignore_ascii_case("junk")));
+        assert!(
+            !folders
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("deleted"))
+        );
+        assert!(folders.iter().any(|name| name == "Projects"));
     }
 
     #[test]
