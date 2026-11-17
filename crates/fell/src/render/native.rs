@@ -168,7 +168,7 @@ pub fn document_column(
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
-    let mut column = div().flex().flex_col().gap(px(32.)).line_height(px(26.));
+    let mut column = div().flex().flex_col().gap(px(24.)).line_height(px(22.));
     if document.is_empty() {
         return column.child(
             div()
@@ -751,7 +751,7 @@ fn crop_to_marks(rgba: &image::RgbaImage) -> image::RgbaImage {
 fn display_size(width: u32, height: u32) -> (f32, f32) {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
-    let scale = (220. / width).min(120. / height).min(1.);
+    let scale = (180. / width).min(100. / height).clamp(1., 1.45);
     (width * scale, height * scale)
 }
 
@@ -872,8 +872,8 @@ mod decode_tests {
         let bytes = find_data(&doc.blocks).expect("fixture has a data image");
         let rgba = super::decode_rgba(bytes).expect("png");
         let (_light, _dark, width, height) = theme_pair(&rgba);
-        assert!(width < 160. && height < 90., "{width}x{height}");
-        assert!(width > 40. && height > 20., "{width}x{height}");
+        assert!((80. ..220.).contains(&width), "{width}x{height}");
+        assert!((40. ..120.).contains(&height), "{width}x{height}");
     }
 
     #[test]
