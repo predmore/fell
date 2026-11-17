@@ -1632,7 +1632,7 @@ fn write_kept(
         conn,
         message.account_id.as_str(),
         message.headers.message_id.as_str(),
-        body,
+        indexed,
     )?;
     Ok(thread_id)
 }
