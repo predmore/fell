@@ -586,7 +586,7 @@ fn picture_icon(palette: &Palette) -> gpui::Div {
 /// does not keep the empty viewport under the card. Enough of that color
 /// stays for the page to reach the bottom of the message pane.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 116;
+    const KEEP_FLAT_ROWS: usize = 28;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -941,7 +941,7 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 40);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 38);
         let short = &rgba[..width as usize * 18 * 4];
         assert_eq!(trim_uniform_bottom(short, width, 18), 18);
         let mut tall = vec![0u8; width as usize * 200 * 4];
@@ -955,7 +955,7 @@ mod decode_tests {
                 tall[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&tall, width, 200), 126);
+        assert_eq!(trim_uniform_bottom(&tall, width, 200), 38);
     }
 
     #[test]
