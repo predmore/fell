@@ -13,7 +13,7 @@ use crate::embed::{
 };
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
-    encode_addresses,
+    encode_addresses, is_short_reply_body,
 };
 use crate::search::{
     IndexedText, SearchHit, SearchResults, fts5_phrase, sync_terms, terms_for_indexed,
@@ -1543,9 +1543,13 @@ fn write_kept(
         message.headers.date_unix
     };
     // The message row keeps the first copy's server id. The other copy's id
-    // and folder live on the alias, so neither is discarded.
-    let remote_id = if alias && !stored.remote_id.is_empty() {
+    // and folder live on the alias, so neither is discarded. A kept row with
+    // no server id still records that alias, so a later sync or reply finds
+    // the thread.
+    if alias {
         remember_alias(conn, message, &stored.canonical_id)?;
+    }
+    let remote_id = if alias && !stored.remote_id.is_empty() {
         stored.remote_id.clone()
     } else {
         message.remote_id.0.clone()
@@ -1738,8 +1742,9 @@ const LIST_ECHO_WINDOW_SECS: u64 = 6 * 60 * 60;
 /// Same sender, exact body fingerprint, and a delivery this close.
 ///
 /// One side must be a list rewrite, and Proton conversation ids must be absent
-/// or equal. Subject is not an identity. More than one candidate stays as
-/// separate rows.
+/// or equal. Subject is not an identity for a longer body. A short body also
+/// has to share that subject, and two list posts stay apart. More than one
+/// candidate stays as separate rows.
 fn find_list_collapse(
     conn: &Connection,
     message: &Message,
@@ -1968,13 +1973,81 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
     // Two plain messages with the same body stay apart.
     let listed =
         incoming_list || stored_list || (unlabeled_ok && unlabeled_sent_and_list(incoming, stored));
-    same_sender(&incoming.headers.from.email, &stored.from_email)
-        && dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
-        && listed
-        && proton_compatible(
+    if !same_sender(&incoming.headers.from.email, &stored.from_email)
+        || !dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
+        || !listed
+        || !proton_compatible(
             &stored.proton_conversation_id,
             &incoming.headers.proton_conversation_id,
         )
+    {
+        return false;
+    }
+    // `+1` from the same sender is not one send. A Sent copy and its echo of
+    // that short text still join when they are the same post.
+    match incoming.body_text.as_deref() {
+        Some(body) if is_short_reply_body(body) => {
+            short_reply_is_one_post(incoming, stored, incoming_list, stored_list)
+        }
+        _ => true,
+    }
+}
+
+/// A short list echo shares the subject and parent with the copy it rewrites.
+///
+/// Two posts that both carry a list id are two messages. Parents match only
+/// when both name the same `In-Reply-To`, or both omit it. A parent on only
+/// one side is a different reply. A list id on only one copy joins only when
+/// the other copy is in Sent, and that Sent copy joins only when the kept
+/// row is not already in Sent.
+fn short_reply_is_one_post(
+    incoming: &Message,
+    stored: &Arrival,
+    incoming_list: bool,
+    stored_list: bool,
+) -> bool {
+    if incoming_list && stored_list {
+        return false;
+    }
+    if subject_key(&incoming.headers.subject) != subject_key(&stored.subject) {
+        return false;
+    }
+    if !short_parents_match(incoming, stored) {
+        return false;
+    }
+    let incoming_sent = incoming
+        .folders
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    let stored_sent = split_field(&stored.folders)
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    if incoming_sent && stored_sent {
+        return false;
+    }
+    // The copy without a list id is the Sent original. An inbox row that
+    // merely lacks a list id is another post.
+    match (incoming_list, stored_list) {
+        (true, false) => stored_sent,
+        (false, true) => incoming_sent,
+        _ => true,
+    }
+}
+
+/// Both copies name the same parent, or both have none.
+fn short_parents_match(incoming: &Message, stored: &Arrival) -> bool {
+    let stored_parent = stored.in_reply_to.as_deref().filter(|id| !id.is_empty());
+    let incoming_parent = incoming
+        .headers
+        .in_reply_to
+        .as_ref()
+        .map(MessageId::as_str)
+        .filter(|id| !id.is_empty());
+    match (stored_parent, incoming_parent) {
+        (Some(stored_id), Some(incoming_id)) => stored_id == incoming_id,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival) -> bool {
@@ -4765,16 +4838,34 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
         let sent_at = 1_700_000_000;
-        let mut first = msg("thanks-a@x", None, None, "First thanks", "Thanks");
+        let mut first = msg(
+            "thanks-a@x",
+            None,
+            None,
+            "First thanks",
+            "Thanks for the detailed notes",
+        );
         first.headers.date_unix = sent_at;
         store.upsert_message(&first).unwrap();
-        let mut echo = msg("thanks-list@x", None, None, "[list] First thanks", "Thanks");
+        let mut echo = msg(
+            "thanks-list@x",
+            None,
+            None,
+            "[list] First thanks",
+            "Thanks for the detailed notes",
+        );
         echo.list_id = Some("list.example".into());
         echo.headers.date_unix = sent_at + 60;
         store.upsert_message(&echo).unwrap();
         assert_eq!(listed(&store).len(), 1);
 
-        let mut later = msg("thanks-b@x", None, None, "Second thanks", "Thanks");
+        let mut later = msg(
+            "thanks-b@x",
+            None,
+            None,
+            "Second thanks",
+            "Thanks for the detailed notes",
+        );
         later.headers.date_unix = sent_at + (2 * 60 * 60);
         store.upsert_message(&later).unwrap();
         let rows = listed(&store);
@@ -4788,6 +4879,298 @@ mod tests {
             rows.iter()
                 .any(|message| message.headers.message_id.as_str() == "thanks-b@x")
         );
+    }
+
+    #[test]
+    fn distinct_short_list_replies_stay_separate() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut first = msg(
+            "plus-a@x",
+            None,
+            Some("patch-a@x"),
+            "[list] Re: Patch A",
+            "+1",
+        );
+        first.list_id = Some("list.example".into());
+        first.headers.date_unix = sent_at;
+        first.folders = vec!["INBOX".into()];
+        store.upsert_message(&first).unwrap();
+        // Same thread and body, both delivered by the list.
+        let mut again = msg(
+            "plus-c@x",
+            None,
+            Some("patch-a@x"),
+            "Re: [list] Patch A",
+            "+1",
+        );
+        again.list_id = Some("list.example".into());
+        again.headers.date_unix = sent_at + (3 * 60 * 60);
+        again.folders = vec!["INBOX".into()];
+        store.upsert_message(&again).unwrap();
+        let mut second = msg(
+            "plus-b@x",
+            None,
+            Some("patch-b@x"),
+            "[list] Re: Patch B",
+            "+1",
+        );
+        second.list_id = Some("list.example".into());
+        second.headers.date_unix = sent_at + (2 * 60 * 60);
+        second.folders = vec!["INBOX".into()];
+        store.upsert_message(&second).unwrap();
+        // A Sent "+1" on another thread shares the subject with one list post
+        // and a different parent. It is not that post's echo.
+        let mut list_budget = msg(
+            "plus-d@x",
+            None,
+            Some("budget@x"),
+            "[list] Re: Budget",
+            "+1",
+        );
+        list_budget.list_id = Some("list.example".into());
+        list_budget.headers.date_unix = sent_at + 60;
+        store.upsert_message(&list_budget).unwrap();
+        let mut sent_other = with_arrival(
+            msg(
+                "plus-sent-budget@x",
+                None,
+                Some("dinner@x"),
+                "Re: Budget",
+                "+1",
+            ),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        sent_other.headers.date_unix = sent_at + 90;
+        store.upsert_message(&sent_other).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 5);
+        for id in [
+            "plus-a@x",
+            "plus-b@x",
+            "plus-c@x",
+            "plus-d@x",
+            "plus-sent-budget@x",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|message| message.headers.message_id.as_str() == id),
+                "{id}"
+            );
+        }
+
+        let echo = Store::open_in_memory().unwrap();
+        echo.upsert_account(&account()).unwrap();
+        let list_thread = echo.upsert_message(&first).unwrap();
+        let mut sent = with_arrival(
+            msg("plus-sent@x", None, Some("patch-a@x"), "Re: Patch A", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        sent.headers.date_unix = sent_at + 30;
+        assert_eq!(echo.upsert_message(&sent).unwrap(), list_thread);
+        let collapsed = listed(&echo);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].headers.message_id.as_str(), "plus-a@x");
+        assert!(collapsed[0].folders.iter().any(|folder| folder == "Sent"));
+        assert!(collapsed[0].folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn second_sent_short_reply_stays_after_the_echo_joins() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut list = msg(
+            "plus-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Re: Patch",
+            "+1",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at;
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let mut first = with_arrival(
+            msg("plus-sent-1@x", None, Some("patch@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        first.headers.date_unix = sent_at + 30;
+        first.remote_id = RemoteId("imap:sent-1".into());
+        store.upsert_message(&first).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+
+        let mut second = with_arrival(
+            msg("plus-sent-2@x", None, Some("patch@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        second.headers.date_unix = sent_at + (60 * 60);
+        second.remote_id = RemoteId("imap:sent-2".into());
+        store.upsert_message(&second).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let kept = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-list@x")
+            .unwrap();
+        let later = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-sent-2@x")
+            .unwrap();
+        assert!(later.folders.iter().any(|folder| folder == "Sent"));
+        assert_eq!(later.remote_id.0, "imap:sent-2");
+        assert_ne!(kept.remote_id.0, "imap:sent-2");
+    }
+
+    #[test]
+    fn list_short_reply_without_a_parent_does_not_absorb_a_sent_reply() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut list = msg("plus-list@x", None, None, "[list] Re: Patch", "+1");
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at;
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let mut sent = with_arrival(
+            msg("plus-sent@x", None, Some("other@x"), "Re: Patch", "+1"),
+            "Sent",
+            "",
+            "me@x.com",
+        );
+        sent.headers.date_unix = sent_at + 60;
+        sent.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&sent).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-list@x")
+        );
+        let sent_row = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "plus-sent@x")
+            .unwrap();
+        assert_eq!(sent_row.remote_id.0, "imap:sent");
+        assert_eq!(
+            sent_row.headers.in_reply_to.as_ref().map(MessageId::as_str),
+            Some("other@x")
+        );
+    }
+
+    #[test]
+    fn inbox_short_reply_without_list_id_stays_beside_a_list_reply() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut inbox = msg("plus-inbox@x", None, Some("patch@x"), "Re: Patch", "+1");
+        inbox.headers.date_unix = sent_at;
+        inbox.folders = vec!["INBOX".into()];
+        store.upsert_message(&inbox).unwrap();
+        let mut list = msg(
+            "plus-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Re: Patch",
+            "+1",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at + (2 * 60 * 60);
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-inbox@x")
+        );
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-list@x")
+        );
+
+        let echo = Store::open_in_memory().unwrap();
+        echo.upsert_account(&account()).unwrap();
+        let mut bare = msg("plus-bare@x", None, None, "Re: Patch", "+1");
+        bare.headers.date_unix = sent_at + 60;
+        bare.folders = vec!["INBOX".into()];
+        echo.upsert_message(&bare).unwrap();
+        let mut listed_echo = msg("plus-echo@x", None, None, "[list] Re: Patch", "+1");
+        listed_echo.list_id = Some("list.example".into());
+        listed_echo.headers.date_unix = sent_at + 90;
+        listed_echo.folders = vec!["INBOX".into()];
+        echo.upsert_message(&listed_echo).unwrap();
+        assert_eq!(listed(&echo).len(), 2);
+    }
+
+    #[test]
+    fn merged_copy_keeps_its_alias_when_the_keeper_has_no_server_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut sent = msg("sent@x", None, None, "Hello", "sent body");
+        sent.headers.date_unix = 1_700_000_000;
+        sent.folders = vec!["Sent".into()];
+        store.upsert_message(&sent).unwrap();
+        let mut list = msg("list@x", None, None, "[list] Hello", "list body");
+        list.headers.date_unix = 1_700_000_000;
+        list.list_id = Some("list.example".into());
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET body_text = 'hello body', snippet = 'hello body',
+                    body_fingerprint = ?1
+                 WHERE account_id = 'a1'",
+                params![fingerprint],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET remote_id = '' WHERE message_id = 'list@x'",
+                [],
+            )
+            .unwrap();
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        store.upsert_message(&again).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].headers.message_id.as_str(), "list@x");
+        let canonical: String = store
+            .conn
+            .query_row(
+                "SELECT canonical_message_id FROM message_aliases WHERE message_id = 'sent@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, "list@x");
+        store.upsert_message(&again).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+        let reply = store
+            .upsert_message(&msg(
+                "reply@x",
+                None,
+                Some("sent@x"),
+                "Re: Hello",
+                "following up on the sent copy",
+            ))
+            .unwrap();
+        assert_eq!(reply, rows[0].thread_id);
+        assert_eq!(listed(&store).len(), 2);
     }
 
     #[test]
