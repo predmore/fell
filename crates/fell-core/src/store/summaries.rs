@@ -21,7 +21,7 @@ use crate::Result;
 use crate::account::AccountId;
 use crate::threading::ThreadId;
 
-const SUMMARY_SCHEMA: &str = r#"
+const SUMMARY_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS thread_summary (
     account_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
@@ -71,36 +71,66 @@ CREATE TABLE IF NOT EXISTS thread_summary_dirty (
     thread_id TEXT NOT NULL,
     PRIMARY KEY (account_id, thread_id)
 ) WITHOUT ROWID;
+"#;
 
+/// Bump when [`SUMMARY_TRIGGERS`] changes. They are rebuilt only then, in
+/// one transaction (see [`super::ensure_triggers`]).
+const SUMMARY_TRIGGERS_VERSION: &str = "1";
+
+// Inserts check NOT EXISTS instead of OR IGNORE: an UPSERT that fires a
+// trigger overrides the trigger's own conflict clause.
+const SUMMARY_TRIGGERS: &str = r#"
 DROP TRIGGER IF EXISTS thread_summary_insert;
 DROP TRIGGER IF EXISTS thread_summary_update;
 DROP TRIGGER IF EXISTS thread_summary_delete;
 
 CREATE TRIGGER thread_summary_insert AFTER INSERT ON messages BEGIN
-    INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
-    VALUES (new.account_id, new.thread_id);
+    INSERT INTO thread_summary_dirty (account_id, thread_id)
+    SELECT new.account_id, new.thread_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_summary_dirty
+        WHERE account_id = new.account_id AND thread_id = new.thread_id
+    );
 END;
 
 CREATE TRIGGER thread_summary_update AFTER UPDATE OF
     account_id, thread_id, subject, snippet, date_unix, unread, folders, archived,
     starred, has_attachment, from_email, from_name, labels
 ON messages BEGIN
-    INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
-    VALUES (old.account_id, old.thread_id);
-    INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
-    VALUES (new.account_id, new.thread_id);
+    INSERT INTO thread_summary_dirty (account_id, thread_id)
+    SELECT old.account_id, old.thread_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_summary_dirty
+        WHERE account_id = old.account_id AND thread_id = old.thread_id
+    );
+    INSERT INTO thread_summary_dirty (account_id, thread_id)
+    SELECT new.account_id, new.thread_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_summary_dirty
+        WHERE account_id = new.account_id AND thread_id = new.thread_id
+    );
 END;
 
 CREATE TRIGGER thread_summary_delete AFTER DELETE ON messages BEGIN
-    INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
-    VALUES (old.account_id, old.thread_id);
+    INSERT INTO thread_summary_dirty (account_id, thread_id)
+    SELECT old.account_id, old.thread_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM thread_summary_dirty
+        WHERE account_id = old.account_id AND thread_id = old.thread_id
+    );
 END;
 "#;
 
 /// Create the tables and triggers, and fill them the first time a mailbox
 /// opens with this code.
 pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SUMMARY_SCHEMA)?;
+    conn.execute_batch(SUMMARY_TABLES)?;
+    super::ensure_triggers(
+        conn,
+        "summary_triggers",
+        SUMMARY_TRIGGERS_VERSION,
+        SUMMARY_TRIGGERS,
+    )?;
     if summaries_are_current(conn)? {
         return Ok(());
     }
@@ -418,6 +448,28 @@ pub(super) fn folder_threads(
     account_id: &AccountId,
     folder: &str,
 ) -> Result<Vec<FolderThread>> {
+    in_one_snapshot(conn, || folder_threads_in(conn, account_id, folder))
+}
+
+/// Run `read` inside one read transaction. The summary rows and the queue
+/// of threads to compute live must come from the same moment: otherwise a
+/// write that skipped the refresh can commit between the two reads and a
+/// thread is dropped or listed twice. A savepoint also nests inside a
+/// write transaction.
+fn in_one_snapshot<T>(conn: &Connection, read: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("SAVEPOINT fell_list_read")?;
+    let out = read();
+    let released = conn.execute_batch("RELEASE fell_list_read");
+    let out = out?;
+    released?;
+    Ok(out)
+}
+
+fn folder_threads_in(
+    conn: &Connection,
+    account_id: &AccountId,
+    folder: &str,
+) -> Result<Vec<FolderThread>> {
     let account = account_id.as_str();
     let keys: Vec<String> = folder_query_names(folder)
         .iter()
@@ -473,6 +525,10 @@ pub(super) fn folder_threads(
 
 /// Distinct folder names, as first stored, in the order they first appeared.
 pub(super) fn folder_names(conn: &Connection, account_id: &AccountId) -> Result<Vec<String>> {
+    in_one_snapshot(conn, || folder_names_in(conn, account_id))
+}
+
+fn folder_names_in(conn: &Connection, account_id: &AccountId) -> Result<Vec<String>> {
     let account = account_id.as_str();
     let queued = queued_threads(conn, account)?;
     if queued.is_empty() {
@@ -885,6 +941,77 @@ mod tests {
                 plan.iter().all(|step| step.contains("thread_id=?")),
                 "{sql}: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_folder_read_works_inside_and_outside_a_write() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut rng = Rng(5);
+        let batch: Vec<Message> = (0..10).map(|index| message(&mut rng, index, &[])).collect();
+        store
+            .apply_delta(
+                &account().id,
+                &MailboxDelta {
+                    messages: batch,
+                    flags: Vec::new(),
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let outside = store.folder_threads(&account().id, "INBOX").unwrap();
+        let tx = crate::store::immediate_transaction(&store.conn).unwrap();
+        let inside = folder_threads(&tx, &account().id, "INBOX").unwrap();
+        let names = folder_names(&tx, &account().id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(inside, outside);
+        assert_eq!(names, store.folder_names(&account().id).unwrap());
+    }
+
+    #[test]
+    fn a_current_mailbox_keeps_its_summary_triggers() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-summary-triggers-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = Store::open(&path).unwrap();
+        first
+            .conn
+            .execute_batch(
+                "DROP TRIGGER thread_summary_delete;
+                 CREATE TRIGGER thread_summary_delete AFTER DELETE ON messages BEGIN
+                     -- marker
+                     INSERT INTO thread_summary_dirty (account_id, thread_id)
+                     SELECT old.account_id, old.thread_id
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM thread_summary_dirty
+                         WHERE account_id = old.account_id AND thread_id = old.thread_id
+                     );
+                 END;",
+            )
+            .unwrap();
+        let second = Store::open(&path).unwrap();
+        let sql: String = second
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'thread_summary_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("marker"),
+            "no trigger rebuild on a current mailbox"
+        );
+        drop(second);
+        drop(first);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 }
