@@ -929,7 +929,15 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
                 open_requested_or_canonical(&requested_abs, &canonical)?
             }
         };
-        let _ = publish_mailbox_path(&db, &path);
+        // A non-canonical path must be recorded. Otherwise a later open sees
+        // no attribute, and a symlink does not raise nlink, so it would guess
+        // the canonical file and start a second WAL.
+        if publish_mailbox_path(&db, &path).is_err() && path != canonical {
+            drop(conn);
+            return Err(crate::Error::Invalid(
+                "cannot publish the shared mailbox path".into(),
+            ));
+        }
         // Every live store holds this shared lock, so a later open cannot
         // take the exclusive lock and start a second WAL.
         db.lock_shared()?;

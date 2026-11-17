@@ -1431,6 +1431,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_busy_symlink_without_a_published_path_does_not_open() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-alias-unpub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
+        let alias = dir.join("alias.sqlite");
+        let hold = rusqlite::Connection::open(&alias).unwrap();
+        hold.pragma_update(None, "journal_mode", "WAL").unwrap();
+        hold.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE marker (value TEXT NOT NULL);
+             INSERT INTO marker (value) VALUES ('from-alias');
+             BEGIN;",
+        )
+        .unwrap();
+        let _ = hold
+            .query_row("SELECT value FROM marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        crate::store::testing_reject_mailbox_xattr(true);
+        let opened = Store::open(&alias);
+        crate::store::testing_reject_mailbox_xattr(false);
+        assert!(opened.is_err(), "alias stayed open without a shared path");
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn an_idle_symlink_opens_the_canonical_mailbox() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
