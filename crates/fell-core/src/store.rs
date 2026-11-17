@@ -309,6 +309,7 @@ impl Store {
         // Batches commit on their own so a large mailbox is not one transaction.
         if schema_version(&conn)?.as_deref() != Some("3") {
             backfill_fingerprints(&conn)?;
+            merge_backfilled_duplicates(&conn)?;
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -975,9 +976,16 @@ fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
     {
+        if !via_alias
+            && !alias_points_at(conn, &message.account_id, &stored.canonical_id)?
+            && let Some(other) =
+                find_list_collapse(conn, message, &fingerprint, Some(&stored.canonical_id))?
+        {
+            return absorb_duplicate(conn, message, &stored, &other);
+        }
         return write_kept(conn, message, &stored, via_alias);
     }
-    if let Some(stored) = find_list_collapse(conn, message, &fingerprint)? {
+    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None)? {
         remember_alias(conn, message, &stored.canonical_id)?;
         return write_kept(conn, message, &stored, true);
     }
@@ -1333,6 +1341,7 @@ fn find_list_collapse(
     conn: &Connection,
     message: &Message,
     fingerprint: &str,
+    exclude: Option<&str>,
 ) -> Result<Option<Arrival>> {
     if fingerprint.is_empty() {
         return Ok(None);
@@ -1349,6 +1358,9 @@ fn find_list_collapse(
     let mut matches = Vec::new();
     for row in rows {
         let stored = row?;
+        if exclude == Some(stored.canonical_id.as_str()) {
+            continue;
+        }
         if is_fingerprint_echo(message, &stored) {
             matches.push(stored);
         }
@@ -1365,6 +1377,79 @@ fn find_list_collapse(
         return Ok(None);
     }
     Ok(Some(only))
+}
+
+/// Fold `message`'s existing row into `keeper`, then drop the duplicate row.
+fn absorb_duplicate(
+    conn: &Connection,
+    message: &Message,
+    doomed: &Arrival,
+    keeper: &Arrival,
+) -> Result<ThreadId> {
+    let thread = write_kept(conn, message, keeper, true)?;
+    let old_terms = terms_for_indexed(IndexedText {
+        subject: &doomed.subject,
+        from_name: doomed.from_name.as_deref(),
+        from_email: &doomed.from_email,
+        body: &doomed.body,
+        to_line: &doomed.to_line,
+        cc_line: &doomed.cc_line,
+        bcc_line: &doomed.bcc_line,
+        folders: &doomed.folders,
+        labels: &doomed.labels,
+    });
+    sync_terms(
+        conn,
+        message.account_id.as_str(),
+        &old_terms,
+        &HashSet::new(),
+    )?;
+    conn.execute(
+        "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
+        params![message.account_id.as_str(), doomed.canonical_id],
+    )?;
+    conn.execute(
+        "UPDATE message_aliases SET canonical_message_id = ?1
+         WHERE account_id = ?2 AND canonical_message_id = ?3",
+        params![
+            keeper.canonical_id,
+            message.account_id.as_str(),
+            doomed.canonical_id,
+        ],
+    )?;
+    Ok(thread)
+}
+
+fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_MESSAGE_COLS} FROM messages
+         WHERE body_fingerprint != ''
+         ORDER BY rowid"
+    ))?;
+    let rows = stmt.query_map([], row_to_message)?;
+    let mut pending = Vec::new();
+    for row in rows {
+        pending.push(row?);
+    }
+    drop(stmt);
+    for message in pending {
+        let fingerprint = message_fingerprint(&message);
+        let Some((stored, via_alias)) =
+            find_stored(conn, &message.account_id, &message.headers.message_id)?
+        else {
+            continue;
+        };
+        if via_alias || alias_points_at(conn, &message.account_id, &stored.canonical_id)? {
+            continue;
+        }
+        let Some(other) =
+            find_list_collapse(conn, &message, &fingerprint, Some(&stored.canonical_id))?
+        else {
+            continue;
+        };
+        absorb_duplicate(conn, &message, &stored, &other)?;
+    }
+    Ok(())
 }
 
 fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str) -> Result<bool> {
@@ -4431,6 +4516,50 @@ mod tests {
         assert_eq!(rows[0].list_id.as_deref(), Some("list.example"));
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resync_joins_a_pair_that_was_stored_separately() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        for (id, subject, folder, list_id) in [
+            ("sent@x", "Hello", "Sent", None),
+            ("list@x", "[list] Hello", "INBOX", Some("list.example")),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint, list_id
+                     ) VALUES (
+                        'a1', ?1, ?1, ?2, '', 'from@x', ?3, 1700000000, 'hello body', 'hello body',
+                        1, ?4, ?5, ?6
+                     )",
+                    params![
+                        id,
+                        format!("msgid:{id}"),
+                        subject,
+                        folder,
+                        fingerprint,
+                        list_id
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(listed(&store).len(), 2);
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        store.upsert_message(&again).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].headers.subject, "Hello");
+        assert_eq!(rows[0].headers.message_id.as_str(), "list@x");
+        assert!(rows[0].folders.iter().any(|folder| folder == "Sent"));
+        assert!(rows[0].folders.iter().any(|folder| folder == "INBOX"));
     }
 
     #[test]
