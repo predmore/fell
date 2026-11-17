@@ -19,6 +19,8 @@ use super::theme::{Palette, ink, paint};
 struct CachedImage {
     on_light: Arc<RenderImage>,
     on_dark: Arc<RenderImage>,
+    width: f32,
+    height: f32,
 }
 
 pub struct ImageGallery {
@@ -50,27 +52,38 @@ impl ImageGallery {
             let Some(rgba) = decode_rgba(bytes) else {
                 return;
             };
-            let (on_light, on_dark) = theme_pair(&rgba);
+            let (on_light, on_dark, width, height) = theme_pair(&rgba);
             used += size;
             gallery.held.push(Arc::clone(&on_light));
             if !Arc::ptr_eq(&on_light, &on_dark) {
                 gallery.held.push(Arc::clone(&on_dark));
             }
-            gallery
-                .decoded
-                .insert(key, CachedImage { on_light, on_dark });
+            gallery.decoded.insert(
+                key,
+                CachedImage {
+                    on_light,
+                    on_dark,
+                    width,
+                    height,
+                },
+            );
         };
         walk_sources(&document.blocks, &mut visit);
         gallery
     }
 
     pub fn get(&self, bytes: &[u8], dark_page: bool) -> Option<Arc<RenderImage>> {
+        Some(Arc::clone(&self.placed(bytes, dark_page)?.0))
+    }
+
+    fn placed(&self, bytes: &[u8], dark_page: bool) -> Option<(Arc<RenderImage>, f32, f32)> {
         let cached = self.decoded.get(&(bytes.as_ptr() as usize))?;
-        Some(if dark_page {
+        let image = if dark_page {
             Arc::clone(&cached.on_dark)
         } else {
             Arc::clone(&cached.on_light)
-        })
+        };
+        Some((image, cached.width, cached.height))
     }
 
     /// Remove every cached texture from the sprite atlas.
@@ -478,14 +491,16 @@ fn image_el(
     gallery: &ImageGallery,
 ) -> AnyElement {
     if let ImageSource::Data { bytes, .. } = source
-        && let Some(rendered) = gallery.get(bytes, palette.scheme() == "dark")
+        && let Some((rendered, width, height)) = gallery.placed(bytes, palette.scheme() == "dark")
     {
         let mut frame = div()
+            .w(px(width))
+            .h(px(height))
             .border(px(1.))
             .border_color(paint(palette.border))
             .rounded(px(4.))
             .overflow_hidden()
-            .child(img(rendered).max_w(px(420.)).max_h(px(240.)));
+            .child(img(rendered).w(px(width)).h(px(height)));
         frame.style().align_self = Some(gpui::AlignItems::FlexStart);
         return frame.into_any_element();
     }
@@ -514,55 +529,76 @@ fn image_el(
         }
     };
     let mut placeholder = div()
-        .w(px(220.))
-        .h(px(72.))
-        .px_3()
+        .px_2()
+        .py(px(6.))
         .flex()
         .items_center()
-        .justify_center()
+        .gap_2()
         .border(px(1.))
         .border_color(paint(palette.border))
         .rounded(px(4.))
         .text_sm()
         .text_color(paint(palette.foreground))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(22.))
-                        .h(px(22.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border(px(1.))
-                        .border_color(paint(palette.dimmed))
-                        .rounded(px(2.))
-                        .text_xs()
-                        .child("img"),
-                )
-                .child(label),
-        );
+        .child(picture_icon(palette))
+        .child(label);
     placeholder.style().align_self = Some(gpui::AlignItems::FlexStart);
     placeholder.into_any_element()
 }
 
 pub(crate) fn embedded_web(image: Arc<RenderImage>, frame: u32) -> AnyElement {
+    // A light page border has to read against both the cream email and the
+    // off-white message pane. The dark border already does.
+    let frame = if frame > 0x808080 { 0xb7b1a6 } else { frame };
     div()
         .w_full()
         .border(px(1.))
         .border_color(paint(frame))
-        .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
+        .child(
+            img(image)
+                .w_full()
+                .max_h(px(520.))
+                .object_fit(gpui::ObjectFit::Contain),
+        )
         .into_any_element()
+}
+
+/// A small picture mark. The blocked-image slot used to spell "img" inside a
+/// second box, which read as a placeholder glyph.
+fn picture_icon(palette: &Palette) -> gpui::Div {
+    div()
+        .w(px(16.))
+        .h(px(16.))
+        .flex()
+        .flex_col()
+        .justify_between()
+        .px(px(2.))
+        .py(px(2.))
+        .border(px(1.))
+        .border_color(paint(palette.dimmed))
+        .rounded(px(2.))
+        .child(
+            div().flex().justify_end().child(
+                div()
+                    .w(px(4.))
+                    .h(px(4.))
+                    .rounded(px(2.))
+                    .bg(paint(palette.dimmed)),
+            ),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(2.))
+                .rounded(px(1.))
+                .bg(paint(palette.dimmed)),
+        )
 }
 
 /// Drop trailing rows that are a flat page color, so a short newsletter
 /// does not keep the empty viewport under the card. A short run of that
 /// color is the email's own padding and stays, so the card is not clipped.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 36;
+    const KEEP_FLAT_ROWS: usize = 16;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -680,15 +716,55 @@ fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
 /// A drawing on a flat paper color is stored twice, once per theme, from the
 /// same decode. The paper becomes transparent and the strokes take the text
 /// color, so a cream sketch does not sit as a light card on a dark page.
-fn theme_pair(rgba: &image::RgbaImage) -> (Arc<RenderImage>, Arc<RenderImage>) {
+fn theme_pair(rgba: &image::RgbaImage) -> (Arc<RenderImage>, Arc<RenderImage>, f32, f32) {
     let Some(strokes) = lift_paper(rgba) else {
+        let (width, height) = display_size(rgba.width(), rgba.height());
         let image = render_frame(rgba.clone());
-        return (Arc::clone(&image), image);
+        return (Arc::clone(&image), image, width, height);
     };
+    let strokes = crop_to_marks(&strokes);
+    let (width, height) = display_size(strokes.width(), strokes.height());
     (
         render_frame(tint(&strokes, [0x1a, 0x1a, 0x1a])),
         render_frame(tint(&strokes, [0xe8, 0xe8, 0xe8])),
+        width,
+        height,
     )
+}
+
+/// Drop the empty paper around a sketch so the frame hugs the drawing.
+fn crop_to_marks(rgba: &image::RgbaImage) -> image::RgbaImage {
+    let (width, height) = rgba.dimensions();
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut any = false;
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        if pixel[3] > 16 {
+            any = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !any || max_x < min_x || max_y < min_y {
+        return rgba.clone();
+    }
+    let pad = 6;
+    let x0 = min_x.saturating_sub(pad);
+    let y0 = min_y.saturating_sub(pad);
+    let x1 = (max_x + pad).min(width - 1);
+    let y1 = (max_y + pad).min(height - 1);
+    image::imageops::crop_imm(rgba, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image()
+}
+
+fn display_size(width: u32, height: u32) -> (f32, f32) {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let scale = (220. / width).min(120. / height).min(1.);
+    (width * scale, height * scale)
 }
 
 fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
@@ -800,6 +876,19 @@ mod decode_tests {
     }
 
     #[test]
+    fn sketch_frame_hugs_the_drawing() {
+        use super::theme_pair;
+        let doc = html_to_document(include_str!(
+            "../../../fell-render/fixtures/native-personal-reply.html"
+        ));
+        let bytes = find_data(&doc.blocks).expect("fixture has a data image");
+        let rgba = super::decode_rgba(bytes).expect("png");
+        let (_light, _dark, width, height) = theme_pair(&rgba);
+        assert!(width < 160. && height < 90., "{width}x{height}");
+        assert!(width > 40. && height > 20., "{width}x{height}");
+    }
+
+    #[test]
     fn fixture_inline_png_decodes() {
         let doc = html_to_document(include_str!(
             "../../../fell-render/fixtures/native-personal-reply.html"
@@ -864,7 +953,7 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 40);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 26);
         let short = &rgba[..width as usize * 18 * 4];
         assert_eq!(trim_uniform_bottom(short, width, 18), 18);
     }

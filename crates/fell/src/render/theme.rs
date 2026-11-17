@@ -57,7 +57,7 @@ impl Palette {
 
     fn light() -> Self {
         Self {
-            background: 0xe8e4dc,
+            background: 0xfbfaf8,
             foreground: 0x1a1a1a,
             dimmed: 0x5e5e5e,
             accent: 0x0b4f9c,
