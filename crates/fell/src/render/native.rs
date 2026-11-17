@@ -159,6 +159,14 @@ fn walk_inlines_sources(inlines: &[Inline], visit: &mut impl FnMut(&ImageSource)
     }
 }
 
+/// Space between blocks. A short letter uses this rhythm instead of a
+/// closing rule.
+const BLOCK_GAP: f32 = 24.;
+
+/// A caption under a sketch uses half the paragraph rhythm, so it reads as
+/// a label for the drawing. The next block still gets [`BLOCK_GAP`].
+const CAPTION_GAP: f32 = BLOCK_GAP / 2.;
+
 /// Native styled text. Compose paints markdown through this same function.
 pub fn document_column(
     document: &StyledDocument,
@@ -168,7 +176,11 @@ pub fn document_column(
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
-    let mut column = div().flex().flex_col().gap(px(24.)).line_height(px(22.));
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px(BLOCK_GAP))
+        .line_height(px(22.));
     if document.is_empty() {
         return column.child(
             div()
@@ -176,10 +188,91 @@ pub fn document_column(
                 .child("This message has no body."),
         );
     }
-    for block in &document.blocks {
-        column = column.child(render_block(block, palette, allow_remote, gallery));
+    for (start, end) in column_runs(&document.blocks, gallery) {
+        column = if end - start == 2 {
+            column.child(sketch_with_caption(
+                &document.blocks[start],
+                &document.blocks[start + 1],
+                palette,
+                allow_remote,
+                gallery,
+            ))
+        } else {
+            column.child(render_block(
+                &document.blocks[start],
+                palette,
+                allow_remote,
+                gallery,
+            ))
+        };
     }
     column
+}
+
+/// A decoded sketch and the gray placeholder under it share one column
+/// child. The column's own gap then stays the full paragraph gap before
+/// whatever follows, including a quote.
+fn sketch_with_caption(
+    sketch: &Block,
+    caption: &Block,
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(CAPTION_GAP))
+        .child(render_block(sketch, palette, allow_remote, gallery))
+        .child(render_block(caption, palette, allow_remote, gallery))
+        .into_any_element()
+}
+
+/// Inclusive-exclusive ranges of blocks that share one column child.
+fn column_runs(blocks: &[Block], gallery: &ImageGallery) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        if caption_under_sketch(&blocks[index], blocks.get(index + 1), gallery) {
+            runs.push((index, index + 2));
+            index += 2;
+        } else {
+            runs.push((index, index + 1));
+            index += 1;
+        }
+    }
+    runs
+}
+
+fn caption_under_sketch(block: &Block, next: Option<&Block>, gallery: &ImageGallery) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    decoded_sketch(block, gallery) && placeholder_caption(next, gallery)
+}
+
+fn sole_image(block: &Block) -> Option<&ImageSource> {
+    match block {
+        Block::Image { source, .. } => Some(source),
+        Block::Paragraph { inlines } => match inlines.as_slice() {
+            [Inline::Image { source, .. }] => Some(source),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn decoded_sketch(block: &Block, gallery: &ImageGallery) -> bool {
+    let Some(ImageSource::Data { bytes, .. }) = sole_image(block) else {
+        return false;
+    };
+    gallery.placed(bytes, false).is_some()
+}
+
+/// The plain gray line a blocked, missing, or undecoded image paints.
+/// A decoded picture is the sketch itself, not its caption.
+fn placeholder_caption(block: &Block, gallery: &ImageGallery) -> bool {
+    sole_image(block).is_some() && !decoded_sketch(block, gallery)
 }
 
 fn render_block(
@@ -887,6 +980,58 @@ mod decode_tests {
         let (_light, _dark, width, height) = theme_pair(&rgba);
         assert!((80. ..220.).contains(&width), "{width}x{height}");
         assert!((40. ..120.).contains(&height), "{width}x{height}");
+    }
+
+    #[test]
+    fn blocked_caption_shares_the_sketch_and_the_quote_keeps_the_paragraph_gap() {
+        use super::{BLOCK_GAP, CAPTION_GAP, caption_under_sketch, column_runs};
+        use fell_render::ImageSource;
+
+        assert_eq!(CAPTION_GAP * 2., BLOCK_GAP);
+
+        let doc = html_to_document(include_str!(
+            "../../../fell-render/fixtures/native-personal-reply.html"
+        ));
+        let gallery = super::ImageGallery::from_document(&doc);
+        let sketch = doc
+            .blocks
+            .iter()
+            .position(|block| super::decoded_sketch(block, &gallery))
+            .expect("sketch");
+        let runs = column_runs(&doc.blocks, &gallery);
+        assert!(
+            runs.contains(&(sketch, sketch + 2)),
+            "caption stays with the sketch: {runs:?}"
+        );
+        assert!(
+            runs.contains(&(sketch + 2, sketch + 3)),
+            "the quote stays its own block: {runs:?}"
+        );
+        assert!(matches!(doc.blocks[sketch + 2], Block::Quote { .. }));
+        assert!(caption_under_sketch(
+            &doc.blocks[sketch],
+            doc.blocks.get(sketch + 1),
+            &gallery
+        ));
+        assert!(!caption_under_sketch(
+            &doc.blocks[sketch - 1],
+            Some(&doc.blocks[sketch]),
+            &gallery
+        ));
+        match super::sole_image(&doc.blocks[sketch + 1]) {
+            Some(ImageSource::Remote(url)) => assert!(url.contains("cabin"), "{url}"),
+            other => panic!("caption is the blocked cabin image, got {other:?}"),
+        }
+
+        let sketch_block = doc.blocks[sketch].clone();
+        let doubled = fell_render::StyledDocument {
+            blocks: vec![sketch_block.clone(), sketch_block],
+        };
+        let both = super::ImageGallery::from_document(&doubled);
+        assert!(
+            !caption_under_sketch(&doubled.blocks[0], Some(&doubled.blocks[1]), &both),
+            "two sketches keep the paragraph gap"
+        );
     }
 
     #[test]
