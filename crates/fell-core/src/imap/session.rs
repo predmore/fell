@@ -1,5 +1,5 @@
 //! Blocking IMAP session. Read-only commands only: CAPABILITY, STARTTLS,
-//! LOGIN, LIST, EXAMINE, UID FETCH, ENABLE, LOGOUT.
+//! LOGIN, LIST, EXAMINE, UID FETCH, ENABLE, IDLE, LOGOUT.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -45,6 +45,20 @@ pub(super) struct Fetched {
     /// never read. The checkpoint must stay below this UID.
     pub body_missing: bool,
 }
+
+/// Why [`Session::idle`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdleEnd {
+    /// The server reported new, removed, or changed mail.
+    Changed,
+    /// `max` passed with no news.
+    Quiet,
+    /// The caller asked to stop.
+    Stopped,
+}
+
+/// How often IDLE looks up from the socket to see whether to stop.
+const IDLE_POLL: Duration = Duration::from_millis(250);
 
 /// How a streaming UID FETCH ended. `Truncated` means the untagged cap was hit;
 /// the rest of that command was discarded and the connection is still usable.
@@ -270,6 +284,146 @@ impl Session {
         uids.sort_unstable();
         uids.dedup();
         Ok(uids)
+    }
+
+    pub(super) fn has_idle(&self) -> bool {
+        self.has_cap("IDLE")
+    }
+
+    /// RFC 2177 IDLE on the mailbox already examined. Returns when the server
+    /// sends `EXISTS`, `EXPUNGE`, `RECENT`, or `FETCH`, when `max` passes, or
+    /// when `stop` returns true (checked every [`IDLE_POLL`]). Always ends
+    /// IDLE with `DONE` and reads the tagged reply, so the session stays
+    /// usable. Read-only: IDLE changes nothing on the server.
+    pub(super) fn idle(
+        &mut self,
+        max: Duration,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<IdleEnd, Error> {
+        self.tag += 1;
+        let tag = format!("a{}", self.tag);
+        self.write_all(format!("{tag} IDLE\r\n").as_bytes())?;
+        // Untagged news can come before the continuation. It still counts.
+        let mut news = false;
+        loop {
+            let (line, _) = self.read_logical()?;
+            if line.starts_with('+') {
+                break;
+            }
+            if text_starts_with_tag(&line, &tag) {
+                return Err(imap_err(format!(
+                    "IDLE refused: {}",
+                    line[tag.len()..].trim()
+                )));
+            }
+            if is_bye(line.as_bytes()) {
+                self.disconnect();
+                return Err(imap_err(format!("{} closed the connection", self.host)));
+            }
+            news |= idle_news(line.as_bytes());
+        }
+        self.set_read_timeout(IDLE_POLL)?;
+        let started = std::time::Instant::now();
+        let end = loop {
+            if news {
+                break Ok(IdleEnd::Changed);
+            }
+            match self.idle_line() {
+                Ok(Some(line)) => {
+                    if text_starts_with_tag(&String::from_utf8_lossy(&line), &tag) {
+                        // The server ended IDLE itself; there is nothing to DONE.
+                        let _ = self.set_read_timeout(TIMEOUT);
+                        let text = String::from_utf8_lossy(&line).into_owned();
+                        return Err(imap_err(format!(
+                            "IDLE ended: {}",
+                            text[tag.len()..].trim()
+                        )));
+                    }
+                    if is_bye(&line) {
+                        self.disconnect();
+                        return Err(imap_err(format!("{} closed the connection", self.host)));
+                    }
+                    // A literal follows: news, and the reply read after DONE
+                    // consumes the literal instead of parsing it as lines.
+                    news = idle_news(&line)
+                        || !matches!(literal_marker(&line), LiteralMarker::NotLiteral);
+                    if news {
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => break Err(err),
+            }
+            if stop() {
+                break Ok(IdleEnd::Stopped);
+            }
+            if started.elapsed() >= max {
+                break Ok(IdleEnd::Quiet);
+            }
+        };
+        let restored = self.set_read_timeout(TIMEOUT);
+        let end = end?;
+        restored?;
+        self.write_all(b"DONE\r\n")?;
+        self.read_reply(&tag, "IDLE")?;
+        Ok(end)
+    }
+
+    /// One line, or `None` when the read timed out. Bytes of a partial line
+    /// stay buffered for the next call.
+    fn idle_line(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let mut buf = self.take_buf();
+        loop {
+            if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                let mut line = buf.drain(..=pos).collect::<Vec<_>>();
+                self.restore_buf(buf);
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(line));
+            }
+            if buf.len() > line_limit() {
+                return Err(imap_err(format!(
+                    "response line from {} exceeds the {} byte limit",
+                    self.host,
+                    line_limit()
+                )));
+            }
+            let mut tmp = [0u8; 4096];
+            let Some(io) = self.io.as_mut() else {
+                return Err(imap_err("connection closed"));
+            };
+            match io.read(&mut tmp) {
+                Ok(0) => {
+                    return Err(imap_err(format!("connection to {} closed", self.host)));
+                }
+                Ok(count) => buf.extend_from_slice(&tmp[..count]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.restore_buf(buf);
+                    return Ok(None);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    return Err(imap_err(format!("read from {} failed: {err}", self.host)));
+                }
+            }
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        let tcp = match self.io.as_ref() {
+            Some(Io::Plain(tcp)) => tcp,
+            Some(Io::Tls(stream)) => &stream.sock.inner,
+            None => return Err(imap_err("connection closed")),
+        };
+        tcp.set_read_timeout(Some(timeout))
+            .map_err(|err| imap_err(format!("read timeout on {}: {err}", self.host)))
     }
 
     pub(super) fn logout(&mut self) {
@@ -1440,6 +1594,29 @@ impl Scan<'_> {
         }
         None
     }
+}
+
+fn is_bye(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line).to_ascii_uppercase();
+    let mut words = text.split_whitespace();
+    words.next() == Some("*") && words.next() == Some("BYE")
+}
+
+/// An untagged IDLE line that means the mailbox changed.
+fn idle_news(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line).to_ascii_uppercase();
+    let mut words = text.split_whitespace();
+    if words.next() != Some("*") {
+        return false;
+    }
+    let Some(number) = words.next() else {
+        return false;
+    };
+    number.chars().all(|ch| ch.is_ascii_digit())
+        && matches!(
+            words.next(),
+            Some("EXISTS" | "EXPUNGE" | "RECENT" | "FETCH")
+        )
 }
 
 fn imap_err(message: impl Into<String>) -> Error {

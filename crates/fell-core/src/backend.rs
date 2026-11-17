@@ -34,6 +34,18 @@ pub trait MailBackend {
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta>;
 
+    /// Block until the server reports new mail, `max` passes, or `stop`
+    /// returns true (checked several times a second). Backends without push
+    /// return [`crate::imap::InboxWait::Unsupported`] at once.
+    fn wait_for_change(
+        &self,
+        _cursor: Option<&SyncCursor>,
+        _max: std::time::Duration,
+        _stop: &mut dyn FnMut() -> bool,
+    ) -> Result<crate::imap::InboxWait> {
+        Ok(crate::imap::InboxWait::Unsupported)
+    }
+
     /// Persist each bounded delta as it is produced. The default fetches once.
     fn sync_changes(
         &self,
@@ -99,6 +111,15 @@ impl MailBackend for BridgeBackend {
         collect_imap(&self.account_id, &self.imap, cursor)
     }
 
+    fn wait_for_change(
+        &self,
+        cursor: Option<&SyncCursor>,
+        max: std::time::Duration,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<crate::imap::InboxWait> {
+        crate::imap::wait_for_inbox(&self.imap, cursor, max, stop)
+    }
+
     fn sync_changes(
         &self,
         cursor: Option<&SyncCursor>,
@@ -150,6 +171,15 @@ impl MailBackend for ImapBackend {
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
         collect_imap(&self.account_id, &self.config, cursor)
+    }
+
+    fn wait_for_change(
+        &self,
+        cursor: Option<&SyncCursor>,
+        max: std::time::Duration,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<crate::imap::InboxWait> {
+        crate::imap::wait_for_inbox(&self.config, cursor, max, stop)
     }
 
     fn sync_changes(
