@@ -211,11 +211,8 @@ impl Store {
         )
         .map_err(crate::Error::Invalid)?;
         for file in &stored.files {
-            let path = folder.join(&file.path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, &file.bytes)?;
+            workspace::write_inside(folder, &file.path, &file.bytes)
+                .map_err(crate::Error::Invalid)?;
         }
         Ok(Some(stored))
     }
@@ -299,6 +296,7 @@ pub fn open_owned_draft(
     if stored.account_id.as_str() != account {
         return Err("this draft belongs to another account".into());
     }
+    guard_open_folder(&folder, agent, account)?;
     store
         .restore_compose_folder(id, &folder)
         .map_err(|err| err.to_string())?;
@@ -498,5 +496,57 @@ mod tests {
         let other_agent = guard_open_folder(&folder, "agent:bob", "acct-a").unwrap_err();
         assert!(other_agent.contains("another agent"), "{other_agent}");
         assert!(guard_open_folder(&folder, "agent:ada", "acct-a").is_ok());
+    }
+
+    #[test]
+    fn restore_does_not_follow_an_attachment_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-restore-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.db");
+        let store = Store::open(&db).unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hello".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&dir, "keep", &fields, "body\n", &account.id).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"keep-me").unwrap();
+        std::os::unix::fs::symlink(&outside, folder.join("chart.png")).unwrap();
+        store
+            .save_compose(&StoredCompose {
+                id: "keep".into(),
+                account_id: account.id.clone(),
+                fields,
+                body: "body\n".into(),
+                files: vec![crate::compose::ResolvedFile {
+                    path: "chart.png".into(),
+                    display_name: "chart.png".into(),
+                    bytes: b"local".to_vec(),
+                    inline: false,
+                }],
+            })
+            .unwrap();
+        let err = store.restore_compose_folder("keep", &folder).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep-me");
     }
 }

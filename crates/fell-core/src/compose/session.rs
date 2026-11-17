@@ -242,12 +242,15 @@ impl DraftSession {
     }
 
     pub fn mark_seen(&mut self) {
-        self.seen_revision = self.revision;
+        if self.seen_revision == self.revision {
+            return;
+        }
         self.painted_files = Some(referenced_file_hashes(
             &self.folder,
             &self.fields,
             &self.body,
         ));
+        self.seen_revision = self.revision;
     }
 
     /// What the compose window repaints for. Seen-ness is not included, so
@@ -838,13 +841,14 @@ impl DraftSession {
 }
 
 fn referenced_file_hashes(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64)> {
-    let mut hashes = workspace::resolve_closure(folder, fields, body)
-        .files
+    // Stat only. Render must not read attachment bytes to decide whether send is allowed.
+    attachment_stamp(folder, fields, body)
         .into_iter()
-        .map(|file| (file.path, content_hash(&file.bytes)))
-        .collect::<Vec<_>>();
-    hashes.sort();
-    hashes
+        .map(|(path, len, mtime)| {
+            let fingerprint = format!("{len}:{mtime}");
+            (path, content_hash(fingerprint.as_bytes()))
+        })
+        .collect()
 }
 
 fn content_hash(bytes: &[u8]) -> u64 {
@@ -1408,7 +1412,8 @@ mod tests {
         fs::write(session.folder().join("chart.png"), b"one").unwrap();
         session.mark_seen();
         assert!(session.prepare_send().is_ok());
-        fs::write(session.folder().join("chart.png"), b"two").unwrap();
+        fs::write(session.folder().join("chart.png"), b"replaced").unwrap();
+        session.mark_seen();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("attachment"), "{err}");
     }

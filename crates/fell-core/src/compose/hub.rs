@@ -145,6 +145,22 @@ impl DraftHub {
         let mut sessions = self.sessions.lock().expect("sessions");
         if !draft_id.is_empty()
             && !sessions.contains_key(&draft_id)
+            && let Ok(folder) = workspace::draft_folder(&draft_id)
+        {
+            let present = std::fs::symlink_metadata(folder.join("draft.md"))
+                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
+            if !present && workspace::require_owner(&folder, &agent).is_err() {
+                return json!({
+                    "id": id,
+                    "ok": false,
+                    "transmitted": false,
+                    "error": "this draft belongs to another agent"
+                })
+                .to_string();
+            }
+        }
+        if !draft_id.is_empty()
+            && !sessions.contains_key(&draft_id)
             && let Ok(folder) = super::persist::ensure_draft_folder(&draft_id)
             && folder.join("draft.md").is_file()
         {

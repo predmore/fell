@@ -712,6 +712,43 @@ pub fn resolve_inside(folder: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(current)
 }
 
+/// Write `relative` inside `folder`. A symlink at the path, or `..`, is refused.
+pub fn write_inside(folder: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
+    let rel = Path::new(relative);
+    if relative.is_empty()
+        || relative.contains('\0')
+        || rel.is_absolute()
+        || relative
+            .split('/')
+            .any(|part| part == ".." || part.is_empty())
+    {
+        return Err(format!(
+            "attachment `{relative}` must stay inside the draft folder"
+        ));
+    }
+    let mut current = folder.to_path_buf();
+    let parts: Vec<_> = rel.components().collect();
+    for (index, component) in parts.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return Err(format!(
+                "attachment `{relative}` must stay inside the draft folder"
+            ));
+        };
+        current.push(part);
+        if is_symlink(&current) {
+            return Err(format!(
+                "refusing to restore `{relative}` through a symlink"
+            ));
+        }
+        let last = index + 1 == parts.len();
+        if !last && !current.exists() {
+            fs::create_dir(&current).map_err(|err| err.to_string())?;
+            set_dir_mode(&current)?;
+        }
+    }
+    atomic_write(&current, bytes)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if is_symlink(path) {
         return Err(format!(
