@@ -1352,7 +1352,8 @@ fn inverted_span(text: &str, weight: FontWeight, kind: StyleKind, colors: Palett
         .bg(rgb(colors.caret))
         .text_color(rgb(colors.bg))
         .font_weight(weight)
-        .px_1();
+        .px(px(4.))
+        .py(px(1.));
     if kind == StyleKind::Code {
         node = node.font_family("monospace");
     }
@@ -1467,9 +1468,9 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
     if path.is_file() {
         block = block.child(
             img(path)
-                .w(px(224.))
-                .h(px(98.))
-                .object_fit(ObjectFit::Contain)
+                .w(px(240.))
+                .h(px(105.))
+                .object_fit(ObjectFit::Fill)
                 .flex_shrink_0(),
         );
     }
