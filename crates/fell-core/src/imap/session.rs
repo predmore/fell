@@ -399,30 +399,38 @@ impl Session {
         let mut text = Vec::new();
         let mut literals = Vec::new();
         let mut retained = 0usize;
-        let mut over_response = false;
         loop {
             let line = self.read_until_crlf()?;
             match literal_marker(&line) {
                 LiteralMarker::NotLiteral => {
+                    if text.len().saturating_add(line.len()) > response_text_limit() {
+                        self.disconnect();
+                        return Err(self.response_cap_error());
+                    }
                     text.extend_from_slice(&line);
                     break;
                 }
                 LiteralMarker::Unusable => {
+                    self.disconnect();
                     return Err(imap_err(
                         "literal length is not a usable number; closing the connection",
                     ));
                 }
                 LiteralMarker::Length(len) => {
-                    text.extend_from_slice(&line);
                     let too_big = len > literal_limit();
-                    let over_total =
-                        over_response || retained.saturating_add(len) > response_limit();
-                    if too_big || over_total {
+                    let over = text.len().saturating_add(line.len()) > response_text_limit()
+                        || literals.len() >= response_literal_limit()
+                        || (!too_big && retained.saturating_add(len) > response_limit());
+                    if over {
+                        // Stop reading. The socket is closed so the rest of this
+                        // response cannot be parsed as later IMAP lines.
+                        self.disconnect();
+                        return Err(self.response_cap_error());
+                    }
+                    text.extend_from_slice(&line);
+                    if too_big {
                         self.discard_exact(len)?;
                         literals.push(LiteralBytes::Discarded);
-                        if over_total && !too_big {
-                            over_response = true;
-                        }
                     } else {
                         let bytes = self.read_exact(len)?;
                         retained += bytes.len();
@@ -431,14 +439,20 @@ impl Session {
                 }
             }
         }
-        if over_response {
-            return Err(imap_err(format!(
-                "response literals exceed the {} byte limit",
-                response_limit()
-            )));
-        }
         let text = String::from_utf8_lossy(&text).into_owned();
         Ok((text, literals))
+    }
+
+    fn disconnect(&mut self) {
+        self.io.take();
+    }
+
+    fn response_cap_error(&self) -> Error {
+        imap_err(format!(
+            "response literals exceed the {} byte or {} literal limit",
+            response_limit(),
+            response_literal_limit()
+        ))
     }
 
     fn read_until_crlf(&mut self) -> Result<Vec<u8>, Error> {
@@ -584,10 +598,13 @@ const MAX_LINE: usize = 1024 * 1024;
 /// `* OK` lines and resets the read timeout on every chunk.
 const MAX_UNTAGGED: usize = 1_000_000;
 
-/// Bytes of literals kept from one protocol response. Further literals are
-/// discarded and the response fails, so a chain of under-cap literals cannot
-/// grow without bound.
+/// Bytes of literals kept from one protocol response.
 const MAX_RESPONSE: usize = MAX_LITERAL;
+/// Header text kept while assembling one response. The bodies live in literals.
+const MAX_RESPONSE_TEXT: usize = 1024 * 1024;
+/// How many literals one response may contain. `{0}` adds no bytes, so a count
+/// cap is what stops that chain.
+const MAX_RESPONSE_LITERALS: usize = 32;
 
 fn response_limit() -> usize {
     #[cfg(test)]
@@ -598,6 +615,14 @@ fn response_limit() -> usize {
     {
         MAX_RESPONSE
     }
+}
+
+fn response_text_limit() -> usize {
+    MAX_RESPONSE_TEXT
+}
+
+fn response_literal_limit() -> usize {
+    MAX_RESPONSE_LITERALS
 }
 
 fn literal_limit() -> usize {
@@ -1548,6 +1573,77 @@ mod tests {
         });
         let Err(err) = opened else {
             panic!("chained literals were retained without a total cap");
+        };
+        let text = err.to_string();
+        assert!(text.contains("response literals"), "{text}");
+        assert!(text.contains("10"), "{text}");
+    }
+
+    #[test]
+    fn zero_length_literal_chain_is_rejected() {
+        use std::io::Write;
+        use std::thread;
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK {0}\r\n").unwrap();
+            for _ in 0..40 {
+                sock.write_all(b" {0}\r\n").unwrap();
+            }
+            sock.write_all(b"\r\n").unwrap();
+        });
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        let Err(err) = opened else {
+            panic!("a chain of empty literals was accepted");
+        };
+        let text = err.to_string();
+        assert!(text.contains("literal limit"), "{text}");
+    }
+
+    #[test]
+    fn response_cap_closes_without_waiting_for_the_rest() {
+        use std::io::{Read, Write};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let _limit = super::limit_response_bytes_to(10);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK {8}\r\nIMAP4rev1 {8}\r\n").unwrap();
+            let _ = sock.flush();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = sock.read(&mut [0u8; 1]);
+        });
+        let started = Instant::now();
+        let opened = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the cap must close the socket instead of waiting for the rest of the reply"
+        );
+        let Err(err) = opened else {
+            panic!("the over-cap literal was kept");
         };
         let text = err.to_string();
         assert!(text.contains("response literals"), "{text}");
