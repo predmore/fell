@@ -1,12 +1,13 @@
 //! UI-free core for Fell: accounts, backends, local store, threading, search, and actions.
 //!
-//! The GPUI crate and the MCP stub depend on this crate. This crate does not
+//! The GPUI crate and the MCP server depend on this crate. This crate does not
 //! depend on them.
 
 #![forbid(unsafe_code)]
 
 pub mod account;
 pub mod actions;
+pub mod agent;
 pub mod backend;
 pub mod imap;
 pub mod message;
@@ -18,6 +19,7 @@ pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use actions::{ActionKind, LabelChange, LocalAction};
+pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
     BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
     SyncCursor,
@@ -26,7 +28,7 @@ pub use imap::{ImapConfig, ImapSecurity};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{Draft, PendingSend, PendingSendId, SentMessage, UserSendConfirmation};
-pub use store::{Store, ThreadSummary};
+pub use store::{SearchPage, Store, ThreadSummary};
 pub use sync::{SyncReport, sync_once};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
@@ -45,6 +47,16 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    #[error("unknown account {0}")]
+    UnknownAccount(String),
+    #[error("unknown thread")]
+    UnknownThread,
+    #[error("nothing to undo")]
+    NothingToUndo,
+    #[error("{0}")]
+    Invalid(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

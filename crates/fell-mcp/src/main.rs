@@ -1,9 +1,10 @@
-//! Placeholder MCP stdio server. Protocol wiring comes later.
+//! Stdio MCP server. Sending mail is not a tool.
+
+#![forbid(unsafe_code)]
 
 fn main() {
-    eprintln!(
-        "fell-mcp: stub. Planned tools: search, summarize, triage, draft. \
-         Sending mail is not an MCP tool and always needs explicit UI confirmation."
-    );
-    std::process::exit(2);
+    if let Err(err) = fell_mcp::cli_main(std::env::args_os()) {
+        eprintln!("fell-mcp: {err}");
+        std::process::exit(2);
+    }
 }

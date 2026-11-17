@@ -26,4 +26,5 @@ gpui = { version = "0.2.2", default-features = false, features = [
     "wayland",
 ] }
 rusqlite = { version = "0.43", features = ["bundled"] }
+serde_json = "1"
 thiserror = "2"

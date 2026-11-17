@@ -1,90 +1,64 @@
-//! MCP server stub for Fell.
+//! MCP server for Fell.
 //!
-//! Planned tools: search, summarize, triage, draft. There is **no send tool**.
-//! Sending mail requires [`fell_core::UserSendConfirmation`] minted by the
-//! GPUI app via `fell_confirm::InteractiveUi`. This crate must not depend on
-//! `fell-confirm`.
+//! Tools: search, read threads, list labels, triage (label, archive, mark
+//! read, snooze), and drafts saved for review. Scopes (read / triage / draft)
+//! stay off until a person enables them. Triage and drafts are logged and
+//! undoable.
 //!
-//! ```compile_fail
-//! use fell_core::{AccountId, Draft, PendingSend, UserSendConfirmation};
-//! let pending = PendingSend::new(
-//!     "x",
-//!     Draft {
-//!         account_id: AccountId("a".into()),
-//!         to: vec![],
-//!         cc: vec![],
-//!         bcc: vec![],
-//!         subject: String::new(),
-//!         body: String::new(),
-//!         in_reply_to: None,
-//!     },
-//! );
-//! let _ = UserSendConfirmation::from_interactive_ui(&Default::default(), &pending);
-//! ```
+//! There is **no send tool**. This process speaks stdio only. It must not
+//! depend on the UI confirmation crate, and it cannot mint a send token.
+//! The core crate's compile-fail test shows a confirmation cannot be minted
+//! without the UI type.
 
-use fell_core::{AccountId, Draft, SearchHit, Store, ThreadId};
+#![forbid(unsafe_code)]
 
-/// Agent-facing tools. Intentionally excludes send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentTool {
-    Search { query: String },
-    Summarize { thread_id: ThreadId },
-    Triage { thread_id: ThreadId },
-    DraftReply { thread_id: ThreadId, body: String },
-}
+mod cli;
+#[cfg(test)]
+mod corpus;
+mod protocol;
+mod tools;
+mod untrusted;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentToolResult {
-    Search(Vec<SearchHit>),
-    Summary(String),
-    Triage(TriageSuggestion),
-    Draft(Draft),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TriageSuggestion {
-    pub thread_id: ThreadId,
-    pub label: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum McpError {
-    #[error(transparent)]
-    Core(#[from] fell_core::Error),
-    #[error("{0} is not implemented yet")]
-    NotImplemented(&'static str),
-}
-
-/// Execute a read/draft tool against the local store. Never sends.
-pub fn dispatch(
-    _store: &Store,
-    _account: &AccountId,
-    tool: AgentTool,
-) -> Result<AgentToolResult, McpError> {
-    match tool {
-        AgentTool::Search { .. } => Err(McpError::NotImplemented("mcp search")),
-        AgentTool::Summarize { .. } => Err(McpError::NotImplemented("mcp summarize")),
-        AgentTool::Triage { .. } => Err(McpError::NotImplemented("mcp triage")),
-        AgentTool::DraftReply { .. } => Err(McpError::NotImplemented("mcp draft")),
-    }
-}
+pub use cli::cli_main;
+pub use protocol::Session;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn no_send_variant() {
-        let names = ["search", "summarize", "triage", "draft"];
-        assert!(names.iter().all(|n| *n != "send"));
-        let err = dispatch(
-            &Store::open_in_memory().unwrap(),
-            &AccountId("a".into()),
-            AgentTool::Search {
-                query: "invoice".into(),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, McpError::NotImplemented(_)));
+    fn mcp_sources_do_not_mint_send_tokens() {
+        const FILES: &[&str] = &[
+            include_str!("../Cargo.toml"),
+            include_str!("lib.rs"),
+            include_str!("cli.rs"),
+            include_str!("tools.rs"),
+            include_str!("protocol.rs"),
+            include_str!("main.rs"),
+        ];
+        let banned = [
+            format!("{}{}", "fell_", "confirm"),
+            format!("{}{}", "fell-", "confirm"),
+            format!("{}{}", "for_", "fell_app"),
+            format!("{}{}", "Interactive", "Ui"),
+            format!("{}{}", "from_interactive", "_ui"),
+            format!("{}{}", "UserSend", "Confirmation"),
+        ];
+        for file in FILES {
+            for word in &banned {
+                assert!(!file.contains(word), "{word} appeared in an MCP source");
+            }
+        }
+        let manifest = include_str!("../Cargo.toml");
+        let confirm_dep = format!("{}{}", "fell-", "confirm");
+        let confirm_mod = format!("{}{}", "fell_", "confirm");
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&confirm_dep) && !trimmed.contains(&confirm_mod),
+                "fell-mcp must not depend on the UI confirmation crate"
+            );
+        }
     }
 }

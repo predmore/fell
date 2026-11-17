@@ -34,6 +34,9 @@ pub struct SearchHit {
     pub thread_id: ThreadId,
     pub subject: String,
     pub snippet: String,
+    /// Address only. The display name stays out of search hits.
+    pub sender_email: String,
+    pub date_unix: i64,
 }
 
 /// Keyword search against the local store.
@@ -363,12 +366,14 @@ fn run_fts(
 ) -> Result<Vec<SearchHit>> {
     // bm25() is only valid in the SELECT of the MATCH query, not in a window.
     let mut sql = String::from(
-        "SELECT message_id, thread_id, subject, snippet FROM (
+        "SELECT message_id, thread_id, subject, snippet, from_email, date_unix FROM (
             SELECT
                 message_id,
                 thread_id,
                 subject,
                 snippet,
+                from_email,
+                date_unix,
                 score,
                 ROW_NUMBER() OVER (
                     PARTITION BY thread_id
@@ -380,6 +385,7 @@ fn run_fts(
                     m.thread_id AS thread_id,
                     m.subject AS subject,
                     m.snippet AS snippet,
+                    m.from_email AS from_email,
                     m.date_unix AS date_unix,
                     bm25(messages_fts, 8.0, 4.0, 2.0, 1.0) AS score
                 FROM messages_fts
@@ -403,12 +409,14 @@ fn run_filtered(
     parsed: &ParsedQuery,
 ) -> Result<Vec<SearchHit>> {
     let mut sql = String::from(
-        "SELECT message_id, thread_id, subject, snippet FROM (
+        "SELECT message_id, thread_id, subject, snippet, from_email, date_unix FROM (
             SELECT
                 m.message_id AS message_id,
                 m.thread_id AS thread_id,
                 m.subject AS subject,
                 m.snippet AS snippet,
+                m.from_email AS from_email,
+                m.date_unix AS date_unix,
                 ROW_NUMBER() OVER (
                     PARTITION BY m.thread_id
                     ORDER BY m.date_unix DESC, m.message_id ASC
@@ -464,6 +472,8 @@ fn query_hits(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<Vec<Se
             thread_id: ThreadId(row.get(1)?),
             subject: row.get(2)?,
             snippet: row.get(3)?,
+            sender_email: row.get(4)?,
+            date_unix: row.get(5)?,
         })
     })?;
     let mut hits = Vec::new();

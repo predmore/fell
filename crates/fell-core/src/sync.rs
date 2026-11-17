@@ -66,6 +66,8 @@ mod tests {
             cc: Vec::new(),
             bcc: Vec::new(),
             has_attachment: false,
+            archived: false,
+            snooze_until: None,
         };
         let backend = FixtureBackend {
             messages: vec![msg],

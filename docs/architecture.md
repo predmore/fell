@@ -5,7 +5,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 ```text
 ┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
 │  fell (GPUI)│     │   fell-mcp  │     │ Proton Mail      │
-│  Wayland UI │     │  agent stub │     │ Bridge (IMAP)    │
+│  Wayland UI │     │  scoped MCP │     │ Bridge (IMAP)    │
 └──────┬──────┘     └──────┬──────┘     └────────┬─────────┘
        │  types only       │  search/draft       │ later: Proton API
        ▼                   ▼                     ▼
@@ -22,7 +22,7 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 | `fell-core` | Accounts, backend trait, sync, local SQLite store (FTS5), threading, search, send-confirmation types. No UI. |
 | `fell-confirm` | Sealed `InteractiveUi` (private field, not `Default`). Required to mint a send confirmation. The GPUI app depends on it; `fell-mcp` must not. |
 | `fell` | GPUI application. Opens a Wayland window. Depends on `fell-core` for data, not the other way around. Mints send confirmations. |
-| `fell-mcp` | Stub MCP server for later agent access. Tools: search, summarize, triage, draft. No send tool. |
+| `fell-mcp` | Stdio MCP server. Search, read threads, list labels, triage, and review drafts. No send tool. Scopes stay off until enabled. |
 
 ## Backends
 
@@ -75,6 +75,18 @@ Proton conversation ids are preferred so Bridge and the future API stay consiste
 ## Sending mail
 
 Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, and body that were shown. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
+
+An agent draft is a `review_drafts` row (`Store::list_review_drafts`), not a `PendingSend`. Fell reads that list when it is time to show the draft for review. Undo deletes it. `create_review_draft` never calls `submit_draft` or `confirm_send`.
+
+Triage (label, archive, mark read, snooze) writes an `agent_actions` row and the previous message state. `Store::undo` reverses the latest action on the account, including ones an agent took. `Store::undo_actor` reverses only that actor's latest action. Archive and snooze survive a later copy of the same Message-ID.
+
+Per-agent scopes live in `agent_grants` and are off until `fell-mcp grant` (or a later UI) enables them. `read` covers search, reading a thread, and listing labels. `triage` covers the four triage tools and undo of those, and stays off unless that scope is granted. `draft` covers saving and listing review drafts and undo of those. A disabled agent gets an empty tool list. Mailbox changes are rate-limited.
+
+`fell-mcp` speaks MCP on stdio only. It does not listen on a socket. Any future network transport must bind to `127.0.0.1`, authenticate with a token file created mode `0600`, and check the `Origin` header.
+
+Search returns at most 20 hits per page: ids, sender address, date, and a short snippet. Thread bodies are plain text and truncated. Draft bodies are capped when they are saved. Text that came from mail is returned only as `untrusted_email_content`, with ids, sender address, and date outside that object. The model is told to treat that text as data, not as instructions. `list_drafts` defaults to the calling agent's drafts and redacts `bcc` on anyone else's rows. The database file, its WAL file, and its shared-memory file are mode `0600`. See [agents.md](agents.md).
+
+The in-app action log, one-key undo, and an in-app confirm for bulk archive are not part of this server. Neither is binding `in_reply_to` into the send-confirmation snapshot.
 
 ## First platform
 
