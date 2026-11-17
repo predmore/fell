@@ -576,14 +576,29 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
         let Some(current) = load_one(conn, account_id, &canonical_id)? else {
             return Ok(());
         };
-        let mut applied = saved.clone();
-        applied.message_id = canonical_id.clone();
-        applied.remote_id.clone_from(&current.remote_id);
-        applied.thread_id.clone_from(&current.thread_id);
-        if applied.list_id.is_none() {
-            applied.list_id.clone_from(&current.list_id);
-        }
-        replace_message_row(conn, account_id, &current, &applied)?;
+        // The snapshot is the other copy. Put its folders and labels back on
+        // the survivor and reattach the alias. Subject, body, and unread stay.
+        let folders = join_tokens(&invert_tokens(
+            &split_tokens(&current.folders),
+            &split_tokens(&saved.folders),
+            &split_tokens(&snapshot.after_folders),
+            true,
+        ));
+        let labels = join_tokens(&invert_tokens(
+            &split_tokens(&current.labels),
+            &split_tokens(&saved.labels),
+            &split_tokens(&snapshot.after_labels),
+            false,
+        ));
+        let old_terms = terms_of(&current);
+        let new_terms = terms_with(&current, &folders, &labels);
+        let changed = conn.execute(
+            "UPDATE messages SET folders = ?1, labels = ?2
+             WHERE account_id = ?3 AND message_id = ?4",
+            params![folders, labels, account_id.as_str(), canonical_id],
+        )?;
+        expect_one(changed, &canonical_id)?;
+        sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
         let mut aliases = snapshot.aliases.clone();
         aliases.push(SavedAlias {
             message_id: saved.message_id.clone(),
@@ -657,11 +672,16 @@ fn replace_message_row(
 ) -> Result<()> {
     let old_terms = terms_of(current);
     let new_terms = terms_of(snapshot);
+    let fingerprint = match snapshot.body_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => crate::message::body_fingerprint(text),
+        _ => String::new(),
+    };
     let mut values = saved_values(snapshot);
     let message_id = values.remove(0);
+    values.push(Value::Text(fingerprint));
     values.push(Value::Text(account_id.as_str().to_string()));
     values.push(message_id);
-    debug_assert_eq!(values.len(), 22);
+    debug_assert_eq!(values.len(), 23);
     let changed = conn.execute(
         "UPDATE messages SET
             remote_id = ?1,
@@ -683,8 +703,9 @@ fn replace_message_row(
             cc_line = ?17,
             bcc_line = ?18,
             has_attachment = ?19,
-            list_id = ?20
-         WHERE account_id = ?21 AND message_id = ?22",
+            list_id = ?20,
+            body_fingerprint = ?21
+         WHERE account_id = ?22 AND message_id = ?23",
         params_from_iter(values),
     )?;
     expect_one(changed, &snapshot.message_id)?;
@@ -2002,11 +2023,11 @@ mod tests {
                     references_header: String::new(),
                     from_name: None,
                     from_email: "from@x".into(),
-                    subject: "Hello".into(),
+                    subject: "OLD SENT".into(),
                     date_unix: 1,
-                    snippet: "hello body".into(),
-                    body_text: Some("hello body".into()),
-                    unread: 1,
+                    snippet: "old body".into(),
+                    body_text: Some("old body".into()),
+                    unread: 0,
                     folders: "Sent".into(),
                     labels: String::new(),
                     arrived_via: String::new(),
@@ -2034,7 +2055,10 @@ mod tests {
         );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].headers.subject, "Hello");
-        assert_eq!(kept[0].folders, vec!["Sent".to_string()]);
+        assert_eq!(kept[0].body_text.as_deref(), Some("hello body"));
+        assert!(kept[0].unread);
+        assert!(kept[0].folders.iter().any(|folder| folder == "INBOX"));
+        assert!(kept[0].folders.iter().any(|folder| folder == "Sent"));
         let remote: String = store
             .connection()
             .query_row(
@@ -2045,6 +2069,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remote, "imap:sent");
+    }
+
+    #[test]
+    fn replacing_a_row_updates_the_body_fingerprint() {
+        let store = open(&[("a1", "c@x")]);
+        let message = sample("a1", "a@x", "Hello", "first body");
+        store.upsert_message(&message).unwrap();
+        let current = load_one(store.connection(), &account("a1"), "a@x")
+            .unwrap()
+            .unwrap();
+        let mut snapshot = current.clone();
+        snapshot.body_text = Some("second body".into());
+        snapshot.snippet = "second body".into();
+        replace_message_row(store.connection(), &account("a1"), &current, &snapshot).unwrap();
+        let fingerprint: String = store
+            .connection()
+            .query_row(
+                "SELECT body_fingerprint FROM messages WHERE message_id = 'a@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fingerprint, crate::message::body_fingerprint("second body"));
     }
 
     #[test]

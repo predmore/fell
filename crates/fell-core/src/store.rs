@@ -1073,8 +1073,10 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
 /// collapsed. That path fills gaps only: a stored body, parent, subject,
 /// proton id, folder, label, address, star, archive bit, or snooze is never
 /// replaced. A same-id resync
-/// (`alias == false`) may replace a non-list subject and a non-empty body, and
-/// still keeps a stored body or parent when the incoming copy has none.
+/// (`alias == false`, and not a list resync of an already merged row) may
+/// replace a non-empty subject, display name, and Proton conversation id, and
+/// a non-empty body. It still keeps a stored body, parent, or Proton id when
+/// the incoming copy has none.
 fn write_kept(
     conn: &Connection,
     message: &Message,
@@ -1104,11 +1106,12 @@ fn write_kept(
         stored_list,
         &message.headers.subject,
         incoming_list,
-        !alias,
+        !like_alias,
     );
     let proton = merged_proton(
         &stored.proton_conversation_id,
         &message.headers.proton_conversation_id,
+        like_alias,
     );
     let mut headers = message.headers.clone();
     // Fall back to the row we are keeping. An incoming list id with no parents
@@ -1156,7 +1159,7 @@ fn write_kept(
         stored_list,
         &message.headers.from.name,
         incoming_list,
-        !alias,
+        !like_alias,
     );
     let date_unix = if alias || (incoming_list && stored.date_unix != 0) {
         if stored.date_unix != 0 {
@@ -1657,8 +1660,18 @@ fn clean_opt(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn merged_proton(stored: &Option<String>, incoming: &Option<String>) -> Option<String> {
-    clean_opt(stored).or_else(|| clean_opt(incoming))
+fn merged_proton(
+    stored: &Option<String>,
+    incoming: &Option<String>,
+    like_alias: bool,
+) -> Option<String> {
+    let stored = clean_opt(stored);
+    let incoming = clean_opt(incoming);
+    if like_alias || incoming.is_none() {
+        stored.or(incoming)
+    } else {
+        incoming
+    }
 }
 
 fn proton_compatible(stored: &Option<String>, incoming: &Option<String>) -> bool {
@@ -1727,6 +1740,9 @@ fn merged_subject(
     let stored_blank = stored_subject.trim().is_empty();
     let incoming_blank = incoming_subject.trim().is_empty();
     if stored_list && !incoming_list && !incoming_blank {
+        return incoming_subject.to_string();
+    }
+    if replace_non_list && !incoming_blank {
         return incoming_subject.to_string();
     }
     if !stored_blank && (incoming_list || incoming_blank) {
@@ -4460,6 +4476,51 @@ mod tests {
                 "orig@x",
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn same_id_list_update_replaces_subject_and_display_name() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg("digest@x", None, None, "Digest 1", "hello body");
+        first.list_id = Some("list.example".into());
+        first.headers.from.name = Some("Ann via Dev".into());
+        store.upsert_message(&first).unwrap();
+        let mut next = first.clone();
+        next.headers.subject = "Digest 2".into();
+        next.headers.from.name = Some("Ann".into());
+        store.upsert_message(&next).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].headers.subject, "Digest 2");
+        assert_eq!(rows[0].headers.from.name.as_deref(), Some("Ann"));
+    }
+
+    #[test]
+    fn same_id_update_replaces_a_proton_conversation_id() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        store
+            .upsert_message(&msg("a@x", Some("conv-old"), None, "Hello", "hello body"))
+            .unwrap();
+        let moved = store
+            .upsert_message(&msg("a@x", Some("conv-new"), None, "Hello", "hello body"))
+            .unwrap();
+        assert_eq!(moved, ThreadId::proton("conv-new"));
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].headers.proton_conversation_id.as_deref(),
+            Some("conv-new")
+        );
+        let mut cleared = msg("a@x", None, None, "Hello", "hello body");
+        cleared.headers.proton_conversation_id = None;
+        store.upsert_message(&cleared).unwrap();
+        let rows = listed(&store);
+        assert_eq!(
+            rows[0].headers.proton_conversation_id.as_deref(),
+            Some("conv-new")
         );
     }
 
