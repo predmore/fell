@@ -258,6 +258,11 @@ impl Session {
     /// Keep the same thread selected when the list is replaced.
     pub fn set_threads(&mut self, threads: Vec<ThreadRow>) -> bool {
         let previous = self.cursor_id.clone();
+        let old_ids: HashSet<String> = self
+            .threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect();
         self.threads = threads;
         if let Some(id) = &previous {
             if self.threads.iter().any(|thread| &thread.id == id) {
@@ -270,14 +275,47 @@ impl Session {
         }
         self.picked
             .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
-        let still_here = |id: &String| self.threads.iter().any(|thread| &thread.id == id);
-        let anchor_here = self.anchor_id.as_ref().is_some_and(still_here);
-        let cursor_here = previous.as_ref().is_some_and(still_here);
-        if self.visual && (!anchor_here || !cursor_here) {
+        if self.visual && !self.visual_span_survived(&old_ids, previous.as_deref()) {
             self.visual = false;
             self.anchor_id = None;
         }
         self.cursor_id != previous
+    }
+
+    /// The visual span survives only when both ends are still present and every
+    /// row now between them was already in the previous list.
+    fn visual_span_survived(
+        &self,
+        old_ids: &HashSet<String>,
+        previous_cursor: Option<&str>,
+    ) -> bool {
+        let Some(anchor) = self
+            .threads
+            .iter()
+            .position(|thread| Some(thread.id.as_str()) == self.anchor_id.as_deref())
+        else {
+            return false;
+        };
+        if !previous_cursor.is_some_and(|id| {
+            old_ids.contains(id) && self.threads.iter().any(|thread| thread.id == id)
+        }) {
+            return false;
+        }
+        let Some(cursor) = self
+            .threads
+            .iter()
+            .position(|thread| Some(thread.id.as_str()) == previous_cursor)
+        else {
+            return false;
+        };
+        let (lo, hi) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        self.threads[lo..=hi]
+            .iter()
+            .all(|thread| old_ids.contains(&thread.id))
     }
 
     pub fn set_messages(&mut self, messages: Vec<ConvMessage>) {
@@ -917,6 +955,18 @@ mod tests {
         assert!(session.anchor_id.is_none());
         let highlighted = session.highlighted();
         assert_eq!(highlighted.len(), 1);
+    }
+
+    #[test]
+    fn visual_mode_ends_when_a_new_row_appears_inside_the_range() {
+        let mut session = session();
+        session.visual = true;
+        session.anchor_id = Some("a".into());
+        session.cursor_id = Some("c".into());
+        session.set_threads(vec![row("a"), row("new"), row("c")]);
+        assert!(!session.visual);
+        assert!(session.anchor_id.is_none());
+        assert!(!session.highlighted().contains("new"));
     }
 
     #[test]

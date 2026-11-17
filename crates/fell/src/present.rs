@@ -248,6 +248,9 @@ pub fn relative_date(now: i64, then: i64) -> String {
         return "Yesterday".into();
     }
     if delta < 7 * 24 * 60 * 60 {
+        if ty != ny {
+            return month_day(now, then);
+        }
         return weekday(tw).into();
     }
     month_day(now, then)
@@ -404,6 +407,22 @@ mod tests {
         assert!(relative_date(now, last_year).contains(&past_year.to_string()));
         assert!(relative_date(now, next_year).contains(&future_year.to_string()));
         assert!(!month_day(now, now).contains(&local_parts(now).0.to_string()));
+        let mut boundary = 1_704_240_000_i64;
+        for _ in 0..40 {
+            let earlier = boundary - 5 * 86_400;
+            let (this_year, this_month, _, _, _, _) = local_parts(boundary);
+            let (that_year, _, _, _, _, _) = local_parts(earlier);
+            if this_month == 1 && that_year + 1 == this_year {
+                let label = relative_date(boundary, earlier);
+                assert!(
+                    label.contains(&that_year.to_string()),
+                    "{label} omitted {that_year}"
+                );
+                return;
+            }
+            boundary += 86_400;
+        }
+        panic!("local calendar has no year boundary within five days");
     }
 
     #[test]
