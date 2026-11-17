@@ -166,7 +166,9 @@ pub fn document_column(
     allow_remote: bool,
     gallery: &ImageGallery,
 ) -> gpui::Div {
-    let mut column = div().flex().flex_col().gap_4();
+    // A short letter should reach the lower part of the pane. The gaps and
+    // line height do that without adding a fake closing rule.
+    let mut column = div().flex().flex_col().gap(px(32.)).line_height(px(26.));
     if document.is_empty() {
         return column.child(
             div()
@@ -496,10 +498,6 @@ fn image_el(
         let mut frame = div()
             .w(px(width))
             .h(px(height))
-            .border(px(1.))
-            .border_color(paint(palette.border))
-            .rounded(px(4.))
-            .overflow_hidden()
             .child(img(rendered).w(px(width)).h(px(height)));
         frame.style().align_self = Some(gpui::AlignItems::FlexStart);
         return frame.into_any_element();
@@ -548,12 +546,7 @@ fn image_el(
 pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
     div()
         .w_full()
-        .child(
-            img(image)
-                .w_full()
-                .max_h(px(520.))
-                .object_fit(gpui::ObjectFit::Contain),
-        )
+        .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
         .into_any_element()
 }
 
@@ -590,10 +583,10 @@ fn picture_icon(palette: &Palette) -> gpui::Div {
 }
 
 /// Drop trailing rows that are a flat page color, so a short newsletter
-/// does not keep the empty viewport under the card. A short run of that
-/// color is the email's own padding and stays, so the card is not clipped.
+/// does not keep the empty viewport under the card. Enough of that color
+/// stays for the page to reach the bottom of the message pane.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 16;
+    const KEEP_FLAT_ROWS: usize = 116;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -948,9 +941,21 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 26);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 40);
         let short = &rgba[..width as usize * 18 * 4];
         assert_eq!(trim_uniform_bottom(short, width, 18), 18);
+        let mut tall = vec![0u8; width as usize * 200 * 4];
+        tall[..rgba.len()].copy_from_slice(&rgba);
+        for y in 40..200 {
+            for x in 0..width as usize {
+                let i = (y * width as usize + x) * 4;
+                tall[i] = 231;
+                tall[i + 1] = 226;
+                tall[i + 2] = 216;
+                tall[i + 3] = 255;
+            }
+        }
+        assert_eq!(trim_uniform_bottom(&tall, width, 200), 126);
     }
 
     #[test]
