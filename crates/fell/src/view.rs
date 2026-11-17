@@ -6,9 +6,9 @@ use fell_core::{AccountId, Store, ThreadId};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollHandle, ScrollStrategy, StatefulInteractiveElement, Styled, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
-    size, uniform_list,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
 
 use crate::keymap::KeyId;
@@ -510,6 +510,7 @@ impl Render for Inbox {
             palette_scroll,
             folder_scroll,
             focus,
+            window,
             cx,
         )
     }
@@ -526,6 +527,7 @@ fn shell(
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
     focus: FocusHandle,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> impl IntoElement {
     let (show_list, show_conv) = present::visible_panes(width, session.pane, session.full_width);
@@ -575,7 +577,7 @@ fn shell(
                         &theme,
                         session,
                         show_conv,
-                        list_width,
+                        if show_conv { list_width } else { width },
                         list_scroll,
                         cx,
                     ))
@@ -584,7 +586,19 @@ fn shell(
                     row.child(splitter(&theme, cx))
                 })
                 .when(show_conv, |row| {
-                    row.child(conversation(&theme, session, conv_scroll, cx))
+                    let conv_width = if show_list {
+                        (width - list_width).max(120.0)
+                    } else {
+                        width
+                    };
+                    row.child(conversation(
+                        &theme,
+                        session,
+                        conv_scroll,
+                        conv_width,
+                        window,
+                        cx,
+                    ))
                 }),
         )
         .child(status_bar(&theme, session))
@@ -659,13 +673,22 @@ fn thread_list(
     let rows = uniform_list(
         "thread-rows",
         session.threads.len(),
-        move |range, _window, app| {
+        move |range, window, app| {
             entity.update(app, |inbox, cx| {
                 let highlighted = inbox.session.highlighted();
+                let text_width = (list_width - 2.0 - 3.0 - 24.0).max(48.0);
                 range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
-                        thread_row(&theme_for_rows, &row, index, &highlighted, cx)
+                        thread_row(
+                            &theme_for_rows,
+                            &row,
+                            index,
+                            &highlighted,
+                            text_width,
+                            window,
+                            cx,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -700,6 +723,8 @@ fn thread_row(
     row: &ThreadRow,
     index: usize,
     highlighted: &std::collections::HashSet<String>,
+    text_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let selected = highlighted.contains(&row.id);
@@ -751,7 +776,9 @@ fn thread_row(
                 .justify_center()
                 .gap(px(3.))
                 .child(thread_line_one(theme, row, weight, selected))
-                .child(thread_line_two(theme, row, weight, selected)),
+                .child(thread_line_two(
+                    theme, row, weight, selected, text_width, window,
+                )),
         )
         .into_any_element()
 }
@@ -864,48 +891,95 @@ fn thread_line_two(
     row: &ThreadRow,
     weight: FontWeight,
     selected: bool,
+    text_width: f32,
+    window: &Window,
 ) -> gpui::Div {
-    let snippet = if selected {
+    let snippet_color = if selected {
         theme.on_selection_dim
     } else {
         theme.dimmed
     };
+    let subject_w = line_px(window, &row.subject, weight).min(280.0);
+    let snippet_w = (text_width - subject_w - 8.0).max(24.0);
+    let subject = clip_line(window, &row.subject, subject_w.min(text_width), weight);
+    let snippet = clip_line(window, &row.snippet, snippet_w, FontWeight::NORMAL);
     div()
-        .w_full()
+        .w(px(text_width))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.))
-        .min_w(px(0.))
         .overflow_hidden()
         .child(
             div()
                 .font_weight(weight)
-                .flex_shrink()
-                .min_w(px(0.))
-                .max_w(px(280.))
+                .flex_none()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_ellipsis()
                 .text_color(rgb(if selected {
                     theme.on_selection
                 } else {
                     theme.foreground
                 }))
-                .child(row.subject.clone()),
+                .child(subject),
         )
         .when(!row.snippet.is_empty(), |line| {
             line.child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.))
+                    .w(px(snippet_w))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(rgb(snippet))
-                    .child(row.snippet.clone()),
+                    .text_color(rgb(snippet_color))
+                    .child(snippet),
             )
         })
+}
+
+fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let mut style = window.text_style();
+    style.font_weight = weight;
+    let font_px = style.font_size.to_pixels(window.rem_size());
+    let run = style.to_run(text.len());
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        font_px,
+        &[run],
+        None,
+    );
+    f32::from(line.width)
+}
+
+/// Shorten one line to `max_px`, ending on an ellipsis that reaches that width.
+fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> String {
+    if line_px(window, text, weight) <= max_px {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut best = "…".to_string();
+    let mut lo = 0;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let mut candidate: String = chars[..mid].iter().collect();
+        candidate = candidate.trim_end().to_string();
+        if !candidate.is_empty() {
+            candidate.push('…');
+        } else {
+            candidate = "…".to_string();
+        }
+        if line_px(window, &candidate, weight) <= max_px {
+            best = candidate;
+            lo = mid;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
@@ -960,6 +1034,8 @@ fn conversation(
     theme: &Theme,
     session: &Session,
     scroll: ScrollHandle,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let subject = session
@@ -972,7 +1048,9 @@ fn conversation(
         .messages
         .iter()
         .enumerate()
-        .map(|(index, message)| message_block(theme, session, message, index, cx))
+        .map(|(index, message)| {
+            message_block(theme, session, message, index, conv_width, window, cx)
+        })
         .collect();
     div()
         .id("conversation")
@@ -1020,13 +1098,15 @@ fn message_block(
     session: &Session,
     message: &ConvMessage,
     index: usize,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let cursor = session.message_cursor == index && session.pane == Pane::Conversation;
     if message.expanded {
         expanded_message(theme, session, message, index, cursor, cx)
     } else {
-        collapsed_message(theme, message, index, cursor, cx)
+        collapsed_message(theme, message, index, cursor, conv_width, window, cx)
     }
 }
 
@@ -1035,8 +1115,15 @@ fn collapsed_message(
     message: &ConvMessage,
     index: usize,
     cursor: bool,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
+    let date = present::relative_date(now_unix(), message.date_unix);
+    let date_w = line_px(window, &date, FontWeight::NORMAL);
+    // Sender column, gaps, row padding, and a little air before the date.
+    let snippet_w = (conv_width - 56.0 - 140.0 - date_w).max(24.0);
+    let snippet = clip_line(window, &message.snippet, snippet_w, FontWeight::NORMAL);
     div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
@@ -1083,17 +1170,16 @@ fn collapsed_message(
         )
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.))
+                .w(px(snippet_w))
+                .flex_none()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_ellipsis()
                 .text_color(rgb(if cursor {
                     theme.on_selection
                 } else {
                     theme.dimmed
                 }))
-                .child(message.snippet.clone()),
+                .child(snippet),
         )
         .child(
             div()
@@ -1103,7 +1189,7 @@ fn collapsed_message(
                 } else {
                     theme.dimmed
                 }))
-                .child(present::relative_date(now_unix(), message.date_unix)),
+                .child(date),
         )
         .into_any_element()
 }
