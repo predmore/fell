@@ -1418,8 +1418,68 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "from-alias");
+        // The reader blocks TRUNCATE (`busy=1`). Stay on the alias so its WAL
+        // is not abandoned for the canonical path.
+        assert_eq!(
+            store.mailbox_path().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("alias.sqlite"))
+        );
         drop(store);
         drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_symlink_opens_the_canonical_mailbox() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-wal-idle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mail.sqlite");
+        drop(Store::open(&real).unwrap());
+        std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
+        let store = Store::open(dir.join("alias.sqlite")).unwrap();
+        assert_eq!(
+            store.mailbox_path(),
+            Some(real.canonicalize().unwrap().as_path())
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_joins_the_open_mailbox() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-hard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let first = Store::open(&path).unwrap();
+        wait_until(|| first.embedding_indexer_running());
+        let other = dir.join("mail-link.sqlite");
+        std::fs::hard_link(&path, &other).unwrap();
+        let second = Store::open(&other).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!second.embedding_indexer_running());
+        assert_eq!(second.mailbox_path(), first.mailbox_path());
+        drop(second);
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

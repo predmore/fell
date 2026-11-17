@@ -258,6 +258,11 @@ pub struct Store {
     indexer: Option<crate::embed::Indexer>,
     pub(crate) conn: Connection,
     path: Option<std::path::PathBuf>,
+    /// Shared lock on the mailbox inode, held until this store is dropped.
+    /// Dropped after the SQLite connection so a new opener cannot migrate
+    /// the WAL while this connection still has the file.
+    #[cfg(unix)]
+    _mailbox_lock: Option<std::fs::File>,
 }
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
@@ -281,23 +286,22 @@ impl Store {
         let requested = path.as_ref();
         // The mailbox holds message text. Create it owner-only before SQLite writes.
         create_private_file(requested)?;
-        // One sidecar lock per file. A relative path, a symlink, and the
-        // absolute path must not start two indexers.
-        let path = requested.canonicalize()?;
-        // SQLite names `-wal` beside the path string it was opened with. Replay
-        // that WAL before switching to the canonical path, or those frames are lost.
-        if requested != path {
-            checkpoint_wal(requested)?;
-        }
-        let conn = Connection::open(&path)?;
+        // One path string per inode. A symlink or a second hard link must not
+        // open a different `-wal` while another connection still has the file.
+        let claimed = claim_mailbox(requested)?;
+        let conn = Connection::open(&claimed.path)?;
         // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut store = Self::from_connection(conn)?;
-        store.path = Some(path.clone());
+        store.path = Some(claimed.path.clone());
+        #[cfg(unix)]
+        {
+            store._mailbox_lock = Some(claimed.lock);
+        }
         store.seal_private_files()?;
         // Embeddings are filled off this thread, and only in one process.
         // A lock problem skips the indexer. Open still returns the mailbox.
-        store.indexer = crate::embed::Indexer::try_spawn(&path);
+        store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
         Ok(store)
     }
 
@@ -349,7 +353,14 @@ impl Store {
             indexer: None,
             conn,
             path: None,
+            #[cfg(unix)]
+            _mailbox_lock: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mailbox_path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     #[cfg(test)]
@@ -820,10 +831,146 @@ fn page_offset(cursor: Option<&str>) -> Result<i64> {
     }
 }
 
-fn checkpoint_wal(path: &Path) -> Result<()> {
-    let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+struct ClaimedMailbox {
+    path: std::path::PathBuf,
+    #[cfg(unix)]
+    lock: std::fs::File,
+}
+
+/// Pick the SQLite path for this inode and hold a shared lock on it.
+///
+/// SQLite names `-wal` and `-shm` from the path string. Two strings for one
+/// inode (a symlink and its target, or two hard links) do not share locks.
+/// Replay the requested path's WAL only while this process holds an exclusive
+/// lock on the inode, and open the canonical path only when that checkpoint
+/// reports `busy=0` and every frame was copied. Otherwise keep the path that
+/// was requested so an existing connection keeps its WAL.
+fn claim_mailbox(requested: &Path) -> Result<ClaimedMailbox> {
+    #[cfg(unix)]
+    {
+        claim_mailbox_unix(requested)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ClaimedMailbox {
+            path: requested.canonicalize()?,
+        })
+    }
+}
+
+#[cfg(unix)]
+const OPEN_PATH_ATTR: &str = "user.fell.sqlite_path";
+
+#[cfg(unix)]
+fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
+    use fs4::fs_std::FileExt;
+
+    let canonical = requested.canonicalize()?;
+    let file = std::fs::File::open(requested)?;
+    let path = if file.try_lock_exclusive()? {
+        let path = adopt_mailbox_path(&file, requested, &canonical)?;
+        // Convert exclusive to shared with no gap. Another opener can join,
+        // but it cannot start its own migration while this store is alive.
+        file.lock_shared()?;
+        path
+    } else {
+        file.lock_shared()?;
+        published_mailbox_path(&file, requested)
+    };
+    Ok(ClaimedMailbox { path, lock: file })
+}
+
+#[cfg(unix)]
+fn adopt_mailbox_path(
+    file: &std::fs::File,
+    requested: &Path,
+    canonical: &Path,
+) -> Result<std::path::PathBuf> {
+    let stable = published_mailbox_path(file, canonical);
+    let requested = absolute_opened(requested)?;
+    if requested != stable {
+        let report = checkpoint_wal(&requested)?;
+        // `busy=1` is a row, not an error. A blocked checkpoint must not
+        // switch paths: frames would stay in the WAL we are about to leave.
+        if report.busy != 0 || report.log != report.checkpointed {
+            let _ = publish_mailbox_path(file, &requested);
+            return Ok(requested);
+        }
+    }
+    if publish_mailbox_path(file, &stable).is_err() && requested != stable {
+        return Ok(requested);
+    }
+    Ok(stable)
+}
+
+#[cfg(unix)]
+fn published_mailbox_path(file: &std::fs::File, fallback: &Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    use xattr::FileExt;
+
+    let Ok(Some(bytes)) = file.get_xattr(OPEN_PATH_ATTR) else {
+        return fallback.to_path_buf();
+    };
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    if same_inode(file, &path) {
+        path
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+#[cfg(unix)]
+fn publish_mailbox_path(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use xattr::FileExt;
+
+    file.set_xattr(OPEN_PATH_ATTR, path.as_os_str().as_bytes())?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn same_inode(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(ours) = file.metadata() else {
+        return false;
+    };
+    let Ok(theirs) = std::fs::metadata(path) else {
+        return false;
+    };
+    ours.dev() == theirs.dev() && ours.ino() == theirs.ino()
+}
+
+#[cfg(unix)]
+fn absolute_opened(path: &Path) -> Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(unix)]
+struct WalCheckpoint {
+    busy: i64,
+    log: i64,
+    checkpointed: i64,
+}
+
+#[cfg(unix)]
+fn checkpoint_wal(path: &Path) -> Result<WalCheckpoint> {
+    let conn = Connection::open(path)?;
+    // A blocked checkpoint returns a row. Do not wait out another connection.
+    conn.busy_timeout(Duration::ZERO)?;
+    let (busy, log, checkpointed) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    Ok(WalCheckpoint {
+        busy,
+        log,
+        checkpointed,
+    })
 }
 
 fn create_private_file(path: &Path) -> Result<()> {

@@ -1872,6 +1872,7 @@ name = "fell-core"
 version = "0.1.0"
 dependencies = [
  "fell-confirm",
+ "fs4",
  "mail-parser",
  "rcgen",
  "rusqlite",
@@ -1881,6 +1882,7 @@ dependencies = [
  "serde_json",
  "similar",
  "thiserror 2.0.21",
+ "xattr",
 ]
 
 [[package]]
@@ -2092,6 +2094,16 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
