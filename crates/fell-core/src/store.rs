@@ -4022,6 +4022,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn sent_parent_survives_list_rewritten_in_reply_to() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
