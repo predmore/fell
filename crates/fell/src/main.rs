@@ -30,7 +30,7 @@ fn main() {
             }
             "--narrow" => {
                 width = 420.0;
-                height = 640.0;
+                height = 760.0;
             }
             "--width" => {
                 if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
