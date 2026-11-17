@@ -43,6 +43,12 @@ SQLite is the source of truth for the UI. Sync writes messages, threads, and an 
 
 Each IMAP mailbox is one folder on the message. A message with no Message-ID is stored under a stable id from the mailbox, UIDVALIDITY, and UID. Copies with the same Message-ID stay one row; see Threading.
 
+## Folder lists
+
+A folder list reads `thread_summary` (one row per thread: first subject, latest snippet and sender, participants, labels, star and attachment markers, message count) joined to `thread_folders` (one row per thread and folder, with that folder's unread state). It does not read `messages`, so its cost follows the folder, not the mailbox. `account_folders` keeps each folder name's earliest stored spelling for the picker.
+
+Triggers on `messages` queue every thread a write touches in `thread_summary_dirty`, whatever code made the write. Every write transaction (`WriteTx`, from `immediate_transaction`) recomputes its queued threads from their messages before it commits, so a reader sees summaries that match the messages they came from. A reader treats a thread still in the queue (a write that bypassed `WriteTx`) as unknown and computes it from `messages`, so the list is right either way. The first open of an older mailbox queues and fills every thread once. A randomized test checks folder lists and folder names against a scan of every message after archive, move, label, delete, undo, and flag changes.
+
 ## Search
 
 `Store::search` reads that store and nothing else. It does not call a backend, so results move only when a local write does.
