@@ -1528,10 +1528,8 @@ fn status_bar(
     };
     div()
         .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .gap_3()
+        .flex_col()
+        .gap_1()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
@@ -1541,7 +1539,7 @@ fn status_bar(
         .child(
             div()
                 .flex()
-                .flex_shrink_0()
+                .flex_wrap()
                 .gap_3()
                 .child(div().text_color(rgb(colors.accent)).child(mode.to_string()))
                 .child(div().text_color(rgb(colors.fg)).child(status.to_string()))
@@ -1549,7 +1547,7 @@ fn status_bar(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().flex_shrink_0().child(send.to_string()))
+        .child(div().flex().justify_end().child(send.to_string()))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
