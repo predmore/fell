@@ -1070,13 +1070,20 @@ fn write_kept(
 ) -> Result<ThreadId> {
     let stored_list = list_is_set(&stored.list_id);
     let incoming_list = clean_list_id(&message.list_id).is_some();
-    let (body_text, snippet) = if alias {
+    // The list copy can be the canonical id. A later sync of that id must not
+    // undo the Sent copy's parent or body. A non-list same-id update still
+    // replaces a non-empty parent.
+    let list_resync_of_merged = !alias
+        && incoming_list
+        && alias_points_at(conn, &message.account_id, &stored.canonical_id)?;
+    let like_alias = alias || list_resync_of_merged;
+    let (body_text, snippet) = if like_alias {
         filled_body_keep_stored(stored, message)
     } else {
         filled_body_canonical(stored, message)
     };
     let fingerprint = fingerprint_of(body_text.as_deref());
-    let (in_reply_to, references) = parents_for_write(stored, message, alias);
+    let (in_reply_to, references) = parents_for_write(stored, message, like_alias);
     let subject = merged_subject(
         &stored.subject,
         stored_list,
@@ -1493,13 +1500,17 @@ fn filled_body_canonical(stored: &Arrival, message: &Message) -> (Option<String>
 }
 
 /// Keep a stored body. Copy the incoming body only when the stored row has none.
+/// The snippet follows that body, so a subject preview does not stick.
 fn filled_body_keep_stored(stored: &Arrival, message: &Message) -> (Option<String>, String) {
-    let body = if body_is_missing(&stored.body_text) && !body_is_missing(&message.body_text) {
+    let take_incoming = body_is_missing(&stored.body_text) && !body_is_missing(&message.body_text);
+    let body = if take_incoming {
         message.body_text.clone()
     } else {
         stored.body_text.clone()
     };
-    let snippet = if stored.snippet.trim().is_empty() && !message.snippet.trim().is_empty() {
+    let snippet = if !message.snippet.trim().is_empty()
+        && (take_incoming || stored.snippet.trim().is_empty())
+    {
         message.snippet.clone()
     } else {
         stored.snippet.clone()
@@ -3974,9 +3985,10 @@ mod tests {
         );
         assert_eq!(collapsed.body_text.as_deref(), Some("hello body"));
 
-        echo.body_text = None;
-        echo.headers.in_reply_to = None;
-        echo.headers.references.clear();
+        echo.body_text = Some("rewritten list body".into());
+        echo.snippet = "rewritten list body".into();
+        echo.headers.in_reply_to = Some(MessageId::new("rewritten@x"));
+        echo.headers.references = vec![MessageId::new("rewritten@x")];
         store.upsert_message(&echo).unwrap();
         let collapsed = listed(&store)
             .into_iter()
@@ -3992,6 +4004,31 @@ mod tests {
         );
         assert_eq!(collapsed.body_text.as_deref(), Some("hello body"));
         assert_eq!(collapsed.headers.subject, "Hello");
+    }
+
+    #[test]
+    fn filled_body_replaces_a_subject_snippet() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut echo = msg("list-rewrite@x", None, None, "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.snippet = "[list] Hello".into();
+        store.upsert_message(&echo).unwrap();
+        let mut sent = msg("orig@x", None, None, "Hello", "hello body");
+        sent.snippet = "plain preview".into();
+        store.upsert_message(&sent).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET body_text = NULL WHERE message_id = 'list-rewrite@x'",
+                [],
+            )
+            .unwrap();
+        store.upsert_message(&sent).unwrap();
+        let collapsed = listed(&store);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].body_text.as_deref(), Some("hello body"));
+        assert_eq!(collapsed[0].snippet, "plain preview");
     }
 
     #[test]
