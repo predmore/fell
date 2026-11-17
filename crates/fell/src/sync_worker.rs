@@ -31,6 +31,8 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(750);
 /// A passive checkpoint after this many committed batches keeps the WAL from
 /// growing without bound during a long first sync.
 const CHECKPOINT_EVERY: usize = 16;
+/// Quiet retries of opening the mailbox before the window shows an error.
+const OPEN_RETRIES_BEFORE_ERROR: usize = 3;
 
 /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean the
 /// store has new rows.
@@ -85,10 +87,17 @@ fn run(
             Err(err) => {
                 let delay = BACKOFF[failures.min(BACKOFF.len() - 1)] / 5;
                 failures += 1;
-                if !send(failed(
-                    SyncFailureKind::Other,
-                    format!("sync could not open the mailbox: {err}"),
-                )) {
+                // A lock held while the window's connection finishes opening
+                // clears in a moment. Say "offline" only if it keeps failing.
+                let status = if failures < OPEN_RETRIES_BEFORE_ERROR {
+                    SyncKind::Connecting
+                } else {
+                    failed(
+                        SyncFailureKind::Other,
+                        format!("sync could not open the mailbox: {err}"),
+                    )
+                };
+                if !send(status) {
                     return;
                 }
                 match wake.recv_timeout(delay) {

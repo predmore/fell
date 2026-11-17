@@ -198,7 +198,7 @@ impl AccountConfig {
         }
         if self.security == ImapSecurity::Plain && !self.is_loopback() {
             return Err(invalid(
-                "security = \"plain\" is only allowed for a host on this machine",
+                "security = \"plain\" is only allowed for a loopback address like 127.0.0.1",
             ));
         }
         match &self.password {
@@ -256,11 +256,15 @@ impl AccountConfig {
         }
     }
 
+    /// The host is a literal loopback address. A name such as `localhost`
+    /// does not count: it is resolved at connect time and may reach another
+    /// machine, which must never get plaintext or an unchecked certificate.
     pub fn is_loopback(&self) -> bool {
-        matches!(
-            self.host.as_str(),
-            "127.0.0.1" | "localhost" | "::1" | "[::1]"
-        )
+        self.host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
     }
 
     /// Resolve the password (running `password_command` if set) and build the backend.
@@ -310,10 +314,21 @@ impl AccountConfig {
                     .output()
                     .map_err(|err| Error::Backend(format!("password_command: {err}")))?;
                 if !output.status.success() {
-                    return Err(Error::Backend(format!(
-                        "password_command exited with {}",
-                        output.status
-                    )));
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let tail: String = stderr
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(160)
+                        .collect();
+                    return Err(Error::Backend(if tail.is_empty() {
+                        format!("password_command exited with {}", output.status)
+                    } else {
+                        format!("password_command exited with {}: {tail}", output.status)
+                    }));
                 }
                 let text = String::from_utf8(output.stdout)
                     .map_err(|_| Error::Backend("password_command printed non-UTF-8".into()))?;
@@ -343,11 +358,18 @@ pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
     let Error::Backend(message) = err else {
         return SyncFailureKind::Other;
     };
+    let upper = message.to_ascii_uppercase();
     if message.starts_with("password_command") {
         SyncFailureKind::Password
-    } else if message.contains("LOGIN failed") || message.contains("AUTHENTICATE failed") {
+    } else if upper.contains("AUTHENTICATIONFAILED")
+        || ((message.contains("LOGIN failed: NO") || message.contains("AUTHENTICATE failed: NO"))
+            && !upper.contains("[UNAVAILABLE]")
+            && !upper.contains("[SERVERBUG]"))
+    {
+        // A NO to LOGIN without a response code is a refused credential on
+        // the servers we know; UNAVAILABLE or SERVERBUG is the server's fault.
         SyncFailureKind::LoginRejected
-    } else if message.starts_with("imap: connect ") {
+    } else if message.starts_with("imap: connect ") || message.starts_with("imap: resolve ") {
         SyncFailureKind::Unreachable
     } else {
         SyncFailureKind::Other
@@ -387,7 +409,7 @@ fn parse_value(raw: &str) -> std::result::Result<Value, String> {
                 '"' => {
                     let tail = chars.as_str().trim();
                     if !tail.is_empty() && !tail.starts_with('#') {
-                        return Err(format!("unexpected text after the string: {tail}"));
+                        return Err("unexpected text after the closing quote".into());
                     }
                     return Ok(Value::Text(out));
                 }
@@ -396,7 +418,7 @@ fn parse_value(raw: &str) -> std::result::Result<Value, String> {
                     Some('\\') => out.push('\\'),
                     Some('n') => out.push('\n'),
                     Some('t') => out.push('\t'),
-                    Some(other) => return Err(format!("unsupported escape \\{other}")),
+                    Some(_) => return Err("unsupported escape (use \\\\ \\\" \\n or \\t)".into()),
                     None => return Err("unterminated string".into()),
                 },
                 other => out.push(other),
@@ -410,14 +432,15 @@ fn parse_value(raw: &str) -> std::result::Result<Value, String> {
         };
         let tail = rest[end + 1..].trim();
         if !tail.is_empty() && !tail.starts_with('#') {
-            return Err(format!("unexpected text after the string: {tail}"));
+            return Err("unexpected text after the closing quote".into());
         }
         return Ok(Value::Text(rest[..end].to_string()));
     }
     let bare = raw.split('#').next().unwrap_or("").trim();
     bare.parse::<u64>()
         .map(Value::Number)
-        .map_err(|_| format!("{bare:?} must be a quoted string or a number"))
+        // Never repeat the value: it may be a password typed without quotes.
+        .map_err(|_| "the value must be a quoted string or a number".into())
 }
 
 fn push(out: &mut String, key: &str, value: &str) {
@@ -525,12 +548,56 @@ mod tests {
     }
 
     #[test]
-    fn only_local_bridge_accepts_its_own_certificate() {
+    fn only_bridge_on_a_loopback_address_skips_certificate_checks() {
         let local = AccountConfig::bridge("a@b", "a@b", PasswordSource::Inline("x".into()));
-        assert!(local.is_loopback());
-        let mut remote = local.clone();
-        remote.host = "mail.example.com".into();
-        assert!(!remote.is_loopback());
+        assert!(local.imap_config().unwrap().accept_invalid_certs);
+        for host in ["::1", "[::1]", "127.0.0.2"] {
+            let mut other = local.clone();
+            other.host = host.into();
+            assert!(other.imap_config().unwrap().accept_invalid_certs, "{host}");
+        }
+        for host in [
+            "localhost",
+            "mail.example.com",
+            "127.1",
+            "2130706433",
+            "10.0.0.1",
+        ] {
+            let mut other = local.clone();
+            other.host = host.into();
+            assert!(!other.imap_config().unwrap().accept_invalid_certs, "{host}");
+        }
+        let mut imap = local.clone();
+        imap.backend = BackendKind::Imap;
+        assert!(!imap.imap_config().unwrap().accept_invalid_certs);
+    }
+
+    #[test]
+    fn plaintext_needs_a_literal_loopback_address() {
+        let text = |host: &str| {
+            format!("email = \"a@b\"\npassword = \"x\"\nhost = \"{host}\"\nsecurity = \"plain\"\n")
+        };
+        assert!(AccountConfig::parse(&text("127.0.0.1")).is_ok());
+        assert!(AccountConfig::parse(&text("::1")).is_ok());
+        for host in ["localhost", "LOCALHOST", "mail.example.com", "127.1"] {
+            assert!(AccountConfig::parse(&text(host)).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn parse_errors_never_repeat_a_value() {
+        for text in [
+            "email = \"a@b\"\npassword = hunter2\n",
+            "email = \"a@b\"\npassword = \"sec\"ret\"\n",
+            "email = \"a@b\"\npassword = 'sec'ret'\n",
+            "email = \"a@b\"\npassword = \"sec\\qret\"\n",
+            "email = \"a@b\"\npassword = \"hunter2\n",
+        ] {
+            let err = AccountConfig::parse(text).unwrap_err().to_string();
+            for secret in ["hunter2", "ret", "qret"] {
+                assert!(!err.contains(secret), "{text:?} -> {err}");
+            }
+        }
     }
 
     #[test]
@@ -541,9 +608,11 @@ mod tests {
             PasswordSource::Command("printf 'pw\\nrest'".into()),
         );
         assert_eq!(config.resolve_password().unwrap(), "pw");
-        config.password = PasswordSource::Command("exit 3".into());
+        config.password =
+            PasswordSource::Command("echo 'gpg: decryption failed' >&2; exit 3".into());
         let err = config.resolve_password().unwrap_err();
         assert_eq!(classify_sync_error(&err), SyncFailureKind::Password);
+        assert!(err.to_string().contains("gpg: decryption failed"), "{err}");
     }
 
     #[test]
@@ -560,6 +629,18 @@ mod tests {
             (
                 "imap: tls handshake setup failed: x",
                 SyncFailureKind::Other,
+            ),
+            (
+                "imap: resolve nope:993 failed: x",
+                SyncFailureKind::Unreachable,
+            ),
+            (
+                "imap: LOGIN failed: NO [UNAVAILABLE] later",
+                SyncFailureKind::Other,
+            ),
+            (
+                "imap: LOGIN failed: NO bad password",
+                SyncFailureKind::LoginRejected,
             ),
         ];
         for (message, kind) in cases {

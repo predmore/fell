@@ -302,20 +302,42 @@ impl Store {
         Ok(store)
     }
 
-    /// Copy the write-ahead log into the database file. `truncate` also
-    /// shrinks the log to zero, waiting up to the busy timeout for readers;
-    /// otherwise this is a passive checkpoint that never waits. Returns the
-    /// frames still in the log that a reader kept from being copied.
+    /// Copy the write-ahead log into the database file. Neither form waits:
+    /// a passive checkpoint copies what no reader still needs, and `truncate`
+    /// also resets the log to zero bytes, but only if no other connection is
+    /// reading or writing at that moment. Otherwise it gives up at once
+    /// instead of holding writers back for the busy timeout. Returns the
+    /// frames left in the log, or -1 when the reset was skipped.
     pub fn checkpoint(&self, truncate: bool) -> Result<i64> {
         let sql = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE)"
         } else {
             "PRAGMA wal_checkpoint(PASSIVE)"
         };
-        let (_busy, log, done): (i64, i64, i64) = self
-            .conn
-            .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        Ok((log - done).max(0))
+        if truncate {
+            self.conn.busy_timeout(Duration::ZERO)?;
+        }
+        let result = self.conn.query_row(sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        });
+        if truncate {
+            self.conn.busy_timeout(Duration::from_secs(5))?;
+        }
+        match result {
+            Ok((busy, _, _)) if busy != 0 => Ok(-1),
+            Ok((_, log, done)) => Ok((log - done).max(0)),
+            // Another connection held the lock: try again after the next pass.
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                Ok(-1)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn db_path(&self) -> Option<&Path> {

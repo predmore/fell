@@ -54,18 +54,32 @@ pub fn run() {
     });
 }
 
-/// What to do with the selection when a folder read lands.
-#[derive(Clone, Debug)]
-enum AfterThreads {
-    /// Sync wrote rows. Keep the selected thread where it is on screen.
-    Refresh,
-    /// A folder switch. Go back to `previous` if the read fails.
-    Switch { previous: String },
-    /// Archive or move. If the selected thread left, the row now at its
-    /// place is selected (see `Session::set_threads`).
-    Changed,
-    /// Undo: select this thread if it is back in the folder.
-    Select(Option<String>),
+/// Why the folder is being reread. Requests made while a read is in flight
+/// merge into one, so a sync refresh can never drop what the user asked for.
+#[derive(Clone, Debug, Default)]
+struct ReadIntent {
+    /// The folder on screen changed. A failure goes back to `list_folder`; a
+    /// selected thread missing from the new folder gives way to the first row.
+    switch: bool,
+    /// Archive, move, or undo wrote to the store. Scroll to the selection
+    /// instead of holding the viewport still.
+    changed: bool,
+    /// Undo: select this thread when it is back in the folder.
+    select: Option<String>,
+}
+
+impl ReadIntent {
+    fn merge(mut self, later: ReadIntent) -> ReadIntent {
+        self.switch |= later.switch;
+        self.changed |= later.changed;
+        self.select = later.select.or(self.select);
+        self
+    }
+
+    /// Only sync asked: keep the selected row still on screen.
+    fn is_refresh(&self) -> bool {
+        !self.switch && !self.changed && self.select.is_none()
+    }
 }
 
 type ThreadsResult = Result<(Vec<ThreadRow>, Vec<String>), String>;
@@ -88,13 +102,14 @@ struct Inbox {
     moved_thread: Option<String>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
-    /// Bumped by every folder read. A read that lands after a newer one was
-    /// asked for is dropped.
-    threads_gen: u64,
-    /// A sync refresh is waiting on the store thread. Another one only marks
-    /// `refresh_again`, so a burst of sync batches is one read, not a queue.
-    refresh_in_flight: bool,
-    refresh_again: bool,
+    /// The folder the rows on screen came from. `session.folder` changes on
+    /// the key press; this changes when that folder's read lands. Archive and
+    /// move act on this one, the list the reader sees.
+    list_folder: String,
+    /// One folder read at a time is on the store thread.
+    read_in_flight: bool,
+    /// Asked for while a read was in flight. Issued when it lands.
+    read_wanted: Option<ReadIntent>,
     /// Bumped by every conversation read. The store thread skips a read that
     /// is already stale, so holding `j` does not build a backlog.
     conv_gen: Arc<AtomicU64>,
@@ -145,9 +160,9 @@ impl Inbox {
             open_thread: None,
             moved_thread: None,
             sync: None,
-            threads_gen: 0,
-            refresh_in_flight: false,
-            refresh_again: false,
+            list_folder: "INBOX".into(),
+            read_in_flight: false,
+            read_wanted: None,
             conv_gen: Arc::new(AtomicU64::new(0)),
         };
         let sync_with = config.zip(startup.path.ok());
@@ -188,7 +203,7 @@ impl Inbox {
             self.sync = Some(handle);
             self.watch_sync(events, cx);
         }
-        self.request_threads(AfterThreads::Refresh, cx);
+        self.request_threads(ReadIntent::default(), cx);
         cx.notify();
     }
 
@@ -207,7 +222,7 @@ impl Inbox {
                             || matches!(kind, SyncKind::Synced { stored, .. } if stored > 0);
                         inbox.session.sync = kind;
                         if wrote {
-                            inbox.refresh_from_store(cx);
+                            inbox.request_threads(ReadIntent::default(), cx);
                         }
                         cx.notify();
                     })
@@ -220,27 +235,25 @@ impl Inbox {
         .detach();
     }
 
-    /// Reread the folder after sync wrote to the store. At most one of these
-    /// is on the store thread at a time.
-    fn refresh_from_store(&mut self, cx: &mut Context<Self>) {
-        if self.refresh_in_flight {
-            self.refresh_again = true;
+    /// Reread the folder on screen on the store thread. While one read is in
+    /// flight, further requests merge into a single follow-up, so a burst of
+    /// sync batches is one read and never a queue.
+    fn request_threads(&mut self, intent: ReadIntent, cx: &mut Context<Self>) {
+        if self.read_in_flight {
+            self.read_wanted = Some(match self.read_wanted.take() {
+                Some(earlier) => earlier.merge(intent),
+                None => intent,
+            });
             return;
         }
-        self.refresh_in_flight = true;
-        self.request_threads(AfterThreads::Refresh, cx);
-    }
-
-    /// Read the folder on screen on the store thread, then apply `after`.
-    fn request_threads(&mut self, after: AfterThreads, cx: &mut Context<Self>) {
-        self.threads_gen += 1;
-        let generation = self.threads_gen;
+        self.read_in_flight = true;
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let me = self.session.account_email.clone();
+        let reading = folder.clone();
         let reply = self.store.call(move |store| -> ThreadsResult {
             let threads = store
-                .folder_threads(&account, &folder)
+                .folder_threads(&account, &reading)
                 .map_err(|err| err.to_string())?;
             let names = store.folder_names(&account).unwrap_or_default();
             Ok((present::thread_rows(&threads, &me), names))
@@ -250,41 +263,55 @@ impl Inbox {
                 return;
             };
             let _ = this.update(cx, |inbox, cx| {
-                inbox.apply_threads(generation, result, after, cx);
+                inbox.read_landed(folder, result, intent, cx);
             });
         })
         .detach();
     }
 
-    fn apply_threads(
+    fn read_landed(
         &mut self,
-        generation: u64,
+        folder: String,
         result: ThreadsResult,
-        after: AfterThreads,
+        intent: ReadIntent,
         cx: &mut Context<Self>,
     ) {
-        let refresh = matches!(after, AfterThreads::Refresh);
-        if refresh {
-            self.refresh_in_flight = false;
+        self.read_in_flight = false;
+        let wanted = self.read_wanted.take();
+        // A user action (switch, archive, move, undo) since this read started
+        // makes it stale. Skip it and read again with both intents, so the
+        // list never flashes a folder or a row the user already left.
+        let stale =
+            folder != self.session.folder || wanted.as_ref().is_some_and(|next| !next.is_refresh());
+        if stale {
+            let merged = match wanted {
+                Some(next) => intent.merge(next),
+                None => intent,
+            };
+            self.request_threads(merged, cx);
+            return;
         }
-        if generation == self.threads_gen {
-            self.show_threads(result, after, cx);
-        }
-        // Sync wrote more while that read ran. Read once more, after showing
-        // this one, so a fast sync cannot starve the list.
-        if refresh && std::mem::take(&mut self.refresh_again) {
-            self.refresh_in_flight = true;
-            self.request_threads(AfterThreads::Refresh, cx);
+        self.show_threads(folder, result, intent, cx);
+        // Only sync wrote while that read ran. Show it first, then read once
+        // more, so a fast sync cannot starve the list.
+        if let Some(next) = wanted {
+            self.request_threads(next, cx);
         }
     }
 
-    fn show_threads(&mut self, result: ThreadsResult, after: AfterThreads, cx: &mut Context<Self>) {
+    fn show_threads(
+        &mut self,
+        folder: String,
+        result: ThreadsResult,
+        intent: ReadIntent,
+        cx: &mut Context<Self>,
+    ) {
         self.session.loading = false;
         let (rows, names) = match result {
             Ok(found) => found,
             Err(err) => {
-                if let AfterThreads::Switch { previous } = after {
-                    self.session.folder = previous;
+                if intent.switch {
+                    self.session.folder = self.list_folder.clone();
                 }
                 self.session.fail_query(QueryFault::Folder, err);
                 cx.notify();
@@ -295,6 +322,16 @@ impl Inbox {
         if !names.is_empty() {
             self.session.folders = names;
         }
+        let switched = folder != self.list_folder;
+        self.list_folder = folder;
+        if switched
+            && let Some(id) = &self.session.cursor_id
+            && !rows.iter().any(|row| &row.id == id)
+        {
+            // A new folder opens at its top, not at the old folder's index.
+            self.session.cursor_id = None;
+        }
+        let row_height = self.list_row_height();
         let before_id = self.session.cursor_id.clone();
         let before_index = before_id
             .as_ref()
@@ -305,8 +342,7 @@ impl Inbox {
                 .map(|row| row.message_count)
         });
         self.session.set_threads(rows);
-        let refresh = matches!(after, AfterThreads::Refresh);
-        if let AfterThreads::Select(Some(id)) = &after {
+        if let Some(id) = &intent.select {
             self.session.select_if_present(id);
         }
         let after_index = self
@@ -315,11 +351,12 @@ impl Inbox {
             .as_ref()
             .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
         let same_thread = self.session.cursor_id == before_id;
-        if refresh && same_thread {
+        if intent.is_refresh() && !switched && same_thread {
             // Rows sync put above the selection push it down. Scroll by the
             // same amount so the selected row stays where the reader left it.
-            if let (Some(before), Some(after)) = (before_index, after_index) {
-                self.shift_list(after as i64 - before as i64);
+            if let (Some(before), Some(after), Some(row)) = (before_index, after_index, row_height)
+            {
+                self.shift_list(after as i64 - before as i64, row);
             }
         } else {
             self.scroll_list_to_cursor();
@@ -332,16 +369,26 @@ impl Inbox {
         cx.notify();
     }
 
-    /// Move the list viewport by `rows` rows without moving the selection.
-    fn shift_list(&self, rows: i64) {
+    /// One row's height as the list last laid it out. GPUI records the
+    /// viewport as `item` and the whole list as `contents`.
+    fn list_row_height(&self) -> Option<f32> {
+        let state = self.list_scroll.0.borrow();
+        let size = state.last_item_size?;
+        let rows = self.session.threads.len();
+        if rows == 0 {
+            return None;
+        }
+        let row = f32::from(size.contents.height) / rows as f32;
+        (row > 0.0).then_some(row)
+    }
+
+    /// Move the list viewport by `rows` rows of `row` pixels without moving
+    /// the selection. GPUI offsets grow more negative further down the list.
+    fn shift_list(&self, rows: i64, row: f32) {
         if rows == 0 {
             return;
         }
         let state = self.list_scroll.0.borrow();
-        let Some(size) = state.last_item_size else {
-            return;
-        };
-        let row = f32::from(size.item.height);
         let handle = &state.base_handle;
         let offset = handle.offset();
         let max = f32::from(handle.max_offset().height) + rows.max(0) as f32 * row;
@@ -389,11 +436,27 @@ impl Inbox {
                 match result {
                     Ok(view) => {
                         inbox.session.clear_query_fault(QueryFault::Message);
-                        inbox.session.set_messages(view);
+                        let same = inbox.open_thread.as_deref() == Some(id.as_str());
+                        // Sync adding to the thread being read must not pull a
+                        // reader who scrolled up back to the bottom.
+                        let follow = if same {
+                            inbox.session.refresh_messages(view)
+                        } else {
+                            inbox.session.set_messages(view);
+                            true
+                        };
                         inbox.open_thread = Some(id);
-                        inbox.scroll_conversation();
+                        if follow {
+                            inbox.scroll_conversation();
+                        }
                     }
-                    Err(err) => inbox.session.fail_query(QueryFault::Message, err),
+                    Err(err) => {
+                        // Never leave another thread's body under this row.
+                        if inbox.open_thread.as_deref() != Some(id.as_str()) {
+                            inbox.clear_open_message();
+                        }
+                        inbox.session.fail_query(QueryFault::Message, err);
+                    }
                 }
                 cx.notify();
             });
@@ -405,7 +468,7 @@ impl Inbox {
     fn change_mailbox(
         &mut self,
         change: impl FnOnce(&fell_core::Store) -> Result<(), fell_core::Error> + Send + 'static,
-        done: impl FnOnce(&mut Self, Result<(), fell_core::Error>) -> Option<AfterThreads> + 'static,
+        done: impl FnOnce(&mut Self, Result<(), fell_core::Error>) -> Option<ReadIntent> + 'static,
         cx: &mut Context<Self>,
     ) {
         let reply = self.store.call(change);
@@ -464,7 +527,9 @@ impl Inbox {
         .detach();
     }
 
-    /// Move messages in the current folder to Archive. A Sent copy stays in Sent.
+    /// Move messages in the folder on screen to Archive. A Sent copy stays in
+    /// Sent. The row leaves the list at once and the row in its place is
+    /// selected, so a second `e` archives that one.
     fn archive_current(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
@@ -474,20 +539,28 @@ impl Inbox {
             self.session.show_toast("No conversation", true);
             return;
         }
-        let folder = self.session.folder.clone();
+        let folder = self.list_folder.clone();
         let account = self.account_id.clone();
         let thread = ThreadId(id.clone());
+        self.take_out_of_list(&id, cx);
         self.change_mailbox(
             move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
             move |inbox, result| match result {
                 Ok(()) => {
                     inbox.moved_thread = Some(id);
                     inbox.session.show_toast("Archived · u", false);
-                    Some(AfterThreads::Changed)
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
                 }
                 Err(err) => {
                     inbox.session.show_toast(archive_failure(&err), true);
-                    None
+                    Some(ReadIntent {
+                        changed: true,
+                        select: Some(id),
+                        ..ReadIntent::default()
+                    })
                 }
             },
             cx,
@@ -499,10 +572,15 @@ impl Inbox {
             self.session.show_toast("No conversation", true);
             return;
         };
+        if !self.session.threads.iter().any(|thread| thread.id == id) {
+            self.session.show_toast("No conversation", true);
+            return;
+        }
         let account = self.account_id.clone();
         let thread = ThreadId(id.clone());
-        let from = self.session.folder.clone();
+        let from = self.list_folder.clone();
         let to = destination.clone();
+        self.take_out_of_list(&id, cx);
         self.change_mailbox(
             move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
             move |inbox, result| match result {
@@ -510,15 +588,30 @@ impl Inbox {
                     inbox.moved_thread = Some(id);
                     let label = present::folder_label(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
-                    Some(AfterThreads::Changed)
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
                 }
                 Err(err) => {
                     inbox.session.show_toast(err.to_string(), true);
-                    None
+                    Some(ReadIntent {
+                        changed: true,
+                        select: Some(id),
+                        ..ReadIntent::default()
+                    })
                 }
             },
             cx,
         );
+    }
+
+    /// Remove `id` from the rows on screen before its write lands and open
+    /// the row that took its place.
+    fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.session.remove_thread(id);
+        self.scroll_list_to_cursor();
+        self.request_messages(true, cx);
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
@@ -528,7 +621,11 @@ impl Inbox {
             |inbox, result| match result {
                 Ok(()) => {
                     inbox.session.show_toast("Undone", false);
-                    Some(AfterThreads::Select(inbox.moved_thread.take()))
+                    Some(ReadIntent {
+                        changed: true,
+                        select: inbox.moved_thread.take(),
+                        ..ReadIntent::default()
+                    })
                 }
                 Err(err) => {
                     let raw = err.to_string();
@@ -609,13 +706,16 @@ impl Inbox {
         }
         // Reads go to the store thread. The list moves on this frame; the
         // conversation follows when its read lands.
-        if step.reload_threads {
+        if step.reload_threads && self.session.folder != folder_before {
             self.request_threads(
-                AfterThreads::Switch {
-                    previous: folder_before,
+                ReadIntent {
+                    switch: true,
+                    ..ReadIntent::default()
                 },
                 cx,
             );
+        } else if step.reload_threads {
+            self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
             self.request_messages(true, cx);
         }

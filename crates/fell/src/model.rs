@@ -467,6 +467,43 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
+    /// Reread of the thread already open (sync added or dropped a message).
+    /// A reader on the last message follows to the new last one. A reader
+    /// further up keeps their message and opened quotes. Returns whether the
+    /// cursor moved to the end.
+    pub fn refresh_messages(&mut self, messages: Vec<ConvMessage>) -> bool {
+        let at_end = self.message_cursor + 1 >= self.messages.len();
+        if at_end {
+            self.set_messages(messages);
+            return true;
+        }
+        let cursor = self.message_cursor;
+        let len = messages.len();
+        self.messages = messages;
+        self.quotes_open.retain(|index| *index < len);
+        self.message_cursor = cursor.min(len.saturating_sub(1));
+        false
+    }
+
+    /// Take `id` out of the list before the store write that removes it
+    /// lands, and select the row that slides into its place (the next row,
+    /// or the previous one at the end). The next key acts on that row.
+    pub fn remove_thread(&mut self, id: &str) {
+        let Some(index) = self.threads.iter().position(|thread| thread.id == id) else {
+            return;
+        };
+        self.threads.remove(index);
+        self.picked.remove(id);
+        if self.cursor_id.as_deref() == Some(id) {
+            let next = index.min(self.threads.len().saturating_sub(1));
+            self.cursor_id = self.threads.get(next).map(|thread| thread.id.clone());
+        }
+        if self.anchor_id.as_deref() == Some(id) {
+            self.visual = false;
+            self.anchor_id = None;
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyId, page_rows: usize) -> Step {
         if self.overlay != Overlay::None {
             return self.overlay_key(key, page_rows);
@@ -1296,6 +1333,33 @@ mod tests {
         session.sync = SyncKind::FirstSync;
         let banner = session.list_banner().unwrap();
         assert!(banner.hint.contains("fell account setup"));
+    }
+
+    #[test]
+    fn removing_the_selected_thread_selects_the_row_in_its_place() {
+        let mut session = session();
+        let ids: Vec<String> = session.threads.iter().map(|row| row.id.clone()).collect();
+        assert!(ids.len() >= 3, "fixture needs three threads");
+        session.cursor_id = Some(ids[1].clone());
+        session.remove_thread(&ids[1]);
+        assert_eq!(session.cursor_id.as_deref(), Some(ids[2].as_str()));
+        let last = session.threads.last().unwrap().id.clone();
+        let before_last = session.threads[session.threads.len() - 2].id.clone();
+        session.cursor_id = Some(last.clone());
+        session.remove_thread(&last);
+        assert_eq!(session.cursor_id.as_deref(), Some(before_last.as_str()));
+    }
+
+    #[test]
+    fn missing_selection_stays_at_its_place_in_the_list() {
+        let mut session = session();
+        let rows = session.threads.clone();
+        assert!(rows.len() >= 3, "fixture needs three threads");
+        session.cursor_id = Some(rows[1].id.clone());
+        let mut without = rows.clone();
+        without.remove(1);
+        session.set_threads(without);
+        assert_eq!(session.cursor_id.as_deref(), Some(rows[2].id.as_str()));
     }
 
     #[test]

@@ -102,7 +102,7 @@ fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, String> {
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         return Err(format!(
-            "{shown} is readable by other users (mode {:o}); run chmod 600 on it",
+            "{shown} is open to other users (mode {:o}); run chmod 600 on it",
             mode & 0o777
         ));
     }
@@ -112,13 +112,32 @@ fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, String> {
         .map_err(|err| format!("{shown}: {err}"))
 }
 
+/// The account file for `fell account show|check`, with the same mode check
+/// the window applies. Nothing in a file other users can change is run.
+pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
+    let path = account_config_path()
+        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
+    match read_account_config(&path)? {
+        Some(config) => Ok((path, config)),
+        None => Err(format!(
+            "{} does not exist; run fell account setup",
+            path.display()
+        )),
+    }
+}
+
 /// Write the account file mode 0600, creating `~/.config/fell` mode 0700 if needed.
 pub fn write_account_config(config: &AccountConfig) -> Result<PathBuf, String> {
+    let path = account_config_path()
+        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
+    write_account_config_at(&path, config)?;
+    Ok(path)
+}
+
+fn write_account_config_at(path: &Path, config: &AccountConfig) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let path = account_config_path()
-        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
     if let Some(dir) = path.parent() {
         create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
     }
@@ -133,8 +152,8 @@ pub fn write_account_config(config: &AccountConfig) -> Result<PathBuf, String> {
     file.write_all(config.render().as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|err| format!("{}: {err}", tmp.display()))?;
-    fs::rename(&tmp, &path).map_err(|err| format!("{}: {err}", path.display()))?;
-    Ok(path)
+    fs::rename(&tmp, path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(())
 }
 
 fn fallback(error: String) -> (Store, Opened) {
@@ -338,6 +357,32 @@ mod tests {
         fs::write(&path, "email = \"a@b\"\n").unwrap();
         let err = read_account_config(&path).unwrap_err();
         assert!(err.contains("password"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn written_account_file_is_private_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("fell-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("fell/account.toml");
+        let config = AccountConfig::bridge(
+            "me@proton.me",
+            "me@proton.me",
+            fell_core::PasswordSource::Inline("p\"w #1".into()),
+        );
+        write_account_config_at(&path, &config).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(read_account_config(&path).unwrap(), Some(config.clone()));
+        // A second write replaces the first through a fresh 0600 temp file.
+        write_account_config_at(&path, &config).unwrap();
+        assert!(!path.with_extension("toml.tmp").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

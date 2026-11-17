@@ -4,11 +4,10 @@
 //! server, and only then writes the file (mode 0600). It reads no mail.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::process::{Command, Stdio};
 
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource, classify_sync_error};
 
-use crate::mailbox::{account_config_path, write_account_config};
+use crate::mailbox::{load_account_file, write_account_config};
 
 const USAGE: &str = "\
 fell account setup [options]   write ~/.config/fell/account.toml after a login check
@@ -197,10 +196,7 @@ fn setup(args: &[String]) -> Result<(), String> {
 }
 
 fn show() -> Result<(), String> {
-    let path = account_config_path().ok_or("no config directory")?;
-    let text =
-        std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let config = AccountConfig::parse(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let (path, config) = load_account_file()?;
     println!("# {}", path.display());
     let mut redacted = config.clone();
     if let PasswordSource::Inline(_) = redacted.password {
@@ -211,10 +207,7 @@ fn show() -> Result<(), String> {
 }
 
 fn check() -> Result<(), String> {
-    let path = account_config_path().ok_or("no config directory")?;
-    let text =
-        std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let config = AccountConfig::parse(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let (_, config) = load_account_file()?;
     match config.check_login() {
         Ok(count) => {
             println!("ok: logged in as {}, {count} folders", config.username);
@@ -273,31 +266,89 @@ fn prompt(label: &str, default: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Read one line with terminal echo off.
+/// Read one line from the terminal with echo off.
+///
+/// Line editing and keyboard signals are off while it reads, so Ctrl-C
+/// cancels the prompt here at once instead of killing the process with echo
+/// still off. The terminal settings come back when the guard drops, on every
+/// return path.
 fn prompt_hidden(label: &str) -> Result<String, String> {
     print!("{label}: ");
     let _ = io::stdout().flush();
-    let echo_off = stty("-echo");
-    let mut line = String::new();
-    let read = io::stdin().lock().read_line(&mut line);
-    if echo_off {
-        stty("echo");
-    }
+    let read = {
+        let _quiet = QuietTerminal::new().map_err(|err| format!("could not hide input: {err}"))?;
+        read_hidden(&mut io::stdin().lock())
+    };
     println!();
-    read.map_err(|err| err.to_string())?;
-    let password = line.trim_end_matches(['\r', '\n']).to_string();
+    let password = read?;
     if password.is_empty() {
         return Err("no password entered".into());
     }
     Ok(password)
 }
 
-fn stty(arg: &str) -> bool {
-    Command::new("stty")
-        .arg(arg)
-        .stdin(Stdio::inherit())
-        .status()
-        .is_ok_and(|status| status.success())
+/// One line from raw terminal bytes: Enter ends it, Ctrl-C or Ctrl-D
+/// cancels, Backspace removes the last character.
+fn read_hidden(input: &mut impl io::Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match input.read(&mut byte) {
+            Ok(0) => return Err("input ended".into()),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+        match byte[0] {
+            b'\n' | b'\r' => break,
+            0x03 | 0x04 => return Err("cancelled".into()),
+            0x7f | 0x08 => {
+                // Drop one whole UTF-8 character.
+                while let Some(last) = bytes.pop() {
+                    if last & 0xC0 != 0x80 {
+                        break;
+                    }
+                }
+            }
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| "the password is not valid UTF-8".into())
+}
+
+/// Echo and keyboard signals off on stdin until dropped.
+struct QuietTerminal {
+    saved: libc::termios,
+}
+
+impl QuietTerminal {
+    fn new() -> io::Result<Self> {
+        // SAFETY: tcgetattr and tcsetattr only read and write the termios
+        // struct passed by pointer, which lives on this stack frame.
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut saved) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut quiet = saved;
+            quiet.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            quiet.c_cc[libc::VMIN] = 1;
+            quiet.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &quiet) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { saved })
+        }
+    }
+}
+
+impl Drop for QuietTerminal {
+    fn drop(&mut self) {
+        // SAFETY: restores the settings read in `new` on the same descriptor.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.saved);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +357,17 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn hidden_input_edits_and_cancels() {
+        let read = |bytes: &[u8]| read_hidden(&mut &bytes[..]);
+        assert_eq!(read(b"hunter2\n").unwrap(), "hunter2");
+        assert_eq!(read(b"huntx\x7fer2\r").unwrap(), "hunter2");
+        assert_eq!(read("pä\x7fass\n".as_bytes()).unwrap(), "pass");
+        assert_eq!(read(b"hun\x03ter\n").unwrap_err(), "cancelled");
+        assert_eq!(read(b"\x04").unwrap_err(), "cancelled");
+        assert_eq!(read(b"no newline").unwrap_err(), "input ended");
     }
 
     #[test]
