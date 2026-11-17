@@ -133,6 +133,15 @@ pub(crate) fn body_fingerprint(body: &str) -> String {
     format!("{hi:016x}{lo:016x}")
 }
 
+/// `+1` and `Thanks!` are not unique. A longer body can still identify one send.
+const SHORT_REPLY_MAX_CHARS: usize = 8;
+
+/// True when `body` is too short to be the only identity of a message.
+pub(crate) fn is_short_reply_body(body: &str) -> bool {
+    let len = normalize_body(body).chars().count();
+    (1..=SHORT_REPLY_MAX_CHARS).contains(&len)
+}
+
 fn normalize_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut pending_space = false;
@@ -180,5 +189,14 @@ mod tests {
         assert!(body_fingerprint("  \n").is_empty());
         assert_ne!(body_fingerprint("hello"), body_fingerprint("hello!"));
         assert_eq!(body_fingerprint("会議"), body_fingerprint("会議"));
+    }
+
+    #[test]
+    fn short_reply_bodies_are_a_few_characters() {
+        assert!(is_short_reply_body("+1"));
+        assert!(is_short_reply_body("  Thanks! \n"));
+        assert!(is_short_reply_body("ありがとう"));
+        assert!(!is_short_reply_body("hello body"));
+        assert!(!is_short_reply_body("   "));
     }
 }
