@@ -15,6 +15,7 @@ pub mod imap;
 pub mod message;
 pub mod search;
 pub mod send;
+mod smtp;
 pub mod store;
 pub mod sync;
 pub mod threading;

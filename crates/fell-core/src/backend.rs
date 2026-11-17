@@ -68,8 +68,9 @@ pub trait MailBackend {
 
 /// Proton Mail Bridge as a local IMAP account. Bridge stays a separate process.
 ///
-/// SMTP fields are recorded for a later send path. This backend does not connect
-/// to them and does not transmit mail.
+/// `confirm_send` submits [`PendingSend::mime`] to `smtp_host`:`smtp_port`
+/// with this account's IMAP username and password. Bridge's usual SMTP port
+/// is 1025 and offers STARTTLS. Bcc is an envelope recipient only.
 #[derive(Debug, Clone)]
 pub struct BridgeBackend {
     pub account_id: AccountId,
@@ -116,7 +117,20 @@ impl MailBackend for BridgeBackend {
         confirmation: UserSendConfirmation,
     ) -> Result<SentMessage> {
         require_confirmation(&pending, &confirmation)?;
-        Err(Error::NotImplemented("Proton Mail Bridge SMTP"))
+        let remote = crate::smtp::deliver(
+            &crate::smtp::Endpoint {
+                host: self.smtp_host.clone(),
+                port: self.smtp_port,
+                username: self.imap.username.clone(),
+                password: self.imap.password.clone(),
+                accept_invalid_certs: self.imap.accept_invalid_certs,
+            },
+            &pending,
+        )?;
+        Ok(SentMessage {
+            pending_id: pending.id,
+            remote_id: crate::RemoteId(remote),
+        })
     }
 }
 

@@ -29,11 +29,11 @@ Fell is a native Proton Mail client. The UI never talks to the network; it reads
 
 `MailBackend` is the seam.
 
-1. **Bridge** — Proton Mail Bridge over local IMAP. Read-only sync uses the generic IMAP client with Bridge's usual host and port. Bridge stays a separate process. SMTP is not connected.
+1. **Bridge** — Proton Mail Bridge over local IMAP, plus SMTP submission on `smtp_host`:`smtp_port` (usually `127.0.0.1:1025` with STARTTLS) using the same username and password. Bridge stays a separate process. The message is `pending.mime`. Bcc is an envelope recipient only, and the socket opens only from `confirm_send` after the editor's send confirmation matches.
 2. **IMAP** — any other IMAP account. Same read-only client.
 3. **Proton API** — direct Proton HTTP API. Same trait, not implemented.
 
-Sync logs in, lists mailboxes, and `EXAMINE`s each one (read-only). New mail is `UID FETCH` with `BODY.PEEK`, so the server is not asked to mark mail read. A cursor stores UIDVALIDITY, the highest UID, and HIGHESTMODSEQ when the server advertises CONDSTORE. The next sync fetches only newer UIDs, or `CHANGEDSINCE` when a modseq is known. IDLE and removal of messages that vanished on the server are later. There is no SMTP, no OAuth, and no send command.
+Sync logs in, lists mailboxes, and `EXAMINE`s each one (read-only). New mail is `UID FETCH` with `BODY.PEEK`, so the server is not asked to mark mail read. A cursor stores UIDVALIDITY, the highest UID, and HIGHESTMODSEQ when the server advertises CONDSTORE. The next sync fetches only newer UIDs, or `CHANGEDSINCE` when a modseq is known. IDLE and removal of messages that vanished on the server are later. The IMAP session has no send command and no OAuth. Bridge SMTP is a separate socket.
 
 The UI and MCP crates take `dyn MailBackend` (or a store already populated by sync). They do not import IMAP or Proton protocol code.
 
@@ -85,7 +85,7 @@ Proton conversation ids are preferred so Bridge and the future API stay consiste
 
 ## Sending mail
 
-Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, and body that were shown. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
+Agents may prepare a `Draft`. Each `submit_draft` mints a unique pending id. Transmitting mail requires a `UserSendConfirmation` minted with `fell_confirm::InteractiveUi::for_fell_app` (see `fell::confirmation_from_ui`) and bound to that id plus the account, recipients, subject, and body that were shown. Bridge `confirm_send` checks that token and then submits the pending MIME over SMTP. Bcc recipients are `RCPT TO` and are not a header of the message. A token for draft A does not confirm draft B. `InteractiveUi` is sealed (private field, not `Default`) so a crate that only depends on `fell-core` cannot mint it. The MCP crate has no send tool and does not depend on `fell-confirm`.
 
 An agent draft is a `review_drafts` row (`Store::list_review_drafts`), not a `PendingSend`. Fell reads that list when it is time to show the draft for review. Undo deletes it. `create_review_draft` never calls `submit_draft` or `confirm_send`.
 
