@@ -61,6 +61,8 @@ struct Inbox {
     split: f32,
     dragging: bool,
     open_thread: Option<String>,
+    /// Thread `m` just moved. `u` selects it again when it returns to this folder.
+    moved_thread: Option<String>,
 }
 
 impl Inbox {
@@ -85,6 +87,7 @@ impl Inbox {
             split: mailbox.split,
             dragging: false,
             open_thread: None,
+            moved_thread: None,
         };
         if let Some(error) = mailbox.error {
             inbox.session.record_startup_error(error);
@@ -197,6 +200,7 @@ impl Inbox {
             &destination,
         ) {
             Ok(_) => {
+                self.moved_thread = Some(id.clone());
                 let label = present::folder_label(&destination);
                 self.session.show_toast(format!("Moved to {label}"), false);
                 if !self.reload_threads() {
@@ -226,8 +230,14 @@ impl Inbox {
         match self.store.undo(&self.account_id) {
             Ok(_) => {
                 self.session.show_toast("Undone", false);
-                if self.reload_threads() && !self.reload_messages(true) {
-                    self.clear_open_message();
+                let restored = self.moved_thread.take();
+                if self.reload_threads() {
+                    if let Some(id) = restored {
+                        self.session.select_if_present(&id);
+                    }
+                    if !self.reload_messages(true) {
+                        self.clear_open_message();
+                    }
                 }
                 self.scroll_list_to_cursor();
                 self.scroll_conversation();

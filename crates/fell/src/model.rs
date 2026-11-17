@@ -305,6 +305,18 @@ impl Session {
         ids
     }
 
+    /// Select `id` when that thread is in the current list.
+    ///
+    /// Undo uses this so the thread that just came back is the one on screen.
+    pub fn select_if_present(&mut self, id: &str) -> bool {
+        if self.threads.iter().any(|thread| thread.id == id) {
+            self.cursor_id = Some(id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Keep the same thread selected when the list is replaced.
     pub fn set_threads(&mut self, threads: Vec<ThreadRow>) -> bool {
         let previous = self.cursor_id.clone();
@@ -925,6 +937,16 @@ mod tests {
         assert!(step.reload_threads);
         assert_eq!(session.folder, "INBOX");
         assert!(session.chord.is_empty());
+    }
+
+    #[test]
+    fn undo_selects_the_thread_that_came_back() {
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        assert!(session.select_if_present("a"));
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
+        assert!(!session.select_if_present("missing"));
+        assert_eq!(session.cursor_id.as_deref(), Some("a"));
     }
 
     #[test]
