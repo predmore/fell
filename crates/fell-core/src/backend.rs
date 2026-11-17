@@ -257,6 +257,7 @@ mod tests {
                 subject: "s".into(),
                 body: "b".into(),
                 in_reply_to: None,
+                attachments_digest: String::new(),
             })
             .unwrap();
         let confirm = UserSendConfirmation::from_interactive_ui(

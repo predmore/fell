@@ -126,6 +126,29 @@ CREATE TABLE IF NOT EXISTS review_drafts (
     created_unix INTEGER NOT NULL,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS compose_drafts (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    from_addr TEXT NOT NULL,
+    to_addrs TEXT NOT NULL,
+    cc_addrs TEXT NOT NULL,
+    bcc_addrs TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    in_reply_to TEXT,
+    updated_unix INTEGER NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS compose_attachments (
+    draft_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (draft_id, path),
+    FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
+);
 "#;
 
 const FTS_TABLE: &str = r#"

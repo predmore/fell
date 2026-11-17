@@ -287,7 +287,7 @@ impl Session {
         };
         let tools = tools::visible(&grant)
             .into_iter()
-            .filter(|tool| !tool.name.contains("send"))
+            .filter(|tool| !crate::tools::transmits(tool.name))
             .map(|tool| {
                 json!({
                     "name": tool.name,
@@ -319,7 +319,7 @@ impl Session {
 
     fn instructions(&self) -> String {
         let mut text = format!(
-            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. There is no send tool. Mail leaves the machine only from the Fell window. {} ",
+            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. request_send only opens the compose editor. There is no send tool that transmits. Mail leaves the machine only from the Fell window. {} ",
             self.agent_id,
             self.account_id.as_str(),
             crate::untrusted::UNTRUSTED_NOTE
@@ -556,7 +556,8 @@ mod tests {
                 "{}",
                 tool["name"]
             );
-            assert!(!tool["name"].as_str().unwrap().contains("send"));
+            let name = tool["name"].as_str().unwrap();
+            assert!(name == "request_send" || !name.contains("send"), "{name}");
         }
     }
 
@@ -633,7 +634,11 @@ mod tests {
         let (mut session, thread) = session_with(AgentGrant::enabled(true, true, true), "bot");
         init(&mut session);
         let names = tool_names(&mut session);
-        assert!(names.iter().all(|name| !name.contains("send")));
+        assert!(
+            names
+                .iter()
+                .all(|name| name == "request_send" || !name.contains("send"))
+        );
         assert!(names.contains(&"undo".to_string()));
         let labeled = tool_json(&call(
             &mut session,
@@ -827,7 +832,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|tool| !tool["name"].as_str().unwrap().contains("send"))
+                .all(|tool| {
+                    let name = tool["name"].as_str().unwrap();
+                    name == "request_send" || !name.contains("send")
+                })
         );
     }
 
@@ -922,6 +930,51 @@ mod tests {
         assert_eq!(other["bcc_redacted"], true);
         assert!(other["bcc"].as_array().unwrap().is_empty());
         assert!(other["body"]["untrusted_email_content"]["text"].is_string());
+    }
+
+    #[test]
+    fn request_send_and_draft_edits_never_transmit() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, true, true), "bot");
+        init(&mut session);
+        let created = tool_json(&call(
+            &mut session,
+            "create_draft",
+            json!({
+                "to": ["ada@example.com"],
+                "subject": "Hi",
+                "body": "alpha paragraph"
+            }),
+        ));
+        let id = created["compose_id"].as_str().unwrap();
+        let edited = tool_json(&call(
+            &mut session,
+            "edit_draft",
+            json!({
+                "draft_id": id,
+                "base_revision": 1,
+                "edits": [{"old": "alpha", "new": "beta"}],
+                "send": true
+            }),
+        ));
+        assert_eq!(edited["transmitted"], false);
+        assert!(edited["draft_md"].as_str().unwrap().contains("beta"));
+        let requested = tool_json(&call(
+            &mut session,
+            "request_send",
+            json!({ "draft_id": id, "send": true, "confirm": true }),
+        ));
+        assert_eq!(requested["transmitted"], false);
+        assert_eq!(requested["opened"], false);
+        let encoded = serde_json::to_string(&requested).unwrap();
+        assert!(!encoded.contains("fixture-sent"));
+        let context = tool_json(&call(
+            &mut session,
+            "get_compose_context",
+            json!({ "draft_id": id }),
+        ));
+        let cwd = context["cwd"].as_str().unwrap();
+        assert!(!std::path::Path::new(cwd).join("thread").exists());
+        assert!(std::path::Path::new(cwd).join("AGENTS.md").is_file());
     }
 
     #[test]

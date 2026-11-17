@@ -9,6 +9,7 @@ pub mod account;
 pub mod actions;
 pub mod agent;
 pub mod backend;
+pub mod compose;
 pub mod imap;
 pub mod message;
 pub mod search;

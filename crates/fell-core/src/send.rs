@@ -22,6 +22,9 @@ pub struct Draft {
     pub body: String,
     /// When set, this draft is a reply in an existing thread.
     pub in_reply_to: Option<crate::MessageId>,
+    /// Hash of the attachment bytes the editor resolved from `draft.md`.
+    /// Empty when the draft has no attachments. Part of the send confirmation.
+    pub attachments_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -62,6 +65,7 @@ impl PendingSend {
 ///         subject: String::new(),
 ///         body: String::new(),
 ///         in_reply_to: None,
+///         attachments_digest: String::new(),
 ///     },
 /// );
 /// let _ = UserSendConfirmation::from_interactive_ui(&Default::default(), &pending);
@@ -75,6 +79,7 @@ pub struct UserSendConfirmation {
     bcc: Vec<String>,
     subject: String,
     body: String,
+    attachments_digest: String,
 }
 
 impl UserSendConfirmation {
@@ -92,6 +97,7 @@ impl UserSendConfirmation {
             bcc: pending.draft.bcc.clone(),
             subject: pending.draft.subject.clone(),
             body: pending.draft.body.clone(),
+            attachments_digest: pending.draft.attachments_digest.clone(),
         }
     }
 
@@ -119,6 +125,7 @@ pub fn require_confirmation(
         && confirmation.bcc == pending.draft.bcc
         && confirmation.subject == pending.draft.subject
         && confirmation.body == pending.draft.body
+        && confirmation.attachments_digest == pending.draft.attachments_digest
     {
         Ok(())
     } else {
@@ -141,6 +148,7 @@ mod tests {
             subject: "hi".into(),
             body: body.into(),
             in_reply_to: None,
+            attachments_digest: String::new(),
         }
     }
 
@@ -210,6 +218,7 @@ mod tests {
                 subject: "hi".into(),
                 body: "shown".into(),
                 in_reply_to: None,
+                attachments_digest: String::new(),
             })
             .unwrap();
         let confirm = mint(&pending);
@@ -249,5 +258,16 @@ mod tests {
     #[test]
     fn fixture_kind_is_bridge_or_api_not_send_path() {
         assert_eq!(BackendKind::Bridge.as_str(), "bridge");
+    }
+
+    #[test]
+    fn confirmation_does_not_cover_swapped_attachments() {
+        let backend = FixtureBackend::default();
+        let pending = backend.submit_draft(draft("shown")).unwrap();
+        let confirm = mint(&pending);
+        let mut swapped = pending;
+        swapped.draft.attachments_digest = "other-bytes".into();
+        let err = backend.confirm_send(swapped, confirm).unwrap_err();
+        assert!(matches!(err, crate::Error::SendUnconfirmed));
     }
 }
