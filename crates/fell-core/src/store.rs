@@ -1590,9 +1590,11 @@ fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str
 fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool) -> bool {
     let incoming_list = clean_list_id(&incoming.list_id).is_some();
     let stored_list = list_is_set(&stored.list_id);
-    // Rows stored before `list_id` existed are all NULL. The one-time upgrade
-    // still joins that pair. Later mail still needs a list id on one side.
-    let listed = incoming_list || stored_list || unlabeled_ok;
+    // Old rows have no list id. Join those only when one copy is in Sent and
+    // the other subject still has a list tag for the same underlying subject.
+    // Two plain messages with the same body stay apart.
+    let listed =
+        incoming_list || stored_list || (unlabeled_ok && unlabeled_sent_and_list(incoming, stored));
     same_sender(&incoming.headers.from.email, &stored.from_email)
         && dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
         && listed
@@ -1600,6 +1602,34 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
             &stored.proton_conversation_id,
             &incoming.headers.proton_conversation_id,
         )
+}
+
+fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival) -> bool {
+    let incoming_sent = incoming
+        .folders
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    let stored_sent = split_field(&stored.folders)
+        .iter()
+        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    if incoming_sent == stored_sent {
+        return false;
+    }
+    let list_subject = if incoming_sent {
+        &stored.subject
+    } else {
+        incoming.headers.subject.as_str()
+    };
+    subject_has_list_prefix(list_subject)
+        && subject_key(&incoming.headers.subject) == subject_key(&stored.subject)
+}
+
+fn subject_has_list_prefix(subject: &str) -> bool {
+    let mut rest = subject.trim();
+    while let Some(after) = strip_reply_prefix(rest) {
+        rest = after.trim();
+    }
+    strip_list_prefix(rest).is_some()
 }
 
 fn remember_alias(conn: &Connection, message: &Message, canonical_id: &str) -> Result<()> {
@@ -1854,9 +1884,8 @@ fn same_sender(left: &str, right: &str) -> bool {
 
 /// Subject with leading `Re:` / `Fwd:` / `Fw:` and `[list]` tags removed.
 ///
-/// Not a collapse key. Prefixes are matched on bytes so a CJK subject is never
-/// sliced inside a character.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Not a collapse key by itself. Prefixes are matched on bytes so a CJK
+/// subject is never sliced inside a character.
 fn subject_key(subject: &str) -> String {
     let mut rest = subject.trim();
     loop {
@@ -5130,6 +5159,90 @@ mod tests {
         assert!(rows[0].list_id.is_none());
         assert!(rows[0].folders.iter().any(|folder| folder == "Sent"));
         assert!(rows[0].folders.iter().any(|folder| folder == "INBOX"));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_keeps_two_sent_replies_that_share_a_short_body() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-thanks.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = crate::message::body_fingerprint("Thanks!");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    arrived_via TEXT NOT NULL DEFAULT '',
+                    to_line TEXT NOT NULL DEFAULT '',
+                    cc_line TEXT NOT NULL DEFAULT '',
+                    bcc_line TEXT NOT NULL DEFAULT '',
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    has_attachment INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    snooze_until INTEGER,
+                    body_fingerprint TEXT NOT NULL DEFAULT '',
+                    UNIQUE (account_id, message_id)
+                 );",
+            )
+            .unwrap();
+            for (id, subject, date) in [
+                ("dinner@x", "Re: Dinner Friday", 1_700_000_000_i64),
+                ("budget@x", "Re: Q3 budget", 1_700_000_000 + 2 * 60 * 60),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint
+                     ) VALUES (
+                        'a1', ?1, ?1, ?1, '', 'from@x', ?2, ?3, 'Thanks!', 'Thanks!', 1, 'Sent', ?4
+                     )",
+                    params![id, subject, date, fingerprint],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.subject == "Re: Dinner Friday")
+        );
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.subject == "Re: Q3 budget")
+        );
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
