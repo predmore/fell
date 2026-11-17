@@ -621,7 +621,7 @@ fn row_is_flat(row: &[u8]) -> bool {
 /// A mail image or a web snapshot. Far below the image crate's 512MiB default,
 /// and checked before the pixels are allocated.
 pub(crate) const MAX_IMAGE_EDGE: u32 = 8_192;
-pub(crate) const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: u64 = fell_render::MAX_DATA_IMAGE_BYTES as u64;
 
 pub(crate) fn raster_allowed(width: u32, height: u32) -> bool {
     if width == 0 || height == 0 || width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE {

@@ -14,7 +14,7 @@ mod markdown;
 mod webview_html;
 
 pub use choose::{MailHeaders, PreparedMail, RenderMode, choose_view, layout_is_complex, prepare};
-pub use document::{Block, ImageSource, Inline, ListItem, StyledDocument};
+pub use document::{Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument};
 pub use fixtures::{Fixture, fixture, fixtures};
 pub use html::{document_from_body, html_to_document, looks_like_html, plain_to_document};
 pub use markdown::markdown_to_document;

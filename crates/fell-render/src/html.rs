@@ -243,8 +243,12 @@ fn text_blocks(node: ego_tree::NodeRef<'_, Node>) -> Vec<Block> {
 
 fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str, depth: u32) -> Vec<Block> {
     match name {
-        "script" | "style" | "head" | "meta" | "link" | "title" | "iframe" | "object" | "embed"
-        | "input" | "button" | "textarea" => Vec::new(),
+        "script" | "style" | "head" | "meta" | "link" | "title" | "embed" | "input" | "button"
+        | "textarea" => Vec::new(),
+        // The HTML parser stores iframe fallback as raw text, not elements.
+        // Parse it again so a paragraph inside the frame stays a paragraph.
+        // The iframe tag and its src are never copied.
+        "iframe" => iframe_fallback(node, depth),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = name.as_bytes()[1].saturating_sub(b'0');
             vec![Block::Heading {
@@ -278,6 +282,18 @@ fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str, depth: u32) -> 
             }
         }
     }
+}
+
+fn iframe_fallback(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
+    if depth >= MAX_HTML_DEPTH {
+        return text_blocks(node);
+    }
+    let fallback = raw_text(node);
+    if fallback.is_empty() {
+        return Vec::new();
+    }
+    let dom = parse_html(&fallback);
+    children_blocks(dom.root_element(), depth)
 }
 
 fn paragraph(inlines: Vec<Inline>) -> Vec<Block> {
@@ -557,65 +573,121 @@ fn image_source(src: &str) -> ImageSource {
 
 fn data_image(rest: &str) -> ImageSource {
     let Some((meta, data)) = rest.split_once(',') else {
-        return ImageSource::Remote(format!("data:{rest}"));
+        return remote_data_uri(rest);
     };
-    let mut parts = meta.split(';');
-    let media_type = parts
+    let media_type = meta
+        .split(';')
         .next()
         .unwrap_or("application/octet-stream")
         .to_string();
     let base64 = meta.to_ascii_lowercase().contains("base64");
     if !base64 {
+        if data.len() > crate::MAX_DATA_IMAGE_BYTES {
+            return placeholder_image(media_type);
+        }
         return ImageSource::Data {
             media_type,
             bytes: data.as_bytes().to_vec(),
         };
     }
-    // MIME wraps base64 at 76 columns, and a data URI may also carry a
-    // percent-encoded newline. The standard engine rejects that whitespace.
-    let payload = strip_data_payload(data);
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        payload.as_bytes(),
-    )
-    .or_else(|_| {
-        base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD_NO_PAD,
-            payload.as_bytes(),
-        )
-    });
-    match decoded {
-        Ok(bytes) => ImageSource::Data { media_type, bytes },
-        Err(_) => ImageSource::Remote(format!("data:{rest}")),
+    // RFC 2397 percent-decodes the payload before the base64 step, so `%2B`
+    // and `%2F` are `+` and `/`. Whitespace, including a percent-encoded
+    // newline, is stripped after that. The decoded length is checked before
+    // the output buffer is allocated.
+    match collect_base64_payload(data) {
+        Err(PayloadLimit::TooLarge) => placeholder_image(media_type),
+        Ok(payload) => match decode_base64_payload(&payload) {
+            Some(bytes) => ImageSource::Data { media_type, bytes },
+            None if rest.len() > crate::MAX_DATA_IMAGE_BYTES => placeholder_image(media_type),
+            None => remote_data_uri(rest),
+        },
     }
 }
 
-fn strip_data_payload(data: &str) -> String {
+fn remote_data_uri(rest: &str) -> ImageSource {
+    if rest.len() > crate::MAX_DATA_IMAGE_BYTES {
+        return placeholder_image("application/octet-stream".to_string());
+    }
+    ImageSource::Remote(format!("data:{rest}"))
+}
+
+fn placeholder_image(media_type: String) -> ImageSource {
+    ImageSource::Data {
+        media_type,
+        bytes: Vec::new(),
+    }
+}
+
+enum PayloadLimit {
+    TooLarge,
+}
+
+/// Largest base64 input whose [`base64::decoded_len_estimate`] stays inside
+/// [`crate::MAX_DATA_IMAGE_BYTES`].
+fn max_base64_chars() -> usize {
+    (crate::MAX_DATA_IMAGE_BYTES / 3) * 4
+}
+
+fn collect_base64_payload(data: &str) -> Result<Vec<u8>, PayloadLimit> {
+    let max_chars = max_base64_chars();
+    let mut payload = Vec::with_capacity(data.len().min(max_chars));
     let bytes = data.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%'
+        let decoded = if bytes[index] == b'%'
             && index + 2 < bytes.len()
-            && is_percent_encoded_space(&bytes[index + 1..index + 3])
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
         {
+            let value = hex_nibble(bytes[index + 1]) << 4 | hex_nibble(bytes[index + 2]);
             index += 3;
+            value
+        } else {
+            let value = bytes[index];
+            index += 1;
+            value
+        };
+        if decoded.is_ascii_whitespace() {
             continue;
         }
-        if !bytes[index].is_ascii_whitespace() {
-            out.push(bytes[index] as char);
+        if payload.len() >= max_chars {
+            return Err(PayloadLimit::TooLarge);
         }
-        index += 1;
+        payload.push(decoded);
     }
-    out
+    Ok(payload)
 }
 
-fn is_percent_encoded_space(bytes: &[u8]) -> bool {
-    let hex = [bytes[0].to_ascii_lowercase(), bytes[1].to_ascii_lowercase()];
-    matches!(
-        hex,
-        [b'0', b'a'] | [b'0', b'd'] | [b'0', b'9'] | [b'2', b'0'] | [b'0', b'c']
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn decode_base64_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let estimate = base64::decoded_len_estimate(payload.len());
+    if estimate > crate::MAX_DATA_IMAGE_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; estimate];
+    let written = base64::Engine::decode_slice(
+        &base64::engine::general_purpose::STANDARD,
+        payload,
+        &mut buf,
     )
+    .or_else(|_| {
+        base64::Engine::decode_slice(
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            payload,
+            &mut buf,
+        )
+    })
+    .ok()?;
+    buf.truncate(written);
+    Some(buf)
 }
 
 fn safe_href(href: &str) -> String {
@@ -630,12 +702,21 @@ fn safe_href(href: &str) -> String {
 
 fn raw_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     let mut out = String::new();
-    for descendant in node.descendants() {
-        if let Node::Text(text) = descendant.value() {
-            out.push_str(text.deref());
-        }
-    }
+    append_raw(node, &mut out);
     out
+}
+
+fn append_raw(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
+    match node.value() {
+        Node::Text(text) => out.push_str(text.deref()),
+        Node::Element(element) if element.name() == "br" => out.push('\n'),
+        Node::Element(_) => {
+            for child in node.children() {
+                append_raw(child, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_ascii_html_ws(ch: char) -> bool {
@@ -862,6 +943,62 @@ mod tests {
         spans.push_str("</p>");
         let text = html_to_document(&spans).plain_text();
         assert!(text.contains("Inline"), "{text}");
+    }
+
+    #[test]
+    fn iframe_and_object_keep_fallback_text_without_their_url() {
+        let doc = html_to_document(
+            r#"<iframe src="https://example.com/x"><p>Thursday at 3pm</p></iframe><object data="https://example.com/y"><p>Friday at 4</p></object>"#,
+        );
+        let text = doc.plain_text();
+        assert!(text.contains("Thursday at 3pm"), "{text}");
+        assert!(text.contains("Friday at 4"), "{text}");
+        assert!(!text.contains("example.com"), "{text}");
+        assert!(!text.contains("<iframe"), "{text}");
+        assert!(!text.contains("<object"), "{text}");
+    }
+
+    #[test]
+    fn pre_and_code_keep_a_newline_for_each_br() {
+        let doc = html_to_document("<pre>a<br>b</pre><p><code>c<br>d</code></p>");
+        let Block::Code { text } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks);
+        };
+        assert_eq!(text, "a\nb");
+        let Block::Paragraph { inlines } = &doc.blocks[1] else {
+            panic!("{:?}", doc.blocks);
+        };
+        assert!(
+            matches!(&inlines[0], Inline::Code(text) if text == "c\nd"),
+            "{inlines:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_base64_plus_and_slash_decode() {
+        let raw = [0xfb_u8, 0xef, 0xff];
+        let payload = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+        assert!(payload.contains('+') && payload.contains('/'), "{payload}");
+        for (plus, slash) in [("%2B", "%2F"), ("%2b", "%2f")] {
+            let escaped = payload.replace('+', plus).replace('/', slash);
+            let source = image_source(&format!("data:image/png;base64,{escaped}"));
+            match source {
+                ImageSource::Data { bytes, .. } => assert_eq!(bytes, raw),
+                other => panic!("{plus} {slash} became {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn data_uri_over_the_cap_keeps_no_bytes() {
+        let payload = "A".repeat(max_base64_chars() + 1);
+        let source = image_source(&format!("data:image/png;base64,{payload}"));
+        match source {
+            ImageSource::Data { bytes, .. } => assert!(bytes.is_empty(), "stored {}", bytes.len()),
+            other => panic!("oversized payload became {other:?}"),
+        }
+        assert!(base64::decoded_len_estimate(max_base64_chars()) <= crate::MAX_DATA_IMAGE_BYTES);
+        assert!(base64::decoded_len_estimate(max_base64_chars() + 1) > crate::MAX_DATA_IMAGE_BYTES);
     }
 
     #[test]

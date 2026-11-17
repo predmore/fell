@@ -69,10 +69,23 @@ fn serialize_node(
         scraper::node::Node::Text(text) => out.push_str(&escape(text.deref())),
         scraper::node::Node::Element(element) => {
             let name = element.name();
+            if name == "iframe" {
+                // Fallback markup is raw text. Parse it and keep the children.
+                // The iframe tag and its src are not emitted.
+                let fallback = subtree_text(node);
+                let parsed = crate::html::parse_html(&fallback);
+                serialize_children(
+                    parsed.root_element(),
+                    out,
+                    allow_remote_images,
+                    allow_style,
+                    depth,
+                );
+                return;
+            }
             if matches!(
                 name,
                 "script"
-                    | "iframe"
                     | "object"
                     | "embed"
                     | "link"
@@ -87,7 +100,10 @@ fn serialize_node(
                     | "html"
                     | "body"
             ) {
-                if matches!(name, "html" | "body" | "head" | "form" | "noscript") {
+                if matches!(
+                    name,
+                    "html" | "body" | "head" | "form" | "noscript" | "object"
+                ) {
                     for child in node.children() {
                         serialize_node(child, out, allow_remote_images, allow_style, depth + 1);
                     }
@@ -815,6 +831,15 @@ mod tests {
         assert!(!unwrapped.contains("<input"));
         assert!(!unwrapped.contains("<button"));
         assert!(!unwrapped.contains("<textarea"));
+        let fallback = sanitize_html(
+            r#"<iframe src="https://example.com/x"><p>Thursday at 3pm</p></iframe><object data="https://example.com/y"><p>Friday at 4</p></object>"#,
+            true,
+        );
+        assert!(fallback.contains("<p>Thursday at 3pm</p>"), "{fallback}");
+        assert!(fallback.contains("<p>Friday at 4</p>"), "{fallback}");
+        assert!(!fallback.contains("<iframe"), "{fallback}");
+        assert!(!fallback.contains("<object"), "{fallback}");
+        assert!(!fallback.contains("example.com"), "{fallback}");
     }
 
     #[test]

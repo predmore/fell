@@ -66,6 +66,10 @@ pub enum ImageSource {
     Data { media_type: String, bytes: Vec<u8> },
 }
 
+/// Decoded `data:` images larger than this are not stored. The painter keeps
+/// the placeholder instead of the bytes. Matches the raster cap in the client.
+pub const MAX_DATA_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
 impl StyledDocument {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
