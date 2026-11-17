@@ -75,6 +75,9 @@ mod tests {
         hub.with_session(&id, |session| {
             assert!(!session.request_send());
             let backend = fell_core::backend_for(session.account_id());
+            let blocked = send_from_editor(session, backend.as_ref()).unwrap_err();
+            assert!(blocked.contains("on screen"), "{blocked}");
+            session.mark_seen();
             let sent = send_from_editor(session, backend.as_ref()).unwrap();
             assert_eq!(sent.remote_id.0, "fixture-sent");
         })

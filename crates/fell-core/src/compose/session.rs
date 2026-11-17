@@ -154,7 +154,7 @@ impl DraftSession {
         Ok(session)
     }
 
-    pub fn open_folder(folder: &Path, account_id: AccountId) -> Result<Self, String> {
+    pub fn open_folder(folder: &Path, _account_hint: AccountId) -> Result<Self, String> {
         let text = workspace::read_draft_file(folder)?;
         let parsed = parse_draft(&text).map_err(|err| err.message)?;
         let id = folder
@@ -162,12 +162,13 @@ impl DraftSession {
             .and_then(|name| name.to_str())
             .unwrap_or("draft")
             .to_string();
-        let stored = std::fs::read_to_string(folder.join("account")).unwrap_or_default();
-        let account_id = if stored.trim().is_empty() {
-            account_id
-        } else {
-            AccountId(stored.trim().to_string())
-        };
+        let stored = std::fs::read_to_string(folder.join("account"))
+            .map_err(|_| "draft folder has no account file".to_string())?;
+        let stored = stored.trim();
+        if stored.is_empty() || stored.contains(['\n', '\r']) {
+            return Err("draft folder has no account file".into());
+        }
+        let account_id = AccountId(stored.to_string());
         let mut session = Self::create(
             folder.to_path_buf(),
             id,
@@ -214,6 +215,12 @@ impl DraftSession {
 
     pub fn mark_seen(&mut self) {
         self.seen_revision = self.revision;
+    }
+
+    /// What the compose window repaints for. Seen-ness is not included, so
+    /// marking a draft seen does not wake the window again.
+    pub fn paint_generation(&self) -> (u64, bool, bool, usize) {
+        (self.revision, self.open, self.focused, self.hunks.len())
     }
 
     pub fn open_for_edit(&mut self) {
@@ -759,7 +766,9 @@ mod tests {
             in_reply_to: Some("<abc@example.com>".into()),
             ..DraftFields::default()
         };
-        let folder = workspace::materialize_in(&root, "d1", &fields, body).unwrap();
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, body, &AccountId("local".into()))
+                .unwrap();
         let session =
             DraftSession::create(folder, "d1", AccountId("local".into()), fields, body).unwrap();
         (root, session)
@@ -980,7 +989,8 @@ mod tests {
         let text = fs::read_to_string(folder.join("draft.md")).unwrap();
         assert!(text.contains("<abc@example.com>"), "{text}");
         assert!(!text.contains("<evil@example.com>"), "{text}");
-        let reopened = DraftSession::open_folder(&folder, AccountId("local".into())).unwrap();
+        let reopened = DraftSession::open_folder(&folder, AccountId("other".into())).unwrap();
+        assert_eq!(reopened.account_id().as_str(), "local");
         assert_eq!(
             reopened.fields().in_reply_to.as_deref(),
             Some("<abc@example.com>")
@@ -988,6 +998,27 @@ mod tests {
         assert!(reopened.snapshot().unreviewed >= 1);
         assert!(text.contains("new@example.com"), "{text}");
         let _ = root;
+    }
+
+    #[test]
+    fn open_refuses_a_folder_with_no_account_file() {
+        let (root, session) = temp_session("body\n");
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        std::fs::remove_file(folder.join("account")).unwrap();
+        let err = match DraftSession::open_folder(&folder, AccountId("local".into())) {
+            Ok(_) => panic!("opened a folder with no account file"),
+            Err(err) => err,
+        };
+        assert!(err.contains("account"), "{err}");
+        let _ = root;
+    }
+
+    #[test]
+    fn send_blocks_until_the_painted_revision_is_marked_seen() {
+        let (_root, session) = temp_session("body\n");
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("on screen"), "{err}");
     }
 
     #[test]

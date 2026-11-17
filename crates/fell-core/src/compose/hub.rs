@@ -9,7 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -23,6 +24,8 @@ pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Sender<()>>>,
     focused: Mutex<Option<String>>,
+    shown: Mutex<Option<String>>,
+    shown_cv: Condvar,
 }
 
 impl Default for DraftHub {
@@ -37,6 +40,8 @@ impl DraftHub {
             sessions: Mutex::new(HashMap::new()),
             listeners: Mutex::new(Vec::new()),
             focused: Mutex::new(None),
+            shown: Mutex::new(None),
+            shown_cv: Condvar::new(),
         }
     }
 
@@ -59,10 +64,45 @@ impl DraftHub {
     ) -> Option<T> {
         let mut sessions = self.sessions.lock().expect("sessions");
         let session = sessions.get_mut(id)?;
+        let before = session.paint_generation();
         let value = body(session);
+        let changed = session.paint_generation() != before;
         drop(sessions);
-        self.emit();
+        if changed {
+            self.emit();
+        }
         Some(value)
+    }
+
+    /// The compose window calls this after it is showing `id`.
+    pub fn note_shown(&self, id: &str) {
+        let mut shown = self.shown.lock().expect("shown");
+        if shown.as_deref() == Some(id) {
+            return;
+        }
+        *shown = Some(id.to_string());
+        self.shown_cv.notify_all();
+    }
+
+    fn wait_shown(&self, id: &str) -> bool {
+        {
+            let shown = self.shown.lock().expect("shown");
+            if shown.as_deref() == Some(id) {
+                return true;
+            }
+        }
+        if self.listeners.lock().expect("listeners").is_empty() {
+            return false;
+        }
+        let shown = self.shown.lock().expect("shown");
+        if shown.as_deref() == Some(id) {
+            return true;
+        }
+        let (shown, _) = self
+            .shown_cv
+            .wait_timeout(shown, Duration::from_millis(500))
+            .expect("shown");
+        shown.as_deref() == Some(id)
     }
 
     pub fn snapshot_ids(&self) -> Vec<String> {
@@ -107,10 +147,21 @@ impl DraftHub {
             && !sessions.contains_key(&draft_id)
             && let Ok(folder) = workspace::draft_folder(&draft_id)
             && folder.join("draft.md").is_file()
-            && let Ok(session) =
-                DraftSession::open_folder(&folder, crate::AccountId("local".into()))
         {
-            sessions.insert(draft_id.clone(), session);
+            match DraftSession::open_folder(&folder, crate::AccountId("local".into())) {
+                Ok(session) => {
+                    sessions.insert(draft_id.clone(), session);
+                }
+                Err(err) => {
+                    return json!({
+                        "id": id,
+                        "ok": false,
+                        "transmitted": false,
+                        "error": err
+                    })
+                    .to_string();
+                }
+            }
         }
         let Some(session) = sessions.get_mut(&draft_id) else {
             return json!({
@@ -121,7 +172,8 @@ impl DraftHub {
             })
             .to_string();
         };
-        let reply = match op {
+        let mut reveal = None;
+        let mut reply = match op {
             "get_draft" => ok_draft(id, session, &agent),
             "get_compose_context" => {
                 let changes = session.take_user_changes(&agent);
@@ -193,13 +245,14 @@ impl DraftHub {
                 let changes = session.take_user_changes(&agent);
                 let transmitted = session.request_send();
                 *self.focused.lock().expect("focused") = Some(draft_id.clone());
+                reveal = Some(draft_id.clone());
                 let snap = session.snapshot();
                 json!({
                     "id": id,
                     "ok": true,
                     "transmitted": transmitted,
-                    "opened": snap.open,
-                    "focused": snap.focused,
+                    "opened": false,
+                    "focused": false,
                     "draft_id": snap.id,
                     "revision": snap.revision,
                     "to": snap.to.iter().map(|item| item.raw.clone()).collect::<Vec<_>>(),
@@ -225,6 +278,13 @@ impl DraftHub {
         };
         drop(sessions);
         self.emit();
+        if let Some(id) = reveal {
+            let shown = self.wait_shown(&id);
+            if let Some(object) = reply.as_object_mut() {
+                object.insert("opened".into(), json!(shown));
+                object.insert("focused".into(), json!(shown));
+            }
+        }
         reply.to_string()
     }
 
@@ -394,7 +454,9 @@ mod tests {
             subject: "Hi".into(),
             ..DraftFields::default()
         };
-        let folder = workspace::materialize_in(&root, "d1", &fields, "alpha\n").unwrap();
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
         let session =
             DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
         let hub = DraftHub::new();
@@ -428,7 +490,20 @@ mod tests {
         );
         let requested: Value = serde_json::from_str(&requested).unwrap();
         assert_eq!(requested["transmitted"], false);
-        assert_eq!(requested["opened"], true);
+        assert_eq!(requested["opened"], false);
+        hub.note_shown("d1");
+        let shown = hub.handle_line(
+            &json!({
+                "id": 3,
+                "op": "request_send",
+                "draft_id": "d1",
+                "agent": "bot"
+            })
+            .to_string(),
+        );
+        let shown: Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(shown["opened"], true);
+        assert_eq!(shown["transmitted"], false);
         assert!(
             requested["note"]
                 .as_str()
@@ -438,5 +513,84 @@ mod tests {
         assert!(requested.get("remote_id").is_none());
         let offline = request_send_without_editor();
         assert_eq!(offline["transmitted"], false);
+    }
+
+    #[test]
+    fn reading_a_session_does_not_wake_the_window() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-idle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
+        let session =
+            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        let hub = DraftHub::new();
+        hub.insert(session);
+        let rx = hub.subscribe();
+        while rx.try_recv().is_ok() {}
+        hub.with_session("d1", |session| {
+            let _ = session.snapshot();
+            session.mark_seen();
+        });
+        assert!(rx.try_recv().is_err());
+        hub.with_session("d1", |session| session.open_for_edit());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn request_send_waits_until_the_window_shows_that_draft() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-show-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
+        let session =
+            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        let hub = Arc::new(DraftHub::new());
+        hub.insert(session);
+        let _inbox = hub.subscribe();
+        let waiter = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waiter.note_shown("d1");
+        });
+        let requested = hub.handle_line(
+            &json!({
+                "id": 1,
+                "op": "request_send",
+                "draft_id": "d1",
+                "agent": "bot"
+            })
+            .to_string(),
+        );
+        let requested: Value = serde_json::from_str(&requested).unwrap();
+        assert_eq!(requested["opened"], true);
+        assert_eq!(requested["transmitted"], false);
     }
 }

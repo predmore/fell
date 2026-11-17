@@ -304,29 +304,94 @@ impl ComposeView {
     }
 
     fn sync_from_hub(&mut self) {
-        let Some(snap) = self
-            .hub
-            .with_session(self.draft_id.as_ref(), |session| session.snapshot())
-        else {
+        self.follow_focus();
+        if !self.pull_unpainted() {
+            self.mark_painted();
+        }
+        self.hub.note_shown(self.draft_id.as_ref());
+    }
+
+    fn follow_focus(&mut self) {
+        let Some(id) = self.hub.focused_id() else {
             return;
         };
-        if snap.revision != self.applied_revision && self.field == Field::Body {
-            let incoming = snap.body.clone();
-            if incoming != self.editor.text() {
-                let row = self.editor.row;
-                let col = self.editor.col;
-                self.editor = Editor::from_body(&incoming);
-                self.editor.row = row;
-                self.editor.col = col;
-                self.editor.mode = Mode::Normal;
-                self.editor.clamp();
-            }
-            self.to_line = join_addrs(&snap.to);
-            self.cc_line = join_addrs(&snap.cc);
-            self.bcc_line = join_addrs(&snap.bcc);
-            self.subject_line = snap.subject.clone();
-            self.applied_revision = snap.revision;
+        if id == self.draft_id.as_ref() {
+            return;
         }
+        let Some((folder, snap)) = self.hub.with_session(&id, |session| {
+            session.open_for_edit();
+            (session.folder().to_path_buf(), session.snapshot())
+        }) else {
+            return;
+        };
+        self.folder = folder;
+        self.draft_id = id.into();
+        self.editor = Editor::from_body(&snap.body);
+        self.applied_revision = snap.revision;
+        self.field = Field::Body;
+        self.to_line = join_addrs(&snap.to);
+        self.cc_line = join_addrs(&snap.cc);
+        self.bcc_line = join_addrs(&snap.bcc);
+        self.subject_line = snap.subject;
+        self.sent = false;
+        self.status = "i insert".into();
+    }
+
+    /// Copies session text that is not on screen. Returns true when the
+    /// editor changed, which means this frame is the first time it is visible.
+    fn pull_unpainted(&mut self) -> bool {
+        let id = self.draft_id.to_string();
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return false;
+        };
+        let mut changed = false;
+        if snap.body != self.editor.text() {
+            let row = self.editor.row;
+            let col = self.editor.col;
+            let mode = self.editor.mode;
+            self.editor = Editor::from_body(&snap.body);
+            self.editor.row = row;
+            self.editor.col = col;
+            self.editor.mode = mode;
+            self.editor.clamp();
+            changed = true;
+        }
+        if self.field != Field::To {
+            let line = join_addrs(&snap.to);
+            if self.to_line != line {
+                self.to_line = line;
+                changed = true;
+            }
+        }
+        if self.field != Field::Cc {
+            let line = join_addrs(&snap.cc);
+            if self.cc_line != line {
+                self.cc_line = line;
+                changed = true;
+            }
+        }
+        if self.field != Field::Bcc {
+            let line = join_addrs(&snap.bcc);
+            if self.bcc_line != line {
+                self.bcc_line = line;
+                changed = true;
+            }
+        }
+        if self.field != Field::Subject && self.subject_line != snap.subject {
+            self.subject_line = snap.subject;
+            changed = true;
+        }
+        self.applied_revision = snap.revision;
+        changed
+    }
+
+    fn mark_painted(&mut self) {
+        let id = self.draft_id.to_string();
+        let _ = self.hub.with_session(&id, |session| {
+            if session.body() == self.editor.text() {
+                session.mark_seen();
+            }
+        });
     }
 
     fn push_body(&mut self) {
@@ -356,12 +421,12 @@ impl ComposeView {
         });
         match result {
             Some(Ok(())) => {
-                if let Some(revision) = self.hub.with_session(&id, |session| {
-                    let _ = session.flush();
-                    session.revision()
-                }) {
-                    self.applied_revision = revision;
+                let _ = self.hub.with_session(&id, |session| session.flush());
+                if self.pull_unpainted() {
+                    self.status = "the draft changed; it is on screen before send".into();
+                    return false;
                 }
+                self.mark_painted();
                 self.status = "draft".into();
                 true
             }
@@ -377,6 +442,10 @@ impl ComposeView {
         if self.field != Field::Body && !self.commit_field(self.field) {
             return;
         }
+        if self.pull_unpainted() {
+            self.status = "the draft changed; it is on screen before send".into();
+            return;
+        }
         let id = self.draft_id.to_string();
         let account = self
             .hub
@@ -386,10 +455,9 @@ impl ComposeView {
             return;
         };
         let backend = fell_core::backend_for(&account);
-        let outcome = self.hub.with_session(&id, |session| {
-            session.mark_seen();
-            send_from_editor(session, backend.as_ref())
-        });
+        let outcome = self
+            .hub
+            .with_session(&id, |session| send_from_editor(session, backend.as_ref()));
         match outcome {
             Some(Ok(_)) => {
                 self.sent = true;
@@ -857,10 +925,6 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let _ = self.hub.with_session(self.draft_id.as_ref(), |session| {
-            session.mark_seen();
-            session.open_for_edit();
-        });
         let snap = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| session.snapshot())
@@ -1021,7 +1085,6 @@ pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, String> {
-    session.mark_seen();
     let outgoing = session.prepare_send()?;
     let files = session
         .resolved_files()
@@ -1186,15 +1249,21 @@ fn styled_body(
 ) -> gpui::Div {
     let text = editor.text();
     let doc = markdown_to_doc(&text);
-    let cursor_byte = cursor_byte(&text, editor.row, editor.col);
+    let cursor_at_col = cursor_byte(&text, editor.row, editor.col);
+    let cursor_at = cursor_byte(&text, editor.row, 0);
+    let mut caret_placed = cursor_line_covered(&text, editor.row, &doc);
     let mut column = div().flex().flex_col().gap_2();
     if doc.blocks.is_empty() {
-        column = column.child(div().text_color(rgb(colors.dim)).child("Write in markdown"));
+        return column.child(cursor_line_row(editor, colors));
     }
     for block in &doc.blocks {
+        if !caret_placed && block.source.is_some_and(|(start, _)| cursor_at < start) {
+            column = column.child(cursor_line_row(editor, colors));
+            caret_placed = true;
+        }
         let on_cursor = block
             .source
-            .is_some_and(|(start, end)| cursor_byte >= start && cursor_byte <= end);
+            .is_some_and(|(start, end)| cursor_at_col >= start && cursor_at_col <= end);
         let edited = block.source.is_some_and(|(start, end)| {
             hunks
                 .iter()
@@ -1211,7 +1280,33 @@ fn styled_body(
             painted
         });
     }
+    if !caret_placed {
+        column = column.child(cursor_line_row(editor, colors));
+    }
     column
+}
+
+fn cursor_line_covered(text: &str, row: usize, doc: &StyledDoc) -> bool {
+    let start = cursor_byte(text, row, 0);
+    let line = text.split_inclusive('\n').nth(row).unwrap_or("");
+    if line.is_empty() {
+        return false;
+    }
+    let end = start + line.len();
+    doc.blocks.iter().any(|block| {
+        block
+            .source
+            .is_some_and(|(block_start, block_end)| start < block_end && end > block_start)
+    })
+}
+
+fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
+    let line = editor
+        .lines
+        .get(editor.row)
+        .map(String::as_str)
+        .unwrap_or("");
+    raw_line(line, Some(editor.col), true, editor.mode, colors)
 }
 
 fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
@@ -1764,7 +1859,13 @@ pub fn open_demo(
         in_reply_to: Some("<q3@example.com>".into()),
         attachments: vec![],
     };
-    let folder = fell_core::compose::materialize_in(&root, "demo", &fields, demo_body())?;
+    let folder = fell_core::compose::materialize_in(
+        &root,
+        "demo",
+        &fields,
+        demo_body(),
+        &AccountId("local".into()),
+    )?;
     std::fs::write(folder.join("chart.png"), crate::png::chart_png())
         .map_err(|err| err.to_string())?;
     let mut session = fell_core::compose::DraftSession::create(
@@ -1780,4 +1881,21 @@ pub fn open_demo(
     hub.insert(session);
     let _ = theme;
     Ok((hub, "demo".into(), folder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_line_covered;
+    use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn a_blank_cursor_line_is_not_inside_a_block() {
+        let text = "# Q3\n\nNext\n";
+        let doc = markdown_to_doc(text);
+        assert!(cursor_line_covered(text, 0, &doc));
+        assert!(!cursor_line_covered(text, 1, &doc));
+        assert!(cursor_line_covered(text, 2, &doc));
+        let blank = markdown_to_doc("\n");
+        assert!(!cursor_line_covered("\n", 0, &blank));
+    }
 }

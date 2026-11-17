@@ -255,8 +255,13 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
             .map(|id| format!("<{}>", id.as_str())),
         attachments: Vec::new(),
     };
-    let cwd =
-        fell_core::compose::materialize_workspace(&compose_id, &fields, &saved.draft.body).ok();
+    let cwd = fell_core::compose::materialize_workspace(
+        &compose_id,
+        &fields,
+        &saved.draft.body,
+        &session.account_id,
+    )
+    .ok();
     Ok(json!({
         "draft_id": saved.draft.id,
         "compose_id": compose_id,

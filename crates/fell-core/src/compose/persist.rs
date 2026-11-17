@@ -174,6 +174,7 @@ impl Store {
             id,
             &stored.fields,
             &stored.body,
+            &stored.account_id,
         )
         .map_err(crate::Error::Invalid)?;
         for file in &stored.files {

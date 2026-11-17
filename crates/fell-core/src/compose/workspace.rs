@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::frontmatter::{DraftFields, DraftIssue, write_draft};
 use super::mime::ResolvedFile;
+use crate::AccountId;
 
 pub const AGENTS_MD: &str = "\
 # Draft folder
@@ -93,8 +94,9 @@ pub fn materialize_workspace(
     id: &str,
     fields: &DraftFields,
     body: &str,
+    account: &AccountId,
 ) -> Result<PathBuf, String> {
-    materialize_in(&draft_root(), id, fields, body)
+    materialize_in(&draft_root(), id, fields, body, account)
 }
 
 pub fn materialize_in(
@@ -102,6 +104,7 @@ pub fn materialize_in(
     id: &str,
     fields: &DraftFields,
     body: &str,
+    account: &AccountId,
 ) -> Result<PathBuf, String> {
     validate_id(id)?;
     let folder = root.join(id);
@@ -122,6 +125,14 @@ pub fn materialize_in(
         let reply = fields.in_reply_to.clone().unwrap_or_default();
         atomic_write(&folder.join("reply.lock"), format!("{reply}\n").as_bytes())?;
     }
+    let account_id = account.as_str().trim();
+    if account_id.is_empty() || account_id.contains(['\n', '\r']) {
+        return Err("draft account id is empty".into());
+    }
+    atomic_write(
+        &folder.join("account"),
+        format!("{account_id}\n").as_bytes(),
+    )?;
     if folder.join("thread").exists() {
         return Err("draft folder must not contain a thread copy".into());
     }
@@ -396,6 +407,7 @@ fn user_id() -> u32 {
 mod tests {
     use super::super::frontmatter::AttachmentRef;
     use super::*;
+    use crate::AccountId;
     use std::os::unix::fs::symlink;
 
     fn isolated(name: &str) -> PathBuf {
@@ -420,7 +432,14 @@ mod tests {
             to: vec!["ada@example.com".into()],
             ..DraftFields::default()
         };
-        let folder = materialize_in(&root, "d1", &fields, "![chart](chart.png)\n").unwrap();
+        let folder = materialize_in(
+            &root,
+            "d1",
+            &fields,
+            "![chart](chart.png)\n",
+            &AccountId("local".into()),
+        )
+        .unwrap();
         fs::write(folder.join("chart.png"), b"png-bytes").unwrap();
         fs::write(folder.join("notes.txt"), b"scratch").unwrap();
         fs::write(folder.join("q3.xlsx"), b"sheet").unwrap();
@@ -456,7 +475,14 @@ mod tests {
     #[test]
     fn parent_paths_and_escaping_symlinks_are_refused() {
         let root = isolated("escape");
-        let folder = materialize_in(&root, "d2", &DraftFields::default(), "body\n").unwrap();
+        let folder = materialize_in(
+            &root,
+            "d2",
+            &DraftFields::default(),
+            "body\n",
+            &AccountId("local".into()),
+        )
+        .unwrap();
         let outside = std::env::temp_dir().join(format!("fell-outside-{}", std::process::id()));
         fs::write(&outside, b"secret").unwrap();
         symlink(&outside, folder.join("leak")).unwrap();
@@ -479,7 +505,8 @@ mod tests {
             ..DraftFields::default()
         };
         let root = isolated("missing");
-        let folder = materialize_in(&root, "d3", &fields, "x\n").unwrap();
+        let folder =
+            materialize_in(&root, "d3", &fields, "x\n", &AccountId("local".into())).unwrap();
         let closure = resolve_closure(&folder, &fields, "x\n");
         assert!(closure.files.is_empty());
         assert!(
