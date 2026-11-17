@@ -850,8 +850,9 @@ fn even_stroke_weight(src: &image::RgbaImage) -> image::RgbaImage {
         return src.clone();
     }
     let components = connected_ink(&mask, width, height);
-    let mut thinned = mask.clone();
-    thin_to_centerline(&mut thinned, width, height);
+    // The thinner never visits the outer pixel. A pad of paper lets a mark
+    // on that frame be removed, then the pad is dropped.
+    let thinned = thin_with_paper_pad(&mask, width, height);
     let mut centers: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
     let mut kept: Vec<bool> = Vec::with_capacity(components.len());
     for pixels in &components {
@@ -981,6 +982,26 @@ fn component_is_thick(mask: &[u8], pixels: &[usize], width: u32, height: u32) ->
         }
         !paper
     })
+}
+
+/// Thin as if the sketch sat one pixel in from the edge, then drop the pad.
+fn thin_with_paper_pad(mask: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let padded_width = width + 2;
+    let padded_height = height + 2;
+    let mut padded = vec![0u8; (padded_width * padded_height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            padded[((y + 1) * padded_width + (x + 1)) as usize] = mask[(y * width + x) as usize];
+        }
+    }
+    thin_to_centerline(&mut padded, padded_width, padded_height);
+    let mut thinned = vec![0u8; mask.len()];
+    for y in 0..height {
+        for x in 0..width {
+            thinned[(y * width + x) as usize] = padded[((y + 1) * padded_width + (x + 1)) as usize];
+        }
+    }
+    thinned
 }
 
 /// Zhang-Suen thinning. Endpoints stay, so a roof peak is not eaten.
@@ -1281,6 +1302,29 @@ mod decode_tests {
         // The blocks stay solid. They are not replaced by a thinner spine.
         assert_eq!(even.get_pixel(5, 5).0[3], 255);
         assert_eq!(even.get_pixel(13, 13).0[3], 255);
+    }
+
+    #[test]
+    fn solid_block_on_the_frame_stays_solid() {
+        use super::even_stroke_weight;
+
+        let mut image = image::RgbaImage::new(32, 32);
+        for y in 4..28 {
+            image.put_pixel(26, y, image::Rgba([255, 255, 255, 255]));
+            image.put_pixel(27, y, image::Rgba([255, 255, 255, 255]));
+        }
+        for y in 8..12 {
+            for x in 0..4 {
+                image.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let even = even_stroke_weight(&image);
+        for y in 8..12 {
+            for x in 0..4 {
+                assert_eq!(even.get_pixel(x, y).0[3], 255, "frame 4x4 {x},{y}");
+            }
+        }
+        assert_eq!(even.get_pixel(26, 16).0[3], 255, "the other stroke stays");
     }
 
     #[test]
