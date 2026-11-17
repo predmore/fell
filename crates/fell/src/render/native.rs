@@ -701,8 +701,20 @@ fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
     if count * 100 / opaque.len() < 80 {
         return None;
     }
+    let mut marks = Vec::new();
+    for px in &opaque {
+        let key = (px[0] & !7, px[1] & !7, px[2] & !7);
+        let paper_pixel = key.0.abs_diff(paper.0) <= 8
+            && key.1.abs_diff(paper.1) <= 8
+            && key.2.abs_diff(paper.2) <= 8;
+        if !paper_pixel {
+            marks.push(*px);
+        }
+    }
+    if marks.is_empty() || marks.iter().any(|px| !near_grayscale(px[0], px[1], px[2])) {
+        return None;
+    }
     let mut out = rgba.clone();
-    let mut strokes = 0usize;
     for px in out.pixels_mut() {
         let key = (px[0] & !7, px[1] & !7, px[2] & !7);
         let paper_pixel = px[3] < 16
@@ -713,10 +725,13 @@ fn lift_paper(rgba: &image::RgbaImage) -> Option<image::RgbaImage> {
             *px = image::Rgba([0, 0, 0, 0]);
         } else {
             *px = image::Rgba([255, 255, 255, 255]);
-            strokes += 1;
         }
     }
-    (strokes > 0).then_some(out)
+    Some(out)
+}
+
+fn near_grayscale(red: u8, green: u8, blue: u8) -> bool {
+    red.max(green).max(blue) - red.min(green).min(blue) <= 24
 }
 
 fn tint(src: &image::RgbaImage, rgb: [u8; 3]) -> image::RgbaImage {
@@ -762,6 +777,21 @@ mod decode_tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn colored_mark_on_white_stays_colored() {
+        use super::lift_paper;
+        let mut image = image::RgbaImage::new(4, 4);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([250, 250, 250, 255]);
+        }
+        image.put_pixel(1, 1, image::Rgba([200, 16, 16, 255]));
+        assert!(
+            lift_paper(&image).is_none(),
+            "a red mark is not a grayscale sketch"
+        );
+        assert_eq!(image.get_pixel(1, 1).0, [200, 16, 16, 255]);
     }
 
     #[test]

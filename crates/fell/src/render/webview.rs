@@ -167,6 +167,7 @@ fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
             Cmd::Show(request) => present(request),
             Cmd::Hide => HOST.with(|slot| {
                 if let Some(host) = slot.borrow().as_ref() {
+                    cancel_source(&host.fail_safe);
                     host.window.hide();
                 }
             }),
@@ -408,6 +409,7 @@ fn snapshot(widget: webkit2gtk::WebView, token: u64, capture: u64, shot: u64) {
                         progress.note_snapshot(settled);
                         host.progress.set(progress);
                         if settled {
+                            cancel_source(&host.fail_safe);
                             host.window.hide();
                         }
                         generation
@@ -489,6 +491,13 @@ fn publish_failure(token: u64, capture: u64) {
 
 fn arm_fail_safe(token: u64, capture: u64) {
     let id = gtk::glib::timeout_add_local(Duration::from_secs(8), move || {
+        // Take the id before GLib retires this source. A later Show must not
+        // call remove on a source that has already finished.
+        HOST.with(|slot| {
+            if let Some(host) = slot.borrow().as_ref() {
+                host.fail_safe.borrow_mut().take();
+            }
+        });
         let should_stop = HOST.with(|slot| {
             slot.borrow().as_ref().is_some_and(|host| {
                 host.token.get() == token
@@ -497,11 +506,6 @@ fn arm_fail_safe(token: u64, capture: u64) {
             })
         });
         if should_stop {
-            HOST.with(|slot| {
-                if let Some(host) = slot.borrow().as_ref() {
-                    host.fail_safe.borrow_mut().take();
-                }
-            });
             apply_progress(LoadProgress::timed_out);
         }
         gtk::glib::ControlFlow::Break
