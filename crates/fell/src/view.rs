@@ -1278,6 +1278,9 @@ fn folder_picker(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> g
                                     inbox.session.folder = name.clone();
                                     inbox.reload_threads();
                                     inbox.reload_messages(true);
+                                    inbox
+                                        .list_scroll
+                                        .scroll_to_item(inbox.session.cursor_index());
                                     inbox.scroll_conversation();
                                 }
                                 cx.notify();

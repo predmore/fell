@@ -76,13 +76,42 @@ fn open_store() -> fell_core::Result<Store> {
 }
 
 fn open_at(path: &Path) -> fell_core::Result<Store> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| fell_core::Error::Backend(err.to_string()))?;
-        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_mailbox_dirs(parent)?;
     }
     let store = Store::open(path)?;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| fell_core::Error::Backend(err.to_string()))?;
     Ok(store)
+}
+
+/// Create missing directories for the mailbox and restrict only those new
+/// directories to 0700. An existing parent, including a home directory or
+/// `/tmp`, keeps the mode it already has.
+fn create_mailbox_dirs(dir: &Path) -> fell_core::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    loop {
+        if current.as_os_str().is_empty() || current.exists() {
+            break;
+        }
+        missing.push(current.to_path_buf());
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    for path in missing.iter().rev() {
+        match fs::create_dir(path) {
+            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|err| fell_core::Error::Backend(err.to_string()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(fell_core::Error::Backend(err.to_string())),
+        }
+    }
+    Ok(())
 }
 
 pub fn store_path() -> Result<PathBuf, String> {
@@ -187,6 +216,33 @@ mod tests {
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(file_mode & 0o077, 0, "mailbox mode {file_mode:o}");
         assert_eq!(dir_mode & 0o077, 0, "directory mode {dir_mode:o}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_parent_keeps_its_mode() {
+        let dir = std::env::temp_dir().join(format!("fell-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+
+        let path = dir.join("mail.db");
+        open_at(&path).unwrap();
+        let after = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, before, "existing parent mode changed");
+        assert_eq!(file_mode, 0o600, "mailbox mode {file_mode:o}");
+
+        let nested = dir.join("created");
+        open_at(&nested.join("mail.db")).unwrap();
+        let nested_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        let parent_again = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            nested_mode, 0o700,
+            "new mailbox directory mode {nested_mode:o}"
+        );
+        assert_eq!(parent_again, before);
         let _ = fs::remove_dir_all(&dir);
     }
 }

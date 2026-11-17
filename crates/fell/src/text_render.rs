@@ -54,7 +54,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
         }
         let joined = quote
             .iter()
-            .map(|line| line.trim_start_matches('>').trim_start())
+            .map(|line| strip_one_quote_marker(line))
             .collect::<Vec<_>>()
             .join("\n");
         quote.clear();
@@ -105,8 +105,18 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
 }
 
 fn is_quote(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with('>')
+    line.trim_start().starts_with('>')
+}
+
+/// Drop one quote marker and at most one space after it, so `>>` stays nested.
+fn strip_one_quote_marker(line: &str) -> String {
+    let rest = line.trim_start();
+    let indent_len = line.len() - rest.len();
+    let Some(rest) = rest.strip_prefix('>') else {
+        return line.to_string();
+    };
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    format!("{}{rest}", &line[..indent_len])
 }
 
 fn is_signature_rule(line: &str) -> bool {
@@ -145,6 +155,24 @@ mod tests {
             rendered.blocks.iter().any(
                 |block| matches!(block, BodyBlock::Quote(text) if text.contains("older line"))
             )
+        );
+    }
+
+    #[test]
+    fn nested_quotes_keep_one_level() {
+        let body = "Thanks.\n\n>> earlier reply\n> > still nested\n> top level\n>  two spaces";
+        let rendered = render_stored_body(Some(body), "");
+        let quote = rendered
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                BodyBlock::Quote(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            quote,
+            "> earlier reply\n> still nested\ntop level\n two spaces"
         );
     }
 
