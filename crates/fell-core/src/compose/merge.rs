@@ -114,6 +114,44 @@ pub fn unified_diff(before: &str, after: &str) -> String {
         .to_string()
 }
 
+/// True when `current[start..end]` sits on a line the user changed since `base`.
+pub fn span_overlaps_user_change(base: &str, current: &str, start: usize, end: usize) -> bool {
+    if base == current {
+        return false;
+    }
+    let current_lines = split_keep(current);
+    let mut byte = 0usize;
+    let mut first = None;
+    let mut last = 0usize;
+    for (index, line) in current_lines.iter().enumerate() {
+        let next = byte + line.len();
+        if start < next && end > byte {
+            if first.is_none() {
+                first = Some(index);
+            }
+            last = index + 1;
+        }
+        byte = next;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    let base_lines = split_keep(base);
+    let map = equal_line_map(base, current, base_lines.len());
+    let mut unchanged = vec![false; current_lines.len()];
+    for (base_index, our_index) in map.iter().enumerate() {
+        if base_index == base_lines.len() {
+            continue;
+        }
+        if let Some(our_index) = our_index
+            && *our_index < unchanged.len()
+        {
+            unchanged[*our_index] = true;
+        }
+    }
+    (first..last).any(|index| !unchanged.get(index).copied().unwrap_or(false))
+}
+
 pub fn find_unique(haystack: &str, needle: &str) -> Result<usize, &'static str> {
     if needle.is_empty() {
         return Err("edit is empty");

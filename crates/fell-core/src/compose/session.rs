@@ -96,6 +96,9 @@ pub struct DraftSession {
     undo: Vec<Checkpoint>,
     undo_open: bool,
     last_written: String,
+    /// Serialized draft before the person's uncommitted edits. Agent edits
+    /// that touch a line changed since this snapshot are refused.
+    settled: String,
     pending: Option<String>,
     pending_delete: bool,
     pending_since: u64,
@@ -133,6 +136,7 @@ impl DraftSession {
             undo: Vec::new(),
             undo_open: false,
             last_written: String::new(),
+            settled: String::new(),
             pending: None,
             pending_delete: false,
             pending_since: 0,
@@ -152,6 +156,7 @@ impl DraftSession {
         }
         session.identities = read_identities(&session.folder);
         session.load_hunks();
+        session.settled = session.serialize();
         session.flush()?;
         Ok(session)
     }
@@ -264,6 +269,7 @@ impl DraftSession {
         self.body = body;
         self.bump();
         self.reconcile_hunks();
+        self.refresh_issues();
     }
 
     pub fn set_subject_from_user(&mut self, subject: String) {
@@ -273,6 +279,7 @@ impl DraftSession {
         self.begin_user_change();
         self.fields.subject = subject;
         self.bump();
+        self.refresh_issues();
     }
 
     pub fn set_from_user(&mut self, from: String) {
@@ -282,6 +289,7 @@ impl DraftSession {
         self.begin_user_change();
         self.fields.from = from;
         self.bump();
+        self.refresh_issues();
     }
 
     pub fn set_addresses_from_user(&mut self, field: &str, line: &str) -> Result<(), String> {
@@ -294,6 +302,7 @@ impl DraftSession {
             _ => return Err("unknown address field".into()),
         }
         self.bump();
+        self.refresh_issues();
         Ok(())
     }
 
@@ -307,6 +316,7 @@ impl DraftSession {
         self.hunks = previous.hunks;
         self.notices = previous.notices;
         self.bump();
+        self.refresh_issues();
         true
     }
 
@@ -318,6 +328,7 @@ impl DraftSession {
         self.end_user_change();
         self.hunks.remove(index);
         self.bump();
+        self.refresh_issues();
         true
     }
 
@@ -346,6 +357,12 @@ impl DraftSession {
         let _ = base_revision;
         let at = merge::find_unique(&current, old)
             .map_err(|err| format!("{err}\nrevision: {}\n{current}", self.revision))?;
+        if merge::span_overlaps_user_change(&self.settled, &current, at, at + old.len()) {
+            return Err(format!(
+                "the text you tried to edit has changed\nrevision: {}\n{current}",
+                self.revision
+            ));
+        }
         let mut next = current.clone();
         next.replace_range(at..at + old.len(), new);
         self.undo.push(self.checkpoint());
@@ -353,6 +370,7 @@ impl DraftSession {
         if old != new && self.serialize().contains(new) {
             self.push_hunk(HunkKind::Body, old.to_string(), new.to_string());
         }
+        self.settled = self.serialize();
         Ok(())
     }
 
@@ -365,6 +383,7 @@ impl DraftSession {
         self.body = body.to_string();
         self.push_hunk(HunkKind::Body, previous, body.to_string());
         self.bump();
+        self.settled = self.serialize();
         Ok(())
     }
 
@@ -552,6 +571,7 @@ impl DraftSession {
         for hunk in outcome.hunks {
             self.push_hunk(hunk.kind, hunk.previous, hunk.inserted);
         }
+        self.settled = self.serialize();
         let _ = self.flush();
     }
 
@@ -568,6 +588,12 @@ impl DraftSession {
         self.issues = parsed.issues;
         self.bump();
         Ok(())
+    }
+
+    fn refresh_issues(&mut self) {
+        if let Ok(parsed) = parse_draft(&self.serialize()) {
+            self.issues = parsed.issues;
+        }
     }
 
     fn push_hunk(&mut self, kind: HunkKind, previous: String, inserted: String) {
@@ -909,6 +935,40 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("in_reply_to"))
         );
+    }
+
+    #[test]
+    fn a_corrected_header_clears_the_old_parse_issue() {
+        let (_root, mut session) = temp_session("body\n");
+        let original = session.serialize();
+        let bad = original.replace(
+            "to: [\"ada@example.com\"]",
+            "to: [\"not-an-email\"]\nevil: 1",
+        );
+        session.edit(session.revision(), &original, &bad).unwrap();
+        session.mark_seen();
+        assert!(session.prepare_send().is_err());
+        session
+            .set_addresses_from_user("to", "ada@example.com")
+            .unwrap();
+        session.mark_seen();
+        assert!(
+            session.prepare_send().is_ok(),
+            "{:?}",
+            session.snapshot().issues
+        );
+    }
+
+    #[test]
+    fn edit_does_not_rewrite_a_line_the_person_extended() {
+        let (_root, mut session) = temp_session("Please send the report\n");
+        session.set_body_from_user("Please send the report today\n".into());
+        let err = session
+            .edit(session.revision(), "send the report", "file the report")
+            .unwrap_err();
+        assert!(err.contains("today"), "{err}");
+        assert!(session.body().contains("Please send the report today"));
+        assert!(!session.body().contains("file the report"));
     }
 
     #[test]
