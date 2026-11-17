@@ -12,6 +12,7 @@ fell-confirm.workspace = true
 fell-core.workspace = true
 fell-render.workspace = true
 gpui.workspace = true
+futures = "0.3"
 gtk = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 libc = "0.2"

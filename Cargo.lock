@@ -1853,6 +1853,7 @@ dependencies = [
  "fell-confirm",
  "fell-core",
  "fell-render",
+ "futures",
  "gpui",
  "gtk",
  "image",

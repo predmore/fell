@@ -37,7 +37,18 @@ cargo test --workspace
 cargo run -p fell
 ```
 
-`fell` opens a two-pane inbox on the local store. An empty store is filled with fixture threads, and the status line says the sync is offline. `--fixture` opens one stored message so the HTML renderer can be seen. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
+`fell` opens a two-pane inbox on the local store. With no account set up, an empty store is filled with fixture threads, and the status line says the sync is offline.
+
+## Connect your mail
+
+Install and start [Proton Mail Bridge](https://proton.me/mail/bridge) (`sudo pacman -S protonmail-bridge` on Arch), sign in, and copy the IMAP username and password Bridge shows for your account. Then:
+
+```sh
+cargo run -p fell -- account setup   # asks for email, username, Bridge password; checks the login
+cargo run -p fell                    # syncs in the background, then every 60 s
+```
+
+Setup writes `~/.config/fell/account.toml` (mode 0600). Use `--password-command 'pass show bridge'` to keep the password out of the file, or `--imap --host imap.example.com` for an IMAP account other than Bridge. `fell account check` tests the login again. Sync is read-only (`EXAMINE` and `BODY.PEEK`), so nothing changes on the server. `space s` syncs now. When Bridge is down or rejects the login, the status line and the empty inbox say so. `--fixture` opens one stored message so the HTML renderer can be seen. Read-only IMAP sync lives in `fell-core` (`ImapBackend`, and `BridgeBackend` as one IMAP account). It does not send mail. Tests talk to a local IMAP server, not a Proton account. The window follows the active Omarchy theme when `~/.local/state/omarchy/current/theme/colors.toml` is present, and otherwise uses the built-in dark or light theme.
 
 ## Agents
 

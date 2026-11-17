@@ -302,6 +302,22 @@ impl Store {
         Ok(store)
     }
 
+    /// Copy the write-ahead log into the database file. `truncate` also
+    /// shrinks the log to zero, waiting up to the busy timeout for readers;
+    /// otherwise this is a passive checkpoint that never waits. Returns the
+    /// frames still in the log that a reader kept from being copied.
+    pub fn checkpoint(&self, truncate: bool) -> Result<i64> {
+        let sql = if truncate {
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        } else {
+            "PRAGMA wal_checkpoint(PASSIVE)"
+        };
+        let (_busy, log, done): (i64, i64, i64) = self
+            .conn
+            .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok((log - done).max(0))
+    }
+
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -313,13 +329,21 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
+        // A first sync can push gigabytes through the log. SQLite reuses the
+        // file after a checkpoint but never shrinks it; this trims it back.
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         conn.execute_batch(SCHEMA)?;
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
-                ON messages(account_id, body_fingerprint);",
+                ON messages(account_id, body_fingerprint);
+             -- Per-thread lookups ordered by date (folder lists pick each
+             -- thread's first subject and latest sender). Without it SQLite
+             -- walks every message in the account once per thread.
+             CREATE INDEX IF NOT EXISTS idx_messages_thread_date
+                ON messages(account_id, thread_id, date_unix);",
         )?;
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
@@ -2901,6 +2925,27 @@ mod tests {
         body: &str,
     ) -> Message {
         msg_for("a1", id, proton, in_reply_to, subject, body)
+    }
+
+    #[test]
+    fn per_thread_lookups_use_the_thread_date_index() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT subject FROM messages s
+                  WHERE s.account_id = ?1 AND s.thread_id = ?2
+                  ORDER BY s.date_unix ASC, s.rowid ASC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(["a1", "t1"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("idx_messages_thread_date"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]

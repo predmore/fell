@@ -58,6 +58,17 @@ impl Drop for BatchLimitGuard {
     }
 }
 
+/// Log in, count selectable mailboxes, and log out. Reads no mail.
+pub(crate) fn check_login(config: &ImapConfig) -> Result<usize, Error> {
+    if config.username.is_empty() {
+        return Err(Error::Backend("imap username is empty".into()));
+    }
+    let mut session = session::Session::open(config)?;
+    let count = session.list_selectable()?.len();
+    session.logout();
+    Ok(count)
+}
+
 pub(crate) fn fetch_imap(
     account_id: &AccountId,
     config: &ImapConfig,

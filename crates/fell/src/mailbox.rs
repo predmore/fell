@@ -1,4 +1,5 @@
-//! Open the local store and, when it is empty, stub-sync fixture mail into it.
+//! Open the local store and read the account file. With no account file, an
+//! empty store is filled with fixture mail so the window has something to show.
 
 use std::env;
 use std::ffi::OsStr;
@@ -6,56 +7,159 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use fell_core::{Account, Store};
+use fell_core::{Account, AccountConfig, Store};
 
 use crate::fixtures::{fixture_account, seed_if_empty};
 use crate::keymap::{self, Keymap};
 use crate::model::SyncKind;
 
-pub struct Mailbox {
-    pub store: Store,
+/// What the window reads before its first frame: small config files only.
+pub struct Startup {
+    pub keymap: Keymap,
+    pub split: f32,
+    pub error: Option<String>,
+    pub config: Option<AccountConfig>,
+    pub path: Result<PathBuf, String>,
+}
+
+/// The mailbox the store thread opened.
+pub struct Opened {
     pub account: Account,
     pub sync: SyncKind,
     pub error: Option<String>,
-    pub keymap: Keymap,
-    pub split: f32,
 }
 
-pub fn open() -> Mailbox {
+pub fn startup() -> Startup {
     let (keymap, keymap_error) = load_keymap();
     let split = load_split();
-    match open_store() {
-        Ok(store) => match prepare(&store) {
-            Ok((account, sync)) => Mailbox {
-                store,
-                account,
-                sync,
-                error: keymap_error,
-                keymap,
-                split,
-            },
-            Err(err) => fallback(keymap, split, err.to_string()),
-        },
-        Err(err) => fallback(keymap, split, err.to_string()),
+    let (config, config_error) = match load_account_config() {
+        Ok(config) => (config, None),
+        Err(err) => (None, Some(err)),
+    };
+    Startup {
+        keymap,
+        split,
+        error: join_errors([keymap_error, config_error]),
+        config,
+        path: store_path(),
     }
 }
 
-fn fallback(keymap: Keymap, split: f32, error: String) -> Mailbox {
+/// Open the store and pick the account. Runs on the store thread: the first
+/// open of a large mailbox can replay its log and take seconds.
+pub fn open_store(
+    path: Result<PathBuf, String>,
+    config: Option<&AccountConfig>,
+) -> (Store, Opened) {
+    let opened = path
+        .and_then(|path| open_at(&path).map_err(|err| err.to_string()))
+        .and_then(|store| match prepare(&store, config) {
+            Ok((account, sync)) => Ok((store, account, sync)),
+            Err(err) => Err(err.to_string()),
+        });
+    match opened {
+        Ok((store, account, sync)) => (
+            store,
+            Opened {
+                account,
+                sync,
+                error: None,
+            },
+        ),
+        Err(error) => fallback(error),
+    }
+}
+
+fn join_errors<const N: usize>(errors: [Option<String>; N]) -> Option<String> {
+    let lines: Vec<String> = errors.into_iter().flatten().collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+pub fn account_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("account.toml"))
+}
+
+/// `Ok(None)` when there is no account file. An unreadable, malformed, or
+/// group/world-readable file is an error so the window can say so.
+fn load_account_config() -> Result<Option<AccountConfig>, String> {
+    let Some(path) = account_config_path() else {
+        return Ok(None);
+    };
+    read_account_config(&path)
+}
+
+fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, String> {
+    let shown = path.display();
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("{shown}: {err}")),
+    };
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{shown} is readable by other users (mode {:o}); run chmod 600 on it",
+            mode & 0o777
+        ));
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("{shown}: {err}"))?;
+    AccountConfig::parse(&text)
+        .map(Some)
+        .map_err(|err| format!("{shown}: {err}"))
+}
+
+/// Write the account file mode 0600, creating `~/.config/fell` mode 0700 if needed.
+pub fn write_account_config(config: &AccountConfig) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = account_config_path()
+        .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
+    if let Some(dir) = path.parent() {
+        create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| format!("{}: {err}", tmp.display()))?;
+    file.write_all(config.render().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("{}: {err}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn fallback(error: String) -> (Store, Opened) {
     let store = Store::open_in_memory().unwrap_or_else(|_| {
         panic!("in-memory store");
     });
-    let account = fixture_account();
-    Mailbox {
+    (
         store,
-        account,
-        sync: SyncKind::StoreError,
-        error: Some(error),
-        keymap,
-        split,
-    }
+        Opened {
+            account: fixture_account(),
+            sync: SyncKind::StoreError,
+            error: Some(error),
+        },
+    )
 }
 
-fn prepare(store: &Store) -> fell_core::Result<(Account, SyncKind)> {
+fn prepare(
+    store: &Store,
+    config: Option<&AccountConfig>,
+) -> fell_core::Result<(Account, SyncKind)> {
+    if let Some(config) = config {
+        let account = config.account();
+        store.upsert_account(&account)?;
+        return Ok((account, SyncKind::Connecting));
+    }
     let accounts = store.list_accounts()?;
     if accounts.is_empty() {
         let account = fixture_account();
@@ -68,11 +172,6 @@ fn prepare(store: &Store) -> fell_core::Result<(Account, SyncKind)> {
     } else {
         Ok((account, SyncKind::LocalOffline))
     }
-}
-
-fn open_store() -> fell_core::Result<Store> {
-    let path = store_path().map_err(fell_core::Error::Backend)?;
-    open_at(&path)
 }
 
 fn open_at(path: &Path) -> fell_core::Result<Store> {
@@ -217,6 +316,45 @@ mod tests {
         assert_eq!(file_mode & 0o077, 0, "mailbox mode {file_mode:o}");
         assert_eq!(dir_mode & 0o077, 0, "directory mode {dir_mode:o}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_file_must_be_private_and_valid() {
+        let dir = std::env::temp_dir().join(format!("fell-acct-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.toml");
+        assert_eq!(read_account_config(&path).unwrap(), None);
+
+        fs::write(&path, "email = \"a@b\"\npassword = \"x\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_account_config(&path).unwrap_err();
+        assert!(err.contains("chmod 600"), "{err}");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = read_account_config(&path).unwrap().unwrap();
+        assert_eq!(config.email, "a@b");
+
+        fs::write(&path, "email = \"a@b\"\n").unwrap();
+        let err = read_account_config(&path).unwrap_err();
+        assert!(err.contains("password"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configured_account_wins_over_fixture_mail() {
+        let store = Store::open_in_memory().unwrap();
+        let (fixture, kind) = prepare(&store, None).unwrap();
+        assert_eq!(kind, SyncKind::FixtureOffline);
+        let config = AccountConfig::bridge(
+            "me@proton.me",
+            "me@proton.me",
+            fell_core::PasswordSource::Inline("x".into()),
+        );
+        let (account, kind) = prepare(&store, Some(&config)).unwrap();
+        assert_eq!(kind, SyncKind::Connecting);
+        assert_eq!(account.email, "me@proton.me");
+        assert_ne!(account.id, fixture.id);
     }
 
     #[test]

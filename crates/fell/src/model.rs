@@ -1,28 +1,87 @@
 //! Inbox session: folders, selection, chords, palette. No drawing.
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use fell_core::SyncFailureKind;
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
 use crate::present::{ConvMessage, Pane, ThreadRow, folder_label, merge_folders};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
-    /// Fixtures were loaded because read-only IMAP is not on this build.
+    /// No account is set up, so the demo threads were loaded.
     FixtureOffline,
-    /// The store already had mail. Sync is still not connected.
+    /// The store already had mail and no account file is set up.
     LocalOffline,
+    /// The store has an account but no mail, and no account file is set up.
     FirstSync,
     StoreError,
+    /// The account file is set up and the first attempt has not answered yet.
+    Connecting,
+    /// Messages written so far in this pass.
+    Syncing {
+        stored: usize,
+    },
+    /// Unix time the last pass finished, and how many messages it wrote.
+    Synced {
+        at: i64,
+        stored: usize,
+    },
+    Failed(SyncFailure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncFailure {
+    pub kind: SyncFailureKind,
+    /// The backend is Proton Mail Bridge, so copy can name it.
+    pub bridge: bool,
+    pub detail: String,
 }
 
 impl SyncKind {
-    pub fn status(&self) -> &'static str {
+    pub fn status(&self) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        self.status_at(now)
+    }
+
+    pub fn status_at(&self, now: i64) -> String {
         match self {
-            Self::FixtureOffline => "fixture · offline",
-            Self::LocalOffline => "local · offline",
-            Self::FirstSync => "waiting for first sync",
-            Self::StoreError => "mailbox error",
+            Self::FixtureOffline => "fixture · offline".into(),
+            Self::LocalOffline => "local · offline".into(),
+            Self::FirstSync => "no account".into(),
+            Self::StoreError => "mailbox error".into(),
+            Self::Connecting => "connecting…".into(),
+            Self::Syncing { stored: 0 } => "syncing…".into(),
+            Self::Syncing { stored } => format!("syncing · {stored} new"),
+            Self::Synced { at, .. } => {
+                let ago = now.saturating_sub(*at).max(0);
+                if ago < 60 {
+                    "synced just now".into()
+                } else if ago < 3600 {
+                    format!("synced {}m ago", ago / 60)
+                } else {
+                    format!("synced {}h ago", ago / 3600)
+                }
+            }
+            Self::Failed(failure) => match failure.kind {
+                SyncFailureKind::Unreachable if failure.bridge => {
+                    "offline · Bridge not running".into()
+                }
+                SyncFailureKind::Unreachable => "offline · server unreachable".into(),
+                SyncFailureKind::LoginRejected => "offline · login rejected".into(),
+                SyncFailureKind::Password => "offline · password_command failed".into(),
+                SyncFailureKind::Other => "offline · sync failed".into(),
+            },
         }
+    }
+
+    /// Paint the status in the error color.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::StoreError | Self::Failed(_))
     }
 }
 
@@ -83,6 +142,8 @@ pub struct Step {
     pub undo: bool,
     /// `e` archives the open thread out of the folder on screen.
     pub archive: bool,
+    /// Start a sync pass now instead of waiting for the next one.
+    pub sync_now: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +196,8 @@ pub struct Session {
     pub toast: Option<Toast>,
     /// Destination chosen by `m`, consumed when the view applies the move.
     pub pending_move: Option<String>,
+    /// The folder on screen has not been read from the store yet.
+    pub loading: bool,
 }
 
 impl Session {
@@ -177,6 +240,7 @@ impl Session {
             folder_intent: FolderIntent::Go,
             toast: None,
             pending_move: None,
+            loading: false,
         }
     }
 
@@ -216,11 +280,18 @@ impl Session {
     }
 
     pub fn detail_text(&self) -> Option<String> {
-        match (&self.startup_error, &self.error) {
-            (Some(startup), Some(query)) => Some(format!("{startup}\n{query}")),
-            (Some(startup), None) => Some(startup.clone()),
-            (None, Some(query)) => Some(query.clone()),
-            (None, None) => None,
+        let sync = match &self.sync {
+            SyncKind::Failed(failure) => Some(failure.detail.as_str()),
+            _ => None,
+        };
+        let lines: Vec<&str> = [self.startup_error.as_deref(), self.error.as_deref(), sync]
+            .into_iter()
+            .flatten()
+            .collect();
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
         }
     }
 
@@ -327,12 +398,20 @@ impl Session {
             .iter()
             .map(|thread| thread.id.clone())
             .collect();
+        let previous_index = previous
+            .as_ref()
+            .and_then(|id| self.threads.iter().position(|thread| &thread.id == id));
         self.threads = threads;
         if let Some(id) = &previous {
             if self.threads.iter().any(|thread| &thread.id == id) {
                 self.cursor_id = Some(id.clone());
             } else {
-                self.cursor_id = self.threads.first().map(|thread| thread.id.clone());
+                // The thread left this folder or merged into another. Stay at
+                // the same place in the list instead of jumping to the top.
+                let index = previous_index
+                    .unwrap_or(0)
+                    .min(self.threads.len().saturating_sub(1));
+                self.cursor_id = self.threads.get(index).map(|thread| thread.id.clone());
             }
         } else {
             self.cursor_id = self.threads.first().map(|thread| thread.id.clone());
@@ -707,6 +786,13 @@ impl Session {
                     ..Step::default()
                 };
             }
+            Action::SyncNow => {
+                self.count.clear();
+                return Step {
+                    sync_now: true,
+                    ..Step::default()
+                };
+            }
             Action::ToggleSelect => {
                 self.count.clear();
                 if let Some(id) = self.cursor_id.clone()
@@ -871,10 +957,17 @@ impl Session {
                 hint: "The folder could not be read.".into(),
             });
         }
-        Some(match self.sync {
+        if self.loading {
+            return Some(Banner {
+                title: format!("Opening {}…", self.folder_title()),
+                hint: String::new(),
+            });
+        }
+        let retry = keymap::binding_text(&self.keymap, Action::SyncNow);
+        Some(match &self.sync {
             SyncKind::FirstSync => Banner {
-                title: "Waiting for the first sync".into(),
-                hint: "The mailbox is on disk. Sync is not connected in this build.".into(),
+                title: "No account is set up".into(),
+                hint: "Run fell account setup in a terminal, then reopen Fell.".into(),
             },
             SyncKind::StoreError => Banner {
                 title: self
@@ -883,7 +976,43 @@ impl Session {
                     .unwrap_or_else(|| "Couldn't open the mailbox".into()),
                 hint: "? details".into(),
             },
-            SyncKind::FixtureOffline | SyncKind::LocalOffline => Banner {
+            SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
+                title: format!("Syncing {}", self.folder_title()),
+                hint: match &self.sync {
+                    SyncKind::Syncing { stored } if *stored > 0 => {
+                        format!("{stored} messages stored · conversations appear as they arrive")
+                    }
+                    _ => "Conversations appear as they arrive".into(),
+                },
+            },
+            SyncKind::Failed(failure) => {
+                let title = match failure.kind {
+                    SyncFailureKind::Unreachable if failure.bridge => {
+                        "Can't reach Proton Mail Bridge"
+                    }
+                    SyncFailureKind::Unreachable => "Can't reach the mail server",
+                    SyncFailureKind::LoginRejected if failure.bridge => {
+                        "Bridge didn't accept the login"
+                    }
+                    SyncFailureKind::LoginRejected => "The server didn't accept the login",
+                    SyncFailureKind::Password => "password_command failed",
+                    SyncFailureKind::Other => "Sync failed",
+                };
+                let fix = match failure.kind {
+                    SyncFailureKind::Unreachable if failure.bridge => {
+                        format!("Start Bridge, then {retry} to retry")
+                    }
+                    SyncFailureKind::LoginRejected => format!(
+                        "Use the IMAP username and password Bridge shows · fell account setup · {retry} retry"
+                    ),
+                    _ => format!("? details · {retry} retry"),
+                };
+                Banner {
+                    title: title.into(),
+                    hint: fix,
+                }
+            }
+            SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
                 title: format!("No conversations in {}", self.folder_title()),
                 hint: "gi inbox · gf folders".into(),
             },
@@ -1166,7 +1295,7 @@ mod tests {
         assert!(banner.hint.contains("gi"));
         session.sync = SyncKind::FirstSync;
         let banner = session.list_banner().unwrap();
-        assert!(banner.title.contains("first sync"));
+        assert!(banner.hint.contains("fell account setup"));
     }
 
     #[test]

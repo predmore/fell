@@ -1495,3 +1495,56 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
     let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
     assert!(cursor.contains("INBOX"), "{cursor}");
 }
+
+#[test]
+fn account_file_logs_in_syncs_and_reports_bad_logins() {
+    use crate::account_config::{
+        AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error,
+    };
+    use crate::sync::sync_with_progress;
+
+    let server = TestServer::spawn(sample_state());
+    let text = format!(
+        "backend = \"imap\"\nemail = \"c@x\"\nusername = \"caleb\"\n\
+         password_command = \"printf secret\"\nhost = \"127.0.0.1\"\n\
+         port = {}\nsecurity = \"plain\"\n",
+        server.addr.port()
+    );
+    let config = AccountConfig::parse(&text).unwrap();
+    assert!(config.check_login().unwrap() >= 1);
+
+    let store = Store::open_in_memory().unwrap();
+    let backend = config.backend().unwrap();
+    let mut seen = Vec::new();
+    let report = sync_with_progress(
+        &config.account(),
+        backend.as_ref(),
+        &store,
+        &mut |progress| seen.push(progress.upserted),
+    )
+    .unwrap();
+    assert!(report.upserted >= 4);
+    assert_eq!(seen.last(), Some(&report.upserted));
+    assert!(!store.list_threads(&config.account().id).unwrap().is_empty());
+
+    let mut wrong = config.clone();
+    wrong.password = PasswordSource::Inline("nope".into());
+    let err = wrong.check_login().unwrap_err();
+    assert_eq!(
+        classify_sync_error(&err),
+        SyncFailureKind::LoginRejected,
+        "{err}"
+    );
+
+    let mut closed = config.clone();
+    closed.port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let err = closed.check_login().unwrap_err();
+    assert_eq!(
+        classify_sync_error(&err),
+        SyncFailureKind::Unreachable,
+        "{err}"
+    );
+}
