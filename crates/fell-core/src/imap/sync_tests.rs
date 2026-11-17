@@ -189,7 +189,7 @@ fn local_server_syncs_into_the_store() {
         .iter()
         .find(|message| message.headers.message_id.as_str() == "root@x")
         .unwrap();
-    assert_eq!(root.folders, vec!["Sent", "INBOX"]);
+    assert_eq!(root.folders, vec!["INBOX", "Sent"]);
     assert_eq!(root.labels, vec!["work"]);
     assert_eq!(root.arrived_via, vec!["alias@x.com"]);
     assert!(!root.unread);

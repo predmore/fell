@@ -71,6 +71,11 @@ enum Io {
 
 impl Session {
     pub(super) fn open(config: &ImapConfig) -> Result<Self, Error> {
+        if config.accept_invalid_certs && !is_loopback_host(&config.host) {
+            return Err(imap_err(
+                "accept_invalid_certs is only allowed for a loopback host",
+            ));
+        }
         let stream = connect_tcp(config)?;
         let mut session = match config.security {
             ImapSecurity::Tls => Session {
@@ -343,9 +348,18 @@ impl Session {
 
     fn read_reply(&mut self, tag: &str, label: &str) -> Result<Reply, Error> {
         let mut untagged = Vec::new();
+        let mut stored_bytes = 0usize;
         let mut overflow = false;
         loop {
             let (text, literals) = self.read_logical()?;
+            let added = text.len() + literal_bytes(&literals);
+            if stored_bytes.saturating_add(added) > command_byte_limit() {
+                self.disconnect();
+                return Err(imap_err(format!(
+                    "{label} exceeded the {} byte reply limit",
+                    command_byte_limit()
+                )));
+            }
             if text_starts_with_tag(&text, tag) {
                 let rest = text[tag.len()..].trim_start();
                 if overflow {
@@ -367,6 +381,7 @@ impl Session {
                 overflow = true;
                 continue;
             }
+            stored_bytes += added;
             untagged.push(Logical { text, literals });
         }
     }
@@ -597,6 +612,9 @@ const MAX_LINE: usize = 1024 * 1024;
 /// Untagged replies stored for one tagged command. Stops a server that trickles
 /// `* OK` lines and resets the read timeout on every chunk.
 const MAX_UNTAGGED: usize = 1_000_000;
+/// Bytes of one tagged command's replies that are kept. LIST, UID discovery,
+/// and the flags pass have no message body, but they can still stream forever.
+const MAX_COMMAND_BYTES: usize = 8 * 1024 * 1024;
 
 /// Bytes of literals kept from one protocol response.
 const MAX_RESPONSE: usize = MAX_LITERAL;
@@ -625,6 +643,17 @@ fn response_literal_limit() -> usize {
     MAX_RESPONSE_LITERALS
 }
 
+fn command_byte_limit() -> usize {
+    #[cfg(test)]
+    {
+        TEST_COMMAND_BYTES.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_COMMAND_BYTES
+    }
+}
+
 fn literal_limit() -> usize {
     #[cfg(test)]
     {
@@ -640,6 +669,7 @@ fn literal_limit() -> usize {
 thread_local! {
     static TEST_LITERAL_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LITERAL) };
     static TEST_RESPONSE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_RESPONSE) };
+    static TEST_COMMAND_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_COMMAND_BYTES) };
 }
 
 #[cfg(test)]
@@ -671,6 +701,22 @@ fn limit_response_bytes_to(limit: usize) -> ResponseLimitGuard {
 impl Drop for ResponseLimitGuard {
     fn drop(&mut self) {
         TEST_RESPONSE_LIMIT.with(|cell| cell.set(MAX_RESPONSE));
+    }
+}
+
+#[cfg(test)]
+struct CommandByteGuard;
+
+#[cfg(test)]
+fn limit_command_bytes_to(limit: usize) -> CommandByteGuard {
+    TEST_COMMAND_BYTES.with(|cell| cell.set(limit));
+    CommandByteGuard
+}
+
+#[cfg(test)]
+impl Drop for CommandByteGuard {
+    fn drop(&mut self) {
+        TEST_COMMAND_BYTES.with(|cell| cell.set(MAX_COMMAND_BYTES));
     }
 }
 
@@ -956,6 +1002,29 @@ enum LiteralMarker {
     Unusable,
 }
 
+fn literal_bytes(literals: &[LiteralBytes]) -> usize {
+    literals
+        .iter()
+        .map(|literal| match literal {
+            LiteralBytes::Kept(bytes) => bytes.len(),
+            LiteralBytes::Discarded => 0,
+        })
+        .sum()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|addr| addr.is_loopback())
+}
+
 fn literal_marker(line: &[u8]) -> LiteralMarker {
     if !line.ends_with(b"}") {
         return LiteralMarker::NotLiteral;
@@ -1122,7 +1191,10 @@ fn body_after_body_key(text: &str, literals: &mut [LiteralBytes]) -> (Vec<u8>, b
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
-        if text[cursor..].len() >= 3 && text[cursor..cursor + 3].eq_ignore_ascii_case("NIL") {
+        if text
+            .get(cursor..cursor + 3)
+            .is_some_and(|word| word.eq_ignore_ascii_case("NIL"))
+        {
             let boundary = bytes
                 .get(cursor + 3)
                 .is_none_or(|byte| !byte.is_ascii_alphanumeric());
@@ -1515,6 +1587,79 @@ mod tests {
         let missing = super::parse_fetch("* 1 FETCH (UID 4 FLAGS (\\Seen))", Vec::new()).unwrap();
         assert!(missing.body_missing);
         assert!(missing.body.is_empty());
+
+        let multibyte = super::parse_fetch("* 1 FETCH (UID 5 FLAGS () BODY[] éé)", Vec::new())
+            .expect("a multibyte tail is not NIL");
+        assert!(multibyte.body_missing);
+    }
+
+    #[test]
+    fn command_reply_byte_cap_closes_the_socket() {
+        use std::io::{Read, Write};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"* OK hi\r\n").unwrap();
+            let line = read_imap_command(&mut sock);
+            let tag = line.split_whitespace().next().unwrap_or("a1");
+            sock.write_all(format!("{tag} OK [CAPABILITY IMAP4rev1] LOGIN\r\n").as_bytes())
+                .unwrap();
+            let line = read_imap_command(&mut sock);
+            let tag = line.split_whitespace().next().unwrap_or("a2");
+            sock.write_all(b"* LIST (\\HasNoChildren) \"/\" \"this-mailbox-name-is-long\"\r\n")
+                .unwrap();
+            let _ = sock.flush();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = sock.read(&mut [0u8; 1]);
+            let _ = sock.write_all(format!("{tag} OK LIST\r\n").as_bytes());
+        });
+        let mut session = super::Session::open(&ImapConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Plain,
+            accept_invalid_certs: false,
+        })
+        .expect("login");
+        let _limit = super::limit_command_bytes_to(24);
+        let started = Instant::now();
+        let listed = session.list_selectable();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the command cap must close the socket instead of buffering the rest"
+        );
+        let Err(err) = listed else {
+            panic!("an unbounded LIST reply was stored");
+        };
+        let text = err.to_string();
+        assert!(text.contains("byte reply limit"), "{text}");
+        assert!(text.contains("24"), "{text}");
+    }
+
+    #[test]
+    fn invalid_certs_are_rejected_off_loopback() {
+        use crate::imap::{ImapConfig, ImapSecurity};
+
+        let opened = super::Session::open(&ImapConfig {
+            host: "imap.example.com".into(),
+            port: 993,
+            username: "caleb".into(),
+            password: "secret".into(),
+            security: ImapSecurity::Tls,
+            accept_invalid_certs: true,
+        });
+        let Err(err) = opened else {
+            panic!("invalid certificates were accepted for a public host");
+        };
+        let text = err.to_string();
+        assert!(text.contains("loopback"), "{text}");
     }
 
     #[test]

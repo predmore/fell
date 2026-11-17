@@ -401,9 +401,9 @@ fn untagged_overflow(err: &Error) -> bool {
 
 fn inbox_rank(name: &str) -> u8 {
     if name.eq_ignore_ascii_case("INBOX") {
-        1
-    } else {
         0
+    } else {
+        1
     }
 }
 
