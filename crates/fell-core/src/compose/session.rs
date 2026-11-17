@@ -23,6 +23,8 @@ use super::writer::{DraftWriter, MailboxSave, OwnWrites, SaveCache, SaveJob, Sav
 const DEBOUNCE_MS: u64 = 150;
 
 const CHANGED_ATTACHMENT: &str = "an attachment changed after it was shown";
+const CHECKING_ATTACHMENT: &str =
+    "still checking an attachment that was just shown; try sending again in a moment";
 
 #[derive(Debug, Clone)]
 struct Checkpoint {
@@ -256,12 +258,28 @@ impl DraftSession {
         if let Ok(known) = store.mailed_addresses(session.account_id()) {
             session.known = known;
         }
-        if let Some(review) = review {
-            session.resume_review(review);
+        match review {
+            Some(review) => session.resume_review(review),
+            None => session.import_legacy_hunks(),
         }
         session.settled = session.serialize();
         session.flush()?;
         Ok(session)
+    }
+
+    /// A draft saved before review state moved into the mailbox kept it in
+    /// `hunks.json`, which agents can write. It is not imported: a hunk's
+    /// `previous` text is what reject restores, so a forged file could plant
+    /// an attacker's sentence behind a reject. The person is told to read the
+    /// draft instead; the next save deletes the file.
+    fn import_legacy_hunks(&mut self) {
+        let path = workspace::control_dir(&self.folder).join("hunks.json");
+        if path.is_file() {
+            self.notices.push(
+                "review marks from an older Fell were not kept; read this draft before you send it"
+                    .into(),
+            );
+        }
     }
 
     /// Hunks come from the mailbox, never from the draft folder. Whatever
@@ -778,7 +796,12 @@ impl DraftSession {
             let digest = digest::sha256(&file.bytes);
             match self.digests.get(&file.path, shown) {
                 Some(Known::Digest(seen)) if seen == digest => {}
-                None if stamp == shown => {}
+                // The shown version is not hashed yet. Sending now could
+                // carry bytes that changed within the same timestamp tick.
+                None => {
+                    self.digests.request(&self.folder, &file.path, shown);
+                    return Err(CHECKING_ATTACHMENT.into());
+                }
                 _ => return Err(CHANGED_ATTACHMENT.into()),
             }
             self.digests.record(&file.path, stamp, digest);
@@ -904,6 +927,10 @@ impl DraftSession {
                 continue;
             };
             if file.stamp == *shown {
+                // Same stamp, but the hash thread saw two different contents.
+                if self.digests.get(&file.path, *shown) == Some(Known::Conflict) {
+                    changed = true;
+                }
                 continue;
             }
             match (
@@ -1172,6 +1199,7 @@ mod tests {
         assert!(session.is_open());
         assert!(session.try_agent_delete().is_err());
         session.mark_seen();
+        session.digests.wait_idle();
         let outgoing = session.prepare_send().unwrap();
         assert!(outgoing.mime.windows(4).any(|window| window == b"From"));
         assert!(
@@ -1439,6 +1467,7 @@ mod tests {
         assert!(session.poll_disk(1_000 + DEBOUNCE_MS));
         assert!(session.body().contains("precious"));
         session.mark_seen();
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_err());
     }
 
@@ -1474,11 +1503,13 @@ mod tests {
         );
         session.edit(session.revision(), &original, &bad).unwrap();
         session.mark_seen();
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_err());
         session
             .set_addresses_from_user("to", "ada@example.com")
             .unwrap();
         session.mark_seen();
+        session.digests.wait_idle();
         assert!(
             session.prepare_send().is_ok(),
             "{:?}",
@@ -1543,6 +1574,7 @@ mod tests {
         // The image is referenced. secret.txt is not.
         session.bump();
         session.mark_seen();
+        session.digests.wait_idle();
         let outgoing = session.prepare_send().unwrap();
         let mime = String::from_utf8(outgoing.mime).unwrap();
         assert!(mime.contains("chart.png"));
@@ -1558,6 +1590,7 @@ mod tests {
             .edit(session.revision(), "jon@example.com", "evil@example.com")
             .unwrap();
         session.mark_seen();
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("from"), "{err}");
     }
@@ -1693,6 +1726,7 @@ mod tests {
     #[test]
     fn send_blocks_until_the_painted_revision_is_marked_seen() {
         let (_root, session) = temp_session("body\n");
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("on screen"), "{err}");
     }
@@ -1711,9 +1745,12 @@ mod tests {
         let (_root, mut session) = temp_session("![chart](chart.png)\n");
         fs::write(session.folder().join("chart.png"), b"one").unwrap();
         session.mark_seen();
+        // The shown version is hashed off the editor's thread first.
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_ok());
         fs::write(session.folder().join("chart.png"), b"replaced").unwrap();
         session.mark_seen();
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("attachment"), "{err}");
     }
@@ -1725,18 +1762,23 @@ mod tests {
         fs::write(&path, b"one").unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
         session.mark_seen();
+        // The shown version is hashed off the editor's thread first.
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_ok());
         fs::write(&path, b"two").unwrap();
         let file = fs::File::options().write(true).open(&path).unwrap();
         file.set_modified(modified).unwrap();
         session.set_body_from_user("![chart](chart.png)\n\nmore\n".into());
         session.mark_seen();
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("attachment"), "{err}");
         session.set_body_from_user("no chart\n".into());
         session.mark_seen();
         session.set_body_from_user("![chart](chart.png)\n".into());
         session.mark_seen();
+        // The shown version is hashed off the editor's thread first.
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_ok());
     }
 
@@ -1931,6 +1973,7 @@ mod tests {
         }
         session.digests.wait_idle();
         assert_eq!(session.digests.hashed(), 1);
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_ok());
     }
 
@@ -1952,6 +1995,7 @@ mod tests {
         assert!(session.snapshot().send_block.is_some());
         session.digests.wait_idle();
         assert_eq!(session.snapshot().send_block, None);
+        session.digests.wait_idle();
         assert!(session.prepare_send().is_ok());
     }
 
@@ -1969,6 +2013,7 @@ mod tests {
             .digests
             .record(&shown, stamp, digest::sha256(b"what the person saw"));
         assert_eq!(session.snapshot().send_block, None);
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("attachment"), "{err}");
     }
@@ -1979,6 +2024,7 @@ mod tests {
         let path = session.folder().join("chart.png");
         fs::write(&path, b"checked").unwrap();
         session.mark_seen();
+        session.digests.wait_idle();
         let outgoing = session.prepare_send().unwrap();
         assert!(!outgoing.mime.is_empty());
         fs::write(&path, b"swapped after the check").unwrap();
@@ -1998,6 +2044,7 @@ mod tests {
         assert!(snap.attachments.is_empty(), "{:?}", snap.attachments);
         let block = snap.send_block.unwrap_or_default();
         assert!(block.contains("hard link"), "{block}");
+        session.digests.wait_idle();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("hard link"), "{err}");
     }
@@ -2207,5 +2254,28 @@ mod tests {
             expected
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_draft_from_before_stored_review_asks_to_be_read() {
+        let (_root, store, session) = stored_session("alpha\nbeta\n");
+        let control = workspace::control_dir(session.folder());
+        fs::create_dir_all(&control).unwrap();
+        fs::write(control.join("hunks.json"), "[]").unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM compose_review", [])
+            .unwrap();
+        let session = reopen(session, &store);
+        assert!(session.snapshot().hunks.is_empty());
+        assert!(
+            session
+                .snapshot()
+                .notices
+                .iter()
+                .any(|notice| notice.contains("read this draft")),
+            "{:?}",
+            session.snapshot().notices
+        );
     }
 }

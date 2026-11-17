@@ -152,6 +152,16 @@ pub(crate) fn follow(edits: &[Edit], new: &str, hunk: &Hunk) -> Option<usize> {
         .find(|&at| new.get(at..at + hunk.inserted.len()) == Some(hunk.inserted.as_str()))
 }
 
+/// Where `text` occurs in `haystack`, when it occurs exactly once.
+fn unique_at(haystack: &str, text: &str) -> Option<usize> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut found = haystack.match_indices(text);
+    let (at, _) = found.next()?;
+    found.next().is_none().then_some(at)
+}
+
 /// Carry hunks across a change the person made. A hunk whose text the
 /// person rewrote is dropped: that text is theirs now. Returns how many.
 pub(crate) fn follow_user(hunks: &mut Vec<Hunk>, old: &str, new: &str) -> usize {
@@ -165,7 +175,16 @@ pub(crate) fn follow_user(hunks: &mut Vec<Hunk>, old: &str, new: &str) -> usize 
             hunk.at = at;
             true
         }
-        None => false,
+        // The diff could not place it (a second edit inside it, or the diff
+        // timed out and rewrote the region). If the agent's exact text is
+        // still there, and only once, it is still the agent's.
+        None => match unique_at(new, &hunk.inserted) {
+            Some(at) => {
+                hunk.at = at;
+                true
+            }
+            None => false,
+        },
     });
     before - hunks.len()
 }
