@@ -223,19 +223,45 @@ fn index_loop(path: std::path::PathBuf, stop: Arc<AtomicBool>, pause: Arc<Atomic
         return;
     }
     let _ = delete_orphans(&conn);
+    let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
         if pause.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
         match index_stale(&conn, INDEX_BATCH) {
-            Ok(0) | Err(_) => thread::sleep(Duration::from_millis(50)),
-            Ok(_) => {}
+            Ok(0) | Err(_) => {
+                // A caught-up mailbox must not rescan on a tight loop.
+                sleep_unless_stopped(idle, &stop);
+                idle = next_idle(idle);
+            }
+            Ok(_) => {
+                idle = IDLE_MIN;
+                // One batch, then let sync and fell-mcp take the write lock.
+                sleep_unless_stopped(BATCH_YIELD, &stop);
+            }
         }
     }
 }
 
 const INDEX_BATCH: usize = 32;
+const IDLE_MIN: Duration = Duration::from_secs(1);
+const IDLE_MAX: Duration = Duration::from_secs(30);
+const BATCH_YIELD: Duration = Duration::from_millis(20);
+
+fn next_idle(current: Duration) -> Duration {
+    current.saturating_mul(2).clamp(IDLE_MIN, IDLE_MAX)
+}
+
+fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
+    let step = Duration::from_millis(50);
+    let mut left = total;
+    while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+        let slice = left.min(step);
+        thread::sleep(slice);
+        left = left.saturating_sub(slice);
+    }
+}
 
 /// Fill up to `limit` missing or outdated body vectors, recent mail first.
 ///
@@ -245,66 +271,6 @@ const INDEX_BATCH: usize = 32;
 pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize> {
     delete_orphans(conn)?;
     index_stale(conn, limit)
-}
-
-/// Write the vector for the body text that is stored on the message.
-///
-/// `body` is `body_text`, or the snippet when the body is null. The same text
-/// and model leave the existing row in place.
-pub(crate) fn sync_message_embedding(
-    conn: &Connection,
-    account_id: &str,
-    message_id: &str,
-    body: &str,
-) -> Result<()> {
-    let embedder = active_embedder();
-    let id = embedder.id();
-    let hash = body_hash(body);
-    let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
-    let expected_bytes = dims.saturating_mul(4);
-    let existing: Option<(String, String, i64, String, i64)> = conn
-        .query_row(
-            "SELECT model, model_version, dims, body_hash, length(vector)
-             FROM message_embeddings
-             WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id, message_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()?;
-    if let Some((model, version, stored_dims, stored_hash, nbytes)) = existing
-        && model == id.model
-        && version == id.version
-        && stored_dims == dims
-        && stored_hash == hash
-        && nbytes == expected_bytes
-    {
-        return Ok(());
-    }
-    let values = embedder.embed(body);
-    let blob = encode_vector(&values);
-    conn.execute(
-        "INSERT INTO message_embeddings (
-            account_id, message_id, model, model_version, dims, body_hash, vector
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(account_id, message_id) DO UPDATE SET
-            model = excluded.model,
-            model_version = excluded.model_version,
-            dims = excluded.dims,
-            body_hash = excluded.body_hash,
-            vector = excluded.vector",
-        params![
-            account_id, message_id, id.model, id.version, dims, hash, blob
-        ],
-    )?;
-    Ok(())
 }
 
 /// Drop a stored vector that no longer matches this body.
@@ -430,34 +396,83 @@ fn index_stale(conn: &Connection, limit: usize) -> Result<usize> {
         pending.push(row?);
     }
     drop(stmt);
-    let mut wrote = 0;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    // Hash outside the write lock. The transaction below only stores vectors
+    // whose body is still the one we hashed, and it commits the whole batch.
+    let mut prepared = Vec::new();
     for (index, (account_id, message_id)) in pending.into_iter().enumerate() {
         interrupt_rebuild(index)?;
-        if write_current_body(conn, &account_id, &message_id)? {
+        let Some(body) = message_body(conn, &account_id, &message_id)? else {
+            continue;
+        };
+        let values = active_embedder().embed(&body);
+        prepared.push((account_id, message_id, body, values));
+    }
+    if prepared.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut wrote = 0;
+    for (account_id, message_id, body, values) in prepared {
+        if store_if_unchanged(&tx, &account_id, &message_id, &body, &values)? {
             wrote += 1;
         }
     }
+    tx.commit()?;
     Ok(wrote)
 }
 
-fn write_current_body(conn: &Connection, account_id: &str, message_id: &str) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
-    let body: Option<String> = tx
-        .query_row(
-            "SELECT COALESCE(body_text, snippet)
-             FROM messages
-             WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id, message_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(body) = body else {
-        remove_message_embedding(&tx, account_id, message_id)?;
-        tx.commit()?;
+fn message_body(conn: &Connection, account_id: &str, message_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT COALESCE(body_text, snippet)
+         FROM messages
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id, message_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn store_if_unchanged(
+    conn: &Connection,
+    account_id: &str,
+    message_id: &str,
+    body: &str,
+    values: &[f32],
+) -> Result<bool> {
+    let Some(current) = message_body(conn, account_id, message_id)? else {
+        remove_message_embedding(conn, account_id, message_id)?;
         return Ok(false);
     };
-    sync_message_embedding(&tx, account_id, message_id, &body)?;
-    tx.commit()?;
+    if current != body {
+        return Ok(false);
+    }
+    let id = active_embedder().id();
+    let hash = body_hash(body);
+    let dims = i64::try_from(values.len()).unwrap_or(i64::MAX);
+    conn.execute(
+        "INSERT INTO message_embeddings (
+            account_id, message_id, model, model_version, dims, body_hash, vector
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+            model = excluded.model,
+            model_version = excluded.model_version,
+            dims = excluded.dims,
+            body_hash = excluded.body_hash,
+            vector = excluded.vector",
+        params![
+            account_id,
+            message_id,
+            id.model,
+            id.version,
+            dims,
+            hash,
+            encode_vector(values)
+        ],
+    )?;
     Ok(true)
 }
 
@@ -1098,7 +1113,14 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_index_keeps_rows_already_written() {
+    fn idle_backoff_grows_and_caps() {
+        assert_eq!(next_idle(IDLE_MIN), Duration::from_secs(2));
+        assert_eq!(next_idle(Duration::from_secs(16)), IDLE_MAX);
+        assert_eq!(next_idle(IDLE_MAX), IDLE_MAX);
+    }
+
+    #[test]
+    fn interrupted_batch_does_not_commit() {
         let store = open(&["a1"]);
         store
             .upsert_message(&message("a1", "a@x", "please pay the invoice"))
@@ -1121,7 +1143,7 @@ mod tests {
         testing_stop_embedding_rebuild_at(Some(1));
         let err = index_embeddings(&store.conn, 64).unwrap_err();
         assert!(err.to_string().contains("interrupted"));
-        assert_eq!(embedding_count(&store), 1);
+        assert_eq!(embedding_count(&store), 0);
 
         testing_stop_embedding_rebuild_at(None);
         index_all(&store);
