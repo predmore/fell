@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS message_refs (
     PRIMARY KEY (account_id, ref_id, child_rowid)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_message_refs_child ON message_refs(child_rowid);
+CREATE INDEX IF NOT EXISTS idx_message_aliases_canonical
+    ON message_aliases(account_id, canonical_message_id);
 
 CREATE TABLE IF NOT EXISTS thread_dirty_rows (
     rowid INTEGER PRIMARY KEY
@@ -263,9 +265,20 @@ pub(super) fn rethread_dirty(conn: &Connection, account_id: &AccountId) -> Resul
     let mut affected = BTreeSet::new();
     {
         let mut clear = conn.prepare_cached("DELETE FROM thread_dirty_rows WHERE rowid = ?1")?;
+        // A resync can move a row to another thread directly. Replies that
+        // cite one of its aliases instead of its own id must follow it.
+        let mut aliases = conn.prepare_cached(
+            "SELECT message_id FROM message_aliases
+             WHERE account_id = ?1 AND canonical_message_id = ?2",
+        )?;
         for (rowid, message_id, in_reply_to, references) in &dirty {
             index_refs(conn, account, *rowid, in_reply_to.as_deref(), references)?;
             ids.insert(message_id.clone());
+            for alias in
+                aliases.query_map(params![account, message_id], |row| row.get::<_, String>(0))?
+            {
+                ids.insert(alias?);
+            }
             affected.insert(*rowid);
             clear.execute(params![rowid])?;
         }
@@ -1072,5 +1085,80 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn a_resynced_alias_takes_replies_that_cite_the_alias_along() {
+        let start = 1_700_000_000;
+        let parent = message(
+            "parent@x",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "p@x",
+            "parent",
+            start,
+            None,
+        );
+        // The list copy arrives first and keeps the row; the original's id
+        // becomes its alias.
+        let mut echo = message(
+            "echo@list",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "me@x",
+            "same post",
+            start + 70,
+            Some("list.x"),
+        );
+        echo.headers.subject = "[list] subject orig@x".into();
+        let orig = message(
+            "orig@x",
+            None,
+            &[],
+            None,
+            "Sent",
+            "me@x",
+            "same post",
+            start + 10,
+            None,
+        );
+        let reply = message(
+            "reply@x",
+            None,
+            &["orig@x".to_string()],
+            None,
+            "INBOX",
+            "b@x",
+            "reply",
+            start + 200,
+            None,
+        );
+        // The original again, now naming its parent: its row moves threads.
+        let resync = message(
+            "orig@x",
+            Some("parent@x"),
+            &["parent@x".to_string()],
+            None,
+            "Sent",
+            "me@x",
+            "same post",
+            start + 10,
+            None,
+        );
+        let incremental = Store::open_in_memory().unwrap();
+        let full = Store::open_in_memory().unwrap();
+        full.full_rethread.set(true);
+        for store in [&incremental, &full] {
+            store.upsert_account(&account()).unwrap();
+            run(store, &Op::Batch(vec![parent.clone(), echo.clone()]));
+            run(store, &Op::Batch(vec![orig.clone()]));
+            run(store, &Op::Batch(vec![reply.clone()]));
+            run(store, &Op::Batch(vec![resync.clone()]));
+        }
+        assert_eq!(threads_of(&incremental), threads_of(&full));
     }
 }
