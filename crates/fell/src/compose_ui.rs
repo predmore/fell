@@ -100,9 +100,9 @@ impl Editor {
             lines.push(String::new());
         }
         Self {
-            lines,
-            row: 0,
+            row: if lines.len() > 2 { 2 } else { 0 },
             col: 0,
+            lines,
             mode: Mode::Normal,
             anchor: None,
             preferred: 0,
@@ -1130,8 +1130,8 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
         BlockBody::Heading { level, inlines } => div()
             .font_weight(FontWeight(680.))
             .text_size(px(if *level <= 1 { 28. } else { 22. }))
-            .child(inline_text(inlines)),
-        BlockBody::Paragraph { inlines } => div().child(inline_text(inlines)),
+            .child(render_inlines(inlines, colors)),
+        BlockBody::Paragraph { inlines } => div().child(render_inlines(inlines, colors)),
         BlockBody::List { ordered, items } => {
             let mut list = div().flex().flex_col();
             for (index, item) in items.iter().enumerate() {
@@ -1145,7 +1145,7 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                         .flex()
                         .gap_2()
                         .child(div().text_color(rgb(colors.accent)).child(marker))
-                        .child(inline_text(item)),
+                        .child(render_inlines(item, colors)),
                 );
             }
             list
@@ -1170,20 +1170,29 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
     }
 }
 
-fn inline_text(inlines: &[fell_core::compose::Inline]) -> String {
-    let mut out = String::new();
+fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gpui::Div {
+    let mut row = div().flex().flex_row().flex_wrap();
     for inline in inlines {
-        match inline {
-            fell_core::compose::Inline::Text(text) => out.push_str(text),
-            fell_core::compose::Inline::Em(inner) | fell_core::compose::Inline::Strong(inner) => {
-                out.push_str(&inline_text(inner));
+        row = match inline {
+            fell_core::compose::Inline::Text(text) => row.child(div().child(text.clone())),
+            fell_core::compose::Inline::Strong(inner) => row.child(
+                div()
+                    .font_weight(FontWeight(700.))
+                    .child(render_inlines(inner, colors)),
+            ),
+            fell_core::compose::Inline::Em(inner) => {
+                row.child(div().italic().child(render_inlines(inner, colors)))
             }
-            fell_core::compose::Inline::Code(text) => out.push_str(text),
-            fell_core::compose::Inline::Link { text, .. } => out.push_str(text),
-            fell_core::compose::Inline::Image { alt, .. } => out.push_str(alt),
-        }
+            fell_core::compose::Inline::Code(text) => {
+                row.child(div().font_family("monospace").child(text.clone()))
+            }
+            fell_core::compose::Inline::Link { text, .. } => {
+                row.child(div().text_color(rgb(colors.accent)).child(text.clone()))
+            }
+            fell_core::compose::Inline::Image { alt, .. } => row.child(div().child(alt.clone())),
+        };
     }
-    out
+    row
 }
 
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
