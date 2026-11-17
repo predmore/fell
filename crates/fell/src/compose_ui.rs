@@ -327,6 +327,9 @@ impl ComposeView {
         }) else {
             return;
         };
+        if folder != self.folder {
+            release_previews(&self.folder);
+        }
         self.folder = folder;
         self.draft_id = id.into();
         self.editor = Editor::from_body(&snap.body);
@@ -1135,6 +1138,12 @@ impl ComposeView {
     }
 }
 
+impl Drop for ComposeView {
+    fn drop(&mut self) {
+        release_previews(&self.folder);
+    }
+}
+
 pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
@@ -1442,7 +1451,10 @@ fn raw_line(
             continue;
         }
         let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
-        if span.kind == StyleKind::Marker && matches!(slice, "- " | "-" | "* " | "*") {
+        if span.start == 0
+            && span.kind == StyleKind::Marker
+            && matches!(slice, "- " | "-" | "* " | "*")
+        {
             row = row.child(
                 div()
                     .text_size(px(16.))
@@ -1677,11 +1689,12 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
         return missing_image(block, alt, colors);
     };
     block.child(
-        img(preview.image)
-            .w(px(preview.width))
-            .h(px(preview.height))
-            .object_fit(gpui::ObjectFit::Contain)
-            .mb(px(16.)),
+        div().pb(px(16.)).child(
+            img(preview.image)
+                .w(px(preview.width))
+                .h(px(preview.height))
+                .object_fit(gpui::ObjectFit::Contain),
+        ),
     )
 }
 
@@ -1700,77 +1713,203 @@ struct Preview {
     height: f32,
 }
 
-struct StoredPreview {
-    stamp: SystemTime,
-    len: u64,
-    image: Arc<RenderImage>,
-    width: f32,
-    height: f32,
+const MAX_FILE_BYTES: u64 = 4_000_000;
+const MAX_DECODE_EDGE: u32 = 8_192;
+const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
+const DISPLAY_WIDTH: u32 = 420;
+const MAX_CACHE_ENTRIES: usize = 8;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+enum Slot {
+    Ready {
+        stamp: SystemTime,
+        len: u64,
+        used: u64,
+        bytes: usize,
+        image: Arc<RenderImage>,
+        width: f32,
+        height: f32,
+    },
+    Rejected {
+        stamp: SystemTime,
+        len: u64,
+        used: u64,
+    },
 }
 
-fn preview_cache() -> &'static Mutex<HashMap<PathBuf, StoredPreview>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, StoredPreview>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+impl Slot {
+    fn used(&self) -> u64 {
+        match self {
+            Slot::Ready { used, .. } | Slot::Rejected { used, .. } => *used,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Slot::Ready { bytes, .. } => *bytes,
+            Slot::Rejected { .. } => 0,
+        }
+    }
+}
+
+struct PreviewCache {
+    entries: HashMap<PathBuf, Slot>,
+    clock: u64,
+}
+
+fn preview_cache() -> &'static Mutex<PreviewCache> {
+    static CACHE: std::sync::OnceLock<Mutex<PreviewCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(PreviewCache {
+            entries: HashMap::new(),
+            clock: 0,
+        })
+    })
+}
+
+/// Drops previews for a draft that is no longer open.
+fn release_previews(folder: &Path) {
+    let Ok(mut cache) = preview_cache().lock() else {
+        return;
+    };
+    cache.entries.retain(|path, _| !path.starts_with(folder));
 }
 
 fn preview_file(path: &Path) -> Option<Preview> {
+    let mut cache = preview_cache().lock().ok()?;
+    cache.entries.retain(|cached, _| cached.is_file());
     let meta = std::fs::metadata(path).ok()?;
     let stamp = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let len = meta.len();
-    let mut cache = preview_cache().lock().ok()?;
-    if let Some(hit) = cache.get(path)
-        && hit.stamp == stamp
-        && hit.len == len
-    {
-        return Some(Preview {
-            image: Arc::clone(&hit.image),
-            width: hit.width,
-            height: hit.height,
-        });
+    if !meta.is_file() || len > MAX_FILE_BYTES {
+        remember(&mut cache, path, stamp, len, None);
+        return None;
     }
+    if let Some(hit) = cache.entries.get(path) {
+        let same = match hit {
+            Slot::Ready {
+                stamp: cached_stamp,
+                len: cached_len,
+                ..
+            }
+            | Slot::Rejected {
+                stamp: cached_stamp,
+                len: cached_len,
+                ..
+            } => *cached_stamp == stamp && *cached_len == len,
+        };
+        if same {
+            return match hit {
+                Slot::Ready {
+                    image,
+                    width,
+                    height,
+                    ..
+                } => Some(Preview {
+                    image: Arc::clone(image),
+                    width: *width,
+                    height: *height,
+                }),
+                Slot::Rejected { .. } => None,
+            };
+        }
+    }
+    drop(cache);
     let bytes = std::fs::read(path).ok()?;
-    let preview = preview_bytes(&bytes)?;
-    cache.insert(
-        path.to_path_buf(),
-        StoredPreview {
+    let preview = preview_bytes(&bytes);
+    let mut cache = preview_cache().lock().ok()?;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file()
+        || meta.len() != len
+        || meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) != stamp
+    {
+        return preview;
+    }
+    remember(&mut cache, path, stamp, len, preview.as_ref());
+    preview
+}
+
+fn remember(
+    cache: &mut PreviewCache,
+    path: &Path,
+    stamp: SystemTime,
+    len: u64,
+    preview: Option<&Preview>,
+) {
+    cache.clock = cache.clock.wrapping_add(1);
+    let used = cache.clock;
+    let slot = if let Some(preview) = preview {
+        let bytes = (preview.width * preview.height * 4.) as usize;
+        if bytes > MAX_CACHE_BYTES {
+            cache.entries.remove(path);
+            return;
+        }
+        Slot::Ready {
             stamp,
             len,
+            used,
+            bytes,
             image: Arc::clone(&preview.image),
             width: preview.width,
             height: preview.height,
-        },
-    );
-    Some(preview)
+        }
+    } else {
+        Slot::Rejected { stamp, len, used }
+    };
+    cache.entries.insert(path.to_path_buf(), slot);
+    while cache.entries.len() > MAX_CACHE_ENTRIES
+        || cache.entries.values().map(Slot::bytes).sum::<usize>() > MAX_CACHE_BYTES
+    {
+        let Some(oldest) = cache
+            .entries
+            .iter()
+            .filter(|(cached, _)| *cached != path)
+            .min_by_key(|(_, slot)| slot.used())
+            .map(|(cached, _)| cached.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&oldest);
+    }
 }
 
 fn preview_bytes(bytes: &[u8]) -> Option<Preview> {
-    const MAX_BYTES: usize = 4_000_000;
-    const MAX_EDGE: u32 = 2_048;
-    const MAX_WIDTH: f32 = 420.;
-    if bytes.is_empty() || bytes.len() > MAX_BYTES {
+    if bytes.is_empty() || u64::try_from(bytes.len()).ok()? > MAX_FILE_BYTES {
         return None;
     }
-    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .ok()?
-        .decode()
         .ok()?;
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE {
-        return None;
-    }
-    let scale = if width as f32 > MAX_WIDTH {
-        MAX_WIDTH / width as f32
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
+    let (width, height) = fitted(image.width(), image.height())?;
+    let image = if image.width() == width && image.height() == height {
+        image
     } else {
-        1.
+        image.resize(width, height, image::imageops::FilterType::Triangle)
     };
     Some(Preview {
-        image: render_rgba(rgba),
-        width: width as f32 * scale,
-        height: height as f32 * scale,
+        image: render_rgba(image.into_rgba8()),
+        width: width as f32,
+        height: height as f32,
     })
+}
+
+fn fitted(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if width <= DISPLAY_WIDTH {
+        return Some((width, height));
+    }
+    let height = u32::try_from(u64::from(height) * u64::from(DISPLAY_WIDTH) / u64::from(width))
+        .ok()?
+        .max(1);
+    Some((DISPLAY_WIDTH, height))
 }
 
 fn render_rgba(mut data: image::RgbaImage) -> Arc<RenderImage> {
@@ -2062,6 +2201,23 @@ mod tests {
     use super::cursor_line_covered;
     use fell_core::compose::markdown_to_doc;
 
+    fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_bytes = kind.to_vec();
+        crc_bytes.extend_from_slice(data);
+        let mut crc = 0xffff_ffffu32;
+        for byte in &crc_bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        out.extend((!crc).to_be_bytes());
+    }
+
     #[test]
     fn an_attached_png_decodes_to_its_own_pixels() {
         let preview = super::preview_bytes(&crate::png::chart_png()).expect("chart");
@@ -2073,6 +2229,102 @@ mod tests {
         let tall = image.get_pixel(90, 20).0;
         let short = image.get_pixel(20, 20).0;
         assert_ne!(tall, short);
+    }
+
+    #[test]
+    fn a_wide_photo_is_downscaled_instead_of_discarded() {
+        let image = image::RgbaImage::from_pixel(3000, 100, image::Rgba([9, 8, 7, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let preview = super::preview_bytes(&bytes).expect("wide");
+        assert!((preview.width - 420.).abs() < 0.1);
+        assert!((preview.height - 14.).abs() < 0.1);
+    }
+
+    #[test]
+    fn an_image_past_the_decoder_edge_is_refused() {
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::new();
+        ihdr.extend(20_000u32.to_be_bytes());
+        ihdr.extend(20_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png_chunk(&mut png, b"IHDR", &ihdr);
+        png_chunk(&mut png, b"IEND", &[]);
+        assert!(super::preview_bytes(&png).is_none());
+    }
+
+    #[test]
+    fn preview_cache_rejects_without_rereading_and_drops() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-preview-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(super::preview_file(&root).is_none());
+
+        let huge = root.join("huge.bin");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(super::MAX_FILE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(super::preview_file(&huge).is_none());
+        assert!(super::preview_file(&huge).is_none());
+
+        let bad = root.join("bad.png");
+        let chart = crate::png::chart_png();
+        std::fs::write(&bad, vec![0u8; chart.len()]).unwrap();
+        let stamp = std::fs::metadata(&bad).unwrap().modified().unwrap();
+        assert!(super::preview_file(&bad).is_none());
+        std::fs::write(&bad, &chart).unwrap();
+        std::fs::File::open(&bad)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert!(
+            super::preview_file(&bad).is_none(),
+            "a rejection sticks until size or mtime changes"
+        );
+        let later = stamp + std::time::Duration::from_secs(2);
+        std::fs::File::open(&bad)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(super::preview_file(&bad).is_some());
+
+        std::fs::remove_file(&bad).unwrap();
+        let other = root.join("other.png");
+        std::fs::write(&other, &chart).unwrap();
+        assert!(super::preview_file(&other).is_some());
+        let cache = super::preview_cache().lock().unwrap();
+        assert!(!cache.entries.contains_key(&bad));
+        drop(cache);
+
+        for index in 0..super::MAX_CACHE_ENTRIES + 3 {
+            let path = root.join(format!("n{index}.png"));
+            std::fs::write(&path, &chart).unwrap();
+            assert!(super::preview_file(&path).is_some());
+        }
+        let cache = super::preview_cache().lock().unwrap();
+        let kept = cache
+            .entries
+            .keys()
+            .filter(|path| path.starts_with(&root))
+            .count();
+        assert!(kept <= super::MAX_CACHE_ENTRIES);
+        drop(cache);
+
+        super::release_previews(&root);
+        let cache = super::preview_cache().lock().unwrap();
+        assert!(cache.entries.keys().all(|path| !path.starts_with(&root)));
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
