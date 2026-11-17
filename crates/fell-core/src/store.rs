@@ -284,9 +284,9 @@ impl Store {
         let mut store = Self::from_connection(conn)?;
         store.path = Some(path.to_path_buf());
         store.seal_private_files()?;
-        // Embeddings are filled off this thread. Open returns before a large
-        // mailbox is indexed.
-        store.indexer = Some(crate::embed::Indexer::spawn(path)?);
+        // Embeddings are filled off this thread, and only in one process.
+        // Open returns before a large mailbox is indexed.
+        store.indexer = crate::embed::Indexer::try_spawn(path)?;
         Ok(store)
     }
 
@@ -346,6 +346,13 @@ impl Store {
         if let Some(indexer) = &self.indexer {
             indexer.pause(paused);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn embedding_indexer_running(&self) -> bool {
+        self.indexer
+            .as_ref()
+            .is_some_and(crate::embed::Indexer::is_running)
     }
 
     pub(crate) fn seal_private_files(&self) -> Result<()> {

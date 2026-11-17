@@ -170,17 +170,27 @@ fn ensure_model_version_column(conn: &Connection) -> Result<()> {
 /// Background indexer for one mailbox file.
 ///
 /// Dropping it asks the thread to stop and waits for the current batch. The
-/// batch is a few messages, so this does not sit on a large mailbox.
+/// batch is a few messages, so this does not sit on a large mailbox. The
+/// sidecar lock is what stops a second process from starting another thread.
 pub(crate) struct Indexer {
     stop: Arc<AtomicBool>,
     /// Tests flip this so open can return before the thread writes.
     #[cfg_attr(not(test), allow(dead_code))]
     pause: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Held for the life of the thread. Dropped after the thread is joined.
+    _lock: Connection,
 }
 
 impl Indexer {
-    pub(crate) fn spawn(path: &Path) -> Result<Self> {
+    /// Start the indexer when this process can take the mailbox's embed lock.
+    ///
+    /// `Ok(None)` means another process already holds it. That open still
+    /// succeeds; it just does not scan or write embeddings.
+    pub(crate) fn try_spawn(path: &Path) -> Result<Option<Self>> {
+        let Some(lock) = try_embed_lock(path)? else {
+            return Ok(None);
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(indexer_starts_paused()));
         let stop_thread = Arc::clone(&stop);
@@ -190,11 +200,17 @@ impl Indexer {
             .name("fell-embeddings".into())
             .spawn(move || index_loop(path, stop_thread, pause_thread))
             .map_err(crate::Error::from)?;
-        Ok(Self {
+        Ok(Some(Self {
             stop,
             pause,
             thread: Some(thread),
-        })
+            _lock: lock,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        self.thread.is_some()
     }
 
     #[cfg(test)]
@@ -210,6 +226,91 @@ impl Drop for Indexer {
             let _ = thread.join();
         }
     }
+}
+
+fn try_embed_lock(db: &Path) -> Result<Option<Connection>> {
+    let path = embed_lock_path(db);
+    create_lock_file(&path)?;
+    let conn = Connection::open(&path)?;
+    // Fail at once when another process already holds the exclusive lock.
+    conn.busy_timeout(Duration::ZERO)?;
+    match conn.execute_batch("BEGIN EXCLUSIVE") {
+        Ok(()) => {
+            restrict_lock_mode(&path)?;
+            Ok(Some(conn))
+        }
+        Err(err) if sqlite_lock_held(&err) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn embed_lock_path(db: &Path) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(".embed.lock");
+    std::path::PathBuf::from(name)
+}
+
+fn sqlite_lock_held(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(code, _) => {
+            code.code == rusqlite::ErrorCode::DatabaseBusy
+                || code.code == rusqlite::ErrorCode::DatabaseLocked
+        }
+        _ => false,
+    }
+}
+
+fn create_lock_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = std::fs::File::create(path)
+                && err.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(err.into());
+            }
+        }
+    }
+    restrict_lock_mode(path)
+}
+
+fn restrict_lock_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+        let mut journal = path.as_os_str().to_os_string();
+        journal.push("-journal");
+        let journal = std::path::PathBuf::from(journal);
+        if journal.exists() {
+            let mut perms = std::fs::metadata(&journal)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&journal, perms)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn index_loop(path: std::path::PathBuf, stop: Arc<AtomicBool>, pause: Arc<AtomicBool>) {
@@ -917,6 +1018,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_second_open_does_not_start_another_indexer() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        let first = Store::open(&path).unwrap();
+        assert!(first.embedding_indexer_running());
+        let second = Store::open(&path).unwrap();
+        assert!(!second.embedding_indexer_running());
+        second.upsert_account(&account("a1")).unwrap();
+        second
+            .upsert_message(&message("a1", "m@x", "please pay the invoice"))
+            .unwrap();
+        assert_eq!(
+            second
+                .search(&AccountId("a1".into()), "invoice")
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        drop(first);
+        let third = Store::open(&path).unwrap();
+        assert!(third.embedding_indexer_running());
+        drop(second);
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
