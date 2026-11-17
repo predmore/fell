@@ -45,7 +45,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0x1c1b19,
             fg: 0xf4f0ea,
             dim: 0xe7e2db,
-            marker: 0xc8c2ba,
+            marker: 0xe8e4dc,
             accent: 0x7aa2f7,
             caret: 0xffffff,
             code: 0x3a3834,
@@ -59,7 +59,7 @@ fn palette(kind: ThemeKind) -> Palette {
             bg: 0xf7f5f2,
             fg: 0x1c1b19,
             dim: 0x3a3632,
-            marker: 0x4a453f,
+            marker: 0x2c2926,
             accent: 0x1d4f91,
             caret: 0x111111,
             code: 0xe4ddd4,
@@ -1042,7 +1042,7 @@ fn field_row(
             .border_color(rgb(if active { colors.accent } else { bg }))
             .child(
                 div()
-                    .w(px(64.))
+                    .w(px(88.))
                     .text_size(px(16.))
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
@@ -1071,7 +1071,7 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
         .border_color(rgb(if active { colors.accent } else { colors.panel }))
         .child(
             div()
-                .w(px(64.))
+                .w(px(88.))
                 .text_size(px(16.))
                 .text_color(rgb(colors.fg))
                 .child("Subject"),
@@ -1090,10 +1090,16 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .filter(|value| !value.is_empty())
         .unwrap_or("new message");
     div()
+        .flex()
+        .gap_3()
+        .px_1()
+        .py_1()
+        .border_l(px(2.))
+        .border_color(rgb(colors.panel))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
-        .px_1()
-        .child(format!("Reply to  {reply}"))
+        .child(div().w(px(88.)).child("Reply to"))
+        .child(reply.to_string())
 }
 
 fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1252,7 +1258,7 @@ fn raw_line(
             _ => colors.fg,
         };
         let weight = match span.kind {
-            StyleKind::Strong => FontWeight(700.),
+            StyleKind::Strong | StyleKind::Marker => FontWeight(700.),
             _ => FontWeight(400.),
         };
         if let Some(cursor_byte) = cursor_byte
@@ -1293,13 +1299,11 @@ fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
     let trimmed = line.trim_start();
     let indent = " ".repeat(line.len() - trimmed.len());
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-        return styled_span(
-            &format!("{indent}• "),
-            colors.accent,
-            FontWeight(400.),
-            StyleKind::Plain,
-            colors.code,
-        );
+        return div()
+            .text_size(px(18.))
+            .font_weight(FontWeight(700.))
+            .text_color(rgb(colors.accent))
+            .child(format!("{indent}● "));
     }
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 && trimmed.as_bytes().get(digits) == Some(&b'.') {
@@ -1396,13 +1400,19 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                 let marker = if *ordered {
                     format!("{}.", index + 1)
                 } else {
-                    "•".into()
+                    "●".into()
                 };
                 list = list.child(
                     div()
                         .flex()
                         .gap_2()
-                        .child(div().text_color(rgb(colors.accent)).child(marker))
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .font_weight(FontWeight(700.))
+                                .text_color(rgb(colors.accent))
+                                .child(marker),
+                        )
                         .child(render_inlines(item, colors)),
                 );
             }
@@ -1470,7 +1480,7 @@ fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Di
             img(path)
                 .w(px(240.))
                 .h(px(105.))
-                .object_fit(ObjectFit::Fill)
+                .object_fit(ObjectFit::None)
                 .flex_shrink_0(),
         );
     }
