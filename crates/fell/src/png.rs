@@ -36,13 +36,15 @@ pub fn chart_png() -> Vec<u8> {
     png
 }
 
+/// Bar heights above the 12px floor. The tallest stops 12px under the top
+/// edge, so the chart has the same margin above its bars as below them.
 fn bars_height(left: u32) -> u32 {
     match left {
-        18 => 36,
-        48 => 58,
-        78 => 88,
-        108 => 42,
-        _ => 96,
+        18 => 30,
+        48 => 49,
+        78 => 74,
+        108 => 35,
+        _ => 81,
     }
 }
 
