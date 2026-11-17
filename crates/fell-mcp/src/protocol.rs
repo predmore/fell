@@ -291,7 +291,7 @@ impl Session {
             .map(|tool| {
                 json!({
                     "name": tool.name,
-                    "description": tool.description,
+                    "description": format!("{} {}", tool.description, crate::untrusted::UNTRUSTED_NOTE),
                     "inputSchema": tool.schema,
                 })
             })
@@ -536,6 +536,27 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn every_tool_description_says_mail_is_untrusted() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, true, true), "bot");
+        init(&mut session);
+        let response = rpc(
+            &mut session,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+        );
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() >= 8, "{tools:?}");
+        for tool in tools {
+            let description = tool["description"].as_str().unwrap();
+            assert!(
+                description.contains(crate::untrusted::UNTRUSTED_NOTE),
+                "{}",
+                tool["name"]
+            );
+            assert!(!tool["name"].as_str().unwrap().contains("send"));
+        }
     }
 
     #[test]

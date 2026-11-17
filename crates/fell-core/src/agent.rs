@@ -583,10 +583,14 @@ fn normalize_addrs(addrs: &[String], field: &str, required: bool) -> Result<Vec<
         if addr.is_empty() || addr.chars().any(|c| c.is_control() || c == '\u{1e}') {
             return Err(Error::Invalid(format!("{field} has an invalid address")));
         }
-        if addr.contains(',') {
-            return Err(Error::Invalid(format!(
-                "{field} has more than one address; pass each address separately"
-            )));
+        if let Err(kind) = address_list_comma(addr) {
+            let message = match kind {
+                CommaInAddress::Separates => {
+                    format!("{field} has more than one address; pass each address separately")
+                }
+                CommaInAddress::UnclosedQuote => format!("{field} has an invalid address"),
+            };
+            return Err(Error::Invalid(message));
         }
         if !addr.contains('@') {
             return Err(Error::Invalid(format!("{field} address needs an @")));
@@ -599,6 +603,35 @@ fn normalize_addrs(addrs: &[String], field: &str, required: bool) -> Result<Vec<
         )));
     }
     Ok(out)
+}
+
+enum CommaInAddress {
+    Separates,
+    UnclosedQuote,
+}
+
+/// A comma inside a quoted display name is part of that one mailbox.
+/// A comma outside quotes separates addresses. An unclosed quote is invalid.
+fn address_list_comma(addr: &str) -> std::result::Result<(), CommaInAddress> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in addr.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => return Err(CommaInAddress::Separates),
+            _ => {}
+        }
+    }
+    if quoted || escaped {
+        Err(CommaInAddress::UnclosedQuote)
+    } else {
+        Ok(())
+    }
 }
 
 fn subject_ok(subject: &str) -> Result<()> {
@@ -1247,6 +1280,28 @@ mod tests {
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("more than one address"), "{message}");
+    }
+
+    #[test]
+    fn quoted_display_name_may_contain_a_comma() {
+        let (store, account_id, _) = seeded();
+        let recipient = "\"Doe, Jane\" <j@x.com>";
+        let saved = store
+            .create_review_draft(
+                ReviewDraftInput {
+                    account_id,
+                    to: vec![recipient.into()],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "s".into(),
+                    body: "b".into(),
+                    in_reply_to: None,
+                    thread_id: None,
+                },
+                "agent:bot",
+            )
+            .unwrap();
+        assert_eq!(saved.draft.to, vec![recipient.to_string()]);
     }
 
     #[test]
