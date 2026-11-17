@@ -119,6 +119,8 @@ pub struct DraftSession {
     /// Texts queued on `writer` that `draft.md` may still show.
     own_writes: OwnWrites,
     pending: Option<String>,
+    /// [`Self::disk_generation`] when `pending` was read.
+    pending_seen: u64,
     pending_delete: bool,
     pending_since: u64,
     open: bool,
@@ -165,6 +167,7 @@ impl DraftSession {
             writer: None,
             own_writes: OwnWrites::default(),
             pending: None,
+            pending_seen: 0,
             pending_delete: false,
             pending_since: 0,
             open: false,
@@ -487,19 +490,35 @@ impl DraftSession {
         diff
     }
 
+    /// What `draft.md` holds now. Call [`Self::push_disk_seen`] instead when
+    /// the file was read before taking the session lock.
     pub fn push_disk(&mut self, content: Option<String>, now_ms: u64) {
+        let since = self.disk_generation();
+        self.push_disk_seen(content, since, now_ms);
+    }
+
+    /// The newest save on disk. A watcher samples this before reading
+    /// `draft.md`, so a read that lands after a later save still knows the
+    /// text it saw was Fell's own.
+    pub fn disk_generation(&self) -> u64 {
+        self.writer.as_ref().map_or(0, DraftWriter::written)
+    }
+
+    /// `content` was read after [`Self::disk_generation`] returned `since`.
+    pub fn push_disk_seen(&mut self, content: Option<String>, since: u64, now_ms: u64) {
         match content {
             None => {
                 self.pending = None;
                 self.pending_delete = true;
                 self.pending_since = now_ms;
             }
-            Some(text) if self.is_own_write(&text) => {
+            Some(text) if self.is_own_write(&text, since) => {
                 self.pending = None;
                 self.pending_delete = false;
             }
             Some(text) => {
                 self.pending = Some(text);
+                self.pending_seen = since;
                 self.pending_delete = false;
                 self.pending_since = now_ms;
             }
@@ -523,7 +542,7 @@ impl DraftSession {
         let Some(text) = self.pending.take() else {
             return false;
         };
-        if self.is_own_write(&text) {
+        if self.is_own_write(&text, self.pending_seen) {
             return false;
         }
         self.merge_disk(&text);
@@ -591,18 +610,14 @@ impl DraftSession {
         self.writer.as_ref().map(DraftWriter::waiter)
     }
 
-    /// `text` is what Fell itself last wrote, or a save still on its way.
-    fn is_own_write(&mut self, text: &str) -> bool {
+    /// `text` is Fell's own: the last text it queued, or, with a writer, a
+    /// save numbered `since` or later (a read made when save `since` was the
+    /// newest on disk shows that save or a newer one).
+    fn is_own_write(&self, text: &str, since: u64) -> bool {
         if text == self.last_written {
             return true;
         }
-        match &self.writer {
-            Some(writer) => {
-                let completed = writer.completed();
-                self.own_writes.contains(completed, text)
-            }
-            None => false,
-        }
+        self.writer.is_some() && self.own_writes.contains(since, text)
     }
 
     fn mailbox_save(&self) -> MailboxSave {
@@ -1627,12 +1642,12 @@ mod tests {
         let readonly = fs::write(folder.join("probe"), "x").is_err();
         session.set_body_from_user("changed\n".into());
         assert!(session.flush().is_ok());
-        session.save_waiter().unwrap().wait();
+        let _ = session.save_waiter().unwrap().wait();
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
         session.set_body_from_user("again\n".into());
         session.flush().unwrap();
-        session.save_waiter().unwrap().wait();
+        session.save_waiter().unwrap().wait().unwrap();
         if readonly {
             assert!(
                 session
@@ -1657,7 +1672,7 @@ mod tests {
             session.set_body_from_user(format!("{step}\n"));
             session.flush().unwrap();
         }
-        session.save_waiter().unwrap().wait();
+        session.save_waiter().unwrap().wait().unwrap();
         let disk = fs::read_to_string(session.folder().join("draft.md")).unwrap();
         assert_eq!(disk, session.serialize());
         assert!(disk.ends_with("50\n"), "{disk}");
@@ -1678,10 +1693,104 @@ mod tests {
         session.push_disk(Some(older.clone()), 0);
         assert!(!session.poll_disk(10_000));
         assert!(session.snapshot().hunks.is_empty());
-        session.save_waiter().unwrap().wait();
+        session.save_waiter().unwrap().wait().unwrap();
         // Once the newer save is on disk, the older text from someone else
         // is a real edit again.
-        assert!(!session.is_own_write(&older));
+        assert!(!session.is_own_write(&older, session.disk_generation()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_save_does_not_merge_the_bytes_still_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        let folder = session.folder().to_path_buf();
+        session.set_body_from_user("beta\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        let on_disk = fs::read_to_string(folder.join("draft.md")).unwrap();
+        // The next save cannot replace draft.md.
+        let control = workspace::control_dir(&folder);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly = fs::write(folder.join("probe"), "x").is_err();
+        session.set_body_from_user("gamma\n".into());
+        session.flush().unwrap();
+        let saved = session.save_waiter().unwrap().wait();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        if readonly {
+            assert!(
+                saved.is_err(),
+                "the agent reply must not claim the save landed"
+            );
+        }
+        // The watcher reads what is really on disk: the earlier save.
+        session.push_disk(Some(on_disk), 0);
+        assert!(!session.poll_disk(10_000));
+        assert!(session.snapshot().hunks.is_empty());
+        assert!(session.body().starts_with("gamma"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_read_made_before_a_later_save_is_still_fells_own() {
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        session.set_body_from_user("beta\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        // The watcher samples, reads draft.md, then waits for the lock...
+        let since = session.disk_generation();
+        let read = fs::read_to_string(session.folder().join("draft.md")).unwrap();
+        // ...while the editor saves again.
+        session.set_body_from_user("gamma\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        session.push_disk_seen(Some(read), since, 0);
+        assert!(!session.poll_disk(10_000));
+        assert!(session.snapshot().hunks.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropping_a_draft_writes_its_queued_save_first() {
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        let folder = session.folder().to_path_buf();
+        for step in 0..20 {
+            session.set_body_from_user(format!("step {step}\n"));
+            session.flush().unwrap();
+        }
+        let expected = session.serialize();
+        drop(session);
+        assert_eq!(
+            fs::read_to_string(folder.join("draft.md")).unwrap(),
+            expected
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settling_the_hub_waits_for_every_draft() {
+        let (root, session) = temp_session("alpha\n");
+        let folder = session.folder().to_path_buf();
+        let id = session.id().to_string();
+        let hub = super::super::DraftHub::new();
+        hub.insert(session);
+        let expected = hub
+            .with_session(&id, |session| {
+                session.set_body_from_user("on quit\n".into());
+                session.flush().unwrap();
+                session.serialize()
+            })
+            .unwrap();
+        hub.settle_all();
+        assert_eq!(
+            fs::read_to_string(folder.join("draft.md")).unwrap(),
+            expected
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -527,10 +527,13 @@ impl ComposeView {
         };
         self.sending = true;
         self.status = "Sending…".into();
+        let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { prepared.transmit() })
+                .spawn(async move {
+                    prepared.transmit(|| hub.with_session(&id, |session| session.revision()))
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.sending = false;
@@ -1181,6 +1184,8 @@ pub fn send_from_editor(
 /// draft lock is held, so what was on screen is what goes out.
 pub struct PreparedSend {
     account: fell_core::AccountId,
+    /// The draft revision these checks passed on.
+    revision: u64,
     outgoing: fell_core::compose::Outgoing,
     files: Vec<fell_core::SubmittedFile>,
 }
@@ -1201,6 +1206,7 @@ pub fn prepare_from_editor(
         .collect();
     Ok(PreparedSend {
         account: session.account_id().clone(),
+        revision: session.revision(),
         outgoing,
         files,
     })
@@ -1208,15 +1214,32 @@ pub fn prepare_from_editor(
 
 impl PreparedSend {
     /// Submit and confirm through the account's backend. Blocks on SMTP.
-    pub fn transmit(self) -> Result<fell_core::SentMessage, String> {
+    /// `revision_now` reads the draft's revision right before the message is
+    /// handed to SMTP; if anything changed since the checks, nothing is sent.
+    pub fn transmit(
+        self,
+        revision_now: impl FnOnce() -> Option<u64>,
+    ) -> Result<fell_core::SentMessage, String> {
         let backend = fell_core::backend_for(&self.account);
-        self.transmit_with(backend.as_ref())
+        self.transmit_checked(backend.as_ref(), revision_now)
     }
 
     fn transmit_with(self, backend: &dyn MailBackend) -> Result<fell_core::SentMessage, String> {
+        let revision = self.revision;
+        self.transmit_checked(backend, || Some(revision))
+    }
+
+    fn transmit_checked(
+        self,
+        backend: &dyn MailBackend,
+        revision_now: impl FnOnce() -> Option<u64>,
+    ) -> Result<fell_core::SentMessage, String> {
         let pending = backend
             .submit_composed(self.outgoing.draft, self.outgoing.mime, self.files)
             .map_err(|err| err.to_string())?;
+        if revision_now() != Some(self.revision) {
+            return Err("the draft changed while sending; nothing was sent".into());
+        }
         let confirm = confirmation_from_ui(&pending);
         backend
             .confirm_send(pending, confirm)

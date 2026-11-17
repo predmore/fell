@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use super::persist::{self, StoredCompose};
 use super::workspace;
@@ -31,18 +32,15 @@ pub(crate) struct MailboxSave {
     pub draft: StoredCompose,
 }
 
-/// State a run keeps between saves: the attachment stamp last copied into
-/// the mailbox and, on the writer thread, the open mailbox.
+/// The attachment stamp last copied into the mailbox, kept between saves.
 #[derive(Default)]
 pub(crate) struct SaveCache {
     attachment_stamp: Vec<(String, u64, u128)>,
-    /// Kept open on the writer thread. A synchronous save opens and drops it.
-    store: Option<(PathBuf, crate::Store)>,
-    keep_store: bool,
 }
 
 impl SaveJob {
-    /// Write the draft file, the hunk file, then the mailbox row.
+    /// Write the draft file, the hunk file, then the mailbox row. `Err`
+    /// means `draft.md` was not replaced.
     pub(crate) fn run(self, cache: &mut SaveCache) -> Result<(), String> {
         workspace::write_draft_file(&self.folder, &self.text)?;
         let control = workspace::control_dir(&self.folder);
@@ -55,6 +53,9 @@ impl SaveJob {
     }
 }
 
+/// Open the mailbox for this one save. Holding a connection open would keep
+/// sync's WAL checkpoint from resetting the log and would pin a replaced
+/// mailbox file.
 fn persist_mailbox(folder: &Path, mailbox: MailboxSave, cache: &mut SaveCache) {
     let path = mailbox
         .store_path
@@ -62,18 +63,7 @@ fn persist_mailbox(folder: &Path, mailbox: MailboxSave, cache: &mut SaveCache) {
     let Some(path) = path.filter(|path| path.is_file()) else {
         return;
     };
-    let reuse = cache
-        .store
-        .as_ref()
-        .is_some_and(|(open, _)| open.as_path() == path.as_path());
-    if !reuse {
-        cache.store = None;
-        let Ok(store) = crate::Store::open(&path) else {
-            return;
-        };
-        cache.store = Some((path, store));
-    }
-    let Some((_, store)) = cache.store.as_ref() else {
+    let Ok(store) = crate::Store::open(&path) else {
         return;
     };
     let draft = mailbox.draft;
@@ -89,16 +79,16 @@ fn persist_mailbox(folder: &Path, mailbox: MailboxSave, cache: &mut SaveCache) {
             cache.attachment_stamp = stamp;
         }
     }
-    if !cache.keep_store {
-        cache.store = None;
-    }
 }
 
 struct Progress {
     /// Saves handed to the thread so far.
     submitted: u64,
-    /// The newest save the thread has finished, written or skipped.
+    /// The newest save the thread has finished with, written or not.
     completed: u64,
+    /// The newest save whose `draft.md` rename succeeded. The file shows
+    /// that save or a newer one.
+    written: u64,
     /// The newest failed write, until the session reports it.
     error: Option<String>,
 }
@@ -108,11 +98,12 @@ struct Shared {
     done: Condvar,
 }
 
-/// The writer thread for one live draft. Dropping it lets the thread finish
-/// the queued save and exit; drop does not wait.
+/// The writer thread for one live draft. Dropping it waits for the queued
+/// save, so a closed draft or a second copy of it never writes late.
 pub(crate) struct DraftWriter {
-    jobs: Sender<(u64, SaveJob)>,
+    jobs: Option<Sender<(u64, SaveJob)>>,
     shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl DraftWriter {
@@ -122,24 +113,34 @@ impl DraftWriter {
             progress: Mutex::new(Progress {
                 submitted: 0,
                 completed: 0,
+                written: 0,
                 error: None,
             }),
             done: Condvar::new(),
         });
         let thread_shared = Arc::clone(&shared);
         // A failed spawn drops `rx`, so saves report an error instead of hanging.
-        let _ = std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("fell-draft-writer".into())
-            .spawn(move || write_loop(rx, thread_shared));
-        Self { jobs, shared }
+            .spawn(move || write_loop(rx, thread_shared))
+            .ok();
+        Self {
+            jobs: Some(jobs),
+            shared,
+            thread,
+        }
     }
 
-    /// Queue a save. Returns its number for [`Self::completed`].
+    /// Queue a save. Returns its number.
     pub(crate) fn submit(&self, job: SaveJob) -> u64 {
         let mut progress = self.shared.progress.lock().expect("draft writer");
         progress.submitted += 1;
         let number = progress.submitted;
-        if self.jobs.send((number, job)).is_err() {
+        let sent = self
+            .jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send((number, job)).is_ok());
+        if !sent {
             progress.completed = number;
             progress.error = Some("the draft writer stopped".into());
             self.shared.done.notify_all();
@@ -147,9 +148,9 @@ impl DraftWriter {
         number
     }
 
-    /// The newest save the thread has finished.
-    pub(crate) fn completed(&self) -> u64 {
-        self.shared.progress.lock().expect("draft writer").completed
+    /// The newest save whose `draft.md` is on disk.
+    pub(crate) fn written(&self) -> u64 {
+        self.shared.progress.lock().expect("draft writer").written
     }
 
     pub(crate) fn take_error(&self) -> Option<String> {
@@ -171,26 +172,41 @@ impl DraftWriter {
     }
 }
 
-/// Waits until every save queued before it was made is on disk.
+impl Drop for DraftWriter {
+    fn drop(&mut self) {
+        // Closing the channel ends the loop after the queued save.
+        self.jobs.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Waits until every save queued before it was made is finished.
 pub struct SaveWaiter {
     shared: Arc<Shared>,
     until: u64,
 }
 
 impl SaveWaiter {
-    pub fn wait(self) {
+    /// `Err` when the newest of those saves did not reach `draft.md`.
+    pub fn wait(self) -> Result<(), String> {
         let mut progress = self.shared.progress.lock().expect("draft writer");
         while progress.completed < self.until {
             progress = self.shared.done.wait(progress).expect("draft writer");
         }
+        if progress.written >= self.until {
+            return Ok(());
+        }
+        Err(progress
+            .error
+            .clone()
+            .unwrap_or_else(|| "the draft was not saved".into()))
     }
 }
 
 fn write_loop(rx: Receiver<(u64, SaveJob)>, shared: Arc<Shared>) {
-    let mut cache = SaveCache {
-        keep_store: true,
-        ..SaveCache::default()
-    };
+    let mut cache = SaveCache::default();
     while let Ok(mut next) = rx.recv() {
         // Only the newest queued save is worth writing.
         while let Ok(newer) = rx.try_recv() {
@@ -200,31 +216,39 @@ fn write_loop(rx: Receiver<(u64, SaveJob)>, shared: Arc<Shared>) {
         let result = job.run(&mut cache);
         let mut progress = shared.progress.lock().expect("draft writer");
         progress.completed = progress.completed.max(number);
-        if let Err(err) = result {
-            progress.error = Some(err);
+        match result {
+            Ok(()) => progress.written = progress.written.max(number),
+            Err(err) => progress.error = Some(err),
         }
         shared.done.notify_all();
     }
 }
 
-/// Texts Fell asked to write that the file may still show. The watcher
-/// ignores these as Fell's own writes. Once save `n` is finished, the file
-/// shows save `n` or a later one, so older texts are dropped.
+/// Texts Fell queued for `draft.md`, numbered. The watcher ignores a file
+/// that shows one of them as Fell's own write.
+///
+/// A read of `draft.md` that began when save `since` was the newest one on
+/// disk shows save `since` or a newer one, never an older one. Failed saves
+/// leave the watermark where it was, so the text still on disk stays known.
 #[derive(Default)]
 pub(crate) struct OwnWrites {
     texts: VecDeque<(u64, String)>,
 }
 
+/// Saves remembered. Far more than can be in flight between two reads.
+const OWN_WRITES_KEPT: usize = 64;
+
 impl OwnWrites {
     pub(crate) fn note(&mut self, number: u64, text: String) {
         self.texts.push_back((number, text));
-    }
-
-    pub(crate) fn contains(&mut self, completed: u64, text: &str) -> bool {
-        // Keep the newest finished save: the file still shows it.
-        while self.texts.len() > 1 && self.texts.get(1).is_some_and(|(n, _)| *n <= completed) {
+        while self.texts.len() > OWN_WRITES_KEPT {
             self.texts.pop_front();
         }
-        self.texts.iter().any(|(_, own)| own == text)
+    }
+
+    pub(crate) fn contains(&self, since: u64, text: &str) -> bool {
+        self.texts
+            .iter()
+            .any(|(number, own)| *number >= since && own == text)
     }
 }

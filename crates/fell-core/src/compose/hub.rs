@@ -77,6 +77,21 @@ impl DraftHub {
         Some(value)
     }
 
+    /// Wait until every live draft's queued save is on disk. The app calls
+    /// this when it quits.
+    pub fn settle_all(&self) {
+        let waiters: Vec<super::SaveWaiter> = self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .values()
+            .filter_map(DraftSession::save_waiter)
+            .collect();
+        for waiter in waiters {
+            let _ = waiter.wait();
+        }
+    }
+
     /// The compose window calls this after it is showing `id`.
     pub fn note_shown(&self, id: &str) {
         let mut shown = self.shown.lock().expect("shown");
@@ -300,8 +315,14 @@ impl DraftHub {
         // An agent reads draft.md right after a tool returns, so the reply
         // waits for the save. The session lock is already released, so the
         // editor keeps painting meanwhile.
-        if let Some(saved) = saved {
-            saved.wait();
+        if let Some(saved) = saved
+            && let Err(err) = saved.wait()
+            && let Some(object) = reply.as_object_mut()
+        {
+            // The edit is in the live draft and on screen; only the file
+            // write failed, so the agent should not repeat the edit.
+            object.insert("saved".into(), json!(false));
+            object.insert("save_error".into(), json!(err));
         }
         if let Some(id) = reveal {
             let shown = self.wait_shown(&id);
