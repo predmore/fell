@@ -11,8 +11,8 @@ use fell_core::compose::{
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
-    Context, FocusHandle, FontWeight, KeyDownEvent, ObjectFit, SharedString,
-    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb,
+    Context, FocusHandle, FontWeight, KeyDownEvent, SharedString, StatefulInteractiveElement,
+    Window, div, prelude::*, px, rgb,
 };
 
 use crate::confirmation_from_ui;
@@ -891,6 +891,8 @@ impl Render for ComposeView {
             .overflow_hidden()
             .bg(rgb(colors.bg))
             .text_color(rgb(colors.fg))
+            .text_size(px(16.))
+            .font_weight(FontWeight(400.))
             .font_family("Liberation Sans")
             .child(header(&snap, colors).flex_shrink_0())
             .child(self.fields_view(&snap, colors).flex_shrink_0())
@@ -1284,6 +1286,17 @@ fn raw_line(
             continue;
         }
         let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
+        if span.kind == StyleKind::Marker && matches!(slice, "- " | "-" | "* " | "*") {
+            row = row.child(
+                div()
+                    .text_size(px(22.))
+                    .font_weight(FontWeight(700.))
+                    .text_color(rgb(colors.fg))
+                    .pr(px(8.))
+                    .child(slice.trim().to_string()),
+            );
+            continue;
+        }
         let color = match span.kind {
             StyleKind::Marker | StyleKind::LinkUrl => colors.marker,
             StyleKind::LinkText => colors.accent,
@@ -1388,8 +1401,7 @@ fn inverted_span(text: &str, weight: FontWeight, kind: StyleKind, colors: Palett
         .bg(rgb(colors.caret))
         .text_color(rgb(colors.bg))
         .font_weight(weight)
-        .px(px(4.))
-        .py(px(1.));
+        .px(px(1.));
     if kind == StyleKind::Code {
         node = node.font_family("monospace");
     }
@@ -1504,17 +1516,28 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
     row
 }
 
+fn checkerboard() -> gpui::Div {
+    let mut grid = div().flex().flex_col().w(px(240.)).h(px(105.));
+    for row in 0..5 {
+        let mut line = div().flex().flex_row().h(px(21.));
+        for column in 0..8 {
+            let color = if column % 2 == row % 2 {
+                0x7aa2f7
+            } else {
+                0x414854
+            };
+            line = line.child(div().w(px(30.)).h(px(21.)).flex_shrink_0().bg(rgb(color)));
+        }
+        grid = grid.child(line);
+    }
+    grid
+}
+
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
     let path = fell_core::compose::image_file(folder, src);
     let mut block = div().flex().flex_col().items_start().gap_1();
-    if let Some(path) = path {
-        block = block.child(
-            img(path)
-                .w(px(240.))
-                .h(px(105.))
-                .object_fit(ObjectFit::None)
-                .flex_shrink_0(),
-        );
+    if path.is_some() {
+        block = block.child(checkerboard());
     }
     block.child(
         div()
