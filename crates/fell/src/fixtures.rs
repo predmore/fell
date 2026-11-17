@@ -88,7 +88,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
             name: "Jon",
             email: "jon@fell.test",
             subject: "Re: Sent copies in the thread",
-            body: "Yes. Keep the list to one folder, and leave m alone until we can move.\n\nThe Sent copy stays in Sent.\n\n-- \nJon\n\n> Can we keep Sent in the thread?\n> I don't want a second sidebar for it.\n>> The list stays one folder wide.\n> > Your reply in Sent still shows up here.",
+            body: "Yes. m moves the copies in this folder. The Sent copy stays in Sent.\n\n-- \nJon\n\n> Can we keep Sent in the thread?\n> I don't want a second sidebar for it.\n>> The list stays one folder wide.\n> > Your reply in Sent still shows up here.",
             ago: 12 * 60,
             unread: true,
             folders: &["INBOX"],

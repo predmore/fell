@@ -110,6 +110,7 @@ pub struct LocalAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Archive,
+    Move,
     Label,
     Delete,
 }
@@ -118,6 +119,7 @@ impl ActionKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Archive => "archive",
+            Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
         }
@@ -126,6 +128,7 @@ impl ActionKind {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "archive" => Ok(Self::Archive),
+            "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
             _ => Err(Error::Action(format!("unknown action {raw}"))),
@@ -195,6 +198,32 @@ impl Store {
         })
     }
 
+    /// Move `from_folder` to `to_folder` on messages in the thread that have it.
+    ///
+    /// Other folders on those rows stay, so a Sent copy is left in Sent when
+    /// the caller moves the copy that is on screen. The call is one undo entry.
+    pub fn move_thread(
+        &self,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        from_folder: &str,
+        to_folder: &str,
+    ) -> Result<LocalAction> {
+        let from_folder = canonical_folder(from_folder)?;
+        let to_folder = canonical_folder(to_folder)?;
+        if from_folder.eq_ignore_ascii_case(&to_folder) {
+            return Err(Error::Action("move needs a different folder".into()));
+        }
+        self.apply_thread(account_id, thread_id, ActionKind::Move, |rows| {
+            let plans = plan_relocate(rows, &from_folder, &to_folder);
+            if plans.is_empty() {
+                return Err(Error::Action(format!("no messages in {from_folder}")));
+            }
+            let summary = format!("moved {} from {from_folder} to {to_folder}", plans.len());
+            Ok((summary, plans))
+        })
+    }
+
     /// Add or remove `change` on every message in the thread that needs it.
     ///
     /// Folders are left as they are. A label that is already present, or
@@ -254,7 +283,7 @@ impl Store {
         })
     }
 
-    /// Restore the latest archive, label, or delete on this account.
+    /// Restore the latest archive, move, label, or delete on this account.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = self.connection().unchecked_transaction()?;
@@ -1278,6 +1307,71 @@ mod tests {
             "From B"
         );
         assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
+    }
+
+    #[test]
+    fn move_keeps_sent_and_undo_restores() {
+        let store = open(&[("a1", "a@x"), ("a2", "b@x")]);
+        let mut root = sample("a1", "root@x", "Hello", "root body");
+        root.folders = vec![FOLDER_INBOX.into(), FOLDER_SENT.into()];
+        root.headers.date_unix = 10;
+        let thread = store.upsert_message(&root).unwrap();
+        let mut reply = sample("a1", "reply@x", "Re: Hello", "reply body");
+        reply.folders = vec![FOLDER_SENT.into()];
+        reply.headers.date_unix = 20;
+        reply.headers.in_reply_to = Some(MessageId::new("root@x"));
+        reply.headers.references = vec![MessageId::new("root@x")];
+        assert_eq!(store.upsert_message(&reply).unwrap(), thread);
+
+        let other = sample("a2", "root@x", "From B", "other body");
+        let other_thread = store.upsert_message(&other).unwrap();
+
+        assert_eq!(
+            text(store.move_thread(&account("a1"), &thread, "INBOX", "inbox")),
+            "move needs a different folder"
+        );
+        assert_eq!(
+            text(store.move_thread(&account("a1"), &thread, "Drafts", "Archive")),
+            "no messages in Drafts"
+        );
+
+        let action = store
+            .move_thread(&account("a1"), &thread, "INBOX", "Projects")
+            .unwrap();
+        assert_eq!(action.kind, ActionKind::Move);
+        assert_eq!(action.summary, "moved 1 from INBOX to Projects");
+        let rows = messages(&store, "a1", &thread);
+        assert_eq!(rows[0].folders, vec![FOLDER_SENT, "Projects"]);
+        assert_eq!(rows[1].folders, vec![FOLDER_SENT]);
+        assert!(
+            store
+                .threads_in_folder(&account("a1"), FOLDER_INBOX)
+                .unwrap()
+                .iter()
+                .all(|summary| summary.thread_id != thread)
+        );
+        assert!(
+            store
+                .threads_in_folder(&account("a1"), "Projects")
+                .unwrap()
+                .iter()
+                .any(|summary| summary.thread_id == thread)
+        );
+        assert_eq!(
+            messages(&store, "a2", &other_thread)[0].folders,
+            vec![FOLDER_INBOX]
+        );
+
+        store.undo(&account("a1")).unwrap();
+        let rows = messages(&store, "a1", &thread);
+        assert_eq!(rows[0].folders, vec![FOLDER_INBOX, FOLDER_SENT]);
+        assert_eq!(rows[1].folders, vec![FOLDER_SENT]);
+        assert!(
+            store
+                .threads_in_folder(&account("a1"), "Projects")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
