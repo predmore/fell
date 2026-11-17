@@ -962,6 +962,13 @@ fn open_requested_or_canonical(
     requested: &Path,
     canonical: &Path,
 ) -> Result<(std::path::PathBuf, Connection)> {
+    // A non-empty canonical WAL already holds frames. Opening the symlink
+    // would checkpoint a different `-wal` and then recover the other one on top.
+    if canonical_wal_has_frames(canonical) {
+        return Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?));
+    }
+    // The canonical WAL is absent. Replay the alias WAL before any connection
+    // opens the canonical path.
     let conn = Connection::open(requested)?;
     conn.busy_timeout(Duration::ZERO)?;
     let (busy, log, checkpointed): (i64, i64, i64) =
@@ -975,6 +982,15 @@ fn open_requested_or_canonical(
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok((requested.to_path_buf(), conn))
     }
+}
+
+#[cfg(unix)]
+fn canonical_wal_has_frames(canonical: &Path) -> bool {
+    let mut wal = canonical.as_os_str().to_os_string();
+    wal.push("-wal");
+    std::fs::metadata(std::path::Path::new(&wal))
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
 }
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {

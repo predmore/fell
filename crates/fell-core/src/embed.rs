@@ -1420,10 +1420,11 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "from-alias");
-        // The reader blocks the checkpoint, so the store keeps the alias WAL.
+        // Those frames are in the canonical WAL, so the store opens that file
+        // and does not start a second WAL for the symlink.
         assert_eq!(
             store.mailbox_path().and_then(|path| path.file_name()),
-            Some(std::ffi::OsStr::new("alias.sqlite"))
+            Some(std::ffi::OsStr::new("mail.sqlite"))
         );
         drop(store);
         drop(hold);
@@ -1432,7 +1433,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_busy_symlink_without_a_published_path_does_not_open() {
+    fn a_busy_symlink_uses_the_canonical_wal() {
         let _reset = PauseReset;
         testing_start_indexer_paused(true);
         let dir = std::env::temp_dir().join(format!(
@@ -1461,10 +1462,58 @@ mod tests {
             })
             .unwrap();
         crate::store::testing_reject_mailbox_xattr(true);
-        let opened = Store::open(&alias);
+        let store = Store::open(&alias).unwrap();
         crate::store::testing_reject_mailbox_xattr(false);
-        assert!(opened.is_err(), "alias stayed open without a shared path");
+        let value: String = store
+            .conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "from-alias");
+        assert_eq!(
+            store.mailbox_path().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("mail.sqlite"))
+        );
+        drop(store);
         drop(hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_does_not_open_over_a_canonical_wal() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-canon-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("mail.sqlite");
+        let held = rusqlite::Connection::open(&real).unwrap();
+        held.pragma_update(None, "journal_mode", "WAL").unwrap();
+        held.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE marker (value TEXT NOT NULL);
+             INSERT INTO marker (value) VALUES ('still-in-wal');",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("mail.sqlite", dir.join("alias.sqlite")).unwrap();
+        let store = Store::open(dir.join("alias.sqlite")).unwrap();
+        let value: String = store
+            .conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "still-in-wal");
+        assert_eq!(
+            store.mailbox_path().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("mail.sqlite"))
+        );
+        drop(store);
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
