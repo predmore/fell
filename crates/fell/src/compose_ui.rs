@@ -65,7 +65,7 @@ fn palette(kind: ThemeKind) -> Palette {
             code: 0xe4ddd4,
             selection: 0xd9e2f2,
             error: 0x9f1239,
-            fresh: 0xe4c9a4,
+            fresh: 0xf3e6d4,
             panel: 0xfffdfb,
             hunk: 0xe7eef8,
         },
@@ -1289,10 +1289,10 @@ fn raw_line(
         if span.kind == StyleKind::Marker && matches!(slice, "- " | "-" | "* " | "*") {
             row = row.child(
                 div()
-                    .text_size(px(22.))
+                    .text_size(px(16.))
                     .font_weight(FontWeight(700.))
                     .text_color(rgb(colors.fg))
-                    .pr(px(8.))
+                    .pr(px(6.))
                     .child(slice.trim().to_string()),
             );
             continue;
@@ -1594,8 +1594,10 @@ fn status_bar(
     };
     div()
         .flex()
-        .flex_col()
-        .gap_1()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_3()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
@@ -1605,7 +1607,7 @@ fn status_bar(
         .child(
             div()
                 .flex()
-                .flex_wrap()
+                .flex_shrink_0()
                 .gap_3()
                 .child(div().text_color(rgb(colors.accent)).child(mode.to_string()))
                 .child(div().text_color(rgb(colors.fg)).child(status.to_string()))
@@ -1613,7 +1615,7 @@ fn status_bar(
                     fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
                 ),
         )
-        .child(div().flex().justify_end().child(send.to_string()))
+        .child(div().flex_shrink_0().child(send.to_string()))
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
