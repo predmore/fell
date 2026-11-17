@@ -1075,11 +1075,11 @@ fn message_row_exists(conn: &Connection, account_id: &AccountId, message_id: &st
 fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow) -> Result<()> {
     let mut values = vec![Value::Text(account_id.as_str().to_string())];
     values.extend(saved_values(row));
-    let source = match row.body_text.as_deref() {
-        Some(text) if !text.trim().is_empty() => text,
-        _ => row.snippet.as_str(),
+    let fingerprint = match row.body_text.as_deref() {
+        Some(text) if !text.trim().is_empty() => crate::message::body_fingerprint(text),
+        _ => String::new(),
     };
-    values.push(Value::Text(crate::message::body_fingerprint(source)));
+    values.push(Value::Text(fingerprint));
     debug_assert_eq!(values.len(), 22);
     conn.execute(
         "INSERT INTO messages (

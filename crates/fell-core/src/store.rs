@@ -1072,7 +1072,7 @@ fn write_kept(
     } else {
         filled_body_canonical(stored, message)
     };
-    let fingerprint = fingerprint_of(body_text.as_deref(), &snippet);
+    let fingerprint = fingerprint_of(body_text.as_deref());
     let (in_reply_to, references) = union_parents(stored, message);
     let subject = merged_subject(
         &stored.subject,
@@ -1357,7 +1357,7 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival) -> bool {
     let incoming_list = clean_list_id(&incoming.list_id).is_some();
     let stored_list = list_is_set(&stored.list_id);
     same_sender(&incoming.headers.from.email, &stored.from_email)
-        && stored.date_unix.abs_diff(incoming.headers.date_unix) <= LIST_ECHO_WINDOW_SECS
+        && dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
         && (incoming_list || stored_list)
         && proton_compatible(
             &stored.proton_conversation_id,
@@ -1384,15 +1384,22 @@ fn remember_alias(
 }
 
 fn message_fingerprint(message: &Message) -> String {
-    fingerprint_of(message.body_text.as_deref(), &message.snippet)
+    fingerprint_of(message.body_text.as_deref())
 }
 
-fn fingerprint_of(body: Option<&str>, snippet: &str) -> String {
-    let source = match body {
-        Some(text) if !text.trim().is_empty() => text,
-        _ => snippet,
-    };
-    body_fingerprint(source)
+/// Fingerprint of a non-empty body. A missing or blank body, including a
+/// subject used as the snippet, has no fingerprint.
+fn fingerprint_of(body: Option<&str>) -> String {
+    match body {
+        Some(text) if !text.trim().is_empty() => body_fingerprint(text),
+        _ => String::new(),
+    }
+}
+
+/// Both copies need a real timestamp. Zero is "no date", not the Unix epoch,
+/// so two undated messages are not within six hours of each other.
+fn dates_within_echo_window(stored: i64, incoming: i64) -> bool {
+    stored != 0 && incoming != 0 && stored.abs_diff(incoming) <= LIST_ECHO_WINDOW_SECS
 }
 
 fn clean_list_id(value: &Option<String>) -> Option<String> {
@@ -1607,21 +1614,17 @@ fn schema_version(conn: &Connection) -> Result<Option<String>> {
 
 fn backfill_fingerprints(conn: &Connection) -> Result<()> {
     let mut stmt =
-        conn.prepare("SELECT rowid, body_text, snippet FROM messages WHERE body_fingerprint = ''")?;
+        conn.prepare("SELECT rowid, body_text FROM messages WHERE body_fingerprint = ''")?;
     let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
     let mut pending = Vec::new();
     for row in rows {
         pending.push(row?);
     }
     drop(stmt);
-    for (rowid, body, snippet) in pending {
-        let fingerprint = fingerprint_of(body.as_deref(), &snippet);
+    for (rowid, body) in pending {
+        let fingerprint = fingerprint_of(body.as_deref());
         if fingerprint.is_empty() {
             continue;
         }
@@ -3636,7 +3639,6 @@ mod tests {
             "list@x.com",
         );
         echo.list_id = Some("list.example".into());
-        echo.body_text = None;
         store.upsert_message(&echo).unwrap();
         let sent = with_arrival(
             msg(
@@ -3664,7 +3666,7 @@ mod tests {
             collapsed.headers.proton_conversation_id.as_deref(),
             Some("conv-1")
         );
-        assert_eq!(collapsed.body_text.as_deref(), Some("hello   body\n"));
+        assert_eq!(collapsed.body_text.as_deref(), Some("hello body"));
         assert_eq!(
             collapsed
                 .headers
@@ -3686,7 +3688,7 @@ mod tests {
             .find(|message| message.list_id.as_deref() == Some("list.example"))
             .unwrap();
         assert_eq!(collapsed.headers.subject, "Hello");
-        assert_eq!(collapsed.body_text.as_deref(), Some("hello   body\n"));
+        assert_eq!(collapsed.body_text.as_deref(), Some("hello body"));
         assert_eq!(
             collapsed
                 .headers
@@ -3937,6 +3939,47 @@ mod tests {
         later.headers.date_unix = 60;
         store.upsert_message(&later).unwrap();
         assert_eq!(listed(&store).len(), 2);
+    }
+
+    #[test]
+    fn empty_body_same_subject_does_not_collapse() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg("a@x", None, None, "Hello", "Hello");
+        first.body_text = None;
+        first.headers.date_unix = 1_700_000_000;
+        let mut echo = msg("b@x", None, None, "Hello", "Hello");
+        echo.body_text = None;
+        echo.list_id = Some("list.example".into());
+        echo.headers.date_unix = first.headers.date_unix + 60;
+        store.upsert_message(&first).unwrap();
+        store.upsert_message(&echo).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|message| message.body_text.is_none()));
+    }
+
+    #[test]
+    fn zero_dates_do_not_collapse() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg("a@x", None, None, "Hello", "hello body");
+        first.headers.date_unix = 0;
+        let mut echo = msg("b@x", None, None, "[list] Hello", "hello body");
+        echo.list_id = Some("list.example".into());
+        echo.headers.date_unix = 0;
+        store.upsert_message(&first).unwrap();
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(listed(&store).len(), 2);
+
+        let mut dated = msg("c@x", None, None, "Hello", "hello body");
+        dated.headers.date_unix = 1_700_000_000;
+        store.upsert_message(&dated).unwrap();
+        let mut undated_echo = msg("d@x", None, None, "[list] Hello", "hello body");
+        undated_echo.list_id = Some("list.example".into());
+        undated_echo.headers.date_unix = 0;
+        store.upsert_message(&undated_echo).unwrap();
+        assert_eq!(listed(&store).len(), 4);
     }
 
     #[test]
