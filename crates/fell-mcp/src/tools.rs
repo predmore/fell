@@ -261,12 +261,11 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
         &saved.draft.body,
         &session.account_id,
     )?);
-    if let Some(folder) = &cwd {
-        fell_core::compose::write_owner(folder, &actor_name(session))?;
-        if let Some(path) = session.store.db_path() {
-            let _ = fell_core::compose::write_store_link(folder, path);
-            let _ = fell_core::compose::remember_compose_store(&compose_id, path);
-        }
+    if let Some(folder) = &cwd
+        && let Some(path) = session.store.db_path()
+    {
+        let _ = fell_core::compose::write_store_link(folder, path);
+        let _ = fell_core::compose::remember_compose_store(&compose_id, path);
     }
     session
         .store

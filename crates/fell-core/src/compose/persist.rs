@@ -332,15 +332,6 @@ pub fn open_owned_draft(
     Ok(folder)
 }
 
-#[cfg(test)]
-fn guard_open_folder(folder: &Path, agent: &str, account: &str) -> std::result::Result<(), String> {
-    match workspace::read_account(folder) {
-        Some(stored) if stored == account => {}
-        _ => return Err("this draft belongs to another account".into()),
-    }
-    workspace::require_owner(folder, agent)
-}
-
 pub fn mailbox_db_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FELL_STORE") {
         return Some(PathBuf::from(path));
@@ -351,7 +342,7 @@ pub fn mailbox_db_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/fell/mail.db"))
 }
 
-fn compose_index_file(id: &str) -> Option<PathBuf> {
+pub(crate) fn compose_index_file(id: &str) -> Option<PathBuf> {
     let root = if let Some(dir) = std::env::var_os("FELL_COMPOSE_INDEX") {
         PathBuf::from(dir)
     } else if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
@@ -525,14 +516,48 @@ mod tests {
         let folder =
             workspace::materialize_in(&dir, "r1", &fields, "body\n", &AccountId("acct-a".into()))
                 .unwrap();
-        workspace::write_owner(&folder, "agent:ada").unwrap();
         let control = workspace::control_dir(&folder);
-        std::fs::write(control.join("account"), "acct-a\n").unwrap();
-        let other_account = guard_open_folder(&folder, "agent:ada", "acct-b").unwrap_err();
-        assert!(other_account.contains("another account"), "{other_account}");
-        let other_agent = guard_open_folder(&folder, "agent:bob", "acct-a").unwrap_err();
-        assert!(other_agent.contains("another agent"), "{other_agent}");
-        assert!(guard_open_folder(&folder, "agent:ada", "acct-a").is_ok());
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::write(control.join("owner"), "agent:bob\n").unwrap();
+        std::fs::write(control.join("account"), "acct-b\n").unwrap();
+        let db = dir.join("mail.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .upsert_account(&Account {
+                id: AccountId("acct-a".into()),
+                display_name: "Ada".into(),
+                email: "jon@example.com".into(),
+                backend_kind: BackendKind::Bridge,
+            })
+            .unwrap();
+        store
+            .save_compose(&StoredCompose {
+                id: "r1".into(),
+                account_id: AccountId("acct-a".into()),
+                fields: fields.clone(),
+                body: "body\n".into(),
+                files: Vec::new(),
+                identities: vec!["jon@example.com".into()],
+                owner: "agent:ada".into(),
+            })
+            .unwrap();
+        let opened = super::super::session::DraftSession::open_with_store(
+            &folder,
+            AccountId("acct-b".into()),
+            &store,
+        );
+        match opened {
+            Ok(_) => panic!("opened with the wrong account"),
+            Err(err) => assert!(err.contains("account"), "{err}"),
+        }
+        let opened = super::super::session::DraftSession::open_with_store(
+            &folder,
+            AccountId("acct-a".into()),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(opened.owner(), "agent:ada");
+        assert_eq!(opened.account_id().as_str(), "acct-a");
     }
 
     #[test]

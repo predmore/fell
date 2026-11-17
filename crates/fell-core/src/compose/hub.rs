@@ -143,40 +143,27 @@ impl DraftHub {
             .unwrap_or("agent")
             .to_string();
         let mut sessions = self.sessions.lock().expect("sessions");
-        if !draft_id.is_empty()
-            && !sessions.contains_key(&draft_id)
-            && let Ok(folder) = workspace::draft_folder(&draft_id)
-        {
-            let present = std::fs::symlink_metadata(folder.join("draft.md"))
-                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
-            if !present && workspace::require_owner(&folder, &agent).is_err() {
-                return json!({
-                    "id": id,
-                    "ok": false,
-                    "transmitted": false,
-                    "error": "this draft belongs to another agent"
-                })
-                .to_string();
+        if !draft_id.is_empty() && !sessions.contains_key(&draft_id) {
+            let Some(account) = super::persist::stored_compose_account(&draft_id) else {
+                return denied(&id, "draft has no mailbox record");
+            };
+            match super::persist::stored_compose_owner(&draft_id).as_deref() {
+                Some(owner) if owner == agent => {}
+                Some(_) => return denied(&id, "this draft belongs to another agent"),
+                None => return denied(&id, "draft has no mailbox record"),
             }
-        }
-        if !draft_id.is_empty()
-            && !sessions.contains_key(&draft_id)
-            && let Ok(folder) = super::persist::ensure_draft_folder(&draft_id)
-            && folder.join("draft.md").is_file()
-        {
-            match DraftSession::open_folder(&folder, crate::AccountId("local".into())) {
+            let folder = match super::persist::ensure_draft_folder(&draft_id) {
+                Ok(folder) => folder,
+                Err(err) => return denied(&id, &err),
+            };
+            if workspace::draft_file_is_symlink(&folder) || !folder.join("draft.md").is_file() {
+                return denied(&id, "draft has no mailbox record");
+            }
+            match DraftSession::open_folder(&folder, crate::AccountId(account)) {
                 Ok(session) => {
                     sessions.insert(draft_id.clone(), session);
                 }
-                Err(err) => {
-                    return json!({
-                        "id": id,
-                        "ok": false,
-                        "transmitted": false,
-                        "error": err
-                    })
-                    .to_string();
-                }
+                Err(err) => return denied(&id, &err),
             }
         }
         let Some(session) = sessions.get_mut(&draft_id) else {
@@ -195,15 +182,9 @@ impl DraftHub {
                 | "edit_draft"
                 | "replace_draft_body"
                 | "request_send"
-        ) && let Err(err) = workspace::require_owner(session.folder(), &agent)
+        ) && !session.allows_agent(&agent)
         {
-            return json!({
-                "id": id,
-                "ok": false,
-                "transmitted": false,
-                "error": err
-            })
-            .to_string();
+            return denied(&id, "this draft belongs to another agent");
         }
         let mut reveal = None;
         let mut reply = match op {
@@ -354,6 +335,16 @@ impl DraftHub {
     }
 }
 
+fn denied(id: &Value, error: &str) -> String {
+    json!({
+        "id": id,
+        "ok": false,
+        "transmitted": false,
+        "error": error
+    })
+    .to_string()
+}
+
 fn ok_draft(id: Value, session: &mut DraftSession, agent: &str) -> Value {
     let changes = session.take_user_changes(agent);
     ok_draft_with(id, session, agent, changes)
@@ -437,13 +428,19 @@ fn open_draft_for_agent(
     if workspace::draft_file_is_symlink(&folder) {
         return Err("draft.md is a symlink".into());
     }
-    if folder.join("draft.md").is_file() {
-        workspace::require_owner(&folder, agent)?;
-        if let Some(stored) = workspace::read_account(&folder)
-            && stored != account
-        {
-            return Err("this draft belongs to another account".into());
+    if let Some(owner) = super::persist::stored_compose_owner(draft_id) {
+        if owner != agent {
+            return Err("this draft belongs to another agent".into());
         }
+    } else if super::persist::stored_compose_account(draft_id).is_some() {
+        return Err("draft has no mailbox record".into());
+    }
+    if let Some(stored) = super::persist::stored_compose_account(draft_id)
+        && stored != account
+    {
+        return Err("this draft belongs to another account".into());
+    }
+    if folder.join("draft.md").is_file() {
         return Ok(folder);
     }
     super::persist::open_owned_draft(draft_id, agent, account)
@@ -545,9 +542,9 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
-        workspace::write_owner(&folder, "bot").unwrap();
-        let session =
+        let mut session =
             DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        session.set_owner("bot");
         let hub = DraftHub::new();
         hub.insert(session);
         let edited = hub.handle_line(
@@ -659,9 +656,9 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
-        workspace::write_owner(&folder, "bot").unwrap();
-        let session =
+        let mut session =
             DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        session.set_owner("bot");
         let hub = Arc::new(DraftHub::new());
         hub.insert(session);
         let _inbox = hub.subscribe();
@@ -710,8 +707,7 @@ mod tests {
             &AccountId("a".into()),
         )
         .unwrap();
-        workspace::write_owner(&folder, "agent:ada").unwrap();
-        let session = DraftSession::create(
+        let mut session = DraftSession::create(
             folder.clone(),
             "d1",
             AccountId("a".into()),
@@ -719,6 +715,8 @@ mod tests {
             "hidden body\n",
         )
         .unwrap();
+        session.set_owner("agent:ada");
+        workspace::write_owner(&folder, "agent:bob").unwrap();
         let hub = DraftHub::new();
         hub.insert(session);
         let denied = hub.handle_line(
@@ -733,8 +731,116 @@ mod tests {
         assert!(denied.contains("another agent"), "{denied}");
         assert!(!denied.contains("secret-bcc@example.com"));
         assert!(!denied.contains("hidden body"));
-        let fallback = workspace::require_owner(&folder, "agent:bob").unwrap_err();
-        assert!(fallback.contains("another agent"));
-        assert!(workspace::require_owner(&folder, "agent:ada").is_ok());
+        let allowed = hub.handle_line(
+            &json!({
+                "id": 2,
+                "op": "get_draft",
+                "draft_id": "d1",
+                "agent": "agent:ada"
+            })
+            .to_string(),
+        );
+        assert!(allowed.contains("hidden body"), "{allowed}");
+        assert!(allowed.contains("secret-bcc@example.com"), "{allowed}");
+    }
+
+    #[test]
+    fn the_socket_loads_the_stored_account_not_local() {
+        let id = format!(
+            "acct{}{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let id = id.chars().take(32).collect::<String>();
+        let folder = workspace::draft_folder(&id).unwrap();
+        let control = workspace::control_dir(&folder);
+        let index = super::super::persist::compose_index_file(&id);
+        let db = std::env::temp_dir().join(format!("{id}.db"));
+        let _ = fs::remove_dir_all(&folder);
+        let _ = fs::remove_dir_all(&control);
+        let _ = fs::remove_file(&db);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            bcc: vec!["secret-bcc@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let root = folder.parent().unwrap().to_path_buf();
+        workspace::materialize_in(
+            &root,
+            &id,
+            &fields,
+            "hidden body\n",
+            &AccountId("acct-real".into()),
+        )
+        .unwrap();
+        workspace::write_owner(&folder, "agent:bob").unwrap();
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: AccountId("acct-real".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        store
+            .save_compose(&super::super::persist::StoredCompose {
+                id: id.clone(),
+                account_id: AccountId("acct-real".into()),
+                fields: fields.clone(),
+                body: "hidden body\n".into(),
+                files: Vec::new(),
+                identities: vec!["jon@example.com".into()],
+                owner: "agent:ada".into(),
+            })
+            .unwrap();
+        super::super::persist::remember_compose_store(&id, &db).unwrap();
+        let hub = DraftHub::new();
+        let denied = hub.handle_line(
+            &json!({
+                "id": 1,
+                "op": "get_draft",
+                "draft_id": id,
+                "agent": "agent:bob"
+            })
+            .to_string(),
+        );
+        assert!(denied.contains("another agent"), "{denied}");
+        assert!(!denied.contains("hidden body"), "{denied}");
+        assert!(!denied.contains("secret-bcc"), "{denied}");
+        let opened = hub.handle_line(
+            &json!({
+                "id": 2,
+                "op": "get_draft",
+                "draft_id": id,
+                "agent": "agent:ada"
+            })
+            .to_string(),
+        );
+        assert!(opened.contains("hidden body"), "{opened}");
+        let account = hub.with_session(&id, |session| session.account_id().as_str().to_string());
+        assert_eq!(account.as_deref(), Some("acct-real"));
+        let missing = DraftHub::new().handle_line(
+            &json!({
+                "id": 3,
+                "op": "get_draft",
+                "draft_id": format!("{id}x"),
+                "agent": "agent:ada"
+            })
+            .to_string(),
+        );
+        assert!(missing.contains("mailbox"), "{missing}");
+        assert!(!missing.contains("another agent"), "{missing}");
+        let _ = fs::remove_dir_all(&folder);
+        let _ = fs::remove_dir_all(&control);
+        let _ = fs::remove_file(&db);
+        if let Some(index) = index {
+            let _ = fs::remove_file(index);
+        }
     }
 }

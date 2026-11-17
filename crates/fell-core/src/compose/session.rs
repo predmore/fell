@@ -91,8 +91,11 @@ pub struct DraftSession {
     body: String,
     revision: u64,
     seen_revision: u64,
-    /// Path and content hash of referenced files at the last paint.
+    /// Path and content hash of referenced files the person has accepted.
+    /// A later text edit does not replace a hash that is already recorded.
     painted_files: Option<Vec<(String, u64)>>,
+    /// The next paint may replace accepted attachment hashes.
+    accept_files: bool,
     locked_reply: Option<String>,
     hunks: Vec<Hunk>,
     next_hunk: u64,
@@ -141,6 +144,7 @@ impl DraftSession {
             revision: 1,
             seen_revision: 0,
             painted_files: None,
+            accept_files: false,
             locked_reply,
             hunks: Vec::new(),
             next_hunk: 1,
@@ -240,6 +244,19 @@ impl DraftSession {
         &self.account_id
     }
 
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn set_owner(&mut self, owner: impl Into<String>) {
+        self.owner = owner.into();
+    }
+
+    /// The mailbox row is the credential. An empty owner matches nobody.
+    pub fn allows_agent(&self, agent: &str) -> bool {
+        !self.owner.is_empty() && self.owner == agent
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -261,14 +278,22 @@ impl DraftSession {
     }
 
     pub fn mark_seen(&mut self) {
-        if self.seen_revision == self.revision {
+        if self.seen_revision == self.revision && !self.accept_files {
             return;
         }
-        self.painted_files = Some(referenced_file_hashes(
-            &self.folder,
-            &self.fields,
-            &self.body,
-        ));
+        let current = referenced_file_hashes(&self.folder, &self.fields, &self.body);
+        if self.painted_files.is_none() || self.accept_files {
+            self.painted_files = Some(current);
+            self.accept_files = false;
+        } else if let Some(painted) = &mut self.painted_files {
+            painted.retain(|(path, _)| current.iter().any(|(name, _)| name == path));
+            for (path, hash) in current {
+                if painted.iter().all(|(name, _)| name != &path) {
+                    painted.push((path, hash));
+                }
+            }
+            painted.sort();
+        }
         self.seen_revision = self.revision;
     }
 
@@ -372,9 +397,13 @@ impl DraftSession {
         let Some(index) = self.hunks.iter().position(|hunk| hunk.id == id) else {
             return false;
         };
+        let kind = self.hunks[index].kind;
         self.begin_user_change();
         self.end_user_change();
         self.hunks.remove(index);
+        if kind == HunkKind::Attachments {
+            self.accept_files = true;
+        }
         self.bump();
         self.refresh_issues();
         true
@@ -874,23 +903,35 @@ fn revert_span(text: &str, hunk: &Hunk) -> Option<String> {
 }
 
 fn referenced_file_hashes(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64)> {
-    // Stat only. Render must not read attachment bytes to decide whether send is allowed.
-    attachment_stamp(folder, fields, body)
-        .into_iter()
-        .map(|(path, len, mtime)| {
-            let fingerprint = format!("{len}:{mtime}");
-            (path, content_hash(fingerprint.as_bytes()))
-        })
-        .collect()
+    let (files, _) = workspace::list_closure(folder, fields, body);
+    let mut stamp = Vec::new();
+    for file in files {
+        let Some(hash) = hash_file(folder, &file.path) else {
+            continue;
+        };
+        stamp.push((file.path, hash));
+    }
+    stamp.sort();
+    stamp
 }
 
-fn content_hash(bytes: &[u8]) -> u64 {
+/// Hash the file bytes. Length and mtime are not part of the stamp.
+fn hash_file(folder: &Path, relative: &str) -> Option<u64> {
+    let path = workspace::resolve_inside(folder, relative).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        for byte in &buf[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
     }
-    hash
+    Some(hash)
 }
 
 fn attachment_stamp(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64, u128)> {
@@ -1512,5 +1553,27 @@ mod tests {
         session.mark_seen();
         let err = session.prepare_send().unwrap_err();
         assert!(err.contains("attachment"), "{err}");
+    }
+
+    #[test]
+    fn a_text_edit_does_not_accept_swapped_attachment_bytes() {
+        let (_root, mut session) = temp_session("![chart](chart.png)\n");
+        let path = session.folder().join("chart.png");
+        fs::write(&path, b"one").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        session.mark_seen();
+        assert!(session.prepare_send().is_ok());
+        fs::write(&path, b"two").unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(modified).unwrap();
+        session.set_body_from_user("![chart](chart.png)\n\nmore\n".into());
+        session.mark_seen();
+        let err = session.prepare_send().unwrap_err();
+        assert!(err.contains("attachment"), "{err}");
+        session.set_body_from_user("no chart\n".into());
+        session.mark_seen();
+        session.set_body_from_user("![chart](chart.png)\n".into());
+        session.mark_seen();
+        assert!(session.prepare_send().is_ok());
     }
 }
