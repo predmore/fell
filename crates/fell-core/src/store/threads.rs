@@ -22,8 +22,8 @@ use crate::account::AccountId;
 use crate::message::{Address, MessageHeaders, MessageId};
 use crate::threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
-/// Tables and triggers behind [`rethread_dirty`]. Safe to run on every open.
-const THREAD_INDEX_SCHEMA: &str = r#"
+/// Tables behind [`rethread_dirty`]. Safe to run on every open.
+const THREAD_INDEX_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS message_refs (
     account_id TEXT NOT NULL,
     ref_id TEXT NOT NULL,
@@ -40,12 +40,20 @@ CREATE TABLE IF NOT EXISTS thread_dirty_ids (
     message_id TEXT NOT NULL,
     PRIMARY KEY (account_id, message_id)
 ) WITHOUT ROWID;
+"#;
 
+/// Bump when [`THREAD_INDEX_TRIGGERS`] changes. Triggers are rebuilt only
+/// then, in one transaction, so no other connection writes while they are
+/// missing.
+const THREAD_TRIGGERS_VERSION: &str = "2";
+
+const THREAD_INDEX_TRIGGERS: &str = r#"
 DROP TRIGGER IF EXISTS thread_dirty_insert;
 DROP TRIGGER IF EXISTS thread_dirty_update;
 DROP TRIGGER IF EXISTS thread_dirty_delete;
 DROP TRIGGER IF EXISTS thread_dirty_alias_insert;
 DROP TRIGGER IF EXISTS thread_dirty_alias_update;
+DROP TRIGGER IF EXISTS thread_dirty_alias_delete;
 
 CREATE TRIGGER thread_dirty_insert AFTER INSERT ON messages BEGIN
     INSERT OR IGNORE INTO thread_dirty_rows (rowid) VALUES (new.rowid);
@@ -75,7 +83,15 @@ CREATE TRIGGER thread_dirty_alias_update AFTER UPDATE OF
     message_id, canonical_message_id
 ON message_aliases BEGIN
     INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
+    VALUES (old.account_id, old.message_id);
+    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
     VALUES (new.account_id, new.message_id);
+END;
+
+-- Replies stored under an alias id stop resolving through it.
+CREATE TRIGGER thread_dirty_alias_delete AFTER DELETE ON message_aliases BEGIN
+    INSERT OR IGNORE INTO thread_dirty_ids (account_id, message_id)
+    VALUES (old.account_id, old.message_id);
 END;
 "#;
 
@@ -88,7 +104,13 @@ const BACKFILL_BATCH: i64 = 2_000;
 /// The fill re-resolves every account once with [`rethread_all`] so later
 /// writes can rely on untouched rows already being on their final thread.
 pub(super) fn ensure_thread_index(conn: &Connection) -> Result<()> {
-    conn.execute_batch(THREAD_INDEX_SCHEMA)?;
+    conn.execute_batch(THREAD_INDEX_TABLES)?;
+    super::ensure_triggers(
+        conn,
+        "thread_triggers",
+        THREAD_TRIGGERS_VERSION,
+        THREAD_INDEX_TRIGGERS,
+    )?;
     if index_is_current(conn)? {
         return Ok(());
     }
@@ -596,6 +618,10 @@ mod tests {
     enum Op {
         Batch(Vec<Message>),
         Delete(String),
+        /// Move this message's thread to Trash from its first folder; from
+        /// Trash, delete it for good.
+        Trash(String),
+        Undo,
     }
 
     /// Arrival out of order, parents named only in `References`, Proton ids
@@ -646,8 +672,9 @@ mod tests {
             made.push(id.clone());
             if rng.chance(8) {
                 // A list rewrites the Message-ID of the same post.
+                // Same post, list subject tag: collapses into an alias.
                 let echo = format!("echo{index}@list");
-                pending.push(message(
+                let mut copy = message(
                     &echo,
                     in_reply_to.as_deref(),
                     &references,
@@ -657,7 +684,9 @@ mod tests {
                     &body,
                     date + 60,
                     Some("list.x"),
-                ));
+                );
+                copy.headers.subject = format!("[list] subject {id}");
+                pending.push(copy);
                 made.push(echo);
             }
             if rng.chance(10) {
@@ -687,6 +716,12 @@ mod tests {
             ops.push(Op::Batch(pending.drain(..size).collect()));
             if rng.chance(20) {
                 ops.push(Op::Delete(made[rng.below(made.len())].clone()));
+            }
+            if rng.chance(15) {
+                ops.push(Op::Trash(made[rng.below(made.len())].clone()));
+            }
+            if rng.chance(10) {
+                ops.push(Op::Undo);
             }
         }
         ops
@@ -720,6 +755,26 @@ mod tests {
                 store
                     .delete_message(&account.id, &MessageId::new(id))
                     .unwrap();
+            }
+            Op::Trash(id) => {
+                let found: Option<(String, String)> = store
+                    .conn
+                    .query_row(
+                        "SELECT thread_id, folders FROM messages WHERE message_id = ?1",
+                        params![MessageId::new(id).as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .unwrap();
+                if let Some((thread, folders)) = found
+                    && let Some(folder) = folders.split('\u{1e}').find(|f| !f.is_empty())
+                {
+                    // Refusals (nothing in that folder) are fine; both stores refuse alike.
+                    let _ = store.delete_thread(&account.id, &ThreadId(thread), folder);
+                }
+            }
+            Op::Undo => {
+                let _ = store.undo(&account.id);
             }
         }
     }
@@ -850,6 +905,142 @@ mod tests {
         let threads = threads_of(&store);
         assert_eq!(threads[0].1, threads[1].1, "{threads:?}");
         drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn deleting_an_aliased_message_rethreads_replies_to_the_alias() {
+        let start = 1_700_000_000;
+        let root = message(
+            "root@x",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "a@x",
+            "root body",
+            start,
+            None,
+        );
+        let sent = message(
+            "sent@x",
+            None,
+            &[],
+            None,
+            "Sent",
+            "me@x",
+            "same post",
+            start + 10,
+            None,
+        );
+        let mut echo = message(
+            "echo@list",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "me@x",
+            "same post",
+            start + 70,
+            Some("list.x"),
+        );
+        echo.headers.subject = "[list] subject sent@x".into();
+        let reply = message(
+            "reply@x",
+            Some("echo@list"),
+            &["root@x".to_string(), "echo@list".to_string()],
+            None,
+            "INBOX",
+            "b@x",
+            "reply body",
+            start + 200,
+            None,
+        );
+        let other = message(
+            "other@x",
+            None,
+            &[],
+            None,
+            "INBOX",
+            "c@x",
+            "other",
+            start,
+            None,
+        );
+        let incremental = Store::open_in_memory().unwrap();
+        let full = Store::open_in_memory().unwrap();
+        full.full_rethread.set(true);
+        for store in [&incremental, &full] {
+            store.upsert_account(&account()).unwrap();
+            run(store, &Op::Batch(vec![root.clone(), sent.clone()]));
+            run(store, &Op::Batch(vec![echo.clone()]));
+            let aliased: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM message_aliases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(aliased, 1, "the echo collapsed into an alias");
+            run(store, &Op::Batch(vec![reply.clone()]));
+            run(store, &Op::Delete("sent@x".into()));
+            run(store, &Op::Batch(vec![other.clone()]));
+        }
+        assert_eq!(threads_of(&incremental), threads_of(&full));
+        assert_eq!(
+            thread_of(&incremental, "reply@x"),
+            thread_of(&incremental, "root@x")
+        );
+    }
+
+    fn thread_of(store: &Store, id: &str) -> String {
+        threads_of(store)
+            .into_iter()
+            .find(|(message, _)| message == id)
+            .map(|(_, thread)| thread)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_current_mailbox_reopens_without_rebuilding_triggers() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-thread-triggers-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let trigger_sql = |store: &Store| -> String {
+            store
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'thread_dirty_insert'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let first = Store::open(&path).unwrap();
+        // Mark the trigger. A rebuild on open would replace it.
+        first
+            .conn
+            .execute_batch(
+                "DROP TRIGGER thread_dirty_insert;
+                 CREATE TRIGGER thread_dirty_insert AFTER INSERT ON messages BEGIN
+                     -- marker
+                     INSERT OR IGNORE INTO thread_dirty_rows (rowid) VALUES (new.rowid);
+                 END;",
+            )
+            .unwrap();
+        // A second connection opens while the first is still live, as the
+        // window, sync, and fell-mcp do.
+        let second = Store::open(&path).unwrap();
+        assert!(
+            trigger_sql(&second).contains("marker"),
+            "no trigger rebuild on a current mailbox"
+        );
+        drop(second);
+        drop(first);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }

@@ -2771,6 +2771,45 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild a set of triggers when `version` differs from `meta.key`.
+///
+/// Dropping and creating triggers outside a transaction leaves a moment with
+/// no trigger, and another connection's write in that moment is never
+/// queued. Here the drop, the create, and the version stamp commit together
+/// under a write lock, and a current mailbox does no trigger DDL at all.
+pub(crate) fn ensure_triggers(
+    conn: &Connection,
+    key: &str,
+    version: &str,
+    sql: &str,
+) -> Result<()> {
+    let current = |conn: &Connection| -> Result<bool> {
+        let stamped: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stamped.as_deref() == Some(version))
+    };
+    if current(conn)? {
+        return Ok(());
+    }
+    let tx = immediate_transaction(conn)?;
+    if current(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, version],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Write lock from the first statement, so an embedding commit cannot
 /// invalidate a snapshot this transaction already read.
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
