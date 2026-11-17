@@ -391,18 +391,31 @@ impl Render for Reader {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .border_b(px(1.))
                     .border_color(paint(palette.border))
-                    .bg(paint(palette.surface))
+                    .bg(paint(palette.code_bg))
                     .text_sm()
-                    .text_color(paint(palette.dimmed))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                         this.model
                             .set_remote_images_allowed(!this.model.remote_images_allowed());
                         cx.notify();
                     }))
-                    .child(status)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w(px(0.))
+                            .child(remote_image_mark(palette.accent))
+                            .child(
+                                div()
+                                    .text_color(paint(palette.foreground))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(status),
+                            ),
+                    )
                     .child(
                         div()
                             .px_3()
@@ -417,6 +430,16 @@ impl Render for Reader {
             )
             .child(message_body(self, &palette))
     }
+}
+
+/// Accent tick so the remote-image status is not another dimmed header line.
+fn remote_image_mark(tone: u32) -> gpui::Div {
+    div()
+        .w(px(3.))
+        .h(px(14.))
+        .flex_none()
+        .rounded(px(1.))
+        .bg(paint(tone))
 }
 
 fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpui::Div> {
