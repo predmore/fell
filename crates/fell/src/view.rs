@@ -494,12 +494,22 @@ impl Inbox {
         .detach();
     }
 
+    /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
+    /// inotify wakes this; without it, a slow poll does.
     fn watch_theme(&self, cx: &mut Context<Self>) {
+        let (changed, mut changes) = futures::channel::mpsc::unbounded();
+        let watching = theme::watch(changed);
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(300))
-                    .await;
+                if watching {
+                    if changes.next().await.is_none() {
+                        break;
+                    }
+                } else {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                }
                 let next = cx
                     .background_executor()
                     .spawn(async { theme::load() })
