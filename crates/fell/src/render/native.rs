@@ -532,10 +532,10 @@ fn image_el(
                 .gap_2()
                 .child(
                     div()
-                        .w(px(28.))
-                        .h(px(28.))
+                        .w(px(36.))
+                        .h(px(36.))
                         .border(px(1.))
-                        .border_color(paint(palette.border))
+                        .border_color(paint(palette.dimmed))
                         .rounded(px(2.)),
                 )
                 .child(label),
@@ -557,7 +557,7 @@ pub(crate) fn embedded_web(image: Arc<RenderImage>, frame: u32) -> AnyElement {
 /// does not keep the empty viewport under the card. A short run of that
 /// color is the email's own padding and stays, so the card is not clipped.
 pub(crate) fn trim_uniform_bottom(rgba: &[u8], width: u32, height: u32) -> u32 {
-    const KEEP_FLAT_ROWS: usize = 24;
+    const KEEP_FLAT_ROWS: usize = 36;
     let row_bytes = width as usize * 4;
     if row_bytes == 0 || height == 0 || rgba.len() < row_bytes * height as usize {
         return height;
@@ -829,7 +829,7 @@ mod decode_tests {
                 rgba[i + 3] = 255;
             }
         }
-        assert_eq!(trim_uniform_bottom(&rgba, width, height), 34);
+        assert_eq!(trim_uniform_bottom(&rgba, width, height), 40);
         let short = &rgba[..width as usize * 18 * 4];
         assert_eq!(trim_uniform_bottom(short, width, 18), 18);
     }

@@ -391,7 +391,7 @@ impl Render for Reader {
                         .child(status)
                         .child(
                             div()
-                                .px_2()
+                                .px_3()
                                 .py_1()
                                 .rounded(px(4.))
                                 .border(px(1.))
@@ -416,12 +416,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
         .py_4();
     if reader.model.mode() == RenderMode::Web {
         if let Some(image) = reader.web_image.clone() {
-            let frame = if palette.scheme() == "dark" {
-                0x5c5c5c
-            } else {
-                palette.border
-            };
-            body.child(native::embedded_web(image, frame))
+            body.child(native::embedded_web(image, palette.border))
         } else if reader.web_failed {
             body.child(
                 div()
