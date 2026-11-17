@@ -831,7 +831,7 @@ mod tests {
         let next = |rx: &mut futures::channel::mpsc::UnboundedReceiver<()>| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                if let Ok(Some(())) = rx.try_next() {
+                if rx.try_recv().is_ok() {
                     return true;
                 }
                 if std::time::Instant::now() > deadline {
@@ -850,7 +850,7 @@ mod tests {
         fs::rename(&staged, &theme).unwrap();
         assert!(next(&mut rx), "a replaced theme folder");
         std::thread::sleep(std::time::Duration::from_millis(300));
-        while rx.try_next().is_ok_and(|item| item.is_some()) {}
+        while rx.try_recv().is_ok() {}
         fs::write(theme.join("colors.toml"), "background = \"#333333\"\n").unwrap();
         assert!(next(&mut rx), "the new folder is watched too");
         drop(rx);
