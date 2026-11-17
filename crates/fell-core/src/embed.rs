@@ -260,9 +260,18 @@ impl Drop for Indexer {
     }
 }
 
-fn open_index_conn(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+fn open_index_conn(path: &Path, stop: &Arc<AtomicBool>) -> Result<Connection> {
+    let mut conn = Connection::open(path)?;
+    // Install this before any query. The default 5s busy timeout ignores stop,
+    // so closing the store would wait it out.
+    let stop_busy = Arc::clone(stop);
+    conn.busy_handler(Some(move |_| {
+        if stop_busy.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+        !stop_busy.load(Ordering::Relaxed)
+    }))?;
     ensure_embedding_schema(&conn)?;
     delete_orphans(&conn)?;
     Ok(conn)
@@ -376,23 +385,15 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
 }
 
 fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool) {
-    let mut conn = loop {
+    let conn = loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        match open_index_conn(path) {
+        match open_index_conn(path, stop) {
             Ok(conn) => break conn,
             Err(_) => sleep_unless_stopped(BUSY_RETRY, stop),
         }
     };
-    let stop_busy = Arc::clone(stop);
-    let _ = conn.busy_handler(Some(move |_| {
-        if stop_busy.load(Ordering::Relaxed) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20));
-        !stop_busy.load(Ordering::Relaxed)
-    }));
     let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
@@ -1418,11 +1419,10 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "from-alias");
-        // Opening the alias to checkpoint would create a second WAL. The store
-        // uses the canonical file instead.
+        // The reader blocks the checkpoint, so the store keeps the alias WAL.
         assert_eq!(
             store.mailbox_path().and_then(|path| path.file_name()),
-            Some(std::ffi::OsStr::new("mail.sqlite"))
+            Some(std::ffi::OsStr::new("alias.sqlite"))
         );
         drop(store);
         drop(hold);
@@ -1524,6 +1524,35 @@ mod tests {
             Some(real.canonicalize().unwrap().as_path())
         );
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_waits_while_the_path_is_published() {
+        let _reset = PauseReset;
+        testing_start_indexer_paused(true);
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-hard-wait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.sqlite");
+        std::fs::File::create(&path).unwrap();
+        let other = dir.join("mail-link.sqlite");
+        std::fs::hard_link(&path, &other).unwrap();
+        crate::store::testing_delay_publish_once(true);
+        let opener = std::thread::spawn(move || Store::open(&path).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second = Store::open(&other).unwrap();
+        let first = opener.join().unwrap();
+        assert_eq!(second.mailbox_path(), first.mailbox_path());
+        drop(second);
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

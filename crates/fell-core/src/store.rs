@@ -867,7 +867,7 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
     use fs4::fs_std::FileExt;
 
     let canonical = absolute_opened(&requested.canonicalize()?)?;
-    for _ in 0..8 {
+    for attempt in 0..8 {
         let db = std::fs::File::open(requested)?;
         let nlink = db.metadata()?.nlink();
         let exclusive = match db.try_lock_exclusive() {
@@ -887,37 +887,44 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
             }
         };
         if !exclusive {
-            let path = if nlink <= 1 {
-                canonical.clone()
-            } else {
-                read_published_path(&db).ok_or_else(|| {
-                    crate::Error::Invalid(
-                        "mailbox is already open and its path was not published".into(),
-                    )
-                })?
-            };
-            // Do not open this caller's name. It would be a second `-wal`.
-            let conn = open_mailbox_db(&path)?;
-            if nlink > 1 && read_published_path(&db).as_ref() != Some(&path) {
+            if let Some(path) = read_published_path(&db) {
+                let conn = open_mailbox_db(&path)?;
+                if read_published_path(&db).as_ref() == Some(&path) {
+                    return Ok(ClaimedMailbox {
+                        path,
+                        conn,
+                        lock: db,
+                    });
+                }
                 drop(conn);
                 drop(db);
                 continue;
             }
-            return Ok(ClaimedMailbox {
-                path,
-                conn,
-                lock: db,
-            });
+            // The holder may still be publishing. Retry while the lock is held
+            // and the attribute is absent. The only name can still open after that.
+            drop(db);
+            if attempt == 7 && nlink <= 1 && absolute_opened(requested)? == canonical {
+                let db = std::fs::File::open(requested)?;
+                let conn = open_mailbox_db(&canonical)?;
+                return Ok(ClaimedMailbox {
+                    path: canonical,
+                    conn,
+                    lock: db,
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
         }
-        let path = if nlink > 1 {
-            read_published_path(&db).unwrap_or(absolute_opened(requested)?)
+        delay_publish_for_test();
+        let requested_abs = absolute_opened(requested)?;
+        let (path, conn) = if requested_abs == canonical {
+            (canonical.clone(), open_mailbox_db(&canonical)?)
         } else {
-            canonical.clone()
+            // Frames committed under the requested name live in its WAL.
+            // Switch only when that checkpoint copied every frame.
+            open_requested_or_canonical(&requested_abs, &canonical)?
         };
-        // Recording the path is required only when another name would be a
-        // different WAL. The only name still opens if the attribute is rejected.
         let _ = publish_mailbox_path(&db, &path);
-        let conn = open_mailbox_db(&path)?;
         // The exclusive lock stays granted. Converting it to shared drops it
         // on Linux before the shared lock exists.
         divert_published_path_for_test(&db);
@@ -935,8 +942,28 @@ fn claim_mailbox_unix(requested: &Path) -> Result<ClaimedMailbox> {
         });
     }
     Err(crate::Error::Invalid(
-        "mailbox path changed while it was opening".into(),
+        "mailbox is already open and its path was not published".into(),
     ))
+}
+
+#[cfg(unix)]
+fn open_requested_or_canonical(
+    requested: &Path,
+    canonical: &Path,
+) -> Result<(std::path::PathBuf, Connection)> {
+    let conn = Connection::open(requested)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let (busy, log, checkpointed): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy == 0 && log == checkpointed {
+        drop(conn);
+        Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?))
+    } else {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        Ok((requested.to_path_buf(), conn))
+    }
 }
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {
@@ -1009,6 +1036,25 @@ thread_local! {
 #[cfg(all(unix, test))]
 pub(crate) fn testing_divert_published_path_once(path: std::path::PathBuf) {
     DIVERT_PUBLISHED_ONCE.with(|cell| *cell.borrow_mut() = Some(path));
+}
+
+#[cfg(all(unix, test))]
+static DELAY_PUBLISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next exclusive open waits before it publishes the shared path.
+#[cfg(all(unix, test))]
+pub(crate) fn testing_delay_publish_once(delay: bool) {
+    DELAY_PUBLISH.store(delay, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn delay_publish_for_test() {
+    #[cfg(test)]
+    {
+        if DELAY_PUBLISH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
 }
 
 #[cfg(unix)]
