@@ -1780,11 +1780,13 @@ fn a_uid_gap_does_not_keep_waking_sync() {
     assert_eq!(outcome, InboxWait::Quiet, "no new mail, so no new pass");
 }
 
+type Setup = Box<dyn Fn(&mut TestState)>;
+
 /// Each setup leaves the stored cursor behind UIDNEXT with no new mail.
 /// The wait must still idle instead of reporting news at once.
 #[test]
 fn a_synced_mailbox_waits_even_when_the_cursor_trails_uidnext() {
-    let setups: Vec<(&str, Box<dyn Fn(&mut TestState)>)> = vec![
+    let setups: Vec<(&str, Setup)> = vec![
         (
             "a body the server never sent",
             Box::new(|state: &mut TestState| {
