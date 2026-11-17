@@ -90,7 +90,7 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
             quote.push(trimmed);
             continue;
         }
-        if !in_signature && is_signature_rule(trimmed) {
+        if !in_signature && is_signature_rule(line) {
             flush_text(&mut text, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
             in_signature = true;
@@ -127,9 +127,12 @@ fn strip_one_quote_marker(line: &str) -> String {
     format!("{}{rest}", &line[..indent_len])
 }
 
+/// RFC 3676 signature delimiter: two dashes, one space, then only whitespace.
 fn is_signature_rule(line: &str) -> bool {
-    let trimmed = line.trim_end();
-    trimmed == "--" || trimmed == "-- "
+    let Some(rest) = line.strip_prefix("-- ") else {
+        return false;
+    };
+    rest.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -181,6 +184,33 @@ mod tests {
         assert_eq!(
             quote,
             "> earlier reply\n> still nested\ntop level\n two spaces"
+        );
+    }
+
+    #[test]
+    fn plain_dashes_do_not_hide_the_rest() {
+        let rendered = render_stored_body(Some("diff\n--\nstill visible"), "");
+        assert!(
+            rendered
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, BodyBlock::Signature(_)))
+        );
+        let text = rendered
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                BodyBlock::Text(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(text.contains("still visible"));
+        let signed = render_stored_body(Some("Thanks.\n-- \nCaleb"), "");
+        assert!(
+            signed
+                .blocks
+                .iter()
+                .any(|block| matches!(block, BodyBlock::Signature(text) if text.contains("Caleb")))
         );
     }
 

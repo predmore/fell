@@ -275,13 +275,16 @@ impl Inbox {
             index += 1;
         }
         let max = f32::from(self.conv_scroll.max_offset().height);
-        let next_y = (f32::from(measured.y) - delta).clamp(-max, 0.0);
-        if let Some(ix) =
-            present::message_after_page(&item_bounds, scrollport_top, f32::from(measured.y), next_y)
-            && ix < self.session.messages.len()
-        {
-            self.session.message_cursor = ix;
-        }
+        let measured_y = f32::from(measured.y);
+        let next_y = (measured_y - delta).clamp(-max, 0.0);
+        let top = present::message_after_page(&item_bounds, scrollport_top, measured_y, next_y)
+            .filter(|index| *index < self.session.messages.len());
+        self.session.message_cursor = present::cursor_after_nudge(
+            self.session.message_cursor,
+            top,
+            next_y < measured_y,
+            next_y != measured_y,
+        );
         self.conv_scroll.set_offset(point(measured.x, px(next_y)));
     }
 

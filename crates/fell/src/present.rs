@@ -201,6 +201,25 @@ pub fn message_after_page(
     message_at_top(&spans, content_top)
 }
 
+/// Cursor after a conversation scroll.
+///
+/// When the clamped offset does not change, the cursor stays. A downward
+/// scroll does not move the highlight onto an earlier message.
+pub fn cursor_after_nudge(
+    current: usize,
+    top: Option<usize>,
+    downward: bool,
+    moved: bool,
+) -> usize {
+    if !moved {
+        return current;
+    }
+    match top {
+        Some(top) if !(downward && top < current) => top,
+        _ => current,
+    }
+}
+
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -416,6 +435,15 @@ mod tests {
         ];
         assert_eq!(message_at_top(&shifted, scrollport - next), Some(1));
         assert_eq!(message_after_page(&[], scrollport, measured, next), None);
+    }
+
+    #[test]
+    fn nudge_keeps_the_cursor_when_the_scroll_does_not_move() {
+        assert_eq!(cursor_after_nudge(4, Some(0), true, false), 4);
+        assert_eq!(cursor_after_nudge(4, Some(0), false, false), 4);
+        assert_eq!(cursor_after_nudge(4, Some(0), true, true), 4);
+        assert_eq!(cursor_after_nudge(1, Some(3), true, true), 3);
+        assert_eq!(cursor_after_nudge(4, Some(1), false, true), 1);
     }
 
     #[test]
