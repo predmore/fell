@@ -51,7 +51,10 @@ impl DraftHub {
         rx
     }
 
-    pub fn insert(&self, session: DraftSession) {
+    /// Add a live draft. Its saves run on a writer thread from now on, so
+    /// holding the session lock never waits for disk.
+    pub fn insert(&self, mut session: DraftSession) {
+        session.attach_writer();
         let id = session.id().to_string();
         self.sessions.lock().expect("sessions").insert(id, session);
         self.emit();
@@ -72,6 +75,21 @@ impl DraftHub {
             self.emit();
         }
         Some(value)
+    }
+
+    /// Wait until every live draft's queued save is on disk. The app calls
+    /// this when it quits.
+    pub fn settle_all(&self) {
+        let waiters: Vec<super::SaveWaiter> = self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .values()
+            .filter_map(DraftSession::save_waiter)
+            .collect();
+        for waiter in waiters {
+            let _ = waiter.wait();
+        }
     }
 
     /// The compose window calls this after it is showing `id`.
@@ -160,7 +178,8 @@ impl DraftHub {
                 return denied(&id, "draft has no mailbox record");
             }
             match DraftSession::open_folder(&folder, crate::AccountId(account)) {
-                Ok(session) => {
+                Ok(mut session) => {
+                    session.attach_writer();
                     sessions.insert(draft_id.clone(), session);
                 }
                 Err(err) => return denied(&id, &err),
@@ -290,8 +309,21 @@ impl DraftHub {
                 "error": "unknown draft op"
             }),
         };
+        let saved = sessions.get(&draft_id).and_then(DraftSession::save_waiter);
         drop(sessions);
         self.emit();
+        // An agent reads draft.md right after a tool returns, so the reply
+        // waits for the save. The session lock is already released, so the
+        // editor keeps painting meanwhile.
+        if let Some(saved) = saved
+            && let Err(err) = saved.wait()
+            && let Some(object) = reply.as_object_mut()
+        {
+            // The edit is in the live draft and on screen; only the file
+            // write failed, so the agent should not repeat the edit.
+            object.insert("saved".into(), json!(false));
+            object.insert("save_error".into(), json!(err));
+        }
         if let Some(id) = reveal {
             let shown = self.wait_shown(&id);
             if let Some(object) = reply.as_object_mut() {

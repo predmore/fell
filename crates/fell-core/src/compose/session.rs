@@ -14,6 +14,7 @@ use super::merge::{self, HunkKind};
 use super::mime::{self, Outgoing, ResolvedFile};
 use super::persist;
 use super::workspace::{self, Closure};
+use super::writer::{DraftWriter, MailboxSave, OwnWrites, SaveCache, SaveJob, SaveWaiter};
 
 const DEBOUNCE_MS: u64 = 150;
 
@@ -111,9 +112,15 @@ pub struct DraftSession {
     store_path: Option<PathBuf>,
     /// When the latest unflushed editor change was armed. `None` when the file is current.
     outbound_since: Option<u64>,
-    /// Path, length, and mtime of attachments last copied into the mailbox.
-    attachment_stamp: Vec<(String, u64, u128)>,
+    /// Synchronous saves: the attachment stamp last copied into the mailbox.
+    save_cache: SaveCache,
+    /// Saves run here, off the lock the editor paints from, once attached.
+    writer: Option<DraftWriter>,
+    /// Texts queued on `writer` that `draft.md` may still show.
+    own_writes: OwnWrites,
     pending: Option<String>,
+    /// [`Self::disk_generation`] when `pending` was read.
+    pending_seen: u64,
     pending_delete: bool,
     pending_since: u64,
     open: bool,
@@ -156,8 +163,11 @@ impl DraftSession {
             settled: String::new(),
             store_path: None,
             outbound_since: None,
-            attachment_stamp: Vec::new(),
+            save_cache: SaveCache::default(),
+            writer: None,
+            own_writes: OwnWrites::default(),
             pending: None,
+            pending_seen: 0,
             pending_delete: false,
             pending_since: 0,
             open: false,
@@ -480,19 +490,35 @@ impl DraftSession {
         diff
     }
 
+    /// What `draft.md` holds now. Call [`Self::push_disk_seen`] instead when
+    /// the file was read before taking the session lock.
     pub fn push_disk(&mut self, content: Option<String>, now_ms: u64) {
+        let since = self.disk_generation();
+        self.push_disk_seen(content, since, now_ms);
+    }
+
+    /// The newest save on disk. A watcher samples this before reading
+    /// `draft.md`, so a read that lands after a later save still knows the
+    /// text it saw was Fell's own.
+    pub fn disk_generation(&self) -> u64 {
+        self.writer.as_ref().map_or(0, DraftWriter::written)
+    }
+
+    /// `content` was read after [`Self::disk_generation`] returned `since`.
+    pub fn push_disk_seen(&mut self, content: Option<String>, since: u64, now_ms: u64) {
         match content {
             None => {
                 self.pending = None;
                 self.pending_delete = true;
                 self.pending_since = now_ms;
             }
-            Some(text) if text == self.last_written => {
+            Some(text) if self.is_own_write(&text, since) => {
                 self.pending = None;
                 self.pending_delete = false;
             }
             Some(text) => {
                 self.pending = Some(text);
+                self.pending_seen = since;
                 self.pending_delete = false;
                 self.pending_since = now_ms;
             }
@@ -516,7 +542,7 @@ impl DraftSession {
         let Some(text) = self.pending.take() else {
             return false;
         };
-        if text == self.last_written {
+        if self.is_own_write(&text, self.pending_seen) {
             return false;
         }
         self.merge_disk(&text);
@@ -544,44 +570,69 @@ impl DraftSession {
         self.flush().is_ok()
     }
 
+    /// Save the draft file, its hunks, and its mailbox row.
+    ///
+    /// With a writer attached this only queues the save, so the caller's
+    /// lock is not held across disk I/O; a failed write shows as a notice on
+    /// the next save. Without one it writes before returning.
     pub fn flush(&mut self) -> Result<(), String> {
         self.outbound_since = None;
         let text = self.serialize();
-        workspace::write_draft_file(&self.folder, &text)?;
-        self.last_written = text;
-        self.save_hunks();
-        self.persist_mailbox();
-        Ok(())
+        let job = SaveJob {
+            folder: self.folder.clone(),
+            text: text.clone(),
+            hunks_json: self.hunks_json(),
+            mailbox: Some(self.mailbox_save()),
+        };
+        self.last_written = text.clone();
+        if let Some(writer) = &self.writer {
+            if let Some(err) = writer.take_error() {
+                self.notices.push(format!("could not save draft.md: {err}"));
+            }
+            let number = writer.submit(job);
+            self.own_writes.note(number, text);
+            return Ok(());
+        }
+        job.run(&mut self.save_cache)
     }
 
-    fn persist_mailbox(&mut self) {
-        let path = self
-            .store_path
-            .clone()
-            .or_else(|| persist::remembered_store_path(&self.id));
-        let Some(path) = path.filter(|path| path.is_file()) else {
-            return;
-        };
-        let Ok(store) = crate::Store::open(&path) else {
-            return;
-        };
-        let draft = persist::StoredCompose {
-            id: self.id.clone(),
-            account_id: self.account_id.clone(),
-            fields: self.fields.clone(),
-            body: self.body.clone(),
-            files: Vec::new(),
-            identities: self.identities.iter().cloned().collect(),
-            owner: self.owner.clone(),
-        };
-        let stamp = attachment_stamp(&self.folder, &self.fields, &self.body);
-        if stamp == self.attachment_stamp {
-            let _ = store.save_compose_text(&draft);
-            return;
+    /// Run later saves on a thread of their own. The app attaches one for
+    /// every draft it shows; tests and the file fallback save inline.
+    pub fn attach_writer(&mut self) {
+        if self.writer.is_none() {
+            self.writer = Some(DraftWriter::spawn());
         }
-        let files = workspace::resolve_closure(&self.folder, &self.fields, &self.body).files;
-        let _ = store.save_compose(&persist::StoredCompose { files, ..draft });
-        self.attachment_stamp = stamp;
+    }
+
+    /// Waits for every save queued so far. Call it after releasing the
+    /// session lock; `None` when saves are synchronous.
+    pub fn save_waiter(&self) -> Option<SaveWaiter> {
+        self.writer.as_ref().map(DraftWriter::waiter)
+    }
+
+    /// `text` is Fell's own: the last text it queued, or, with a writer, a
+    /// save numbered `since` or later (a read made when save `since` was the
+    /// newest on disk shows that save or a newer one).
+    fn is_own_write(&self, text: &str, since: u64) -> bool {
+        if text == self.last_written {
+            return true;
+        }
+        self.writer.is_some() && self.own_writes.contains(since, text)
+    }
+
+    fn mailbox_save(&self) -> MailboxSave {
+        MailboxSave {
+            store_path: self.store_path.clone(),
+            draft: persist::StoredCompose {
+                id: self.id.clone(),
+                account_id: self.account_id.clone(),
+                fields: self.fields.clone(),
+                body: self.body.clone(),
+                files: Vec::new(),
+                identities: self.identities.iter().cloned().collect(),
+                owner: self.owner.clone(),
+            },
+        }
     }
 
     pub fn closure(&self) -> Closure {
@@ -850,7 +901,7 @@ impl DraftSession {
         self.next_hunk = self.hunks.iter().map(|hunk| hunk.id).max().unwrap_or(0) + 1;
     }
 
-    fn save_hunks(&self) {
+    fn hunks_json(&self) -> String {
         let items: Vec<serde_json::Value> = self
             .hunks
             .iter()
@@ -870,12 +921,7 @@ impl DraftSession {
                 })
             })
             .collect();
-        let control = workspace::control_dir(&self.folder);
-        let _ = std::fs::create_dir_all(&control);
-        let _ = std::fs::write(
-            control.join("hunks.json"),
-            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
-        );
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
     }
 }
 
@@ -934,7 +980,11 @@ fn hash_file(folder: &Path, relative: &str) -> Option<u64> {
     Some(hash)
 }
 
-fn attachment_stamp(folder: &Path, fields: &DraftFields, body: &str) -> Vec<(String, u64, u128)> {
+pub(crate) fn attachment_stamp(
+    folder: &Path,
+    fields: &DraftFields,
+    body: &str,
+) -> Vec<(String, u64, u128)> {
     let (files, _) = workspace::list_closure(folder, fields, body);
     let mut stamp = Vec::new();
     for file in files {
@@ -1576,5 +1626,171 @@ mod tests {
         session.set_body_from_user("![chart](chart.png)\n".into());
         session.mark_seen();
         assert!(session.prepare_send().is_ok());
+    }
+
+    #[test]
+    fn a_save_with_a_writer_does_not_touch_disk_on_the_calling_thread() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut session) = temp_session("body\n");
+        session.attach_writer();
+        let folder = session.folder().to_path_buf();
+        let control = workspace::control_dir(&folder);
+        // Saves into a folder this thread cannot write. An inline save
+        // would fail here; a queued one returns and reports later.
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly = fs::write(folder.join("probe"), "x").is_err();
+        session.set_body_from_user("changed\n".into());
+        assert!(session.flush().is_ok());
+        let _ = session.save_waiter().unwrap().wait();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        session.set_body_from_user("again\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        if readonly {
+            assert!(
+                session
+                    .snapshot()
+                    .notices
+                    .iter()
+                    .any(|notice| notice.starts_with("could not save draft.md")),
+                "{:?}",
+                session.snapshot().notices
+            );
+        }
+        let disk = fs::read_to_string(folder.join("draft.md")).unwrap();
+        assert_eq!(disk, session.serialize());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_saves_land_in_order_and_the_newest_wins() {
+        let (root, mut session) = temp_session("0\n");
+        session.attach_writer();
+        for step in 1..=50 {
+            session.set_body_from_user(format!("{step}\n"));
+            session.flush().unwrap();
+        }
+        session.save_waiter().unwrap().wait().unwrap();
+        let disk = fs::read_to_string(session.folder().join("draft.md")).unwrap();
+        assert_eq!(disk, session.serialize());
+        assert!(disk.ends_with("50\n"), "{disk}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_queued_save_is_not_read_back_as_an_agent_edit() {
+        let (root, mut session) = temp_session("first\n");
+        session.attach_writer();
+        session.set_body_from_user("second\n".into());
+        session.flush().unwrap();
+        let older = session.serialize();
+        session.set_body_from_user("third\n".into());
+        session.flush().unwrap();
+        // The watcher can read the file while it still shows the older
+        // save. That is Fell's own write, not an agent edit.
+        session.push_disk(Some(older.clone()), 0);
+        assert!(!session.poll_disk(10_000));
+        assert!(session.snapshot().hunks.is_empty());
+        session.save_waiter().unwrap().wait().unwrap();
+        // Once the newer save is on disk, the older text from someone else
+        // is a real edit again.
+        assert!(!session.is_own_write(&older, session.disk_generation()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_save_does_not_merge_the_bytes_still_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        let folder = session.folder().to_path_buf();
+        session.set_body_from_user("beta\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        let on_disk = fs::read_to_string(folder.join("draft.md")).unwrap();
+        // The next save cannot replace draft.md.
+        let control = workspace::control_dir(&folder);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o500)).unwrap();
+        let readonly = fs::write(folder.join("probe"), "x").is_err();
+        session.set_body_from_user("gamma\n".into());
+        session.flush().unwrap();
+        let saved = session.save_waiter().unwrap().wait();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        if readonly {
+            assert!(
+                saved.is_err(),
+                "the agent reply must not claim the save landed"
+            );
+        }
+        // The watcher reads what is really on disk: the earlier save.
+        session.push_disk(Some(on_disk), 0);
+        assert!(!session.poll_disk(10_000));
+        assert!(session.snapshot().hunks.is_empty());
+        assert!(session.body().starts_with("gamma"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_read_made_before_a_later_save_is_still_fells_own() {
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        session.set_body_from_user("beta\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        // The watcher samples, reads draft.md, then waits for the lock...
+        let since = session.disk_generation();
+        let read = fs::read_to_string(session.folder().join("draft.md")).unwrap();
+        // ...while the editor saves again.
+        session.set_body_from_user("gamma\n".into());
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        session.push_disk_seen(Some(read), since, 0);
+        assert!(!session.poll_disk(10_000));
+        assert!(session.snapshot().hunks.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropping_a_draft_writes_its_queued_save_first() {
+        let (root, mut session) = temp_session("alpha\n");
+        session.attach_writer();
+        let folder = session.folder().to_path_buf();
+        for step in 0..20 {
+            session.set_body_from_user(format!("step {step}\n"));
+            session.flush().unwrap();
+        }
+        let expected = session.serialize();
+        drop(session);
+        assert_eq!(
+            fs::read_to_string(folder.join("draft.md")).unwrap(),
+            expected
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settling_the_hub_waits_for_every_draft() {
+        let (root, session) = temp_session("alpha\n");
+        let folder = session.folder().to_path_buf();
+        let id = session.id().to_string();
+        let hub = super::super::DraftHub::new();
+        hub.insert(session);
+        let expected = hub
+            .with_session(&id, |session| {
+                session.set_body_from_user("on quit\n".into());
+                session.flush().unwrap();
+                session.serialize()
+            })
+            .unwrap();
+        hub.settle_all();
+        assert_eq!(
+            fs::read_to_string(folder.join("draft.md")).unwrap(),
+            expected
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

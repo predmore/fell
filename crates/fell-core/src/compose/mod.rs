@@ -11,6 +11,7 @@ mod mime;
 mod persist;
 mod session;
 mod workspace;
+mod writer;
 
 pub use frontmatter::{
     AttachmentRef, DraftFields, DraftIssue, ParsedDraft, email_of, format_address_line,
@@ -36,3 +37,4 @@ pub use workspace::{
     materialize_workspace, read_account, read_owner, require_owner, resolve_inside, write_owner,
     write_store_link,
 };
+pub use writer::SaveWaiter;

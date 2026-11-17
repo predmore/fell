@@ -173,6 +173,8 @@ pub struct ComposeView {
     palette: Option<String>,
     status: SharedString,
     sent: bool,
+    /// A send is talking to the server. Another send waits for it.
+    sending: bool,
     watching: bool,
     flush_pending: bool,
     flush_gen: u64,
@@ -213,6 +215,7 @@ impl ComposeView {
             palette: None,
             status: "i insert".into(),
             sent: false,
+            sending: false,
             watching: false,
             flush_pending: false,
             flush_gen: 0,
@@ -492,7 +495,14 @@ impl ComposeView {
         }
     }
 
-    fn send(&mut self) {
+    /// Check and build the message under the draft lock, then talk to SMTP
+    /// on a background thread. The window keeps painting while Bridge
+    /// answers, and a second send waits for the first to finish.
+    fn send(&mut self, cx: &mut Context<Self>) {
+        if self.sending {
+            self.status = "Sending…".into();
+            return;
+        }
         if self.field != Field::Body && !self.commit_field(self.field) {
             return;
         }
@@ -502,28 +512,45 @@ impl ComposeView {
         }
         self.flush_now();
         let id = self.draft_id.to_string();
-        let account = self
-            .hub
-            .with_session(&id, |session| session.account_id().clone());
-        let Some(account) = account else {
-            self.status = "draft is not open".into();
-            return;
-        };
-        let backend = fell_core::backend_for(&account);
-        let outcome = self
-            .hub
-            .with_session(&id, |session| send_from_editor(session, backend.as_ref()));
-        match outcome {
-            Some(Ok(_)) => {
-                self.sent = true;
-                self.status = "Sent from the editor".into();
-            }
+        let prepared = self.hub.with_session(&id, prepare_from_editor);
+        let prepared = match prepared {
+            Some(Ok(prepared)) => prepared,
             Some(Err(err)) => {
                 self.sent = false;
                 self.status = format!("Not sent: {err}").into();
+                return;
             }
-            None => self.status = "draft is not open".into(),
-        }
+            None => {
+                self.status = "draft is not open".into();
+                return;
+            }
+        };
+        self.sending = true;
+        self.status = "Sending…".into();
+        let hub = self.hub.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    prepared.transmit(|| hub.with_session(&id, |session| session.revision()))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.sending = false;
+                match outcome {
+                    Ok(_) => {
+                        this.sent = true;
+                        this.status = "Sent from the editor".into();
+                    }
+                    Err(err) => {
+                        this.sent = false;
+                        this.status = format!("Not sent: {err}").into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn undo(&mut self) {
@@ -562,11 +589,11 @@ impl ComposeView {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
         if self.palette.is_some() {
-            self.palette_key(key, typed);
+            self.palette_key(key, typed, cx);
             return;
         }
         if self.leader {
-            self.leader_key(key);
+            self.leader_key(key, cx);
             return;
         }
         if key == "escape" {
@@ -607,7 +634,7 @@ impl ComposeView {
         }
     }
 
-    fn palette_key(&mut self, key: &str, typed: Option<&str>) {
+    fn palette_key(&mut self, key: &str, typed: Option<&str>, cx: &mut Context<Self>) {
         let Some(query) = self.palette.as_mut() else {
             return;
         };
@@ -616,7 +643,7 @@ impl ComposeView {
             "enter" => {
                 let query = query.clone();
                 self.palette = None;
-                self.run_palette(&query);
+                self.run_palette(&query, cx);
             }
             "backspace" => {
                 query.pop();
@@ -629,15 +656,15 @@ impl ComposeView {
         }
     }
 
-    fn run_palette(&mut self, query: &str) {
+    fn run_palette(&mut self, query: &str, cx: &mut Context<Self>) {
         if let Some(action) = palette_action(query) {
-            self.run_action(action);
+            self.run_action(action, cx);
         }
     }
 
-    fn run_action(&mut self, action: &str) {
+    fn run_action(&mut self, action: &str, cx: &mut Context<Self>) {
         match action {
-            "send" => self.send(),
+            "send" => self.send(cx),
             "preview" => {
                 self.preview = !self.preview;
                 self.status = if self.preview {
@@ -665,7 +692,7 @@ impl ComposeView {
         }
     }
 
-    fn leader_key(&mut self, key: &str) {
+    fn leader_key(&mut self, key: &str, cx: &mut Context<Self>) {
         match key {
             "m" => {
                 self.status = "mail: s send · p preview · r raw · q quote · t theme".into();
@@ -709,7 +736,7 @@ impl ComposeView {
         self.leader = false;
         self.which_visible = false;
         if !action.is_empty() {
-            self.run_action(action);
+            self.run_action(action, cx);
         }
     }
 
@@ -1144,10 +1171,29 @@ impl Drop for ComposeView {
     }
 }
 
+/// Check and send the draft on screen in one call. Blocks on SMTP, so the
+/// window uses [`prepare_from_editor`] and transmits off its thread.
 pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, String> {
+    prepare_from_editor(session)?.transmit_with(backend)
+}
+
+/// The message the editor is about to send, checked and built while the
+/// draft lock is held, so what was on screen is what goes out.
+pub struct PreparedSend {
+    account: fell_core::AccountId,
+    /// The draft revision these checks passed on.
+    revision: u64,
+    outgoing: fell_core::compose::Outgoing,
+    files: Vec<fell_core::SubmittedFile>,
+}
+
+/// Run the editor's send checks and read the attachments. No network.
+pub fn prepare_from_editor(
+    session: &mut fell_core::compose::DraftSession,
+) -> Result<PreparedSend, String> {
     let outgoing = session.prepare_send()?;
     let files = session
         .resolved_files()
@@ -1158,13 +1204,47 @@ pub fn send_from_editor(
             inline: file.inline,
         })
         .collect();
-    let pending = backend
-        .submit_composed(outgoing.draft, outgoing.mime, files)
-        .map_err(|err| err.to_string())?;
-    let confirm = confirmation_from_ui(&pending);
-    backend
-        .confirm_send(pending, confirm)
-        .map_err(|err| err.to_string())
+    Ok(PreparedSend {
+        account: session.account_id().clone(),
+        revision: session.revision(),
+        outgoing,
+        files,
+    })
+}
+
+impl PreparedSend {
+    /// Submit and confirm through the account's backend. Blocks on SMTP.
+    /// `revision_now` reads the draft's revision right before the message is
+    /// handed to SMTP; if anything changed since the checks, nothing is sent.
+    pub fn transmit(
+        self,
+        revision_now: impl FnOnce() -> Option<u64>,
+    ) -> Result<fell_core::SentMessage, String> {
+        let backend = fell_core::backend_for(&self.account);
+        self.transmit_checked(backend.as_ref(), revision_now)
+    }
+
+    fn transmit_with(self, backend: &dyn MailBackend) -> Result<fell_core::SentMessage, String> {
+        let revision = self.revision;
+        self.transmit_checked(backend, || Some(revision))
+    }
+
+    fn transmit_checked(
+        self,
+        backend: &dyn MailBackend,
+        revision_now: impl FnOnce() -> Option<u64>,
+    ) -> Result<fell_core::SentMessage, String> {
+        let pending = backend
+            .submit_composed(self.outgoing.draft, self.outgoing.mime, self.files)
+            .map_err(|err| err.to_string())?;
+        if revision_now() != Some(self.revision) {
+            return Err("the draft changed while sending; nothing was sent".into());
+        }
+        let confirm = confirmation_from_ui(&pending);
+        backend
+            .confirm_send(pending, confirm)
+            .map_err(|err| err.to_string())
+    }
 }
 
 fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {

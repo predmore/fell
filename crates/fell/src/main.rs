@@ -73,6 +73,13 @@ fn main() {
     let draft_id_for_window = draft_id.clone();
     let folder_for_window = folder.clone();
     Application::new().run(move |cx: &mut App| {
+        // Saves run on writer threads. Quitting waits for the queued ones.
+        let quitting = hub.clone();
+        cx.on_app_quit(move |_| {
+            let hub = quitting.clone();
+            async move { hub.settle_all() }
+        })
+        .detach();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let hub = hub.clone();
         let draft_id = draft_id_for_window.clone();
@@ -215,9 +222,14 @@ fn watch_folder(
                     if fell_core::compose::draft_file_is_symlink(&current_folder) {
                         continue;
                     }
+                    // Sample before reading: the read happens outside the
+                    // lock, and a save can land in between.
+                    let since = hub
+                        .with_session(&id, |session| session.disk_generation())
+                        .unwrap_or(0);
                     let content = std::fs::read_to_string(current_folder.join("draft.md")).ok();
                     hub.with_session(&id, |session| {
-                        session.push_disk(content, 0);
+                        session.push_disk_seen(content, since, 0);
                         session.poll_disk(150);
                     });
                 }
