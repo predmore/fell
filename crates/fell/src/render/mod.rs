@@ -303,9 +303,9 @@ impl Render for Reader {
         }
         let palette = self.theme.palette();
         let images = if self.model.remote_images_allowed() {
-            "Remote images allowed"
+            "Remote images allowed · Block"
         } else {
-            "Remote images blocked. Press i to allow them."
+            "Remote images blocked · Allow"
         };
         div()
             .id("fell-reader")
@@ -368,12 +368,25 @@ impl Render for Reader {
                     ),
             )
             .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_sm()
-                    .text_color(paint(palette.accent))
-                    .child(images),
+                div().px_4().py_2().child(
+                    div()
+                        .id("remote-images")
+                        .px_3()
+                        .py_1()
+                        .border(px(1.))
+                        .border_color(paint(palette.accent))
+                        .rounded(px(4.))
+                        .bg(paint(palette.surface))
+                        .text_sm()
+                        .text_color(paint(palette.accent))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            this.model
+                                .set_remote_images_allowed(!this.model.remote_images_allowed());
+                            cx.notify();
+                        }))
+                        .child(images),
+                ),
             )
             .child(message_body(self, &palette))
     }
@@ -385,7 +398,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
-        .px_5()
+        .px_4()
         .py_4();
     if reader.model.mode() == RenderMode::Web {
         if let Some(image) = reader.web_image.clone() {

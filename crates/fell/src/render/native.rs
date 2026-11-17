@@ -253,7 +253,7 @@ fn list_item(
         .child(
             div()
                 .flex_shrink_0()
-                .text_base()
+                .text_lg()
                 .text_color(paint(palette.foreground))
                 .child(marker),
         )
@@ -513,8 +513,8 @@ fn image_el(
         }
     };
     let mut placeholder = div()
-        .w(px(220.))
-        .h(px(88.))
+        .w(px(280.))
+        .h(px(120.))
         .px_3()
         .flex()
         .items_center()
@@ -532,6 +532,8 @@ fn image_el(
 pub(crate) fn embedded_web(image: Arc<RenderImage>) -> AnyElement {
     div()
         .w_full()
+        .border(px(1.))
+        .border_color(paint(0x6e6a64))
         .child(img(image).w_full().object_fit(gpui::ObjectFit::Contain))
         .into_any_element()
 }
