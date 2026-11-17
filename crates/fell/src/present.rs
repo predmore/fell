@@ -376,6 +376,8 @@ mod tests {
             bcc: Vec::new(),
             starred: false,
             has_attachment: false,
+            archived: false,
+            snooze_until: None,
         };
         let messages = conversation(
             &[

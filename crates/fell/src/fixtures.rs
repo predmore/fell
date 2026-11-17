@@ -351,6 +351,8 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
         bcc: Vec::new(),
         starred: row.starred,
         has_attachment: row.attachment,
+        archived: false,
+        snooze_until: None,
     }
 }
 

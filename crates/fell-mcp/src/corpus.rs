@@ -164,6 +164,7 @@ fn message(id: &str, name: &str, email: &str, body: &str, date_unix: i64) -> Mes
         to: Vec::new(),
         cc: Vec::new(),
         bcc: Vec::new(),
+        starred: false,
         has_attachment: false,
         archived: false,
         snooze_until: None,
