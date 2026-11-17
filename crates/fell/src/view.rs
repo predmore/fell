@@ -56,6 +56,7 @@ struct Inbox {
     list_scroll: ScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
+    folder_scroll: ScrollHandle,
     split: f32,
     dragging: bool,
     open_thread: Option<String>,
@@ -79,6 +80,7 @@ impl Inbox {
             list_scroll: ScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
+            folder_scroll: ScrollHandle::new(),
             split: mailbox.split,
             dragging: false,
             open_thread: None,
@@ -86,8 +88,9 @@ impl Inbox {
         if let Some(error) = mailbox.error {
             inbox.session.error = Some(error);
         }
-        inbox.reload_threads();
-        inbox.reload_messages(true);
+        if inbox.reload_threads() && !inbox.reload_messages(true) {
+            inbox.clear_open_message();
+        }
         inbox.scroll_conversation();
         inbox.watch_theme(cx);
         inbox
@@ -116,43 +119,57 @@ impl Inbox {
         .detach();
     }
 
-    fn reload_threads(&mut self) {
+    fn reload_threads(&mut self) -> bool {
         match self
             .store
             .folder_threads(&self.account_id, &self.session.folder)
         {
             Ok(threads) => {
+                self.session.error = None;
                 if let Ok(names) = self.store.folder_names(&self.account_id) {
                     self.session.folders = names;
                 }
                 let rows = present::thread_rows(&threads, &self.session.account_email, now_unix());
                 self.session.set_threads(rows);
+                true
             }
-            Err(err) => self.session.error = Some(err.to_string()),
+            Err(err) => {
+                self.session.error = Some(err.to_string());
+                false
+            }
         }
     }
 
-    fn reload_messages(&mut self, force: bool) {
+    fn reload_messages(&mut self, force: bool) -> bool {
         let Some(id) = self.session.cursor_id.clone() else {
-            self.session.messages.clear();
-            self.open_thread = None;
-            return;
+            self.clear_open_message();
+            return true;
         };
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
-            return;
+            return true;
         }
         match self
             .store
             .thread_messages(&self.account_id, &ThreadId(id.clone()))
         {
             Ok(messages) => {
+                self.session.error = None;
                 let view =
                     present::conversation(&messages, &self.session.account_email, now_unix());
                 self.session.set_messages(view);
                 self.open_thread = Some(id);
+                true
             }
-            Err(err) => self.session.error = Some(err.to_string()),
+            Err(err) => {
+                self.session.error = Some(err.to_string());
+                false
+            }
         }
+    }
+
+    fn clear_open_message(&mut self) {
+        self.session.messages.clear();
+        self.open_thread = None;
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -163,8 +180,9 @@ impl Inbox {
         let page = self.page_rows();
         let message_before = self.session.message_cursor;
         let thread_before = self.session.cursor_id.clone();
+        let folder_before = self.session.folder.clone();
         let step = self.session.on_key(key, page);
-        self.apply_step(step, message_before, thread_before, cx);
+        self.apply_step(step, message_before, thread_before, folder_before, cx);
         cx.stop_propagation();
     }
 
@@ -173,18 +191,27 @@ impl Inbox {
         step: Step,
         message_before: usize,
         thread_before: Option<String>,
+        folder_before: String,
         cx: &mut Context<Self>,
     ) {
         let mut loaded_messages = false;
         let mut loaded_threads = false;
         if step.reload_threads {
-            self.reload_threads();
-            self.reload_messages(true);
-            loaded_messages = true;
-            loaded_threads = true;
+            if !self.reload_threads() {
+                self.session.folder = folder_before;
+            } else {
+                loaded_threads = true;
+                if !self.reload_messages(true) {
+                    self.clear_open_message();
+                }
+                loaded_messages = true;
+            }
         } else if step.reload_messages {
-            self.reload_messages(true);
-            loaded_messages = true;
+            if !self.reload_messages(true) {
+                self.session.cursor_id = thread_before.clone();
+            } else {
+                loaded_messages = true;
+            }
         }
         if step.arm_which {
             self.arm_which(cx);
@@ -201,6 +228,9 @@ impl Inbox {
         if self.session.overlay == Overlay::Palette {
             self.palette_scroll
                 .scroll_to_item(self.session.palette_index);
+        }
+        if self.session.overlay == Overlay::Folders {
+            self.folder_scroll.scroll_to_item(self.session.folder_index);
         }
         cx.notify();
     }
@@ -252,11 +282,15 @@ impl Inbox {
 
     fn select_thread(&mut self, id: String) {
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
+        let previous = self.session.cursor_id.clone();
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
         if changed {
-            self.reload_messages(true);
-            self.scroll_conversation();
+            if !self.reload_messages(true) {
+                self.session.cursor_id = previous;
+            } else {
+                self.scroll_conversation();
+            }
         }
         self.list_scroll.scroll_to_item(self.session.cursor_index());
     }
@@ -270,6 +304,7 @@ impl Render for Inbox {
         let list_scroll = self.list_scroll.clone();
         let conv_scroll = self.conv_scroll.clone();
         let palette_scroll = self.palette_scroll.clone();
+        let folder_scroll = self.folder_scroll.clone();
         let focus = self.focus.clone();
         let split = self.split;
         shell(
@@ -280,6 +315,7 @@ impl Render for Inbox {
             list_scroll,
             conv_scroll,
             palette_scroll,
+            folder_scroll,
             focus,
             cx,
         )
@@ -295,6 +331,7 @@ fn shell(
     list_scroll: ScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
+    folder_scroll: ScrollHandle,
     focus: FocusHandle,
     cx: &mut Context<Inbox>,
 ) -> impl IntoElement {
@@ -363,7 +400,13 @@ fn shell(
             |root| root.child(which_key_popup(&theme, &session)),
         )
         .when(session.overlay != Overlay::None, |root| {
-            root.child(overlay(&theme, &session, &palette_scroll, cx))
+            root.child(overlay(
+                &theme,
+                &session,
+                &palette_scroll,
+                &folder_scroll,
+                cx,
+            ))
         })
 }
 
@@ -1095,6 +1138,7 @@ fn overlay(
     theme: &Theme,
     session: &Session,
     palette_scroll: &ScrollHandle,
+    folder_scroll: &ScrollHandle,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     div()
@@ -1116,7 +1160,7 @@ fn overlay(
         )
         .child(match session.overlay {
             Overlay::Palette => palette(theme, session, palette_scroll, cx).into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, cx).into_any_element(),
+            Overlay::Folders => folder_picker(theme, session, folder_scroll, cx).into_any_element(),
             Overlay::Help => help(theme, session, cx).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
@@ -1199,8 +1243,15 @@ fn palette(
                                 let page = inbox.page_rows();
                                 let message_before = inbox.session.message_cursor;
                                 let thread_before = inbox.session.cursor_id.clone();
+                                let folder_before = inbox.session.folder.clone();
                                 let step = inbox.session.perform(action, page);
-                                inbox.apply_step(step, message_before, thread_before, cx);
+                                inbox.apply_step(
+                                    step,
+                                    message_before,
+                                    thread_before,
+                                    folder_before,
+                                    cx,
+                                );
                             }),
                         )
                         .child(div().flex_1().child(item.label.clone()))
@@ -1219,7 +1270,12 @@ fn palette(
         )
 }
 
-fn folder_picker(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
+fn folder_picker(
+    theme: &Theme,
+    session: &Session,
+    scroll: &ScrollHandle,
+    cx: &mut Context<Inbox>,
+) -> gpui::Div {
     let choices = session.folder_choices();
     let selected = session.folder_index;
     div()
@@ -1259,6 +1315,7 @@ fn folder_picker(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> g
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
+                .track_scroll(scroll)
                 .py(px(4.))
                 .children(choices.iter().enumerate().map(|(index, name)| {
                     let name = name.clone();
@@ -1288,13 +1345,19 @@ fn folder_picker(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> g
                                 window.focus(&inbox.focus);
                                 inbox.session.overlay = Overlay::None;
                                 if inbox.session.folder != name {
+                                    let previous = inbox.session.folder.clone();
                                     inbox.session.folder = name.clone();
-                                    inbox.reload_threads();
-                                    inbox.reload_messages(true);
-                                    inbox
-                                        .list_scroll
-                                        .scroll_to_item(inbox.session.cursor_index());
-                                    inbox.scroll_conversation();
+                                    if !inbox.reload_threads() {
+                                        inbox.session.folder = previous;
+                                    } else {
+                                        if !inbox.reload_messages(true) {
+                                            inbox.clear_open_message();
+                                        }
+                                        inbox
+                                            .list_scroll
+                                            .scroll_to_item(inbox.session.cursor_index());
+                                        inbox.scroll_conversation();
+                                    }
                                 }
                                 cx.notify();
                             }),
