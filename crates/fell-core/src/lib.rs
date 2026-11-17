@@ -1,4 +1,4 @@
-//! UI-free core for Fell: accounts, backends, local store, threading, and search.
+//! UI-free core for Fell: accounts, backends, local store, threading, search, and actions.
 //!
 //! The GPUI crate and the MCP stub depend on this crate. This crate does not
 //! depend on them.
@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod actions;
 pub mod backend;
 pub mod message;
 pub mod search;
@@ -15,6 +16,7 @@ pub mod sync;
 pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
+pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use backend::{
     BridgeBackend, FixtureBackend, MailBackend, MailboxDelta, ProtonApiBackend, SyncCursor,
 };
@@ -32,6 +34,8 @@ pub enum Error {
     Store(#[from] rusqlite::Error),
     #[error("search: {0}")]
     Search(String),
+    #[error("{0}")]
+    Action(String),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error("send requires explicit UI confirmation")]
