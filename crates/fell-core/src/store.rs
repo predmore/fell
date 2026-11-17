@@ -1997,8 +1997,9 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
 ///
 /// Two posts that both carry a list id are two messages. Parents match only
 /// when both name the same `In-Reply-To`, or both omit it. A parent on only
-/// one side is a different reply. A Sent copy joins only when the kept row
-/// is not already in Sent.
+/// one side is a different reply. A list id on only one copy joins only when
+/// the other copy is in Sent, and that Sent copy joins only when the kept
+/// row is not already in Sent.
 fn short_reply_is_one_post(
     incoming: &Message,
     stored: &Arrival,
@@ -2021,7 +2022,16 @@ fn short_reply_is_one_post(
     let stored_sent = split_field(&stored.folders)
         .iter()
         .any(|folder| folder.eq_ignore_ascii_case("Sent"));
-    !(incoming_sent && stored_sent)
+    if incoming_sent && stored_sent {
+        return false;
+    }
+    // The copy without a list id is the Sent original. An inbox row that
+    // merely lacks a list id is another post.
+    match (incoming_list, stored_list) {
+        (true, false) => stored_sent,
+        (false, true) => incoming_sent,
+        _ => true,
+    }
 }
 
 /// Both copies name the same parent, or both have none.
@@ -4828,16 +4838,34 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
         let sent_at = 1_700_000_000;
-        let mut first = msg("thanks-a@x", None, None, "First thanks", "Thanks");
+        let mut first = msg(
+            "thanks-a@x",
+            None,
+            None,
+            "First thanks",
+            "Thanks for the detailed notes",
+        );
         first.headers.date_unix = sent_at;
         store.upsert_message(&first).unwrap();
-        let mut echo = msg("thanks-list@x", None, None, "[list] First thanks", "Thanks");
+        let mut echo = msg(
+            "thanks-list@x",
+            None,
+            None,
+            "[list] First thanks",
+            "Thanks for the detailed notes",
+        );
         echo.list_id = Some("list.example".into());
         echo.headers.date_unix = sent_at + 60;
         store.upsert_message(&echo).unwrap();
         assert_eq!(listed(&store).len(), 1);
 
-        let mut later = msg("thanks-b@x", None, None, "Second thanks", "Thanks");
+        let mut later = msg(
+            "thanks-b@x",
+            None,
+            None,
+            "Second thanks",
+            "Thanks for the detailed notes",
+        );
         later.headers.date_unix = sent_at + (2 * 60 * 60);
         store.upsert_message(&later).unwrap();
         let rows = listed(&store);
@@ -5037,6 +5065,51 @@ mod tests {
             sent_row.headers.in_reply_to.as_ref().map(MessageId::as_str),
             Some("other@x")
         );
+    }
+
+    #[test]
+    fn inbox_short_reply_without_list_id_stays_beside_a_list_reply() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let sent_at = 1_700_000_000;
+        let mut inbox = msg("plus-inbox@x", None, Some("patch@x"), "Re: Patch", "+1");
+        inbox.headers.date_unix = sent_at;
+        inbox.folders = vec!["INBOX".into()];
+        store.upsert_message(&inbox).unwrap();
+        let mut list = msg(
+            "plus-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Re: Patch",
+            "+1",
+        );
+        list.list_id = Some("list.example".into());
+        list.headers.date_unix = sent_at + (2 * 60 * 60);
+        list.folders = vec!["INBOX".into()];
+        store.upsert_message(&list).unwrap();
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-inbox@x")
+        );
+        assert!(
+            rows.iter()
+                .any(|message| message.headers.message_id.as_str() == "plus-list@x")
+        );
+
+        let echo = Store::open_in_memory().unwrap();
+        echo.upsert_account(&account()).unwrap();
+        let mut bare = msg("plus-bare@x", None, None, "Re: Patch", "+1");
+        bare.headers.date_unix = sent_at + 60;
+        bare.folders = vec!["INBOX".into()];
+        echo.upsert_message(&bare).unwrap();
+        let mut listed_echo = msg("plus-echo@x", None, None, "[list] Re: Patch", "+1");
+        listed_echo.list_id = Some("list.example".into());
+        listed_echo.headers.date_unix = sent_at + 90;
+        listed_echo.folders = vec!["INBOX".into()];
+        echo.upsert_message(&listed_echo).unwrap();
+        assert_eq!(listed(&echo).len(), 2);
     }
 
     #[test]
