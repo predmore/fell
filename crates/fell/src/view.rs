@@ -1171,16 +1171,14 @@ fn thread_row(
             }),
         )
         // Shorter than the row, so bars on adjacent unread rows stay apart.
+        // A read row keeps the gap but no fill, so a selected row's
+        // highlight shows through it.
         .child(
             div()
                 .w(px(3.))
                 .h(px(44.))
                 .rounded_r_sm()
-                .bg(rgb(if row.unread {
-                    theme.accent
-                } else {
-                    theme.background
-                })),
+                .when(row.unread, |bar| bar.bg(rgb(theme.accent))),
         )
         .child(
             div()
