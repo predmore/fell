@@ -7,7 +7,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::MailboxDelta;
-use crate::embed::{Embedding, invalidate_message_embedding, remove_message_embedding};
+use crate::embed::{
+    Embedding, dequeue_message, enqueue_message, invalidate_message_embedding,
+    remove_message_embedding,
+};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses,
@@ -488,6 +491,7 @@ impl Store {
         });
         sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
         remove_message_embedding(&tx, account_id.as_str(), message_id.as_str())?;
+        dequeue_message(&tx, account_id.as_str(), message_id.as_str())?;
         let removed = tx.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), stored.canonical_id],
@@ -1116,6 +1120,11 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
         labels: &labels,
     });
     sync_terms(conn, message.account_id.as_str(), &HashSet::new(), &terms)?;
+    enqueue_message(
+        conn,
+        message.account_id.as_str(),
+        message.headers.message_id.as_str(),
+    )?;
     Ok(thread_id)
 }
 

@@ -21,7 +21,9 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::account::AccountId;
-use crate::embed::{invalidate_message_embedding, remove_message_embedding};
+use crate::embed::{
+    dequeue_message, enqueue_message, invalidate_message_embedding, remove_message_embedding,
+};
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
@@ -514,6 +516,7 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
     if plan.remove_row {
         sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
         remove_message_embedding(conn, account_id.as_str(), &plan.before.message_id)?;
+        dequeue_message(conn, account_id.as_str(), &plan.before.message_id)?;
         let changed = conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
             params![account_id.as_str(), plan.before.message_id],
@@ -1319,6 +1322,7 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
         params_from_iter(values),
     )?;
     remove_message_embedding(conn, account_id.as_str(), &row.message_id)?;
+    enqueue_message(conn, account_id.as_str(), &row.message_id)?;
     Ok(())
 }
 

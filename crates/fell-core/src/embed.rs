@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     vector BLOB NOT NULL,
     PRIMARY KEY (account_id, message_id)
 );
+
+CREATE TABLE IF NOT EXISTS embedding_queue (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id)
+);
 "#;
 
 /// Placeholder vector for `body`.
@@ -437,7 +443,52 @@ pub(crate) fn invalidate_message_embedding(
     {
         return Ok(());
     }
-    remove_message_embedding(conn, account_id, message_id)
+    remove_message_embedding(conn, account_id, message_id)?;
+    enqueue_message(conn, account_id, message_id)
+}
+
+pub(crate) fn enqueue_message(conn: &Connection, account_id: &str, message_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO embedding_queue (account_id, message_id) VALUES (?1, ?2)
+         ON CONFLICT(account_id, message_id) DO NOTHING",
+        params![account_id, message_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn dequeue_message(conn: &Connection, account_id: &str, message_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM embedding_queue WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id, message_id],
+    )?;
+    Ok(())
+}
+
+fn select_queued(conn: &Connection, limit: usize) -> Result<Vec<StaleRow>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+         FROM embedding_queue q
+         JOIN messages m
+           ON m.account_id = q.account_id AND m.message_id = q.message_id
+         ORDER BY m.date_unix DESC, m.rowid DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(StaleRow {
+            key: MailKey {
+                rowid: row.get(0)?,
+                date_unix: row.get(1)?,
+            },
+            account_id: row.get(2)?,
+            message_id: row.get(3)?,
+        })
+    })?;
+    let mut pending = Vec::new();
+    for row in rows {
+        pending.push(row?);
+    }
+    Ok(pending)
 }
 
 pub(crate) fn remove_message_embedding(
@@ -498,6 +549,11 @@ enum Bound {
     Any,
     Older(MailKey),
     Newer(MailKey),
+    /// Strictly after `after` and strictly before `before`.
+    Between {
+        after: MailKey,
+        before: MailKey,
+    },
 }
 
 enum IndexStep {
@@ -508,13 +564,16 @@ enum IndexStep {
 /// One newest-to-oldest pass over rows that still need a vector.
 ///
 /// `before` is the oldest key already taken. The next older batch starts
-/// strictly below it, so a catch-up does not reread the prefix it just wrote.
-/// `high` is the newest key in this pass. Mail that arrives after that is
-/// taken before the walk continues downward.
+/// strictly below it. `high` stays the floor of that pass. Mail newer than
+/// `high` is paged downward from `newer_before` until a short batch shows the
+/// range is exhausted, and only then does the walk continue below `before`.
 #[derive(Default)]
 struct Scan {
     before: Option<MailKey>,
     high: Option<MailKey>,
+    /// Exclusive upper bound of the next page above `high`. `None` starts at
+    /// the newest row above the floor.
+    newer_before: Option<MailKey>,
 }
 
 impl Scan {
@@ -522,13 +581,30 @@ impl Scan {
         if limit == 0 {
             return Ok(IndexStep::Idle);
         }
+        let queued = select_queued(conn, limit)?;
+        if !queued.is_empty() {
+            let wrote = write_batch(conn, &queued)?;
+            return Ok(IndexStep::Wrote(wrote));
+        }
         if let Some(high) = self.high {
-            let newer = select_stale(conn, limit, Bound::Newer(high))?;
+            let bound = match self.newer_before {
+                Some(upper) => Bound::Between {
+                    after: high,
+                    before: upper,
+                },
+                None => Bound::Newer(high),
+            };
+            let newer = select_stale(conn, limit, bound)?;
             if !newer.is_empty() {
                 let wrote = write_batch(conn, &newer)?;
-                self.high = newer.first().map(|row| row.key);
+                if newer.len() == limit {
+                    self.newer_before = newer.last().map(|row| row.key);
+                } else {
+                    self.newer_before = None;
+                }
                 return Ok(IndexStep::Wrote(wrote));
             }
+            self.newer_before = None;
         }
         let bound = match self.before {
             Some(key) => Bound::Older(key),
@@ -546,6 +622,7 @@ impl Scan {
         if self.before.is_some() || self.high.is_some() {
             self.before = None;
             self.high = None;
+            self.newer_before = None;
             let top = select_stale(conn, limit, Bound::Any)?;
             if top.is_empty() {
                 return Ok(IndexStep::Idle);
@@ -565,56 +642,66 @@ fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<Sta
     let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
     let bytes = dims.saturating_mul(4);
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let (sql, date, rowid) = match bound {
-        Bound::Any => (
-            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
-             FROM messages m
-             LEFT JOIN message_embeddings e
-               ON e.account_id = m.account_id AND e.message_id = m.message_id
-             WHERE e.message_id IS NULL
+    let stale = "e.message_id IS NULL
                 OR e.model != ?1
                 OR e.model_version != ?2
                 OR e.dims != ?3
-                OR length(e.vector) != ?4
-             ORDER BY m.date_unix DESC, m.rowid DESC
-             LIMIT ?5",
-            None,
-            None,
+                OR length(e.vector) != ?4";
+    let (sql, keys) = match bound {
+        Bound::Any => (
+            format!(
+                "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+                 FROM messages m
+                 LEFT JOIN message_embeddings e
+                   ON e.account_id = m.account_id AND e.message_id = m.message_id
+                 WHERE {stale}
+                 ORDER BY m.date_unix DESC, m.rowid DESC
+                 LIMIT ?5"
+            ),
+            Vec::new(),
         ),
         Bound::Older(key) => (
-            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
-             FROM messages m
-             LEFT JOIN message_embeddings e
-               ON e.account_id = m.account_id AND e.message_id = m.message_id
-             WHERE (e.message_id IS NULL
-                OR e.model != ?1
-                OR e.model_version != ?2
-                OR e.dims != ?3
-                OR length(e.vector) != ?4)
-               AND (m.date_unix < ?6 OR (m.date_unix = ?6 AND m.rowid < ?7))
-             ORDER BY m.date_unix DESC, m.rowid DESC
-             LIMIT ?5",
-            Some(key.date_unix),
-            Some(key.rowid),
+            format!(
+                "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+                 FROM messages m
+                 LEFT JOIN message_embeddings e
+                   ON e.account_id = m.account_id AND e.message_id = m.message_id
+                 WHERE ({stale})
+                   AND (m.date_unix < ?6 OR (m.date_unix = ?6 AND m.rowid < ?7))
+                 ORDER BY m.date_unix DESC, m.rowid DESC
+                 LIMIT ?5"
+            ),
+            vec![key.date_unix, key.rowid],
         ),
         Bound::Newer(key) => (
-            "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
-             FROM messages m
-             LEFT JOIN message_embeddings e
-               ON e.account_id = m.account_id AND e.message_id = m.message_id
-             WHERE (e.message_id IS NULL
-                OR e.model != ?1
-                OR e.model_version != ?2
-                OR e.dims != ?3
-                OR length(e.vector) != ?4)
-               AND (m.date_unix > ?6 OR (m.date_unix = ?6 AND m.rowid > ?7))
-             ORDER BY m.date_unix DESC, m.rowid DESC
-             LIMIT ?5",
-            Some(key.date_unix),
-            Some(key.rowid),
+            format!(
+                "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+                 FROM messages m
+                 LEFT JOIN message_embeddings e
+                   ON e.account_id = m.account_id AND e.message_id = m.message_id
+                 WHERE ({stale})
+                   AND (m.date_unix > ?6 OR (m.date_unix = ?6 AND m.rowid > ?7))
+                 ORDER BY m.date_unix DESC, m.rowid DESC
+                 LIMIT ?5"
+            ),
+            vec![key.date_unix, key.rowid],
+        ),
+        Bound::Between { after, before } => (
+            format!(
+                "SELECT m.rowid, m.date_unix, m.account_id, m.message_id
+                 FROM messages m
+                 LEFT JOIN message_embeddings e
+                   ON e.account_id = m.account_id AND e.message_id = m.message_id
+                 WHERE ({stale})
+                   AND (m.date_unix > ?6 OR (m.date_unix = ?6 AND m.rowid > ?7))
+                   AND (m.date_unix < ?8 OR (m.date_unix = ?8 AND m.rowid < ?9))
+                 ORDER BY m.date_unix DESC, m.rowid DESC
+                 LIMIT ?5"
+            ),
+            vec![after.date_unix, after.rowid, before.date_unix, before.rowid],
         ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let mapped = |row: &rusqlite::Row<'_>| {
         Ok(StaleRow {
             key: MailKey {
@@ -625,9 +712,24 @@ fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<Sta
             message_id: row.get(3)?,
         })
     };
-    let rows = match (date, rowid) {
-        (Some(date), Some(rowid)) => stmt.query_map(
+    let rows = match keys.as_slice() {
+        [] => stmt.query_map(params![id.model, id.version, dims, bytes, limit], mapped)?,
+        [date, rowid] => stmt.query_map(
             params![id.model, id.version, dims, bytes, limit, date, rowid],
+            mapped,
+        )?,
+        [after_date, after_rowid, before_date, before_rowid] => stmt.query_map(
+            params![
+                id.model,
+                id.version,
+                dims,
+                bytes,
+                limit,
+                after_date,
+                after_rowid,
+                before_date,
+                before_rowid
+            ],
             mapped,
         )?,
         _ => stmt.query_map(params![id.model, id.version, dims, bytes, limit], mapped)?,
@@ -640,14 +742,21 @@ fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<Sta
 }
 
 fn write_batch(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
+    // A failed commit must not leave this connection holding the write lock.
+    if !conn.is_autocommit() {
+        conn.execute_batch("ROLLBACK")?;
+    }
     // Immediate, so the re-read and the insert share one write lock.
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let wrote = write_batch_locked(conn, rows);
     match wrote {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
+        Ok(n) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(n),
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err.into())
+            }
+        },
         Err(err) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(err)
@@ -661,10 +770,12 @@ fn write_batch_locked(conn: &Connection, rows: &[StaleRow]) -> Result<usize> {
         interrupt_rebuild(index)?;
         let Some(body) = message_body(conn, &row.account_id, &row.message_id)? else {
             remove_message_embedding(conn, &row.account_id, &row.message_id)?;
+            dequeue_message(conn, &row.account_id, &row.message_id)?;
             continue;
         };
         let values = active_embedder().embed(&body);
         store_embedding(conn, &row.account_id, &row.message_id, &body, &values)?;
+        dequeue_message(conn, &row.account_id, &row.message_id)?;
         wrote += 1;
     }
     Ok(wrote)
@@ -1446,6 +1557,62 @@ mod tests {
                 .message_embedding(&AccountId("a1".into()), &MessageId::new("old@x"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_newer_burst_is_paged_without_skipping_the_tail() {
+        let store = open(&["a1"]);
+        let mut floor = message("a1", "floor@x", "floor");
+        floor.headers.date_unix = 1;
+        store.upsert_message(&floor).unwrap();
+        let mut scan = Scan::default();
+        assert!(matches!(
+            scan.step(&store.conn, 1).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        for (id, date) in [("a@x", 10_i64), ("b@x", 20), ("c@x", 30)] {
+            let mut message = message("a1", id, id);
+            message.headers.date_unix = date;
+            store.upsert_message(&message).unwrap();
+        }
+        // The queue would hide a cursor bug. This pass has to see the rows itself.
+        store
+            .conn
+            .execute("DELETE FROM embedding_queue", [])
+            .unwrap();
+        assert!(matches!(
+            scan.step(&store.conn, 2).unwrap(),
+            IndexStep::Wrote(2)
+        ));
+        assert_eq!(stored(&store, "a1", "c@x").version, EMBEDDING_VERSION);
+        assert_eq!(stored(&store, "a1", "b@x").version, EMBEDDING_VERSION);
+        assert!(
+            store
+                .message_embedding(&AccountId("a1".into()), &MessageId::new("a@x"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            scan.step(&store.conn, 2).unwrap(),
+            IndexStep::Wrote(1)
+        ));
+        assert_eq!(stored(&store, "a1", "a@x").version, EMBEDDING_VERSION);
+    }
+
+    #[test]
+    fn a_failed_batch_does_not_keep_the_write_lock() {
+        let store = open(&["a1"]);
+        store
+            .upsert_message(&message("a1", "m@x", "please pay the invoice"))
+            .unwrap();
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(!store.conn.is_autocommit());
+        assert_eq!(index_embeddings(&store.conn, 4).unwrap(), 1);
+        assert!(store.conn.is_autocommit());
+        assert_eq!(
+            stored(&store, "a1", "m@x"),
+            embed_body("please pay the invoice")
         );
     }
 
