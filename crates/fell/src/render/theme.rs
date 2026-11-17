@@ -64,7 +64,7 @@ impl Palette {
             quote: 0x0b4f9c,
             code_bg: 0xe7e5e1,
             border: 0xd5d2cc,
-            surface: 0xfffefc,
+            surface: 0xfbfaf8,
         }
     }
 
