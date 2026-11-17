@@ -493,8 +493,11 @@ fn image_el(
         }
     };
     let mut placeholder = div()
+        .w(px(220.))
+        .h(px(88.))
         .px_3()
-        .py_2()
+        .flex()
+        .items_center()
         .border(px(1.))
         .border_color(paint(palette.border))
         .rounded(px(4.))
