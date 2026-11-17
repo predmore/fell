@@ -465,6 +465,10 @@ fn image_el(
     {
         return div()
             .max_w(px(420.))
+            .border(px(1.))
+            .border_color(paint(palette.border))
+            .rounded(px(4.))
+            .overflow_hidden()
             .child(img(rendered).max_w(px(420.)).max_h(px(240.)))
             .into_any_element();
     }
@@ -498,6 +502,7 @@ fn image_el(
         .px_3()
         .flex()
         .items_center()
+        .justify_center()
         .border(px(1.))
         .border_color(paint(palette.border))
         .rounded(px(4.))
