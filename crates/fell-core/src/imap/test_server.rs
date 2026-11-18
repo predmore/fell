@@ -88,6 +88,9 @@ pub(super) struct TestState {
     /// Sleep this long after each 64 KiB of a `BODY[<section>]` reply, so a
     /// part fetch is slow.
     pub part_write_delay: Option<Duration>,
+    /// Ignore `<offset.len>` and send the whole part, with no `<origin>`,
+    /// as some servers do.
+    pub part_ignores_window: bool,
 }
 
 pub(super) struct TestServer {
@@ -516,6 +519,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
                             &section,
                             window,
                             guard.part_write_delay,
+                            guard.part_ignores_window,
                         );
                         continue;
                     }
@@ -671,12 +675,13 @@ fn part_request(upper: &str) -> Option<(String, Option<(usize, usize)>)> {
 }
 
 fn write_part(
-    write: &mut TcpStream,
+    write: &mut impl Write,
     seq: usize,
     message: &FixtureMessage,
     section: &str,
     window: Option<(usize, usize)>,
     delay: Option<Duration>,
+    ignore_window: bool,
 ) {
     let Some(bytes) = section_body(&message.raw, section) else {
         let _ = write.write_all(
@@ -688,7 +693,7 @@ fn write_part(
         );
         return;
     };
-    let (origin, slice) = match window {
+    let (origin, slice) = match window.filter(|_| !ignore_window) {
         Some((offset, len)) => {
             let start = offset.min(bytes.len());
             let end = start.saturating_add(len).min(bytes.len());

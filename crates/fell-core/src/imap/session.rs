@@ -49,6 +49,15 @@ pub(super) struct Fetched {
     pub body_missing: bool,
 }
 
+/// One reply to [`Session::uid_fetch_part`].
+#[derive(Debug)]
+pub(super) struct PartWindow {
+    /// The `<origin>` the server put after `BODY[<section>]`. `None` when it
+    /// sent none: it ignored the window and this is the whole part.
+    pub origin: Option<usize>,
+    pub bytes: Vec<u8>,
+}
+
 /// Why [`Session::idle`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IdleEnd {
@@ -409,33 +418,58 @@ impl Session {
     /// One window of one MIME part, still transfer-encoded:
     /// `UID FETCH <uid> (UID BODY.PEEK[<section>]<offset.len>)`. `BODY.PEEK`
     /// leaves the message unread. `Ok(None)` when the reply has no body for
-    /// `uid` (the server no longer has it). A server that ignores the window
-    /// sends the whole part, which the caller sees as a long first window.
+    /// `uid` (the server no longer has it).
+    ///
+    /// The reply is read the way [`Session::uid_fetch_each`] reads bodies:
+    /// one literal up to the literal cap, with no cap on the reply as a
+    /// whole, since a server that ignores the window sends the whole part
+    /// at once. [`PartWindow::origin`] tells the caller which it got.
     pub(super) fn uid_fetch_part(
         &mut self,
         uid: u32,
         section: &str,
         offset: usize,
         len: usize,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<Option<PartWindow>, Error> {
+        self.tag += 1;
+        let tag = format!("a{}", self.tag);
         let cmd = format!("UID FETCH {uid} (UID BODY.PEEK[{section}]<{offset}.{len}>)");
-        let lines = self.command("UID FETCH", &cmd)?.untagged;
-        for line in lines {
-            let Some(fetched) = parse_fetch(&line.text, line.literals) else {
+        self.write_all(format!("{tag} {cmd}\r\n").as_bytes())?;
+        let mut found: Option<Result<PartWindow, Error>> = None;
+        let mut seen = 0usize;
+        loop {
+            let (text, literals) = self.read_logical()?;
+            if text_starts_with_tag(&text, &tag) {
+                let rest = text[tag.len()..].trim_start();
+                if !rest.to_ascii_uppercase().starts_with("OK") {
+                    return Err(imap_err(format!("UID FETCH failed: {rest}")));
+                }
+                return found.transpose();
+            }
+            self.note_untagged(&text);
+            seen += 1;
+            if found.is_some() || seen > untagged_limit() {
+                continue;
+            }
+            let origin = partial_origin(&text);
+            let Some(fetched) = parse_fetch(&text, literals) else {
                 continue;
             };
             if fetched.uid != uid || fetched.body_missing {
                 continue;
             }
-            if fetched.skipped {
-                return Err(imap_err(format!(
+            found = Some(if fetched.skipped {
+                Err(imap_err(format!(
                     "part {section} of UID {uid} is larger than the {} byte literal limit",
                     literal_limit()
-                )));
-            }
-            return Ok(Some(fetched.body));
+                )))
+            } else {
+                Ok(PartWindow {
+                    origin,
+                    bytes: fetched.body,
+                })
+            });
         }
-        Ok(None)
     }
 
     /// `ENABLE QRESYNC` succeeded on this session.
@@ -1600,6 +1634,19 @@ fn parse_flags(text: &str) -> Option<Fetched> {
         skipped: false,
         body_missing: false,
     })
+}
+
+/// The `<origin>` of a partial `BODY[<section>]<origin>` in a FETCH reply.
+fn partial_origin(text: &str) -> Option<usize> {
+    let upper = text.to_ascii_uppercase();
+    let start = upper.find("BODY[")?;
+    let close = start + upper[start..].find(']')?;
+    let tail = text[close + 1..].strip_prefix('<')?;
+    let (digits, _) = tail.split_once('>')?;
+    if digits.is_empty() || digits.len() > 12 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// The nstring after `BODY` / `BODY[...]`, not whichever literal arrived first.

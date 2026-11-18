@@ -148,13 +148,16 @@ pub trait MailBackend {
     }
 
     /// Fetch one MIME part of a stored copy by its IMAP section, still
-    /// transfer-encoded. Read-only: nothing is marked read. `Ok(None)` when
-    /// the server no longer has the copy. `progress` hears the bytes read
-    /// so far. Backends with nothing to fetch return `None`.
+    /// transfer-encoded. `encoded_size` is its listed size on the wire
+    /// ([`crate::MimePart::encoded_size`]), so a fetch knows when it has it
+    /// all. Read-only: nothing is marked read. `Ok(None)` when the server
+    /// no longer has the copy. `progress` hears the bytes read so far.
+    /// Backends with nothing to fetch return `None`.
     fn fetch_part(
         &self,
         _copy: &crate::RemoteId,
         _section: &str,
+        _encoded_size: u64,
         _progress: &mut dyn FnMut(u64),
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
@@ -240,9 +243,10 @@ impl MailBackend for BridgeBackend {
         &self,
         copy: &crate::RemoteId,
         section: &str,
+        encoded_size: u64,
         progress: &mut dyn FnMut(u64),
     ) -> Result<Option<Vec<u8>>> {
-        crate::imap::fetch_part(&self.imap, copy, section, progress)
+        crate::imap::fetch_part(&self.imap, copy, section, encoded_size, progress)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
@@ -310,9 +314,10 @@ impl MailBackend for ImapBackend {
         &self,
         copy: &crate::RemoteId,
         section: &str,
+        encoded_size: u64,
         progress: &mut dyn FnMut(u64),
     ) -> Result<Option<Vec<u8>>> {
-        crate::imap::fetch_part(&self.config, copy, section, progress)
+        crate::imap::fetch_part(&self.config, copy, section, encoded_size, progress)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {

@@ -332,7 +332,13 @@ pub fn fetch_part(
     }
     let mut differed = false;
     for copy in &request.copies {
-        let Some(raw) = backend.fetch_part(copy, &request.part.section, progress)? else {
+        let Some(raw) = backend.fetch_part(
+            copy,
+            &request.part.section,
+            request.part.encoded_size,
+            progress,
+        )?
+        else {
             continue;
         };
         let bytes = decode_part(request.part.encoding, &raw);

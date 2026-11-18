@@ -53,6 +53,7 @@ fn sample_state() -> TestState {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -983,6 +984,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1052,6 +1054,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1123,6 +1126,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1243,6 +1247,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1359,6 +1364,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1506,6 +1512,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1606,6 +1613,7 @@ fn non_ascii_password_logs_in_as_a_literal() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1682,6 +1690,7 @@ fn fetch_batches_survive_a_dropped_connection() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1797,6 +1806,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1879,6 +1889,7 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1954,6 +1965,7 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -2050,6 +2062,7 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         special_use: false,
         reject_list_return: false,
         part_write_delay: None,
+        part_ignores_window: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -3792,6 +3805,89 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
     let mut odd = request.clone();
     odd.part.section = "1 (FLAGS)".into();
     assert!(crate::parts::fetch_part(&backend, &cache, &odd, &mut |_| {}).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Sync `fixture` from a server that honours `<offset.len>` or ignores it,
+/// and the request for its part 2.
+fn part_server(
+    fixture: &crate::imap::mime_fixtures::MimeFixture,
+    ignores_window: bool,
+) -> (TestServer, ImapBackend, crate::parts::PartRequest) {
+    let mut state = inbox_state(vec![(1, fixture.raw.clone())]);
+    state.part_ignores_window = ignores_window;
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let request = store
+        .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
+        .unwrap()
+        .unwrap();
+    (server, backend, request)
+}
+
+fn part_fetches(server: &TestServer) -> usize {
+    commands(server)
+        .iter()
+        .filter(|line| line.contains("BODY.PEEK[2]"))
+        .count()
+}
+
+#[test]
+fn a_server_that_ignores_the_window_sends_a_10_mb_part_whole() {
+    let size = 10 * 1024 * 1024;
+    let fixture = crate::imap::mime_fixtures::large_attachment("big@x", size);
+    let (server, backend, request) = part_server(&fixture, true);
+    assert!(request.part.encoded_size > 8 * 1024 * 1024, "over the reply cap");
+    let (root, cache) = temp_cache("whole");
+    server.state.lock().expect("state").commands.clear();
+    let mut heard = Vec::new();
+    let cached =
+        crate::parts::fetch_part(&backend, &cache, &request, &mut |n| heard.push(n)).unwrap();
+    assert_eq!(std::fs::read(&cached.path).unwrap(), fixture.bytes[0].1);
+    assert_eq!(heard, [request.part.encoded_size]);
+    assert_eq!(part_fetches(&server), 1, "one reply held the whole part");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_part_exactly_one_window_long_is_fetched_once() {
+    let fixture = crate::imap::mime_fixtures::large_attachment("big@x", 3000);
+    for ignores_window in [false, true] {
+        let (server, backend, request) = part_server(&fixture, ignores_window);
+        let window = usize::try_from(request.part.encoded_size).unwrap();
+        super::part_fetch::set_window(window);
+        let (root, cache) = temp_cache(if ignores_window { "exact-i" } else { "exact" });
+        server.state.lock().expect("state").commands.clear();
+        let cached = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {});
+        super::part_fetch::set_window(2 * 1024 * 1024);
+        let cached = cached.unwrap();
+        assert_eq!(
+            std::fs::read(&cached.path).unwrap(),
+            fixture.bytes[0].1,
+            "ignores the window: {ignores_window}"
+        );
+        assert_eq!(part_fetches(&server), 1, "ignores the window: {ignores_window}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // Smaller windows still add up to the part when the server honours them.
+    let (server, backend, request) = part_server(&fixture, false);
+    let window = usize::try_from(request.part.encoded_size).unwrap() / 2;
+    super::part_fetch::set_window(window);
+    let (root, cache) = temp_cache("halves");
+    server.state.lock().expect("state").commands.clear();
+    let cached = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {});
+    super::part_fetch::set_window(2 * 1024 * 1024);
+    assert_eq!(
+        std::fs::read(&cached.unwrap().path).unwrap(),
+        fixture.bytes[0].1
+    );
+    assert!((2..=3).contains(&part_fetches(&server)), "{:?}", commands(&server));
     let _ = std::fs::remove_dir_all(&root);
 }
 
