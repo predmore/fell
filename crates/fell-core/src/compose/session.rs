@@ -1177,6 +1177,36 @@ impl DraftSession {
         }
     }
 
+    /// The person checked Sent and the mail is not there: a draft that
+    /// "may have been sent" becomes editable and sendable again. Only that
+    /// lock is released, in the mailbox first; a recorded send never is.
+    pub fn release_maybe_sent(&mut self) -> Result<(), String> {
+        if self.send_lock != Some(SendLock::MaybeSent) {
+            return Err(match self.send_lock {
+                Some(lock) => format!("{}; it cannot be unlocked", lock.reason()),
+                None => "this draft is not locked".into(),
+            });
+        }
+        let store = self.send_store()?;
+        store
+            .finish_compose_send(&self.account_id, &self.id, None)
+            .map_err(|err| format!("could not unlock this draft in the mailbox ({err})"))?;
+        // Another process may have recorded the send meanwhile.
+        match store
+            .load_compose_send(&self.account_id, &self.id)
+            .map_err(|err| err.to_string())?
+        {
+            None => {
+                self.send_lock = None;
+                Ok(())
+            }
+            Some(lock) => {
+                self.send_lock = Some(lock);
+                Err(format!("{}; it cannot be unlocked", lock.reason()))
+            }
+        }
+    }
+
     /// Record how [`DraftSession::begin_send`]'s send ended. `None` means
     /// nothing was transmitted and the draft may be sent again.
     pub fn end_send(&mut self, lock: Option<SendLock>) {
@@ -2895,6 +2925,31 @@ mod tests {
         let reopened =
             DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(reopened.send_lock(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unlocking_releases_only_a_draft_that_may_have_been_sent() {
+        let (root, store, session) = stored_session("body\n");
+        let account = AccountId("local".into());
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::MaybeSent))
+            .unwrap();
+        let mut reopened = reopen(session, &store);
+        assert_eq!(reopened.send_lock(), Some(SendLock::MaybeSent));
+        reopened.release_maybe_sent().unwrap();
+        assert_eq!(reopened.send_lock(), None);
+        // The mailbox agrees, so a restart does not lock it again.
+        let mut reopened = reopen(reopened, &store);
+        assert_eq!(reopened.send_lock(), None);
+        assert!(reopened.release_maybe_sent().is_err(), "nothing to unlock");
+        // A recorded send is never released.
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::Sent))
+            .unwrap();
+        let mut reopened = reopen(reopened, &store);
+        assert!(reopened.release_maybe_sent().is_err());
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
         let _ = fs::remove_dir_all(root);
     }
 

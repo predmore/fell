@@ -2308,7 +2308,12 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         // it is never cut short.
         String::new()
     } else if session.cursor_draft().is_some() {
-        "j k  ·  enter edit  ·  c new  ·  space  ·  :".to_string()
+        // A draft that may have gone out opens read-only.
+        if session.cursor_thread().is_some_and(|row| row.warn) {
+            "j k  ·  enter open  ·  c new  ·  space  ·  :".to_string()
+        } else {
+            "j k  ·  enter edit  ·  c new  ·  space  ·  :".to_string()
+        }
     } else if session.pane == Pane::Conversation {
         "j k  ·  esc  ·  ctrl-d  ·  space  ·  :".to_string()
     } else {

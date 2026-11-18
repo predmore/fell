@@ -264,8 +264,9 @@ impl DraftHub {
             let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
                 Some(_) if sent => format!("sent{}  ·  gs sent", quoted_subject(&subject)),
+                // The key to what the warning asks: look in Sent.
                 Some(reason) if reason == SendLock::MaybeSent.reason() => format!(
-                    "{MAYBE_SENT_NOTICE}{}  ·  gd drafts",
+                    "{MAYBE_SENT_NOTICE}{}  ·  gs sent",
                     quoted_subject(&subject)
                 ),
                 Some(reason) => format!("{reason}{}", quoted_subject(&subject)),
@@ -301,10 +302,13 @@ impl DraftHub {
         let name = quoted_subject(&subject);
         let sent = locked == Some(SendLock::Sent.reason());
         let line = match (locked, failure) {
+            (_, Some(failure)) if failure == MAYBE_SENT_NOTICE => {
+                format!("{failure}{name}  ·  gs sent")
+            }
             (_, Some(failure)) => format!("{failure}{name}  ·  gd drafts"),
             (Some(_), None) if sent => format!("sent{name}  ·  gs sent"),
             (Some(reason), None) if reason == SendLock::MaybeSent.reason() => {
-                format!("{MAYBE_SENT_NOTICE}{name}  ·  gd drafts")
+                format!("{MAYBE_SENT_NOTICE}{name}  ·  gs sent")
             }
             (Some(reason), None) => format!("{reason}{name}"),
             (None, None) => format!("not sent{name}  ·  gd drafts"),

@@ -991,8 +991,9 @@ impl ComposeView {
             } else if key == ":" {
                 self.palette = Some(String::new());
             } else {
-                // The bar's right side already gives the reason.
-                self.status = "read-only · :q close".into();
+                // Shown as the idle hint for this lock; the bar's right side
+                // already gives the reason.
+                self.status = "normal".into();
             }
             return;
         }
@@ -1083,6 +1084,19 @@ impl ComposeView {
             return;
         }
         match action {
+            "unlock" => {
+                let released = self
+                    .hub
+                    .with_session(self.draft_id.as_ref(), |session| {
+                        session.release_maybe_sent()
+                    })
+                    .unwrap_or_else(|| Err("this draft is not open".into()));
+                self.status = match released {
+                    Ok(()) => "unlocked · edit or space m s send".into(),
+                    Err(err) => err.into(),
+                };
+                cx.notify();
+            }
             "send" => self.send(cx),
             "preview" => {
                 self.preview = !self.preview;
@@ -1468,15 +1482,26 @@ impl Render for ComposeView {
             Mode::Insert => "insert",
             Mode::Visual => "visual",
         };
-        let locked = self
+        let lock = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| session.send_lock())
-            .flatten()
-            .is_some();
+            .flatten();
+        let locked = lock.is_some();
+        let maybe_sent = lock == Some(SendLock::MaybeSent);
         let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
             // Nothing to type into: the way out is the hint.
             (_, "i insert" | "insert" | "esc normal" | "normal") if locked => {
-                "read-only · :q close".into()
+                if maybe_sent {
+                    // The way forward once Sent has been checked. Narrow,
+                    // the warning beside it says why it is read-only.
+                    if window.viewport_size().width > px(640.) {
+                        "read-only · :unlock if not in Sent · :q close".into()
+                    } else {
+                        ":unlock · :q close".into()
+                    }
+                } else {
+                    "read-only · :q close".into()
+                }
             }
             (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
             (Mode::Normal, "esc normal" | "normal") => "i insert".into(),
@@ -3374,9 +3399,9 @@ fn status_bar(
             .flex_shrink_0()
             .text_color(rgb(colors.error))
             .child(if wide {
-                fell_core::compose::MAYBE_SENT_NOTICE
-            } else {
                 "may have been sent · check Sent"
+            } else {
+                "may have been sent"
             }),
         Some(reason) => div()
             .flex()
@@ -3586,6 +3611,11 @@ fn palette_action(query: &str) -> Option<&'static str> {
     // Vim's `:q`. `quote` still runs from `:qu`.
     if query == "q" || query == "quit" {
         return Some("close");
+    }
+    // Spelled out in full: it lets a draft that may have gone out be sent
+    // again.
+    if query == "unlock" {
+        return Some("unlock");
     }
     let mut found = None;
     for name in [
