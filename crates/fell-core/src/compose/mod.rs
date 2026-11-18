@@ -30,8 +30,8 @@ pub use markdown::{
 pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
 pub use persist::{
-    StoredCompose, ensure_draft_folder, open_owned_draft, remember_compose_store,
-    stored_compose_account, stored_compose_owner,
+    StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft, remember_compose_store,
+    remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, SendLock, SentBcc, Snapshot,

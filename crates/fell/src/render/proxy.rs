@@ -313,7 +313,12 @@ mod tests {
 
     #[test]
     fn stalled_public_fetch_ends_with_forbidden() {
-        ensure_test_net();
+        if fell_core::test_support::skip_unless_available(
+            "stalled_public_fetch_ends_with_forbidden",
+            fell_core::test_support::test_net_missing(),
+        ) {
+            return;
+        }
         let stalled = TcpListener::bind("192.0.2.1:0").unwrap();
         let stalled_port = stalled.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -352,7 +357,12 @@ mod tests {
 
     #[test]
     fn in_flight_cap_denies_the_next_request() {
-        ensure_test_net();
+        if fell_core::test_support::skip_unless_available(
+            "in_flight_cap_denies_the_next_request",
+            fell_core::test_support::test_net_missing(),
+        ) {
+            return;
+        }
         let stalled = TcpListener::bind("192.0.2.1:0").unwrap();
         let stalled_port = stalled.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -400,14 +410,5 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         drop(held);
-    }
-
-    fn ensure_test_net() {
-        if TcpListener::bind("192.0.2.1:0").is_ok() {
-            return;
-        }
-        let _ = std::process::Command::new("sudo")
-            .args(["/usr/bin/ip", "addr", "add", "192.0.2.1/32", "dev", "lo"])
-            .status();
     }
 }
