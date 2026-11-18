@@ -169,25 +169,25 @@ impl DraftHub {
             )
         });
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
-            // The outcome comes first and the reopen key next, so a narrow
-            // status bar cuts only the draft's name.
+            // Outcome, which draft, what is left, then the way back; spaced
+            // like the rest of the inbox status bar.
             let name = if subject.trim().is_empty() {
                 String::new()
             } else {
-                let short: String = subject.chars().take(18).collect();
-                let more = if subject.chars().count() > 18 {
+                let short: String = subject.chars().take(60).collect();
+                let more = if subject.chars().count() > 60 {
                     "…"
                 } else {
                     ""
                 };
-                format!(" · \u{201c}{short}{more}\u{201d}")
+                format!("  ·  \u{201c}{short}{more}\u{201d}")
             };
             let line = match locked {
                 Some(reason) => format!("{reason}{name}"),
                 None if asked && unreviewed > 0 => {
-                    format!("Not sent · space a r reopen · {unreviewed} unreviewed{name}")
+                    format!("not sent{name}  ·  {unreviewed} unreviewed  ·  space a r reopen")
                 }
-                None => format!("Not sent · space a r reopen{name}"),
+                None => format!("not sent{name}  ·  space a r reopen"),
             };
             *self.last_closed.lock().expect("last closed") = Some(id.to_string());
             self.closed.lock().expect("closed").push(line);
@@ -1052,7 +1052,7 @@ mod tests {
         hub.note_hidden("d1");
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("Not sent"), "{lines:?}");
+        assert!(lines[0].starts_with("not sent"), "{lines:?}");
         assert!(hub.take_closed().is_empty());
     }
 

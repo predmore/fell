@@ -235,6 +235,11 @@ pub struct ComposeView {
     seen_edits: usize,
     /// The person moved between edits; arrivals then leave focus alone.
     focus_by_user: bool,
+    /// The person pressed a key in this window; until then the cursor
+    /// follows the focused edit as it does on opening.
+    touched: bool,
+    /// Agent edits already announced, so an arrival can be named.
+    known_hunks: Vec<u64>,
 }
 
 impl ComposeView {
@@ -285,6 +290,8 @@ impl ComposeView {
             focused_hunk: None,
             seen_edits: 0,
             focus_by_user: false,
+            touched: false,
+            known_hunks: Vec::new(),
         }
     }
 
@@ -437,7 +444,12 @@ impl ComposeView {
             return;
         };
         let order = ordered_hunks(&snap);
-        let arrived = order.len().saturating_sub(self.seen_edits);
+        let new: Vec<u64> = order
+            .iter()
+            .map(|(hunk, _)| *hunk)
+            .filter(|hunk| !self.known_hunks.contains(hunk))
+            .collect();
+        self.known_hunks = order.iter().map(|(hunk, _)| *hunk).collect();
         self.seen_edits = order.len();
         if order.is_empty() {
             self.focused_hunk = None;
@@ -446,36 +458,35 @@ impl ComposeView {
         let still_there = self
             .focused_hunk
             .is_some_and(|focused| order.iter().any(|(hunk, _)| *hunk == focused));
-        if arrived == 0 && still_there {
+        if new.is_empty() && still_there {
             return;
         }
-        // Until the person moves between edits, focus is the first edit in
-        // reading order, as opening on edits does. Their cursor stays put.
+        let first_new = new.first().copied();
+        let at = first_new
+            .and_then(|first| order.iter().position(|(hunk, _)| *hunk == first))
+            .unwrap_or(0);
+        // Until the person moves between edits, focus follows the newest
+        // arrival; until they press a key, the cursor goes there too.
         if !still_there || !self.focus_by_user {
-            self.focused_hunk = order.first().map(|(hunk, _)| *hunk);
-        }
-        if arrived > 0 {
-            let who = snap
-                .send_requested_by
-                .as_deref()
-                .map(agent_label)
-                .unwrap_or_else(|| "the agent".into());
-            let at = self
-                .focused_hunk
-                .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
-                .unwrap_or(0);
-            let what = if arrived == 1 {
-                "made an edit".to_string()
+            if self.touched {
+                self.focused_hunk = order.get(at).map(|(hunk, _)| *hunk);
             } else {
-                format!("made {arrived} edits")
-            };
-            self.status = format!(
-                "{who} {what} · on edit {} of {} · ]h [h move",
-                at + 1,
-                order.len()
-            )
-            .into();
+                self.focus_hunk_at(&order, at);
+            }
         }
+        if first_new.is_none() {
+            return;
+        }
+        let who = snap
+            .send_requested_by
+            .as_deref()
+            .map(agent_label)
+            .unwrap_or_else(|| "the agent".into());
+        let what = match (new.len(), order_hunk(&snap, &order, at)) {
+            (1, Some(hunk)) => format!("changed {}", edit_name(&snap, hunk)),
+            (count, _) => format!("made {count} edits"),
+        };
+        self.status = format!("{who} {what} · edit {} of {}", at + 1, order.len()).into();
     }
 
     /// An agent asked for review: start on its first edit, if any.
@@ -486,6 +497,7 @@ impl ComposeView {
         };
         let order = ordered_hunks(&snap);
         self.seen_edits = order.len();
+        self.known_hunks = order.iter().map(|(hunk, _)| *hunk).collect();
         if !order.is_empty() {
             self.focus_hunk_at(&order, 0);
         }
@@ -878,6 +890,7 @@ impl ComposeView {
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        self.touched = true;
         if self.field == Field::Body && !self.pull_if_stale() {
             self.status = "the draft changed under the cursor; the key was not applied".into();
             return;
@@ -1459,7 +1472,7 @@ impl ComposeView {
             ))
             .child(reply_row(snap, colors))
             .children(if !snap.hunks.is_empty() {
-                Some(hunk_banner(snap, self.focused_hunk, colors))
+                Some(hunk_banner(snap, self.focused_hunk, colors, wide))
             } else if snap.send_requested_by.is_some() {
                 // The row stays, so an edit arriving later does not push the
                 // message down under the reader.
@@ -1777,7 +1790,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .children(snap.send_requested_by.as_ref().map(|agent| {
             div()
                 .text_color(rgb(colors.accent))
-                .child(format!("— asked by {}", agent_label(agent)))
+                .child(format!("asked by {}", agent_label(agent)))
         }));
     div()
         .flex()
@@ -1936,7 +1949,7 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
 fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
     let reply = match (&snap.reply_context, snap.in_reply_to.as_deref()) {
         (Some(parent), _) => format!(
-            "{} · {} · {}",
+            "{} · {} ({})",
             parent.sender,
             parent.subject,
             crate::present::relative_date(now_unix_secs(), parent.date_unix)
@@ -1964,7 +1977,7 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette) -> gpui::Div {
+fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette, wide: bool) -> gpui::Div {
     let order = ordered_hunks(snap);
     let at = focused
         .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
@@ -2003,8 +2016,11 @@ fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette) -> gpui::
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
+        // Wide: one line with dots. Narrow: parts wrap as units with space
+        // between them, so no line ends on a dot.
+        .gap_x(px(if wide { 0. } else { 18. }))
         .children(parts.into_iter().enumerate().map(|(index, part)| {
-            div().flex_shrink_0().child(if index < last {
+            div().flex_shrink_0().child(if wide && index < last {
                 format!("{part}  ·  ")
             } else {
                 part
@@ -2043,7 +2059,7 @@ fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<
     let slice = snap.text.get(hunk.start..hunk.end)?;
     let line = slice
         .lines()
-        .map(|line| line.trim().trim_start_matches(['-', '*', '#', '>', ' ']))
+        .map(plain_markdown)
         .find(|line| !line.is_empty())?;
     let mut words: Vec<&str> = line.split_whitespace().take(4).collect();
     let more = line.split_whitespace().count() > words.len();
@@ -2075,6 +2091,26 @@ fn edit_name(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> String {
             .map(|words| format!("\u{201c}{words}\u{201d}"))
             .unwrap_or_else(|| "the edit".into()),
     }
+}
+
+/// Markdown source shown as plain words: list and heading markers and
+/// emphasis marks dropped, so "was *March*" reads like the new text.
+fn plain_markdown(text: &str) -> String {
+    let line = text.trim();
+    let line = &line[content_byte(line)..];
+    line.chars()
+        .filter(|ch| !matches!(ch, '*' | '_' | '`'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn content_byte(line: &str) -> usize {
+    let column = content_column(line);
+    line.char_indices()
+        .nth(column)
+        .map(|(at, _)| at)
+        .unwrap_or(line.len())
 }
 
 /// The first column after a line's markdown marker ("- ", "> ", "1. ").
@@ -2262,6 +2298,7 @@ fn raw_source_block(
     let base_line = text[..start].chars().filter(|ch| *ch == '\n').count();
     let mut line_start = start;
     let mut announced = Vec::new();
+    let mut previous_tinted = false;
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
         let line_end = line_start + line.len();
@@ -2278,16 +2315,20 @@ fn raw_source_block(
             .map(|(index, _)| index)
             .collect();
         if !touching.is_empty() {
+            // A new edit right under another one starts its own block.
+            let mut gap =
+                previous_tinted && touching.iter().any(|index| !announced.contains(index));
             for index in &touching {
                 if announced.contains(index) {
                     continue;
                 }
                 announced.push(*index);
-                let previous = &edits[*index].2;
+                let previous = plain_markdown(&edits[*index].2);
                 let is_focused = Some(edits[*index].3) == focused;
                 if !previous.is_empty() {
                     column = column.child(
                         div()
+                            .when(gap, |row| row.mt(px(6.)))
                             .flex()
                             .gap_2()
                             .bg(rgb(colors.hunk))
@@ -2299,8 +2340,9 @@ fn raw_source_block(
                             }))
                             .text_color(rgb(colors.dim))
                             .child(div().flex_shrink_0().child("was"))
-                            .child(div().line_through().child(previous.clone())),
+                            .child(div().line_through().child(previous)),
                     );
+                    gap = false;
                 }
             }
             // The focused edit carries an accent bar, so the body shows
@@ -2309,6 +2351,7 @@ fn raw_source_block(
                 .iter()
                 .any(|index| Some(edits[*index].3) == focused);
             painted = div()
+                .when(gap, |row| row.mt(px(6.)))
                 .w_full()
                 .bg(rgb(colors.hunk))
                 .border_l(px(3.))
@@ -2319,6 +2362,7 @@ fn raw_source_block(
                 }))
                 .child(painted);
         }
+        previous_tinted = !touching.is_empty();
         column = column.child(painted);
         line_start = line_end + 1;
     }
@@ -2970,11 +3014,7 @@ fn status_bar(
             }
             right
                 .child(dot())
-                .child(
-                    div()
-                        .text_color(rgb(colors.fg))
-                        .child(if wide { ":q close" } else { ":q" }),
-                )
+                .child(div().text_color(rgb(colors.fg)).child(":q close"))
         }
     };
     let bar = div()

@@ -1054,7 +1054,7 @@ fn shell(
                     ))
                 }),
         )
-        .child(status_bar(&theme, session))
+        .child(status_bar(&theme, session, width, window))
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
             |root| root.child(which_key_popup(&theme, session)),
@@ -1433,6 +1433,42 @@ fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> St
         }
     }
     best
+}
+
+/// Fit a notice to `max_px`. A quoted name gives up its letters first, so
+/// the outcome before it and the key after it stay whole.
+fn fit_notice(window: &Window, text: &str, max_px: f32) -> String {
+    if line_px(window, text, FontWeight::NORMAL) <= max_px {
+        return text.to_string();
+    }
+    let quoted = text.find('\u{201c}').and_then(|open| {
+        text[open..]
+            .find('\u{201d}')
+            .map(|close| (open, open + close))
+    });
+    let Some((open, close)) = quoted else {
+        return clip_line(window, text, max_px, FontWeight::NORMAL);
+    };
+    let before = &text[..open + '\u{201c}'.len_utf8()];
+    let after = &text[close..];
+    let name: Vec<char> = text[before.len()..close]
+        .trim_end_matches('…')
+        .chars()
+        .collect();
+    let mut best = None;
+    let (mut lo, mut hi) = (1, name.len());
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let short: String = name[..mid].iter().collect();
+        let candidate = format!("{before}{}…{after}", short.trim_end());
+        if line_px(window, &candidate, FontWeight::NORMAL) <= max_px {
+            best = Some(candidate);
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best.unwrap_or_else(|| clip_line(window, text, max_px, FontWeight::NORMAL))
 }
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
@@ -1931,7 +1967,7 @@ fn body_block(
     }
 }
 
-fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
+fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> gpui::Div {
     let hint = if !session.chord.is_empty() {
         session.prefix_text()
     } else if session.toast.is_some() {
@@ -1948,6 +1984,20 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
     } else {
         format!("{} ", session.count)
     };
+    let toast = session.toast.as_ref().map(|toast| {
+        // What the bar spends before the notice: padding, mode, sync, the
+        // dots and gaps between them, and the air after it.
+        let mode = session.mode_label().to_string();
+        let sync = session.sync.status();
+        let mut used = 28.0 + 16.0 + 4.0 * 12.0;
+        used += line_px(window, &mode, FontWeight::NORMAL)
+            + line_px(window, &sync, FontWeight::NORMAL)
+            + 2.0 * line_px(window, "·", FontWeight::NORMAL);
+        if session.detail_text().is_some() {
+            used += 12.0 + line_px(window, "· ? details", FontWeight::NORMAL);
+        }
+        fit_notice(window, &toast.text, (width - used).max(80.0))
+    });
     div()
         .h(px(30.))
         .px(px(14.))
@@ -1999,13 +2049,7 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
                     Some(_) => theme.foreground,
                     None => theme.dimmed,
                 }))
-                .child(
-                    session
-                        .toast
-                        .as_ref()
-                        .map(|toast| toast.text.clone())
-                        .unwrap_or_default(),
-                ),
+                .child(toast.unwrap_or_default()),
         )
         .child(
             div()
