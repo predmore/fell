@@ -37,6 +37,7 @@ pub use persist::{
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
     forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
+    start_reply_in_zone,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,

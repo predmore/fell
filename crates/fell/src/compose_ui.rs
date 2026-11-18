@@ -1568,7 +1568,9 @@ impl ComposeView {
         let redirects = redirects(snap);
         // A context row's subject gives way, with an ellipsis, so who and
         // when stay on one line at any width.
-        let row_px = f32::from(window.viewport_size().width) - 32.0 - 10.0 - LABEL_PX - 12.0;
+        // The padding, border, label and gap around the value, and a
+        // margin, since the shaped width runs a little under the painted.
+        let row_px = f32::from(window.viewport_size().width) - 32.0 - 10.0 - LABEL_PX - 12.0 - 24.0;
         let fit = |who: &str, what: &str, when: &str| {
             let room = row_px - text_px(window, who, 16.0) - text_px(window, when, 16.0);
             fit_px(what, room, &|text| text_px(window, text, 16.0))
@@ -1651,8 +1653,18 @@ impl ComposeView {
             )
             .children(snap.forwarded.as_ref().map(|forward| {
                 let who = display_safe(&forward.sender);
-                let what = fit(&who, &dot_before(&display_safe(&forward.subject)), "");
-                context_row("Forwarding", &who, &what, None, colors)
+                let when = forward.date_unix.map(|date| {
+                    format!(
+                        "\u{a0}({})",
+                        crate::present::relative_date(now_unix_secs(), date)
+                    )
+                });
+                let what = fit(
+                    &who,
+                    &dot_before(&display_safe(&forward.subject)),
+                    when.as_deref().unwrap_or(""),
+                );
+                context_row("Forwarding", &who, &what, when, colors)
             }))
             .children(if !snap.hunks.is_empty() {
                 // Room for the edit's words: the row, less the keys beside
@@ -1745,7 +1757,7 @@ impl ComposeView {
         let label = if self.quote_open {
             format!("{what}  ·  space m q hide")
         } else {
-            format!("{what}  ·  space m q")
+            format!("{what}  ·  space m q show")
         };
         let mut block = div()
             .px_5()
@@ -2158,41 +2170,52 @@ fn field_row(
     let note = |address: &fell_core::compose::AddressView| {
         let redirect = redirects.contains(&address.email.trim().to_lowercase());
         match (redirect, address.fresh) {
-            (true, true) => Some(("(Reply-To\u{a0}·\u{a0}first\u{a0}time)", colors.error)),
+            (true, true) => Some(("(Reply-To · first time)", colors.error)),
             (true, false) => Some(("(Reply-To)", colors.dim)),
-            (false, true) => Some(("(first\u{a0}time)", colors.dim)),
+            (false, true) => Some(("(first time)", colors.dim)),
             (false, false) => None,
         }
     };
+    // The address, then its note as one unbreakable piece: a narrow window
+    // wraps the note whole onto the next line, never inside it.
     let marked = |address: &fell_core::compose::AddressView, comma: bool| {
-        let mut text = address.raw.clone();
-        let mut marks = Vec::new();
-        if let Some((words, color)) = note(address) {
-            // Non-breaking, so the note never wraps away from its address.
-            text.push('\u{a0}');
-            let start = text.len();
-            text.push_str(words);
-            marks.push((
-                start..text.len(),
-                gpui::HighlightStyle {
-                    color: Some(rgb(color).into()),
-                    font_style: Some(gpui::FontStyle::Italic),
-                    ..Default::default()
-                },
-            ));
+        let comma = if comma { "," } else { "" };
+        let mut piece = div().flex().flex_wrap().gap_x(px(5.));
+        match note(address) {
+            Some((words, color)) => {
+                // The address may wrap inside itself when it alone is wider
+                // than the row; the note then takes the next line.
+                piece = piece
+                    .child(div().min_w(px(0.)).child(address.raw.clone()))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .italic()
+                            .text_color(rgb(color))
+                            .child(format!("{words}{comma}")),
+                    );
+            }
+            None => piece = piece.child(format!("{}{comma}", address.raw)),
         }
-        if comma {
-            text.push(',');
-        }
-        gpui::StyledText::new(SharedString::from(text)).with_highlights(marks)
+        piece
     };
     let shown = if active {
-        // The field being typed in shows the raw line and a caret at its end.
+        // The field being typed in shows the raw line and a caret at its end;
+        // empty, it says what it wants, dimmed.
         div()
             .flex()
             .items_center()
             .child(SharedString::from(value.to_string()))
             .child(caret(colors, Mode::Insert))
+            .when(value.is_empty() && label == "To", |line| {
+                line.children(placeholder.map(|(words, _)| {
+                    div()
+                        .pl(px(6.))
+                        .text_color(rgb(colors.dim))
+                        .child(words.to_string())
+                }))
+            })
     } else if addresses.is_empty() {
         match (value.is_empty(), placeholder) {
             (true, Some((words, color))) => div().text_color(rgb(color)).child(words.to_string()),
@@ -3458,29 +3481,26 @@ fn render_rgba(mut data: image::RgbaImage) -> Arc<RenderImage> {
 }
 
 fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
-    let names = if snap.attachments.is_empty() {
-        "none".to_string()
-    } else {
-        snap.attachments
-            .iter()
-            .map(|file| {
-                if file.inline {
-                    format!("{} inline", file.name)
-                } else {
-                    file.name.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ·  ")
-    };
+    let own = snap
+        .attachments
+        .iter()
+        .map(|file| {
+            if file.inline {
+                format!("{} inline", file.name)
+            } else {
+                file.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ·  ");
     // A forward cannot carry the original's files yet: say so here, open
     // quote or not, so no one sends it thinking they went along.
     let dropped = snap
         .forwarded
         .as_ref()
         .and_then(|forward| forward.not_forwarded.as_deref())
-        .map(display_safe);
-    div()
+        .map(|names| format!("{} not forwarded", display_safe(names)));
+    let row = div()
         .flex()
         .when(!wide, |row| row.flex_col())
         .min_w(px(0.))
@@ -3494,20 +3514,28 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         .child(
             div()
                 .flex_shrink_0()
-                .child(format!("Attachments\u{a0}\u{a0}{names}")),
-        )
-        // A narrow window gives it a line of its own rather than cut it.
-        .children(dropped.map(|names| {
-            let lead = if wide {
-                "\u{a0}\u{a0}·\u{a0}\u{a0}"
-            } else {
-                ""
-            };
-            div()
-                .min_w(px(0.))
-                .text_color(rgb(colors.error))
-                .child(format!("{lead}not forwarded: {names}"))
-        }))
+                .child(if own.is_empty() && dropped.is_some() {
+                    "Attachments\u{a0}\u{a0}".to_string()
+                } else if own.is_empty() {
+                    "Attachments\u{a0}\u{a0}none".to_string()
+                } else {
+                    format!("Attachments\u{a0}\u{a0}{own}")
+                }),
+        );
+    // The dropped files are the value when the draft has none of its own;
+    // beside files it has, they follow a dot. A narrow window gives them a
+    // line of their own rather than cut them.
+    row.children(dropped.map(|dropped| {
+        let lead = if own.is_empty() || !wide {
+            ""
+        } else {
+            "\u{a0}\u{a0}·\u{a0}\u{a0}"
+        };
+        div()
+            .min_w(px(0.))
+            .text_color(rgb(colors.error))
+            .child(format!("{lead}{dropped}"))
+    }))
 }
 
 /// One line, in the inbox's style: mode and hints on the left, send on
@@ -3612,7 +3640,7 @@ fn status_bar(
                     .text_color(rgb(colors.fg))
                     // Short enough to sit beside the mode and send, in the
                     // words the header and a wide bar use.
-                    .child(format!("{fresh} first-time")),
+                    .child(format!("first-time: {fresh}")),
             );
         }
     }

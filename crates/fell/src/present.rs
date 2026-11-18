@@ -656,6 +656,19 @@ fn month_name(month: u8) -> &'static str {
     .unwrap_or("Month")
 }
 
+/// Seconds east of UTC of the local zone at `unix`, or 0 when unknown.
+pub fn local_offset(unix: i64) -> i64 {
+    // SAFETY: `localtime_r` is thread-safe and writes only through `out`.
+    unsafe {
+        let seconds = unix as libc::time_t;
+        let mut out = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&seconds, &mut out).is_null() {
+            return 0;
+        }
+        (out.tm_gmtoff as i64).clamp(-14 * 3600, 14 * 3600)
+    }
+}
+
 fn local_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     unsafe { local_parts_libc(unix) }.unwrap_or_else(|| utc_parts(unix))
 }

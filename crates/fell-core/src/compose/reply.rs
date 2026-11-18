@@ -10,7 +10,7 @@ use crate::message::{Address, Message, MessageId};
 
 use super::frontmatter::DraftFields;
 use super::markdown::escape;
-use super::mime::rfc5322_date;
+use super::mime::{quote_date_at, rfc5322_date_at};
 
 /// Which kind of answer a draft starts as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,9 +55,21 @@ pub const MAX_REFERENCES: usize = 20;
 /// An id longer than this is not a Message-ID worth sending on.
 const MAX_ID_LEN: usize = 250;
 
-/// Start a `kind` answer to `parent` from `from`. `own` holds the person's
-/// own addresses, which a reply never sends to.
+/// Start a `kind` answer to `parent` from `from`, with the quote's dates in
+/// UTC. `own` holds the person's own addresses, which a reply never sends to.
 pub fn start_reply(kind: ReplyKind, parent: &Message, from: &str, own: &[String]) -> ReplyStart {
+    start_reply_in_zone(kind, parent, from, own, 0)
+}
+
+/// [`start_reply`] with the quote's dates in the person's zone, `offset`
+/// seconds east of UTC at the time the original was sent.
+pub fn start_reply_in_zone(
+    kind: ReplyKind,
+    parent: &Message,
+    from: &str,
+    own: &[String],
+    offset: i64,
+) -> ReplyStart {
     let subject = &parent.headers.subject;
     let parent_id = parent.headers.message_id.as_str();
     match kind {
@@ -81,7 +93,7 @@ pub fn start_reply(kind: ReplyKind, parent: &Message, from: &str, own: &[String]
             {
                 references.rotate_left(1);
             }
-            let (quote_text, quote_html) = reply_quote(parent);
+            let (quote_text, quote_html) = reply_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
                     from: from.to_string(),
@@ -99,7 +111,7 @@ pub fn start_reply(kind: ReplyKind, parent: &Message, from: &str, own: &[String]
             }
         }
         ReplyKind::Forward => {
-            let (quote_text, quote_html) = forward_quote(parent);
+            let (quote_text, quote_html) = forward_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
                     from: from.to_string(),
@@ -303,10 +315,10 @@ fn original_text(parent: &Message) -> String {
 }
 
 /// "On <date>, <sender> wrote:" and the original with `> ` before each line.
-fn reply_quote(parent: &Message) -> (String, String) {
+fn reply_quote(parent: &Message, offset: i64) -> (String, String) {
     let intro = format!(
         "On {}, {} wrote:",
-        rfc5322_date(parent.headers.date_unix),
+        quote_date_at(parent.headers.date_unix, offset),
         display_address(&parent.headers.from)
     );
     let body = original_text(parent);
@@ -404,6 +416,8 @@ const NOT_FORWARDED: &str = "Attachments (not forwarded): ";
 pub struct ForwardSummary {
     pub sender: String,
     pub subject: String,
+    /// When the original was sent, from the block's Date line.
+    pub date_unix: Option<i64>,
     /// The original's attachment names, or `None` when it had none.
     pub not_forwarded: Option<String>,
 }
@@ -419,6 +433,7 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
     let mut summary = ForwardSummary {
         sender: String::new(),
         subject: String::new(),
+        date_unix: None,
         not_forwarded: None,
     };
     for line in lines.take_while(|line| !line.is_empty()) {
@@ -428,6 +443,9 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
                 Some((name, _)) if !name.trim().is_empty() => name.trim().to_string(),
                 _ => from.trim().to_string(),
             };
+        } else if let Some(date) = line.strip_prefix("Date: ") {
+            summary.date_unix =
+                mail_parser::DateTime::parse_rfc822(date).map(|date| date.to_timestamp());
         } else if let Some(subject) = line.strip_prefix("Subject: ") {
             summary.subject = subject.to_string();
         } else if let Some(names) = line.strip_prefix(NOT_FORWARDED) {
@@ -440,11 +458,14 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
 /// The forwarded header block and the original, unquoted. Attachments are
 /// named in the block: Fell does not keep their bytes, so they do not go
 /// with the forward.
-fn forward_quote(parent: &Message) -> (String, String) {
+fn forward_quote(parent: &Message, offset: i64) -> (String, String) {
     let mut header = vec![
         FORWARD_MARK.to_string(),
         format!("From: {}", display_address(&parent.headers.from)),
-        format!("Date: {}", rfc5322_date(parent.headers.date_unix)),
+        format!(
+            "Date: {}",
+            rfc5322_date_at(parent.headers.date_unix, offset)
+        ),
         format!("Subject: {}", one_line(&parent.headers.subject)),
     ];
     if !parent.to.is_empty() {
@@ -622,7 +643,7 @@ mod tests {
         let mut chain = vec![MessageId::new("mid@x"), MessageId::new("root@x")];
         chain.extend((0..20).map(|n| MessageId::new(format!("m{n}@x"))));
         message.headers.references = chain;
-        let start = start_reply(ReplyKind::Reply, &message, "jon@example.com", &me());
+        let start = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
         let refs = &start.parts.references;
         assert_eq!(refs.len(), MAX_REFERENCES);
         assert_eq!(refs[0], "root@x");
@@ -724,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_reply_starts_with_its_parent_and_the_quote() {
-        let start = start_reply(ReplyKind::Reply, &parent(), "jon@example.com", &me());
+        let start = start_reply_in_zone(ReplyKind::Reply, &parent(), "jon@example.com", &me(), 0);
         assert_eq!(start.fields.from, "jon@example.com");
         assert_eq!(start.fields.subject, "Re: Plans");
         assert_eq!(start.fields.in_reply_to.as_deref(), Some("parent@x"));
@@ -736,7 +757,7 @@ mod tests {
             start
                 .parts
                 .quote_text
-                .starts_with("On Tue, 14 Nov 2023 22:13:20 +0000, Ada Lovelace <ada@x> wrote:\n"),
+                .starts_with("On Tue, 14 Nov 2023 at 22:13, Ada Lovelace <ada@x> wrote:\n"),
             "{}",
             start.parts.quote_text
         );
@@ -770,7 +791,7 @@ mod tests {
         let mut message = parent();
         message.has_attachment = true;
         message.attachment_names = vec!["report.pdf".into(), "chart.png".into()];
-        let start = start_reply(ReplyKind::Forward, &message, "jon@example.com", &me());
+        let start = start_reply_in_zone(ReplyKind::Forward, &message, "jon@example.com", &me(), 0);
         assert!(start.fields.to.is_empty() && start.fields.cc.is_empty());
         assert_eq!(start.fields.subject, "Fwd: Plans");
         assert_eq!(start.fields.in_reply_to, None);
@@ -795,10 +816,11 @@ mod tests {
             Some(ForwardSummary {
                 sender: "Ada Lovelace".into(),
                 subject: "Re: Plans".into(),
+                date_unix: Some(1_700_000_000),
                 not_forwarded: Some("report.pdf, chart.png".into()),
             })
         );
-        let reply = start_reply(ReplyKind::Reply, &message, "jon@example.com", &me());
+        let reply = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
         assert_eq!(forward_summary(&reply.parts.quote_text), None);
     }
 

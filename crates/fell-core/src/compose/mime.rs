@@ -415,13 +415,35 @@ fn rfc5322_now() -> String {
 }
 
 pub(super) fn rfc5322_date(unix: i64) -> String {
-    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let (year, month, day, hour, minute, second, weekday) = civil_from_unix(unix);
+    rfc5322_date_at(unix, 0)
+}
+
+const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// An RFC 5322 date in the zone `offset` seconds east of UTC.
+pub(super) fn rfc5322_date_at(unix: i64, offset: i64) -> String {
+    let (year, month, day, hour, minute, second, weekday) =
+        civil_from_unix(unix.saturating_add(offset));
+    let sign = if offset < 0 { '-' } else { '+' };
+    let minutes = offset.unsigned_abs() / 60;
     format!(
-        "{}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} +0000",
+        "{}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} {sign}{:02}{:02}",
+        WEEKDAYS[weekday],
+        MONTHS[(month - 1) as usize],
+        (minutes / 60) % 100,
+        minutes % 60
+    )
+}
+
+/// "Wed, 18 Nov 2026 at 08:16": a quote's intro, in the person's zone,
+/// without seconds.
+pub(super) fn quote_date_at(unix: i64, offset: i64) -> String {
+    let (year, month, day, hour, minute, _, weekday) = civil_from_unix(unix.saturating_add(offset));
+    format!(
+        "{}, {day} {} {year:04} at {hour:02}:{minute:02}",
         WEEKDAYS[weekday],
         MONTHS[(month - 1) as usize]
     )
@@ -665,6 +687,18 @@ mod tests {
     #[test]
     fn epoch_date_is_thursday_first_of_january() {
         assert_eq!(rfc5322_date(0), "Thu, 01 Jan 1970 00:00:00 +0000");
+        assert_eq!(
+            rfc5322_date_at(1_700_000_000, -8 * 3600),
+            "Tue, 14 Nov 2023 14:13:20 -0800"
+        );
+        assert_eq!(
+            rfc5322_date_at(1_700_000_000, 5 * 3600 + 1800),
+            "Wed, 15 Nov 2023 03:43:20 +0530"
+        );
+        assert_eq!(
+            quote_date_at(1_700_000_000, -8 * 3600),
+            "Tue, 14 Nov 2023 at 14:13"
+        );
     }
 
     #[test]
