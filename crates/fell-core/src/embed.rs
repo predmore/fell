@@ -404,7 +404,9 @@ impl Drop for Indexer {
 fn open_index_conn(path: &Path, stop: &Arc<AtomicBool>) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     // Install this before any query. The default 5s busy timeout ignores stop,
-    // so closing the store would wait it out.
+    // so closing the store would wait it out. Like sync, the indexer is
+    // background work: it waits for as long as it takes and does not ask
+    // sync to stand aside (see `store::write_lock`).
     let stop_busy = Arc::clone(stop);
     conn.busy_handler(Some(move |_| {
         if stop_busy.load(Ordering::Relaxed) {
