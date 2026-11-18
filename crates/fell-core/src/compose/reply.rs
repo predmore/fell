@@ -10,7 +10,7 @@ use crate::message::{Address, Message, MessageId};
 
 use super::frontmatter::DraftFields;
 use super::markdown::escape;
-use super::mime::{quote_date_at, rfc5322_date_at};
+use super::mime::{parse_quote_date, quote_date_at};
 
 /// Which kind of answer a draft starts as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -293,6 +293,15 @@ fn display_address(address: &Address) -> String {
     }
 }
 
+/// The sender as a quote's intro names them: the name alone when there is
+/// one, so the line never breaks inside an address.
+fn intro_name(address: &Address) -> String {
+    match address.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => one_line(name),
+        _ => address.email.trim().to_string(),
+    }
+}
+
 fn display_addresses(addresses: &[Address]) -> String {
     addresses
         .iter()
@@ -319,7 +328,7 @@ fn reply_quote(parent: &Message, offset: i64) -> (String, String) {
     let intro = format!(
         "On {}, {} wrote:",
         quote_date_at(parent.headers.date_unix, offset),
-        display_address(&parent.headers.from)
+        intro_name(&parent.headers.from)
     );
     let body = original_text(parent);
     let mut text = format!("{intro}\n");
@@ -416,8 +425,10 @@ const NOT_FORWARDED: &str = "Attachments (not forwarded): ";
 pub struct ForwardSummary {
     pub sender: String,
     pub subject: String,
-    /// When the original was sent, from the block's Date line.
-    pub date_unix: Option<i64>,
+    /// When the original was sent, from the block's Date line. That line is
+    /// in the zone the forward was written in, so this is its wall-clock
+    /// time read as UTC: subtract the local offset to get the instant.
+    pub date_wall: Option<i64>,
     /// The original's attachment names, or `None` when it had none.
     pub not_forwarded: Option<String>,
 }
@@ -433,7 +444,7 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
     let mut summary = ForwardSummary {
         sender: String::new(),
         subject: String::new(),
-        date_unix: None,
+        date_wall: None,
         not_forwarded: None,
     };
     for line in lines.take_while(|line| !line.is_empty()) {
@@ -444,8 +455,7 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
                 _ => from.trim().to_string(),
             };
         } else if let Some(date) = line.strip_prefix("Date: ") {
-            summary.date_unix =
-                mail_parser::DateTime::parse_rfc822(date).map(|date| date.to_timestamp());
+            summary.date_wall = parse_quote_date(date);
         } else if let Some(subject) = line.strip_prefix("Subject: ") {
             summary.subject = subject.to_string();
         } else if let Some(names) = line.strip_prefix(NOT_FORWARDED) {
@@ -462,10 +472,7 @@ fn forward_quote(parent: &Message, offset: i64) -> (String, String) {
     let mut header = vec![
         FORWARD_MARK.to_string(),
         format!("From: {}", display_address(&parent.headers.from)),
-        format!(
-            "Date: {}",
-            rfc5322_date_at(parent.headers.date_unix, offset)
-        ),
+        format!("Date: {}", quote_date_at(parent.headers.date_unix, offset)),
         format!("Subject: {}", one_line(&parent.headers.subject)),
     ];
     if !parent.to.is_empty() {
@@ -757,7 +764,7 @@ mod tests {
             start
                 .parts
                 .quote_text
-                .starts_with("On Tue, 14 Nov 2023 at 22:13, Ada Lovelace <ada@x> wrote:\n"),
+                .starts_with("On Tue, 14 Nov 2023 at 22:13, Ada Lovelace wrote:\n"),
             "{}",
             start.parts.quote_text
         );
@@ -816,7 +823,7 @@ mod tests {
             Some(ForwardSummary {
                 sender: "Ada Lovelace".into(),
                 subject: "Re: Plans".into(),
-                date_unix: Some(1_700_000_000),
+                date_wall: Some(1_699_999_980),
                 not_forwarded: Some("report.pdf, chart.png".into()),
             })
         );

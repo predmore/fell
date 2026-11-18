@@ -1653,7 +1653,8 @@ impl ComposeView {
             )
             .children(snap.forwarded.as_ref().map(|forward| {
                 let who = display_safe(&forward.sender);
-                let when = forward.date_unix.map(|date| {
+                let when = forward.date_wall.map(|wall| {
+                    let date = wall - crate::present::local_offset(wall);
                     format!(
                         "\u{a0}({})",
                         crate::present::relative_date(now_unix_secs(), date)

@@ -423,6 +423,32 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+/// Read back a [`quote_date_at`] line ("Wed, 18 Nov 2026 at 08:16") as
+/// seconds since the epoch of that wall-clock time read as UTC.
+pub(super) fn parse_quote_date(text: &str) -> Option<i64> {
+    let (_, rest) = text.split_once(", ")?;
+    let (date, time) = rest.split_once(" at ")?;
+    let mut parts = date.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_name = parts.next()?;
+    let month = MONTHS.iter().position(|name| *name == month_name)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let (hour, minute) = time.trim().split_once(':')?;
+    let (hour, minute): (i64, i64) = (hour.parse().ok()?, minute.parse().ok()?);
+    if !(1..=31).contains(&day) || !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60)
+}
+
 /// An RFC 5322 date in the zone `offset` seconds east of UTC.
 pub(super) fn rfc5322_date_at(unix: i64, offset: i64) -> String {
     let (year, month, day, hour, minute, second, weekday) =
@@ -699,6 +725,16 @@ mod tests {
             quote_date_at(1_700_000_000, -8 * 3600),
             "Tue, 14 Nov 2023 at 14:13"
         );
+        assert_eq!(
+            parse_quote_date(&quote_date_at(1_700_000_000, 0)),
+            Some(1_699_999_980)
+        );
+        assert_eq!(parse_quote_date("Thu, 1 Jan 1970 at 00:00"), Some(0));
+        assert_eq!(
+            parse_quote_date("Thu, 29 Feb 2024 at 23:59"),
+            Some(1_709_251_140)
+        );
+        assert_eq!(parse_quote_date("garbage"), None);
     }
 
     #[test]
