@@ -568,6 +568,10 @@ impl ComposeView {
             let _ = self.commit_field(self.field);
         }
         self.end_insert();
+        // The draft this window showed is no longer in front of anyone: it
+        // closes for editing, and the inbox says so, as when the window
+        // closes.
+        self.hub.note_hidden(self.draft_id.as_ref());
         let Some((folder, snap)) = self.hub.with_session(&id, |session| {
             session.open_for_edit();
             (session.folder().to_path_buf(), session.snapshot())
@@ -1869,10 +1873,13 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
 /// without format characters (bidi overrides, zero-width marks) that could
 /// make the sentence around it read differently.
 fn agent_label(agent: &str) -> String {
-    agent
-        .strip_prefix("agent:")
-        .unwrap_or(agent)
-        .chars()
+    display_safe(agent.strip_prefix("agent:").unwrap_or(agent))
+}
+
+/// Text from outside (an agent name, a sender, a subject) without line
+/// breaks or the invisible marks that reorder or hide what is drawn.
+fn display_safe(text: &str) -> String {
+    text.chars()
         .filter(|ch| {
             !ch.is_control()
                 && !matches!(
@@ -2004,11 +2011,11 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
     let reply = match (&snap.reply_context, snap.in_reply_to.as_deref()) {
         (Some(parent), _) => format!(
             "{} · {} ({})",
-            parent.sender,
-            parent.subject,
+            display_safe(&parent.sender),
+            display_safe(&parent.subject),
             crate::present::relative_date(now_unix_secs(), parent.date_unix)
         ),
-        (None, Some(id)) if !id.trim().is_empty() => id.to_string(),
+        (None, Some(id)) if !id.trim().is_empty() => display_safe(id),
         _ => "none (new message)".to_string(),
     };
     div()
@@ -3527,6 +3534,14 @@ mod tests {
         assert_eq!(
             super::agent_label("agent:bot\u{202E}dneS\u{200B}"),
             "botdneS"
+        );
+    }
+
+    #[test]
+    fn a_reply_sender_and_subject_cannot_reorder_the_row() {
+        assert_eq!(
+            super::display_safe("Jon\u{202E}gnisab\u{202C}\nRe: plan"),
+            "JongnisabRe: plan"
         );
     }
 

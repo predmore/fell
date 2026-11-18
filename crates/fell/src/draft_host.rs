@@ -65,11 +65,13 @@ pub fn watch_folder(
                     .is_none_or(|(current_id, _)| *current_id != id)
                 && let Some(next) = hub.with_session(&id, |session| session.folder().to_path_buf())
             {
-                let released = match &current {
-                    Some((_, folder)) => watcher.unwatch(folder).is_ok(),
-                    None => true,
-                };
-                if released && watcher.watch(&next, RecursiveMode::NonRecursive).is_ok() {
+                // The old watch ends either way: a folder that is gone took
+                // its watch with it. A failed watch leaves nothing current,
+                // so the next pass tries again.
+                if let Some((_, folder)) = current.take() {
+                    let _ = watcher.unwatch(&folder);
+                }
+                if watcher.watch(&next, RecursiveMode::NonRecursive).is_ok() {
                     // A write that landed before the watch began sent no
                     // event; merge whatever the file holds now.
                     merge_from_disk(&hub, &id, &next);
@@ -177,7 +179,12 @@ fn reveal(
             .is_ok()
     });
     if !raised {
-        *window.borrow_mut() = open_compose_window(cx, hub.clone(), id);
+        let opened = open_compose_window(cx, hub.clone(), id);
+        if opened.is_none() {
+            // No window shows it, so it is not open for editing.
+            hub.with_session(id, |session| session.close_editor());
+        }
+        *window.borrow_mut() = opened;
     }
 }
 
