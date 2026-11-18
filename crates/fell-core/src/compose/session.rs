@@ -570,10 +570,13 @@ impl DraftSession {
         self.known = known;
     }
 
-    /// Paint `html` as the quoted original below the draft. It is not sent;
-    /// [`Self::start_reply_in`] keeps a quote that is.
+    /// Paint `html` as the quoted original below a draft that quotes
+    /// nothing, as the demo does. A reply's quote is sent in both parts, so
+    /// it is never replaced here: the two parts would disagree.
     pub fn set_quote(&mut self, html: Option<String>) {
-        self.reply.quote_html = html.unwrap_or_default();
+        if self.reply.quote_text.is_empty() {
+            self.reply.quote_html = html.unwrap_or_default();
+        }
     }
 
     /// References and the quoted original this draft sends with it.

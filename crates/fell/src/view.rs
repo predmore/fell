@@ -1060,12 +1060,8 @@ impl Inbox {
             };
             let result = match found {
                 Ok(Some(parent)) => {
-                    let start = fell_core::compose::start_reply(
-                        kind,
-                        &parent,
-                        &email,
-                        std::slice::from_ref(&email),
-                    );
+                    let own = fell_core::compose::own_addresses(&parent, &email);
+                    let start = fell_core::compose::start_reply(kind, &parent, &email, &own);
                     let hub = hub.clone();
                     cx.background_executor()
                         .spawn(async move { home.new_reply(&hub, &account, start) })

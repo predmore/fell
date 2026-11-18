@@ -87,7 +87,9 @@ pub(crate) fn to_message(
     if let Some(parent) = &in_reply_to
         && !references.iter().any(|id| id == parent)
     {
-        references.insert(0, parent.clone());
+        // The parent is the newest id, so it goes last: the first id stays
+        // the thread's root, which a capped References keeps.
+        references.push(parent.clone());
     }
     let from = parsed
         .as_ref()

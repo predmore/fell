@@ -562,6 +562,17 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
     let saved = &snapshot.row;
     if let Some(current) = load_one(conn, account_id, &saved.message_id)? {
         if snapshot.removed {
+            // A snapshot taken before Fell kept Reply-To and attachment names
+            // has them empty. Keep what a sync has filled in since: local
+            // actions never change them.
+            let mut saved = saved.clone();
+            if saved.reply_to_line.is_empty() {
+                saved.reply_to_line = current.reply_to_line.clone();
+            }
+            if saved.attachment_names.is_empty() {
+                saved.attachment_names = current.attachment_names.clone();
+            }
+            let saved = &saved;
             replace_message_row(conn, account_id, &current, saved)?;
             restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
             return Ok(());

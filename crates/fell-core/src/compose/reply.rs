@@ -63,12 +63,24 @@ pub fn start_reply(kind: ReplyKind, parent: &Message, from: &str, own: &[String]
     match kind {
         ReplyKind::Reply | ReplyKind::ReplyAll => {
             let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll);
-            let references: Vec<String> = parent
+            let mut references: Vec<String> = parent
                 .headers
                 .references
                 .iter()
                 .map(|id| id.as_str().to_string())
                 .collect();
+            // Mail synced before In-Reply-To was appended has it in front of
+            // the chain it was missing from. It is the newest id, not the
+            // root, so it moves to the end before the chain is capped.
+            if references.len() > 1
+                && parent
+                    .headers
+                    .in_reply_to
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == references[0])
+            {
+                references.rotate_left(1);
+            }
             let (quote_text, quote_html) = reply_quote(parent);
             ReplyStart {
                 fields: DraftFields {
@@ -124,6 +136,44 @@ fn prefixed(marker: &str, subject: &str) -> String {
     }
 }
 
+/// The person's own addresses for a reply to `parent`: the account's, the
+/// aliases this copy arrived through (Delivered-To and the like), and the
+/// sender of a copy in Sent, which the person sent from some address of
+/// theirs. A mailing list the copy arrived through is not theirs, so a reply
+/// all still goes to it.
+pub fn own_addresses(parent: &Message, account_email: &str) -> Vec<String> {
+    let list = parent.list_id.as_deref().map(|id| {
+        id.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_lowercase()
+    });
+    let is_list = |email: &str| {
+        list.as_deref()
+            .is_some_and(|list| !list.is_empty() && email.to_lowercase().replace('@', ".") == list)
+    };
+    let mut own = vec![account_email.trim().to_string()];
+    own.extend(
+        parent
+            .arrived_via
+            .iter()
+            .map(|email| email.trim().to_string())
+            .filter(|email| email.contains('@') && !is_list(email)),
+    );
+    if in_sent(parent) {
+        own.push(parent.headers.from.email.trim().to_string());
+    }
+    own.retain(|email| !email.is_empty());
+    own
+}
+
+/// Whether a copy of `message` is in the Sent folder.
+fn in_sent(message: &Message) -> bool {
+    message.folders.iter().any(|folder| {
+        folder.eq_ignore_ascii_case("sent") || folder.eq_ignore_ascii_case("sent mail")
+    })
+}
+
 /// To and Cc for a reply to `parent`. To is Reply-To when the message has
 /// one, else the sender. Reply all adds the other To recipients to To and
 /// keeps Cc as Cc. The person's own addresses (`own`) and repeats are left
@@ -134,7 +184,7 @@ pub fn reply_recipients(parent: &Message, own: &[String], all: bool) -> (Vec<Str
         .map(|email| email.trim().to_lowercase())
         .collect();
     let mine = |address: &Address| own.contains(&address.email.trim().to_lowercase());
-    let from_me = mine(&parent.headers.from);
+    let from_me = mine(&parent.headers.from) || in_sent(parent);
     let primary: Vec<&Address> = if from_me {
         parent.to.iter().collect()
     } else if !parent.reply_to.is_empty() {
@@ -483,6 +533,56 @@ mod tests {
         assert_eq!(to, vec!["Ada Lovelace <ada@x>", "Maya <maya@x>"]);
         // Ada is in To already and Jon is me, in any case; Sam is listed twice.
         assert_eq!(cc, vec!["sam@x"]);
+    }
+
+    #[test]
+    fn mail_i_sent_from_an_alias_is_answered_to_its_recipients() {
+        // Sent from me@pm.me while the account is jon@example.com: the
+        // Sent copy is mine, so the reply goes to whom it went to, never to
+        // the alias.
+        let mut message = parent();
+        message.folders = vec!["Sent".into()];
+        message.headers.from = address(Some("Jon"), "me@pm.me");
+        message.to = vec![
+            address(Some("Maya"), "maya@x"),
+            address(None, "me+lists@pm.me"),
+        ];
+        message.arrived_via = vec!["me+lists@pm.me".into()];
+        let own = own_addresses(&message, "jon@example.com");
+        let (to, _) = reply_recipients(&message, &own, false);
+        assert_eq!(to, vec!["Maya <maya@x>"]);
+        let (to, cc) = reply_recipients(&message, &own, true);
+        assert_eq!(to, vec!["Maya <maya@x>"]);
+        assert!(!cc.iter().chain(&to).any(|line| line.contains("pm.me")));
+    }
+
+    #[test]
+    fn a_list_the_mail_arrived_through_stays_on_a_reply_all() {
+        let mut message = parent();
+        message.list_id = Some("<team.lists.x>".into());
+        message.arrived_via = vec!["team@lists.x".into(), "jon+team@example.com".into()];
+        message.cc.push(address(None, "team@lists.x"));
+        message.cc.push(address(None, "jon+team@example.com"));
+        let own = own_addresses(&message, "jon@example.com");
+        assert_eq!(own, vec!["jon@example.com", "jon+team@example.com"]);
+        let (_, cc) = reply_recipients(&message, &own, true);
+        assert!(cc.contains(&"team@lists.x".to_string()), "{cc:?}");
+        assert!(!cc.iter().any(|line| line.contains("jon+team")), "{cc:?}");
+    }
+
+    #[test]
+    fn a_chain_with_its_parent_in_front_keeps_its_root_when_capped() {
+        // Synced before In-Reply-To was appended: [mid, root, ...].
+        let mut message = parent();
+        message.headers.in_reply_to = Some(MessageId::new("mid@x"));
+        let mut chain = vec![MessageId::new("mid@x"), MessageId::new("root@x")];
+        chain.extend((0..20).map(|n| MessageId::new(format!("m{n}@x"))));
+        message.headers.references = chain;
+        let start = start_reply(ReplyKind::Reply, &message, "jon@example.com", &me());
+        let refs = &start.parts.references;
+        assert_eq!(refs.len(), MAX_REFERENCES);
+        assert_eq!(refs[0], "root@x");
+        assert_eq!(&refs[refs.len() - 2..], ["mid@x", "parent@x"]);
     }
 
     #[test]

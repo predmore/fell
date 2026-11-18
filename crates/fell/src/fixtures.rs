@@ -409,7 +409,7 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
             .iter()
             .map(|label| (*label).to_string())
             .collect(),
-        arrived_via: vec![row.email.into()],
+        arrived_via: vec![account.email.clone()],
         to: people(to),
         cc: people(cc),
         bcc: people(bcc),

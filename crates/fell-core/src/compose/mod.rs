@@ -36,7 +36,7 @@ pub use persist::{
 };
 pub use reply::{
     MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references, forward_subject,
-    reply_recipients, reply_subject, start_reply,
+    own_addresses, reply_recipients, reply_subject, start_reply,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
