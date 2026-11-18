@@ -5148,6 +5148,177 @@ mod tests {
     }
 
     #[test]
+    fn a_list_parent_rewritten_to_the_list_copy_of_the_same_parent_still_joins() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let root_thread = store
+            .upsert_message(&msg("patch@x", None, None, "Patch", "patch notes"))
+            .unwrap();
+        // The list's own copy of the parent, under the id the list gave it.
+        let mut root_copy = msg(
+            "patch-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Patch",
+            "patch notes as the list delivered them",
+        );
+        root_copy.list_id = Some("list.example".into());
+        assert_eq!(store.upsert_message(&root_copy).unwrap(), root_thread);
+        let at = 1_700_000_000;
+        let mut sent = msg(
+            "sent-a@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Looks right to me, merging this afternoon.",
+        );
+        sent.headers.date_unix = at;
+        sent.folders = vec!["Sent".into()];
+        let mut echo = msg(
+            "echo@x",
+            None,
+            Some("patch-list@x"),
+            "[list] Re: Patch",
+            "Looks right to me, merging this afternoon.",
+        );
+        echo.list_id = Some("list.example".into());
+        echo.headers.date_unix = at + 60;
+        echo.folders = vec!["INBOX".into()];
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(alias_target(&store, "echo@x").as_deref(), Some("sent-a@x"));
+        assert!(!message_row_present(&store, "echo@x"));
+    }
+
+    /// Insert a row as an older Fell stored it, before the copies were joined.
+    fn insert_raw_row(
+        store: &Store,
+        (id, subject, parent, folder, list_id, date): (&str, &str, &str, &str, Option<&str>, i64),
+    ) {
+        let fingerprint = crate::message::body_fingerprint("Sounds good to me");
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, in_reply_to,
+                    references_header, from_email, subject, date_unix, snippet, body_text,
+                    unread, folders, body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', ?1, ?1, ?2, ?3, ?3, 'from@x', ?4, ?5, 'Sounds good to me',
+                    'Sounds good to me', 1, ?6, ?7, ?8
+                 )",
+                params![
+                    id,
+                    format!("msgid:{id}"),
+                    parent,
+                    subject,
+                    date,
+                    folder,
+                    fingerprint,
+                    list_id
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resync_from_three_rows_joins_only_the_send_and_its_own_echo() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let at = 1_700_000_000_i64;
+        insert_raw_row(
+            &store,
+            ("sent-a@x", "Re: Patch", "patch@x", "Sent", None, at),
+        );
+        insert_raw_row(
+            &store,
+            (
+                "sent-b@x",
+                "Re: Budget",
+                "budget@x",
+                "Sent",
+                None,
+                at + 5 * 60,
+            ),
+        );
+        insert_raw_row(
+            &store,
+            (
+                "list-b@x",
+                "[list] Re: Budget",
+                "budget@x",
+                "INBOX",
+                Some("list.example"),
+                at + 10 * 60,
+            ),
+        );
+        for (id, subject, parent, folder, date) in [
+            ("sent-a@x", "Re: Patch", "patch@x", "Sent", at),
+            ("sent-b@x", "Re: Budget", "budget@x", "Sent", at + 5 * 60),
+        ] {
+            let mut again = msg(id, None, Some(parent), subject, "Sounds good to me");
+            again.headers.date_unix = date;
+            again.folders = vec![folder.into()];
+            store.upsert_message(&again).unwrap();
+        }
+        // Sent A is another post and keeps its row. Sent B and its list echo
+        // are one message: exactly one of the two rows stays.
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert_eq!(alias_target(&store, "sent-a@x"), None);
+        let b_rows = ["sent-b@x", "list-b@x"]
+            .iter()
+            .filter(|id| message_row_present(&store, id))
+            .count();
+        assert_eq!(b_rows, 1);
+        assert_eq!(listed(&store).len(), 2);
+    }
+
+    #[test]
+    fn a_sent_copy_reusing_the_list_posts_id_joins_that_post() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (sent_a, list_b) = sent_a_and_list_b();
+        store.upsert_message(&sent_a).unwrap();
+        store.upsert_message(&list_b).unwrap();
+        // The Sent original of B: the list kept its Message-ID.
+        let mut sent_b = msg(
+            "list-b@x",
+            None,
+            Some("budget@x"),
+            "Re: Budget",
+            "Sounds good to me",
+        );
+        sent_b.headers.date_unix = list_b.headers.date_unix - 60;
+        sent_b.folders = vec!["Sent".into()];
+        store.upsert_message(&sent_b).unwrap();
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert!(message_row_present(&store, "list-b@x"));
+        assert_eq!(alias_target(&store, "sent-a@x"), None);
+        assert_eq!(alias_target(&store, "list-b@x"), None);
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let b = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "list-b@x")
+            .unwrap();
+        assert!(
+            b.folders.iter().any(|folder| folder == "Sent"),
+            "{:?}",
+            b.folders
+        );
+        assert!(
+            b.folders.iter().any(|folder| folder == "INBOX"),
+            "{:?}",
+            b.folders
+        );
+        let a = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "sent-a@x")
+            .unwrap();
+        assert_eq!(a.folders, vec!["Sent"]);
+    }
+
+    #[test]
     fn upgrade_keeps_a_sent_copy_beside_a_list_post_on_another_subject() {
         let path = std::env::temp_dir().join(format!(
             "fell-schema-v2-{}-sent-subject.sqlite",
