@@ -1,5 +1,6 @@
 //! Row and conversation presentation. Pure functions, no GPUI.
 
+use fell_core::compose::DraftSummary;
 use fell_core::{FolderThread, Message};
 
 use crate::text_render::{RenderedBody, render_stored_body};
@@ -30,7 +31,13 @@ pub struct ThreadRow {
     pub subject: String,
     pub snippet: String,
     pub labels: Vec<String>,
+    /// The first label is a warning (a draft that may have gone out), drawn
+    /// in the error colour, not as a tag.
+    pub warn: bool,
     pub unread: bool,
+    /// The compose draft this row stands for, in the drafts list. `None`
+    /// for a thread.
+    pub draft: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,9 +257,166 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             subject: one_line(&thread.subject),
             snippet: one_line(&thread.snippet),
             labels: thread.labels.clone(),
+            warn: false,
             unread: thread.unread,
+            draft: None,
         })
         .collect()
+}
+
+/// The row id of compose draft `id`. Thread ids never start with this.
+pub fn draft_row_id(id: &str) -> String {
+    format!("draft:{id}")
+}
+
+/// Rows for compose drafts, shown above the synced Drafts folder: who the
+/// draft is to, a `draft` chip (or `may have been sent`), and the agent it
+/// belongs to.
+pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
+    drafts
+        .iter()
+        .map(|draft| {
+            let names: Vec<String> = draft
+                .to
+                .iter()
+                .chain(&draft.cc)
+                .map(|raw| recipient_label(raw))
+                .collect();
+            let spans = if names.is_empty() {
+                vec![NameSpan {
+                    text: "No recipients".into(),
+                    emphasis: false,
+                }]
+            } else {
+                // "to Ada": the column names who a draft is to, not who
+                // sent it, as it does for threads.
+                names
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                    .map(|(index, name)| NameSpan {
+                        text: if index == 0 {
+                            format!("to {name}")
+                        } else {
+                            name.clone()
+                        },
+                        emphasis: false,
+                    })
+                    .collect()
+            };
+            let mut labels = vec![if draft.maybe_sent {
+                "check Sent".to_string()
+            } else {
+                "draft".to_string()
+            }];
+            let agent: String = draft
+                .owner
+                .trim_start_matches("agent:")
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(24)
+                .collect();
+            if !agent.trim().is_empty() {
+                labels.push(agent);
+            }
+            ThreadRow {
+                id: draft_row_id(&draft.id),
+                spans,
+                extra: names.len().saturating_sub(3),
+                message_count: 1,
+                starred: false,
+                has_attachment: false,
+                date_unix: draft.updated_unix,
+                subject: if draft.subject.trim().is_empty() {
+                    "(no subject)".into()
+                } else {
+                    one_line(&draft.subject)
+                },
+                snippet: one_line(&draft.body),
+                labels,
+                warn: draft.maybe_sent,
+                unread: false,
+                draft: Some(draft.id.clone()),
+            }
+        })
+        .collect()
+}
+
+/// A draft in the reading pane: one message, from the person, as it reads.
+pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
+    let address = |raw: &String| {
+        let (name, email) = fell_core::compose::mailbox_parts(raw)
+            .unwrap_or_else(|| (None, raw.trim().to_string()));
+        // Named as the draft's row names them, so "to Ada" reads the same.
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| Some(recipient_label(&email)));
+        fell_core::Address { name, email }
+    };
+    let from = address(&draft.from);
+    let message_id = fell_core::MessageId::new(draft_row_id(&draft.id));
+    let message = Message {
+        account_id: fell_core::AccountId(String::new()),
+        headers: fell_core::MessageHeaders {
+            message_id: message_id.clone(),
+            proton_conversation_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            from,
+            subject: draft.subject.clone(),
+            date_unix: draft.updated_unix,
+        },
+        remote_id: fell_core::RemoteId(String::new()),
+        thread_id: fell_core::ThreadId::from_message_id(&message_id),
+        snippet: one_line(&draft.body),
+        body_text: Some(draft.body.clone()),
+        unread: false,
+        folders: Vec::new(),
+        labels: Vec::new(),
+        arrived_via: Vec::new(),
+        to: draft.to.iter().map(address).collect(),
+        cc: draft.cc.iter().map(address).collect(),
+        bcc: draft.bcc.iter().map(address).collect(),
+        starred: false,
+        has_attachment: false,
+        archived: false,
+        snooze_until: None,
+        list_id: None,
+    };
+    let mut shown = conversation(&[message], me);
+    for message in &mut shown {
+        message.folders = if draft.maybe_sent {
+            "Draft · may have been sent · check Sent before sending again".into()
+        } else {
+            "Draft".into()
+        };
+        message.expanded = true;
+    }
+    shown
+}
+
+/// A recipient as a draft row names them: the display name, or the
+/// address's local part with a capital, as a name would have.
+fn recipient_label(raw: &str) -> String {
+    let named = fell_core::compose::mailbox_parts(raw)
+        .is_some_and(|(name, _)| name.as_deref().is_some_and(|name| !name.trim().is_empty()));
+    let label = address_name(raw);
+    if named {
+        return label;
+    }
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => label,
+    }
+}
+
+/// The name a draft row shows for one recipient.
+fn address_name(raw: &str) -> String {
+    match fell_core::compose::mailbox_parts(raw) {
+        Some((name, email)) => display_name(&name, &email, ""),
+        None => one_line(raw),
+    }
 }
 
 pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {
@@ -533,32 +697,79 @@ fn utc_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     (year, month, day, hour, minute, wday)
 }
 
-/// Fit a notice to `max_px`, as `measure` sizes text. A quoted name gives
-/// up whole words first, so the outcome before it and the key after it
-/// stay whole; only a first word too long alone is cut inside.
+/// Fit a notice to `max_px`, as `measure` sizes text. The quoted name
+/// gives up whole words first. If even one word does not fit, the clauses
+/// between the outcome and the closing key go next, last first, and the
+/// name is fitted again; so the outcome and the key always stay whole and
+/// no clause is cut in the middle. Only an outcome too long alone is cut.
 pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
     if measure(text) <= max_px {
         return text.to_string();
     }
-    let quoted = text.find('\u{201c}').and_then(|open| {
-        text[open..]
-            .find('\u{201d}')
-            .map(|close| (open, open + close))
-    });
-    let Some((open, close)) = quoted else {
-        return cut_to(text, "", "", max_px, &measure);
-    };
-    let before = &text[..open + '\u{201c}'.len_utf8()];
-    let after = &text[close..];
-    let name = text[before.len()..close].trim_end_matches('…');
-    let words: Vec<&str> = name.split_whitespace().collect();
-    for count in (1..words.len()).rev() {
-        let candidate = format!("{before}{}…{after}", words[..count].join(" "));
+    if let Some(fitted) = shorten_name(text, max_px, &measure) {
+        return fitted;
+    }
+    let mut parts: Vec<&str> = text.split(NOTICE_DOT).collect();
+    while let Some(drop) = (1..parts.len().saturating_sub(1))
+        .rev()
+        .find(|index| !parts[*index].contains('\u{201c}'))
+    {
+        parts.remove(drop);
+        let candidate = parts.join(NOTICE_DOT);
+        if measure(&candidate) <= max_px {
+            return candidate;
+        }
+        if let Some(fitted) = shorten_name(&candidate, max_px, &measure) {
+            return fitted;
+        }
+    }
+    // Not one word of the name fits: a stub of it says nothing, so the
+    // name goes, and the outcome and key stay whole.
+    if let Some(at) = parts.iter().position(|part| part.contains('\u{201c}'))
+        && parts.len() > 1
+    {
+        let mut without = parts.clone();
+        without.remove(at);
+        let candidate = without.join(NOTICE_DOT);
         if measure(&candidate) <= max_px {
             return candidate;
         }
     }
-    cut_to(name, before, after, max_px, &measure)
+    let text = parts.join(NOTICE_DOT);
+    match quoted_span(&text) {
+        Some((open, close)) => {
+            let before = &text[..open + '\u{201c}'.len_utf8()];
+            let after = &text[close..];
+            let name = text[before.len()..close].trim_end_matches('…');
+            cut_to(name, before, after, max_px, &measure)
+        }
+        None => cut_to(&text, "", "", max_px, &measure),
+    }
+}
+
+/// How the inbox separates a notice's clauses.
+const NOTICE_DOT: &str = "  ·  ";
+
+fn quoted_span(text: &str) -> Option<(usize, usize)> {
+    text.find('\u{201c}').and_then(|open| {
+        text[open..]
+            .find('\u{201d}')
+            .map(|close| (open, open + close))
+    })
+}
+
+/// `text` with its quoted name cut to whole words that fit, keeping at
+/// least the first; `None` when no quoted name, or not even one word, fits.
+fn shorten_name(text: &str, max_px: f32, measure: &impl Fn(&str) -> f32) -> Option<String> {
+    let (open, close) = quoted_span(text)?;
+    let before = &text[..open + '\u{201c}'.len_utf8()];
+    let after = &text[close..];
+    let name = text[before.len()..close].trim_end_matches('…');
+    let words: Vec<&str> = name.split_whitespace().collect();
+    (1..words.len())
+        .rev()
+        .map(|count| format!("{before}{}…{after}", words[..count].join(" ")))
+        .find(|candidate| measure(candidate) <= max_px)
 }
 
 /// The longest start of `middle` that fits between `before` and `after`,
@@ -592,6 +803,38 @@ mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    #[test]
+    fn a_draft_row_names_who_it_is_to() {
+        assert_eq!(recipient_label("ada@example.com"), "Ada");
+        assert_eq!(
+            recipient_label("Ada Lovelace <ada@example.com>"),
+            "Ada Lovelace"
+        );
+        assert_eq!(recipient_label("jon.smith@example.com"), "Jon.smith");
+    }
+
+    #[test]
+    fn a_narrow_warning_drops_its_middle_clause_before_its_key() {
+        let notice = "may have been sent  ·  check Sent before sending again  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent";
+        let width = |text: &str| text.chars().count() as f32;
+        let fitted = fit_notice(notice, 60.0, width);
+        assert_eq!(
+            fitted,
+            "may have been sent  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent"
+        );
+        let fitted = fit_notice(notice, 48.0, width);
+        assert_eq!(
+            fitted,
+            "may have been sent  ·  \u{201c}Budget…\u{201d}  ·  gs sent"
+        );
+        assert!(width(&fitted) <= 48.0);
+        // Not one word of the subject fits: it goes, not a stub of it.
+        assert_eq!(
+            fit_notice(notice, 36.0, width),
+            "may have been sent  ·  gs sent"
+        );
+    }
 
     #[test]
     fn a_notice_gives_up_whole_words_of_the_subject_first() {

@@ -139,6 +139,8 @@ struct Editor {
     row: usize,
     col: usize,
     mode: Mode,
+    /// A header field takes the typing, so the body draws no caret.
+    caret_hidden: bool,
     anchor: Option<(usize, usize)>,
     preferred: usize,
     count: usize,
@@ -184,6 +186,7 @@ impl Editor {
             col,
             lines,
             mode: Mode::Normal,
+            caret_hidden: false,
             anchor: None,
             preferred: 0,
             count: 0,
@@ -238,13 +241,17 @@ pub struct ComposeView {
     palette: Option<String>,
     status: SharedString,
     sent: bool,
-    /// A send is talking to the server. Another send waits for it.
-    sending: bool,
+    /// The draft whose send is talking to the server. Another send of it
+    /// waits. The window may have moved to another draft meanwhile.
+    sending: Option<String>,
     watching: bool,
     flush_pending: bool,
     flush_gen: u64,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
+    /// Close once a send went out, so the person is back in the inbox and
+    /// the sent draft does not linger. The demo window stays, showing sent.
+    close_on_send: bool,
     /// `]` or `[` was pressed; `h` then jumps to the next or previous edit.
     bracket: Option<char>,
     /// The agent edit that the bar describes and keep, reject act on.
@@ -299,11 +306,12 @@ impl ComposeView {
             palette: None,
             status: "i insert".into(),
             sent: false,
-            sending: false,
+            sending: None,
             watching: false,
             flush_pending: false,
             flush_gen: 0,
             closing: false,
+            close_on_send: false,
             bracket: None,
             focused_hunk: None,
             seen_edits: 0,
@@ -507,6 +515,21 @@ impl ComposeView {
         self.status = format!("{who} {what} · edit {} of {}", at + 1, order.len()).into();
     }
 
+    /// Close the window after a send that went out.
+    pub(crate) fn close_after_send(&mut self) {
+        self.close_on_send = true;
+    }
+
+    /// A draft with nobody to send it to yet starts on the To line, ready
+    /// to type, as a new draft from `c` does.
+    fn start_on_recipients_if_empty(&mut self, snap: &Snapshot) {
+        if snap.to.is_empty() && snap.cc.is_empty() && snap.bcc.is_empty() && snap.hunks.is_empty()
+        {
+            self.field = Field::To;
+            self.status = "to · tab next".into();
+        }
+    }
+
     /// An agent asked for review: start on its first edit, if any.
     pub(crate) fn start_on_first_edit(&mut self) {
         let id = self.draft_id.to_string();
@@ -518,6 +541,21 @@ impl ComposeView {
         self.known_hunks = order.iter().map(|(hunk, _)| *hunk).collect();
         if !order.is_empty() {
             self.focus_hunk_at(&order, 0);
+            return;
+        }
+        self.start_on_recipients_if_empty(&snap);
+        if snap.send_requested_by.is_none() {
+            // The person's own draft: pick up where the text ends.
+            if let Some(row) = self
+                .editor
+                .lines
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+            {
+                self.editor.row = row;
+                self.editor.col = self.editor.lines[row].chars().count();
+                self.editor.clamp();
+            }
             return;
         }
         // No edits yet: start on the first line of text, so the first view
@@ -589,10 +627,11 @@ impl ComposeView {
         self.to_line = join_addrs(&snap.to);
         self.cc_line = join_addrs(&snap.cc);
         self.bcc_line = join_addrs(&snap.bcc);
-        self.subject_line = snap.subject;
+        self.subject_line = snap.subject.clone();
         self.sent = false;
         self.quote_open = false;
         self.status = "i insert".into();
+        self.start_on_recipients_if_empty(&snap);
     }
 
     /// Copies session text that is not on screen. Returns true when the
@@ -759,11 +798,11 @@ impl ComposeView {
     /// answers. The draft is claimed for the send before it starts, so a
     /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.sending {
+        let id = self.draft_id.to_string();
+        if self.sending.as_deref() == Some(id.as_str()) {
             self.status = "Sending…".into();
             return;
         }
-        let id = self.draft_id.to_string();
         if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
             self.status = lock.reason().into();
             return;
@@ -788,42 +827,45 @@ impl ComposeView {
                 return;
             }
         };
-        self.sending = true;
+        self.sending = Some(id.clone());
         self.status = "Sending…".into();
         let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
+            let sent_id = id.clone();
             let outcome = cx
                 .background_executor()
-                .spawn(async move { transmit_from_hub(&hub, &id, prepared, account_backend) })
+                .spawn({
+                    let hub = hub.clone();
+                    async move { transmit_from_hub(&hub, &id, prepared, account_backend) }
+                })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.sending = false;
-                match outcome {
-                    Ok(_) => {
-                        this.sent = true;
-                        let id = this.draft_id.to_string();
-                        let unrecorded = this
-                            .hub
-                            .with_session(&id, |session| {
-                                session.snapshot().notices.iter().any(|notice| {
-                                    notice.starts_with("could not record how this send ended")
-                                })
-                            })
-                            .unwrap_or(false);
-                        this.status = if unrecorded {
-                            "Sent; the mailbox did not record it, so this draft will read as possibly sent"
-                        } else {
-                            "Sent from the editor"
-                        }
-                        .into();
-                    }
-                    Err(err) => {
-                        this.sent = matches!(err, SendFailure::MaybeSent(_));
-                        this.status = err.to_string().into();
-                    }
+            let shown = this.update(cx, |this, cx| {
+                if this.sending.as_deref() == Some(sent_id.as_str()) {
+                    this.sending = None;
+                }
+                let end = finish_send(
+                    &this.hub,
+                    &sent_id,
+                    this.draft_id.as_ref(),
+                    this.close_on_send,
+                    &outcome,
+                );
+                if let Some(status) = end.status {
+                    this.sent = end.sent;
+                    this.status = status.into();
+                }
+                if end.close {
+                    this.closing = true;
                 }
                 cx.notify();
             });
+            if shown.is_err() {
+                // The window closed while the send ran.
+                hub.report_send(
+                    &sent_id,
+                    send_failure_line(&hub, &sent_id, &outcome).as_deref(),
+                );
+            }
         })
         .detach();
     }
@@ -935,16 +977,26 @@ impl ComposeView {
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
-        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
-            && key != "escape"
-        {
-            self.status = lock.reason().into();
-            return;
-        }
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
+        if let Some(Some(_)) = self.hub.with_session(&id, |session| session.send_lock())
+            && key != "escape"
+        {
+            // Still a window: `:` and its commands work, so `:q` closes
+            // it; `run_action` refuses the ones that would change the draft.
+            if self.palette.is_some() {
+                self.palette_key(key, typed, cx);
+            } else if key == ":" {
+                self.palette = Some(String::new());
+            } else {
+                // Shown as the idle hint for this lock; the bar's right side
+                // already gives the reason.
+                self.status = "normal".into();
+            }
+            return;
+        }
         if self.palette.is_some() {
             self.palette_key(key, typed, cx);
             return;
@@ -1021,7 +1073,31 @@ impl ComposeView {
     }
 
     fn run_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        let locked = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
+            .flatten();
+        if let Some(lock) = locked
+            && matches!(action, "quote" | "keep" | "reject" | "undo")
+        {
+            self.status = lock.reason().into();
+            return;
+        }
         match action {
+            "unlock" => {
+                let released = self
+                    .hub
+                    .with_session(self.draft_id.as_ref(), |session| {
+                        session.release_maybe_sent()
+                    })
+                    .unwrap_or_else(|| Err("this draft is not open".into()));
+                self.status = match released {
+                    // The bar's right side already offers send.
+                    Ok(()) => "unlocked".into(),
+                    Err(err) => err.into(),
+                };
+                cx.notify();
+            }
             "send" => self.send(cx),
             "preview" => {
                 self.preview = !self.preview;
@@ -1360,6 +1436,7 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.editor.caret_hidden = self.field != Field::Body;
         if self.closing {
             window.remove_window();
         }
@@ -1399,17 +1476,30 @@ impl Render for ComposeView {
             .as_ref()
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
+        let wide = window.viewport_size().width > px(640.);
+        let lock = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
+            .flatten();
         let mode = match self.editor.mode {
+            // Nothing to type into: a narrow bar gives the mode's room to
+            // the way forward and the warning.
+            _ if lock.is_some() && !wide => "",
+            // A header field takes typing as insert mode does.
+            _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
             Mode::Insert => "insert",
             Mode::Visual => "visual",
         };
-        let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
-            (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
-            (Mode::Normal, "esc normal") => "i insert".into(),
+        let hint: SharedString = match (self.editor.mode, self.status.as_ref(), lock) {
+            // Nothing to type into: the way out is the hint.
+            (_, "i insert" | "insert" | "esc normal" | "normal", Some(lock)) => {
+                locked_hint(lock, wide).into()
+            }
+            (Mode::Insert, "i insert" | "insert", _) => "esc normal".into(),
+            (Mode::Normal, "esc normal" | "normal", _) => "i insert".into(),
             _ => self.status.clone(),
         };
-        let wide = window.viewport_size().width > px(640.);
         let mono = self
             .look
             .as_ref()
@@ -1514,7 +1604,17 @@ impl ComposeView {
                 self.field == Field::Subject,
                 colors,
             ))
-            .child(reply_row(snap, colors))
+            // A new message of the person's own has nothing to reply to;
+            // an agent's draft always says what it answers, even nothing.
+            .when(
+                snap.send_requested_by.is_some()
+                    || snap.reply_context.is_some()
+                    || snap
+                        .in_reply_to
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty()),
+                |column| column.child(reply_row(snap, colors)),
+            )
             .children(if !snap.hunks.is_empty() {
                 // Room for the edit's words: the row, less the keys beside
                 // them on a wide window.
@@ -1671,6 +1771,102 @@ impl std::fmt::Display for SendFailure {
                 )
             }
         }
+    }
+}
+
+/// What the compose window does once a send of `sent` finished, while it
+/// shows `on_screen`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SendEnd {
+    /// The window's new status line. `None` leaves the draft on screen alone.
+    pub status: Option<String>,
+    /// The window shows sent mail.
+    pub sent: bool,
+    /// Close the window: it shows the draft that went out.
+    pub close: bool,
+}
+
+/// Said when a send went out but the mailbox could not record it.
+const SENT_UNRECORDED: &str =
+    "Sent; the mailbox did not record it, so this draft will read as possibly sent";
+
+/// The window is one, and `c`, Enter or an agent's `request_send` can move
+/// it to another draft while a send is still in flight. Only the draft that
+/// was sent is closed, and its outcome reaches the inbox even when the
+/// window no longer shows it.
+pub(crate) fn finish_send(
+    hub: &DraftHub,
+    sent: &str,
+    on_screen: &str,
+    close_on_send: bool,
+    outcome: &Result<fell_core::SentMessage, SendFailure>,
+) -> SendEnd {
+    if sent != on_screen {
+        hub.report_send(sent, send_failure_line(hub, sent, outcome).as_deref());
+        return SendEnd {
+            status: None,
+            sent: false,
+            close: false,
+        };
+    }
+    match outcome {
+        Ok(_) => {
+            let unrecorded = send_unrecorded(hub, sent);
+            // Back to the inbox, which says it was sent. A send the mailbox
+            // did not record keeps the window, so the person reads why.
+            let close = close_on_send && !unrecorded;
+            if close {
+                hub.note_hidden(sent);
+            }
+            SendEnd {
+                status: Some(
+                    if unrecorded {
+                        SENT_UNRECORDED
+                    } else {
+                        "Sent from the editor"
+                    }
+                    .into(),
+                ),
+                sent: true,
+                close,
+            }
+        }
+        Err(err) => SendEnd {
+            status: Some(err.to_string()),
+            sent: matches!(err, SendFailure::MaybeSent(_)),
+            close: false,
+        },
+    }
+}
+
+/// The mailbox could not record how the send of `id` ended.
+fn send_unrecorded(hub: &DraftHub, id: &str) -> bool {
+    hub.with_session(id, |session| {
+        session
+            .snapshot()
+            .notices
+            .iter()
+            .any(|notice| notice.starts_with("could not record how this send ended"))
+    })
+    .unwrap_or(false)
+}
+
+/// What went wrong with a send of `id`, for the inbox. `None` for a send
+/// that went out and was recorded.
+fn send_failure_line(
+    hub: &DraftHub,
+    id: &str,
+    outcome: &Result<fell_core::SentMessage, SendFailure>,
+) -> Option<String> {
+    match outcome {
+        // Worded as the inbox's other notices are: lowercase, outcome first.
+        Ok(_) if send_unrecorded(hub, id) => Some(
+            "sent  ·  the mailbox did not record it, so this draft reads as possibly sent".into(),
+        ),
+        Ok(_) => None,
+        Err(SendFailure::MaybeSent(_)) => Some(fell_core::compose::MAYBE_SENT_NOTICE.into()),
+        Err(SendFailure::NotSent(detail)) => Some(format!("not sent  ·  {detail}")),
+        Err(SendFailure::Locked(lock)) => Some(lock.reason().into()),
     }
 }
 
@@ -1904,7 +2100,14 @@ fn field_row(
 ) -> gpui::Div {
     // While a field is being edited it shows the raw line. Otherwise each
     // address stands alone, and one the account never mailed says "new".
-    let shown = if active || addresses.is_empty() {
+    let shown = if active {
+        // The field being typed in shows the raw line and a caret at its end.
+        div()
+            .flex()
+            .items_center()
+            .child(SharedString::from(value.to_string()))
+            .child(caret(colors, Mode::Insert))
+    } else if addresses.is_empty() {
         div().child(if value.is_empty() {
             SharedString::from(" ")
         } else {
@@ -2003,7 +2206,10 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
                 .flex_1()
                 .min_w(px(0.))
                 .font_weight(FontWeight(560.))
-                .child(subject.to_string()),
+                .flex()
+                .items_center()
+                .child(subject.to_string())
+                .when(active, |row| row.child(caret(colors, Mode::Insert))),
         )
 }
 
@@ -2301,10 +2507,16 @@ fn styled_body(
     let doc = markdown_to_doc(&text);
     let mut column = div().flex().flex_col();
     let mut previous: Option<&BlockBody> = None;
-    for (index, item) in body_layout(&text, editor.row, editor.col, &doc)
-        .into_iter()
-        .enumerate()
-    {
+    let items: Vec<BodyItem> = if editor.caret_hidden {
+        // Typing goes to a header field: every block shows styled, with
+        // no caret line, so there is one caret on screen.
+        (0..doc.blocks.len())
+            .map(|index| BodyItem::Block { index, raw: false })
+            .collect()
+    } else {
+        body_layout(&text, editor.row, editor.col, &doc)
+    };
+    for (index, item) in items.into_iter().enumerate() {
         let (body, mut painted) = match item {
             BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
             BodyItem::Block { index, raw } => {
@@ -2410,7 +2622,7 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
 fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
     for (index, line) in editor.lines.iter().enumerate() {
-        let cursor = (editor.mode != Mode::Normal || true) && index == editor.row;
+        let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
             cursor.then_some(editor.col),
@@ -2442,7 +2654,7 @@ fn raw_source_block(
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
         let line_end = line_start + line.len();
-        let cursor = (row == editor.row).then_some(editor.col);
+        let cursor = (!editor.caret_hidden && row == editor.row).then_some(editor.col);
         let mut painted = raw_line(line, cursor, cursor.is_some(), editor.mode, colors);
         // Only the lines an agent changed carry the tint, with what they
         // replaced directly above the first of them.
@@ -3091,7 +3303,13 @@ fn status_bar(
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     // A narrow window keeps one line: the mode, first-time count, send and
     // the unreviewed count stay; the insert and close hints go first.
-    let mut left = div().flex().flex_1().gap_2().min_w(px(0.));
+    // Clipped, so a long message never draws under the send keys.
+    let mut left = div()
+        .flex()
+        .flex_1()
+        .gap_2()
+        .min_w(px(0.))
+        .overflow_hidden();
     let idle = matches!(
         status.as_ref(),
         "i insert" | "esc normal" | "normal" | "insert"
@@ -3119,8 +3337,18 @@ fn status_bar(
             );
         }
     } else {
-        // Narrow: a message (an edit position, an error) beats the hints and
-        // gives way first; the first-time count stays, short.
+        // Narrow: the mode always shows; a message (an edit position, an
+        // error) beats the hints and gives way first.
+        if !mode.is_empty() {
+            left = left
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(colors.dim))
+                        .child(mode.to_string()),
+                )
+                .when(!idle, |left| left.child(dot()));
+        }
         if !idle {
             left = left.child(
                 div()
@@ -3133,20 +3361,49 @@ fn status_bar(
         // The header tags each first-time address; the count fills an idle
         // bar only, so it is never read as a count of edits.
         if fresh > 0 && idle {
-            left = left.child(
+            left = left.child(dot()).child(
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(colors.fg))
-                    .child(format!("{fresh} first-time")),
+                    // Short enough to sit beside the mode and send.
+                    .child(if fresh == 1 {
+                        "1 new recipient".to_string()
+                    } else {
+                        format!("{fresh} new recipients")
+                    }),
             );
         }
     }
     let right = match &snap.send_block {
+        // Gone out: say so plainly, not as a block.
+        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => div()
+            .flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(colors.accent))
+                    .font_weight(FontWeight(600.))
+                    .child("sent"),
+            )
+            .child(dot())
+            .child(div().text_color(rgb(colors.fg)).child(":q close")),
+        // Narrow: the reason alone says send is blocked, and leaves the
+        // message on the left its room.
+        // May have gone out: the warning the inbox gives, in its colour.
+        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => div()
+            .flex_shrink_0()
+            .text_color(rgb(colors.error))
+            .child(MAYBE_SENT_WARNING),
         Some(reason) => div()
             .flex()
+            .flex_shrink_0()
             .gap_2()
-            .child(div().text_color(rgb(colors.dim)).child("send blocked"))
-            .child(dot())
+            .when(wide, |right| {
+                right
+                    .child(div().text_color(rgb(colors.dim)).child("send blocked"))
+                    .child(dot())
+            })
             .child(div().text_color(rgb(colors.fg)).child(reason.clone())),
         None => {
             let mut right = div()
@@ -3338,6 +3595,21 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
+/// What a locked draft's bar offers. A draft that may have gone out can be
+/// unlocked, once Sent has been checked; one that went out only closes.
+fn locked_hint(lock: SendLock, wide: bool) -> &'static str {
+    match (lock, wide) {
+        (SendLock::MaybeSent, true) => "read-only · :unlock if not in Sent · :q close",
+        (SendLock::MaybeSent, false) => ":unlock · :q close",
+        (_, true) => "read-only · :q close",
+        (_, false) => ":q close",
+    }
+}
+
+/// The window's warning for a draft that may have gone out, at any width:
+/// the person checks Sent before unlocking or sending again.
+const MAYBE_SENT_WARNING: &str = "may have been sent · check Sent";
+
 fn palette_action(query: &str) -> Option<&'static str> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -3346,6 +3618,11 @@ fn palette_action(query: &str) -> Option<&'static str> {
     // Vim's `:q`. `quote` still runs from `:qu`.
     if query == "q" || query == "quit" {
         return Some("close");
+    }
+    // Spelled out in full: it lets a draft that may have gone out be sent
+    // again.
+    if query == "unlock" {
+        return Some("unlock");
     }
     let mut found = None;
     for name in [
@@ -3466,6 +3743,23 @@ pub fn open_demo(
 mod tests {
     use super::{Editor, cursor_line_covered, plain_markdown};
     use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn a_maybe_sent_draft_says_check_sent_at_every_width() {
+        use fell_core::compose::SendLock;
+        assert!(super::MAYBE_SENT_WARNING.contains("check Sent"));
+        for wide in [true, false] {
+            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":unlock"));
+            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":q close"));
+            assert!(!super::locked_hint(SendLock::Sent, wide).contains(":unlock"));
+        }
+        // Narrow, both sides share 460 px with room to spare.
+        let narrow = super::locked_hint(SendLock::MaybeSent, false)
+            .chars()
+            .count()
+            + super::MAYBE_SENT_WARNING.chars().count();
+        assert!(narrow <= 50, "{narrow}");
+    }
 
     #[test]
     fn was_text_drops_emphasis_marks_but_not_marks_inside_words() {

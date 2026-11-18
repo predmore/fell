@@ -199,6 +199,48 @@ fn ensure_control(folder: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The control folder's note of the `draft.md` text Fell wrote last.
+const OWN_SAVE: &str = "own-save";
+
+/// Note that Fell is about to write `text` to `draft.md`, before it does, so
+/// a save whose mailbox row never landed (a failed write, a crash) is still
+/// known as Fell's own on the next open. Only a SHA-256 is kept. Not synced:
+/// a note lost in a crash only means the next open goes back to the row.
+///
+/// This folder is writable by anything the person runs, so the note only
+/// decides whether the next open keeps `draft.md`. What it gained over the
+/// mailbox row is still marked for review.
+pub(crate) fn note_own_save(folder: &Path, text: &str) -> Result<(), String> {
+    let control = ensure_control(folder)?;
+    let path = control.join(OWN_SAVE);
+    let tmp = control.join(format!("{OWN_SAVE}.{}.tmp", std::process::id()));
+    if is_symlink(&path) || is_symlink(&tmp) {
+        return Err("the save note is a symlink".into());
+    }
+    fs::write(&tmp, own_save_digest(text)).map_err(|err| err.to_string())?;
+    fs::rename(&tmp, &path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        err.to_string()
+    })
+}
+
+/// `text` is what Fell last wrote, or was about to write, to `draft.md`.
+pub(crate) fn is_own_save(folder: &Path, text: &str) -> bool {
+    let path = control_dir(folder).join(OWN_SAVE);
+    if is_symlink(&path) {
+        return false;
+    }
+    fs::read_to_string(path).is_ok_and(|noted| noted.trim() == own_save_digest(text))
+}
+
+fn own_save_digest(text: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub fn write_owner(folder: &Path, agent: &str) -> Result<(), String> {
     if agent.is_empty() || agent.chars().any(|ch| ch.is_control()) {
         return Err("draft owner is empty".into());

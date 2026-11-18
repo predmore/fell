@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::session::DraftSession;
+use super::session::{DraftSession, SendLock};
 use super::workspace::{self, draft_socket_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,10 @@ impl HubListener {
 /// and is then dropped.
 type Listener = Box<dyn Fn() -> bool + Send>;
 
+/// The inbox notice for a draft that may have gone out, worded as its row
+/// and preview are.
+pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
+
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
@@ -47,9 +51,41 @@ pub struct DraftHub {
     /// again for a draft that is already focused.
     reveals: AtomicU64,
     /// One line per review window that closed, for the inbox to show.
-    closed: Mutex<Vec<String>>,
+    /// Closing notices for the inbox, each with whether it is a warning.
+    closed: Mutex<Vec<(String, bool)>>,
     /// The draft whose review window closed last, for the inbox to reopen.
     last_closed: Mutex<Option<String>>,
+    /// Drafts being read from disk to go live, so two opens of one draft
+    /// never write its folder at the same time. See [`DraftHub::begin_open`].
+    opening: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Held while draft `id` is read from disk to go live. Dropping it lets the
+/// next open of that draft start.
+pub struct OpenGuard<'a> {
+    hub: &'a DraftHub,
+    id: String,
+}
+
+impl Drop for OpenGuard<'_> {
+    fn drop(&mut self) {
+        self.hub.opening.lock().expect("opening").remove(&self.id);
+    }
+}
+
+/// `subject` quoted for an inbox line, after the outcome. Spaced like the
+/// rest of the inbox status bar.
+fn quoted_subject(subject: &str) -> String {
+    if subject.trim().is_empty() {
+        return String::new();
+    }
+    let short: String = subject.chars().take(60).collect();
+    let more = if subject.chars().count() > 60 {
+        "…"
+    } else {
+        ""
+    };
+    format!("  ·  \u{201c}{short}{more}\u{201d}")
 }
 
 impl Default for DraftHub {
@@ -69,6 +105,7 @@ impl DraftHub {
             reveals: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
             last_closed: Mutex::new(None),
+            opening: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -104,6 +141,55 @@ impl DraftHub {
         self.emit();
     }
 
+    /// Start reading draft `id` from disk to make it live. `None` when it is
+    /// live already, or another open of it is running: that one shows it,
+    /// and this one must not touch its folder. Checked under the sessions
+    /// lock, so a draft that goes live meanwhile is seen.
+    pub fn begin_open(&self, id: &str) -> Option<OpenGuard<'_>> {
+        let sessions = self.sessions.lock().expect("sessions");
+        if sessions.contains_key(id) {
+            return None;
+        }
+        let mut opening = self.opening.lock().expect("opening");
+        if !opening.insert(id.to_string()) {
+            return None;
+        }
+        drop(opening);
+        drop(sessions);
+        Some(OpenGuard {
+            hub: self,
+            id: id.to_string(),
+        })
+    }
+
+    /// Add a live draft unless one with its id is already live, which then
+    /// stays as it is, unsaved typing included. Returns whether it was added.
+    pub fn insert_new(&self, mut session: DraftSession) -> bool {
+        let id = session.id().to_string();
+        let mut sessions = self.sessions.lock().expect("sessions");
+        if sessions.contains_key(&id) {
+            return false;
+        }
+        session.attach_writer();
+        sessions.insert(id, session);
+        drop(sessions);
+        self.emit();
+        true
+    }
+
+    /// Bring the editor up on live draft `id`, as the person asked from the
+    /// inbox. Unlike `request_send`, no agent is named. `false` when the
+    /// draft is not live.
+    pub fn show(&self, id: &str) -> bool {
+        if self.with_session(id, DraftSession::open_for_edit).is_none() {
+            return false;
+        }
+        *self.focused.lock().expect("focused") = Some(id.to_string());
+        self.reveals.fetch_add(1, Ordering::SeqCst);
+        self.emit();
+        true
+    }
+
     pub fn with_session<T>(
         &self,
         id: &str,
@@ -121,15 +207,19 @@ impl DraftHub {
         Some(value)
     }
 
-    /// Wait until every live draft's queued save is on disk. The app calls
-    /// this when it quits.
+    /// Queue every save still waiting on the editor's debounce, then wait
+    /// until each live draft's saves are on disk. The app calls this when it
+    /// quits.
     pub fn settle_all(&self) {
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
             .lock()
             .expect("sessions")
-            .values()
-            .filter_map(DraftSession::save_waiter)
+            .values_mut()
+            .filter_map(|session| {
+                let _ = session.flush_pending();
+                session.save_waiter()
+            })
             .collect();
         for waiter in waiters {
             let _ = waiter.wait();
@@ -157,8 +247,10 @@ impl DraftHub {
             }
             was
         };
-        // No window has it open for editing any more.
+        // No window has it open for editing any more. Typing still waiting
+        // on the save debounce is saved now.
         let summary = self.with_session(id, |session| {
+            let _ = session.flush_pending();
             session.close_editor();
             let snap = session.snapshot();
             (
@@ -169,40 +261,101 @@ impl DraftHub {
             )
         });
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
-            // Outcome, which draft, what is left, then the way back; spaced
-            // like the rest of the inbox status bar.
-            let name = if subject.trim().is_empty() {
-                String::new()
-            } else {
-                let short: String = subject.chars().take(60).collect();
-                let more = if subject.chars().count() > 60 {
-                    "…"
-                } else {
-                    ""
-                };
-                format!("  ·  \u{201c}{short}{more}\u{201d}")
-            };
+            let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
-                Some(reason) => format!("{reason}{name}"),
-                None if asked && unreviewed > 0 => {
-                    format!("not sent{name}  ·  {unreviewed} unreviewed  ·  space a r reopen")
+                Some(_) if sent => format!("sent{}  ·  gs sent", quoted_subject(&subject)),
+                // The key to what the warning asks: look in Sent.
+                Some(reason) if reason == SendLock::MaybeSent.reason() => format!(
+                    "{MAYBE_SENT_NOTICE}{}  ·  gs sent",
+                    quoted_subject(&subject)
+                ),
+                Some(reason) => format!("{reason}{}", quoted_subject(&subject)),
+                None if asked && unreviewed > 0 => format!(
+                    "not sent{}  ·  {unreviewed} unreviewed  ·  space a r reopen",
+                    quoted_subject(&subject)
+                ),
+                None if asked => {
+                    format!("not sent{}  ·  space a r reopen", quoted_subject(&subject))
                 }
-                None => format!("not sent{name}  ·  space a r reopen"),
+                // The person's own draft: kept, and in the drafts list.
+                None => format!("draft saved{}  ·  gd drafts", quoted_subject(&subject)),
             };
-            *self.last_closed.lock().expect("last closed") = Some(id.to_string());
-            self.closed.lock().expect("closed").push(line);
-            self.emit();
+            let warn = locked == Some(SendLock::MaybeSent.reason());
+            self.push_closed(id, line, sent, warn);
         }
     }
 
+    /// Tell the inbox how a send of `id` ended, for a send that finished
+    /// after the compose window moved on to another draft or closed: no
+    /// window is left to say it. `failure` is what went wrong: a send that
+    /// did not go out, may have, or went out but was not recorded.
+    pub fn report_send(&self, id: &str, failure: Option<&str>) {
+        // Any failure is a warning: mail that did not go out, may have, or
+        // went out unrecorded.
+        let warn_failure = failure.is_some();
+        let Some((locked, subject)) = self.with_session(id, |session| {
+            let snap = session.snapshot();
+            (snap.send_lock_reason(), snap.subject.clone())
+        }) else {
+            return;
+        };
+        let name = quoted_subject(&subject);
+        let sent = locked == Some(SendLock::Sent.reason());
+        let line = match (locked, failure) {
+            (_, Some(failure)) if failure == MAYBE_SENT_NOTICE => {
+                format!("{failure}{name}  ·  gs sent")
+            }
+            (_, Some(failure)) => format!("{failure}{name}  ·  gd drafts"),
+            (Some(_), None) if sent => format!("sent{name}  ·  gs sent"),
+            (Some(reason), None) if reason == SendLock::MaybeSent.reason() => {
+                format!("{MAYBE_SENT_NOTICE}{name}  ·  gs sent")
+            }
+            (Some(reason), None) => format!("{reason}{name}"),
+            (None, None) => format!("not sent{name}  ·  gd drafts"),
+        };
+        let warn = warn_failure || locked == Some(SendLock::MaybeSent.reason());
+        self.push_closed(id, line, sent, warn);
+    }
+
+    /// Queue `line` for the inbox. Mail that went out is not offered again
+    /// by reopen; anything else is the draft reopen brings back.
+    fn push_closed(&self, id: &str, line: String, sent: bool, warn: bool) {
+        {
+            let mut last = self.last_closed.lock().expect("last closed");
+            if !sent {
+                *last = Some(id.to_string());
+            } else if last.as_deref() == Some(id) {
+                *last = None;
+            }
+        }
+        self.closed.lock().expect("closed").push((line, warn));
+        self.emit();
+    }
+
     /// Show the review window that closed last again, as a `request_send`
-    /// would. `false` when there is none, or its draft is gone.
+    /// would. `false` when there is none, its draft is gone, or it was sent.
     pub fn reopen_last(&self) -> bool {
         let Some(id) = self.last_closed.lock().expect("last closed").clone() else {
             return false;
         };
-        if self.with_session(&id, DraftSession::request_send).is_none() {
-            return false;
+        let reopened = self.with_session(&id, |session| {
+            if session.send_lock() == Some(SendLock::Sent) {
+                return false;
+            }
+            session.request_send();
+            true
+        });
+        match reopened {
+            Some(true) => {}
+            Some(false) => {
+                // Sent since it closed: nothing is left to reopen.
+                let mut last = self.last_closed.lock().expect("last closed");
+                if last.as_deref() == Some(id.as_str()) {
+                    *last = None;
+                }
+                return false;
+            }
+            None => return false,
         }
         *self.focused.lock().expect("focused") = Some(id);
         self.reveals.fetch_add(1, Ordering::SeqCst);
@@ -212,6 +365,15 @@ impl DraftHub {
 
     /// Lines about review windows that closed since the last call.
     pub fn take_closed(&self) -> Vec<String> {
+        self.take_notices()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// The closing notices since the last take, each with whether it is a
+    /// warning the inbox shows in its error colour.
+    pub fn take_notices(&self) -> Vec<(String, bool)> {
         std::mem::take(&mut *self.closed.lock().expect("closed"))
     }
 
@@ -281,6 +443,11 @@ impl DraftHub {
             .to_string();
         let mut sessions = self.sessions.lock().expect("sessions");
         if !draft_id.is_empty() && !sessions.contains_key(&draft_id) {
+            // The inbox is reading this draft from its folder: a second
+            // reader now could take a half-written folder as the draft.
+            if self.opening.lock().expect("opening").contains(&draft_id) {
+                return denied(&id, "the draft is opening in Fell; try again");
+            }
             let Some(account) = super::persist::stored_compose_account(&draft_id) else {
                 return denied(&id, "draft has no mailbox record");
             };
@@ -1056,6 +1223,109 @@ mod tests {
         assert!(hub.take_closed().is_empty());
     }
 
+    /// Typing that is still waiting on the save debounce.
+    fn type_unsaved(hub: &DraftHub, body: &str) -> std::path::PathBuf {
+        hub.with_session("d1", |session| {
+            session.set_body_from_user(body.into());
+            session.arm_outbound(u64::MAX);
+            assert!(!session.poll_outbound(0), "the debounce has not elapsed");
+            session.folder().join("draft.md")
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn closing_the_editor_saves_typing_the_debounce_held_back() {
+        let hub = hub_with_d1("close-flush");
+        let file = type_unsaved(&hub, "typed before close\n");
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        hub.with_session("d1", |session| session.save_waiter())
+            .flatten()
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("typed before close")
+        );
+    }
+
+    #[test]
+    fn quitting_saves_typing_the_debounce_held_back() {
+        let hub = hub_with_d1("quit-flush");
+        let file = type_unsaved(&hub, "typed before quit\n");
+        hub.settle_all();
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("typed before quit")
+        );
+    }
+
+    #[test]
+    fn the_inbox_shows_a_draft_without_naming_an_agent() {
+        let hub = hub_with_d1("show");
+        assert!(!hub.show("missing"));
+        assert!(hub.show("d1"));
+        assert_eq!(hub.reveal_count(), 1);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        let snap = hub
+            .with_session("d1", |session| session.snapshot())
+            .unwrap();
+        assert!(snap.open);
+        assert_eq!(snap.send_requested_by, None);
+        // The person's own draft closes to the drafts list, not a review.
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        let lines = hub.take_closed();
+        assert!(lines[0].starts_with("draft saved"), "{lines:?}");
+        assert!(lines[0].ends_with("gd drafts"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_live_draft_is_not_replaced_by_a_second_open() {
+        let hub = hub_with_d1("insert-new");
+        hub.with_session("d1", |session| session.set_body_from_user("live\n".into()));
+        let folder = hub
+            .with_session("d1", |session| session.folder().to_path_buf())
+            .unwrap();
+        let again = DraftSession::create(
+            folder,
+            "d1",
+            AccountId("a".into()),
+            DraftFields::default(),
+            "from disk\n",
+        )
+        .unwrap();
+        assert!(!hub.insert_new(again));
+        let body = hub
+            .with_session("d1", |session| session.body().to_string())
+            .unwrap();
+        assert_eq!(body, "live\n");
+    }
+
+    #[test]
+    fn a_late_send_that_may_have_gone_out_is_a_lowercase_warning() {
+        let hub = hub_with_d1("late");
+        hub.report_send("d1", Some(MAYBE_SENT_NOTICE));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (line, warn) = &notices[0];
+        assert!(line.starts_with("may have been sent"), "{line}");
+        assert!(line.contains("\u{201c}Hi\u{201d}"), "{line}");
+        assert!(*warn, "a possible double send is shown as a warning");
+        // A draft simply left unsent is news, not a warning.
+        hub.report_send("d1", None);
+        let notices = hub.take_notices();
+        assert_eq!(
+            notices[0].0,
+            "not sent  ·  \u{201c}Hi\u{201d}  ·  gd drafts"
+        );
+        assert!(!notices[0].1);
+    }
+
     #[test]
     fn the_inbox_can_reopen_the_review_that_closed() {
         let hub = hub_with_d1("reopen");
@@ -1073,6 +1343,98 @@ mod tests {
             hub.with_session("d1", |session| session.snapshot().open)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn reopen_does_not_raise_a_draft_that_was_sent_after_it_closed() {
+        let hub = hub_with_d1("reopen-sent");
+        let _host = hub.subscribe();
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        assert!(hub.reopen_last());
+        hub.note_shown("d1");
+        hub.with_session("d1", |session| {
+            session.end_send(Some(SendLock::Sent));
+        });
+        // The sent close clears what the first close left for reopen.
+        hub.note_hidden("d1");
+        let lines = hub.take_closed();
+        assert!(lines.last().unwrap().starts_with("sent"), "{lines:?}");
+        let before = hub.reveal_count();
+        assert!(
+            !hub.reopen_last(),
+            "mail that went out is not offered again"
+        );
+        assert_eq!(hub.reveal_count(), before);
+    }
+
+    #[test]
+    fn reopen_refuses_a_draft_sent_while_no_window_showed_it() {
+        let hub = hub_with_d1("reopen-sent-hidden");
+        let _host = hub.subscribe();
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        // Sent without a window closing on it, so no close cleared it.
+        hub.with_session("d1", |session| {
+            session.end_send(Some(SendLock::Sent));
+        });
+        assert!(!hub.reopen_last());
+        assert!(!hub.reopen_last(), "and it stays refused");
+    }
+
+    #[test]
+    fn a_send_reported_after_the_window_moved_on_reaches_the_inbox() {
+        let hub = hub_with_d1("report-send");
+        hub.show("d1");
+        hub.note_shown("d1");
+        // The window moved to another draft while the send was in flight.
+        hub.note_hidden("d1");
+        let _ = hub.take_closed();
+        hub.with_session("d1", |session| {
+            session.end_send(Some(SendLock::Sent));
+        });
+        hub.report_send("d1", None);
+        let lines = hub.take_closed();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].contains("Hi"), "{lines:?}");
+        assert!(!hub.reopen_last());
+        // A send that did not go out says why, and the draft stays.
+        hub.with_session("d1", |session| session.end_send(None));
+        hub.report_send("d1", Some("Not sent: refused"));
+        let lines = hub.take_closed();
+        assert!(lines[0].starts_with("Not sent: refused"), "{lines:?}");
+        assert!(lines[0].ends_with("gd drafts"), "{lines:?}");
+    }
+
+    #[test]
+    fn one_open_of_a_draft_at_a_time_and_none_once_it_is_live() {
+        let hub = DraftHub::new();
+        let first = hub.begin_open("d1").expect("nothing is opening d1");
+        assert!(hub.begin_open("d1").is_none(), "d1 is being opened");
+        assert!(hub.begin_open("d2").is_some(), "other drafts are not held");
+        drop(first);
+        assert!(hub.begin_open("d1").is_some());
+        let live = hub_with_d1("open-guard");
+        assert!(live.begin_open("d1").is_none(), "d1 is live");
+    }
+
+    #[test]
+    fn the_socket_waits_for_a_draft_the_inbox_is_opening() {
+        let hub = DraftHub::new();
+        let _opening = hub.begin_open("d9").unwrap();
+        let reply: Value = serde_json::from_str(&hub.handle_line(
+            &json!({ "id": 1, "op": "get_draft", "draft_id": "d9", "agent": "bot" }).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("opening"),
+            "{reply}"
+        );
+        assert!(hub.with_session("d9", |_| ()).is_none());
     }
 
     #[test]

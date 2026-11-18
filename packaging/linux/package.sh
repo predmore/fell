@@ -47,6 +47,7 @@ mkdir -p "$stage" "$work" "$tools"
 
 install -m 0755 "$bin" "$stage/fell"
 install -m 0644 "$here/dev.predmore.fell.desktop" "$stage/dev.predmore.fell.desktop"
+install -m 0644 "$here/dev.predmore.fell.compose.desktop" "$stage/dev.predmore.fell.compose.desktop"
 install -m 0644 "$here/dev.predmore.fell.png" "$stage/dev.predmore.fell.png"
 install -m 0644 "$here/README.md" "$stage/README.md"
 

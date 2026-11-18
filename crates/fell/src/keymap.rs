@@ -32,6 +32,7 @@ pub enum Action {
     Inbox,
     Sent,
     Drafts,
+    Compose,
     FolderPicker,
     Move,
     Archive,
@@ -60,6 +61,7 @@ impl Action {
             Self::Inbox => "Go to Inbox",
             Self::Sent => "Go to Sent",
             Self::Drafts => "Go to Drafts",
+            Self::Compose => "Compose",
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
@@ -80,7 +82,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 23] = [
+const ALL_ACTIONS: [Action; 24] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -92,6 +94,7 @@ const ALL_ACTIONS: [Action; 23] = [
     Action::Inbox,
     Action::Sent,
     Action::Drafts,
+    Action::Compose,
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
@@ -185,6 +188,7 @@ fn default_bindings() -> Vec<Binding> {
         Action::FolderPicker,
         Some("go"),
     );
+    bind(&[KeyId::Char('c')], Action::Compose, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
@@ -553,6 +557,23 @@ mod tests {
         assert_eq!(inbox[0].action, Action::Inbox);
         assert!(inbox[0].binding.contains("g i"));
         assert!(inbox[0].binding.contains("space f i"));
+    }
+
+    #[test]
+    fn c_composes_and_the_palette_says_so() {
+        let keymap = Keymap::default();
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Char('c')]),
+            SeqMatch::Action(Action::Compose)
+        );
+        let items = palette_items(&keymap, "compose", &[]);
+        assert_eq!(items[0].action, Action::Compose);
+        assert_eq!(items[0].binding, "c");
+        assert!(
+            which_key(&keymap, &[])
+                .iter()
+                .any(|item| item.key == "c" && item.label == "Compose")
+        );
     }
 
     #[test]

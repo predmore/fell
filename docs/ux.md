@@ -61,6 +61,8 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Every action is reachable from the palette, and every chord shows in which-key, so nothing is hidden behind a memorized key.
 
 ## Compose: styled markdown you edit as plain text
+- `c` in the inbox (and Compose in the palette) opens the compose window on a new draft for the account, starting on the To line. There is one compose window: opening another draft moves it there. `gd` lists your drafts, newest first, above the synced Drafts folder; `Enter` opens the selected one in the editor. Closing the window keeps the draft and the inbox says so ("draft saved · gd drafts").
+- After a send that went out, the window closes and the inbox shows "Sent" with the subject; the draft leaves the drafts list. A send that may have gone out keeps the window and the draft, both saying to check Sent before sending again.
 - The composer is a markdown editor that styles as you type. The text you edit is always plain markdown (no hidden rich-text model, no toolbar needed), but headings, bold, italics, code, lists, quotes and links render styled in place, so the draft looks like the email the recipient will get.
 - Markdown markers (`**`, `#`, `>`, link URLs) stay editable: they show dimmed on the line the cursor is on and fold away elsewhere. Cursor movement, selection, undo and vim motions behave exactly as in plain text.
 - Inline images render in place, at a sensible max width. Paste or drag an image (or attach with a key) and it inserts a markdown image reference that displays as the image; deleting the reference removes the image. Images go out as inline CID parts, not links to anywhere.

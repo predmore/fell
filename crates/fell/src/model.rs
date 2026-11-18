@@ -207,6 +207,10 @@ pub struct Step {
     pub sync_now: bool,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
+    /// `c`: start a new draft and open it in the compose editor.
+    pub compose: bool,
+    /// Open the selected row's draft in the compose editor.
+    pub open_draft: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +397,21 @@ impl Session {
         folder_label(&self.folder)
     }
 
+    /// The compose draft the selected row stands for, in the drafts list.
+    pub fn cursor_thread(&self) -> Option<&ThreadRow> {
+        let id = self.cursor_id.as_ref()?;
+        self.threads.iter().find(|thread| &thread.id == id)
+    }
+
+    pub fn cursor_draft(&self) -> Option<&str> {
+        let id = self.cursor_id.as_ref()?;
+        self.threads
+            .iter()
+            .find(|thread| &thread.id == id)?
+            .draft
+            .as_deref()
+    }
+
     /// Unread threads in the folder, including rows that are not loaded.
     pub fn unread_threads(&self) -> usize {
         self.unread_count
@@ -420,8 +439,19 @@ impl Session {
         let Some(Pending::After { key, down }) = &self.pending else {
             return None;
         };
-        let place = self.threads.partition_point(|row| row_key(row) <= *key);
+        let lead = self.draft_rows();
+        let place = lead + self.threads[lead..].partition_point(|row| row_key(row) <= *key);
         Some((place, *down))
+    }
+
+    /// Compose drafts at the top of the Drafts list. They come before the
+    /// folder's first row and are not part of its order, so paging skips
+    /// them.
+    fn draft_rows(&self) -> usize {
+        self.threads
+            .iter()
+            .take_while(|row| row.draft.is_some())
+            .count()
     }
 
     /// Take the cursor move waiting for rows. Dropping a `G` or `gg` that
@@ -724,15 +754,17 @@ impl Session {
             Some(Jump::Bottom(rows)) => return FolderSpan::Bottom { rows },
             None => {}
         }
-        let (Some(top), Some(bottom), Some((lo, hi))) = (
-            self.threads.first(),
-            self.threads.last(),
-            self.focus(visible),
-        ) else {
+        // Positions below are among the folder's rows, after any drafts.
+        let lead = self.draft_rows();
+        let rows = &self.threads[lead..];
+        let (Some(top), Some(bottom), Some((lo, hi))) =
+            (rows.first(), rows.last(), self.focus(visible))
+        else {
             return FolderSpan::Top {
                 rows: self.load_rows.max(fetch.after),
             };
         };
+        let (lo, hi) = (lo.saturating_sub(lead), hi.saturating_sub(lead));
         if let Some(key) = select {
             let above = self.more_before && *key < row_key(top);
             let below = self.more_after && *key > row_key(bottom);
@@ -745,7 +777,7 @@ impl Session {
                 };
             }
         }
-        let len = self.threads.len();
+        let len = rows.len();
         let mut start = if fetch.before > 0 {
             0
         } else {
@@ -759,16 +791,13 @@ impl Session {
         // A thread to select within the loaded bounds is read even when it
         // moved among rows that would be dropped.
         if let Some(key) = select {
-            let at = self
-                .threads
-                .partition_point(|row| row_key(row) < *key)
-                .min(len - 1);
+            let at = rows.partition_point(|row| row_key(row) < *key).min(len - 1);
             start = start.min(at);
             end = end.max(at);
         }
         // From the top when the top is loaded, so rows sync adds above the
         // first one are read too.
-        let first = (start > 0 || self.more_before).then(|| row_key(&self.threads[start]));
+        let first = (start > 0 || self.more_before).then(|| row_key(&rows[start]));
         let after = if end + 1 < len {
             0
         } else if self.more_after {
@@ -779,7 +808,7 @@ impl Session {
         };
         FolderSpan::Window {
             first,
-            last: row_key(&self.threads[end]),
+            last: row_key(&rows[end]),
             before: if start == 0 { fetch.before } else { 0 },
             after,
         }
@@ -807,7 +836,8 @@ impl Session {
             // Something got selected meanwhile (a click, undo): keep it.
             Pending::After { .. } if self.cursor_id.is_some() => {}
             Pending::After { key, down } => {
-                let next = self.threads.iter().find(|row| row_key(row) > key);
+                let lead = self.draft_rows();
+                let next = self.threads[lead..].iter().find(|row| row_key(row) > key);
                 match next {
                     Some(row) => {
                         self.cursor_id = Some(row.id.clone());
@@ -1334,7 +1364,10 @@ impl Session {
             Action::Last => step.reload_messages = self.jump_last(),
             Action::Open => {
                 self.count.clear();
-                if self.pane == Pane::List {
+                if self.cursor_draft().is_some() {
+                    // A draft row opens in the editor, not the reading pane.
+                    step.open_draft = true;
+                } else if self.pane == Pane::List {
                     self.pane = Pane::Conversation;
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
@@ -1380,6 +1413,11 @@ impl Session {
                 self.count.clear();
                 if self.cursor_id.is_none() {
                     self.show_toast("No conversation", true);
+                    return Step::default();
+                }
+                if self.cursor_draft().is_some() {
+                    // Said now, not after a folder is picked for nothing.
+                    self.show_toast(DRAFT_NOT_THREAD, true);
                     return Step::default();
                 }
                 self.folder_intent = FolderIntent::Move;
@@ -1454,6 +1492,13 @@ impl Session {
                 self.count.clear();
                 return Step {
                     reopen_review: true,
+                    ..Step::default()
+                };
+            }
+            Action::Compose => {
+                self.count.clear();
+                return Step {
+                    compose: true,
                     ..Step::default()
                 };
             }
@@ -1633,6 +1678,17 @@ impl Session {
                     hint: fix,
                 }
             }
+            SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
+                if self.folder.eq_ignore_ascii_case("drafts") =>
+            {
+                Banner {
+                    title: "No drafts".into(),
+                    hint: format!(
+                        "{} compose · gi inbox",
+                        keymap::binding_text(&self.keymap, Action::Compose)
+                    ),
+                }
+            }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
                 title: format!("No conversations in {}", self.folder_title()),
                 hint: "gi inbox · gf folders".into(),
@@ -1640,6 +1696,9 @@ impl Session {
         })
     }
 }
+
+/// Archive and move act on threads. A draft row is not one.
+pub const DRAFT_NOT_THREAD: &str = "That is a draft · enter opens it in the editor";
 
 /// Where `row` sits in its folder list.
 pub fn row_key(row: &ThreadRow) -> ListKey {
@@ -1674,8 +1733,43 @@ mod tests {
             subject: id.into(),
             snippet: "snippet".into(),
             labels: vec![],
+            warn: false,
             unread: false,
+            draft: None,
         }
+    }
+
+    #[test]
+    fn c_composes_and_enter_opens_a_draft_row_in_the_editor() {
+        let mut session = session();
+        let step = session.on_key(KeyId::Char('c'), 10);
+        assert!(step.compose && step.arm_which);
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        assert_eq!(session.cursor_draft(), Some("c1"));
+        let step = session.on_key(KeyId::Enter, 10);
+        assert!(step.open_draft);
+        assert_eq!(session.pane, Pane::List, "a draft opens in the editor");
+        session.cursor_id = Some("a".into());
+        let step = session.on_key(KeyId::Enter, 10);
+        assert!(!step.open_draft);
+        assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn m_on_a_draft_row_explains_without_opening_the_picker() {
+        let mut session = session();
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        let step = session.on_key(KeyId::Char('m'), 10);
+        assert!(!step.apply_move);
+        assert_eq!(session.overlay, Overlay::None);
+        let toast = session.toast.as_ref().expect("m says why");
+        assert_eq!(toast.text, DRAFT_NOT_THREAD);
     }
 
     fn session() -> Session {
@@ -1918,9 +2012,15 @@ mod tests {
     fn empty_folder_and_first_sync_copy() {
         let mut session = session();
         session.threads.clear();
+        session.folder = "Archive".into();
+        let banner = session.list_banner().unwrap();
+        assert!(banner.title.contains("Archive"));
+        assert!(banner.hint.contains("gi"));
+        // An empty drafts list says how to start one.
         session.folder = "Drafts".into();
         let banner = session.list_banner().unwrap();
-        assert!(banner.title.contains("Drafts"));
+        assert_eq!(banner.title, "No drafts");
+        assert!(banner.hint.starts_with("c compose"), "{}", banner.hint);
         assert!(banner.hint.contains("gi"));
         session.sync = SyncKind::FirstSync;
         let banner = session.list_banner().unwrap();
@@ -2161,6 +2261,91 @@ mod tests {
 
     fn ids(session: &Session) -> Vec<String> {
         session.threads.iter().map(|row| row.id.clone()).collect()
+    }
+
+    /// What the view shows for `span` in Drafts: the compose drafts above
+    /// the rows read, when those reach the top of the folder.
+    fn read_with_drafts(
+        session: &mut Session,
+        folder: &Folder,
+        drafts: &[ThreadRow],
+        span: FolderSpan,
+    ) {
+        let (rows, before, after) = folder.read(&span);
+        let mut shown = if before { Vec::new() } else { drafts.to_vec() };
+        shown.extend(rows);
+        session.set_page(shown, before, after, 0);
+    }
+
+    fn land_with_drafts(session: &mut Session, folder: &Folder, drafts: &[ThreadRow]) {
+        let mut reads = 0;
+        while let Some(fetch) = session.take_fetch() {
+            reads += 1;
+            assert!(reads < 20, "the list keeps asking for rows");
+            let span = session.span(fetch, None, None);
+            read_with_drafts(session, folder, drafts, span);
+        }
+    }
+
+    #[test]
+    fn drafts_above_the_folder_do_not_move_its_window() {
+        let (mut session, folder) = paged(30, 10, 2);
+        // One draft older than every thread, one newer: neither sorts with
+        // the folder, and paging must not read from either.
+        let drafts: Vec<ThreadRow> = [("draft-old", 1), ("draft-new", 2_000_000)]
+            .into_iter()
+            .map(|(id, date)| ThreadRow {
+                draft: Some(id.into()),
+                ..dated(id, date)
+            })
+            .collect();
+        read_with_drafts(&mut session, &folder, &drafts, FolderSpan::Top { rows: 10 });
+        assert_eq!(&ids(&session)[..3], ["draft-old", "draft-new", "t00"]);
+        session.cursor_id = Some("draft-old".into());
+        let FolderSpan::Window { first, last, .. } = session.span(Fetch::default(), None, None)
+        else {
+            panic!("a refresh rereads the loaded rows");
+        };
+        assert_eq!(first, None, "from the folder's top");
+        assert_eq!(last.thread_id.0, "t09");
+        // Keeping few rows past the reader puts the window's end at the
+        // cursor. On a draft that is the folder's first row, not the draft,
+        // whose date would end the read above every thread.
+        session.keep_rows = 0;
+        session.cursor_id = Some("draft-new".into());
+        let span = session.span(Fetch::default(), None, None);
+        let FolderSpan::Window { first, last, .. } = &span else {
+            panic!("a refresh rereads the loaded rows");
+        };
+        assert_eq!(*first, None);
+        assert_eq!(last.thread_id.0, "t00");
+        read_with_drafts(&mut session, &folder, &drafts, span);
+        assert_eq!(&ids(&session)[..3], ["draft-old", "draft-new", "t00"]);
+        session.keep_rows = 1_000;
+        read_with_drafts(&mut session, &folder, &drafts, FolderSpan::Top { rows: 10 });
+        session.cursor_id = Some("draft-old".into());
+        // Down past the loaded rows: more load below, in order.
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        let loaded = ids(&session);
+        let threads: Vec<&String> = loaded.iter().skip(2).collect();
+        let expected: Vec<String> = (0..threads.len())
+            .map(|index| format!("t{index:02}"))
+            .collect();
+        assert_eq!(threads, expected.iter().collect::<Vec<_>>());
+        assert_eq!(session.cursor_id.as_deref(), Some("t09"));
+        // The bottom does not reach the top, so the drafts are not shown.
+        session.on_key(KeyId::Char('G'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        assert_eq!(session.cursor_id.as_deref(), Some("t29"));
+        assert!(session.threads.iter().all(|row| row.draft.is_none()));
+        // And back at the top, they are again.
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('g'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        assert_eq!(session.cursor_id.as_deref(), Some("draft-old"));
     }
 
     #[test]

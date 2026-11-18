@@ -344,6 +344,206 @@ mod tests {
         assert_eq!(backend.count(), 1);
     }
 
+    /// The account file's account, and a draft `c` started for it in the
+    /// inbox, addressed and written as the person would in the editor.
+    fn inbox_draft(
+        tag: &str,
+    ) -> (
+        fell_core::AccountConfig,
+        crate::draft_host::DraftHome,
+        std::sync::Arc<fell_core::compose::DraftHub>,
+        String,
+    ) {
+        let config = fell_core::AccountConfig::bridge(
+            "jon@example.com",
+            "jon",
+            fell_core::PasswordSource::Inline("bridge-password".into()),
+        );
+        let home = crate::draft_host::tests::temp_home(tag, &config.account());
+        let hub = std::sync::Arc::new(fell_core::compose::DraftHub::new());
+        let id = addressed_draft(&home, &hub, &config, "Lunch");
+        (config, home, hub, id)
+    }
+
+    /// Another draft `c` started in `home`, shown in the window, addressed
+    /// and titled `subject`.
+    fn addressed_draft(
+        home: &crate::draft_host::DraftHome,
+        hub: &fell_core::compose::DraftHub,
+        config: &fell_core::AccountConfig,
+        subject: &str,
+    ) -> String {
+        let id = home
+            .new_draft(hub, &AccountId(config.id.clone()), &config.email)
+            .unwrap();
+        assert!(crate::draft_host::show_draft(hub, &id));
+        hub.with_session(&id, |session| {
+            session
+                .set_addresses_from_user("to", "Ada <ada@example.com>")
+                .unwrap();
+            session.set_subject_from_user(subject.into());
+            session.set_body_from_user("Thursday?\n".into());
+            session.flush().unwrap();
+            session.mark_seen();
+        });
+        id
+    }
+
+    #[test]
+    fn a_send_that_lands_after_the_window_moved_on_leaves_the_new_draft_open() {
+        let (config, home, hub, sent) = inbox_draft("moved-on");
+        let backend = Counting::new(|| Ok(()));
+        let asked = std::sync::Mutex::new(Vec::new());
+        let prepared = hub
+            .with_session(&sent, crate::compose_ui::prepare_from_editor)
+            .unwrap()
+            .unwrap();
+        // `c` while the send is still talking to the server: the one window
+        // moves to the new draft.
+        hub.note_shown(&sent);
+        let other = addressed_draft(&home, &hub, &config, "Dinner");
+        hub.note_hidden(&sent);
+        hub.note_shown(&other);
+        let _ = hub.take_closed();
+        let counting = backend.clone();
+        let outcome = crate::compose_ui::transmit_from_hub(&hub, &sent, prepared, |account| {
+            asked.lock().unwrap().push(account.clone());
+            Ok(Box::new(counting))
+        });
+        assert!(outcome.is_ok());
+        let end = crate::compose_ui::finish_send(&hub, &sent, &other, true, &outcome);
+        assert_eq!(end.status, None, "the draft on screen keeps its status");
+        assert!(!end.close, "the draft on screen is not closed");
+        let open = hub
+            .with_session(&other, |session| session.snapshot().open)
+            .unwrap();
+        assert!(open, "the new draft is still open for editing");
+        // The inbox still hears that the first one went out.
+        let lines = hub.take_closed();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].contains("Lunch"), "{lines:?}");
+        // On the draft that was sent, the window closes as before.
+        let backend = Counting::new(|| Ok(()));
+        let outcome = send_as_window(&hub, &other, &backend, &asked);
+        let end = crate::compose_ui::finish_send(&hub, &other, &other, true, &outcome);
+        assert!(end.close);
+        assert_eq!(end.status.as_deref(), Some("Sent from the editor"));
+        assert!(hub.take_closed()[0].contains("Dinner"));
+    }
+
+    #[test]
+    fn a_maybe_sent_result_for_a_draft_no_longer_on_screen_goes_to_the_inbox() {
+        let (config, home, hub, sent) = inbox_draft("moved-on-uncertain");
+        let backend = Counting::new(|| {
+            Err(fell_core::Error::SendUncertain(
+                "smtp: read timed out".into(),
+            ))
+        });
+        let asked = std::sync::Mutex::new(Vec::new());
+        let other = addressed_draft(&home, &hub, &config, "Dinner");
+        let _ = hub.take_closed();
+        let outcome = send_as_window(&hub, &sent, &backend, &asked);
+        let end = crate::compose_ui::finish_send(&hub, &sent, &other, true, &outcome);
+        assert_eq!(end.status, None, "no error is painted on the other draft");
+        assert!(!end.sent);
+        let notices = hub.take_notices();
+        let (line, warn) = &notices[0];
+        assert!(line.starts_with("may have been sent"), "{notices:?}");
+        assert!(line.contains("check Sent before sending again"), "{line}");
+        assert!(line.contains("Lunch"), "{line}");
+        assert!(*warn, "the inbox shows it in the error colour");
+    }
+
+    /// Send draft `id` as the window does, through `backend`, recording
+    /// which account the window asked a backend for.
+    fn send_as_window(
+        hub: &fell_core::compose::DraftHub,
+        id: &str,
+        backend: &Counting,
+        asked: &std::sync::Mutex<Vec<AccountId>>,
+    ) -> Result<fell_core::SentMessage, SendFailure> {
+        let prepared = hub
+            .with_session(id, crate::compose_ui::prepare_from_editor)
+            .unwrap()?;
+        let counting = backend.clone();
+        crate::compose_ui::transmit_from_hub(hub, id, prepared, move |account| {
+            asked.lock().unwrap().push(account.clone());
+            Ok(Box::new(counting))
+        })
+    }
+
+    #[test]
+    fn a_draft_from_the_inbox_sends_once_through_the_account_file() {
+        let (config, home, hub, id) = inbox_draft("inbox-send");
+        let account = AccountId(config.id.clone());
+        // The window resolves its backend from the account file for this
+        // account; there is no fixture to fall back on.
+        assert!(!fell_core::is_demo_account(&account));
+        assert!(fell_core::backend_for(&account, None).is_err());
+        let mut imap = config.clone();
+        imap.backend = fell_core::BackendKind::Imap;
+        assert_eq!(
+            fell_core::backend_for(&account, Some(&imap))
+                .unwrap()
+                .kind(),
+            fell_core::BackendKind::Imap
+        );
+        let backend = Counting::new(|| Ok(()));
+        let asked = std::sync::Mutex::new(Vec::new());
+        let sent = send_as_window(&hub, &id, &backend, &asked).unwrap();
+        assert_eq!(sent.remote_id.0, "counted");
+        assert_eq!(backend.count(), 1);
+        assert_eq!(*asked.lock().unwrap(), vec![account.clone()]);
+        let again = send_as_window(&hub, &id, &backend, &asked).unwrap_err();
+        assert_eq!(
+            again,
+            SendFailure::Locked(fell_core::compose::SendLock::Sent)
+        );
+        assert_eq!(backend.count(), 1);
+        // The sent draft leaves the drafts list.
+        let listed = fell_core::Store::open(&home.store)
+            .unwrap()
+            .unsent_compose_drafts(&account)
+            .unwrap();
+        assert!(listed.iter().all(|draft| draft.id != id), "{listed:?}");
+        // Closing its window tells the inbox it was sent.
+        hub.note_shown(&id);
+        hub.note_hidden(&id);
+        let lines = hub.take_closed();
+        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].contains("Lunch"), "{lines:?}");
+        assert!(
+            !hub.reopen_last(),
+            "mail that went out is not offered again"
+        );
+    }
+
+    #[test]
+    fn a_draft_that_may_have_been_sent_stays_listed_with_check_sent() {
+        let (config, home, hub, id) = inbox_draft("inbox-uncertain");
+        let account = AccountId(config.id.clone());
+        let backend = Counting::new(|| {
+            Err(fell_core::Error::SendUncertain(
+                "smtp: read timed out".into(),
+            ))
+        });
+        let asked = std::sync::Mutex::new(Vec::new());
+        let err = send_as_window(&hub, &id, &backend, &asked).unwrap_err();
+        assert!(err.to_string().contains("Check Sent"), "{err}");
+        let listed = fell_core::Store::open(&home.store)
+            .unwrap()
+            .unsent_compose_drafts(&account)
+            .unwrap();
+        let kept = listed.iter().find(|draft| draft.id == id).expect("kept");
+        assert!(kept.maybe_sent);
+        let row = &crate::present::draft_rows(&listed)[0];
+        assert!(row.labels[0].contains("check Sent"), "{:?}", row.labels);
+        hub.note_shown(&id);
+        hub.note_hidden(&id);
+        assert!(hub.take_closed()[0].contains("check Sent"));
+    }
+
     /// A draft with a Bcc, bound to a mailbox file the test can read.
     fn bcc_session(name: &str) -> (fell_core::compose::DraftSession, fell_core::Store) {
         let root = std::env::temp_dir().join(format!(

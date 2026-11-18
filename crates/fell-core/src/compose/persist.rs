@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::store::Store;
 use crate::{AccountId, Result};
 
-use super::frontmatter::{AttachmentRef, DraftFields};
+use super::frontmatter::{AttachmentRef, DraftFields, write_draft};
 use super::mime::ResolvedFile;
 use super::session::SendLock;
 use super::workspace;
@@ -25,6 +25,24 @@ pub struct StoredCompose {
     pub files: Vec<ResolvedFile>,
     pub identities: Vec<String>,
     pub owner: String,
+}
+
+/// One compose draft as the inbox's drafts list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSummary {
+    pub id: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    /// The person's own Bcc, shown only to them in the preview.
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    /// The agent the draft belongs to; empty for the person's own.
+    pub owner: String,
+    pub updated_unix: i64,
+    /// A send that may have gone out. Sent drafts are not listed.
+    pub maybe_sent: bool,
 }
 
 /// Agent hunks waiting for review, and the serialized draft their byte
@@ -380,6 +398,44 @@ impl Store {
         }))
     }
 
+    /// The account's compose drafts that have not gone out, newest first.
+    ///
+    /// A draft whose send went out leaves the list; one that may have gone
+    /// out stays, marked, so the person checks Sent. An agent's draft is
+    /// listed while its review draft is (an undone one is not).
+    pub fn unsent_compose_drafts(&self, account_id: &AccountId) -> Result<Vec<DraftSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.from_addr, d.to_addrs, d.cc_addrs, d.subject, d.body, d.owner,
+                    d.updated_unix, s.state, d.bcc_addrs
+             FROM compose_drafts d
+             LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
+             WHERE d.account_id = ?1
+               AND IFNULL(s.state, ?2) != ?3
+               AND (d.owner = '' OR EXISTS (
+                   SELECT 1 FROM review_drafts r
+                   WHERE r.account_id = d.account_id AND 'r' || r.id = d.id
+               ))
+             ORDER BY d.updated_unix DESC, d.id DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id.as_str(), SEND_CLEAR, SEND_SENT], |row| {
+            let state: Option<String> = row.get(8)?;
+            Ok(DraftSummary {
+                id: row.get(0)?,
+                from: row.get(1)?,
+                to: split_list(&row.get::<_, String>(2)?),
+                cc: split_list(&row.get::<_, String>(3)?),
+                bcc: split_list(&row.get::<_, String>(9)?),
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                owner: row.get(6)?,
+                updated_unix: row.get(7)?,
+                // Anything but a clean "clear" errs toward "may have been sent".
+                maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn compose_owner(&self, id: &str) -> Result<Option<String>> {
         Ok(self.load_compose(id)?.map(|draft| draft.owner))
     }
@@ -457,6 +513,63 @@ impl Store {
         let Some(stored) = self.load_compose(id)? else {
             return Ok(None);
         };
+        write_compose_folder(&stored, id, folder)?;
+        Ok(Some(stored))
+    }
+
+    /// Ready draft `id`'s folder for opening. The mailbox row is Fell's own
+    /// copy, so the folder is written from it, except when `draft.md` holds
+    /// the text Fell saved last: a save whose mailbox row did not land is
+    /// newer than the row, and is kept. What it has over the row is then
+    /// marked for review when the draft opens, as for any outside change.
+    /// `None` when the mailbox has no such draft.
+    pub fn refresh_compose_folder(&self, id: &str, folder: &Path) -> Result<Option<StoredCompose>> {
+        let Some(stored) = self.load_compose(id)? else {
+            return Ok(None);
+        };
+        let own = workspace::read_draft_file(folder)
+            .is_ok_and(|text| workspace::is_own_save(folder, &text));
+        if own {
+            // The folder's files belong with the text kept: only ones it has
+            // lost come back from the row, never older bytes over newer.
+            for file in &stored.files {
+                let present =
+                    workspace::resolve_inside(folder, &file.path).is_ok_and(|path| path.exists());
+                if !present {
+                    workspace::write_inside(folder, &file.path, &file.bytes)
+                        .map_err(crate::Error::Invalid)?;
+                }
+            }
+            return Ok(Some(stored));
+        }
+        write_compose_folder(&stored, id, folder)?;
+        // The folder is the row again; an older note no longer applies.
+        let _ = workspace::note_own_save(folder, &write_draft(&stored.fields, &stored.body));
+        Ok(Some(stored))
+    }
+
+    /// Forget draft `id`: its row, attachments, review and send record.
+    pub(crate) fn delete_compose(&self, id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(REVIEW_SCHEMA)?;
+        tx.execute(
+            "DELETE FROM compose_review WHERE draft_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM compose_attachments WHERE draft_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM compose_send WHERE draft_id = ?1", params![id])?;
+        tx.execute("DELETE FROM compose_drafts WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Write `stored` out as draft `id`'s folder, attachments included.
+fn write_compose_folder(stored: &StoredCompose, id: &str, folder: &Path) -> Result<()> {
+    {
         workspace::materialize_in(
             folder.parent().unwrap_or(folder),
             id,
@@ -469,7 +582,7 @@ impl Store {
             workspace::write_inside(folder, &file.path, &file.bytes)
                 .map_err(crate::Error::Invalid)?;
         }
-        Ok(Some(stored))
+        Ok(())
     }
 }
 
@@ -702,6 +815,73 @@ mod tests {
     use crate::{Account, BackendKind};
 
     #[test]
+    fn the_drafts_list_drops_sent_mail_and_marks_maybe_sent() {
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Me".into(),
+            email: "me@x".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let save = |id: &str, owner: &str| {
+            store
+                .save_compose(&StoredCompose {
+                    id: id.into(),
+                    account_id: account.id.clone(),
+                    fields: DraftFields {
+                        from: "me@x".into(),
+                        to: vec!["Ada <ada@x>".into()],
+                        subject: format!("about {id}"),
+                        ..DraftFields::default()
+                    },
+                    body: "hello\n".into(),
+                    files: Vec::new(),
+                    identities: vec!["me@x".into()],
+                    owner: owner.into(),
+                })
+                .unwrap();
+        };
+        save("open", "");
+        save("went", "");
+        save("unsure", "");
+        save("retried", "");
+        // An agent's draft whose review draft was undone.
+        save("r99", "agent:bot");
+        let claim = |id: &str, lock: Option<SendLock>| {
+            assert_eq!(
+                store.claim_compose_send(&account.id, id, None).unwrap(),
+                None
+            );
+            if lock != Some(SendLock::MaybeSent) {
+                store.finish_compose_send(&account.id, id, lock).unwrap();
+            }
+        };
+        claim("went", Some(SendLock::Sent));
+        claim("unsure", Some(SendLock::MaybeSent));
+        claim("retried", None);
+        let listed = store.unsent_compose_drafts(&account.id).unwrap();
+        let mut ids: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|draft| (draft.id.as_str(), draft.maybe_sent))
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![("open", false), ("retried", false), ("unsure", true)]
+        );
+        let open = listed.iter().find(|draft| draft.id == "open").unwrap();
+        assert_eq!(open.to, vec!["Ada <ada@x>".to_string()]);
+        assert_eq!(open.subject, "about open");
+        assert!(
+            store
+                .unsent_compose_drafts(&AccountId("other".into()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn attachments_survive_a_reload() {
         let store = Store::open_in_memory().unwrap();
         let account = Account {
@@ -736,6 +916,57 @@ mod tests {
         assert_eq!(loaded.body, "![chart](chart.png)\n");
         assert_eq!(loaded.files[0].bytes, b"png");
         assert_eq!(loaded.fields.to, vec!["ada@example.com".to_string()]);
+    }
+
+    #[test]
+    fn keeping_fells_own_save_keeps_its_newer_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let file = |path: &str, bytes: &[u8]| ResolvedFile {
+            path: path.into(),
+            display_name: path.into(),
+            bytes: bytes.to_vec(),
+            inline: true,
+        };
+        store
+            .save_compose(&StoredCompose {
+                id: "d1".into(),
+                account_id: account.id.clone(),
+                fields: DraftFields {
+                    from: "jon@example.com".into(),
+                    ..DraftFields::default()
+                },
+                body: "![chart](chart.png) ![logo](logo.png)\n".into(),
+                files: vec![file("chart.png", b"old"), file("logo.png", b"logo")],
+                identities: vec!["jon@example.com".into()],
+                owner: String::new(),
+            })
+            .unwrap();
+        let folder = std::env::temp_dir().join(format!(
+            "fell-own-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        // Fell saved a new chart and its text; the mailbox row missed both.
+        let text = "---\nfrom: jon@example.com\n---\n![chart](chart.png) ![logo](logo.png) v2\n";
+        std::fs::write(folder.join("draft.md"), text).unwrap();
+        workspace::note_own_save(&folder, text).unwrap();
+        std::fs::write(folder.join("chart.png"), b"new").unwrap();
+        store.refresh_compose_folder("d1", &folder).unwrap();
+        assert_eq!(std::fs::read(folder.join("chart.png")).unwrap(), b"new");
+        // A file the folder lost still comes back from the row.
+        assert_eq!(std::fs::read(folder.join("logo.png")).unwrap(), b"logo");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

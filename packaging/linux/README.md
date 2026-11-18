@@ -8,9 +8,24 @@ x86_64 CI build from `main`. This is not a GitHub Release.
 
 - `fell` — the binary
 - `dev.predmore.fell.desktop`
+- `dev.predmore.fell.compose.desktop`: hidden; it gives the compose window (app id `dev.predmore.fell.compose`) the Fell icon
 - `dev.predmore.fell.png`
 
-Run `./fell`. For a launcher, copy the binary onto `PATH`, the desktop file to `~/.local/share/applications/`, and the icon to `~/.local/share/icons/hicolor/256x256/apps/`.
+Run `./fell`. For a launcher, copy the binary onto `PATH`, both desktop files to `~/.local/share/applications/`, and the icon to `~/.local/share/icons/hicolor/256x256/apps/`.
+
+## Hyprland
+
+The compose window has its own app id, so a rule can open it floating and centred instead of tiled:
+
+```lua
+hl.window_rule({
+    name  = "fell-compose",
+    match = { class = "^dev\\.predmore\\.fell\\.compose$" },
+    float = true,
+    size = "1000 780",
+    center = true,
+})
+```
 
 ## AppImage
 
