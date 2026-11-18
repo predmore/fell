@@ -1,7 +1,7 @@
 //! Row and conversation presentation. Pure functions, no GPUI.
 
 use fell_core::compose::DraftSummary;
-use fell_core::{FolderThread, Message};
+use fell_core::{FolderRoles, FolderThread, Message};
 
 use crate::text_render::{RenderedBody, render_stored_body};
 
@@ -385,7 +385,8 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
         reply_to: Vec::new(),
         attachment_names: Vec::new(),
     };
-    let mut shown = conversation(&[message], me);
+    // The folder line is replaced below, so no account roles are needed.
+    let mut shown = conversation(&[message], me, &FolderRoles::default());
     for message in &mut shown {
         message.folders = if draft.maybe_sent {
             "Draft · may have been sent · check Sent before sending again".into()
@@ -421,7 +422,8 @@ fn address_name(raw: &str) -> String {
     }
 }
 
-pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {
+/// `roles` names each message's folders the way the account uses them.
+pub fn conversation(messages: &[Message], me: &str, roles: &FolderRoles) -> Vec<ConvMessage> {
     let last = messages.len().saturating_sub(1);
     messages
         .iter()
@@ -435,7 +437,7 @@ pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {
                 folders: message
                     .folders
                     .iter()
-                    .map(|folder| folder_label(folder))
+                    .map(|folder| roles.label(folder))
                     .collect::<Vec<_>>()
                     .join(" · "),
                 date_unix: message.headers.date_unix,
@@ -485,29 +487,20 @@ pub fn display_name(name: &Option<String>, email: &str, me: &str) -> String {
     email.split('@').next().unwrap_or(email).to_string()
 }
 
-pub fn folder_label(name: &str) -> String {
-    match name.to_ascii_lowercase().as_str() {
-        "inbox" => "Inbox".into(),
-        "sent" => "Sent".into(),
-        "drafts" => "Drafts".into(),
-        "archive" | "archived" => "Archive".into(),
-        "spam" | "junk" => "Spam".into(),
-        "trash" | "deleted" => "Trash".into(),
-        _ => name.to_string(),
-    }
-}
-
-pub fn merge_folders(stored: &[String]) -> Vec<String> {
-    let standard = ["INBOX", "Sent", "Drafts", "Archive", "Spam", "Trash"];
-    let mut out: Vec<String> = standard.iter().map(|name| (*name).to_string()).collect();
+/// Folders for the `gf` picker: the account's role folders first, then the
+/// rest of `stored`. A stored name that is another spelling of a role
+/// folder's name (`junk` for `Spam`) shares that row.
+pub fn merge_folders(roles: &FolderRoles, stored: &[String]) -> Vec<String> {
+    let mut out = roles.picker(&[]);
     for name in stored {
-        let canonical = fell_core::canonical_folder_name(name)
-            .map(str::to_string)
-            .unwrap_or_else(|| name.clone());
-        if out.iter().any(|have| have.eq_ignore_ascii_case(&canonical)) {
+        let alias_of_shown = fell_core::folder_aliases(name).iter().any(|alias| {
+            out.iter()
+                .any(|have| fell_core::folder_aliases(have).contains(alias))
+        });
+        if alias_of_shown || out.iter().any(|have| have.eq_ignore_ascii_case(name)) {
             continue;
         }
-        out.push(canonical);
+        out.push(name.clone());
     }
     out
 }
@@ -989,27 +982,66 @@ mod tests {
 
     #[test]
     fn alias_folders_share_one_picker_row() {
-        let folders = merge_folders(&[
-            "Junk".into(),
+        // Before any listing, a stored alias shares the role's default row.
+        let stored: Vec<String> = vec![
+            "junk".into(),
             "Deleted".into(),
             "Archived".into(),
             "Projects".into(),
-        ]);
+        ];
+        let folders = merge_folders(&FolderRoles::default(), &stored);
         assert_eq!(
-            folders
-                .iter()
-                .filter(|name| folder_label(name) == "Spam")
-                .count(),
-            1
+            folders,
+            vec![
+                "INBOX", "Sent", "Drafts", "Archive", "Spam", "Trash", "Projects"
+            ]
         );
-        assert!(folders.iter().any(|name| name == "Spam"));
-        assert!(!folders.iter().any(|name| name.eq_ignore_ascii_case("junk")));
-        assert!(
-            !folders
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case("deleted"))
+
+        // Roles read from those names: each folder is its role's one row.
+        let roles = FolderRoles::from_names(&stored);
+        let folders = merge_folders(&roles, &stored);
+        let labels: Vec<String> = folders.iter().map(|name| roles.label(name)).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Inbox", "Sent", "Drafts", "Archive", "Spam", "Trash", "Projects"
+            ]
         );
-        assert!(folders.iter().any(|name| name == "Projects"));
+        assert!(folders.iter().any(|name| name == "junk"));
+        assert!(!folders.iter().any(|name| name == "Spam"));
+    }
+
+    #[test]
+    fn server_folder_names_show_their_role_label() {
+        let roles = FolderRoles::new(vec![
+            fell_core::RoleFolder {
+                role: fell_core::FolderRole::Sent,
+                name: "[Gmail]/Sent Mail".into(),
+                raw: "[Gmail]/Sent Mail".into(),
+                source: fell_core::RoleSource::Server,
+            },
+            fell_core::RoleFolder {
+                role: fell_core::FolderRole::All,
+                name: "[Gmail]/All Mail".into(),
+                raw: "[Gmail]/All Mail".into(),
+                source: fell_core::RoleSource::Server,
+            },
+        ]);
+        let folders = merge_folders(&roles, &["[Gmail]/Sent Mail".into(), "Receipts".into()]);
+        assert_eq!(
+            folders,
+            vec![
+                "INBOX",
+                "[Gmail]/Sent Mail",
+                "Drafts",
+                "[Gmail]/All Mail",
+                "Spam",
+                "Trash",
+                "Receipts"
+            ]
+        );
+        assert_eq!(roles.label("[Gmail]/All Mail"), "All Mail");
+        assert_eq!(roles.label("Receipts"), "Receipts");
     }
 
     #[test]
@@ -1069,6 +1101,7 @@ mod tests {
                 message("c", true, "INBOX"),
             ],
             "me@x",
+            &FolderRoles::default(),
         );
         assert!(!messages[0].expanded);
         assert!(!messages[1].expanded);

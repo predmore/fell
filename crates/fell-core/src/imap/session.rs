@@ -24,6 +24,9 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) struct Listed {
     pub raw: String,
     pub decoded: String,
+    pub delimiter: Option<char>,
+    /// LIST attributes, including RFC 6154 SPECIAL-USE marks like `\Sent`.
+    pub attributes: Vec<String>,
 }
 
 pub(super) struct Examined {
@@ -162,8 +165,25 @@ impl Session {
         Ok(session)
     }
 
+    /// Selectable mailboxes with their LIST attributes.
+    ///
+    /// A server that advertises SPECIAL-USE (RFC 6154) is asked to mark
+    /// Sent, Trash, and the rest with `RETURN (SPECIAL-USE)`. Others may
+    /// still mark them on a plain LIST, so attributes are kept either way.
+    /// A server that advertises it but refuses the option gets a plain LIST.
     pub(super) fn list_selectable(&mut self) -> Result<Vec<Listed>, Error> {
-        let lines = self.command("LIST", "LIST \"\" \"*\"")?.untagged;
+        const PLAIN: &str = "LIST \"\" \"*\"";
+        let lines = if self.has_cap("SPECIAL-USE") {
+            match self.command("LIST", "LIST \"\" \"*\" RETURN (SPECIAL-USE)") {
+                Ok(reply) => reply.untagged,
+                Err(Error::Backend(message)) if message.contains("LIST failed:") => {
+                    self.command("LIST", PLAIN)?.untagged
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            self.command("LIST", PLAIN)?.untagged
+        };
         let mut out = Vec::new();
         for line in lines {
             let Some(listed) = parse_list(&line.text, &line.literals) else {
@@ -175,6 +195,8 @@ impl Session {
             out.push(Listed {
                 raw: listed.raw,
                 decoded: listed.decoded,
+                delimiter: listed.delimiter,
+                attributes: listed.attributes,
             });
         }
         Ok(out)
@@ -1095,6 +1117,8 @@ struct ParsedList {
     raw: String,
     decoded: String,
     noselect: bool,
+    delimiter: Option<char>,
+    attributes: Vec<String>,
 }
 
 fn connect_tcp(config: &ImapConfig) -> Result<TcpStream, Error> {
@@ -1247,6 +1271,7 @@ pub(crate) fn wrap_tcp_as_tls(
         password: String::new(),
         security: ImapSecurity::Tls,
         accept_invalid_certs,
+        folder_overrides: Vec::new(),
     };
     Ok(TlsStream {
         inner: wrap_tls(tcp, Vec::new(), &config)?,
@@ -1488,16 +1513,23 @@ fn parse_list(text: &str, literals: &[LiteralBytes]) -> Option<ParsedList> {
         literals,
         literal: 0,
     };
-    let _delimiter = scan.astring()?;
+    let delimiter = scan.astring()?;
+    let delimiter = if delimiter.eq_ignore_ascii_case("NIL") {
+        None
+    } else {
+        delimiter.chars().next()
+    };
     let raw = scan.astring()?;
-    let noselect = flags
-        .iter()
-        .any(|flag| flag.eq_ignore_ascii_case("\\Noselect"));
+    let noselect = flags.iter().any(|flag| {
+        flag.eq_ignore_ascii_case("\\Noselect") || flag.eq_ignore_ascii_case("\\NonExistent")
+    });
     let decoded = decode_modified_utf7(&raw);
     Some(ParsedList {
         raw,
         decoded,
         noselect,
+        delimiter,
+        attributes: flags,
     })
 }
 
@@ -1873,6 +1905,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         })
         .expect("an oversized literal is discarded so the rest of the response can finish");
     }
@@ -1912,6 +1945,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("an unbounded greeting was accepted");
@@ -1959,6 +1993,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         })
         .expect("login");
         let listed = session.list_selectable().expect("list");
@@ -2039,6 +2074,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         })
         .expect("login");
         let _limit = super::limit_command_bytes_to(24);
@@ -2067,6 +2103,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Tls,
             accept_invalid_certs: true,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("invalid certificates were accepted for a public host");
@@ -2096,6 +2133,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("an unusable literal length was treated as protocol text");
@@ -2128,6 +2166,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("chained literals were retained without a total cap");
@@ -2161,6 +2200,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("a chain of empty literals was accepted");
@@ -2195,6 +2235,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -2235,6 +2276,7 @@ mod tests {
             password: "secret".into(),
             security: ImapSecurity::Plain,
             accept_invalid_certs: false,
+            folder_overrides: Vec::new(),
         });
         let Err(err) = opened else {
             panic!("an untagged flood was accepted");
@@ -2332,6 +2374,7 @@ mod tests {
             password: "secret".into(),
             security,
             accept_invalid_certs: true,
+            folder_overrides: Vec::new(),
         })
         .expect("TLS login");
         assert!(

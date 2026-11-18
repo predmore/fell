@@ -82,6 +82,9 @@ pub struct MailboxDelta {
     pub cursor: Option<SyncCursor>,
     pub removals: Vec<FolderRemoval>,
     pub settle: Settle,
+    /// Each role's folder, when this pass listed the server's mailboxes.
+    /// Replaces the account's stored roles.
+    pub roles: Option<crate::folders::FolderRoles>,
 }
 
 /// Mail transport. IMAP/Proton live behind this trait; the UI never calls them directly.
@@ -324,6 +327,9 @@ fn collect_imap(
         }
         if delta.cursor.is_some() {
             combined.cursor = delta.cursor;
+        }
+        if delta.roles.is_some() {
+            combined.roles = delta.roles;
         }
         Ok(())
     })?;

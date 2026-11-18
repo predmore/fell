@@ -16,7 +16,14 @@
 //! # smtp_host = "127.0.0.1"     # defaults to host
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
+//! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
 //! ```
+//!
+//! Sync learns which folder is Sent, Drafts, Trash and so on from the
+//! server's SPECIAL-USE marks, or from common names when it marks none.
+//! `sent_folder`, `drafts_folder`, `trash_folder`, `junk_folder`,
+//! `archive_folder`, `all_mail_folder`, and `flagged_folder` name the folder
+//! for that role and win over both.
 //!
 //! Sending uses only this file's username and password, never anything in a
 //! draft folder. `smtp_security = "starttls"` (the default) refuses a server
@@ -27,6 +34,7 @@ use std::process::Command;
 
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::{BridgeBackend, DEMO_ACCOUNT_IDS, ImapBackend, MailBackend};
+use crate::folders::FolderRole;
 use crate::imap::{ImapConfig, ImapSecurity};
 use crate::smtp::SmtpConfig;
 use crate::{Error, Result};
@@ -63,6 +71,8 @@ pub struct AccountConfig {
     pub smtp_host: Option<String>,
     pub smtp_port: Option<u16>,
     pub smtp_security: Option<ImapSecurity>,
+    /// `sent_folder = "..."` and the like, in [`FolderRole::ALL`] order.
+    pub folders: Vec<(FolderRole, String)>,
 }
 
 impl AccountConfig {
@@ -86,6 +96,7 @@ impl AccountConfig {
             smtp_host: None,
             smtp_port: None,
             smtp_security: None,
+            folders: Vec::new(),
         }
     }
 
@@ -169,6 +180,22 @@ impl AccountConfig {
         let smtp_security = get("smtp_security")
             .map(|v| v.security("smtp_security"))
             .transpose()?;
+        let mut folders = Vec::new();
+        for role in FolderRole::ALL {
+            let Some(key) = role.config_key() else {
+                continue;
+            };
+            if let Some(value) = get(key) {
+                let name = value.text(key)?;
+                if name.trim().is_empty() {
+                    return Err(invalid(format!("{key} is empty")));
+                }
+                if name.chars().any(char::is_control) {
+                    return Err(invalid(format!("{key} contains a control character")));
+                }
+                folders.push((role, name.trim().to_string()));
+            }
+        }
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -186,6 +213,7 @@ impl AccountConfig {
             smtp_host,
             smtp_port,
             smtp_security,
+            folders,
         };
         config.validate()?;
         Ok(config)
@@ -264,6 +292,11 @@ impl AccountConfig {
         }
         if let Some(security) = self.smtp_security {
             push(&mut out, "smtp_security", security_name(security));
+        }
+        for (role, name) in &self.folders {
+            if let Some(key) = role.config_key() {
+                push(&mut out, key, name);
+            }
         }
         out
     }
@@ -350,6 +383,7 @@ impl AccountConfig {
             // Bridge signs its local listener with its own certificate. Any
             // other host must present a certificate a public CA vouches for.
             accept_invalid_certs: self.backend == BackendKind::Bridge && self.is_loopback(),
+            folder_overrides: self.folders.clone(),
         })
     }
 
@@ -541,6 +575,40 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_overrides_parse_and_render() {
+        let text = "backend = \"imap\"\nemail = \"me@example.com\"\nhost = \"imap.example.com\"\npassword = \"pw\"\nsent_folder = \"Sent Items\"\narchive_folder = \" Ablage \"\nall_mail_folder = \"[Gmail]/All Mail\"\n";
+        let config = AccountConfig::parse(text).unwrap();
+        assert_eq!(
+            config.folders,
+            vec![
+                (FolderRole::Sent, "Sent Items".to_string()),
+                (FolderRole::Archive, "Ablage".to_string()),
+                (FolderRole::All, "[Gmail]/All Mail".to_string()),
+            ]
+        );
+        assert_eq!(AccountConfig::parse(&config.render()).unwrap(), config);
+        assert_eq!(
+            config.imap_config().unwrap().folder_overrides,
+            config.folders
+        );
+
+        let base = "email = \"me@proton.me\"\npassword = \"pw\"\n";
+        for (line, message) in [
+            ("drafts_folder = \"\"\n", "drafts_folder is empty"),
+            ("trash_folder = 3\n", "trash_folder must be a quoted string"),
+            (
+                "trash_folder = \"a\\tb\"\n",
+                "trash_folder contains a control character",
+            ),
+            ("inbox_folder = \"Inbox\"\n", "unknown key inbox_folder"),
+            ("spam_folder = \"Spam\"\n", "unknown key spam_folder"),
+        ] {
+            let err = AccountConfig::parse(&format!("{base}{line}")).unwrap_err();
+            assert!(err.to_string().contains(message), "{line}: {err}");
+        }
+    }
 
     #[test]
     fn bridge_defaults() {

@@ -6,10 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::ops::Range;
 
 use fell_core::compose::ReplyKind;
-use fell_core::{FolderSpan, ListKey, SyncFailureKind, ThreadId};
+use fell_core::{FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
-use crate::present::{ConvMessage, Pane, ThreadRow, folder_label, merge_folders};
+use crate::present::{ConvMessage, Pane, ThreadRow, merge_folders};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
@@ -235,6 +235,8 @@ pub struct Session {
     pub account_email: String,
     pub folder: String,
     pub folders: Vec<String>,
+    /// Which folder is Sent, Drafts, Archive and the rest on this account.
+    pub roles: FolderRoles,
     /// The loaded part of the folder list: a run of rows in list order.
     pub threads: Vec<ThreadRow>,
     /// The folder has rows above `threads` that are not loaded.
@@ -302,8 +304,9 @@ impl Session {
         Self {
             account_name: account_name.into(),
             account_email: account_email.into(),
-            folder: "INBOX".into(),
+            folder: FolderRole::Inbox.default_name().into(),
             folders: Vec::new(),
+            roles: FolderRoles::default(),
             threads: Vec::new(),
             more_before: false,
             more_after: false,
@@ -397,7 +400,12 @@ impl Session {
     }
 
     pub fn folder_title(&self) -> String {
-        folder_label(&self.folder)
+        self.roles.label(&self.folder)
+    }
+
+    /// The folder on screen is the account's drafts folder.
+    pub fn in_drafts(&self) -> bool {
+        self.roles.is(FolderRole::Drafts, &self.folder)
     }
 
     /// The compose draft the selected row stands for, in the drafts list.
@@ -500,7 +508,7 @@ impl Session {
     }
 
     pub fn folder_choices(&self) -> Vec<String> {
-        let all = merge_folders(&self.folders);
+        let all = merge_folders(&self.roles, &self.folders);
         let query = self.folder_query.trim();
         all.into_iter()
             .filter(|name| {
@@ -512,7 +520,8 @@ impl Session {
                 if query.is_empty() {
                     return true;
                 }
-                folder_label(name)
+                self.roles
+                    .label(name)
                     .to_ascii_lowercase()
                     .contains(&query.to_ascii_lowercase())
                     || name
@@ -1411,9 +1420,9 @@ impl Session {
                     step.reload_messages = self.move_cursor(Motion::Backward(steps));
                 }
             }
-            Action::Inbox => step.reload_threads = self.go_folder("INBOX"),
-            Action::Sent => step.reload_threads = self.go_folder("Sent"),
-            Action::Drafts => step.reload_threads = self.go_folder("Drafts"),
+            Action::Inbox => step.reload_threads = self.go_role(FolderRole::Inbox),
+            Action::Sent => step.reload_threads = self.go_role(FolderRole::Sent),
+            Action::Drafts => step.reload_threads = self.go_role(FolderRole::Drafts),
             Action::FolderPicker => {
                 self.count.clear();
                 self.folder_intent = FolderIntent::Go;
@@ -1541,6 +1550,12 @@ impl Session {
             }
         }
         step
+    }
+
+    /// Open the account's folder for `role`, whatever the server calls it.
+    fn go_role(&mut self, role: FolderRole) -> bool {
+        let folder = self.roles.name(role).to_string();
+        self.go_folder(&folder)
     }
 
     fn go_folder(&mut self, folder: &str) -> bool {
@@ -1716,7 +1731,7 @@ impl Session {
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
-                if self.folder.eq_ignore_ascii_case("drafts") =>
+                if self.in_drafts() =>
             {
                 Banner {
                     title: "No drafts".into(),
@@ -1882,6 +1897,52 @@ mod tests {
         assert!(step.reload_threads);
         assert_eq!(session.folder, "INBOX");
         assert!(session.chord.is_empty());
+    }
+
+    #[test]
+    fn gs_and_gd_open_the_folders_the_server_marked() {
+        let mut session = session();
+        let folder = |role, name: &str| fell_core::RoleFolder {
+            role,
+            name: name.into(),
+            raw: name.into(),
+            source: fell_core::RoleSource::Server,
+        };
+        session.roles = FolderRoles::new(vec![
+            folder(FolderRole::Inbox, "INBOX"),
+            folder(FolderRole::Sent, "Sent Items"),
+            folder(FolderRole::Drafts, "[Gmail]/Drafts"),
+            folder(FolderRole::Junk, "Junk"),
+        ]);
+        session.folders = vec!["INBOX".into(), "Sent Items".into(), "Sent".into()];
+        session.on_key(KeyId::Char('g'), 4);
+        assert!(session.on_key(KeyId::Char('s'), 4).reload_threads);
+        assert_eq!(session.folder, "Sent Items");
+        assert_eq!(session.folder_title(), "Sent");
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('d'), 4);
+        assert_eq!(session.folder, "[Gmail]/Drafts");
+        assert_eq!(session.folder_title(), "Drafts");
+        assert!(session.in_drafts());
+
+        // The picker leads with the role folders under their labels, and a
+        // plain folder that only shares a role's usual name keeps its own.
+        session.folder_query.clear();
+        let choices = session.folder_choices();
+        assert_eq!(
+            choices,
+            vec![
+                "INBOX",
+                "Sent Items",
+                "[Gmail]/Drafts",
+                "Archive",
+                "Junk",
+                "Trash",
+                "Sent"
+            ]
+        );
+        session.folder_query = "spam".into();
+        assert_eq!(session.folder_choices(), vec!["Junk"]);
     }
 
     #[test]
