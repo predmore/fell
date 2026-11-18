@@ -406,6 +406,38 @@ impl Session {
         Ok(Some(out))
     }
 
+    /// One window of one MIME part, still transfer-encoded:
+    /// `UID FETCH <uid> (UID BODY.PEEK[<section>]<offset.len>)`. `BODY.PEEK`
+    /// leaves the message unread. `Ok(None)` when the reply has no body for
+    /// `uid` (the server no longer has it). A server that ignores the window
+    /// sends the whole part, which the caller sees as a long first window.
+    pub(super) fn uid_fetch_part(
+        &mut self,
+        uid: u32,
+        section: &str,
+        offset: usize,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let cmd = format!("UID FETCH {uid} (UID BODY.PEEK[{section}]<{offset}.{len}>)");
+        let lines = self.command("UID FETCH", &cmd)?.untagged;
+        for line in lines {
+            let Some(fetched) = parse_fetch(&line.text, line.literals) else {
+                continue;
+            };
+            if fetched.uid != uid || fetched.body_missing {
+                continue;
+            }
+            if fetched.skipped {
+                return Err(imap_err(format!(
+                    "part {section} of UID {uid} is larger than the {} byte literal limit",
+                    literal_limit()
+                )));
+            }
+            return Ok(Some(fetched.body));
+        }
+        Ok(None)
+    }
+
     /// `ENABLE QRESYNC` succeeded on this session.
     pub(super) fn qresync(&self) -> bool {
         self.qresync
@@ -1590,6 +1622,13 @@ fn body_after_body_key(text: &str, literals: &mut [LiteralBytes]) -> (Vec<u8>, b
                 return (Vec::new(), false, true);
             };
             cursor += end + 1;
+            // A partial fetch names its origin octet: `BODY[2]<0>`.
+            if bytes.get(cursor) == Some(&b'<') {
+                let Some(end) = text[cursor..].find('>') else {
+                    return (Vec::new(), false, true);
+                };
+                cursor += end + 1;
+            }
         }
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;

@@ -3,11 +3,18 @@
 //! `body_text` is the plain text search and snippets use, with HTML reduced
 //! to text. The HTML and plain parts are kept as sent in [`MessageParts`] for
 //! the conversation view; sanitizing HTML belongs to rendering, not sync.
+//! Every other MIME part is listed by its IMAP section ([`MimePart`]); its
+//! bytes are not kept.
 
-use mail_parser::{HeaderForm, MessageParser, PartKind};
+use std::collections::HashSet;
+
+use mail_parser::{HeaderForm, MessageParser, MessageRef, PartKind};
 
 use crate::account::AccountId;
-use crate::message::{Address, Message, MessageHeaders, MessageId, MessageParts, RemoteId};
+use crate::message::{
+    Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
+    RemoteId, TransferEncoding,
+};
 use crate::threading::ThreadId;
 
 use super::escape_mailbox;
@@ -122,6 +129,7 @@ pub(crate) fn to_message(
     let arrived_via = parsed.as_ref().map(arrival_addresses).unwrap_or_default();
     let list_id = parsed.as_ref().and_then(list_id_header);
     let thread_id = ThreadId::from_message_id(&message_id);
+    let parts = parsed.as_ref().map(body_parts).unwrap_or_default();
 
     Message {
         account_id: account_id.clone(),
@@ -155,15 +163,13 @@ pub(crate) fn to_message(
         cc: address_list(parsed.as_ref().and_then(|message| message.cc())),
         bcc: address_list(parsed.as_ref().and_then(|message| message.bcc())),
         starred: false,
-        has_attachment: parsed
-            .as_ref()
-            .is_some_and(|message| message.has_attachments()),
+        has_attachment: has_attachment(&parts.mime_parts),
         archived: false,
         snooze_until: None,
         list_id,
         reply_to: address_list(parsed.as_ref().and_then(|message| message.reply_to())),
-        attachment_names: parsed.as_ref().map(attachment_names).unwrap_or_default(),
-        parts: Some(parsed.as_ref().map(body_parts).unwrap_or_default()),
+        attachment_names: attachment_names(&parts.mime_parts),
+        parts: Some(parts),
     }
 }
 
@@ -226,10 +232,12 @@ pub(crate) fn parts_from_raw(raw: &[u8]) -> MessageParts {
 fn body_parts(message: &mail_parser::Message<'_>) -> MessageParts {
     let html = joined(message.html_body(), |kind| matches!(kind, PartKind::Html));
     let plain = joined(message.text_body(), |kind| matches!(kind, PartKind::Text));
+    let mime_parts = list_parts(message.root(), html.as_deref());
     MessageParts {
         html,
         plain,
         bulk_headers: bulk_headers(message),
+        mime_parts,
     }
 }
 
@@ -302,18 +310,252 @@ fn unfold(raw: &str) -> String {
         .join(" ")
 }
 
-/// File names of the attachments, as a forward lists them. A part with no
-/// name is called "attachment".
-fn attachment_names(message: &mail_parser::Message<'_>) -> Vec<String> {
-    message
-        .attachments()
+/// Whether any part is a file offered to the reader. Signatures and images
+/// the HTML shows are not.
+pub(crate) fn has_attachment(parts: &[MimePart]) -> bool {
+    parts.iter().any(|part| part.role == PartRole::Attachment)
+}
+
+/// File names of the attachments, as a forward lists them: the message's
+/// own, not those inside an attached message. A part with no name is called
+/// "attachment".
+pub(crate) fn attachment_names(parts: &[MimePart]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|part| part.role == PartRole::Attachment && !part.nested)
         .map(|part| {
-            part.attachment_name()
-                .map(|name| name.trim().replace(['\u{1e}', '\u{1f}'], " "))
-                .filter(|name| !name.is_empty())
+            part.filename
+                .as_deref()
+                .map(|name| name.replace(['\u{1e}', '\u{1f}'], " "))
                 .unwrap_or_else(|| "attachment".to_string())
         })
         .collect()
+}
+
+/// A hostile message cannot make the part list large.
+const MAX_MIME_PARTS: usize = 256;
+const MAX_PART_NAME: usize = 255;
+const MAX_MIME_TYPE: usize = 127;
+/// Attached messages inside attached messages are listed this deep.
+const MAX_NESTED_MESSAGES: usize = 4;
+
+const SIGNATURE_TYPES: &[&str] = &[
+    "application/pgp-signature",
+    "application/pkcs7-signature",
+    "application/x-pkcs7-signature",
+];
+
+/// The non-body parts of `message`, numbered as IMAP numbers them.
+///
+/// The top-level parts of a multipart message are `1`, `2`, …; a multipart
+/// inside part `2` numbers its children `2.1`, `2.2`. A message that is not
+/// multipart has one part, `1`. An attached `message/rfc822` at `3` is
+/// listed itself, then its own parts follow under `3.`, as if it were the
+/// whole message.
+fn list_parts(message: MessageRef<'_>, html: Option<&str>) -> Vec<MimePart> {
+    let mut out = Vec::new();
+    let cids = html.map(cid_references).unwrap_or_default();
+    walk_message(message, "", &cids, 0, &mut out);
+    out
+}
+
+fn walk_message(
+    message: MessageRef<'_>,
+    prefix: &str,
+    cids: &HashSet<String>,
+    depth: usize,
+    out: &mut Vec<MimePart>,
+) {
+    let root = message.root_part();
+    if root.is_multipart() {
+        walk_children(root, prefix, cids, depth, out);
+    } else {
+        leaf(root, section(prefix, 1), false, cids, depth, out);
+    }
+}
+
+fn walk_children(
+    container: mail_parser::MessagePart<'_>,
+    prefix: &str,
+    cids: &HashSet<String>,
+    depth: usize,
+    out: &mut Vec<MimePart>,
+) {
+    let signed = container.is_content_type("multipart", "signed");
+    for (index, child) in container.children().enumerate() {
+        if out.len() >= MAX_MIME_PARTS {
+            return;
+        }
+        let number = section(prefix, index + 1);
+        if child.is_multipart() {
+            walk_children(child, &number, cids, depth, out);
+        } else {
+            leaf(child, number, signed && index == 1, cids, depth, out);
+        }
+    }
+}
+
+fn section(prefix: &str, number: usize) -> String {
+    if prefix.is_empty() {
+        number.to_string()
+    } else {
+        format!("{prefix}.{number}")
+    }
+}
+
+fn leaf(
+    part: mail_parser::MessagePart<'_>,
+    section: String,
+    signature_slot: bool,
+    cids: &HashSet<String>,
+    depth: usize,
+    out: &mut Vec<MimePart>,
+) {
+    if out.len() >= MAX_MIME_PARTS {
+        return;
+    }
+    let nested_message = part.nested();
+    // The text the reader sees as the body is not a file.
+    if nested_message.is_none() && part.is_text() && (part.in_text_body() || part.in_html_body()) {
+        return;
+    }
+    let mime_type = mime_type(&part);
+    let filename = part.attachment_name().and_then(clean_name);
+    let size = part.decoded_len() as u64;
+    // An empty text leftover in no body list (a stray preamble) is noise.
+    if nested_message.is_none() && part.is_text() && filename.is_none() && size == 0 {
+        return;
+    }
+    let content_id = part
+        .content_id()
+        .map(|id| {
+            id.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim()
+        })
+        .filter(|id| !id.is_empty() && id.len() <= MAX_PART_NAME)
+        .map(str::to_string);
+    let role = if signature_slot || SIGNATURE_TYPES.contains(&mime_type.as_str()) {
+        PartRole::Signature
+    } else if content_id
+        .as_deref()
+        .is_some_and(|id| cids.contains(&id.to_ascii_lowercase()))
+    {
+        PartRole::Inline
+    } else {
+        PartRole::Attachment
+    };
+    let disposition = match part.content_disposition() {
+        Some(value) if value.ctype().eq_ignore_ascii_case("inline") => Disposition::Inline,
+        Some(value) if value.ctype().eq_ignore_ascii_case("attachment") => Disposition::Attachment,
+        _ => Disposition::Unspecified,
+    };
+    let encoding = match part.encoding() {
+        mail_parser::Encoding::Base64 => TransferEncoding::Base64,
+        mail_parser::Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
+        mail_parser::Encoding::None => TransferEncoding::Identity,
+    };
+    out.push(MimePart {
+        section: section.clone(),
+        role,
+        mime_type,
+        filename,
+        size,
+        encoded_size: part.raw_body().len() as u64,
+        encoding,
+        content_id,
+        disposition,
+        nested: depth > 0,
+    });
+    if let Some(inner) = nested_message
+        && depth < MAX_NESTED_MESSAGES
+    {
+        let html = joined(inner.html_body(), |kind| matches!(kind, PartKind::Html));
+        let cids = html.as_deref().map(cid_references).unwrap_or_default();
+        walk_message(inner, &section, &cids, depth + 1, out);
+    }
+}
+
+fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
+    let given = part.content_type().and_then(|value| {
+        let subtype = value.subtype()?;
+        let joined = format!("{}/{}", value.ctype(), subtype).to_ascii_lowercase();
+        let token = |ch: char| ch.is_ascii_alphanumeric() || "!#$&^_.+-/".contains(ch);
+        (joined.len() <= MAX_MIME_TYPE && joined.chars().all(token)).then_some(joined)
+    });
+    given.unwrap_or_else(|| {
+        if part.is_message() {
+            "message/rfc822"
+        } else if part.content_type().is_none() && part.is_text() {
+            "text/plain"
+        } else {
+            "application/octet-stream"
+        }
+        .to_string()
+    })
+}
+
+/// One line, no control or bidi-override characters, at most 255 bytes.
+fn clean_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .filter(|ch| !is_bidi_control(*ch))
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = cleaned.len().min(MAX_PART_NAME);
+    while !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cleaned = cleaned[..end].trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+pub(crate) fn is_bidi_control(ch: char) -> bool {
+    matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The Content-IDs an HTML body names in `cid:` URLs, lowercase and
+/// percent-decoded (RFC 2392).
+fn cid_references(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("cid:") {
+        let start = from + found + 4;
+        let end = lower[start..]
+            .find(|ch: char| ch.is_whitespace() || "\"'()<>".contains(ch))
+            .map_or(lower.len(), |len| start + len);
+        let id = percent_decode(&lower[start..end]);
+        if !id.is_empty() && id.len() <= MAX_PART_NAME {
+            out.insert(id);
+        }
+        from = end.max(start);
+        if out.len() >= MAX_MIME_PARTS {
+            break;
+        }
+    }
+    out
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(hex) = text.get(index + 1..index + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).to_ascii_lowercase()
 }
 
 fn address_list(list: Option<mail_parser::AddressList<'_>>) -> Vec<Address> {
@@ -683,5 +925,208 @@ mod tests {
         );
         assert!(message.has_attachment);
         assert_eq!(message.attachment_names, vec!["report.pdf", "attachment"]);
+    }
+
+    use crate::imap::mime_fixtures::{self, MimeFixture};
+    use crate::message::{Disposition, MimePart, PartRole, TransferEncoding};
+
+    fn listed(fixture: &MimeFixture) -> (Message, Vec<MimePart>) {
+        let message = to_message(
+            &AccountId("a1".into()),
+            "INBOX",
+            "INBOX",
+            1,
+            3,
+            &[],
+            &fixture.raw,
+        );
+        let parts = message.parts.clone().unwrap().mime_parts;
+        (message, parts)
+    }
+
+    /// Each listed section, read with the test server's own MIME walk and
+    /// decoded, is the fixture's bytes.
+    fn assert_sections_hold_the_bytes(fixture: &MimeFixture, parts: &[MimePart]) {
+        for (section, bytes) in &fixture.bytes {
+            let part = parts
+                .iter()
+                .find(|part| part.section == *section)
+                .unwrap_or_else(|| panic!("section {section} is listed: {parts:?}"));
+            let raw = super::super::test_server::section_body(&fixture.raw, section)
+                .unwrap_or_else(|| panic!("the server finds section {section}"));
+            assert_eq!(part.encoded_size, raw.len() as u64, "section {section}");
+            assert_eq!(
+                &crate::parts::decode_part(part.encoding, &raw),
+                bytes,
+                "section {section}"
+            );
+            assert_eq!(part.size, bytes.len() as u64, "section {section}");
+        }
+    }
+
+    #[test]
+    fn mixed_mail_lists_both_attachments_by_section() {
+        let fixture = mime_fixtures::mixed_two_attachments("mix@x");
+        let (message, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        let pdf = &parts[0];
+        assert_eq!(pdf.section, "2");
+        assert_eq!(pdf.role, PartRole::Attachment);
+        assert_eq!(pdf.mime_type, "application/pdf");
+        assert_eq!(pdf.filename.as_deref(), Some("report.pdf"));
+        assert_eq!(pdf.encoding, TransferEncoding::Base64);
+        assert_eq!(pdf.disposition, Disposition::Attachment);
+        assert!(!pdf.nested);
+        let csv = &parts[1];
+        assert_eq!(csv.section, "3");
+        assert_eq!(csv.mime_type, "text/csv");
+        assert_eq!(csv.filename.as_deref(), Some("totals.csv"));
+        assert_eq!(csv.encoding, TransferEncoding::QuotedPrintable);
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        assert!(message.has_attachment);
+        assert_eq!(message.attachment_names, vec!["report.pdf", "totals.csv"]);
+        // The text body is the body, not a file.
+        assert_eq!(
+            message.body_text.as_deref().map(str::trim),
+            Some("Two files attached.")
+        );
+    }
+
+    #[test]
+    fn related_images_the_html_shows_are_inline_not_attachments() {
+        let fixture = mime_fixtures::related_cid_images("rel@x");
+        let (message, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].section, "2");
+        assert_eq!(parts[0].role, PartRole::Inline);
+        assert_eq!(parts[0].content_id.as_deref(), Some("logo@x"));
+        assert_eq!(parts[0].mime_type, "image/png");
+        // An image no cid: names is something the reader can only open.
+        assert_eq!(parts[1].section, "3");
+        assert_eq!(parts[1].role, PartRole::Attachment);
+        assert_eq!(parts[1].filename.as_deref(), Some("stray.png"));
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        assert!(message.has_attachment);
+        assert_eq!(message.attachment_names, vec!["stray.png"]);
+
+        // With only the logo, the message has no attachment.
+        let only_logo = String::from_utf8(fixture.raw.clone()).unwrap();
+        let cut = only_logo
+            .find("--rel\r\nContent-Type: image/png; name=")
+            .unwrap();
+        let only_logo = format!("{}--rel--\r\n", &only_logo[..cut]);
+        let (message, parts) = listed(&MimeFixture {
+            raw: only_logo.into_bytes(),
+            bytes: Vec::new(),
+        });
+        assert_eq!(parts.len(), 1);
+        assert!(!message.has_attachment);
+        assert!(message.attachment_names.is_empty());
+    }
+
+    #[test]
+    fn an_rfc_2231_name_is_decoded() {
+        let fixture = mime_fixtures::rfc2231_name("2231@x");
+        let (message, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].filename.as_deref(), Some("Ñandú 日本語.txt"));
+        assert_eq!(parts[0].mime_type, "application/octet-stream");
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        assert_eq!(message.attachment_names, vec!["Ñandú 日本語.txt"]);
+    }
+
+    #[test]
+    fn an_attached_message_is_listed_then_its_own_parts() {
+        let fixture = mime_fixtures::nested_message("fwd@x");
+        let (message, parts) = listed(&fixture);
+        let sections: Vec<_> = parts.iter().map(|part| part.section.as_str()).collect();
+        assert_eq!(sections, ["2", "2.2"], "{parts:?}");
+        assert_eq!(parts[0].mime_type, "message/rfc822");
+        assert_eq!(parts[0].filename.as_deref(), Some("Original.eml"));
+        assert_eq!(parts[0].role, PartRole::Attachment);
+        assert!(!parts[0].nested);
+        assert_eq!(parts[1].mime_type, "application/zip");
+        assert_eq!(parts[1].filename.as_deref(), Some("inner.zip"));
+        assert!(parts[1].nested);
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        // A forward names the attached message, not the files inside it.
+        assert_eq!(message.attachment_names, vec!["Original.eml"]);
+    }
+
+    #[test]
+    fn a_signature_is_not_an_attachment() {
+        let fixture = mime_fixtures::pgp_signed("sig@x");
+        let (message, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].role, PartRole::Signature);
+        assert_eq!(parts[0].filename.as_deref(), Some("signature.asc"));
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        assert!(!message.has_attachment, "issue #148");
+        assert!(message.attachment_names.is_empty());
+
+        // S/MIME: the second part of multipart/signed, whatever its type.
+        let smime = String::from_utf8(fixture.raw)
+            .unwrap()
+            .replace(
+                "application/pgp-signature; name=\"signature.asc\"",
+                "application/octet-stream",
+            )
+            .replace("filename=\"signature.asc\"", "filename=\"smime.p7s\"");
+        let (message, parts) = listed(&MimeFixture {
+            raw: smime.into_bytes(),
+            bytes: Vec::new(),
+        });
+        assert_eq!(parts[0].role, PartRole::Signature);
+        assert!(!message.has_attachment);
+    }
+
+    #[test]
+    fn a_message_that_is_one_file_is_part_one() {
+        let raw = format!(
+            "From: a@x\r\nMessage-ID: <one@x>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: application/pdf; name=\"scan.pdf\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+            mime_fixtures::base64(b"%PDF scan")
+        );
+        let fixture = MimeFixture {
+            raw: raw.into_bytes(),
+            bytes: vec![("1", b"%PDF scan".to_vec())],
+        };
+        let (message, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].section, "1");
+        assert_sections_hold_the_bytes(&fixture, &parts);
+        assert!(message.has_attachment);
+    }
+
+    #[test]
+    fn hostile_part_lists_and_names_are_capped_and_cleaned() {
+        let mut raw = String::from(
+            "From: a@x\r\nMessage-ID: <flood@x>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"f\"\r\n\r\n",
+        );
+        raw.push_str(
+            "--f\r\nContent-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"../../evil\u{202e}fdp.exe\x07\"\r\n\r\nx\r\n",
+        );
+        for index in 0..400 {
+            raw.push_str(&format!(
+                "--f\r\nContent-Type: application/x-{index}\r\n\
+                 Content-Disposition: attachment\r\n\r\nx\r\n"
+            ));
+        }
+        raw.push_str("--f--\r\n");
+        let (_, parts) = listed(&MimeFixture {
+            raw: raw.into_bytes(),
+            bytes: Vec::new(),
+        });
+        assert_eq!(parts.len(), MAX_MIME_PARTS);
+        // Kept as sent apart from control and bidi characters; making it a
+        // safe file name is the cache's job.
+        assert_eq!(parts[0].filename.as_deref(), Some("../../evilfdp.exe"));
+        assert_eq!(
+            crate::parts::sanitize_filename(parts[0].filename.as_deref(), &parts[0].mime_type),
+            "_.._evilfdp.exe"
+        );
     }
 }

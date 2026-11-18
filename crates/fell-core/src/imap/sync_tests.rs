@@ -52,6 +52,7 @@ fn sample_state() -> TestState {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -981,6 +982,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1049,6 +1051,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1119,6 +1122,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1238,6 +1242,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1353,6 +1358,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1499,6 +1505,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1598,6 +1605,7 @@ fn non_ascii_password_logs_in_as_a_literal() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1673,6 +1681,7 @@ fn fetch_batches_survive_a_dropped_connection() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1787,6 +1796,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1868,6 +1878,7 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1942,6 +1953,7 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -2037,6 +2049,7 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         vanished_reply: None,
         special_use: false,
         reject_list_return: false,
+        part_write_delay: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -3519,4 +3532,352 @@ fn a_body_backfill_batch_stops_at_its_byte_cap() {
         )
         .unwrap();
     assert_eq!(empty, 0, "nothing deferred was recorded as gone");
+}
+
+/// INBOX alone, holding `messages` as (uid, raw), all unread.
+fn inbox_state(messages: Vec<(u32, Vec<u8>)>) -> TestState {
+    let mut state = sample_state();
+    state.mailboxes = vec![FixtureMailbox {
+        name: "INBOX".into(),
+        list_flags: String::new(),
+        uidvalidity: 20,
+        uidnext: None,
+        omit_uidnext: false,
+        reject_examine: false,
+        reject_fetch: false,
+        vanished: Vec::new(),
+        messages: messages
+            .into_iter()
+            .map(|(uid, raw)| FixtureMessage {
+                uid,
+                flags: Vec::new(),
+                modseq: 1,
+                body_form: BodyForm::Literal,
+                raw,
+            })
+            .collect(),
+    }];
+    state
+}
+
+fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
+    let root = std::env::temp_dir().join(format!(
+        "fell-part-fetch-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = crate::parts::PartCache::open(&root, crate::parts::DEFAULT_CACHE_BYTES).unwrap();
+    (root, cache)
+}
+
+#[test]
+fn attachments_are_listed_on_sync_and_fetched_by_section() {
+    use crate::imap::mime_fixtures;
+    let fixtures = [
+        ("mix@x", mime_fixtures::mixed_two_attachments("mix@x")),
+        ("rel@x", mime_fixtures::related_cid_images("rel@x")),
+        ("2231@x", mime_fixtures::rfc2231_name("2231@x")),
+        ("fwd@x", mime_fixtures::nested_message("fwd@x")),
+        ("sig@x", mime_fixtures::pgp_signed("sig@x")),
+    ];
+    let server = TestServer::spawn(inbox_state(
+        fixtures
+            .iter()
+            .enumerate()
+            .map(|(index, (_, fixture))| (index as u32 + 1, fixture.raw.clone()))
+            .collect(),
+    ));
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+
+    let listed = |id: &str| {
+        store
+            .message_attachments(&acct.id, &crate::MessageId::new(id))
+            .unwrap()
+            .expect("sync lists parts")
+    };
+    let summary = |id: &str| {
+        listed(id)
+            .into_iter()
+            .map(|part| (part.section, part.role, part.mime_type, part.filename))
+            .collect::<Vec<_>>()
+    };
+    use crate::PartRole::{Attachment, Inline, Signature};
+    let some = |name: &str| Some(name.to_string());
+    assert_eq!(
+        summary("mix@x"),
+        [
+            (
+                "2".into(),
+                Attachment,
+                "application/pdf".into(),
+                some("report.pdf")
+            ),
+            (
+                "3".into(),
+                Attachment,
+                "text/csv".into(),
+                some("totals.csv")
+            ),
+        ]
+    );
+    assert_eq!(
+        summary("rel@x"),
+        [
+            ("2".into(), Inline, "image/png".into(), None),
+            (
+                "3".into(),
+                Attachment,
+                "image/png".into(),
+                some("stray.png")
+            ),
+        ]
+    );
+    assert_eq!(
+        summary("2231@x"),
+        [(
+            "2".into(),
+            Attachment,
+            "application/octet-stream".into(),
+            some("Ñandú 日本語.txt")
+        )]
+    );
+    assert_eq!(
+        summary("fwd@x"),
+        [
+            (
+                "2".into(),
+                Attachment,
+                "message/rfc822".into(),
+                some("Original.eml")
+            ),
+            (
+                "2.2".into(),
+                Attachment,
+                "application/zip".into(),
+                some("inner.zip")
+            ),
+        ]
+    );
+    assert_eq!(
+        summary("sig@x"),
+        [(
+            "2".into(),
+            Signature,
+            "application/pgp-signature".into(),
+            some("signature.asc")
+        )]
+    );
+    assert!(!stored(&store, &acct, "sig@x").unwrap().has_attachment);
+    assert!(stored(&store, &acct, "mix@x").unwrap().has_attachment);
+
+    // Every part comes back as its exact decoded bytes, a window at a time.
+    super::part_fetch::set_window(1000);
+    let (root, cache) = temp_cache("sections");
+    server.state.lock().expect("state").commands.clear();
+    for (id, fixture) in &fixtures {
+        for (section, bytes) in &fixture.bytes {
+            let request = store
+                .part_request(&acct.id, &crate::MessageId::new(*id), section)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} {section} is listed"));
+            let mut heard = Vec::new();
+            let cached =
+                crate::parts::fetch_part(&backend, &cache, &request, &mut |n| heard.push(n))
+                    .unwrap();
+            assert_eq!(
+                &std::fs::read(&cached.path).unwrap(),
+                bytes,
+                "{id} {section}"
+            );
+            assert_eq!(cached.size, bytes.len() as u64);
+            assert_eq!(
+                heard.last().copied(),
+                Some(request.part.encoded_size),
+                "{id}"
+            );
+            assert!(heard.windows(2).all(|pair| pair[0] < pair[1]), "{heard:?}");
+        }
+    }
+    let logged = commands(&server);
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.ends_with("UID FETCH 1 (UID BODY.PEEK[2]<1000.1000>)")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.ends_with("UID FETCH 4 (UID BODY.PEEK[2.2]<0.1000>)")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .filter(|line| line.contains("UID FETCH"))
+            .all(|line| line.contains("BODY.PEEK[")),
+    );
+    assert_read_only(&server);
+    assert!(stored(&store, &acct, "mix@x").unwrap().unread);
+
+    // A second fetch is read from the cache, without a connection.
+    server.state.lock().expect("state").commands.clear();
+    let again = store
+        .part_request(&acct.id, &crate::MessageId::new("mix@x"), "2")
+        .unwrap()
+        .unwrap();
+    crate::parts::fetch_part(&backend, &cache, &again, &mut |_| {}).unwrap();
+    assert!(commands(&server).is_empty());
+
+    // Opening the related message fetches the image its HTML shows.
+    let requests = store
+        .part_requests(&acct.id, &crate::MessageId::new("rel@x"))
+        .unwrap();
+    let inline = crate::parts::prefetch_inline_parts(&backend, &cache, &requests).unwrap();
+    assert_eq!(inline.len(), 1);
+    assert_eq!(inline[0].0, "logo@x");
+    assert_eq!(
+        std::fs::read(&inline[0].1.path).unwrap(),
+        fixtures[1].1.bytes[0].1
+    );
+    super::part_fetch::set_window(2 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
+    let fixture = crate::imap::mime_fixtures::mixed_two_attachments("mix@x");
+    let server = TestServer::spawn(inbox_state(vec![(1, fixture.raw.clone())]));
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let request = store
+        .part_request(&acct.id, &crate::MessageId::new("mix@x"), "2")
+        .unwrap()
+        .unwrap();
+    let (root, cache) = temp_cache("gone");
+    // The copy now numbers another part 2: its bytes are not handed over.
+    mailbox(&mut server.state.lock().expect("state"), "INBOX").messages[0].raw =
+        crate::imap::mime_fixtures::rfc2231_name("mix@x").raw;
+    let err = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("where it was listed"), "{err}");
+    assert!(cache.lookup(&request).is_none());
+    mailbox(&mut server.state.lock().expect("state"), "INBOX")
+        .messages
+        .clear();
+    let err = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("no server copy"), "{err}");
+    assert!(cache.lookup(&request).is_none());
+    // A new UIDVALIDITY is gone too, without a UID FETCH.
+    mailbox(&mut server.state.lock().expect("state"), "INBOX").uidvalidity = 21;
+    server.state.lock().expect("state").commands.clear();
+    assert!(crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).is_err());
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|line| line.contains("UID FETCH"))
+    );
+    // A section that is not a part number never reaches the server.
+    let mut odd = request.clone();
+    odd.part.section = "1 (FLAGS)".into();
+    assert!(crate::parts::fetch_part(&backend, &cache, &odd, &mut |_| {}).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
+    use std::time::{Duration, Instant};
+    let size = 10 * 1024 * 1024;
+    let fixture = crate::imap::mime_fixtures::large_attachment("big@x", size);
+    let syncing = TestServer::spawn(inbox_state(vec![(1, fixture.raw.clone())]));
+    // The part comes from its own connection, slowly: about 2 s for 13 MB.
+    let mut slow = inbox_state(vec![(1, fixture.raw.clone())]);
+    slow.part_write_delay = Some(Duration::from_millis(10));
+    let parts_server = TestServer::spawn(slow);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(syncing.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let request = store
+        .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.part.size, size as u64);
+
+    let (root, cache) = temp_cache("big");
+    let part_backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(parts_server.addr.port()),
+    };
+    let fetcher = crate::parts::PartFetcher::start(
+        move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
+        cache,
+    );
+    let (events, heard) = std::sync::mpsc::channel();
+    let asked = Instant::now();
+    fetcher.fetch(request.clone(), move |event| {
+        let _ = events.send(event);
+    });
+    assert!(
+        asked.elapsed() < Duration::from_millis(100),
+        "fetch() returns at once"
+    );
+    match heard.recv_timeout(Duration::from_secs(30)).unwrap() {
+        crate::parts::PartEvent::Progress { fetched, total } => {
+            assert!(fetched < total);
+            assert_eq!(total, request.part.encoded_size);
+        }
+        crate::parts::PartEvent::Done(result) => panic!("done too soon: {result:?}"),
+    }
+
+    // A sync pass runs to the end while the part is still downloading.
+    mailbox(&mut syncing.state.lock().expect("state"), "INBOX")
+        .messages
+        .push(FixtureMessage {
+            uid: 2,
+            flags: Vec::new(),
+            modseq: 2,
+            body_form: BodyForm::Literal,
+            raw: raw_message("new@x", None, "New", "Ann <ann@x>", "new mail", ""),
+        });
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "new@x").is_some());
+    let mut done = None;
+    while let Ok(event) = heard.try_recv() {
+        if let crate::parts::PartEvent::Done(result) = event {
+            done = Some(result);
+        }
+    }
+    assert!(done.is_none(), "the sync pass finished first");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let cached = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match heard.recv_timeout(left).expect("the fetch finishes") {
+            crate::parts::PartEvent::Progress { .. } => continue,
+            crate::parts::PartEvent::Done(result) => break result.unwrap(),
+        }
+    };
+    assert_eq!(cached.size, size as u64);
+    assert!(std::fs::read(&cached.path).unwrap() == fixture.bytes[0].1);
+    let windows = commands(&parts_server)
+        .iter()
+        .filter(|line| line.contains("BODY.PEEK[2]<"))
+        .count();
+    assert_eq!(windows, 7, "2 MB windows of a 13.6 MB part");
+    let _ = std::fs::remove_dir_all(&root);
 }

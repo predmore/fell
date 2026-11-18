@@ -116,7 +116,27 @@ CREATE TABLE IF NOT EXISTS local_action_bodies (
     html BLOB,
     plain BLOB,
     bulk_headers TEXT NOT NULL DEFAULT '',
+    parts_listed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (action_id, message_id),
+    FOREIGN KEY(action_id) REFERENCES local_actions(id)
+);
+
+-- The message_parts list of a message an action removed, as stored.
+CREATE TABLE IF NOT EXISTS local_action_parts (
+    action_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    section TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    role INTEGER NOT NULL,
+    mime_type TEXT NOT NULL,
+    filename TEXT,
+    size INTEGER NOT NULL,
+    encoded_size INTEGER NOT NULL,
+    encoding INTEGER NOT NULL,
+    content_id TEXT,
+    disposition INTEGER NOT NULL,
+    nested INTEGER NOT NULL,
+    PRIMARY KEY (action_id, message_id, section),
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
 "#;
@@ -357,6 +377,10 @@ impl Store {
             "DELETE FROM local_action_bodies WHERE action_id = ?1",
             params![action.id],
         )?;
+        tx.execute(
+            "DELETE FROM local_action_parts WHERE action_id = ?1",
+            params![action.id],
+        )?;
         let changed = tx.execute(
             "UPDATE local_actions SET undone = 1
              WHERE id = ?1 AND account_id = ?2 AND undone = 0",
@@ -460,6 +484,11 @@ impl Store {
 fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
+    if !crate::store::bodies::has_column(conn, "local_action_bodies", "parts_listed")? {
+        conn.execute_batch(
+            "ALTER TABLE local_action_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(())
 }
 
@@ -670,8 +699,8 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
 }
 
 /// Put back the parts a removed row had, replacing any a later sync wrote
-/// for the same id, as the row itself is. A row that had none is queued
-/// to be fetched again.
+/// for the same id, as the row itself is, with its part list. A row that had
+/// none, or no list, is queued to be fetched again.
 fn restore_bodies(
     conn: &Connection,
     account_id: &AccountId,
@@ -680,17 +709,30 @@ fn restore_bodies(
 ) -> Result<()> {
     for sql in [
         "DELETE FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        "DELETE FROM message_parts WHERE account_id = ?1 AND message_id = ?2",
         "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
     ] {
         conn.execute(sql, params![account_id.as_str(), message_id])?;
     }
     let restored = conn.execute(
-        "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
-         SELECT ?1, message_id, codec, html, plain, bulk_headers FROM local_action_bodies
+        "INSERT INTO message_bodies
+            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed)
+         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+         FROM local_action_bodies
          WHERE action_id = ?3 AND message_id = ?2",
         params![account_id.as_str(), message_id, action_id],
     )?;
-    if restored == 0 {
+    let columns = crate::store::bodies::PART_COLUMNS;
+    conn.execute(
+        &format!(
+            "INSERT INTO message_parts (account_id, message_id, {columns})
+             SELECT ?1, message_id, {columns} FROM local_action_parts
+             WHERE action_id = ?3 AND message_id = ?2"
+        ),
+        params![account_id.as_str(), message_id, action_id],
+    )?;
+    let listed = crate::store::bodies::parts_listed(conn, account_id, message_id)?;
+    if restored == 0 || !listed {
         conn.execute(
             "INSERT OR IGNORE INTO body_backfill (account_id, message_id) VALUES (?1, ?2)",
             params![account_id.as_str(), message_id],
@@ -1144,9 +1186,19 @@ fn insert_snapshot(
         // them for undo as stored.
         conn.execute(
             "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers)
-             SELECT ?1, message_id, codec, html, plain, bulk_headers FROM message_bodies
+                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed)
+             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+             FROM message_bodies
              WHERE account_id = ?2 AND message_id = ?3",
+            params![action_id, account_id.as_str(), plan.before.message_id],
+        )?;
+        let columns = crate::store::bodies::PART_COLUMNS;
+        conn.execute(
+            &format!(
+                "INSERT INTO local_action_parts (action_id, message_id, {columns})
+                 SELECT ?1, message_id, {columns} FROM message_parts
+                 WHERE account_id = ?2 AND message_id = ?3"
+            ),
             params![action_id, account_id.as_str(), plan.before.message_id],
         )?;
     }
@@ -2492,6 +2544,7 @@ mod tests {
 
     fn html(text: &str) -> crate::MessageParts {
         crate::MessageParts {
+            mime_parts: Vec::new(),
             html: Some(format!("<p>{text}</p>")),
             plain: Some(text.into()),
             bulk_headers: vec![("List-Id".into(), "<news.x>".into())],
@@ -2579,6 +2632,93 @@ mod tests {
             Some("server body")
         );
         assert_eq!(body_of(&store, "note@x"), Some(html("server")));
+    }
+
+    fn with_file(text: &str, name: &str) -> crate::MessageParts {
+        crate::MessageParts {
+            mime_parts: vec![crate::MimePart {
+                section: "2".into(),
+                role: crate::PartRole::Attachment,
+                mime_type: "application/pdf".into(),
+                filename: Some(name.into()),
+                size: 10,
+                encoded_size: 16,
+                encoding: crate::TransferEncoding::Base64,
+                content_id: None,
+                disposition: crate::Disposition::Attachment,
+                nested: false,
+            }],
+            ..html(text)
+        }
+    }
+
+    fn files_of(store: &Store, id: &str) -> Option<Vec<String>> {
+        store
+            .message_attachments(&account("a1"), &MessageId::new(id))
+            .unwrap()
+            .map(|parts| parts.into_iter().filter_map(|part| part.filename).collect())
+    }
+
+    #[test]
+    fn undo_of_expunge_puts_back_the_part_list() {
+        let store = open(&[("a1", "a@x")]);
+        let mut note = sample("a1", "note@x", "Note", "first body");
+        note.parts = Some(with_file("first", "first.pdf"));
+        let thread = store.upsert_message(&note).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["first.pdf".into()]));
+
+        expunge(&store, &thread);
+        assert_eq!(files_of(&store, "note@x"), None);
+        let mut later = sample("a1", "note@x", "Later", "later body");
+        later.parts = Some(with_file("later", "later.pdf"));
+        store.upsert_message(&later).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["later.pdf".into()]));
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["first.pdf".into()]));
+        assert!(!queued(&store, "note@x"));
+        let saved: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM local_action_parts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(saved, 0, "undo drops the saved list");
+
+        // A copy arriving only in the expunged folder replaces the saved list.
+        expunge(&store, &thread);
+        let mut gone = sample("a1", "note@x", "Note", "server body");
+        gone.folders = vec![FOLDER_TRASH.into()];
+        gone.parts = Some(with_file("server", "server.pdf"));
+        store
+            .apply_delta(
+                &account("a1"),
+                &MailboxDelta {
+                    messages: vec![gone],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert!(messages(&store, "a1", &thread).is_empty());
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["server.pdf".into()]));
+    }
+
+    #[test]
+    fn undo_of_expunge_requeues_a_row_whose_list_was_never_taken() {
+        let store = open(&[("a1", "a@x")]);
+        let mut note = sample("a1", "old@x", "Old", "old body");
+        note.parts = Some(html("old"));
+        let thread = store.upsert_message(&note).unwrap();
+        // Stored before part lists were kept.
+        store
+            .connection()
+            .execute_batch("UPDATE message_bodies SET parts_listed = 0")
+            .unwrap();
+        expunge(&store, &thread);
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(body_of(&store, "old@x"), Some(html("old")));
+        assert_eq!(files_of(&store, "old@x"), None);
+        assert!(queued(&store, "old@x"), "queued to list its parts");
     }
 
     #[test]

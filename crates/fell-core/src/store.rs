@@ -452,6 +452,11 @@ impl Store {
         if version < 4 {
             bodies::queue_stored_mail(&conn)?;
         }
+        // 5 queues mail whose attachments were never listed (message_parts):
+        // all mail stored before it, fetched once more by the same backfill.
+        if version < 5 {
+            bodies::queue_unlisted_mail(&conn)?;
+        }
         Ok(Self {
             indexer: None,
             conn,
@@ -735,15 +740,73 @@ impl Store {
         bodies::read(&self.conn, account_id, &canonical)
     }
 
+    /// The attachments, `cid:` images and signatures of one message, by its
+    /// id or an id that collapsed into it, in document order. Metadata only.
+    /// `None` when sync has not listed them yet (mail synced before the list
+    /// was kept; [`crate::sync::fetch_message_body`] fetches it).
+    pub fn message_attachments(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<Vec<crate::MimePart>>> {
+        let Some(canonical) = self.canonical_id(account_id, message_id)? else {
+            return Ok(None);
+        };
+        bodies::list(&self.conn, account_id, &canonical)
+    }
+
+    /// What [`crate::parts::fetch_part`] needs to fetch one part: the part
+    /// and the message's server copies. `None` when the message, the part,
+    /// or any server copy is missing.
+    pub fn part_request(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+        section: &str,
+    ) -> Result<Option<crate::parts::PartRequest>> {
+        Ok(self
+            .part_requests(account_id, message_id)?
+            .into_iter()
+            .find(|request| request.part.section == section))
+    }
+
+    /// A [`crate::parts::PartRequest`] for every listed part of one message,
+    /// in document order. Empty when none are listed or no copy is left.
+    pub fn part_requests(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Vec<crate::parts::PartRequest>> {
+        let Some(canonical) = self.canonical_id(account_id, message_id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(list) = bodies::list(&self.conn, account_id, &canonical)? else {
+            return Ok(Vec::new());
+        };
+        let copies = bodies::copies_of(&self.conn, account_id, &canonical)?;
+        if copies.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(list
+            .into_iter()
+            .map(|part| crate::parts::PartRequest {
+                account_id: account_id.clone(),
+                message_id: MessageId(canonical.clone()),
+                part,
+                copies: copies.clone(),
+            })
+            .collect())
+    }
+
     /// Up to `limit` messages stored before parts were kept, newest first,
     /// with the server copies to fetch them from.
     pub fn missing_bodies(&self, account_id: &AccountId, limit: usize) -> Result<Vec<BodyRequest>> {
         bodies::missing(&self.conn, account_id, limit)
     }
 
-    /// The server copies to fetch for one message with no stored body part,
-    /// including one an earlier backfill could not fetch. `None` when it has
-    /// a body part already, or no copy to fetch.
+    /// The server copies to fetch for one message with no stored body part
+    /// or no part list, including one an earlier backfill could not fetch.
+    /// `None` when it has both already, or no copy to fetch.
     pub fn body_request(
         &self,
         account_id: &AccountId,
@@ -754,6 +817,7 @@ impl Store {
         };
         if bodies::read(&self.conn, account_id, &canonical)?
             .is_some_and(|parts| parts.html.is_some() || parts.plain.is_some())
+            && bodies::parts_listed(&self.conn, account_id, &canonical)?
         {
             return Ok(None);
         }
@@ -796,7 +860,20 @@ impl Store {
             if parts.has_body() {
                 filled += 1;
             }
-            bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
+            let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
+            if listed && let Some(list) = parts.mime_parts() {
+                // The first list replaces flags an older classifier set.
+                tx.execute(
+                    "UPDATE messages SET has_attachment = ?1, attachment_names = ?2
+                     WHERE account_id = ?3 AND message_id = ?4",
+                    params![
+                        i64::from(crate::imap::has_attachment(list)),
+                        union_tokens("", &crate::imap::attachment_names(list), false),
+                        account_id.as_str(),
+                        canonical,
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(filled)
@@ -1845,14 +1922,27 @@ fn write_kept(
     let to_line = union_addresses(&stored.to_line, &message.to);
     let cc_line = union_addresses(&stored.cc_line, &message.cc);
     let bcc_line = union_addresses(&stored.bcc_line, &message.bcc);
-    let has_attachment = stored.has_attachment || message.has_attachment;
+    // A row whose part list was never taken has flags from an older
+    // classifier (a signature counted as a file). The first parsed list
+    // replaces them; after that, any copy with a file keeps the marker.
+    let relist = message.parts.is_some()
+        && !bodies::parts_listed(conn, &message.account_id, &stored.canonical_id)?;
+    let has_attachment = if relist {
+        message.has_attachment
+    } else {
+        stored.has_attachment || message.has_attachment
+    };
     // The first copy's Reply-To stands; a copy that names none adds nothing.
     let reply_to_line = if stored.reply_to_line.is_empty() {
         encode_addresses(&message.reply_to)
     } else {
         stored.reply_to_line.clone()
     };
-    let attachment_names = union_tokens(&stored.attachment_names, &message.attachment_names, false);
+    let attachment_names = if relist {
+        union_tokens("", &message.attachment_names, false)
+    } else {
+        union_tokens(&stored.attachment_names, &message.attachment_names, false)
+    };
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
     let from_email = if alias {
         prefer_nonempty(&stored.from_email, &message.headers.from.email)
@@ -4670,7 +4760,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
@@ -6657,7 +6747,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let fingerprint: String = store
             .conn
             .query_row(
@@ -6794,7 +6884,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let filled: i64 = store
             .conn
             .query_row(
@@ -6939,11 +7029,92 @@ mod tests {
         assert_eq!(
             kept,
             crate::MessageParts {
+                mime_parts: Vec::new(),
                 html: Some("<p>hello body</p>".into()),
                 plain: Some("hello body".into()),
                 bulk_headers: vec![("List-Id".into(), "<list.example>".into())],
             }
         );
+    }
+
+    #[test]
+    fn absorb_moves_the_deleted_rows_part_list_onto_a_kept_row_without_one() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        for (id, remote, subject, folders, list) in [
+            ("sent@x", "imap:sent", "Hello", "Sent", None),
+            (
+                "list@x",
+                "imap:inbox",
+                "[list] Hello",
+                "INBOX",
+                Some("list.example"),
+            ),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint, list_id
+                     ) VALUES (
+                        'a1', ?1, ?2, ?1, '', 'from@x', ?3, 1700000000, 'hello body',
+                        'hello body', 1, ?4, ?5, ?6
+                     )",
+                    params![id, remote, subject, folders, fingerprint, list],
+                )
+                .unwrap();
+        }
+        let fixture = crate::imap::mime_fixtures::mixed_two_attachments("sent@x");
+        let parsed = crate::imap::parts_from_raw(&fixture.raw);
+        assert_eq!(parsed.mime_parts.len(), 2);
+        bodies::write(
+            &store.conn,
+            &account().id,
+            "sent@x",
+            &bodies::StoredParts::new(&parsed),
+            bodies::Write::Replace,
+        )
+        .unwrap();
+        // The list copy, which the merge keeps, was stored before part
+        // lists were kept.
+        store
+            .conn
+            .execute(
+                "INSERT INTO message_bodies (account_id, message_id, codec, plain)
+                 VALUES ('a1', 'list@x', 1, NULL)",
+                [],
+            )
+            .unwrap();
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        again.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&again).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+        let kept: String = store
+            .conn
+            .query_row("SELECT message_id FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, "list@x");
+        assert_eq!(
+            store
+                .message_attachments(&account().id, &MessageId::new("list@x"))
+                .unwrap(),
+            Some(parsed.mime_parts.clone())
+        );
+        // The deleted row's own rows went with it.
+        let left: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_parts WHERE message_id = 'sent@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -7158,7 +7329,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let rows = listed(&store);
         assert_eq!(rows.len(), 2);
         let kept = rows
@@ -7343,7 +7514,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
 
         // A crash after the tables exist but before version 4 is stamped:
         // the next open queues again.
