@@ -14,7 +14,6 @@
 //! process; another process (`fell-mcp`) waits the same way without it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -52,20 +51,29 @@ fn now_mark() -> u64 {
         .saturating_add(1)
 }
 
+/// Names one mailbox file: its device and inode, so every path to it
+/// (a symlink, a second hard link) shares one [`Turns`].
+#[cfg(unix)]
+pub(crate) type FileKey = (u64, u64);
+/// Names one mailbox file: the path every store in this process opens it by.
+#[cfg(not(unix))]
+pub(crate) type FileKey = std::path::PathBuf;
+
 impl Turns {
-    /// The one `Turns` for the mailbox at `path`, as long as a store has it open.
-    pub(crate) fn for_file(path: &Path) -> Arc<Self> {
-        static FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<Turns>>>> = OnceLock::new();
+    /// The one `Turns` for the mailbox `key` names, as long as a store has
+    /// it open.
+    pub(crate) fn for_file(key: FileKey) -> Arc<Self> {
+        static FILES: OnceLock<Mutex<HashMap<FileKey, Weak<Turns>>>> = OnceLock::new();
         let mut files = FILES
             .get_or_init(Mutex::default)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         files.retain(|_, turns| turns.strong_count() > 0);
-        if let Some(turns) = files.get(path).and_then(Weak::upgrade) {
+        if let Some(turns) = files.get(&key).and_then(Weak::upgrade) {
             return turns;
         }
         let turns = Arc::new(Self::default());
-        files.insert(path.to_path_buf(), Arc::downgrade(&turns));
+        files.insert(key, Arc::downgrade(&turns));
         turns
     }
 
@@ -675,6 +683,32 @@ mod tests {
             .apply_delta(&account_id, &nothing_changed("modseq-2"))
             .unwrap();
         assert!(unread_of(&store, 2_050));
+    }
+
+    /// A store opened through a symlink or a second hard link shares the
+    /// turn of one opened by the file's own name.
+    #[cfg(unix)]
+    #[test]
+    fn every_path_to_a_mailbox_shares_its_turn() {
+        let dir = scratch("paths");
+        let path = dir.join("mail.db");
+        let by_name = Store::open(&path).unwrap();
+        let symlink = dir.join("symlink.db");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        let hard_link = dir.join("hard-link.db");
+        std::fs::hard_link(&path, &hard_link).unwrap();
+        let by_symlink = Store::open(&symlink).unwrap();
+        let by_hard_link = Store::open(&hard_link).unwrap();
+        let other_dir = scratch("paths-other");
+        let other = Store::open(other_dir.join("mail.db")).unwrap();
+
+        let turns = |store: &Store| Arc::clone(&store.lock_wait.turns);
+        assert!(Arc::ptr_eq(&turns(&by_name), &turns(&by_symlink)));
+        assert!(Arc::ptr_eq(&turns(&by_name), &turns(&by_hard_link)));
+        assert!(!Arc::ptr_eq(&turns(&by_name), &turns(&other)));
+        drop((by_name, by_symlink, by_hard_link, other));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     #[test]

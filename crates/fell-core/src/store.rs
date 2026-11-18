@@ -359,7 +359,15 @@ impl Store {
         // One path string per inode. A symlink or a second hard link must not
         // open a different `-wal` while another connection still has the file.
         let claimed = claim_mailbox(requested)?;
-        let turns = write_lock::Turns::for_file(&claimed.path);
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = claimed.lock.metadata()?;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let file = claimed.path.clone();
+        let turns = write_lock::Turns::for_file(file);
         let mut store = Self::from_connection(claimed.conn, turns)?;
         store.path = Some(claimed.path.clone());
         #[cfg(unix)]
