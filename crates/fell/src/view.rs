@@ -1792,25 +1792,21 @@ fn recipient_lines(
                     })
             }))
     } else {
-        // Only the names give way to an ellipsis; the count and the key
-        // always show. The text takes the box's colour, so hover reaches it.
         // Whole people only, measured like the thread list, so the count
         // always matches the names on screen; the Bcc and key always show.
+        // Only a single name too long for the pane is cut, with an ellipsis.
+        // The text takes the box's colour, so hover reaches it.
         let room = (conv_width - 48.0).min(680.0);
-        let (names, hidden) = present::fit_recipients(line, |names, tail| {
+        let (names, tail, _) = present::fit_recipients(line, |names, tail| {
             line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
                 <= room
         });
-        let bcc = line
-            .bcc
-            .as_ref()
-            .map(|bcc| format!(" · {bcc}"))
-            .unwrap_or_default();
-        let tail = if hidden > 0 {
-            format!(" +{hidden} more{bcc} · q")
-        } else {
-            format!("{bcc} · q")
-        };
+        let names = clip_line(
+            window,
+            &names,
+            (room - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
+            FontWeight::NORMAL,
+        );
         div()
             .flex()
             .min_w(px(0.))

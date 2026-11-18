@@ -157,9 +157,13 @@ fn label_of(label: &str) -> &'static str {
 }
 
 /// The closed line that fits: the most whole people (up to `line.budget`)
-/// for which `fits(names, tail)` holds, and how many are left out. Never
-/// cuts inside a name, so the count always matches what is on screen.
-pub fn fit_recipients(line: &RecipientLine, fits: impl Fn(&str, &str) -> bool) -> (String, usize) {
+/// for which `fits(names, tail)` holds, the tail that goes with them
+/// (" +N more · bcc X · q"), and how many are left out. Never drops a
+/// name partway, so the count always matches what is on screen.
+pub fn fit_recipients(
+    line: &RecipientLine,
+    fits: impl Fn(&str, &str) -> bool,
+) -> (String, String, usize) {
     let total: usize = line.names.iter().map(|(_, names)| names.len()).sum();
     let tail = |hidden: usize| {
         let bcc = line
@@ -176,14 +180,18 @@ pub fn fit_recipients(line: &RecipientLine, fits: impl Fn(&str, &str) -> bool) -
     let most = line.budget.min(total);
     for shown in (1..=most).rev() {
         let text = first_people(&line.names, shown);
-        if fits(&text, &tail(total - shown)) {
-            return (text, total - shown);
+        let rest = tail(total - shown);
+        if fits(&text, &rest) {
+            return (text, rest, total - shown);
         }
     }
-    // Not even one person fits beside the tail: show the first anyway.
+    // Not even one person fits beside the tail: show the first anyway, and
+    // let the caller shorten that one name.
+    let hidden = total.saturating_sub(1);
     (
         first_people(&line.names, 1.min(total)),
-        total.saturating_sub(1),
+        tail(hidden),
+        hidden,
     )
 }
 
@@ -900,16 +908,18 @@ mod tests {
         let mine = addressed("me@x", &[("Ada", "ada@x")], &cc, &bcc);
         let line = recipient_line(&mine, "me@x").unwrap();
         // Room for everything the budget allows.
-        let (text, hidden) = fit_recipients(&line, |_, _| true);
+        let (text, _, hidden) = fit_recipients(&line, |_, _| true);
         assert_eq!(text, "to Ada · cc Maya, Sam, Priya");
         assert_eq!(hidden, 3);
         // A narrow pane: measure by characters, 40 in all.
         let width = |text: &str| text.chars().count();
-        let (text, hidden) = fit_recipients(&line, |names, tail| width(names) + width(tail) <= 40);
+        let (text, tail, hidden) =
+            fit_recipients(&line, |names, tail| width(names) + width(tail) <= 40);
         assert_eq!(text, "to Ada · cc Maya");
+        assert_eq!(tail, " +5 more · bcc Riya · q");
         assert_eq!(hidden, 5);
         // Nothing fits: the first person still shows, and the count is right.
-        let (text, hidden) = fit_recipients(&line, |_, _| false);
+        let (text, _, hidden) = fit_recipients(&line, |_, _| false);
         assert_eq!(text, "to Ada");
         assert_eq!(hidden, 6);
     }
