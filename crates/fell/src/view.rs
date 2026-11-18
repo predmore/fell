@@ -1773,38 +1773,44 @@ fn recipient_lines(
                                             .child(format!("{address}{comma}")),
                                     )
                             }))
-                            .children(group.only_you.then(|| {
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(rgb(theme.dimmed))
-                                    .child("only you")
-                            }))
-                            .children(last_row.then(|| {
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(rgb(theme.dimmed))
-                                    .child("· q to hide")
-                            }))
+                            // One dim note ends the row, so its separators
+                            // space evenly: "only you · q to hide".
+                            .children({
+                                let note = match (group.only_you, last_row) {
+                                    (true, true) => Some("only you · q to hide"),
+                                    (true, false) => Some("only you"),
+                                    (false, true) => Some("· q to hide"),
+                                    (false, false) => None,
+                                };
+                                note.map(|note| {
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(theme.dimmed))
+                                        .child(note)
+                                })
+                            })
                     })
             }))
     } else {
         // Only the names give way to an ellipsis; the count and the key
         // always show. The text takes the box's colour, so hover reaches it.
-        // The Bcc on the person's own mail always shows, after the count.
+        // Whole people only, measured like the thread list, so the count
+        // always matches the names on screen; the Bcc and key always show.
+        let room = (conv_width - 48.0).min(680.0);
+        let (names, hidden) = present::fit_recipients(line, |names, tail| {
+            line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
+                <= room
+        });
         let bcc = line
             .bcc
             .as_ref()
             .map(|bcc| format!(" · {bcc}"))
             .unwrap_or_default();
-        let tail = if line.hidden > 0 {
-            format!(" +{} more{bcc} · q", line.hidden)
+        let tail = if hidden > 0 {
+            format!(" +{hidden} more{bcc} · q")
         } else {
             format!("{bcc} · q")
         };
-        // Measured, like the thread list: the names get a real ellipsis and
-        // the count and key always fit after them.
-        let room = (conv_width - 48.0).min(680.0) - line_px(window, &tail, FontWeight::NORMAL);
-        let names = clip_line(window, &line.short, room.max(48.0), FontWeight::NORMAL);
         div()
             .flex()
             .min_w(px(0.))

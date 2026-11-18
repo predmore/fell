@@ -58,6 +58,11 @@ pub struct RecipientLine {
     /// "bcc Riya" on the person's own sent mail. Never folded into the
     /// count, so a Bcc always shows on the closed line.
     pub bcc: Option<String>,
+    /// Every To and Cc name, by group, for fitting the closed line to the
+    /// width on screen whole person by whole person.
+    pub names: Vec<(&'static str, Vec<String>)>,
+    /// How many names the closed line shows at most.
+    pub budget: usize,
     /// Every recipient with an address, a row per group, once opened.
     pub groups: Vec<RecipientGroup>,
 }
@@ -98,6 +103,7 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
     let mut short = Vec::new();
     let mut full = Vec::new();
     let mut bcc = None;
+    let mut all_names: Vec<(&'static str, Vec<String>)> = Vec::new();
     let mut shown = 0;
     for (label, full_label, people) in groups {
         if people.is_empty() {
@@ -113,6 +119,7 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
                 more => format!("bcc {} +{}", names[0], more - 1),
             });
         } else {
+            all_names.push((label_of(label), names.clone()));
             let room = budget.saturating_sub(shown).min(names.len());
             if room > 0 {
                 short.push(format!("{label} {}", names[..room].join(", ")));
@@ -139,8 +146,62 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
         short: short.join(" · "),
         hidden: visible - shown,
         bcc,
+        names: all_names,
+        budget,
         groups: full,
     })
+}
+
+fn label_of(label: &str) -> &'static str {
+    if label == "to" { "to" } else { "cc" }
+}
+
+/// The closed line that fits: the most whole people (up to `line.budget`)
+/// for which `fits(names, tail)` holds, and how many are left out. Never
+/// cuts inside a name, so the count always matches what is on screen.
+pub fn fit_recipients(line: &RecipientLine, fits: impl Fn(&str, &str) -> bool) -> (String, usize) {
+    let total: usize = line.names.iter().map(|(_, names)| names.len()).sum();
+    let tail = |hidden: usize| {
+        let bcc = line
+            .bcc
+            .as_ref()
+            .map(|bcc| format!(" · {bcc}"))
+            .unwrap_or_default();
+        if hidden > 0 {
+            format!(" +{hidden} more{bcc} · q")
+        } else {
+            format!("{bcc} · q")
+        }
+    };
+    let most = line.budget.min(total);
+    for shown in (1..=most).rev() {
+        let text = first_people(&line.names, shown);
+        if fits(&text, &tail(total - shown)) {
+            return (text, total - shown);
+        }
+    }
+    // Not even one person fits beside the tail: show the first anyway.
+    (
+        first_people(&line.names, 1.min(total)),
+        total.saturating_sub(1),
+    )
+}
+
+/// "to Ada · cc Maya, Sam" for the first `count` people across groups.
+fn first_people(groups: &[(&'static str, Vec<String>)], count: usize) -> String {
+    let mut parts = Vec::new();
+    let mut left = count;
+    for (label, names) in groups {
+        if left == 0 {
+            break;
+        }
+        let take = left.min(names.len());
+        if take > 0 {
+            parts.push(format!("{label} {}", names[..take].join(", ")));
+            left -= take;
+        }
+    }
+    parts.join(" · ")
 }
 
 /// "me" only for the person's own address. Someone else whose name or
@@ -823,6 +884,34 @@ mod tests {
         assert_eq!(line.short, "to Ada · cc Maya, Sam, Priya");
         assert_eq!(line.hidden, 3);
         assert_eq!(line.bcc.as_deref(), Some("bcc Riya +1"));
+    }
+
+    #[test]
+    fn the_closed_line_drops_whole_people_and_counts_them() {
+        let cc = [
+            ("Maya", "maya@x"),
+            ("Sam", "sam@x"),
+            ("Priya", "priya@x"),
+            ("Jon", "jon@x"),
+            ("Bob", "bob@x"),
+            ("Lena", "lena@x"),
+        ];
+        let bcc = [("Riya", "riya@x")];
+        let mine = addressed("me@x", &[("Ada", "ada@x")], &cc, &bcc);
+        let line = recipient_line(&mine, "me@x").unwrap();
+        // Room for everything the budget allows.
+        let (text, hidden) = fit_recipients(&line, |_, _| true);
+        assert_eq!(text, "to Ada · cc Maya, Sam, Priya");
+        assert_eq!(hidden, 3);
+        // A narrow pane: measure by characters, 40 in all.
+        let width = |text: &str| text.chars().count();
+        let (text, hidden) = fit_recipients(&line, |names, tail| width(names) + width(tail) <= 40);
+        assert_eq!(text, "to Ada · cc Maya");
+        assert_eq!(hidden, 5);
+        // Nothing fits: the first person still shows, and the count is right.
+        let (text, hidden) = fit_recipients(&line, |_, _| false);
+        assert_eq!(text, "to Ada");
+        assert_eq!(hidden, 6);
     }
 
     #[test]
