@@ -186,6 +186,7 @@ impl Inbox {
         })
         .detach();
         inbox.watch_theme(cx);
+        inbox.watch_reviews(cx);
         inbox.watch_dates(cx);
         inbox
     }
@@ -515,6 +516,38 @@ impl Inbox {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Say so in the status bar when a review window an agent opened closes,
+    /// so the person knows the draft was kept and nothing was sent.
+    fn watch_reviews(&self, cx: &mut Context<Self>) {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            return;
+        };
+        let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
+        hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
+        cx.spawn(async move |this, cx| {
+            while events.next().await.is_some() {
+                while events.try_recv().is_ok() {}
+                let closed = hub.take_closed();
+                let Some(line) = closed.last().cloned() else {
+                    continue;
+                };
+                let alive = this
+                    .update(cx, |inbox, cx| {
+                        inbox.session.show_toast(line, false);
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
         })
         .detach();
     }

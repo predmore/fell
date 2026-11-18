@@ -130,6 +130,19 @@ pub enum SendLock {
     MaybeSent,
 }
 
+impl Snapshot {
+    /// Why this draft cannot be sent again, when a send went out or may have.
+    pub fn send_lock_reason(&self) -> Option<&'static str> {
+        match self.send_block.as_deref() {
+            Some(reason) if reason == SendLock::Sent.reason() => Some(SendLock::Sent.reason()),
+            Some(reason) if reason == SendLock::MaybeSent.reason() => {
+                Some(SendLock::MaybeSent.reason())
+            }
+            _ => None,
+        }
+    }
+}
+
 impl SendLock {
     pub fn reason(self) -> &'static str {
         match self {

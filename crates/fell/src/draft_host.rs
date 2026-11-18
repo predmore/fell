@@ -117,8 +117,14 @@ fn merge_from_disk(hub: &DraftHub, id: &str, folder: &std::path::Path) {
 /// Serve agent drafts from the inbox: the socket, the folder watcher, and a
 /// compose window that opens, or comes to the front, whenever an agent calls
 /// `request_send`. Saves still queued when Fell quits are waited for.
+/// The app's draft hub, for windows that want to hear from it.
+pub(crate) struct AgentDrafts(pub Arc<DraftHub>);
+
+impl gpui::Global for AgentDrafts {}
+
 pub fn host_agent_drafts(cx: &mut App) -> Arc<DraftHub> {
     let hub = Arc::new(DraftHub::new());
+    cx.set_global(AgentDrafts(hub.clone()));
     // Subscribe before the socket accepts anything, and count reveals from
     // zero, so a request_send that lands while the inbox is still opening
     // is not lost.

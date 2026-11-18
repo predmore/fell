@@ -46,6 +46,8 @@ pub struct DraftHub {
     /// Bumped by every `request_send`, so a host can bring the editor up
     /// again for a draft that is already focused.
     reveals: AtomicU64,
+    /// One line per review window that closed, for the inbox to show.
+    closed: Mutex<Vec<String>>,
 }
 
 impl Default for DraftHub {
@@ -63,6 +65,7 @@ impl DraftHub {
             shown: Mutex::new(None),
             shown_cv: Condvar::new(),
             reveals: AtomicU64::new(0),
+            closed: Mutex::new(Vec::new()),
         }
     }
 
@@ -143,14 +146,41 @@ impl DraftHub {
     /// The compose window showing `id` closed. A later `request_send` waits
     /// for a window to show it again before it reports the draft opened.
     pub fn note_hidden(&self, id: &str) {
-        {
+        let was_shown = {
             let mut shown = self.shown.lock().expect("shown");
-            if shown.as_deref() == Some(id) {
+            let was = shown.as_deref() == Some(id);
+            if was {
                 *shown = None;
             }
-        }
+            was
+        };
         // No window has it open for editing any more.
-        self.with_session(id, DraftSession::close_editor);
+        let summary = self.with_session(id, |session| {
+            session.close_editor();
+            let snap = session.snapshot();
+            (
+                snap.send_lock_reason(),
+                snap.unreviewed,
+                snap.send_requested_by.is_some(),
+            )
+        });
+        if was_shown && let Some((locked, unreviewed, asked)) = summary {
+            let line = match locked {
+                Some(reason) => format!("Review closed · {reason}"),
+                None if asked && unreviewed > 0 => format!(
+                    "Review closed · draft kept, not sent · {unreviewed} agent edit{} unreviewed",
+                    if unreviewed == 1 { "" } else { "s" }
+                ),
+                None => "Review closed · draft kept, not sent".to_string(),
+            };
+            self.closed.lock().expect("closed").push(line);
+            self.emit();
+        }
+    }
+
+    /// Lines about review windows that closed since the last call.
+    pub fn take_closed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.closed.lock().expect("closed"))
     }
 
     fn wait_shown(&self, id: &str) -> bool {
@@ -977,6 +1007,21 @@ mod tests {
             !hub.with_session("d1", |session| session.snapshot().open)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn a_closed_review_window_leaves_one_notice() {
+        let hub = hub_with_d1("notice");
+        let _host = hub.subscribe();
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        // The window's own release reports it again; that adds nothing.
+        hub.note_hidden("d1");
+        let lines = hub.take_closed();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("not sent"), "{lines:?}");
+        assert!(hub.take_closed().is_empty());
     }
 
     #[test]

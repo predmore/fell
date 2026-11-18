@@ -229,6 +229,8 @@ pub struct ComposeView {
     closing: bool,
     /// `]` or `[` was pressed; `h` then jumps to the next or previous edit.
     bracket: Option<char>,
+    /// The agent edit that the bar describes and keep, reject act on.
+    focused_hunk: Option<u64>,
 }
 
 impl ComposeView {
@@ -276,6 +278,7 @@ impl ComposeView {
             flush_gen: 0,
             closing: false,
             bracket: None,
+            focused_hunk: None,
         }
     }
 
@@ -374,52 +377,53 @@ impl ComposeView {
         self.look.is_some()
     }
 
-    /// Put the cursor on the next (or previous) agent edit in the body,
-    /// wrapping around. Recipient and subject edits sit in the header.
+    /// Move to the next (or previous) agent edit, wrapping around, and put
+    /// the cursor on it when it is in the body.
     fn goto_hunk(&mut self, forward: bool) {
         let id = self.draft_id.to_string();
         let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
             return;
         };
-        let mut lines: Vec<usize> = snap
-            .hunks
-            .iter()
-            .filter_map(|hunk| body_edit_line(&snap, hunk))
-            .collect();
-        lines.sort_unstable();
-        lines.dedup();
-        let here = self.editor.row + 1;
-        let next = if forward {
-            lines.iter().find(|line| **line > here).or(lines.first())
-        } else {
-            lines
-                .iter()
-                .rev()
-                .find(|line| **line < here)
-                .or(lines.last())
-        };
-        match next {
-            Some(line) => {
-                self.editor.row = line - 1;
-                self.editor.col = 0;
-                self.editor.clamp();
-                let position = lines.iter().position(|item| item == line).unwrap_or(0) + 1;
-                self.status = format!("edit {position} of {}", lines.len()).into();
-            }
-            None => self.status = "no agent edits in the body".into(),
+        let order = ordered_hunks(&snap);
+        if order.is_empty() {
+            self.focused_hunk = None;
+            self.status = "no agent edits".into();
+            return;
         }
+        let at = self
+            .focused_hunk
+            .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused));
+        let next = match (at, forward) {
+            (None, _) => 0,
+            (Some(at), true) => (at + 1) % order.len(),
+            (Some(at), false) => (at + order.len() - 1) % order.len(),
+        };
+        self.focus_hunk_at(&order, next);
+    }
+
+    fn focus_hunk_at(&mut self, order: &[(u64, Option<usize>)], index: usize) {
+        let Some((hunk, line)) = order.get(index) else {
+            self.focused_hunk = None;
+            return;
+        };
+        self.focused_hunk = Some(*hunk);
+        if let Some(line) = line {
+            self.editor.row = line - 1;
+            self.editor.col = 0;
+            self.editor.clamp();
+        }
+        self.status = format!("edit {} of {}", index + 1, order.len()).into();
     }
 
     /// An agent asked for review: start on its first edit, if any.
     pub(crate) fn start_on_first_edit(&mut self) {
         let id = self.draft_id.to_string();
-        let pending = self
-            .hub
-            .with_session(&id, |session| !session.snapshot().hunks.is_empty())
-            .unwrap_or(false);
-        if pending {
-            self.editor.row = 0;
-            self.goto_hunk(true);
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return;
+        };
+        let order = ordered_hunks(&snap);
+        if !order.is_empty() {
+            self.focus_hunk_at(&order, 0);
         }
     }
 
@@ -723,20 +727,42 @@ impl ComposeView {
 
     fn keep_or_reject(&mut self, keep: bool) {
         let id = self.draft_id.to_string();
-        let hunk = self.hub.with_session(&id, |session| {
-            session.snapshot().hunks.first().map(|hunk| hunk.id)
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return;
+        };
+        let order = ordered_hunks(&snap);
+        let at = self
+            .focused_hunk
+            .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
+            .unwrap_or(0);
+        let Some((hunk_id, _)) = order.get(at).copied() else {
+            return;
+        };
+        self.hub.with_session(&id, |session| {
+            if keep {
+                session.keep_hunk(hunk_id);
+            } else {
+                session.reject_hunk(hunk_id);
+            }
+            let _ = session.flush();
         });
-        if let Some(Some(hunk_id)) = hunk {
-            self.hub.with_session(&id, |session| {
-                if keep {
-                    session.keep_hunk(hunk_id);
-                } else {
-                    session.reject_hunk(hunk_id);
-                }
-                let _ = session.flush();
-            });
-            self.applied_revision = 0;
-            self.sync_from_hub();
+        self.applied_revision = 0;
+        self.sync_from_hub();
+        // The next edit slides into this one's place.
+        let after = self
+            .hub
+            .with_session(&id, |session| ordered_hunks(&session.snapshot()))
+            .unwrap_or_default();
+        if after.is_empty() {
+            self.focused_hunk = None;
+            self.status = if keep {
+                "kept; no edits left"
+            } else {
+                "rejected; no edits left"
+            }
+            .into();
+        } else {
+            self.focus_hunk_at(&after, at.min(after.len() - 1));
         }
     }
 
@@ -1331,7 +1357,9 @@ impl ComposeView {
                 colors,
             ))
             .child(reply_row(snap, colors))
-            .children((!snap.hunks.is_empty()).then(|| hunk_banner(snap, colors)))
+            .children(
+                (!snap.hunks.is_empty()).then(|| hunk_banner(snap, self.focused_hunk, colors)),
+            )
     }
 
     fn body_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1619,7 +1647,8 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .min_w(px(0.))
         .child(div().flex_shrink_0().font_weight(FontWeight(620.)).child(
             if snap.send_requested_by.is_some() {
-                "Review and send"
+                // The dot ends this part, so a wrapped line never starts with it.
+                "Review and send ·"
             } else {
                 "Compose"
             },
@@ -1627,7 +1656,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .children(snap.send_requested_by.as_ref().map(|agent| {
             div()
                 .text_color(rgb(colors.accent))
-                .child(format!("· asked by {}", agent_label(agent)))
+                .child(format!("asked by {}", agent_label(agent)))
         }));
     div()
         .flex()
@@ -1698,9 +1727,10 @@ fn field_row(
             if address.fresh {
                 // Never mailed from this account. Not an agent change, so it
                 // does not wear the agent accent.
-                text.push(' ');
+                // Non-breaking, so the note never wraps away from its address.
+                text.push('\u{a0}');
                 let start = text.len();
-                text.push_str("(first time)");
+                text.push_str("(first\u{a0}time)");
                 marks.push((
                     start..text.len(),
                     gpui::HighlightStyle {
@@ -1789,29 +1819,30 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
-    let first = snap.hunks.first();
-    let what = first
+fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette) -> gpui::Div {
+    let order = ordered_hunks(snap);
+    let at = focused
+        .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
+        .unwrap_or(0);
+    let hunk = order
+        .get(at)
+        .and_then(|(id, _)| snap.hunks.iter().find(|hunk| hunk.id == *id));
+    let what = hunk
         .map(|hunk| match hunk.kind {
             HunkKind::Recipients => "agent changed recipients".to_string(),
             HunkKind::Subject => "agent changed the subject".to_string(),
             HunkKind::Attachments => "agent changed attachments".to_string(),
-            HunkKind::Body => match body_edit_line(snap, hunk) {
-                Some(line) => format!("agent edit at line {line}"),
+            HunkKind::Body => match edit_preview(snap, hunk) {
+                Some(words) => format!("agent edit \u{201c}{words}\u{201d}"),
                 None => "agent edit".to_string(),
             },
         })
         .unwrap_or_else(|| "agent edit".into());
-    let count = snap.hunks.len();
-    let label = if count > 1 {
-        format!("{what} (1 of {count})")
-    } else {
-        what
-    };
+    let label = format!("{what} · {} of {}", at + 1, order.len().max(1));
     // Parts wrap as units, so a narrow window never cuts a key in half.
     let parts = [
         label,
-        "]h next".to_string(),
+        "]h [h move".to_string(),
         "u undo".to_string(),
         "space a k keep".to_string(),
         "space a x reject".to_string(),
@@ -1844,6 +1875,40 @@ fn body_edit_line(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Optio
     }
     let at = snap.body.find(slice)?;
     Some(snap.body[..at].matches('\n').count() + 1)
+}
+
+/// Every agent edit in reading order: header changes first, then body
+/// edits by line. The line is set for body edits.
+fn ordered_hunks(snap: &Snapshot) -> Vec<(u64, Option<usize>)> {
+    let mut header: Vec<(u64, Option<usize>)> = Vec::new();
+    let mut body: Vec<(u64, Option<usize>)> = Vec::new();
+    for hunk in &snap.hunks {
+        match hunk.kind {
+            HunkKind::Body => body.push((hunk.id, body_edit_line(snap, hunk))),
+            _ => header.push((hunk.id, None)),
+        }
+    }
+    body.sort_by_key(|(id, line)| (line.unwrap_or(usize::MAX), *id));
+    header.extend(body);
+    header
+}
+
+/// The first few words of a body edit's new text, for the edit bar.
+fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<String> {
+    let slice = snap.text.get(hunk.start..hunk.end)?;
+    let line = slice
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['-', '*', '#', '>', ' ']))
+        .find(|line| !line.is_empty())?;
+    let mut words: Vec<&str> = line.split_whitespace().take(5).collect();
+    let more = line.split_whitespace().count() > words.len();
+    if words.is_empty() {
+        return None;
+    }
+    if more {
+        words.push("…");
+    }
+    Some(words.join(" "))
 }
 
 /// Each body edit: its byte range in the body and the text it replaced.
@@ -1891,41 +1956,13 @@ fn styled_body(
                             .collect()
                     })
                     .unwrap_or_default();
-                let painted = if raw {
-                    raw_source_block(block, &text, editor, colors)
+                let painted = if raw || !edits.is_empty() {
+                    raw_source_block(block, &text, editor, &edits, colors)
                 } else {
                     render_block(block, folder, colors)
                 };
-                let painted = if edits.is_empty() {
-                    painted
-                } else {
-                    // What the agent replaced, struck through, above the new text.
-                    let replaced = edits
-                        .iter()
-                        .filter(|(start, _, previous)| {
-                            !previous.is_empty()
-                                && block
-                                    .source
-                                    .is_some_and(|(from, to)| *start >= from && *start < to)
-                        })
-                        .map(|(_, _, previous)| {
-                            div()
-                                .flex()
-                                .gap_2()
-                                .text_color(rgb(colors.dim))
-                                .child(div().flex_shrink_0().child("was"))
-                                .child(div().line_through().child(previous.clone()))
-                        });
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .bg(rgb(colors.hunk))
-                        .children(replaced)
-                        .child(painted)
-                };
                 // A block in source form spaces like text, not like an image.
-                ((!raw).then_some(&block.body), painted)
+                ((!raw && edits.is_empty()).then_some(&block.body), painted)
             }
         };
         if index > 0 && !joins_previous(previous, body) {
@@ -2025,6 +2062,7 @@ fn raw_source_block(
     block: &fell_core::compose::Block,
     text: &str,
     editor: &Editor,
+    edits: &[&(usize, usize, String)],
     colors: Palette,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
@@ -2033,16 +2071,44 @@ fn raw_source_block(
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
     let base_line = text[..start].chars().filter(|ch| *ch == '\n').count();
+    let mut line_start = start;
+    let mut announced = Vec::new();
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
+        let line_end = line_start + line.len();
         let cursor = (row == editor.row).then_some(editor.col);
-        column = column.child(raw_line(
-            line,
-            cursor,
-            cursor.is_some(),
-            editor.mode,
-            colors,
-        ));
+        let mut painted = raw_line(line, cursor, cursor.is_some(), editor.mode, colors);
+        // Only the lines an agent changed carry the tint, with what they
+        // replaced directly above the first of them.
+        let touching: Vec<usize> = edits
+            .iter()
+            .enumerate()
+            .filter(|(_, (from, to, _))| *from < line_end.max(line_start + 1) && *to > line_start)
+            .map(|(index, _)| index)
+            .collect();
+        if !touching.is_empty() {
+            for index in &touching {
+                if announced.contains(index) {
+                    continue;
+                }
+                announced.push(*index);
+                let previous = &edits[*index].2;
+                if !previous.is_empty() {
+                    column = column.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .bg(rgb(colors.hunk))
+                            .text_color(rgb(colors.dim))
+                            .child(div().flex_shrink_0().child("was"))
+                            .child(div().line_through().child(previous.clone())),
+                    );
+                }
+            }
+            painted = div().w_full().bg(rgb(colors.hunk)).child(painted);
+        }
+        column = column.child(painted);
+        line_start = line_end + 1;
     }
     column
 }
@@ -2614,22 +2680,36 @@ fn status_bar(
         (0, _) => None,
         (1, true) => Some("1 first-time recipient".to_string()),
         (count, true) => Some(format!("{count} first-time recipients")),
-        (count, false) => Some(format!("{count} first-time")),
+        (count, false) => Some(format!("{count} first-time rcpt")),
     };
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     // A narrow window keeps one line: the mode, first-time count, send and
     // the unreviewed count stay; the insert and close hints go first.
-    let mut left = div().flex().gap_2();
+    let mut left = div().flex().gap_2().min_w(px(0.));
+    let idle = matches!(
+        status.as_ref(),
+        "i insert" | "esc normal" | "normal" | "insert"
+    );
     if wide {
         left = left
             .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
             .child(dot())
             .child(div().text_color(rgb(colors.fg)).child(status.to_string()));
-    }
-    if let Some(label) = fresh_label {
-        if wide {
-            left = left.child(dot());
+        if let Some(label) = fresh_label {
+            left = left
+                .child(dot())
+                .child(div().text_color(rgb(colors.fg)).child(label));
         }
+    } else if !idle {
+        // Narrow: a message (an edit position, an error) beats the hints.
+        left = left.child(
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(rgb(colors.fg))
+                .child(status.to_string()),
+        );
+    } else if let Some(label) = fresh_label {
         left = left.child(div().text_color(rgb(colors.fg)).child(label));
     }
     let right = match &snap.send_block {
@@ -2935,6 +3015,35 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn edits_are_ordered_header_first_then_by_body_line() {
+        let mut snap = super::empty_snapshot("d");
+        snap.body = "one\ntwo\nthree\n".into();
+        snap.text = format!("---\nto: []\n---\n{}", snap.body);
+        let at = |needle: &str| snap.text.find(needle).unwrap();
+        let hunk = |id: u64, kind, needle: &str| fell_core::compose::HunkView {
+            id,
+            kind,
+            start: at(needle),
+            end: at(needle) + needle.len(),
+            label: String::new(),
+            previous: String::new(),
+        };
+        snap.hunks = vec![
+            hunk(7, super::HunkKind::Body, "three"),
+            hunk(3, super::HunkKind::Body, "one"),
+            hunk(9, super::HunkKind::Recipients, "to: []"),
+        ];
+        assert_eq!(
+            super::ordered_hunks(&snap),
+            vec![(9, None), (3, Some(1)), (7, Some(3))]
+        );
+        assert_eq!(
+            super::edit_preview(&snap, &snap.hunks[0]).as_deref(),
+            Some("three")
+        );
+    }
 
     #[test]
     fn agent_names_lose_format_characters() {
