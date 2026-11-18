@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Fell compose
+Comment=Fell's compose window
+Exec=fell
+Icon=dev.predmore.fell
+Terminal=false
+NoDisplay=true
+StartupWMClass=dev.predmore.fell.compose

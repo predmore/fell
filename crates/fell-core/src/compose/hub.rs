@@ -37,6 +37,10 @@ impl HubListener {
 /// and is then dropped.
 type Listener = Box<dyn Fn() -> bool + Send>;
 
+/// The inbox notice for a draft that may have gone out, worded as its row
+/// and preview are.
+const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
+
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
@@ -258,7 +262,11 @@ impl DraftHub {
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
             let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
-                Some(_) if sent => format!("Sent{}", quoted_subject(&subject)),
+                Some(_) if sent => format!("sent{}", quoted_subject(&subject)),
+                Some(reason) if reason == SendLock::MaybeSent.reason() => format!(
+                    "{MAYBE_SENT_NOTICE}{}  ·  gd drafts",
+                    quoted_subject(&subject)
+                ),
                 Some(reason) => format!("{reason}{}", quoted_subject(&subject)),
                 None if asked && unreviewed > 0 => format!(
                     "not sent{}  ·  {unreviewed} unreviewed  ·  space a r reopen",
@@ -289,7 +297,10 @@ impl DraftHub {
         let sent = locked == Some(SendLock::Sent.reason());
         let line = match (locked, failure) {
             (_, Some(failure)) => format!("{failure}{name}  ·  gd drafts"),
-            (Some(_), None) if sent => format!("Sent{name}"),
+            (Some(_), None) if sent => format!("sent{name}"),
+            (Some(reason), None) if reason == SendLock::MaybeSent.reason() => {
+                format!("{MAYBE_SENT_NOTICE}{name}  ·  gd drafts")
+            }
             (Some(reason), None) => format!("{reason}{name}"),
             (None, None) => format!("not sent{name}  ·  gd drafts"),
         };

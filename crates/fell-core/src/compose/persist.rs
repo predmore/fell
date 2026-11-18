@@ -34,6 +34,8 @@ pub struct DraftSummary {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// The person's own Bcc, shown only to them in the preview.
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
     /// The agent the draft belongs to; empty for the person's own.
@@ -404,7 +406,7 @@ impl Store {
     pub fn unsent_compose_drafts(&self, account_id: &AccountId) -> Result<Vec<DraftSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.from_addr, d.to_addrs, d.cc_addrs, d.subject, d.body, d.owner,
-                    d.updated_unix, s.state
+                    d.updated_unix, s.state, d.bcc_addrs
              FROM compose_drafts d
              LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
              WHERE d.account_id = ?1
@@ -422,6 +424,7 @@ impl Store {
                 from: row.get(1)?,
                 to: split_list(&row.get::<_, String>(2)?),
                 cc: split_list(&row.get::<_, String>(3)?),
+                bcc: split_list(&row.get::<_, String>(9)?),
                 subject: row.get(4)?,
                 body: row.get(5)?,
                 owner: row.get(6)?,

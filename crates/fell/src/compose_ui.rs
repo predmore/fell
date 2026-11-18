@@ -1443,6 +1443,8 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let mode = match self.editor.mode {
+            // A header field takes typing as insert mode does.
+            _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
             Mode::Insert => "insert",
             Mode::Visual => "visual",

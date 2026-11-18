@@ -725,7 +725,10 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                         if let Some(line) = closed.last().cloned() {
-                            inbox.session.show_toast(line, false);
+                            // A send that may have gone out is the one
+                            // notice to stop for.
+                            let warn = line.starts_with("may have been sent");
+                            inbox.session.show_toast(line, warn);
                             cx.notify();
                         }
                     })
@@ -945,7 +948,7 @@ impl Inbox {
         };
         // The window takes a moment to appear: say what is coming now.
         if id.is_none() {
-            self.session.show_toast("New draft", false);
+            self.session.show_toast("new draft", false);
         } else {
             let subject = self
                 .session
@@ -1035,6 +1038,7 @@ impl Inbox {
                 };
                 draft.to = raw(&snap.to);
                 draft.cc = raw(&snap.cc);
+                draft.bcc = raw(&snap.bcc);
                 draft.subject = snap.subject;
                 draft.body = snap.body;
                 draft.from = snap.from;

@@ -329,7 +329,10 @@ fn open_compose_window(
                     title: Some("Fell compose".into()),
                     ..Default::default()
                 }),
-                app_id: Some("dev.predmore.fell".into()),
+                // Its own app id, so a window manager rule can float and size the
+                // compose window before it maps; the hidden desktop entry of
+                // the same name keeps the Fell icon.
+                app_id: Some("dev.predmore.fell.compose".into()),
                 focus: true,
                 show: true,
                 ..Default::default()

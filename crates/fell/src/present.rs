@@ -347,6 +347,10 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
     let address = |raw: &String| {
         let (name, email) = fell_core::compose::mailbox_parts(raw)
             .unwrap_or_else(|| (None, raw.trim().to_string()));
+        // Named as the draft's row names them, so "to Ada" reads the same.
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| Some(recipient_label(&email)));
         fell_core::Address { name, email }
     };
     let from = address(&draft.from);
@@ -372,7 +376,7 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
         arrived_via: Vec::new(),
         to: draft.to.iter().map(address).collect(),
         cc: draft.cc.iter().map(address).collect(),
-        bcc: Vec::new(),
+        bcc: draft.bcc.iter().map(address).collect(),
         starred: false,
         has_attachment: false,
         archived: false,
