@@ -245,6 +245,9 @@ pub struct ComposeView {
     flush_gen: u64,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
+    /// Close once a send went out, so the person is back in the inbox and
+    /// the sent draft does not linger. The demo window stays, showing sent.
+    close_on_send: bool,
     /// `]` or `[` was pressed; `h` then jumps to the next or previous edit.
     bracket: Option<char>,
     /// The agent edit that the bar describes and keep, reject act on.
@@ -304,6 +307,7 @@ impl ComposeView {
             flush_pending: false,
             flush_gen: 0,
             closing: false,
+            close_on_send: false,
             bracket: None,
             focused_hunk: None,
             seen_edits: 0,
@@ -507,6 +511,21 @@ impl ComposeView {
         self.status = format!("{who} {what} · edit {} of {}", at + 1, order.len()).into();
     }
 
+    /// Close the window after a send that went out.
+    pub(crate) fn close_after_send(&mut self) {
+        self.close_on_send = true;
+    }
+
+    /// A draft with nobody to send it to yet starts on the To line, ready
+    /// to type, as a new draft from `c` does.
+    fn start_on_recipients_if_empty(&mut self, snap: &Snapshot) {
+        if snap.to.is_empty() && snap.cc.is_empty() && snap.bcc.is_empty() && snap.hunks.is_empty()
+        {
+            self.field = Field::To;
+            self.status = "to · tab next field".into();
+        }
+    }
+
     /// An agent asked for review: start on its first edit, if any.
     pub(crate) fn start_on_first_edit(&mut self) {
         let id = self.draft_id.to_string();
@@ -520,6 +539,7 @@ impl ComposeView {
             self.focus_hunk_at(&order, 0);
             return;
         }
+        self.start_on_recipients_if_empty(&snap);
         // No edits yet: start on the first line of text, so the first view
         // shows headings as headings, not as the raw line under the cursor.
         if let Some(row) = self
@@ -589,10 +609,11 @@ impl ComposeView {
         self.to_line = join_addrs(&snap.to);
         self.cc_line = join_addrs(&snap.cc);
         self.bcc_line = join_addrs(&snap.bcc);
-        self.subject_line = snap.subject;
+        self.subject_line = snap.subject.clone();
         self.sent = false;
         self.quote_open = false;
         self.status = "i insert".into();
+        self.start_on_recipients_if_empty(&snap);
     }
 
     /// Copies session text that is not on screen. Returns true when the
@@ -816,6 +837,13 @@ impl ComposeView {
                             "Sent from the editor"
                         }
                         .into();
+                        // Back to the inbox, which says it was sent. A send the
+                        // mailbox did not record keeps the window, so the
+                        // person reads why.
+                        if this.close_on_send && !unrecorded {
+                            this.closing = true;
+                            this.hub.note_hidden(this.draft_id.as_ref());
+                        }
                     }
                     Err(err) => {
                         this.sent = matches!(err, SendFailure::MaybeSent(_));
@@ -3142,6 +3170,19 @@ fn status_bar(
         }
     }
     let right = match &snap.send_block {
+        // Gone out: say so plainly, not as a block.
+        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => div()
+            .flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(colors.accent))
+                    .font_weight(FontWeight(600.))
+                    .child("sent"),
+            )
+            .child(dot())
+            .child(div().text_color(rgb(colors.fg)).child(":q close")),
         Some(reason) => div()
             .flex()
             .gap_2()

@@ -29,4 +29,5 @@ wry = { version = "0.57.2", default-features = false, features = ["os-webview"] 
 
 [dev-dependencies]
 rusqlite.workspace = true
+serde_json.workspace = true
 sha2 = { version = "0.10.9", default-features = false }

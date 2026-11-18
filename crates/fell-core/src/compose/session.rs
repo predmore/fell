@@ -839,6 +839,16 @@ impl DraftSession {
         self.flush().is_ok()
     }
 
+    /// Queue the save an editor change is still waiting on, if any. Closing
+    /// the editor or quitting calls this, so the debounce never drops typing.
+    pub fn flush_pending(&mut self) -> Result<(), String> {
+        if self.outbound_since.is_some() {
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
     /// Save the draft file and its mailbox row, with the hunks.
     ///
     /// With a writer attached this only queues the save, so the caller's

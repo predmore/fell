@@ -207,6 +207,10 @@ pub struct Step {
     pub sync_now: bool,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
+    /// `c`: start a new draft and open it in the compose editor.
+    pub compose: bool,
+    /// Open the selected row's draft in the compose editor.
+    pub open_draft: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +397,16 @@ impl Session {
         folder_label(&self.folder)
     }
 
+    /// The compose draft the selected row stands for, in the drafts list.
+    pub fn cursor_draft(&self) -> Option<&str> {
+        let id = self.cursor_id.as_ref()?;
+        self.threads
+            .iter()
+            .find(|thread| &thread.id == id)?
+            .draft
+            .as_deref()
+    }
+
     /// Unread threads in the folder, including rows that are not loaded.
     pub fn unread_threads(&self) -> usize {
         self.unread_count
@@ -420,8 +434,19 @@ impl Session {
         let Some(Pending::After { key, down }) = &self.pending else {
             return None;
         };
-        let place = self.threads.partition_point(|row| row_key(row) <= *key);
+        let lead = self.draft_rows();
+        let place = lead + self.threads[lead..].partition_point(|row| row_key(row) <= *key);
         Some((place, *down))
+    }
+
+    /// Compose drafts at the top of the Drafts list. They come before the
+    /// folder's first row and are not part of its order, so paging skips
+    /// them.
+    fn draft_rows(&self) -> usize {
+        self.threads
+            .iter()
+            .take_while(|row| row.draft.is_some())
+            .count()
     }
 
     /// Take the cursor move waiting for rows. Dropping a `G` or `gg` that
@@ -724,15 +749,17 @@ impl Session {
             Some(Jump::Bottom(rows)) => return FolderSpan::Bottom { rows },
             None => {}
         }
-        let (Some(top), Some(bottom), Some((lo, hi))) = (
-            self.threads.first(),
-            self.threads.last(),
-            self.focus(visible),
-        ) else {
+        // Positions below are among the folder's rows, after any drafts.
+        let lead = self.draft_rows();
+        let rows = &self.threads[lead..];
+        let (Some(top), Some(bottom), Some((lo, hi))) =
+            (rows.first(), rows.last(), self.focus(visible))
+        else {
             return FolderSpan::Top {
                 rows: self.load_rows.max(fetch.after),
             };
         };
+        let (lo, hi) = (lo.saturating_sub(lead), hi.saturating_sub(lead));
         if let Some(key) = select {
             let above = self.more_before && *key < row_key(top);
             let below = self.more_after && *key > row_key(bottom);
@@ -745,7 +772,7 @@ impl Session {
                 };
             }
         }
-        let len = self.threads.len();
+        let len = rows.len();
         let mut start = if fetch.before > 0 {
             0
         } else {
@@ -759,16 +786,13 @@ impl Session {
         // A thread to select within the loaded bounds is read even when it
         // moved among rows that would be dropped.
         if let Some(key) = select {
-            let at = self
-                .threads
-                .partition_point(|row| row_key(row) < *key)
-                .min(len - 1);
+            let at = rows.partition_point(|row| row_key(row) < *key).min(len - 1);
             start = start.min(at);
             end = end.max(at);
         }
         // From the top when the top is loaded, so rows sync adds above the
         // first one are read too.
-        let first = (start > 0 || self.more_before).then(|| row_key(&self.threads[start]));
+        let first = (start > 0 || self.more_before).then(|| row_key(&rows[start]));
         let after = if end + 1 < len {
             0
         } else if self.more_after {
@@ -779,7 +803,7 @@ impl Session {
         };
         FolderSpan::Window {
             first,
-            last: row_key(&self.threads[end]),
+            last: row_key(&rows[end]),
             before: if start == 0 { fetch.before } else { 0 },
             after,
         }
@@ -807,7 +831,8 @@ impl Session {
             // Something got selected meanwhile (a click, undo): keep it.
             Pending::After { .. } if self.cursor_id.is_some() => {}
             Pending::After { key, down } => {
-                let next = self.threads.iter().find(|row| row_key(row) > key);
+                let lead = self.draft_rows();
+                let next = self.threads[lead..].iter().find(|row| row_key(row) > key);
                 match next {
                     Some(row) => {
                         self.cursor_id = Some(row.id.clone());
@@ -1334,7 +1359,10 @@ impl Session {
             Action::Last => step.reload_messages = self.jump_last(),
             Action::Open => {
                 self.count.clear();
-                if self.pane == Pane::List {
+                if self.cursor_draft().is_some() {
+                    // A draft row opens in the editor, not the reading pane.
+                    step.open_draft = true;
+                } else if self.pane == Pane::List {
                     self.pane = Pane::Conversation;
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
@@ -1454,6 +1482,13 @@ impl Session {
                 self.count.clear();
                 return Step {
                     reopen_review: true,
+                    ..Step::default()
+                };
+            }
+            Action::Compose => {
+                self.count.clear();
+                return Step {
+                    compose: true,
                     ..Step::default()
                 };
             }
@@ -1633,6 +1668,17 @@ impl Session {
                     hint: fix,
                 }
             }
+            SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
+                if self.folder.eq_ignore_ascii_case("drafts") =>
+            {
+                Banner {
+                    title: "No drafts".into(),
+                    hint: format!(
+                        "{} compose · gi inbox",
+                        keymap::binding_text(&self.keymap, Action::Compose)
+                    ),
+                }
+            }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
                 title: format!("No conversations in {}", self.folder_title()),
                 hint: "gi inbox · gf folders".into(),
@@ -1675,7 +1721,27 @@ mod tests {
             snippet: "snippet".into(),
             labels: vec![],
             unread: false,
+            draft: None,
         }
+    }
+
+    #[test]
+    fn c_composes_and_enter_opens_a_draft_row_in_the_editor() {
+        let mut session = session();
+        let step = session.on_key(KeyId::Char('c'), 10);
+        assert!(step.compose && step.arm_which);
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        assert_eq!(session.cursor_draft(), Some("c1"));
+        let step = session.on_key(KeyId::Enter, 10);
+        assert!(step.open_draft);
+        assert_eq!(session.pane, Pane::List, "a draft opens in the editor");
+        session.cursor_id = Some("a".into());
+        let step = session.on_key(KeyId::Enter, 10);
+        assert!(!step.open_draft);
+        assert_eq!(session.pane, Pane::Conversation);
     }
 
     fn session() -> Session {
@@ -1918,9 +1984,15 @@ mod tests {
     fn empty_folder_and_first_sync_copy() {
         let mut session = session();
         session.threads.clear();
+        session.folder = "Archive".into();
+        let banner = session.list_banner().unwrap();
+        assert!(banner.title.contains("Archive"));
+        assert!(banner.hint.contains("gi"));
+        // An empty drafts list says how to start one.
         session.folder = "Drafts".into();
         let banner = session.list_banner().unwrap();
-        assert!(banner.title.contains("Drafts"));
+        assert_eq!(banner.title, "No drafts");
+        assert!(banner.hint.starts_with("c compose"), "{}", banner.hint);
         assert!(banner.hint.contains("gi"));
         session.sync = SyncKind::FirstSync;
         let banner = session.list_banner().unwrap();

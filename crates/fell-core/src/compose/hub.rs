@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::session::DraftSession;
+use super::session::{DraftSession, SendLock};
 use super::workspace::{self, draft_socket_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,34 @@ impl DraftHub {
         self.emit();
     }
 
+    /// Add a live draft unless one with its id is already live, which then
+    /// stays as it is, unsaved typing included. Returns whether it was added.
+    pub fn insert_new(&self, mut session: DraftSession) -> bool {
+        let id = session.id().to_string();
+        let mut sessions = self.sessions.lock().expect("sessions");
+        if sessions.contains_key(&id) {
+            return false;
+        }
+        session.attach_writer();
+        sessions.insert(id, session);
+        drop(sessions);
+        self.emit();
+        true
+    }
+
+    /// Bring the editor up on live draft `id`, as the person asked from the
+    /// inbox. Unlike `request_send`, no agent is named. `false` when the
+    /// draft is not live.
+    pub fn show(&self, id: &str) -> bool {
+        if self.with_session(id, DraftSession::open_for_edit).is_none() {
+            return false;
+        }
+        *self.focused.lock().expect("focused") = Some(id.to_string());
+        self.reveals.fetch_add(1, Ordering::SeqCst);
+        self.emit();
+        true
+    }
+
     pub fn with_session<T>(
         &self,
         id: &str,
@@ -121,15 +149,19 @@ impl DraftHub {
         Some(value)
     }
 
-    /// Wait until every live draft's queued save is on disk. The app calls
-    /// this when it quits.
+    /// Queue every save still waiting on the editor's debounce, then wait
+    /// until each live draft's saves are on disk. The app calls this when it
+    /// quits.
     pub fn settle_all(&self) {
         let waiters: Vec<super::SaveWaiter> = self
             .sessions
             .lock()
             .expect("sessions")
-            .values()
-            .filter_map(DraftSession::save_waiter)
+            .values_mut()
+            .filter_map(|session| {
+                let _ = session.flush_pending();
+                session.save_waiter()
+            })
             .collect();
         for waiter in waiters {
             let _ = waiter.wait();
@@ -157,8 +189,10 @@ impl DraftHub {
             }
             was
         };
-        // No window has it open for editing any more.
+        // No window has it open for editing any more. Typing still waiting
+        // on the save debounce is saved now.
         let summary = self.with_session(id, |session| {
+            let _ = session.flush_pending();
             session.close_editor();
             let snap = session.snapshot();
             (
@@ -182,14 +216,21 @@ impl DraftHub {
                 };
                 format!("  ·  \u{201c}{short}{more}\u{201d}")
             };
+            let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
+                Some(_) if sent => format!("Sent{name}"),
                 Some(reason) => format!("{reason}{name}"),
                 None if asked && unreviewed > 0 => {
                     format!("not sent{name}  ·  {unreviewed} unreviewed  ·  space a r reopen")
                 }
-                None => format!("not sent{name}  ·  space a r reopen"),
+                None if asked => format!("not sent{name}  ·  space a r reopen"),
+                // The person's own draft: kept, and in the drafts list.
+                None => format!("draft saved{name}  ·  gd drafts"),
             };
-            *self.last_closed.lock().expect("last closed") = Some(id.to_string());
+            // Mail that went out is not offered again.
+            if !sent {
+                *self.last_closed.lock().expect("last closed") = Some(id.to_string());
+            }
             self.closed.lock().expect("closed").push(line);
             self.emit();
         }
@@ -1054,6 +1095,89 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("not sent"), "{lines:?}");
         assert!(hub.take_closed().is_empty());
+    }
+
+    /// Typing that is still waiting on the save debounce.
+    fn type_unsaved(hub: &DraftHub, body: &str) -> std::path::PathBuf {
+        hub.with_session("d1", |session| {
+            session.set_body_from_user(body.into());
+            session.arm_outbound(u64::MAX);
+            assert!(!session.poll_outbound(0), "the debounce has not elapsed");
+            session.folder().join("draft.md")
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn closing_the_editor_saves_typing_the_debounce_held_back() {
+        let hub = hub_with_d1("close-flush");
+        let file = type_unsaved(&hub, "typed before close\n");
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        hub.with_session("d1", |session| session.save_waiter())
+            .flatten()
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("typed before close")
+        );
+    }
+
+    #[test]
+    fn quitting_saves_typing_the_debounce_held_back() {
+        let hub = hub_with_d1("quit-flush");
+        let file = type_unsaved(&hub, "typed before quit\n");
+        hub.settle_all();
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("typed before quit")
+        );
+    }
+
+    #[test]
+    fn the_inbox_shows_a_draft_without_naming_an_agent() {
+        let hub = hub_with_d1("show");
+        assert!(!hub.show("missing"));
+        assert!(hub.show("d1"));
+        assert_eq!(hub.reveal_count(), 1);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        let snap = hub
+            .with_session("d1", |session| session.snapshot())
+            .unwrap();
+        assert!(snap.open);
+        assert_eq!(snap.send_requested_by, None);
+        // The person's own draft closes to the drafts list, not a review.
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        let lines = hub.take_closed();
+        assert!(lines[0].starts_with("draft saved"), "{lines:?}");
+        assert!(lines[0].ends_with("gd drafts"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_live_draft_is_not_replaced_by_a_second_open() {
+        let hub = hub_with_d1("insert-new");
+        hub.with_session("d1", |session| session.set_body_from_user("live\n".into()));
+        let folder = hub
+            .with_session("d1", |session| session.folder().to_path_buf())
+            .unwrap();
+        let again = DraftSession::create(
+            folder,
+            "d1",
+            AccountId("a".into()),
+            DraftFields::default(),
+            "from disk\n",
+        )
+        .unwrap();
+        assert!(!hub.insert_new(again));
+        let body = hub
+            .with_session("d1", |session| session.body().to_string())
+            .unwrap();
+        assert_eq!(body, "live\n");
     }
 
     #[test]

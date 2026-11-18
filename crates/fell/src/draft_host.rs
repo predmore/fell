@@ -10,7 +10,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fell_core::compose::DraftHub;
+use fell_core::AccountId;
+use fell_core::compose::{DraftFields, DraftHub, DraftSession};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
     px, size,
@@ -22,19 +23,20 @@ use crate::compose_ui::ComposeView;
 /// Answer `fell-mcp` draft calls on the user's private socket. Another Fell
 /// already serving it keeps it; this one then serves no agents.
 pub fn serve_socket(hub: Arc<DraftHub>) {
-    let path = fell_core::compose::draft_socket_path();
-    let listener = match DraftHub::bind(&path) {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("fell: agent drafts are not served here: {err}");
-            return;
-        }
-    };
+    if let Err(err) = serve_socket_at(hub, &fell_core::compose::draft_socket_path()) {
+        eprintln!("fell: agent drafts are not served here: {err}");
+    }
+}
+
+/// Serve the hub at `path` on a thread of its own.
+fn serve_socket_at(hub: Arc<DraftHub>, path: &std::path::Path) -> std::io::Result<()> {
+    let listener = DraftHub::bind(path)?;
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             hub.serve_one(stream);
         }
     });
+    Ok(())
 }
 
 /// Merge outside writes to the focused draft's `draft.md`, such as an
@@ -116,14 +118,84 @@ fn merge_from_disk(hub: &DraftHub, id: &str, folder: &std::path::Path) {
     });
 }
 
-/// Serve agent drafts from the inbox: the socket, the folder watcher, and a
-/// compose window that opens, or comes to the front, whenever an agent calls
-/// `request_send`. Saves still queued when Fell quits are waited for.
+/// Where the inbox keeps the person's drafts: their folders under the
+/// runtime drafts root, the same place agents' drafts live, and their rows
+/// in the mailbox file the inbox reads.
+#[derive(Clone, Debug)]
+pub(crate) struct DraftHome {
+    pub root: PathBuf,
+    pub store: PathBuf,
+}
+
+impl DraftHome {
+    /// The real drafts location for the mailbox at `store`.
+    pub fn real(store: PathBuf) -> Self {
+        Self {
+            root: fell_core::compose::draft_root(),
+            store,
+        }
+    }
+
+    /// A new, empty draft from `email` on `account`, saved to the mailbox and
+    /// opened as a live session. Disk only; run it off the UI thread.
+    pub fn new_draft(&self, account: &AccountId, email: &str) -> Result<DraftSession, String> {
+        let id = new_draft_id();
+        let fields = DraftFields {
+            from: email.to_string(),
+            ..DraftFields::default()
+        };
+        let folder = fell_core::compose::materialize_in(&self.root, &id, &fields, "", account)?;
+        let mut session = DraftSession::create(folder, &id, account.clone(), fields, "")?;
+        session.bind_store(&self.store);
+        session.flush()?;
+        drop(session);
+        self.open(&id, account)
+    }
+
+    /// Draft `id` as the mailbox holds it. The folder is written from the
+    /// mailbox row first: the row is Fell's own copy, while anything on the
+    /// machine may have changed the folder since the draft was last open.
+    pub fn open(&self, id: &str, account: &AccountId) -> Result<DraftSession, String> {
+        let folder = self.root.join(id);
+        let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        let restored = store
+            .restore_compose_folder(id, &folder)
+            .map_err(|err| err.to_string())?;
+        if restored.is_none() {
+            return Err("the draft is no longer in the mailbox".into());
+        }
+        DraftSession::open_with_store(&folder, account.clone(), &store)
+    }
+}
+
+/// A draft id no other draft has: `c` and the time in nanoseconds.
+fn new_draft_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("c{nanos:x}")
+}
+
 /// The app's draft hub, for windows that want to hear from it.
 pub(crate) struct AgentDrafts(pub Arc<DraftHub>);
 
 impl gpui::Global for AgentDrafts {}
 
+/// Put `session` in the hub unless that draft is already live, then bring
+/// the compose window up on it. There is one window and one hub: an open
+/// window moves to this draft.
+pub(crate) fn show_draft(hub: &DraftHub, session: Option<DraftSession>, id: &str) -> bool {
+    if let Some(session) = session {
+        hub.insert_new(session);
+    }
+    hub.show(id)
+}
+
+/// Serve agent drafts from the inbox: the socket, the folder watcher, and a
+/// compose window that opens, or comes to the front, whenever an agent calls
+/// `request_send` or the person opens a draft. Saves still queued when Fell
+/// quits are waited for.
 pub fn host_agent_drafts(cx: &mut App) -> Arc<DraftHub> {
     let hub = Arc::new(DraftHub::new());
     cx.set_global(AgentDrafts(hub.clone()));
@@ -252,6 +324,7 @@ fn open_compose_window(
                     let mut compose = ComposeView::new(hub, id, folder, cx);
                     compose.set_look(crate::theme::load());
                     compose.start_on_first_edit();
+                    compose.close_after_send();
                     compose.watch_live(cx);
                     compose
                 })
@@ -274,4 +347,122 @@ fn compose_window_size() -> (f32, f32) {
             Some((width.parse().ok()?, height.parse().ok()?))
         })
         .unwrap_or((900.0, 760.0))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Write};
+
+    /// A drafts root and a mailbox with `account` in it, under a fresh temp dir.
+    pub(crate) fn temp_home(tag: &str, account: &fell_core::Account) -> DraftHome {
+        let root = std::env::temp_dir().join(format!(
+            "fell-inbox-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = root.join("mail.db");
+        fell_core::Store::open(&store)
+            .unwrap()
+            .upsert_account(account)
+            .unwrap();
+        DraftHome {
+            root: root.join("drafts"),
+            store,
+        }
+    }
+
+    pub(crate) fn me() -> fell_core::Account {
+        fell_core::Account {
+            id: AccountId("mail".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: fell_core::BackendKind::Bridge,
+        }
+    }
+
+    fn call(socket: &std::path::Path, request: Value) -> Value {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        writeln!(stream, "{request}").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[test]
+    fn c_keeps_a_new_draft_in_the_drafts_folder_and_the_mailbox() {
+        let account = me();
+        let home = temp_home("new", &account);
+        let session = home.new_draft(&account.id, &account.email).unwrap();
+        assert!(session.folder().starts_with(&home.root));
+        assert!(session.folder().join("draft.md").is_file());
+        assert_eq!(session.fields().from, "jon@example.com");
+        assert!(session.owner().is_empty(), "the person's own draft");
+        let listed = fell_core::Store::open(&home.store)
+            .unwrap()
+            .unsent_compose_drafts(&account.id)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, session.id());
+        // Reopening reads the mailbox's copy, even with the folder gone.
+        let id = session.id().to_string();
+        drop(session);
+        std::fs::remove_dir_all(home.root.join(&id)).unwrap();
+        let reopened = home.open(&id, &account.id).unwrap();
+        assert_eq!(reopened.id(), id);
+        assert!(home.open("c0", &account.id).is_err());
+    }
+
+    #[test]
+    fn a_draft_from_c_answers_on_the_socket_and_request_send_only_focuses_it() {
+        let account = me();
+        let home = temp_home("socket", &account);
+        let hub = Arc::new(DraftHub::new());
+        let socket = home.root.with_file_name("live.sock");
+        serve_socket_at(hub.clone(), &socket).unwrap();
+        let session = home.new_draft(&account.id, &account.email).unwrap();
+        let id = session.id().to_string();
+        assert!(show_draft(&hub, Some(session), &id));
+        assert_eq!(hub.focused_id().as_deref(), Some(id.as_str()));
+        let reveals = hub.reveal_count();
+        // The compose window is up, and the person has typed, not yet saved.
+        hub.note_shown(&id);
+        hub.with_session(&id, |session| {
+            session.set_body_from_user("typed in the editor\n".into());
+            session.arm_outbound(u64::MAX);
+        });
+        // No agent was given this draft, so none may read it.
+        let refused = call(
+            &socket,
+            json!({ "id": 1, "op": "get_draft", "draft_id": id, "agent": "agent:bot" }),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["transmitted"], false);
+        // Once it is given to one, that agent reads the live draft, unsaved
+        // typing included.
+        hub.with_session(&id, |session| session.set_owner("agent:bot"));
+        let draft = call(
+            &socket,
+            json!({ "id": 2, "op": "get_draft", "draft_id": id, "agent": "agent:bot" }),
+        );
+        assert_eq!(draft["ok"], true, "{draft}");
+        assert_eq!(draft["body"], "typed in the editor\n");
+        let asked = call(
+            &socket,
+            json!({ "id": 3, "op": "request_send", "draft_id": id, "agent": "agent:bot" }),
+        );
+        assert_eq!(asked["ok"], true, "{asked}");
+        assert_eq!(asked["transmitted"], false);
+        assert_eq!(asked["focused"], true);
+        assert_eq!(hub.focused_id().as_deref(), Some(id.as_str()));
+        assert_eq!(hub.reveal_count(), reveals + 1);
+        let lock = hub.with_session(&id, |session| session.send_lock());
+        assert_eq!(lock, Some(None), "nothing was sent or claimed");
+    }
 }

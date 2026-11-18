@@ -1,5 +1,6 @@
 //! Row and conversation presentation. Pure functions, no GPUI.
 
+use fell_core::compose::DraftSummary;
 use fell_core::{FolderThread, Message};
 
 use crate::text_render::{RenderedBody, render_stored_body};
@@ -31,6 +32,9 @@ pub struct ThreadRow {
     pub snippet: String,
     pub labels: Vec<String>,
     pub unread: bool,
+    /// The compose draft this row stands for, in the drafts list. `None`
+    /// for a thread.
+    pub draft: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,8 +255,132 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             snippet: one_line(&thread.snippet),
             labels: thread.labels.clone(),
             unread: thread.unread,
+            draft: None,
         })
         .collect()
+}
+
+/// The row id of compose draft `id`. Thread ids never start with this.
+pub fn draft_row_id(id: &str) -> String {
+    format!("draft:{id}")
+}
+
+/// Rows for compose drafts, shown above the synced Drafts folder: who the
+/// draft is to, a `draft` chip (or `may have been sent`), and the agent it
+/// belongs to.
+pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
+    drafts
+        .iter()
+        .map(|draft| {
+            let names: Vec<String> = draft
+                .to
+                .iter()
+                .chain(&draft.cc)
+                .map(|raw| address_name(raw))
+                .collect();
+            let spans = if names.is_empty() {
+                vec![NameSpan {
+                    text: "No recipients".into(),
+                    emphasis: false,
+                }]
+            } else {
+                names
+                    .iter()
+                    .take(3)
+                    .map(|name| NameSpan {
+                        text: name.clone(),
+                        emphasis: false,
+                    })
+                    .collect()
+            };
+            let mut labels = vec![if draft.maybe_sent {
+                "may have been sent · check Sent".to_string()
+            } else {
+                "draft".to_string()
+            }];
+            let agent: String = draft
+                .owner
+                .trim_start_matches("agent:")
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(24)
+                .collect();
+            if !agent.trim().is_empty() {
+                labels.push(agent);
+            }
+            ThreadRow {
+                id: draft_row_id(&draft.id),
+                spans,
+                extra: names.len().saturating_sub(3),
+                message_count: 1,
+                starred: false,
+                has_attachment: false,
+                date_unix: draft.updated_unix,
+                subject: if draft.subject.trim().is_empty() {
+                    "(no subject)".into()
+                } else {
+                    one_line(&draft.subject)
+                },
+                snippet: one_line(&draft.body),
+                labels,
+                unread: false,
+                draft: Some(draft.id.clone()),
+            }
+        })
+        .collect()
+}
+
+/// A draft in the reading pane: one message, from the person, as it reads.
+pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
+    let address = |raw: &String| {
+        let (name, email) = fell_core::compose::mailbox_parts(raw)
+            .unwrap_or_else(|| (None, raw.trim().to_string()));
+        fell_core::Address { name, email }
+    };
+    let from = address(&draft.from);
+    let message_id = fell_core::MessageId::new(draft_row_id(&draft.id));
+    let message = Message {
+        account_id: fell_core::AccountId(String::new()),
+        headers: fell_core::MessageHeaders {
+            message_id: message_id.clone(),
+            proton_conversation_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            from,
+            subject: draft.subject.clone(),
+            date_unix: draft.updated_unix,
+        },
+        remote_id: fell_core::RemoteId(String::new()),
+        thread_id: fell_core::ThreadId::from_message_id(&message_id),
+        snippet: one_line(&draft.body),
+        body_text: Some(draft.body.clone()),
+        unread: false,
+        folders: Vec::new(),
+        labels: Vec::new(),
+        arrived_via: Vec::new(),
+        to: draft.to.iter().map(address).collect(),
+        cc: draft.cc.iter().map(address).collect(),
+        bcc: Vec::new(),
+        starred: false,
+        has_attachment: false,
+        archived: false,
+        snooze_until: None,
+        list_id: None,
+    };
+    let mut shown = conversation(&[message], me);
+    for message in &mut shown {
+        message.folders = "Draft".into();
+        message.expanded = true;
+    }
+    shown
+}
+
+/// The name a draft row shows for one recipient.
+fn address_name(raw: &str) -> String {
+    match fell_core::compose::mailbox_parts(raw) {
+        Some((name, email)) => display_name(&name, &email, ""),
+        None => one_line(raw),
+    }
 }
 
 pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {

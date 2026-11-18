@@ -27,6 +27,22 @@ pub struct StoredCompose {
     pub owner: String,
 }
 
+/// One compose draft as the inbox's drafts list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSummary {
+    pub id: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    /// The agent the draft belongs to; empty for the person's own.
+    pub owner: String,
+    pub updated_unix: i64,
+    /// A send that may have gone out. Sent drafts are not listed.
+    pub maybe_sent: bool,
+}
+
 /// Agent hunks waiting for review, and the serialized draft their byte
 /// ranges point into. Kept in the mailbox, beside the compose row it is
 /// saved with, because the draft folder and its neighbours are writable by
@@ -380,6 +396,43 @@ impl Store {
         }))
     }
 
+    /// The account's compose drafts that have not gone out, newest first.
+    ///
+    /// A draft whose send went out leaves the list; one that may have gone
+    /// out stays, marked, so the person checks Sent. An agent's draft is
+    /// listed while its review draft is (an undone one is not).
+    pub fn unsent_compose_drafts(&self, account_id: &AccountId) -> Result<Vec<DraftSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.from_addr, d.to_addrs, d.cc_addrs, d.subject, d.body, d.owner,
+                    d.updated_unix, s.state
+             FROM compose_drafts d
+             LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
+             WHERE d.account_id = ?1
+               AND IFNULL(s.state, ?2) != ?3
+               AND (d.owner = '' OR EXISTS (
+                   SELECT 1 FROM review_drafts r
+                   WHERE r.account_id = d.account_id AND 'r' || r.id = d.id
+               ))
+             ORDER BY d.updated_unix DESC, d.id DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id.as_str(), SEND_CLEAR, SEND_SENT], |row| {
+            let state: Option<String> = row.get(8)?;
+            Ok(DraftSummary {
+                id: row.get(0)?,
+                from: row.get(1)?,
+                to: split_list(&row.get::<_, String>(2)?),
+                cc: split_list(&row.get::<_, String>(3)?),
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                owner: row.get(6)?,
+                updated_unix: row.get(7)?,
+                // Anything but a clean "clear" errs toward "may have been sent".
+                maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn compose_owner(&self, id: &str) -> Result<Option<String>> {
         Ok(self.load_compose(id)?.map(|draft| draft.owner))
     }
@@ -700,6 +753,73 @@ mod tests {
         assert_eq!(store.message_summary(&account.id, &missing).unwrap(), None);
     }
     use crate::{Account, BackendKind};
+
+    #[test]
+    fn the_drafts_list_drops_sent_mail_and_marks_maybe_sent() {
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Me".into(),
+            email: "me@x".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let save = |id: &str, owner: &str| {
+            store
+                .save_compose(&StoredCompose {
+                    id: id.into(),
+                    account_id: account.id.clone(),
+                    fields: DraftFields {
+                        from: "me@x".into(),
+                        to: vec!["Ada <ada@x>".into()],
+                        subject: format!("about {id}"),
+                        ..DraftFields::default()
+                    },
+                    body: "hello\n".into(),
+                    files: Vec::new(),
+                    identities: vec!["me@x".into()],
+                    owner: owner.into(),
+                })
+                .unwrap();
+        };
+        save("open", "");
+        save("went", "");
+        save("unsure", "");
+        save("retried", "");
+        // An agent's draft whose review draft was undone.
+        save("r99", "agent:bot");
+        let claim = |id: &str, lock: Option<SendLock>| {
+            assert_eq!(
+                store.claim_compose_send(&account.id, id, None).unwrap(),
+                None
+            );
+            if lock != Some(SendLock::MaybeSent) {
+                store.finish_compose_send(&account.id, id, lock).unwrap();
+            }
+        };
+        claim("went", Some(SendLock::Sent));
+        claim("unsure", Some(SendLock::MaybeSent));
+        claim("retried", None);
+        let listed = store.unsent_compose_drafts(&account.id).unwrap();
+        let mut ids: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|draft| (draft.id.as_str(), draft.maybe_sent))
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![("open", false), ("retried", false), ("unsure", true)]
+        );
+        let open = listed.iter().find(|draft| draft.id == "open").unwrap();
+        assert_eq!(open.to, vec!["Ada <ada@x>".to_string()]);
+        assert_eq!(open.subject, "about open");
+        assert!(
+            store
+                .unsent_compose_drafts(&AccountId("other".into()))
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn attachments_survive_a_reload() {

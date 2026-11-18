@@ -15,6 +15,9 @@ use gpui::{
     prelude::*, px, rgb, size, uniform_list,
 };
 
+use fell_core::compose::DraftSummary;
+
+use crate::draft_host::DraftHome;
 use crate::keymap::KeyId;
 use crate::mailbox;
 use crate::model::{Fetch, Overlay, QueryFault, Session, Step, SyncKind, row_key};
@@ -23,6 +26,9 @@ use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
+
+/// Archive and move act on threads. A draft row is not one.
+const DRAFT_NOT_THREAD: &str = "That is a draft · enter opens it in the editor";
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -106,9 +112,16 @@ struct ListRead {
     /// Where the selected thread sits now, when it is still in the folder
     /// but not among `rows`: new mail moved it outside the window.
     followed: Option<ListKey>,
+    /// In Drafts, the person's compose drafts, shown above the synced rows
+    /// when the window reaches the top of the folder.
+    drafts: Vec<DraftSummary>,
 }
 
 type ThreadsResult = Result<ListRead, String>;
+
+fn is_drafts(folder: &str) -> bool {
+    folder.eq_ignore_ascii_case("drafts")
+}
 
 struct Inbox {
     focus: FocusHandle,
@@ -146,6 +159,10 @@ struct Inbox {
     /// Bumped by every conversation read. The store thread skips a read that
     /// is already stale, so holding `j` does not build a backlog.
     conv_gen: Arc<AtomicU64>,
+    /// Where `c` keeps a new draft. `None` when the mailbox did not open.
+    draft_home: Option<DraftHome>,
+    /// The compose drafts at the top of the Drafts list, as last read.
+    drafts: Vec<DraftSummary>,
 }
 
 impl Inbox {
@@ -154,6 +171,7 @@ impl Inbox {
         let theme = theme::load();
         let config = startup.config.clone();
         let path = startup.path.clone();
+        let draft_home = startup.path.clone().ok().map(DraftHome::real);
         let (store, ready) = StoreClient::spawn({
             let config = config.clone();
             move || mailbox::open_store(path, config.as_ref())
@@ -200,6 +218,8 @@ impl Inbox {
             read_wanted: None,
             pending_removals: std::collections::HashSet::new(),
             conv_gen: Arc::new(AtomicU64::new(0)),
+            draft_home,
+            drafts: Vec::new(),
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -232,6 +252,10 @@ impl Inbox {
             self.session.record_startup_error(joined);
         }
         let store_failed = opened.sync == SyncKind::StoreError;
+        if store_failed {
+            // The window reads a stand-in; a draft kept there would be lost.
+            self.draft_home = None;
+        }
         self.session.sync = opened.sync;
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
@@ -322,6 +346,13 @@ impl Inbox {
                     .flatten(),
                 _ => None,
             };
+            let drafts = if is_drafts(&reading) {
+                store
+                    .unsent_compose_drafts(&account)
+                    .map_err(|err| err.to_string())?
+            } else {
+                Vec::new()
+            };
             Ok(ListRead {
                 rows: present::thread_rows(&page.threads, &me),
                 more_before: page.more_before,
@@ -329,6 +360,7 @@ impl Inbox {
                 unread: page.unread,
                 names,
                 followed,
+                drafts,
             })
         };
         // Only sync asked: nobody is waiting, so keep the interactive lane
@@ -391,12 +423,13 @@ impl Inbox {
     ) {
         self.session.loading = false;
         let ListRead {
-            mut rows,
+            rows: threads,
             more_before,
             more_after,
             mut unread,
             names,
             followed,
+            drafts,
         } = match result {
             Ok(found) => found,
             Err(err) => {
@@ -409,6 +442,16 @@ impl Inbox {
             }
         };
         self.session.clear_query_fault(QueryFault::Folder);
+        // The person's drafts first, as the editor has them right now. They
+        // sit above the folder's first row, so they show only when the rows
+        // read reach the top of the folder.
+        self.drafts = self.live_drafts(drafts, cx);
+        let mut rows = if more_before {
+            Vec::new()
+        } else {
+            present::draft_rows(&self.drafts)
+        };
+        rows.extend(threads);
         if !names.is_empty() {
             self.session.folders = names;
         }
@@ -481,7 +524,8 @@ impl Inbox {
         }
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
-        if open_changed || grew {
+        // A draft's preview follows its edits.
+        if open_changed || grew || self.session.cursor_draft().is_some() {
             self.request_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
@@ -558,6 +602,25 @@ impl Inbox {
             return;
         };
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if let Some(draft) = self.session.cursor_draft() {
+            // A draft is shown from the drafts list, not read as a thread.
+            self.conv_gen.fetch_add(1, Ordering::SeqCst);
+            let shown = self
+                .drafts
+                .iter()
+                .find(|item| item.id == draft)
+                .map(|item| present::draft_conversation(item, &self.session.account_email))
+                .unwrap_or_default();
+            let same = self.open_thread.as_deref() == Some(id.as_str());
+            if same {
+                self.session.refresh_messages(shown, true);
+            } else {
+                self.session.set_messages(shown);
+            }
+            self.session.clear_query_fault(QueryFault::Message);
+            self.open_thread = Some(id);
             return;
         }
         let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -655,13 +718,17 @@ impl Inbox {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
                 let closed = hub.take_closed();
-                let Some(line) = closed.last().cloned() else {
-                    continue;
-                };
                 let alive = this
                     .update(cx, |inbox, cx| {
-                        inbox.session.show_toast(line, false);
-                        cx.notify();
+                        // A draft changed, was sent, or is new: the drafts
+                        // list on screen follows.
+                        if is_drafts(&inbox.session.folder) {
+                            inbox.request_threads(ReadIntent::default(), cx);
+                        }
+                        if let Some(line) = closed.last().cloned() {
+                            inbox.session.show_toast(line, false);
+                            cx.notify();
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -731,6 +798,10 @@ impl Inbox {
             self.session.show_toast("No conversation", true);
             return;
         };
+        if self.session.cursor_draft().is_some() {
+            self.session.show_toast(DRAFT_NOT_THREAD, true);
+            return;
+        }
         if !self.session.threads.iter().any(|thread| thread.id == id) {
             self.session.show_toast("No conversation", true);
             return;
@@ -771,6 +842,10 @@ impl Inbox {
             self.session.show_toast("No conversation", true);
             return;
         };
+        if self.session.cursor_draft().is_some() {
+            self.session.show_toast(DRAFT_NOT_THREAD, true);
+            return;
+        }
         if !self.session.threads.iter().any(|thread| thread.id == id) {
             self.session.show_toast("No conversation", true);
             return;
@@ -857,6 +932,103 @@ impl Inbox {
         );
     }
 
+    /// `c` (no id) or Enter on a draft row: bring the compose window up on
+    /// the draft. A live draft shows at once; otherwise it is created or read
+    /// from the mailbox off this thread, then shown.
+    fn open_draft(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            self.session
+                .show_toast("Compose is not available here", true);
+            return;
+        };
+        if let Some(id) = &id
+            && crate::draft_host::show_draft(&hub, None, id)
+        {
+            return;
+        }
+        let Some(home) = self.draft_home.clone() else {
+            self.session.show_toast(
+                "The mailbox did not open, so a draft has nowhere to go · ? details",
+                true,
+            );
+            return;
+        };
+        let account = self.account_id.clone();
+        let email = self.session.account_email.clone();
+        let creating = id.is_none();
+        if creating {
+            self.session.show_toast("New draft", false);
+        }
+        let task = cx.background_executor().spawn(async move {
+            match id {
+                Some(id) => home.open(&id, &account),
+                None => home.new_draft(&account, &email),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |inbox, cx| {
+                match result {
+                    Ok(session) => {
+                        let id = session.id().to_string();
+                        crate::draft_host::show_draft(&hub, Some(session), &id);
+                    }
+                    Err(err) => {
+                        let what = if creating {
+                            "start a draft"
+                        } else {
+                            "open the draft"
+                        };
+                        inbox
+                            .session
+                            .show_toast(format!("Couldn't {what}: {err}"), true);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The drafts the store listed, with what the editor holds for any that
+    /// are live: unsaved typing, and a send that just went out.
+    fn live_drafts(&self, stored: Vec<DraftSummary>, cx: &mut Context<Self>) -> Vec<DraftSummary> {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            return stored;
+        };
+        stored
+            .into_iter()
+            .filter_map(|mut draft| {
+                let live = hub.with_session(&draft.id, |session| {
+                    (session.snapshot(), session.send_lock())
+                });
+                let Some((snap, lock)) = live else {
+                    return Some(draft);
+                };
+                match lock {
+                    Some(fell_core::compose::SendLock::Sent) => return None,
+                    Some(_) => draft.maybe_sent = true,
+                    None => {}
+                }
+                let raw = |items: &[fell_core::compose::AddressView]| {
+                    items.iter().map(|item| item.raw.clone()).collect()
+                };
+                draft.to = raw(&snap.to);
+                draft.cc = raw(&snap.cc);
+                draft.subject = snap.subject;
+                draft.body = snap.body;
+                draft.from = snap.from;
+                Some(draft)
+            })
+            .collect()
+    }
+
     fn clear_open_message(&mut self) {
         self.session.messages.clear();
         self.open_thread = None;
@@ -916,6 +1088,14 @@ impl Inbox {
             if !reopened {
                 self.session.show_toast("no agent review to reopen", false);
             }
+        }
+        if step.compose {
+            self.open_draft(None, cx);
+        }
+        if step.open_draft
+            && let Some(id) = self.session.cursor_draft().map(str::to_string)
+        {
+            self.open_draft(Some(id), cx);
         }
         if step.sync_now {
             match &self.sync {
@@ -2108,6 +2288,8 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         // A notice takes the hints' room until the next key clears it, so
         // it is never cut short.
         String::new()
+    } else if session.cursor_draft().is_some() {
+        "j k  ·  enter edit  ·  c new  ·  space  ·  :".to_string()
     } else if session.pane == Pane::Conversation {
         "j k  ·  esc  ·  ctrl-d  ·  space  ·  :".to_string()
     } else {

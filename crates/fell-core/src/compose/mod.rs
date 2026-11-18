@@ -17,7 +17,7 @@ mod writer;
 
 pub use frontmatter::{
     AttachmentRef, DraftFields, DraftIssue, ParsedDraft, email_of, format_address_line,
-    parse_address_line,
+    mailbox_parts, parse_address_line,
 };
 pub use hub::{
     DraftHub, HubEvent, editor_is_running, file_fallback_edit, file_fallback_get,
@@ -30,8 +30,8 @@ pub use markdown::{
 pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
 pub use persist::{
-    StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft, remember_compose_store,
-    remembered_store_path, stored_compose_account, stored_compose_owner,
+    DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
+    remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
