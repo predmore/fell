@@ -16,6 +16,7 @@ use super::frontmatter::{
 use super::merge::{self, HunkKind, MergeOutcome};
 use super::mime::{self, Outgoing, ResolvedFile};
 use super::persist::{self, StoredReview};
+use super::reply::ReplyParts;
 use super::review::{self, Hunk};
 use super::workspace::{self, Closure, FileStamp, ListedFile};
 use super::writer::{
@@ -111,12 +112,19 @@ pub struct Snapshot {
     /// The message this draft replies to, as "sender · subject · date",
     /// when the mailbox has it.
     pub reply_context: Option<ReplyContext>,
+    /// What a forward carries, read from its header block.
+    pub forwarded: Option<super::reply::ForwardSummary>,
 }
 
 /// The parent message of a reply, read from the mailbox when the draft opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyContext {
     pub sender: String,
+    /// The sender's address, shown when the reply goes somewhere else.
+    pub sender_email: String,
+    /// Where the original asked replies to go, lowercased. A To address in
+    /// here that is not the sender is marked, so a redirect is seen.
+    pub reply_to: Vec<String>,
     pub subject: String,
     pub date_unix: i64,
 }
@@ -210,7 +218,9 @@ pub struct DraftSession {
     identities: HashSet<String>,
     owner: String,
     agent_seen: HashMap<String, String>,
-    quoted: Option<String>,
+    /// References and the quoted original of a reply or forward. Fell sets
+    /// these; the draft file does not carry them.
+    reply: ReplyParts,
     /// Set before a send starts and kept after it may have gone out, so no
     /// second press or reopened view sends it again. The mailbox holds the
     /// record a restart reads; see [`Self::begin_send`].
@@ -242,6 +252,28 @@ impl DraftSession {
         body: &str,
         store: &Path,
     ) -> Result<PathBuf, String> {
+        Self::start_reply_in(
+            root,
+            id,
+            account_id,
+            fields,
+            body,
+            &ReplyParts::default(),
+            store,
+        )
+    }
+
+    /// [`Self::start_in`] for a reply or forward: its References and quoted
+    /// original are kept in the mailbox row with it.
+    pub fn start_reply_in(
+        root: &Path,
+        id: &str,
+        account_id: AccountId,
+        fields: DraftFields,
+        body: &str,
+        reply: &ReplyParts,
+        store: &Path,
+    ) -> Result<PathBuf, String> {
         workspace::validate_id(id)?;
         if !store.is_file() {
             return Err("the mailbox file is missing".into());
@@ -255,6 +287,7 @@ impl DraftSession {
             body.to_string(),
         );
         session.store_path = Some(store.to_path_buf());
+        session.reply = reply.clone();
         let text = session.serialize();
         super::writer::persist_mailbox(
             &folder,
@@ -320,7 +353,7 @@ impl DraftSession {
             identities: HashSet::new(),
             owner: String::new(),
             agent_seen: HashMap::new(),
-            quoted: None,
+            reply: ReplyParts::default(),
             send_lock: None,
         };
         if let Some(email) = email_of(&session.fields.from) {
@@ -378,6 +411,27 @@ impl DraftSession {
         session.owner = stored.owner;
         session.locked_reply = stored.fields.in_reply_to.clone();
         session.fields.in_reply_to = session.locked_reply.clone();
+        session.reply = stored.reply;
+        if session.reply.references.is_empty()
+            && let Some(parent) = session
+                .locked_reply
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+        {
+            // A reply started without its chain, such as an agent's: the
+            // parent's own References, when the mailbox has the parent. If
+            // it does not yet, the chain stays empty so a later open builds
+            // it; a send meanwhile cites the parent alone.
+            let found = store
+                .message(session.account_id(), &crate::MessageId::new(parent))
+                .ok()
+                .flatten();
+            if let Some(message) = found {
+                // The rule a reply started here uses, so a long chain keeps
+                // its root either way.
+                session.reply.references = super::reply::reply_references(&message, parent);
+            }
+        }
         session.issues = parsed.issues;
         if let Some(path) = store.db_path() {
             session.store_path = Some(path.to_path_buf());
@@ -520,8 +574,18 @@ impl DraftSession {
         self.known = known;
     }
 
+    /// Paint `html` as the quoted original below a draft that quotes
+    /// nothing, as the demo does. A reply's quote is sent in both parts, so
+    /// it is never replaced here: the two parts would disagree.
     pub fn set_quote(&mut self, html: Option<String>) {
-        self.quoted = html;
+        if self.reply.quote_text.is_empty() {
+            self.reply.quote_html = html.unwrap_or_default();
+        }
+    }
+
+    /// References and the quoted original this draft sends with it.
+    pub fn reply_parts(&self) -> &ReplyParts {
+        &self.reply
     }
 
     /// The window painted this revision. Records which version of each
@@ -965,6 +1029,7 @@ impl DraftSession {
                 files: Vec::new(),
                 identities: self.identities.iter().cloned().collect(),
                 owner: self.owner.clone(),
+                reply: self.reply.clone(),
             },
             review: StoredReview {
                 text: text.to_string(),
@@ -997,6 +1062,7 @@ impl DraftSession {
             &self.fields,
             &self.body,
             &closure.files,
+            &self.reply,
         );
         *self.prepared.lock().expect("prepared send") = Some((self.revision, closure.files));
         Ok(outgoing)
@@ -1075,13 +1141,14 @@ impl DraftSession {
                 })
                 .collect(),
             unreviewed: self.hunks.len(),
-            quoted: self.quoted.clone(),
+            quoted: Some(self.reply.quote_html.clone()).filter(|html| !html.trim().is_empty()),
             open: self.open,
             focused: self.focused,
             send_block,
             text,
             send_requested_by: self.send_requested_by.clone(),
             reply_context: self.reply_context.clone(),
+            forwarded: super::reply::forward_summary(&self.reply.quote_text),
         }
     }
 
@@ -1771,6 +1838,8 @@ mod tests {
                 archived: false,
                 snooze_until: None,
                 list_id: None,
+                reply_to: Vec::new(),
+                attachment_names: Vec::new(),
             })
             .unwrap();
         let fields = DraftFields {

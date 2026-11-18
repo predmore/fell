@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::ops::Range;
 
+use fell_core::compose::ReplyKind;
 use fell_core::{FolderSpan, ListKey, SyncFailureKind, ThreadId};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
@@ -211,6 +212,8 @@ pub struct Step {
     pub compose: bool,
     /// Open the selected row's draft in the compose editor.
     pub open_draft: bool,
+    /// `r`, `R`, `f`: answer [`Session::reply_target`] in a new draft.
+    pub reply: Option<ReplyKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +404,19 @@ impl Session {
     pub fn cursor_thread(&self) -> Option<&ThreadRow> {
         let id = self.cursor_id.as_ref()?;
         self.threads.iter().find(|thread| &thread.id == id)
+    }
+
+    /// The message `r`, `R`, and `f` answer: the one under the cursor in
+    /// the conversation, or the latest when the list has focus. None on a
+    /// draft row or before the conversation is read.
+    pub fn reply_target(&self) -> Option<&ConvMessage> {
+        if self.cursor_draft().is_some() || self.cursor_thread().is_none() {
+            return None;
+        }
+        match self.pane {
+            Pane::Conversation => self.messages.get(self.message_cursor),
+            Pane::List => self.messages.last(),
+        }
     }
 
     pub fn cursor_draft(&self) -> Option<&str> {
@@ -1502,6 +1518,27 @@ impl Session {
                     ..Step::default()
                 };
             }
+            Action::Reply | Action::ReplyAll | Action::Forward => {
+                self.count.clear();
+                let kind = match action {
+                    Action::Reply => ReplyKind::Reply,
+                    Action::ReplyAll => ReplyKind::ReplyAll,
+                    _ => ReplyKind::Forward,
+                };
+                if self.reply_target().is_none() {
+                    let what = if kind == ReplyKind::Forward {
+                        "forward"
+                    } else {
+                        "reply to"
+                    };
+                    self.show_toast(format!("No message to {what} here"), false);
+                    return Step::default();
+                }
+                return Step {
+                    reply: Some(kind),
+                    ..Step::default()
+                };
+            }
         }
         step
     }
@@ -1756,6 +1793,48 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn r_shift_r_and_f_answer_the_message_in_view_or_the_latest() {
+        let mut session = session();
+        session.cursor_id = Some("a".into());
+        // Nothing read yet: nothing to answer, and the person is told.
+        let step = session.on_key(KeyId::Char('r'), 10);
+        assert_eq!(step.reply, None);
+        assert!(session.toast.is_some());
+        let first = empty_message(false);
+        let second = empty_message(true);
+        session.set_messages(vec![first.clone(), second.clone()]);
+        // From the list, the latest message.
+        let step = session.on_key(KeyId::Char('r'), 10);
+        assert_eq!(step.reply, Some(ReplyKind::Reply));
+        assert!(step.arm_which);
+        assert_eq!(session.reply_target().map(|m| &m.id), Some(&second.id));
+        // In the conversation, the one under the cursor.
+        session.pane = Pane::Conversation;
+        session.message_cursor = 0;
+        let step = session.on_key(KeyId::Char('R'), 10);
+        assert_eq!(step.reply, Some(ReplyKind::ReplyAll));
+        assert_eq!(session.reply_target().map(|m| &m.id), Some(&first.id));
+        let step = session.on_key(KeyId::Char('f'), 10);
+        assert_eq!(step.reply, Some(ReplyKind::Forward));
+        // A count does not repeat it.
+        session.on_key(KeyId::Char('3'), 10);
+        let step = session.on_key(KeyId::Char('r'), 10);
+        assert_eq!(step.reply, Some(ReplyKind::Reply));
+        assert!(session.count.is_empty());
+        // A draft row is not a message to answer.
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        let step = session.on_key(KeyId::Char('f'), 10);
+        assert_eq!(step.reply, None);
+        assert_eq!(
+            session.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("No message to forward here")
+        );
     }
 
     #[test]

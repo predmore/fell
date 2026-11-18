@@ -1,6 +1,7 @@
 //! Multipart message built from the markdown the editor is showing.
 //!
 //! `text/plain` is that markdown. `text/html` comes from the shared renderer.
+//! A reply or forward adds its quoted original after both.
 //! Inline images are CID parts. Remote URLs are not fetched.
 //!
 //! The bytes in [`Outgoing::mime`] are the message that leaves the machine.
@@ -14,6 +15,7 @@ use crate::send::Draft;
 
 use super::frontmatter::{DraftFields, mailbox_parts};
 use super::markdown::{doc_to_html, markdown_to_doc};
+use super::reply::{ReplyParts, build_references};
 
 static TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -41,16 +43,35 @@ pub fn build_outgoing(
     fields: &DraftFields,
     body: &str,
     files: &[ResolvedFile],
+    reply: &ReplyParts,
 ) -> Outgoing {
-    let plain = if body.ends_with('\n') || body.is_empty() {
+    let mut plain = if body.ends_with('\n') || body.is_empty() {
         body.to_string()
     } else {
         format!("{body}\n")
     };
-    let html = doc_to_html(&markdown_to_doc(&plain));
+    let mut html = doc_to_html(&markdown_to_doc(&plain));
+    // The quoted original goes after what the person wrote, in both parts.
+    if !reply.quote_text.trim().is_empty() {
+        if !plain.is_empty() {
+            plain.push('\n');
+        }
+        plain.push_str(&reply.quote_text);
+        if !plain.ends_with('\n') {
+            plain.push('\n');
+        }
+    }
+    if !reply.quote_html.trim().is_empty() {
+        // Inside the document, before it closes: a quote after </html> is
+        // dropped by many readers.
+        match html.rfind("</body>") {
+            Some(at) => html.insert_str(at, &reply.quote_html),
+            None => html.push_str(&reply.quote_html),
+        }
+    }
     let digest = attachment_digest(files);
     let message_id = fresh_message_id();
-    let mime = render_mime(fields, &message_id, &plain, &html, files);
+    let mime = render_mime(fields, &message_id, &plain, &html, files, &reply.references);
     let in_reply_to = fields
         .in_reply_to
         .as_ref()
@@ -80,6 +101,7 @@ fn render_mime(
     plain: &str,
     html: &str,
     files: &[ResolvedFile],
+    references: &[String],
 ) -> Vec<u8> {
     let blobs = content_blobs(plain, html, files);
     let mixed = fresh_boundary("mix", &blobs);
@@ -104,9 +126,16 @@ fn render_mime(
         .as_ref()
         .filter(|value| !value.trim().is_empty())
     {
-        let id = angle_id(reply);
-        headers.push_str(&header_line("In-Reply-To", &id));
-        headers.push_str(&header_line("References", &id));
+        headers.push_str(&header_line("In-Reply-To", &angle_id(reply)));
+        // The parent's References and then the parent (RFC 5322 §3.6.4), so
+        // a reader missing a message in between still has the chain.
+        let chain = build_references(references, reply);
+        let line = chain
+            .iter()
+            .map(|id| angle_id(id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        headers.push_str(&header_line("References", &line));
     }
     headers.push_str("MIME-Version: 1.0\r\n");
     let mut body = String::new();
@@ -390,14 +419,62 @@ fn rfc5322_now() -> String {
     rfc5322_date(unix)
 }
 
-fn rfc5322_date(unix: i64) -> String {
-    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let (year, month, day, hour, minute, second, weekday) = civil_from_unix(unix);
+pub(super) fn rfc5322_date(unix: i64) -> String {
+    rfc5322_date_at(unix, 0)
+}
+
+const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Read back a [`quote_date_at`] line ("Wed, 18 Nov 2026 at 08:16") as
+/// seconds since the epoch of that wall-clock time read as UTC.
+pub(super) fn parse_quote_date(text: &str) -> Option<i64> {
+    let (_, rest) = text.split_once(", ")?;
+    let (date, time) = rest.split_once(" at ")?;
+    let mut parts = date.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_name = parts.next()?;
+    let month = MONTHS.iter().position(|name| *name == month_name)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let (hour, minute) = time.trim().split_once(':')?;
+    let (hour, minute): (i64, i64) = (hour.parse().ok()?, minute.parse().ok()?);
+    if !(1..=31).contains(&day) || !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60)
+}
+
+/// An RFC 5322 date in the zone `offset` seconds east of UTC.
+pub(super) fn rfc5322_date_at(unix: i64, offset: i64) -> String {
+    let (year, month, day, hour, minute, second, weekday) =
+        civil_from_unix(unix.saturating_add(offset));
+    let sign = if offset < 0 { '-' } else { '+' };
+    let minutes = offset.unsigned_abs() / 60;
     format!(
-        "{}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} +0000",
+        "{}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} {sign}{:02}{:02}",
+        WEEKDAYS[weekday],
+        MONTHS[(month - 1) as usize],
+        (minutes / 60) % 100,
+        minutes % 60
+    )
+}
+
+/// "Wed, 18 Nov 2026 at 08:16": a quote's intro, in the person's zone,
+/// without seconds.
+pub(super) fn quote_date_at(unix: i64, offset: i64) -> String {
+    let (year, month, day, hour, minute, _, weekday) = civil_from_unix(unix.saturating_add(offset));
+    format!(
+        "{}, {day} {} {year:04} at {hour:02}:{minute:02}",
         WEEKDAYS[weekday],
         MONTHS[(month - 1) as usize]
     )
@@ -559,7 +636,13 @@ mod tests {
     }
 
     fn sample(body: &str, files: Vec<ResolvedFile>) -> Outgoing {
-        build_outgoing(AccountId("a".into()), &fields(), body, &files)
+        build_outgoing(
+            AccountId("a".into()),
+            &fields(),
+            body,
+            &files,
+            &ReplyParts::default(),
+        )
     }
 
     fn parse(bytes: &[u8]) -> mail_parser::Message<'_> {
@@ -635,6 +718,28 @@ mod tests {
     #[test]
     fn epoch_date_is_thursday_first_of_january() {
         assert_eq!(rfc5322_date(0), "Thu, 01 Jan 1970 00:00:00 +0000");
+        assert_eq!(
+            rfc5322_date_at(1_700_000_000, -8 * 3600),
+            "Tue, 14 Nov 2023 14:13:20 -0800"
+        );
+        assert_eq!(
+            rfc5322_date_at(1_700_000_000, 5 * 3600 + 1800),
+            "Wed, 15 Nov 2023 03:43:20 +0530"
+        );
+        assert_eq!(
+            quote_date_at(1_700_000_000, -8 * 3600),
+            "Tue, 14 Nov 2023 at 14:13"
+        );
+        assert_eq!(
+            parse_quote_date(&quote_date_at(1_700_000_000, 0)),
+            Some(1_699_999_980)
+        );
+        assert_eq!(parse_quote_date("Thu, 1 Jan 1970 at 00:00"), Some(0));
+        assert_eq!(
+            parse_quote_date("Thu, 29 Feb 2024 at 23:59"),
+            Some(1_709_251_140)
+        );
+        assert_eq!(parse_quote_date("garbage"), None);
     }
 
     #[test]
@@ -661,6 +766,7 @@ mod tests {
                 bytes: image.clone(),
                 inline: true,
             }],
+            &ReplyParts::default(),
         );
         assert_smtp_lines(&outgoing.mime);
         let raw = String::from_utf8(outgoing.mime.clone()).unwrap();
@@ -713,5 +819,58 @@ mod tests {
                 .parts()
                 .any(|part| part.decoded().as_ref() == image.as_slice())
         );
+    }
+
+    #[test]
+    fn a_reply_sends_the_whole_reference_chain_and_its_quote() {
+        let reply = ReplyParts {
+            references: (0..30).map(|n| format!("m{n}@example.com")).collect(),
+            quote_text: "On a day, Ada wrote:\n> the original\n".into(),
+            quote_html: "<p>On a day, Ada wrote:</p><blockquote><p>the original</p></blockquote>"
+                .into(),
+        };
+        let outgoing = build_outgoing(
+            AccountId("a".into()),
+            &fields(),
+            "My answer.\n",
+            &[],
+            &reply,
+        );
+        assert_smtp_lines(&outgoing.mime);
+        let message = parse(&outgoing.mime);
+        let references: Vec<String> = message
+            .references()
+            .unwrap()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(references.len(), super::super::MAX_REFERENCES);
+        assert_eq!(references[0], "m0@example.com");
+        assert_eq!(references[1], "m12@example.com");
+        assert_eq!(references.last().unwrap(), "abc@example.com");
+        let text = message.body_text(0).unwrap().replace("\r\n", "\n");
+        assert!(
+            text.starts_with("My answer.\n\nOn a day, Ada wrote:\n> the original"),
+            "{text}"
+        );
+        let html = message.body_html(0).unwrap().to_string();
+        assert!(html.contains("<blockquote><p>the original</p></blockquote>"));
+        // The quote is inside the document, after the answer.
+        let quote_at = html.find("<blockquote><p>the original").unwrap();
+        assert!(html.find("My answer.").unwrap() < quote_at, "{html}");
+        assert!(quote_at < html.rfind("</body>").unwrap(), "{html}");
+        assert!(html.trim_end().ends_with("</html>"), "{html}");
+        // The confirmation covers the quote: it is in the body the person sends.
+        assert!(outgoing.draft.body.contains("> the original"));
+        // A reply with no stored chain still names its parent.
+        let bare = sample("hi\n", Vec::new());
+        let message = parse(&bare.mime);
+        let references: Vec<String> = message
+            .references()
+            .unwrap()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(references, vec!["abc@example.com".to_string()]);
     }
 }

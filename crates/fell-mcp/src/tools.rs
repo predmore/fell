@@ -279,6 +279,7 @@ fn create_draft(session: &Session, args: &Value) -> Result<Value, String> {
                 .into_iter()
                 .collect(),
             owner: actor_name(session),
+            reply: Default::default(),
         })
         .map_err(store_error)?;
     Ok(json!({

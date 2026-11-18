@@ -143,7 +143,9 @@ pub fn html_to_doc(html: &str) -> StyledDoc {
     let bytes = cleaned.as_bytes();
     let mut index = 0;
     let mut list: Option<(bool, Vec<Vec<Inline>>)> = None;
-    let mut quote: Option<Vec<Block>> = None;
+    // Open blockquotes, innermost last. A closed one becomes a block of
+    // the one around it, or of the document.
+    let mut quotes: Vec<Vec<Block>> = Vec::new();
     let flush_paragraph = |paragraph: &mut Vec<Inline>, blocks: &mut Vec<Block>| {
         if paragraph.is_empty() {
             return;
@@ -177,7 +179,9 @@ pub fn html_to_doc(html: &str) -> StyledDoc {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
             "br" => push_text(&mut paragraph, "\n"),
-            "p" | "div" if closing => flush_paragraph(&mut paragraph, &mut blocks),
+            "p" | "div" if closing => {
+                flush_paragraph(&mut paragraph, quotes.last_mut().unwrap_or(&mut blocks))
+            }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !closing => {
                 flush_paragraph(&mut paragraph, &mut blocks);
                 let level = name.as_bytes()[1] - b'0';
@@ -213,12 +217,13 @@ pub fn html_to_doc(html: &str) -> StyledDoc {
                 index = next;
             }
             "blockquote" if !closing => {
-                flush_paragraph(&mut paragraph, &mut blocks);
-                quote = Some(Vec::new());
+                flush_paragraph(&mut paragraph, quotes.last_mut().unwrap_or(&mut blocks));
+                quotes.push(Vec::new());
             }
             "blockquote" if closing => {
-                if let Some(inner) = quote.take() {
-                    blocks.push(Block {
+                if let Some(mut inner) = quotes.pop() {
+                    flush_paragraph(&mut paragraph, &mut inner);
+                    quotes.last_mut().unwrap_or(&mut blocks).push(Block {
                         source: None,
                         body: BlockBody::Quote { blocks: inner },
                     });
@@ -265,8 +270,8 @@ pub fn html_to_doc(html: &str) -> StyledDoc {
             "img" => {
                 let alt = attr(tag, "alt").unwrap_or_default();
                 let src = attr(tag, "src").unwrap_or_default();
-                if paragraph.is_empty() || quote.is_some() || list.is_some() {
-                    blocks.push(Block {
+                if paragraph.is_empty() || !quotes.is_empty() || list.is_some() {
+                    quotes.last_mut().unwrap_or(&mut blocks).push(Block {
                         source: None,
                         body: BlockBody::Image { alt, src },
                     });
@@ -276,24 +281,16 @@ pub fn html_to_doc(html: &str) -> StyledDoc {
             }
             _ => {}
         }
-        if let Some(bucket) = quote.as_mut()
-            && !paragraph.is_empty()
-            && matches!(name.as_str(), "p" | "div" | "br")
-        {
-            let inlines = std::mem::take(&mut paragraph);
-            bucket.push(Block {
-                source: None,
-                body: BlockBody::Paragraph { inlines },
-            });
-        }
     }
-    flush_paragraph(&mut paragraph, &mut blocks);
-    if let Some(inner) = quote.take() {
-        blocks.push(Block {
+    // Quotes left open at the end close here, innermost first.
+    while let Some(mut inner) = quotes.pop() {
+        flush_paragraph(&mut paragraph, &mut inner);
+        quotes.last_mut().unwrap_or(&mut blocks).push(Block {
             source: None,
             body: BlockBody::Quote { blocks: inner },
         });
     }
+    flush_paragraph(&mut paragraph, &mut blocks);
     StyledDoc { blocks }
 }
 
@@ -840,7 +837,7 @@ fn is_remote_url(src: &str) -> bool {
         || lower.contains("://")
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -1007,6 +1004,55 @@ mod tests {
         assert_eq!(covered.len(), "**bold** and [a](https://example.com)".len());
         assert!(spans.iter().any(|span| span.kind == StyleKind::Marker));
         assert!(spans.iter().any(|span| span.kind == StyleKind::Strong));
+    }
+
+    #[test]
+    fn html_quotes_keep_their_paragraphs_in_order_and_nest() {
+        let doc = html_to_doc(
+            "<p>On Mon, Jon wrote:</p><blockquote><p>Yes.</p><p>-- <br>Jon</p>\
+             <blockquote><p>Can we?</p></blockquote><p>After</p></blockquote><p>Me</p>",
+        );
+        let text = |inlines: &[Inline]| {
+            inlines
+                .iter()
+                .map(|inline| match inline {
+                    Inline::Text(text) => text.clone(),
+                    _ => String::new(),
+                })
+                .collect::<String>()
+        };
+        let shape = |blocks: &[Block]| -> Vec<String> {
+            fn walk(
+                blocks: &[Block],
+                depth: usize,
+                text: &dyn Fn(&[Inline]) -> String,
+                out: &mut Vec<String>,
+            ) {
+                for block in blocks {
+                    match &block.body {
+                        BlockBody::Paragraph { inlines } => {
+                            out.push(format!("{depth}:{}", text(inlines)))
+                        }
+                        BlockBody::Quote { blocks } => walk(blocks, depth + 1, text, out),
+                        _ => out.push(format!("{depth}:?")),
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(blocks, 0, &text, &mut out);
+            out
+        };
+        assert_eq!(
+            shape(&doc.blocks),
+            vec![
+                "0:On Mon, Jon wrote:",
+                "1:Yes.",
+                "1:-- \nJon",
+                "2:Can we?",
+                "1:After",
+                "0:Me"
+            ]
+        );
     }
 
     #[test]

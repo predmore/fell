@@ -15,7 +15,7 @@ use gpui::{
     prelude::*, px, rgb, size, uniform_list,
 };
 
-use fell_core::compose::DraftSummary;
+use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::draft_host::DraftHome;
 use crate::keymap::KeyId;
@@ -117,6 +117,20 @@ struct ListRead {
 }
 
 type ThreadsResult = Result<ListRead, String>;
+
+/// What the inbox says while a reply or forward's window comes up:
+/// "reply all · Jon".
+fn reply_notice(kind: ReplyKind, sender: &str) -> String {
+    format!("{}{sender}", reply_notice_prefix(kind))
+}
+
+fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
+    match kind {
+        ReplyKind::Reply => "reply · ",
+        ReplyKind::ReplyAll => "reply all · ",
+        ReplyKind::Forward => "forward · ",
+    }
+}
 
 fn is_drafts(folder: &str) -> bool {
     folder.eq_ignore_ascii_case("drafts")
@@ -1010,6 +1024,85 @@ impl Inbox {
         .detach();
     }
 
+    /// `r`, `R`, `f`: start a reply, reply all, or forward of the message
+    /// the model picked, and bring the compose window up on it. The parent
+    /// is read on the store thread and the draft is written off this one.
+    fn start_reply(&mut self, kind: ReplyKind, cx: &mut Context<Self>) {
+        // The conversation on screen must be the selected row's: right
+        // after a move, it can still be the last row's.
+        let loaded = self.open_thread.is_some() && self.open_thread == self.session.cursor_id;
+        let Some(target) = self.session.reply_target().filter(|_| loaded) else {
+            self.session
+                .show_toast("The conversation is still loading", false);
+            return;
+        };
+        let parent_id = fell_core::MessageId::new(&target.id);
+        let sender = target.sender.clone();
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            self.session
+                .show_toast("Compose is not available here", true);
+            return;
+        };
+        let Some(home) = self.draft_home.clone() else {
+            self.session.show_toast(
+                "The mailbox did not open, so a draft has nowhere to go · ? details",
+                true,
+            );
+            return;
+        };
+        self.session.show_toast(reply_notice(kind, &sender), false);
+        let account = self.account_id.clone();
+        let email = self.session.account_email.clone();
+        let read = self.store.call({
+            let account = account.clone();
+            move |store| store.message(&account, &parent_id)
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(found) = read.await else {
+                return;
+            };
+            let result = match found {
+                Ok(Some(parent)) => {
+                    let own = fell_core::compose::own_addresses(&parent, &email);
+                    let offset = crate::present::local_offset(parent.headers.date_unix);
+                    let start = fell_core::compose::start_reply_in_zone(
+                        kind, &parent, &email, &own, offset,
+                    );
+                    let hub = hub.clone();
+                    cx.background_executor()
+                        .spawn(async move { home.new_reply(&hub, &account, start) })
+                        .await
+                }
+                Ok(None) => Err("the message is no longer in the mailbox".to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                match result {
+                    Ok(id) => {
+                        if crate::draft_host::show_draft(&hub, &id) {
+                            inbox.settle_opening_notice(cx);
+                        }
+                    }
+                    Err(err) => {
+                        let what = if kind == ReplyKind::Forward {
+                            "start the forward"
+                        } else {
+                            "start the reply"
+                        };
+                        inbox
+                            .session
+                            .show_toast(format!("Couldn't {what}: {err}"), true);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The window is on its way: once it has had time to show, the inbox's
     /// "opening" notice has done its job and goes, unless something newer
     /// replaced it.
@@ -1020,7 +1113,11 @@ impl Inbox {
                 .await;
             let _ = this.update(cx, |inbox, cx| {
                 let opening = inbox.session.toast.as_ref().is_some_and(|toast| {
-                    toast.text.starts_with("opening draft") || toast.text == "new draft"
+                    toast.text.starts_with("opening draft")
+                        || toast.text == "new draft"
+                        || [ReplyKind::Reply, ReplyKind::ReplyAll, ReplyKind::Forward]
+                            .into_iter()
+                            .any(|kind| toast.text.starts_with(reply_notice_prefix(kind)))
                 });
                 if opening {
                     inbox.session.clear_toast();
@@ -1135,6 +1232,9 @@ impl Inbox {
             && let Some(id) = self.session.cursor_draft().map(str::to_string)
         {
             self.open_draft(Some(id), cx);
+        }
+        if let Some(kind) = step.reply {
+            self.start_reply(kind, cx);
         }
         if step.sync_now {
             match &self.sync {
@@ -2885,7 +2985,8 @@ fn should_follow_visible(overlay: &Overlay, chord_empty: bool, pane: Pane, key: 
     }
     match key {
         KeyId::Char('j' | 'k' | 'q') => true,
-        KeyId::Enter | KeyId::Char('o') => pane == Pane::Conversation,
+        // Expand, reply, reply all, and forward act on the message on screen.
+        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f') => pane == Pane::Conversation,
         _ => false,
     }
 }
@@ -3077,5 +3178,21 @@ mod tests {
             Pane::Conversation,
             KeyId::Char('k')
         ));
+        // r, R, and f answer the message on screen in the conversation, and
+        // the latest one from the list.
+        for key in ['r', 'R', 'f'] {
+            assert!(should_follow_visible(
+                &Overlay::None,
+                true,
+                Pane::Conversation,
+                KeyId::Char(key)
+            ));
+            assert!(!should_follow_visible(
+                &Overlay::None,
+                true,
+                Pane::List,
+                KeyId::Char(key)
+            ));
+        }
     }
 }
