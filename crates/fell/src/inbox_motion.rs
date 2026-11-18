@@ -87,6 +87,9 @@ pub struct InboxMotion {
     /// The conversation gliding to a page or a message.
     pub conv_glide: Option<Glide>,
     toast_in: Option<Transition>,
+    /// The opacity a notice fading in starts from: what a notice still
+    /// leaving has already lost, so the two never show less than one.
+    toast_from: f32,
     /// The notice that is leaving and its fade.
     toast_out: Option<(Toast, Transition)>,
     last_toast: Option<Toast>,
@@ -119,6 +122,10 @@ pub struct InboxMotion {
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
     conv_from: Option<f32>,
+    /// The palette or folder picker's height: it fits its items, and eases
+    /// to the new fit when typing changes how many there are.
+    card_to: Option<f32>,
+    card_glide: Option<Glide>,
 }
 
 /// Scroll offsets a settle jumped to, for the view to apply.
@@ -136,6 +143,7 @@ impl InboxMotion {
             list_glide: None,
             conv_glide: None,
             toast_in: None,
+            toast_from: 0.0,
             toast_out: None,
             last_toast: None,
             hints_out: None,
@@ -157,6 +165,8 @@ impl InboxMotion {
             arrival: None,
             list_from: None,
             conv_from: None,
+            card_to: None,
+            card_glide: None,
         }
     }
 
@@ -178,10 +188,12 @@ impl InboxMotion {
                         self.toast_out = None;
                     } else {
                         self.toast_in = start(motion::FADE);
+                        self.toast_from = 0.0;
                         match old {
-                            // Another notice replaced this one: cross-fade.
+                            // Another notice replaced this one: cross-fade,
+                            // out as fast as the new one comes in.
                             Some(old) => {
-                                self.toast_out = start(motion::QUICK).map(|fade| (old, fade));
+                                self.toast_out = start(motion::FADE).map(|fade| (old, fade));
                             }
                             // The hints make room as the notice comes, from
                             // what shows of them now. A notice still leaving
@@ -189,12 +201,19 @@ impl InboxMotion {
                             // A chord's prefix held the hints' place: the
                             // hints were not showing, so they stay hidden.
                             None => {
+                                // A notice that comes a few frames after the
+                                // key cleared the last one (an archive is
+                                // shown when the store has it) picks up
+                                // where that one fades.
+                                if let Some((_, fade)) = &self.toast_out {
+                                    self.toast_from = 1.0 - fade.remaining(now);
+                                }
                                 self.hints_from = match &self.toast_out {
                                     _ if self.last_chord => 0.0,
-                                    Some((_, fade)) => fade.progress(now),
+                                    Some((_, fade)) => 1.0 - fade.remaining(now),
                                     None => 1.0,
                                 };
-                                self.hints_out = start(motion::QUICK);
+                                self.hints_out = start(motion::FADE);
                             }
                         }
                     }
@@ -202,7 +221,7 @@ impl InboxMotion {
                 (None, Some(old)) => {
                     self.toast_in = None;
                     self.hints_out = None;
-                    self.toast_out = start(motion::FADE_OUT).map(|fade| (old, fade));
+                    self.toast_out = start(motion::FADE).map(|fade| (old, fade));
                 }
                 (None, None) => {}
             }
@@ -221,7 +240,7 @@ impl InboxMotion {
                     .last_layer
                     .clone()
                     .filter(|layer| !layer.chord.is_empty())
-                    .and_then(|layer| start(motion::QUICK).map(|fade| (layer, fade)));
+                    .and_then(|layer| start(motion::FADE).map(|fade| (layer, fade)));
             }
         }
         self.last_which = which;
@@ -235,10 +254,13 @@ impl InboxMotion {
                     .last_layer
                     .clone()
                     .filter(|layer| layer.overlay != Overlay::None)
-                    .and_then(|layer| start(motion::QUICK).map(|fade| (layer, fade)));
+                    .and_then(|layer| start(motion::FADE).map(|fade| (layer, fade)));
             } else {
                 self.overlay = start(motion::FADE);
                 self.overlay_out = None;
+                // A card that opens is as tall as its items at once.
+                self.card_to = None;
+                self.card_glide = None;
             }
             self.last_overlay = session.overlay.clone();
         }
@@ -273,6 +295,26 @@ impl InboxMotion {
                 .and_then(|old| start(motion::QUICK).map(|fade| (old, fade)));
             self.last_selected = session.cursor_id.clone();
         }
+    }
+
+    /// The open card should be `fit` pixels tall to hold its items; `None`
+    /// when no card is open, and one fading out keeps the height it had.
+    /// A key never settles this: nothing acts on the card's bottom edge,
+    /// and typing quickly keeps easing from where the edge is drawn.
+    pub fn fit_card(&mut self, fit: Option<f32>, now: Instant) {
+        let Some(fit) = fit else { return };
+        if let Some(to) = self.card_to.filter(|to| (to - fit).abs() >= 0.5) {
+            let from = self.card_glide.map_or(to, |glide| glide.value(now));
+            self.card_glide = Glide::start(&self.motion, from, fit, 0.0, motion::FADE, now);
+        }
+        self.card_to = Some(fit);
+    }
+
+    /// How tall the card is drawn now.
+    pub fn card_height(&self, now: Instant) -> Option<f32> {
+        self.card_glide
+            .map(|glide| glide.value(now))
+            .or(self.card_to)
     }
 
     /// Another thread's messages replaced the conversation.
@@ -360,6 +402,10 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
+        if self.card_glide.is_some_and(|glide| !glide.running(now)) {
+            self.card_glide = None;
+        }
+        running |= self.card_glide.is_some();
         running |= keep_with(&mut self.selection_out, now);
         if self.pane.is_some_and(|(t, _)| !t.running(now)) {
             self.pane = None;
@@ -402,17 +448,17 @@ impl InboxMotion {
     }
 
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
-        let notice = session
-            .toast
-            .clone()
-            .map(|toast| (toast, motion::progress(self.toast_in.as_ref(), now)));
+        let notice = session.toast.clone().map(|toast| {
+            let p = motion::progress(self.toast_in.as_ref(), now);
+            (toast, motion::lerp(self.toast_from, 1.0, p))
+        });
         let leaving = self
             .toast_out
             .as_ref()
-            .map(|(toast, fade)| (toast.clone(), 1.0 - fade.progress(now)));
+            .map(|(toast, fade)| (toast.clone(), fade.remaining(now)));
         let hints = match (&notice, &leaving) {
             (Some(_), _) => {
-                self.hints_from * (1.0 - motion::progress(self.hints_out.as_ref(), now))
+                self.hints_from * self.hints_out.map_or(0.0, |fade| fade.remaining(now))
             }
             (None, Some((_, opacity))) => 1.0 - opacity,
             (None, None) => 1.0,
@@ -440,14 +486,14 @@ impl InboxMotion {
     pub fn closing_overlay(&mut self, now: Instant) -> Option<(&mut Layer, f32)> {
         self.overlay_out
             .as_mut()
-            .map(|(layer, fade)| (layer, 1.0 - fade.progress(now)))
+            .map(|(layer, fade)| (layer, fade.remaining(now)))
     }
 
     /// The which-key popup that just closed, as it was, and its opacity.
     pub fn closing_which(&mut self, now: Instant) -> Option<(&mut Layer, f32)> {
         self.which_out
             .as_mut()
-            .map(|(layer, fade)| (layer, 1.0 - fade.progress(now)))
+            .map(|(layer, fade)| (layer, fade.remaining(now)))
     }
 
     pub fn pane_entry(&self, pane: Pane, now: Instant) -> PaneEntry {
@@ -496,12 +542,6 @@ impl InboxMotion {
         } else {
             1.0 - p
         }
-    }
-
-    /// Progress of a focus change between the panes: the key hints, which
-    /// differ per pane, fade in with it.
-    pub fn focus_change(&self, now: Instant) -> f32 {
-        motion::progress(self.focus.as_ref(), now)
     }
 }
 
@@ -559,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hints_fade_out_quicker_than_a_notice_fades_in() {
+    fn the_hints_fade_out_as_a_notice_fades_in() {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
         let now = Instant::now();
@@ -569,9 +609,11 @@ mod tests {
         assert_eq!(motion.status(&session, now).hints, 1.0, "no pop");
         let mid = motion.status(&session, later(now, 40));
         assert!(mid.hints > 0.0 && mid.hints < 1.0);
-        let quick = motion.status(&session, later(now, 80));
-        assert_eq!(quick.hints, 0.0, "gone after QUICK");
-        assert!(quick.notice.unwrap().1 < 1.0, "still fading in over FADE");
+        let sum = mid.hints + mid.notice.unwrap().1;
+        assert!((1.0..1.2).contains(&sum), "never a dip: {sum}");
+        let done = motion.status(&session, later(now, 120));
+        assert_eq!(done.hints, 0.0, "gone after FADE");
+        assert_eq!(done.notice.unwrap().1, 1.0);
     }
 
     #[test]
@@ -606,12 +648,45 @@ mod tests {
         assert_eq!(old.text, "Undone");
         assert_eq!(opacity, 1.0);
         assert_eq!(status.hints, 0.0);
-        let after = motion.status(&session, later(swap, 80));
-        assert!(
-            after.leaving.is_none_or(|(_, o)| o == 0.0),
-            "old out over QUICK"
+        // A true cross-fade: one goes as the other comes, never a cut.
+        for ms in [17, 33, 50, 80] {
+            let mid = motion.status(&session, later(swap, ms));
+            let (old, new) = (mid.leaving.unwrap().1, mid.notice.unwrap().1);
+            assert!((1.0..1.2).contains(&(old + new)), "{ms} ms: {old} + {new}");
+        }
+        assert!(motion.status(&session, later(swap, 17)).leaving.unwrap().1 > 0.7);
+        let after = motion.status(&session, later(swap, 120));
+        assert!(after.leaving.is_none_or(|(_, o)| o == 0.0), "out over FADE");
+        assert_eq!(after.notice.unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn a_notice_that_comes_late_picks_up_where_the_last_one_fades() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Undone", false);
+        motion.observe(&session, (true, true), now);
+        motion.settle(now);
+        // `e`: the key clears "Undone" at once ...
+        let key = later(now, 300);
+        session.clear_toast();
+        motion.observe(&session, (true, true), key);
+        // ... and the store has the archive three frames later.
+        let shown = later(key, 50);
+        session.show_toast("Archived · u", false);
+        motion.observe(&session, (true, true), shown);
+        for ms in [0, 17, 33, 60] {
+            let status = motion.status(&session, later(shown, ms));
+            let new = status.notice.unwrap().1;
+            let old = status.leaving.map_or(0.0, |(_, o)| o);
+            // Within a few percent of one whole notice: no visible dip.
+            assert!(old + new >= 0.95, "{ms} ms: {old} + {new}");
+        }
+        assert_eq!(
+            motion.status(&session, later(shown, 120)).notice.unwrap().1,
+            1.0
         );
-        assert!(after.notice.unwrap().1 < 1.0, "new in over FADE");
     }
 
     #[test]
@@ -681,11 +756,16 @@ mod tests {
         layer.swap(&mut session);
         assert_eq!(session.overlay, Overlay::None, "the session is put back");
         assert!(session.palette_query.is_empty());
-        // A key during the fade does not cut it off, and it ends in QUICK.
+        // A key during the fade does not cut it off, and it ends in FADE.
         motion.settle(later(now, 40));
         assert!(motion.closing_overlay(later(now, 40)).unwrap().1 < 1.0);
-        assert!(!motion.tick(later(now, 80)));
-        assert!(motion.closing_overlay(later(now, 80)).is_none());
+        assert!(
+            motion.closing_overlay(later(now, 17)).unwrap().1 > 0.7,
+            "no cut on the first frame"
+        );
+        assert!(motion.tick(later(now, 80)));
+        assert!(!motion.tick(later(now, 120)));
+        assert!(motion.closing_overlay(later(now, 120)).is_none());
     }
 
     #[test]
@@ -749,7 +829,6 @@ mod tests {
         assert_eq!(entry.opacity, 0.0);
         assert!(entry.dx > 0.0, "from the right");
         assert_eq!(motion.pane_entry(Pane::List, now).opacity, 1.0);
-        assert_eq!(motion.focus_change(now), 0.0, "the hints fade in");
         session.pane = Pane::List;
         let back = later(now, 300);
         motion.observe(&session, (true, false), back);
@@ -757,6 +836,42 @@ mod tests {
             motion.pane_entry(Pane::List, back).dx < 0.0,
             "from the left"
         );
+    }
+
+    #[test]
+    fn the_palette_eases_to_fit_its_items() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.overlay = Overlay::Palette;
+        motion.observe(&session, (true, true), now);
+        motion.fit_card(Some(400.0), now);
+        assert_eq!(motion.card_height(now), Some(400.0), "opens at its fit");
+        // Typing filters it down to two items.
+        let typed = later(now, 200);
+        motion.fit_card(Some(126.0), typed);
+        assert_eq!(motion.card_height(typed), Some(400.0), "no jump");
+        let mid = motion.card_height(later(typed, 40)).unwrap();
+        assert!(mid < 400.0 && mid > 126.0);
+        // Another key mid-ease starts from where the edge is drawn.
+        motion.settle(later(typed, 40));
+        motion.fit_card(Some(90.0), later(typed, 40));
+        assert_eq!(motion.card_height(later(typed, 40)), Some(mid));
+        assert!(!motion.tick(later(typed, 200)));
+        assert_eq!(motion.card_height(later(typed, 200)), Some(90.0));
+        // Closed and opened again: at its fit at once.
+        session.overlay = Overlay::None;
+        motion.observe(&session, (true, true), later(typed, 300));
+        motion.fit_card(None, later(typed, 300));
+        assert_eq!(
+            motion.card_height(later(typed, 300)),
+            Some(90.0),
+            "fades out as it was"
+        );
+        session.overlay = Overlay::Folders;
+        motion.observe(&session, (true, true), later(typed, 400));
+        motion.fit_card(Some(200.0), later(typed, 400));
+        assert_eq!(motion.card_height(later(typed, 400)), Some(200.0));
     }
 
     #[test]

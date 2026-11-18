@@ -263,6 +263,15 @@ pub fn landing(switched: bool, holds_viewport: bool, same_thread: bool) -> Landi
     }
 }
 
+/// How tall a palette or folder-picker card is drawn to hold `rows` items
+/// of `row_px` each: its 1 px border top and bottom, the 44 px query line
+/// and 4 px above and below the rows. Never taller than `max` or the
+/// `room` the window leaves, never shorter than the query line.
+pub fn card_height(rows: usize, row_px: f32, max: f32, room: f32) -> f32 {
+    let fit = 2.0 + 44.0 + 8.0 + rows as f32 * row_px;
+    fit.min(max).min(room).max(2.0 + 44.0)
+}
+
 /// The list scroll offset (0 at the top, negative further down) that shows
 /// row `index` of `rows` rows of height `row` in a viewport `view` tall,
 /// starting from `offset`. A row already in full view stays put. `moved`:
@@ -876,6 +885,20 @@ mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    #[test]
+    fn a_card_is_as_tall_as_its_items_up_to_its_max() {
+        // Five folders: no empty surface below the last (#171).
+        assert_eq!(card_height(5, 34.0, 380.0, 900.0), 54.0 + 170.0);
+        assert_eq!(card_height(0, 36.0, 420.0, 900.0), 54.0);
+        assert_eq!(card_height(40, 36.0, 420.0, 900.0), 420.0);
+        assert_eq!(card_height(40, 36.0, 420.0, 300.0), 300.0, "a short window");
+        assert_eq!(
+            card_height(40, 36.0, 420.0, 10.0),
+            46.0,
+            "the query line stays"
+        );
+    }
 
     #[test]
     fn the_list_scrolls_only_as_far_as_the_selection_needs() {

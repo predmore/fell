@@ -1724,6 +1724,9 @@ impl Render for Inbox {
         let width = f32::from(window.viewport_size().width);
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
         self.motion.observe(&self.session, panes, now);
+        let viewport_h = f32::from(window.viewport_size().height);
+        self.motion
+            .fit_card(card_fit(&self.session, viewport_h), now);
         self.advance_glides(now, window.scale_factor());
         let animating = self.motion.tick(now);
         if animating {
@@ -1740,6 +1743,10 @@ impl Render for Inbox {
         let folder_scroll = self.folder_scroll.clone();
         let focus = self.focus.clone();
         let split = self.split;
+        let card = self
+            .motion
+            .card_height(now)
+            .map(|height| motion::snap(height, window.scale_factor()));
         // An overlay or which-key a key just closed fades out as it was
         // drawn: its state goes back into the session only while its
         // element is built. It takes no input.
@@ -1756,6 +1763,7 @@ impl Render for Inbox {
                     &theme,
                     &self.session,
                     (opacity, 0.0),
+                    card,
                     false,
                     &palette_scroll,
                     &folder_scroll,
@@ -1771,7 +1779,11 @@ impl Render for Inbox {
             &self.session,
             &self.motion,
             now,
-            Shown { subject, leaving },
+            Shown {
+                subject,
+                leaving,
+                card,
+            },
             width,
             split,
             list_scroll,
@@ -1813,6 +1825,8 @@ struct Shown {
     subject: String,
     /// Overlays fading out, drawn under any open one.
     leaving: Vec<gpui::AnyElement>,
+    /// The palette's or folder picker's height as drawn this frame.
+    card: Option<f32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1837,7 +1851,11 @@ fn shell(
     let list_entry = motion.pane_entry(Pane::List, now);
     let conv_entry = motion.pane_entry(Pane::Conversation, now);
     let status = motion.status(session, now);
-    let Shown { subject, leaving } = shown;
+    let Shown {
+        subject,
+        leaving,
+        card,
+    } = shown;
     div()
         .id("fell-root")
         .track_focus(&focus)
@@ -1923,14 +1941,7 @@ fn shell(
                     ))
                 }),
         )
-        .child(status_bar(
-            &theme,
-            session,
-            status,
-            motion.focus_change(now),
-            width,
-            window,
-        ))
+        .child(status_bar(&theme, session, status, width, window))
         .children(leaving)
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
@@ -1941,6 +1952,7 @@ fn shell(
                 &theme,
                 session,
                 motion.overlay(now),
+                card,
                 true,
                 &palette_scroll,
                 &folder_scroll,
@@ -2959,18 +2971,19 @@ fn body_block(
     }
 }
 
-/// `hints_in`: how far the key hints are into a focus change, which
-/// swaps them for the other pane's.
+/// Mode, sync state and one notice. At rest there are no key hints
+/// (docs/ux.md, Quiet): the right side shows only what the reader is
+/// typing, a count or a chord's prefix, while which-key lists the rest.
 fn status_bar(
     theme: &Theme,
     session: &Session,
     status: StatusMotion,
-    hints_in: f32,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
-    // A notice takes the key hints' room, entering or leaving, so its text
-    // never re-flows as it fades. The hints fade under it at the right.
+    // A notice takes the room of the keys being typed (a count, a chord's
+    // prefix), entering or leaving, so its text never re-flows as it fades.
+    // Those keys fade under it at the right.
     let noticed = status.notice.is_some() || status.leaving.is_some();
     let notice_opacity = status
         .notice
@@ -2978,19 +2991,10 @@ fn status_bar(
         .chain(status.leaving.iter())
         .map(|(_, opacity)| *opacity)
         .fold(0.0, f32::max);
-    let hint = if !session.chord.is_empty() {
-        session.prefix_text()
-    } else if session.cursor_draft().is_some() {
-        // A draft that may have gone out opens read-only.
-        if session.cursor_thread().is_some_and(|row| row.warn) {
-            "j k  ·  enter open  ·  c new  ·  space  ·  :".to_string()
-        } else {
-            "j k  ·  enter edit  ·  c new  ·  space  ·  :".to_string()
-        }
-    } else if session.pane == Pane::Conversation {
-        "j k  ·  esc  ·  ctrl-d  ·  space  ·  :".to_string()
+    let hint = if session.chord.is_empty() {
+        String::new()
     } else {
-        "j k  ·  enter  ·  space  ·  :".to_string()
+        session.prefix_text()
     };
     let count = if session.count.is_empty() {
         String::new()
@@ -3000,36 +3004,10 @@ fn status_bar(
     let size = (theme.ui_px - 1.0).max(12.0);
     let ui = theme.ui_family.as_ref();
     let mono = theme.mono_family.as_ref();
-    // Key hints give up whole keys from the end until they fit beside the
-    // mode and sync, so a narrow window never cuts one in half.
-    let hint = if session.chord.is_empty() {
-        let mut room = width
-            - 28.0
-            - 4.0 * 12.0
-            - 16.0
-            - bar_px(window, session.mode_label(), size, mono)
-            - bar_px(window, &session.sync.status(), size, ui)
-            - bar_px(window, "·", size, ui);
-        if session.detail_text().is_some() {
-            room -= 12.0 + bar_px(window, "· ? details", size, ui);
-        }
-        let mut parts: Vec<&str> = hint.split("  ·  ").collect();
-        while parts.len() > 1 && bar_px(window, &parts.join("  ·  "), size, mono) > room {
-            parts.pop();
-        }
-        parts.join("  ·  ")
-    } else {
-        hint
-    };
-    let hint_opacity = status.hints
-        * if session.chord.is_empty() {
-            hints_in
-        } else {
-            1.0
-        };
+    let hint_opacity = status.hints;
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
-    // children. No key hints show beside a notice, so no air after it.
+    // children. No typed keys show beside a notice, so no air after it.
     let mut used = 28.0 + 4.0 * 12.0;
     used += bar_px(window, session.mode_label(), size, mono)
         + bar_px(window, &session.sync.status(), size, ui)
@@ -3114,7 +3092,7 @@ fn status_bar(
                 .relative()
                 .flex_1()
                 .min_w(px(0.))
-                // Air before the key hints, so a long message never runs into them.
+                // Air before the typed keys, so a long message never runs into them.
                 .when(!noticed, |cell| cell.pr(px(16.)))
                 .overflow_hidden()
                 .map(|cell| match (current, leaving) {
@@ -3200,10 +3178,34 @@ fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)
 
 const PALETTE_PX: f32 = 560.0;
 const PICKER_PX: f32 = 420.0;
+const PALETTE_MAX_PX: f32 = 420.0;
+const PICKER_MAX_PX: f32 = 380.0;
+const PALETTE_ROW_PX: f32 = 36.0;
+const PICKER_ROW_PX: f32 = 34.0;
+/// Where the palette, folder picker and help card sit below the window's top.
+const CARD_TOP_PX: f32 = 72.0;
+
+/// How tall the open palette or folder picker should be to hold its items
+/// (its border, the 44 px query line and 4 px above and below the rows),
+/// up to its maximum and the window. `None` for any other overlay.
+fn card_fit(session: &Session, viewport_h: f32) -> Option<f32> {
+    let (rows, row_px, max) = match session.overlay {
+        Overlay::Palette => (session.palette().len(), PALETTE_ROW_PX, PALETTE_MAX_PX),
+        Overlay::Folders => (session.folder_choices().len(), PICKER_ROW_PX, PICKER_MAX_PX),
+        _ => return None,
+    };
+    Some(present::card_height(
+        rows,
+        row_px,
+        max,
+        viewport_h - CARD_TOP_PX - 16.0,
+    ))
+}
 const HELP_PX: f32 = 520.0;
 
 /// `(opacity, drop)`: the card fades in as it settles the last few pixels
-/// down; its width never changes, so nothing in it re-flows. `live`: false
+/// down; its width never changes, so nothing in it re-flows. `card`: the
+/// palette's or folder picker's height, easing to fit its items. `live`: false
 /// for one fading out after it closed, which takes no input: clicks go
 /// through to what is under it.
 #[allow(clippy::too_many_arguments)]
@@ -3211,6 +3213,7 @@ fn overlay(
     theme: &Theme,
     session: &Session,
     (opacity, drop): (f32, f32),
+    card: Option<f32>,
     live: bool,
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
@@ -3224,7 +3227,7 @@ fn overlay(
         .bottom(px(0.))
         .flex()
         .justify_center()
-        .pt(px(72. - drop))
+        .pt(px(CARD_TOP_PX - drop))
         .when(live, |layer| {
             layer.occlude().on_mouse_down(
                 MouseButton::Left,
@@ -3236,9 +3239,11 @@ fn overlay(
         })
         .child(match session.overlay {
             Overlay::Palette => palette(theme, session, palette_scroll, cx)
+                .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::Folders => folder_picker(theme, session, folder_scroll, cx)
+                .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::Help => help(theme, session, cx).opacity(opacity).into_any_element(),
@@ -3256,7 +3261,7 @@ fn palette(
     let selected = session.palette_index;
     div()
         .w(px(PALETTE_PX))
-        .max_h(px(420.))
+        .max_h(px(PALETTE_MAX_PX))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -3300,7 +3305,7 @@ fn palette(
                     let action = item.action;
                     div()
                         .id(gpui::ElementId::named_usize("palette", index))
-                        .h(px(36.))
+                        .h(px(PALETTE_ROW_PX))
                         .mx(px(4.))
                         .px(px(10.))
                         .flex()
@@ -3367,7 +3372,7 @@ fn folder_picker(
     let selected = session.folder_index;
     div()
         .w(px(PICKER_PX))
-        .max_h(px(380.))
+        .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -3428,7 +3433,7 @@ fn folder_picker(
                     };
                     div()
                         .id(gpui::ElementId::named_usize("folder", index))
-                        .h(px(34.))
+                        .h(px(PICKER_ROW_PX))
                         .mx(px(4.))
                         .px(px(10.))
                         .flex()

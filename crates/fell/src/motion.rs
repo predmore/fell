@@ -26,27 +26,28 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// A colour or focus change: a pane's focus edge.
+/// A colour or focus change (a pane's focus edge), or content that
+/// arrives in place from [`ARRIVE_FROM`]: another thread's messages,
+/// another folder's rows.
 pub const QUICK: Duration = Duration::from_millis(80);
-/// A row leaving the list: it fades while the rows below close the gap.
-pub const COLLAPSE: Duration = Duration::from_millis(100);
-/// Rows arriving or moving, a pane sliding in, a scroll gliding to its target.
+/// Rows moving, a pane sliding in, a scroll gliding to its target.
 pub const SLIDE: Duration = Duration::from_millis(120);
 /// A pane coming into view: the conversation replacing the list in a
 /// narrow window, or the list coming back. The longest move, so the longest.
 pub const PANE: Duration = Duration::from_millis(160);
-/// An overlay (palette, folder picker, which-key) or a notice fading in.
-/// Overlays and notices leave faster, over [`QUICK`].
+/// Anything fading in or out on its own: an overlay (palette, folder
+/// picker, help, which-key), a notice, a row that left the list. Every
+/// exit takes this long, on the gentler [`fade_out`] curve, so nothing
+/// that leaves reads as a cut.
 pub const FADE: Duration = Duration::from_millis(120);
-/// A notice fading out after the next key cleared it.
-pub const FADE_OUT: Duration = Duration::from_millis(160);
 
 /// How far an overlay rises while it fades in, in pixels.
 pub const RISE_PX: f32 = 6.0;
 /// How far a pane that comes into view slides in from its side, in pixels.
 pub const PANE_SLIDE_PX: f32 = 24.0;
-/// Another thread's messages arrive at this opacity and settle to full,
-/// so switching threads softens instead of blinking through empty.
+/// Another thread's messages, and another folder's rows, arrive at this
+/// opacity and settle to full over [`QUICK`], so switching softens instead
+/// of blinking through empty.
 pub const ARRIVE_FROM: f32 = 0.4;
 /// A glide never starts further than this many viewports from its target:
 /// `gg` from far down the list covers the last stretch, not every row.
@@ -56,6 +57,14 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 1.0;
 pub fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
+}
+
+/// How much of something leaving still shows at linear time `t`: a
+/// quadratic ease-out, gentler at the start than [`ease_out`], so an exit
+/// never reads as a cut. Over [`FADE`] at 60 Hz: 74 %, 52 %, 34 % after
+/// one, two and three frames.
+pub fn fade_out(t: f32) -> f32 {
+    (1.0 - t.clamp(0.0, 1.0)).powi(2)
 }
 
 pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
@@ -110,6 +119,11 @@ impl Transition {
 
     pub fn running(&self, now: Instant) -> bool {
         self.linear(now) < 1.0
+    }
+
+    /// For a fade-out: how much of what is leaving still shows ([`fade_out`]).
+    pub fn remaining(&self, now: Instant) -> f32 {
+        fade_out(self.linear(now))
     }
 }
 
@@ -265,7 +279,7 @@ pub struct Ghost<R> {
 
 impl<R> Ghost<R> {
     pub fn opacity(&self, now: Instant) -> f32 {
-        1.0 - self.transition.progress(now)
+        self.transition.remaining(now)
     }
 
     pub fn running(&self, now: Instant) -> bool {
@@ -279,12 +293,15 @@ impl<R> Ghost<R> {
 /// The list itself changes at once. Each row is drawn offset by where it
 /// used to be, and the offset eases to zero: rows below an archived row
 /// slide up into its place, rows below an undone row slide down to make
-/// room, and a row that was not on screen fades in. Rows that left are
-/// [`Ghost`]s. When no row on screen survives the change, or the list is
-/// another folder's, the new rows fade in and nothing slides.
+/// room and it opens in the gap, and a row that was not on screen arrives
+/// in place from [`ARRIVE_FROM`]. Rows that left are [`Ghost`]s. When no
+/// row on screen survives the change, or the list is another folder's,
+/// every row arrives in place and nothing slides.
 #[derive(Clone, Debug)]
 pub struct ListShift<R> {
     transition: Transition,
+    /// Rows arriving in place, from [`ARRIVE_FROM`]: never from empty.
+    arrive: Transition,
     /// Row id → its top before the change, in viewport pixels.
     before: HashMap<String, f32>,
     /// Row id → how far it is drawn from its slot when the shift starts,
@@ -303,7 +320,7 @@ impl<R: Clone> ListShift<R> {
     /// with their top in list content as of now. `carried`: ghosts of an
     /// earlier shift still fading, kept so a quick second change does not
     /// cut them off. `replace`: the list is another one (a folder switch):
-    /// every row fades in, and nothing of the old list lingers.
+    /// every row arrives in place, and nothing of the old list lingers.
     pub fn start(
         motion: &Motion,
         before: Vec<(String, f32)>,
@@ -314,8 +331,9 @@ impl<R: Clone> ListShift<R> {
         now: Instant,
     ) -> Option<ListShift<R>> {
         let transition = motion.start(SLIDE, now)?;
+        let arrive = motion.start(QUICK, now)?;
         let replaced = replace || (!before.is_empty() && left.len() == before.len());
-        let fade = motion.start(COLLAPSE, now)?;
+        let fade = motion.start(FADE, now)?;
         let mut ghosts: Vec<Ghost<R>> = Vec::new();
         if !replaced {
             ghosts.extend(carried.into_iter().filter(|ghost| ghost.running(now)));
@@ -327,6 +345,7 @@ impl<R: Clone> ListShift<R> {
         }
         Some(ListShift {
             transition,
+            arrive,
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
             ghosts,
@@ -336,7 +355,7 @@ impl<R: Clone> ListShift<R> {
     }
 
     /// How far row `id`, whose slot starts at viewport `top`, starts from
-    /// its slot: `None` when it fades in instead.
+    /// its slot: `None` when it appears where it is instead.
     fn start_for(&self, id: &str, top: f32) -> Option<f32> {
         if self.replaced {
             return None;
@@ -376,14 +395,26 @@ impl<R: Clone> ListShift<R> {
             },
             None => {
                 // The row below came down from above: this row was put in
-                // between, and the gap it sits in is still opening.
+                // between (undo, new mail), and it grows with the gap it
+                // sits in.
                 let opening = below
                     .and_then(|(next, next_top)| self.resolve(next, next_top))
                     .is_some_and(|dy| dy < -0.5);
-                RowMotion {
-                    dy: 0.0,
-                    opacity: p,
-                    reveal: if opening { p } else { 1.0 },
+                if opening {
+                    RowMotion {
+                        dy: 0.0,
+                        opacity: p,
+                        reveal: p,
+                    }
+                } else {
+                    // Arriving in a slot nothing slides into (another
+                    // folder, a `G` landing): softened, never blinked
+                    // through empty.
+                    RowMotion {
+                        dy: 0.0,
+                        opacity: lerp(ARRIVE_FROM, 1.0, self.arrive.progress(now)),
+                        reveal: 1.0,
+                    }
                 }
             }
         }
@@ -452,7 +483,7 @@ mod tests {
 
     #[test]
     fn durations_stay_in_the_quick_range() {
-        for duration in [QUICK, COLLAPSE, SLIDE, PANE, FADE, FADE_OUT] {
+        for duration in [QUICK, SLIDE, PANE, FADE] {
             assert!((80..=160).contains(&duration.as_millis()), "{duration:?}");
         }
     }
@@ -464,6 +495,17 @@ mod tests {
         assert!(ease_out(0.25) > 0.25, "ease-out leads the clock");
         assert_eq!(ease_out(2.0), 1.0);
         assert_eq!(ease_out(-1.0), 0.0);
+    }
+
+    #[test]
+    fn an_exit_is_gentle_on_its_first_frames() {
+        let start = Instant::now();
+        let fade = Transition::new(start, FADE);
+        assert_eq!(fade.remaining(start), 1.0);
+        let frame = Duration::from_micros(16_667);
+        assert!(fade.remaining(start + frame) > 0.7);
+        assert!(fade.remaining(start + 2 * frame) > 0.5);
+        assert_eq!(fade.remaining(at(start, 120)), 0.0);
     }
 
     #[test]
@@ -598,16 +640,16 @@ mod tests {
             start,
         )
         .unwrap();
-        assert_eq!(shift.row("new", 0.0, None, start).opacity, 0.0);
+        assert_eq!(shift.row("new", 0.0, None, start).opacity, ARRIVE_FROM);
         assert_eq!(
             shift.row("far", 900.0, None, start),
             RowMotion {
                 dy: 0.0,
-                opacity: 0.0,
+                opacity: ARRIVE_FROM,
                 reveal: 1.0,
             }
         );
-        assert_eq!(shift.row("new", 0.0, None, at(start, 120)).opacity, 1.0);
+        assert_eq!(shift.row("new", 0.0, None, at(start, 80)).opacity, 1.0);
     }
 
     #[test]
@@ -617,6 +659,7 @@ mod tests {
         let mut shift = shift(&[("a", 0.0), ("c", 68.0)], &[], vec![], false, start);
         let b = shift.row("b", 68.0, Some(("c", 136.0)), start);
         assert_eq!(b.reveal, 0.0, "closed while c still covers its slot");
+        assert_eq!(b.opacity, 0.0, "it grows with its gap");
         let mid = at(start, 40);
         let b = shift.row("b", 68.0, Some(("c", 136.0)), mid);
         let c = shift.row("c", 136.0, None, mid);
@@ -637,7 +680,35 @@ mod tests {
         let start = Instant::now();
         let mut replaced = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], false, start);
         assert!(replaced.ghosts_in(0.0, 68.0, start).is_empty());
-        assert_eq!(replaced.row("x", 0.0, None, start).opacity, 0.0);
+        assert_eq!(replaced.row("x", 0.0, None, start).opacity, ARRIVE_FROM);
+    }
+
+    #[test]
+    fn a_folder_switch_never_paints_an_empty_list() {
+        let start = Instant::now();
+        // `gs`: Sent's rows replace the inbox's. Rows below the first are
+        // asked for with the row below them, as the view does.
+        let mut switched = shift(
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0)],
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0)],
+            vec![],
+            true,
+            start,
+        );
+        let rows = [("x", 0.0), ("y", 68.0), ("z", 136.0)];
+        let mut last = [0.0f32; 3];
+        for ms in [0, 1, 16, 33, 50, 66, 80] {
+            let now = at(start, ms);
+            for (i, (id, top)) in rows.iter().enumerate() {
+                let below = rows.get(i + 1).map(|(id, top)| (*id, *top));
+                let drawn = switched.row(id, *top, below, now);
+                assert!(drawn.opacity >= ARRIVE_FROM, "{id} at {ms} ms: {drawn:?}");
+                assert!(drawn.opacity >= last[i], "never dims again");
+                assert_eq!((drawn.dy, drawn.reveal), (0.0, 1.0));
+                last[i] = drawn.opacity;
+            }
+        }
+        assert_eq!(last, [1.0; 3], "full after QUICK");
     }
 
     #[test]
