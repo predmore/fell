@@ -61,7 +61,7 @@ fell-mcp grant --store /path/to/fell.sqlite --account ACCOUNT --agent AGENT --re
 fell-mcp serve --store /path/to/fell.sqlite --account ACCOUNT --agent AGENT
 ```
 
-`--read` is search, read, and list labels. `--triage` is label, archive, mark read, snooze, and undo of those. `--draft` is saving and listing review drafts, and undo of those. `fell-mcp revoke` turns the agent off again.
+`--read` is search, read threads, list threads, list folders, and list labels. `--triage` is label, archive, move, star, mark read, mark unread, snooze, unsnooze, and undo of those. `--draft` is saving and listing review drafts, and undo of those. `fell-mcp revoke` turns the agent off again.
 
 ## Nightly Linux artifacts
 
