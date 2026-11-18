@@ -238,6 +238,7 @@ fn open_compose_window(
                 cx.new(|cx| {
                     let mut compose = ComposeView::new(hub, id, folder, cx);
                     compose.set_look(crate::theme::load());
+                    compose.start_on_first_edit();
                     compose.watch_live(cx);
                     compose
                 })

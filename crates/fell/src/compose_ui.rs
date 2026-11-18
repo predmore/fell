@@ -227,6 +227,8 @@ pub struct ComposeView {
     flush_gen: u64,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
+    /// `]` or `[` was pressed; `h` then jumps to the next or previous edit.
+    bracket: Option<char>,
 }
 
 impl ComposeView {
@@ -273,6 +275,7 @@ impl ComposeView {
             flush_pending: false,
             flush_gen: 0,
             closing: false,
+            bracket: None,
         }
     }
 
@@ -369,6 +372,55 @@ impl ComposeView {
     /// Whether this window still follows the Omarchy theme.
     pub(crate) fn follows_look(&self) -> bool {
         self.look.is_some()
+    }
+
+    /// Put the cursor on the next (or previous) agent edit in the body,
+    /// wrapping around. Recipient and subject edits sit in the header.
+    fn goto_hunk(&mut self, forward: bool) {
+        let id = self.draft_id.to_string();
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return;
+        };
+        let mut lines: Vec<usize> = snap
+            .hunks
+            .iter()
+            .filter_map(|hunk| body_edit_line(&snap, hunk))
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let here = self.editor.row + 1;
+        let next = if forward {
+            lines.iter().find(|line| **line > here).or(lines.first())
+        } else {
+            lines
+                .iter()
+                .rev()
+                .find(|line| **line < here)
+                .or(lines.last())
+        };
+        match next {
+            Some(line) => {
+                self.editor.row = line - 1;
+                self.editor.col = 0;
+                self.editor.clamp();
+                let position = lines.iter().position(|item| item == line).unwrap_or(0) + 1;
+                self.status = format!("edit {position} of {}", lines.len()).into();
+            }
+            None => self.status = "no agent edits in the body".into(),
+        }
+    }
+
+    /// An agent asked for review: start on its first edit, if any.
+    pub(crate) fn start_on_first_edit(&mut self) {
+        let id = self.draft_id.to_string();
+        let pending = self
+            .hub
+            .with_session(&id, |session| !session.snapshot().hunks.is_empty())
+            .unwrap_or(false);
+        if pending {
+            self.editor.row = 0;
+            self.goto_hunk(true);
+        }
     }
 
     fn colors(&self) -> Palette {
@@ -972,6 +1024,16 @@ impl ComposeView {
     }
 
     fn normal_key(&mut self, key: &str, typed: Option<&str>) {
+        if let Some(bracket) = self.bracket.take() {
+            if typed == Some("h") || key == "h" {
+                self.goto_hunk(bracket == ']');
+            }
+            return;
+        }
+        if matches!(typed, Some("]") | Some("[")) || matches!(key, "]" | "[") {
+            self.bracket = typed.or(Some(key)).and_then(|text| text.chars().next());
+            return;
+        }
         if key != "0"
             && key.chars().all(|ch| ch.is_ascii_digit())
             && let Ok(digit) = key.parse::<usize>()
@@ -1550,47 +1612,40 @@ impl PreparedSend {
 }
 
 fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
-    let title = if snap.send_requested_by.is_some() {
-        "Review and send"
-    } else {
-        "Compose"
-    };
-    let top = div()
+    let title = div()
+        .flex()
+        .flex_wrap()
+        .gap_x_2()
+        .min_w(px(0.))
+        .child(div().flex_shrink_0().font_weight(FontWeight(620.)).child(
+            if snap.send_requested_by.is_some() {
+                "Review and send"
+            } else {
+                "Compose"
+            },
+        ))
+        .children(snap.send_requested_by.as_ref().map(|agent| {
+            div()
+                .text_color(rgb(colors.accent))
+                .child(format!("· asked by {}", agent_label(agent)))
+        }));
+    div()
         .flex()
         .justify_between()
         .gap_3()
-        .child(
-            div()
-                .flex_shrink_0()
-                .font_weight(FontWeight(620.))
-                .child(title),
-        )
-        .child(
-            div()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .text_size(px(16.))
-                .text_color(rgb(colors.dim))
-                .child(format!("from {}", snap.from)),
-        );
-    // Its own line, so it never pushes the sender out of a narrow window.
-    let asked = snap.send_requested_by.as_ref().map(|agent| {
-        div().text_color(rgb(colors.accent)).child(format!(
-            "{} asked you to review and send",
-            agent_label(agent)
-        ))
-    });
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
         .border_b_1()
         .border_color(rgb(colors.selection))
-        .child(top)
-        .children(asked)
+        .child(title)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(16.))
+                .text_color(rgb(colors.dim))
+                .child(format!("from {}", snap.from)),
+        )
 }
 
 /// An agent id as the header shows it: without the `agent:` prefix, and
@@ -1641,14 +1696,16 @@ fn field_row(
             }
             text.push_str(&address.raw);
             if address.fresh {
+                // Never mailed from this account. Not an agent change, so it
+                // does not wear the agent accent.
                 text.push(' ');
                 let start = text.len();
-                text.push_str("new");
+                text.push_str("(first time)");
                 marks.push((
                     start..text.len(),
                     gpui::HighlightStyle {
-                        color: Some(rgb(colors.accent).into()),
-                        font_weight: Some(FontWeight(600.)),
+                        color: Some(rgb(colors.dim).into()),
+                        font_style: Some(gpui::FontStyle::Italic),
                         ..Default::default()
                     },
                 ));
@@ -1702,11 +1759,16 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
 }
 
 fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
-    let reply = snap
-        .in_reply_to
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("new message");
+    let reply = match (&snap.reply_context, snap.in_reply_to.as_deref()) {
+        (Some(parent), _) => format!(
+            "{} · {} · {}",
+            parent.sender,
+            parent.subject,
+            crate::present::relative_date(now_unix_secs(), parent.date_unix)
+        ),
+        (None, Some(id)) if !id.trim().is_empty() => id.to_string(),
+        _ => "none (new message)".to_string(),
+    };
     div()
         .flex()
         .gap_3()
@@ -1717,7 +1779,14 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
         .child(div().w(px(88.)).flex_shrink_0().child("In reply to"))
-        .child(reply.to_string())
+        .child(div().flex_1().min_w(px(0.)).child(reply))
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1739,18 +1808,32 @@ fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
     } else {
         what
     };
+    // Parts wrap as units, so a narrow window never cuts a key in half.
+    let parts = [
+        label,
+        "]h next".to_string(),
+        "u undo".to_string(),
+        "space a k keep".to_string(),
+        "space a x reject".to_string(),
+    ];
+    let last = parts.len() - 1;
     div()
         .flex()
+        .flex_wrap()
         .px_1()
         .py_1()
         .border_l(px(2.))
-        .border_color(rgb(colors.accent))
+        .border_color(rgb(colors.rule))
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
-        .child(format!(
-            "{label}  ·  u undo  ·  space a k keep  ·  space a x reject"
-        ))
+        .children(parts.into_iter().enumerate().map(|(index, part)| {
+            div().flex_shrink_0().child(if index < last {
+                format!("{part}  ·  ")
+            } else {
+                part
+            })
+        }))
 }
 
 /// The body line (from 1) where a body hunk starts, as the editor counts it.
@@ -1763,7 +1846,8 @@ fn body_edit_line(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Optio
     Some(snap.body[..at].matches('\n').count() + 1)
 }
 
-fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize)> {
+/// Each body edit: its byte range in the body and the text it replaced.
+fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String)> {
     snap.hunks
         .iter()
         .filter(|hunk| hunk.kind == HunkKind::Body)
@@ -1773,7 +1857,7 @@ fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize)> {
                 return None;
             }
             let at = snap.body.find(slice)?;
-            Some((at, at + slice.len()))
+            Some((at, at + slice.len(), hunk.previous.trim().to_string()))
         })
         .collect()
 }
@@ -1781,7 +1865,7 @@ fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize)> {
 fn styled_body(
     editor: &Editor,
     folder: &Path,
-    hunks: &[(usize, usize)],
+    hunks: &[(usize, usize, String)],
     colors: Palette,
 ) -> gpui::Div {
     let text = editor.text();
@@ -1796,20 +1880,49 @@ fn styled_body(
             BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
-                let edited = block.source.is_some_and(|(start, end)| {
-                    hunks
-                        .iter()
-                        .any(|(hunk_start, hunk_end)| start < *hunk_end && end > *hunk_start)
-                });
+                let edits: Vec<&(usize, usize, String)> = block
+                    .source
+                    .map(|(start, end)| {
+                        hunks
+                            .iter()
+                            .filter(|(hunk_start, hunk_end, _)| {
+                                start < *hunk_end && end > *hunk_start
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let painted = if raw {
                     raw_source_block(block, &text, editor, colors)
                 } else {
                     render_block(block, folder, colors)
                 };
-                let painted = if edited {
-                    div().w_full().bg(rgb(colors.hunk)).child(painted)
-                } else {
+                let painted = if edits.is_empty() {
                     painted
+                } else {
+                    // What the agent replaced, struck through, above the new text.
+                    let replaced = edits
+                        .iter()
+                        .filter(|(start, _, previous)| {
+                            !previous.is_empty()
+                                && block
+                                    .source
+                                    .is_some_and(|(from, to)| *start >= from && *start < to)
+                        })
+                        .map(|(_, _, previous)| {
+                            div()
+                                .flex()
+                                .gap_2()
+                                .text_color(rgb(colors.dim))
+                                .child(div().flex_shrink_0().child("was"))
+                                .child(div().line_through().child(previous.clone()))
+                        });
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(colors.hunk))
+                        .children(replaced)
+                        .child(painted)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw).then_some(&block.body), painted)
@@ -2499,23 +2612,25 @@ fn status_bar(
         .count();
     let fresh_label = match (fresh, wide) {
         (0, _) => None,
-        (1, true) => Some("1 new recipient".to_string()),
-        (1, false) => Some("1 new".to_string()),
-        (count, true) => Some(format!("{count} new recipients")),
-        (count, false) => Some(format!("{count} new")),
+        (1, true) => Some("1 first-time recipient".to_string()),
+        (count, true) => Some(format!("{count} first-time recipients")),
+        (count, false) => Some(format!("{count} first-time")),
     };
     let dot = || div().text_color(rgb(colors.dim)).child("·");
-    let mut left = div()
-        .flex()
-        .flex_wrap()
-        .gap_2()
-        .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
-        .child(dot())
-        .child(div().text_color(rgb(colors.fg)).child(status.to_string()));
-    if let Some(label) = fresh_label {
+    // A narrow window keeps one line: the mode, first-time count, send and
+    // the unreviewed count stay; the insert and close hints go first.
+    let mut left = div().flex().gap_2();
+    if wide {
         left = left
+            .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
             .child(dot())
-            .child(div().text_color(rgb(colors.accent)).child(label));
+            .child(div().text_color(rgb(colors.fg)).child(status.to_string()));
+    }
+    if let Some(label) = fresh_label {
+        if wide {
+            left = left.child(dot());
+        }
+        left = left.child(div().text_color(rgb(colors.fg)).child(label));
     }
     let right = match &snap.send_block {
         Some(reason) => div()
@@ -2538,14 +2653,16 @@ fn status_bar(
                         .child(format!("{} unreviewed", snap.unreviewed)),
                 );
             }
+            if wide {
+                right = right
+                    .child(dot())
+                    .child(div().text_color(rgb(colors.fg)).child(":q close"));
+            }
             right
-                .child(dot())
-                .child(div().text_color(rgb(colors.fg)).child(":q close"))
         }
     };
     let bar = div()
         .flex()
-        .flex_wrap()
         .items_center()
         .justify_between()
         .gap_x_4()
@@ -2656,6 +2773,7 @@ fn empty_snapshot(id: &str) -> Snapshot {
         send_block: None,
         text: String::new(),
         send_requested_by: None,
+        reply_context: None,
     }
 }
 

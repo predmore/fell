@@ -385,6 +385,38 @@ impl Store {
     }
 
     /// Addresses this account has already mailed, plus its own address.
+    /// Sender, subject, and date of a stored message, by id or an id that
+    /// collapsed into it. For the compose window's "In reply to" row.
+    pub fn message_summary(
+        &self,
+        account_id: &AccountId,
+        message_id: &crate::MessageId,
+    ) -> Result<Option<super::ReplyContext>> {
+        self.conn
+            .query_row(
+                "SELECT m.from_name, m.from_email, m.subject, m.date_unix FROM messages m
+                 WHERE m.account_id = ?1 AND (
+                     m.message_id = ?2 OR m.message_id IN (
+                         SELECT canonical_message_id FROM message_aliases
+                         WHERE account_id = ?1 AND message_id = ?2
+                     )
+                 )
+                 LIMIT 1",
+                params![account_id.as_str(), message_id.as_str()],
+                |row| {
+                    let name: Option<String> = row.get(0)?;
+                    let email: String = row.get(1)?;
+                    Ok(super::ReplyContext {
+                        sender: name.filter(|name| !name.trim().is_empty()).unwrap_or(email),
+                        subject: row.get(2)?,
+                        date_unix: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn mailed_addresses(&self, account_id: &AccountId) -> Result<HashSet<String>> {
         let mut known = HashSet::new();
         if let Some(account) = self.get_account(account_id)? {
@@ -602,6 +634,71 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_names_its_parent_by_id_or_alias() {
+        let store = Store::open_in_memory().unwrap();
+        let account = crate::Account {
+            id: AccountId("a".into()),
+            display_name: "Me".into(),
+            email: "me@x".into(),
+            backend_kind: crate::BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let id = crate::MessageId::new("parent@x");
+        store
+            .upsert_message(&crate::Message {
+                account_id: account.id.clone(),
+                headers: crate::MessageHeaders {
+                    message_id: id.clone(),
+                    proton_conversation_id: None,
+                    in_reply_to: None,
+                    references: Vec::new(),
+                    from: crate::Address {
+                        name: Some("Jon".into()),
+                        email: "jon@x".into(),
+                    },
+                    subject: "Plans".into(),
+                    date_unix: 42,
+                },
+                remote_id: crate::RemoteId("r".into()),
+                thread_id: crate::ThreadId::from_message_id(&id),
+                snippet: "hi".into(),
+                body_text: Some("hi".into()),
+                unread: false,
+                folders: vec!["INBOX".into()],
+                labels: Vec::new(),
+                arrived_via: Vec::new(),
+                to: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                starred: false,
+                has_attachment: false,
+                archived: false,
+                snooze_until: None,
+                list_id: None,
+            })
+            .unwrap();
+        let summary = store.message_summary(&account.id, &id).unwrap().unwrap();
+        assert_eq!(summary.sender, "Jon");
+        assert_eq!(summary.subject, "Plans");
+        assert_eq!(summary.date_unix, 42);
+        store
+            .conn
+            .execute(
+                "INSERT INTO message_aliases (account_id, message_id, canonical_message_id)
+                 VALUES ('a', 'echo@list', 'parent@x')",
+                [],
+            )
+            .unwrap();
+        let echo = crate::MessageId::new("echo@list");
+        assert_eq!(
+            store.message_summary(&account.id, &echo).unwrap(),
+            Some(summary)
+        );
+        let missing = crate::MessageId::new("missing@x");
+        assert_eq!(store.message_summary(&account.id, &missing).unwrap(), None);
+    }
     use crate::{Account, BackendKind};
 
     #[test]
