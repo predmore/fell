@@ -132,8 +132,25 @@ mod tests {
             "body\n",
         )
         .unwrap();
+        // Sends are recorded in the mailbox before they start.
+        let db = root.join("mail.db");
+        fell_core::Store::open(&db)
+            .unwrap()
+            .upsert_account(&fell_core::Account {
+                id: AccountId("mailbox".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: fell_core::BackendKind::Bridge,
+            })
+            .unwrap();
+        session.bind_store(&db);
+        session.flush().unwrap();
         session.mark_seen();
         session
+    }
+
+    fn mailbox_of(session: &fell_core::compose::DraftSession) -> std::path::PathBuf {
+        session.folder().parent().unwrap().join("mail.db")
     }
 
     #[test]
@@ -241,6 +258,28 @@ mod tests {
         assert!(session.send_lock().is_none());
         let _ = send_from_editor(&mut session, &backend).unwrap_err();
         assert_eq!(backend.count(), 2);
+    }
+
+    #[test]
+    fn a_claim_the_mailbox_cannot_record_blocks_the_send() {
+        let mut session = real_session("unrecorded");
+        // The mailbox refuses the write, as a full or read-only disk would.
+        rusqlite::Connection::open(mailbox_of(&session))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_claim BEFORE INSERT ON compose_send
+                 BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+            )
+            .unwrap();
+        let backend = Counting::new(|| Ok(()));
+        let err = send_from_editor(&mut session, &backend).unwrap_err();
+        assert!(matches!(err, SendFailure::NotSent(_)), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.starts_with("Not sent"), "{shown}");
+        assert!(shown.contains("could not record this send"), "{shown}");
+        assert!(shown.contains("disk is full"), "{shown}");
+        assert_eq!(backend.count(), 0);
+        assert!(session.send_lock().is_none());
     }
 
     #[test]
