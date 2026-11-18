@@ -141,11 +141,13 @@ pub struct MimePart {
 pub enum PartRole {
     /// A file offered to the reader. Sets `has_attachment`.
     Attachment,
-    /// Shown inside the HTML body, which names its `Content-ID` in a `cid:`
-    /// URL. Not an attachment.
+    /// An image shown inside the HTML body, which loads its `Content-ID` by
+    /// a `cid:` URL (`src`, `background`, `poster`, CSS `url()`), and not
+    /// sent as `Content-Disposition: attachment`. Not an attachment.
     Inline,
-    /// A detached signature (`application/pgp-signature`, S/MIME, or the
-    /// second part of `multipart/signed`). Not an attachment.
+    /// A detached signature: `application/pgp-signature`, an S/MIME
+    /// signature type, or a part named `*.p7s` or `signature.asc`. Not an
+    /// attachment.
     Signature,
 }
 
