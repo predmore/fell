@@ -20,6 +20,9 @@ fn main() {
     if args.first().map(String::as_str) == Some("account") {
         std::process::exit(fell::account_command(&args[1..]));
     }
+    if args.first().map(String::as_str) == Some("embeddings") {
+        std::process::exit(fell::embeddings_command(&args[1..]));
+    }
     if args.iter().any(|arg| arg == "--fixture" || arg == "--help") {
         preview();
         return;
