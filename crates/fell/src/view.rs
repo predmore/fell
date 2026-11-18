@@ -1740,34 +1740,36 @@ fn recipient_lines(
                             .child(group.label),
                     )
                     .child({
-                        // One run of text, so a long list wraps like prose.
-                        let mut text = group
-                            .people
-                            .iter()
-                            .map(|person| person.replace(' ', "\u{a0}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let mut marks = Vec::new();
-                        if group.only_you {
-                            text.push_str("   ");
-                            let start = text.len();
-                            text.push_str("only you");
-                            marks.push((
-                                start..text.len(),
-                                gpui::HighlightStyle {
-                                    color: Some(rgb(theme.dimmed).into()),
-                                    ..Default::default()
-                                },
-                            ));
-                        }
+                        // Each person is one piece that never breaks, with
+                        // its comma attached, so a line never starts with an
+                        // address or a comma. The row wraps between pieces.
+                        let last = group.people.len().saturating_sub(1);
                         div()
+                            .flex()
+                            .flex_wrap()
                             .flex_1()
                             .min_w(px(0.))
+                            .gap_x(px(6.))
                             .text_color(rgb(theme.foreground))
-                            .child(
-                                gpui::StyledText::new(SharedString::from(text))
-                                    .with_highlights(marks),
-                            )
+                            .children(group.people.iter().enumerate().map(|(at, person)| {
+                                let piece = if at < last {
+                                    format!("{person},")
+                                } else {
+                                    person.clone()
+                                };
+                                div()
+                                    .min_w(px(0.))
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .overflow_hidden()
+                                    .child(piece)
+                            }))
+                            .children(group.only_you.then(|| {
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(theme.dimmed))
+                                    .child("only you")
+                            }))
                     })
             }))
             .child(div().text_color(rgb(theme.dimmed)).child("q to hide"))
@@ -1775,9 +1777,9 @@ fn recipient_lines(
         // Only the names give way to an ellipsis; the count and the key
         // always show. The text takes the box's colour, so hover reaches it.
         let tail = if line.hidden > 0 {
-            format!(" +{} more · q for all", line.hidden)
+            format!(" +{} more · q", line.hidden)
         } else {
-            " · q for addresses".to_string()
+            " · q".to_string()
         };
         // Measured, like the thread list: the names get a real ellipsis and
         // the count and key always fit after them.
