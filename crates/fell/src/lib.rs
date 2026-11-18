@@ -6,6 +6,7 @@
 pub mod render;
 
 mod compose_ui;
+mod embeddings;
 mod fixtures;
 mod keymap;
 mod mailbox;
@@ -28,6 +29,7 @@ pub fn run() {
 }
 
 pub use compose_ui::{ComposeView, SendFailure, ThemeKind, open_demo, send_from_editor};
+pub use embeddings::embeddings_command;
 pub use setup::account_command;
 
 /// Proof of an explicit Send click in the Fell window.

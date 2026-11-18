@@ -14,6 +14,18 @@ Two extra permissive licenses appear only as gpui 0.2.2 transitives, so they are
 
 Both are OSI/FSF-free, not copyleft. Drop the exceptions if a newer `gpui` removes those crates.
 
+## Local embedding model
+
+The runtime is `tract-onnx` 0.23 and its `tract-*` crates (MIT OR Apache-2.0). They are pure Rust, link no ONNX Runtime library, and download nothing at build time; `tract-linalg` assembles its bundled kernels with `cc`. The tokenizer is ours, on `unicode-normalization` and `unicode-properties` (MIT OR Apache-2.0). `fell embeddings install` uses `ureq` (MIT OR Apache-2.0) over the existing rustls/ring stack and the system trust store. It does not use `webpki-roots`, whose CDLA-Permissive-2.0 license is not on the allow list.
+
+The weights are not in the repository or in any package. They are downloaded only by `fell embeddings install`, after the person agrees:
+
+- `sentence-transformers/all-MiniLM-L6-v2` at commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`. The model card says `license: apache-2.0`. Its base model, `nreimers/MiniLM-L6-H384-uncased`, is MIT. Verified 2026-11-17.
+- `onnx/model_qint8_arm64.onnx`, 23,026,053 bytes, SHA-256 `4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474`. The repository publishes the same bytes as `model_qint8_avx512.onnx` and `model_qint8_avx512_vnni.onnx`. The ops are portable, so x86_64 runs it too.
+- `vocab.txt`, 231,508 bytes, SHA-256 `07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3`.
+
+Before pinning a different model, re-read its card at the exact commit. Weights under CC-BY-NC, OpenRAIL non-commercial, or any other non-commercial grant are not allowed, even when the surrounding code is MIT.
+
 ## Proton Mail Bridge (GPL-3.0)
 
 Backend 1 talks to [Proton Mail Bridge](https://github.com/ProtonMail/proton-bridge) over local IMAP/SMTP. Bridge is GPL-3.0. It is a **separate process**, not linked into Fell, so it does not affect Fell's MIT license. Fell never vendors, statically links, or distributes Bridge.
