@@ -1761,6 +1761,18 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
     let cc_line = encode_addresses(&message.cc);
     let bcc_line = encode_addresses(&message.bcc);
     let list_id = clean_list_id(&message.list_id);
+    // A new row stores this copy's part list, so the marker and names
+    // come from it.
+    let (has_attachment, attachment_names) = match &message.parts {
+        Some(parts) => (
+            crate::imap::has_attachment(&parts.mime_parts),
+            union_tokens("", &crate::imap::attachment_names(&parts.mime_parts), false),
+        ),
+        None => (
+            message.has_attachment,
+            union_tokens("", &message.attachment_names, false),
+        ),
+    };
     conn.execute(
         "INSERT INTO messages (
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
@@ -1794,13 +1806,13 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             cc_line,
             bcc_line,
             i64::from(message.starred),
-            i64::from(message.has_attachment),
+            i64::from(has_attachment),
             i64::from(message.archived),
             message.snooze_until,
             fingerprint,
             list_id,
             encode_addresses(&message.reply_to),
-            union_tokens("", &message.attachment_names, false),
+            attachment_names,
         ],
     )?;
     if let Some(parts) = &message.parts {
@@ -3204,7 +3216,7 @@ fn strip_inbox_tokens(raw: &str) -> String {
         .join("\u{1e}")
 }
 
-fn union_tokens(existing: &str, incoming: &[String], address: bool) -> String {
+pub(crate) fn union_tokens(existing: &str, incoming: &[String], address: bool) -> String {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for raw in split_field(existing)
