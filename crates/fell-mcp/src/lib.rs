@@ -1,7 +1,8 @@
 //! MCP server for Fell.
 //!
-//! Tools: search, read threads, list labels, triage (label, archive, mark
-//! read, snooze), and drafts saved for review. Scopes (read / triage / draft)
+//! Tools: search, read threads, list folders, threads and labels, triage
+//! (label, move, archive, star, mark read or unread, snooze, unsnooze), and
+//! drafts saved for review. Scopes (read / triage / draft)
 //! stay off until a person enables them. Triage and drafts are logged and
 //! undoable.
 //!

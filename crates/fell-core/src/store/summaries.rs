@@ -369,6 +369,8 @@ struct Summary {
     message_count: usize,
     starred: bool,
     has_attachment: bool,
+    /// Any message in the thread is unread, whatever its folder.
+    unread: bool,
     latest_email: String,
     latest_name: Option<String>,
     /// `name \x1f email` per message, oldest first, joined by `\x1e`.
@@ -466,6 +468,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
                     message_count: 1,
                     starred,
                     has_attachment,
+                    unread,
                     latest_email: from_email,
                     latest_name: from_name,
                     participants: String::new(),
@@ -482,6 +485,7 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
                 summary.message_count += 1;
                 summary.starred |= starred;
                 summary.has_attachment |= has_attachment;
+                summary.unread |= unread;
             }
         }
     }
@@ -574,6 +578,45 @@ pub struct FolderPage {
     pub unread: usize,
 }
 
+/// Narrows a list read. The default keeps every row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListFilter {
+    /// Only threads unread in the list: in a folder, unread in that folder;
+    /// under a label, any message unread.
+    pub unread_only: bool,
+    /// Only threads whose latest message is at or after this unix second.
+    pub since: Option<i64>,
+}
+
+impl ListFilter {
+    fn keeps(&self, thread: &FolderThread) -> bool {
+        (!self.unread_only || thread.unread)
+            && self
+                .since
+                .is_none_or(|since| thread.last_date_unix >= since)
+    }
+}
+
+/// What a [`ThreadList`] lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListSource<'a> {
+    /// A folder, matched as [`crate::Store::folder_page`] matches it.
+    Folder(&'a str),
+    /// Threads with a message carrying this exact label.
+    Label(&'a str),
+}
+
+/// Rows after a list position, newest activity first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadList {
+    pub threads: Vec<FolderThread>,
+    /// More rows pass the filter below the last one returned.
+    pub more: bool,
+    /// Unread threads in the whole folder, ignoring the filter. `None` for a
+    /// label, which has no unread index.
+    pub unread: Option<usize>,
+}
+
 /// Reads one folder's list. Built inside a snapshot, so every read through
 /// it sees the same moment.
 struct ListReader<'a> {
@@ -586,10 +629,21 @@ struct ListReader<'a> {
     queued: Vec<FolderThread>,
     /// The account has threads in the refresh queue, in any folder.
     any_queued: bool,
+    /// Applies to rows, not to the unread count.
+    filter: ListFilter,
 }
 
 impl<'a> ListReader<'a> {
     fn new(conn: &'a Connection, account_id: &'a AccountId, folder: &str) -> Result<Self> {
+        Self::filtered(conn, account_id, folder, ListFilter::default())
+    }
+
+    fn filtered(
+        conn: &'a Connection,
+        account_id: &'a AccountId,
+        folder: &str,
+        filter: ListFilter,
+    ) -> Result<Self> {
         let account = account_id.as_str();
         let keys: Vec<String> = folder_query_names(folder)
             .iter()
@@ -619,6 +673,7 @@ impl<'a> ListReader<'a> {
             keys,
             queued,
             any_queued,
+            filter,
         })
     }
 
@@ -637,7 +692,15 @@ impl<'a> ListReader<'a> {
         }
         let mut found: Vec<FolderThread> = Vec::new();
         for key in &self.keys {
-            let (sql, bind) = window_sql(self.account, key, lower, upper, from_end, limit);
+            let (sql, bind) = window_sql(
+                self.account,
+                key,
+                lower,
+                upper,
+                from_end,
+                limit,
+                &self.filter,
+            );
             let mut stmt = self.conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params_from_iter(bind.iter()), list_row)?;
             for row in rows {
@@ -647,7 +710,9 @@ impl<'a> ListReader<'a> {
         found.extend(
             self.queued
                 .iter()
-                .filter(|thread| (lower, upper).contains(&ListKey::of(thread)))
+                .filter(|thread| {
+                    (lower, upper).contains(&ListKey::of(thread)) && self.filter.keeps(thread)
+                })
                 .cloned(),
         );
         found.sort_by_key(ListKey::of);
@@ -770,6 +835,7 @@ fn window_sql(
     upper: Bound<&ListKey>,
     from_end: bool,
     limit: Option<usize>,
+    filter: &ListFilter,
 ) -> (String, Vec<Value>) {
     let mut bind: Vec<Value> = vec![account.to_string().into(), key.to_string().into()];
     let mut sql = String::from(
@@ -781,6 +847,14 @@ fn window_sql(
            ON ts.account_id = tf.account_id AND ts.thread_id = tf.thread_id
          WHERE tf.account_id = ?1 AND tf.folder_key = ?2",
     );
+    if filter.unread_only {
+        sql.push_str("\n           AND tf.unread = 1");
+    }
+    // A range on the index's date column, so the walk stops at `since`.
+    if let Some(since) = filter.since {
+        bind.push(since.into());
+        sql.push_str(&format!("\n           AND tf.last_date >= ?{}", bind.len()));
+    }
     // Below `lower` in list order: older, or the same date and a later id.
     if let Included(at) | Excluded(at) = lower {
         let id = if matches!(lower, Included(_)) {
@@ -885,6 +959,120 @@ pub(super) fn folder_page(
     in_one_snapshot(conn, || {
         ListReader::new(conn, account_id, folder)?.page(span)
     })
+}
+
+/// Up to `limit` rows of `source` below `after` (from the top when `None`)
+/// that pass `filter`. A folder reads its list index, so the cost follows the
+/// rows read; a label reads every thread summary in the account.
+pub(super) fn thread_list(
+    conn: &Connection,
+    account_id: &AccountId,
+    source: ListSource<'_>,
+    filter: &ListFilter,
+    after: Option<&ListKey>,
+    limit: usize,
+) -> Result<ThreadList> {
+    in_one_snapshot(conn, || {
+        let lower = after.map_or(Unbounded, Excluded);
+        let (mut threads, unread) = match source {
+            ListSource::Folder(folder) => {
+                let reader = ListReader::filtered(conn, account_id, folder, filter.clone())?;
+                let rows = reader.rows(lower, Unbounded, false, Some(limit.saturating_add(1)))?;
+                (rows, Some(reader.unread()?))
+            }
+            ListSource::Label(label) => (
+                label_rows(
+                    conn,
+                    account_id,
+                    label,
+                    filter,
+                    after,
+                    limit.saturating_add(1),
+                )?,
+                None,
+            ),
+        };
+        let more = threads.len() > limit;
+        threads.truncate(limit);
+        Ok(ThreadList {
+            threads,
+            more,
+            unread,
+        })
+    })
+}
+
+/// Threads carrying `label`, in list order. Label tokens sit in
+/// `thread_summary.labels`, which has no index, so this reads every summary
+/// in the account and sorts the matches.
+fn label_rows(
+    conn: &Connection,
+    account_id: &AccountId,
+    label: &str,
+    filter: &ListFilter,
+    after: Option<&ListKey>,
+    limit: usize,
+) -> Result<Vec<FolderThread>> {
+    let account = account_id.as_str();
+    let any_unread = "EXISTS (
+               SELECT 1 FROM messages m
+               WHERE m.account_id = ts.account_id AND m.thread_id = ts.thread_id
+                 AND m.unread = 1
+           )";
+    let mut bind: Vec<Value> = vec![account.to_string().into(), label.to_string().into()];
+    let mut sql = format!(
+        "SELECT ts.thread_id, ts.subject, ts.snippet, ts.last_date, ts.message_count,
+                {any_unread}, ts.starred, ts.has_attachment, ts.latest_email,
+                ts.latest_name, ts.participants, ts.labels
+         FROM thread_summary ts
+         WHERE ts.account_id = ?1
+           AND instr(char(30) || ts.labels || char(30), char(30) || ?2 || char(30)) > 0
+           AND NOT EXISTS (
+               SELECT 1 FROM thread_summary_dirty d
+               WHERE d.account_id = ts.account_id AND d.thread_id = ts.thread_id
+           )"
+    );
+    if let Some(since) = filter.since {
+        bind.push(since.into());
+        sql.push_str(&format!("\n           AND ts.last_date >= ?{}", bind.len()));
+    }
+    if let Some(at) = after {
+        bind.push(at.date_unix.into());
+        bind.push(at.thread_id.0.clone().into());
+        let (date, thread) = (bind.len() - 1, bind.len());
+        sql.push_str(&format!(
+            "\n           AND (ts.last_date < ?{date} OR (ts.last_date = ?{date} AND ts.thread_id > ?{thread}))"
+        ));
+    }
+    if filter.unread_only {
+        sql.push_str(&format!("\n           AND {any_unread}"));
+    }
+    bind.push((limit.min(i64::MAX as usize) as i64).into());
+    sql.push_str(&format!(
+        "\n         ORDER BY ts.last_date DESC, ts.thread_id ASC LIMIT ?{}",
+        bind.len()
+    ));
+    let mut found: Vec<FolderThread> = {
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(bind.iter()), list_row)?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for thread in queued_threads(conn, account)? {
+        let Some(summary) = compute(conn, account, &thread)? else {
+            continue;
+        };
+        if !summary.labels.split('\u{1e}').any(|token| token == label) {
+            continue;
+        }
+        let row = folder_thread(&thread, &summary, summary.unread);
+        let below = after.is_none_or(|at| ListKey::of(&row) > *at);
+        if below && filter.keeps(&row) {
+            found.push(row);
+        }
+    }
+    found.sort_by_key(ListKey::of);
+    found.truncate(limit);
+    Ok(found)
 }
 
 /// Where `thread` sits in `folder`'s list now, or `None` when it is not in
@@ -1245,12 +1433,148 @@ mod tests {
             );
             if pages {
                 assert_pages_match(store, folder, &full, context);
+                let unread = full.iter().filter(|thread| thread.unread).count();
+                for filter in filters(&full) {
+                    let expected: Vec<FolderThread> = full
+                        .iter()
+                        .filter(|thread| filter.keeps(thread))
+                        .cloned()
+                        .collect();
+                    let (listed, unreads) = read_all(store, ListSource::Folder(folder), &filter);
+                    assert_eq!(listed, expected, "{context}: {folder} {filter:?}");
+                    assert!(unreads.iter().all(|count| *count == Some(unread)));
+                }
+            }
+        }
+        if pages {
+            for label in ["tag0", "tag1", "tag2", "tag", "missing"] {
+                let full = label_scan(store, label);
+                for filter in filters(&full) {
+                    let expected: Vec<FolderThread> = full
+                        .iter()
+                        .filter(|thread| filter.keeps(thread))
+                        .cloned()
+                        .collect();
+                    let (listed, unreads) = read_all(store, ListSource::Label(label), &filter);
+                    assert_eq!(listed, expected, "{context}: label {label} {filter:?}");
+                    assert!(unreads.iter().all(Option::is_none));
+                }
             }
         }
         assert_eq!(
             store.folder_names(&account).unwrap(),
             store.folder_names_scan(&account).unwrap(),
             "{context}: folder names"
+        );
+    }
+
+    /// Every filter shape, with `since` in the middle of `full`.
+    fn filters(full: &[FolderThread]) -> Vec<ListFilter> {
+        let since = full.get(full.len() / 2).map(|thread| thread.last_date_unix);
+        vec![
+            ListFilter::default(),
+            ListFilter {
+                unread_only: true,
+                since: None,
+            },
+            ListFilter {
+                unread_only: false,
+                since,
+            },
+            ListFilter {
+                unread_only: true,
+                since,
+            },
+        ]
+    }
+
+    /// Page through `source` three rows at a time, as an agent would.
+    fn read_all(
+        store: &Store,
+        source: ListSource<'_>,
+        filter: &ListFilter,
+    ) -> (Vec<FolderThread>, Vec<Option<usize>>) {
+        let account = account().id;
+        let mut out: Vec<FolderThread> = Vec::new();
+        let mut unreads = Vec::new();
+        loop {
+            let after = out.last().map(ListKey::of);
+            let page = store
+                .thread_list(&account, source, filter, after.as_ref(), 3)
+                .unwrap();
+            assert!(page.threads.len() <= 3);
+            assert!(
+                !page.more || page.threads.len() == 3,
+                "more needs a full page"
+            );
+            unreads.push(page.unread);
+            out.extend(page.threads);
+            if !page.more {
+                return (out, unreads);
+            }
+        }
+    }
+
+    /// Threads carrying `label`, from each thread's messages.
+    fn label_scan(store: &Store, label: &str) -> Vec<FolderThread> {
+        let account = account().id;
+        let mut stmt = store
+            .conn
+            .prepare("SELECT DISTINCT thread_id FROM messages WHERE account_id = ?1")
+            .unwrap();
+        let threads: Vec<String> = stmt
+            .query_map(params![account.as_str()], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let mut out: Vec<FolderThread> = threads
+            .iter()
+            .filter_map(|thread| {
+                let summary = compute(&store.conn, account.as_str(), thread).unwrap()?;
+                summary
+                    .labels
+                    .split('\u{1e}')
+                    .any(|token| token == label)
+                    .then(|| folder_thread(thread, &summary, summary.unread))
+            })
+            .collect();
+        out.sort_by_key(ListKey::of);
+        out
+    }
+
+    #[test]
+    fn a_filtered_folder_read_still_walks_the_list_index() {
+        let store = Store::open_in_memory().unwrap();
+        let key = ListKey {
+            date_unix: 1_700_000_000,
+            thread_id: ThreadId("t".into()),
+        };
+        let filter = ListFilter {
+            unread_only: true,
+            since: Some(1_600_000_000),
+        };
+        let (sql, bind) = window_sql(
+            "acct",
+            "inbox",
+            Excluded(&key),
+            Unbounded,
+            false,
+            Some(21),
+            &filter,
+        );
+        let plan = plan(&store, &sql, &bind);
+        assert!(
+            plan.iter().all(|step| !step.contains("messages")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_thread_folders_list")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+            "{plan:?}"
         );
     }
 
@@ -1533,7 +1857,15 @@ mod tests {
             (Included(&key), Included(&key), false),
             (Unbounded, Excluded(&key), true),
         ] {
-            let (sql, bind) = window_sql("acct", "inbox", lower, upper, from_end, Some(10));
+            let (sql, bind) = window_sql(
+                "acct",
+                "inbox",
+                lower,
+                upper,
+                from_end,
+                Some(10),
+                &ListFilter::default(),
+            );
             let plan = plan(&store, &sql, &bind);
             assert!(
                 plan.iter().all(|step| !step.contains("messages")),
@@ -1610,6 +1942,7 @@ mod tests {
             Unbounded,
             false,
             Some(limit),
+            &ListFilter::default(),
         );
         let mut stmt = store.conn.prepare(&sql).unwrap();
         let rows = stmt
@@ -2039,6 +2372,38 @@ mod tests {
         time("G: Bottom 100", &|| {
             store
                 .folder_page(&account, "INBOX", &FolderSpan::Bottom { rows: 100 })
+                .unwrap()
+                .threads
+                .len()
+        });
+        let filter = ListFilter::default();
+        time("thread_list Inbox, 50 rows mid-folder", &|| {
+            store
+                .thread_list(
+                    &account,
+                    ListSource::Folder("INBOX"),
+                    &filter,
+                    Some(&ListKey::of(&full[middle])),
+                    50,
+                )
+                .unwrap()
+                .threads
+                .len()
+        });
+        let unread = ListFilter {
+            unread_only: true,
+            since: None,
+        };
+        time("thread_list Inbox unread only, 50 rows", &|| {
+            store
+                .thread_list(&account, ListSource::Folder("INBOX"), &unread, None, 50)
+                .unwrap()
+                .threads
+                .len()
+        });
+        time("thread_list label tag1, 50 rows", &|| {
+            store
+                .thread_list(&account, ListSource::Label("tag1"), &filter, None, 50)
                 .unwrap()
                 .threads
                 .len()

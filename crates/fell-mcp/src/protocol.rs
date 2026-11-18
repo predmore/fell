@@ -319,7 +319,7 @@ impl Session {
 
     fn instructions(&self) -> String {
         let mut text = format!(
-            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list labels, triage (label, archive, mark read, snooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. request_send only opens the compose editor. There is no send tool that transmits. Mail leaves the machine only from the Fell window. {} ",
+            "Fell agent `{}` on account `{}`. This server speaks stdio only. Tools search and read the local mailbox, list folders, threads and labels, triage (label, move, archive, star, mark read or unread, snooze, unsnooze), and save drafts for a person to review in Fell. Triage tools stay off unless that scope is granted. Mailbox changes are rate-limited. request_send only opens the compose editor. There is no send tool that transmits. Mail leaves the machine only from the Fell window. {} ",
             self.agent_id,
             self.account_id.as_str(),
             crate::untrusted::UNTRUSTED_NOTE
@@ -582,7 +582,13 @@ mod tests {
         init(&mut session);
         assert_eq!(
             tool_names(&mut session),
-            ["search", "read_thread", "list_labels"]
+            [
+                "search",
+                "read_thread",
+                "list_folders",
+                "list_threads",
+                "list_labels"
+            ]
         );
         let hits = tool_json(&call(&mut session, "search", json!({ "query": "invoice" })));
         assert_eq!(hits["hits"][0]["thread_id"], thread.as_str());
@@ -846,12 +852,30 @@ mod tests {
     fn triage_tools_stay_off_without_the_scope_and_mutations_are_limited() {
         let (mut session, _thread) = session_with(AgentGrant::enabled(true, false, false), "bot");
         init(&mut session);
-        for name in ["label", "archive", "mark_read", "snooze"] {
+        let (mut session, thread) = (session, _thread);
+        for name in TRIAGE_TOOLS {
             assert!(
                 !tool_names(&mut session).iter().any(|tool| tool == name),
                 "{name}"
             );
+            let denied = call(
+                &mut session,
+                name,
+                json!({ "thread_id": thread.as_str(), "to": "Work", "label": "x", "mode": "add", "until_unix": 1 }),
+            );
+            assert_eq!(denied["result"]["isError"], true, "{name}");
+            assert!(
+                tool_text(&denied).contains("lacks the triage scope"),
+                "{name}: {denied}"
+            );
         }
+        assert!(
+            session
+                .store
+                .list_actions(&session.account_id)
+                .unwrap()
+                .is_empty()
+        );
         let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
         session.set_mutation_limit(2);
         init(&mut session);
@@ -1000,6 +1024,523 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 9, "method": "resources/list" }),
         );
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    const TRIAGE_TOOLS: [&str; 8] = [
+        "label",
+        "move",
+        "archive",
+        "star",
+        "mark_read",
+        "mark_unread",
+        "snooze",
+        "unsnooze",
+    ];
+
+    /// The seeded Invoice thread (date 30, INBOX and Work, unread, billing)
+    /// plus four more threads. Returns ids newest first.
+    fn triage_inbox(session: &Session) -> Vec<ThreadId> {
+        let mut ids = Vec::new();
+        for (id, date, unread, folders, label) in [
+            ("newest@x", 90, true, &["INBOX"][..], "billing"),
+            ("read@x", 70, false, &["INBOX"][..], ""),
+            ("sent@x", 60, false, &["Sent"][..], ""),
+            ("older@x", 50, true, &["INBOX"][..], ""),
+        ] {
+            let mut next = message("a1", id, id, &format!("body of {id}"), label);
+            next.headers.date_unix = date;
+            next.unread = unread;
+            next.folders = folders.iter().map(|name| (*name).to_string()).collect();
+            ids.push(session.store.upsert_message(&next).unwrap());
+        }
+        ids
+    }
+
+    #[test]
+    fn list_folders_and_list_threads_page_newest_first() {
+        let (mut session, invoice) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        let ids = triage_inbox(&session);
+        init(&mut session);
+
+        let folders = tool_json(&call(&mut session, "list_folders", json!({})));
+        let folders = folders["folders"].as_array().unwrap();
+        assert_eq!(
+            folders[0],
+            json!({ "name": "INBOX", "role": "inbox", "unread_threads": 3 })
+        );
+        let work = folders.iter().find(|row| row["name"] == "Work").unwrap();
+        assert_eq!(work["role"], Value::Null);
+        assert_eq!(work["unread_threads"], 1);
+        let sent = folders.iter().find(|row| row["name"] == "Sent").unwrap();
+        assert_eq!(sent["role"], "sent");
+        assert_eq!(sent["unread_threads"], 0);
+
+        // Inbox by default, newest first, two at a time.
+        let first = tool_json(&call(&mut session, "list_threads", json!({ "limit": 2 })));
+        assert_eq!(first["folder"], "INBOX");
+        assert_eq!(first["unread_threads"], 3);
+        let rows = first["threads"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["thread_id"], ids[0].as_str());
+        assert_eq!(rows[1]["thread_id"], ids[1].as_str());
+        assert_eq!(rows[0]["sender_address"], "ada@x");
+        assert_eq!(rows[0]["date_unix"], 90);
+        assert_eq!(rows[0]["message_count"], 1);
+        assert_eq!(rows[0]["unread"], true);
+        assert_eq!(rows[0]["starred"], false);
+        assert_eq!(rows[0]["labels"], json!(["billing"]));
+        assert_eq!(
+            rows[0]["subject"]["untrusted_email_content"]["text"],
+            "newest@x"
+        );
+        assert_eq!(
+            rows[0]["snippet"]["untrusted_email_content"]["text"],
+            "body of newest@x"
+        );
+        assert!(rows[0].get("body").is_none());
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let second = tool_json(&call(
+            &mut session,
+            "list_threads",
+            json!({ "limit": 2, "cursor": cursor }),
+        ));
+        let rows = second["threads"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["thread_id"], ids[3].as_str());
+        assert_eq!(rows[1]["thread_id"], invoice.as_str());
+        assert_eq!(second["next_cursor"], Value::Null);
+
+        let unread = tool_json(&call(
+            &mut session,
+            "list_threads",
+            json!({ "unread_only": true, "since": 40 }),
+        ));
+        let unread: Vec<_> = unread["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["thread_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(unread, [ids[0].as_str(), ids[3].as_str()]);
+
+        let sent = tool_json(&call(
+            &mut session,
+            "list_threads",
+            json!({ "folder": "sent" }),
+        ));
+        assert_eq!(sent["threads"][0]["thread_id"], ids[2].as_str());
+
+        let billing = tool_json(&call(
+            &mut session,
+            "list_threads",
+            json!({ "label": "billing" }),
+        ));
+        assert_eq!(billing["label"], "billing");
+        assert!(billing.get("unread_threads").is_none());
+        let billing: Vec<_> = billing["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["thread_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(billing, [ids[0].as_str(), invoice.as_str()]);
+
+        for (args, error) in [
+            (json!({ "folder": "INBOX", "label": "billing" }), "not both"),
+            (json!({ "limit": 0 }), "limit must be"),
+            (json!({ "cursor": "nonsense" }), "cursor must be"),
+            (json!({ "unread_only": "yes" }), "must be a boolean"),
+        ] {
+            let response = call(&mut session, "list_threads", args);
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            assert!(tool_text(&response).contains(error), "{response}");
+        }
+        let capped = tool_json(&call(&mut session, "list_threads", json!({ "limit": 500 })));
+        assert_eq!(capped["threads"].as_array().unwrap().len(), 4);
+
+        let (mut drafter, _) = session_with(AgentGrant::enabled(false, false, true), "bot");
+        init(&mut drafter);
+        for name in ["list_folders", "list_threads"] {
+            let denied = call(&mut drafter, name, json!({}));
+            assert!(
+                tool_text(&denied).contains("lacks the read scope"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_star_mark_unread_and_unsnooze_are_logged_and_undone() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        init(&mut session);
+        let read_first = |session: &mut Session| {
+            tool_json(&call(
+                session,
+                "read_thread",
+                json!({ "thread_id": thread.as_str() }),
+            ))["messages"][0]
+                .clone()
+        };
+        tool_json(&call(
+            &mut session,
+            "mark_read",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        tool_json(&call(
+            &mut session,
+            "snooze",
+            json!({ "thread_id": thread.as_str(), "until_unix": 1_893_456_000 }),
+        ));
+        let moved = tool_json(&call(
+            &mut session,
+            "move",
+            json!({ "thread_id": thread.as_str(), "to": "work" }),
+        ));
+        assert_eq!(moved["kind"], "move");
+        assert_eq!(moved["summary"], "moved thread from INBOX to Work");
+        let starred = tool_json(&call(
+            &mut session,
+            "star",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        assert_eq!(starred["kind"], "star");
+        let again = tool_json(&call(
+            &mut session,
+            "star",
+            json!({ "thread_id": thread.as_str(), "starred": true }),
+        ));
+        assert_eq!(again["changed"], false);
+        let unread = tool_json(&call(
+            &mut session,
+            "mark_unread",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        assert_eq!(unread["kind"], "mark_unread");
+        let unsnoozed = tool_json(&call(
+            &mut session,
+            "unsnooze",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        assert_eq!(unsnoozed["kind"], "unsnooze");
+
+        let now = read_first(&mut session);
+        assert_eq!(now["folders"], json!(["Work"]));
+        assert_eq!(now["starred"], true);
+        assert_eq!(now["unread"], true);
+        assert_eq!(now["snooze_until"], Value::Null);
+        let inbox = tool_json(&call(&mut session, "list_threads", json!({})));
+        assert!(inbox["threads"].as_array().unwrap().is_empty());
+
+        for kind in ["unsnooze", "mark_unread", "star", "move"] {
+            assert_eq!(
+                tool_json(&call(&mut session, "undo", json!({})))["kind"],
+                kind
+            );
+        }
+        let back = read_first(&mut session);
+        assert_eq!(back["folders"], json!(["INBOX", "Work"]));
+        assert_eq!(back["starred"], false);
+        assert_eq!(back["unread"], false);
+        assert_eq!(back["snooze_until"], 1_893_456_000);
+        let unstar = tool_json(&call(
+            &mut session,
+            "star",
+            json!({ "thread_id": thread.as_str(), "starred": false }),
+        ));
+        assert_eq!(unstar["changed"], false);
+    }
+
+    #[test]
+    fn move_refuses_trash_spam_and_folders_the_mailbox_lacks() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        let mut junk = message("a1", "junk@x", "Junk", "junk body", "");
+        junk.folders = vec!["Junk".into()];
+        let junk = session.store.upsert_message(&junk).unwrap();
+        init(&mut session);
+        for to in ["Trash", "deleted", "Spam", "junk", "Sent", "Drafts"] {
+            let refused = call(
+                &mut session,
+                "move",
+                json!({ "thread_id": thread.as_str(), "to": to }),
+            );
+            assert_eq!(refused["result"]["isError"], true, "{to}");
+            assert!(
+                tool_text(&refused).contains("cannot move mail to Trash, Spam"),
+                "{to}: {refused}"
+            );
+        }
+        let unknown = call(
+            &mut session,
+            "move",
+            json!({ "thread_id": thread.as_str(), "to": "Receipts" }),
+        );
+        assert!(tool_text(&unknown).contains("list_folders"), "{unknown}");
+        let wrong_source = call(
+            &mut session,
+            "move",
+            json!({ "thread_id": thread.as_str(), "from": "Sent", "to": "Work" }),
+        );
+        assert!(tool_text(&wrong_source).contains("no messages in Sent"));
+        assert!(
+            session
+                .store
+                .list_actions(&session.account_id)
+                .unwrap()
+                .is_empty()
+        );
+        // Archive is always a destination, as it is for the archive tool.
+        let archived = tool_json(&call(
+            &mut session,
+            "move",
+            json!({ "thread_id": thread.as_str(), "to": "Archive" }),
+        ));
+        assert_eq!(archived["kind"], "move");
+        // Rescuing mail out of Spam is allowed.
+        let rescued = tool_json(&call(
+            &mut session,
+            "move",
+            json!({ "thread_id": junk.as_str(), "from": "Spam", "to": "INBOX" }),
+        ));
+        assert_eq!(rescued["summary"], "moved thread from Spam to INBOX");
+    }
+
+    /// Record `roles` as if the server's LIST reply had marked them
+    /// (SPECIAL-USE), as sync does.
+    fn mark_roles(session: &Session, roles: &[(fell_core::FolderRole, &str)]) {
+        let folders = roles
+            .iter()
+            .map(|(role, name)| fell_core::RoleFolder {
+                role: *role,
+                name: (*name).into(),
+                raw: (*name).into(),
+                source: fell_core::RoleSource::Server,
+            })
+            .collect();
+        session
+            .store
+            .apply_delta(
+                &session.account_id,
+                &fell_core::MailboxDelta {
+                    roles: Some(fell_core::FolderRoles::new(folders)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn stored_in(session: &Session, id: &str, folders: &[&str]) -> ThreadId {
+        let mut filed = message("a1", id, id, "body", "");
+        filed.folders = folders.iter().map(|name| (*name).to_string()).collect();
+        session.store.upsert_message(&filed).unwrap()
+    }
+
+    /// A server that names its Sent or Trash its own way still has them
+    /// refused: the check reads the server's marks, not a name table.
+    #[test]
+    fn move_refuses_server_marked_trash_sent_spam_and_drafts() {
+        use fell_core::FolderRole;
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        init(&mut session);
+        for (role, folder) in [
+            (FolderRole::Sent, "Sent Items"),
+            (FolderRole::Trash, "Deleted Messages"),
+            (FolderRole::Trash, "[Gmail]/Trash"),
+            (FolderRole::Junk, "Bulk"),
+            (FolderRole::Drafts, "Brouillons"),
+        ] {
+            stored_in(&session, &format!("{folder}@x"), &[folder]);
+            mark_roles(&session, &[(FolderRole::Inbox, "INBOX"), (role, folder)]);
+            let listed = tool_json(&call(&mut session, "list_folders", json!({})));
+            let entry = listed["folders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == folder)
+                .unwrap_or_else(|| panic!("{folder} not listed: {listed}"));
+            assert_eq!(entry["role"], role.key(), "{folder}");
+            for to in [folder.to_string(), folder.to_ascii_lowercase()] {
+                let refused = call(
+                    &mut session,
+                    "move",
+                    json!({ "thread_id": thread.as_str(), "to": to }),
+                );
+                assert_eq!(refused["result"]["isError"], true, "{to}");
+                assert!(
+                    tool_text(&refused).contains("cannot move mail to Trash, Spam, Sent or Drafts"),
+                    "{to}: {refused}"
+                );
+            }
+        }
+        // Gmail's All Mail and Starred are views: moving into one is
+        // archive or star, and moving out would drop it from the view.
+        stored_in(&session, "all@x", &["[Gmail]/All Mail", "[Gmail]/Starred"]);
+        mark_roles(
+            &session,
+            &[
+                (FolderRole::All, "[Gmail]/All Mail"),
+                (FolderRole::Flagged, "[Gmail]/Starred"),
+            ],
+        );
+        for args in [
+            json!({ "thread_id": thread.as_str(), "to": "[Gmail]/All Mail" }),
+            json!({ "thread_id": thread.as_str(), "to": "[Gmail]/Starred" }),
+            json!({ "thread_id": thread.as_str(), "from": "[Gmail]/All Mail", "to": "Work" }),
+        ] {
+            let refused = call(&mut session, "move", args.clone());
+            assert!(
+                tool_text(&refused).contains("use archive or star"),
+                "{args}: {refused}"
+            );
+        }
+        assert!(
+            session
+                .store
+                .list_actions(&session.account_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Once the server marks its folders, a user folder that happens to be
+    /// called Sent or Trash is just a folder, and mail can be moved out of
+    /// Trash and Spam and back again with undo.
+    #[test]
+    fn move_files_into_user_folders_and_out_of_trash_and_spam() {
+        use fell_core::FolderRole;
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        let trashed = stored_in(&session, "trashed@x", &["[Gmail]/Trash"]);
+        let spam = stored_in(&session, "spam@x", &["[Gmail]/Spam"]);
+        stored_in(&session, "label@x", &["Projects", "Trash"]);
+        mark_roles(
+            &session,
+            &[
+                (FolderRole::Inbox, "INBOX"),
+                (FolderRole::Trash, "[Gmail]/Trash"),
+                (FolderRole::Junk, "[Gmail]/Spam"),
+            ],
+        );
+        init(&mut session);
+        for to in ["Projects", "Trash"] {
+            let moved = tool_json(&call(
+                &mut session,
+                "move",
+                json!({ "thread_id": thread.as_str(), "from": "Work", "to": to }),
+            ));
+            assert_eq!(moved["kind"], "move", "{to}: {moved}");
+            let undone = tool_json(&call(&mut session, "undo", json!({})));
+            assert_eq!(undone["kind"], "move");
+        }
+        for (id, from) in [(&trashed, "[Gmail]/Trash"), (&spam, "[Gmail]/Spam")] {
+            let rescued = tool_json(&call(
+                &mut session,
+                "move",
+                json!({ "thread_id": id.as_str(), "from": from, "to": "INBOX" }),
+            ));
+            assert_eq!(
+                rescued["summary"],
+                format!("moved thread from {from} to INBOX")
+            );
+            let read = tool_json(&call(
+                &mut session,
+                "read_thread",
+                json!({ "thread_id": id.as_str() }),
+            ));
+            assert_eq!(read["messages"][0]["folders"], json!(["INBOX"]));
+            assert_eq!(
+                tool_json(&call(&mut session, "undo", json!({})))["kind"],
+                "move"
+            );
+            let back = tool_json(&call(
+                &mut session,
+                "read_thread",
+                json!({ "thread_id": id.as_str() }),
+            ));
+            assert_eq!(back["messages"][0]["folders"], json!([from]));
+        }
+    }
+
+    /// A message with more names than read_thread lists says how many it
+    /// left out, as a cut body says it was truncated.
+    #[test]
+    fn read_thread_counts_attachment_names_it_leaves_out() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        let mut many = message("a1", "many@x", "Scans", "see attached", "");
+        many.has_attachment = true;
+        many.attachment_names = (1..=25).map(|n| format!("scan-{n:02}.pdf")).collect();
+        let many = session.store.upsert_message(&many).unwrap();
+        let mut few = message("a1", "few@x", "One scan", "see attached", "");
+        few.has_attachment = true;
+        few.attachment_names = vec!["scan.pdf".into()];
+        let few = session.store.upsert_message(&few).unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": many.as_str() }),
+        ));
+        let message = &read["messages"][0];
+        let names = message["attachments"].as_array().unwrap();
+        assert_eq!(names.len(), 20);
+        assert_eq!(
+            names[19]["name"]["untrusted_email_content"]["text"],
+            "scan-20.pdf"
+        );
+        assert_eq!(message["attachments_omitted"], 5);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": few.as_str() }),
+        ));
+        assert_eq!(read["messages"][0]["attachments_omitted"], 0);
+    }
+
+    #[test]
+    fn read_thread_lists_attachment_names_inside_the_envelope() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        let mut invoice = message("a1", "pdf@x", "Invoice", "see attached", "");
+        invoice.has_attachment = true;
+        invoice.attachment_names = vec!["invoice-march.pdf".into()];
+        let thread = session.store.upsert_message(&invoice).unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        let message = &read["messages"][0];
+        assert_eq!(message["has_attachment"], true);
+        assert_eq!(
+            message["attachments"],
+            json!([{ "name": { "untrusted_email_content": {
+                "text": "invoice-march.pdf",
+                "truncated": false,
+            } } }])
+        );
+    }
+
+    /// Every tool, whatever it is passed, neither sends nor says it did.
+    /// Mail leaves only from the editor's own send action.
+    #[test]
+    fn no_tool_transmits_whatever_it_is_given() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, true), "bot");
+        init(&mut session);
+        let listed = tool_names(&mut session);
+        let names = crate::tools::all_tool_names();
+        assert_eq!(listed, names);
+        for name in names {
+            for args in [
+                json!({}),
+                json!({ "thread_id": thread.as_str(), "send": true, "confirm": true, "transmit": true }),
+            ] {
+                let response = call(&mut session, name, args);
+                assert!(response.get("error").is_none(), "{name}: {response}");
+                let text = tool_text(&response);
+                if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                    assert_ne!(body["transmitted"], true, "{name}: {text}");
+                    assert!(body.get("sent").is_none(), "{name}: {text}");
+                }
+            }
+        }
     }
 
     #[test]

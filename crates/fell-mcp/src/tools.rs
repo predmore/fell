@@ -1,11 +1,21 @@
 //! MCP tool registry. There is no send tool, and names containing "send"
 //! are refused even if a later edit adds one to the list.
 
-use fell_core::{AgentGrant, Message, MessageId, ReviewDraft, ReviewDraftInput, ThreadId};
+use fell_core::{
+    AgentGrant, FolderThread, ListFilter, ListKey, ListSource, Message, MessageId, ReviewDraft,
+    ReviewDraftInput, ThreadId,
+};
 use serde_json::{Map, Value, json};
 
 use crate::protocol::Session;
 use crate::untrusted::{self, DEFAULT_THREAD_CHARS, MAX_THREAD_CHARS, SNIPPET_CHARS};
+
+/// Rows in a `list_threads` page when the caller does not say.
+const DEFAULT_LIST_ROWS: usize = 20;
+/// Most rows one `list_threads` page returns.
+const MAX_LIST_ROWS: usize = 50;
+/// Most attachment names `read_thread` lists per message.
+const MAX_ATTACHMENT_NAMES: usize = 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolScope {
@@ -65,9 +75,13 @@ fn is_mutation(name: &str) -> bool {
     matches!(
         name,
         "label"
+            | "move"
             | "archive"
+            | "star"
             | "mark_read"
+            | "mark_unread"
             | "snooze"
+            | "unsnooze"
             | "create_draft"
             | "undo"
             | "edit_draft"
@@ -79,11 +93,17 @@ fn dispatch(session: &Session, name: &str, args: &Value) -> Result<Value, String
     match name {
         "search" => search(session, args),
         "read_thread" => read_thread(session, args),
+        "list_folders" => list_folders(session),
+        "list_threads" => list_threads(session, args),
         "list_labels" => list_labels(session),
         "label" => label(session, args),
+        "move" => move_thread(session, args),
         "archive" => archive(session, args),
+        "star" => star(session, args),
         "mark_read" => mark_read(session, args),
+        "mark_unread" => mark_unread(session, args),
         "snooze" => snooze(session, args),
+        "unsnooze" => unsnooze(session, args),
         "create_draft" => create_draft(session, args),
         "list_drafts" => list_drafts(session, args),
         "get_draft" => get_draft(session, args),
@@ -150,6 +170,139 @@ fn read_thread(session: &Session, args: &Value) -> Result<Value, String> {
     }))
 }
 
+/// One stored folder per alias group, Inbox first. Inbox is listed even
+/// before any message names it: a message with no folder is in Inbox.
+fn folder_names(session: &Session) -> Result<Vec<String>, String> {
+    let stored = session
+        .store
+        .folder_names(&session.account_id)
+        .map_err(store_error)?;
+    let mut out = vec!["INBOX".to_string()];
+    for name in stored {
+        if !out.iter().any(|have| same_folder(have, &name)) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+/// Same folder, ignoring ASCII case and aliases such as Archive/Archived.
+fn same_folder(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+        || fell_core::folder_aliases(a)
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(b))
+}
+
+fn list_folders(session: &Session) -> Result<Value, String> {
+    let roles = folder_roles(session)?;
+    let mut folders = Vec::new();
+    for name in folder_names(session)? {
+        let unread = session
+            .store
+            .folder_page(
+                &session.account_id,
+                &name,
+                &fell_core::FolderSpan::Top { rows: 0 },
+            )
+            .map_err(store_error)?
+            .unread;
+        folders.push(json!({
+            "name": name,
+            "role": roles.role_of(&name).map(fell_core::FolderRole::key),
+            "unread_threads": unread,
+        }));
+    }
+    Ok(json!({ "folders": folders }))
+}
+
+fn list_threads(session: &Session, args: &Value) -> Result<Value, String> {
+    let folder = optional_string(args, "folder")?.filter(|value| !value.trim().is_empty());
+    let label = optional_string(args, "label")?.filter(|value| !value.trim().is_empty());
+    let source = match (&folder, &label) {
+        (Some(_), Some(_)) => return Err("pass folder or label, not both".into()),
+        (None, Some(label)) => ListSource::Label(label.trim()),
+        (Some(folder), None) => ListSource::Folder(folder.trim()),
+        (None, None) => ListSource::Folder("INBOX"),
+    };
+    let limit = match optional_i64(args, "limit")? {
+        None => DEFAULT_LIST_ROWS,
+        Some(value) if value <= 0 => return Err("limit must be a positive integer".into()),
+        Some(value) => (value as usize).min(MAX_LIST_ROWS),
+    };
+    let filter = ListFilter {
+        unread_only: optional_bool(args, "unread_only")?,
+        since: optional_i64(args, "since")?,
+    };
+    let after = optional_string(args, "cursor")?
+        .map(|cursor| parse_list_cursor(session, &cursor))
+        .transpose()?;
+    let list = session
+        .store
+        .thread_list(&session.account_id, source, &filter, after.as_ref(), limit)
+        .map_err(store_error)?;
+    let next_cursor = list
+        .more
+        .then(|| list.threads.last())
+        .flatten()
+        .map(|last| {
+            format!(
+                "{}:{}",
+                last.last_date_unix,
+                session.show_id(last.thread_id.as_str())
+            )
+        });
+    let threads = list
+        .threads
+        .iter()
+        .map(|thread| list_row_json(session, thread))
+        .collect::<Vec<_>>();
+    let mut body = Map::new();
+    match source {
+        ListSource::Folder(name) => {
+            body.insert("folder".into(), Value::String(name.to_string()));
+        }
+        ListSource::Label(name) => {
+            body.insert("label".into(), Value::String(name.to_string()));
+        }
+    }
+    if let Some(unread) = list.unread {
+        body.insert("unread_threads".into(), Value::from(unread));
+    }
+    body.insert("threads".into(), Value::Array(threads));
+    body.insert("next_cursor".into(), json!(next_cursor));
+    Ok(Value::Object(body))
+}
+
+/// A cursor is `date:thread_id`, the last row of the previous page.
+fn parse_list_cursor(session: &Session, cursor: &str) -> Result<ListKey, String> {
+    let bad = || "cursor must be next_cursor from list_threads".to_string();
+    let (date, thread) = cursor.split_once(':').ok_or_else(bad)?;
+    let date_unix = date.parse::<i64>().map_err(|_| bad())?;
+    if thread.is_empty() {
+        return Err(bad());
+    }
+    Ok(ListKey {
+        date_unix,
+        thread_id: ThreadId(session.resolve_id(thread)),
+    })
+}
+
+fn list_row_json(session: &Session, thread: &FolderThread) -> Value {
+    json!({
+        "thread_id": session.show_id(thread.thread_id.as_str()),
+        "sender_address": session.show_id(&thread.latest_email),
+        "date_unix": thread.last_date_unix,
+        "message_count": thread.message_count,
+        "unread": thread.unread,
+        "starred": thread.starred,
+        "has_attachment": thread.has_attachment,
+        "labels": thread.labels,
+        "subject": untrusted::envelope(&thread.subject, SNIPPET_CHARS),
+        "snippet": untrusted::envelope(&thread.snippet, SNIPPET_CHARS),
+    })
+}
+
 fn list_labels(session: &Session) -> Result<Value, String> {
     let labels = session
         .store
@@ -175,6 +328,84 @@ fn label(session: &Session, args: &Value) -> Result<Value, String> {
         _ => return Err("mode must be add or remove".into()),
     }
     .map_err(store_error)?;
+    Ok(mutation_json(action))
+}
+
+/// What each folder is for, from the server's SPECIAL-USE marks when it
+/// gave any (see [`fell_core::Store::folder_roles`]).
+fn folder_roles(session: &Session) -> Result<fell_core::FolderRoles, String> {
+    session
+        .store
+        .folder_roles(&session.account_id)
+        .map_err(store_error)
+}
+
+fn move_thread(session: &Session, args: &Value) -> Result<Value, String> {
+    let thread_id = thread_arg(session, args)?;
+    let to = require_string(args, "to")?;
+    let from = optional_string(args, "from")?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "INBOX".to_string());
+    // Refuse by role before the name is resolved, so `to: "Trash"` says why
+    // even on an account whose Trash has another name. The store checks the
+    // resolved folder again.
+    let roles = folder_roles(session)?;
+    fell_core::agent::check_agent_move(&roles, &from, &to).map_err(store_error)?;
+    // Only folders the mailbox has, so a typo does not invent one. The
+    // archive folder is always a destination, as it is for the archive tool.
+    let known = folder_names(session)?;
+    let to = known
+        .into_iter()
+        .chain(std::iter::once(roles.archive_name().to_string()))
+        .find(|name| same_folder(name, to.trim()))
+        .ok_or("unknown folder; pass a name from list_folders")?;
+    let action = session
+        .store
+        .agent_move_thread(
+            &session.account_id,
+            &thread_id,
+            &from,
+            &to,
+            &actor_name(session),
+        )
+        .map_err(store_error)?;
+    Ok(mutation_json(action))
+}
+
+fn star(session: &Session, args: &Value) -> Result<Value, String> {
+    let thread_id = thread_arg(session, args)?;
+    let starred = match args.get("starred") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("starred must be a boolean".into()),
+    };
+    let action = session
+        .store
+        .star_thread(
+            &session.account_id,
+            &thread_id,
+            starred,
+            &actor_name(session),
+        )
+        .map_err(store_error)?;
+    Ok(mutation_json(action))
+}
+
+fn mark_unread(session: &Session, args: &Value) -> Result<Value, String> {
+    let thread_id = thread_arg(session, args)?;
+    let action = session
+        .store
+        .mark_thread_unread(&session.account_id, &thread_id, &actor_name(session))
+        .map_err(store_error)?;
+    Ok(mutation_json(action))
+}
+
+fn unsnooze(session: &Session, args: &Value) -> Result<Value, String> {
+    let thread_id = thread_arg(session, args)?;
+    let action = session
+        .store
+        .unsnooze_thread(&session.account_id, &thread_id, &actor_name(session))
+        .map_err(store_error)?;
     Ok(mutation_json(action))
 }
 
@@ -524,6 +755,15 @@ fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -
         "snippet": untrusted::envelope(&message.snippet, SNIPPET_CHARS),
         "body": untrusted::envelope_body(body, body_budget),
         "unread": message.unread,
+        "starred": message.starred,
+        "has_attachment": message.has_attachment,
+        "attachments": message
+            .attachment_names
+            .iter()
+            .take(MAX_ATTACHMENT_NAMES)
+            .map(|name| json!({ "name": untrusted::envelope(name, SNIPPET_CHARS) }))
+            .collect::<Vec<_>>(),
+        "attachments_omitted": message.attachment_names.len().saturating_sub(MAX_ATTACHMENT_NAMES),
         "folders": message.folders,
         "labels": message.labels,
         "archived": message.archived,
@@ -809,7 +1049,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "read_thread",
-            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, and the sender's display name use that same object. Sender address and date stay outside it. No attachments and no remote fetch.",
+            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name only, never their contents, at most 20 per message; attachments_omitted counts the rest. has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
             scope: ToolScope::Read,
             schema: object_schema(
                 Map::from_iter([
@@ -826,6 +1066,55 @@ fn all_tools() -> Vec<Tool> {
                     ),
                 ]),
                 &["thread_id"],
+            ),
+        },
+        Tool {
+            name: "list_folders",
+            description: "List this account's folders, Inbox first: name, role (inbox, sent, drafts, trash, junk, archive, all_mail, flagged, or null for an ordinary folder; from the server's own folder marks when it has them), and the number of unread threads. Pass a name to list_threads or move.",
+            scope: ToolScope::Read,
+            schema: object_schema(Map::new(), &[]),
+        },
+        Tool {
+            name: "list_threads",
+            description: "List threads in one folder (default INBOX) or under one label, newest activity first. Each row: thread id, latest sender address, date of the latest message, message count, unread, starred, has_attachment, labels, and subject and snippet as untrusted_email_content. There is no body; use read_thread. Pass cursor from next_cursor for the next page.",
+            scope: ToolScope::Read,
+            schema: object_schema(
+                Map::from_iter([
+                    (
+                        "folder".into(),
+                        prop("string", "Folder name from list_folders. Default INBOX."),
+                    ),
+                    (
+                        "label".into(),
+                        prop(
+                            "string",
+                            "List threads with this label instead of a folder. Exact name from list_labels.",
+                        ),
+                    ),
+                    (
+                        "unread_only".into(),
+                        prop("boolean", "Only threads with unread mail."),
+                    ),
+                    (
+                        "since".into(),
+                        prop(
+                            "integer",
+                            "Only threads whose latest message is at or after this unix second.",
+                        ),
+                    ),
+                    (
+                        "limit".into(),
+                        prop("integer", "Rows per page. Default 20, at most 50."),
+                    ),
+                    (
+                        "cursor".into(),
+                        prop(
+                            "string",
+                            "Page token from the previous response's next_cursor.",
+                        ),
+                    ),
+                ]),
+                &[],
             ),
         },
         Tool {
@@ -855,6 +1144,22 @@ fn all_tools() -> Vec<Tool> {
             ),
         },
         Tool {
+            name: "move",
+            description: "Move a thread's messages from one folder to another. Only messages in the from folder move; copies elsewhere, such as Sent, stay. The destination must be a folder from list_folders, or Archive. Agents cannot move mail to a folder whose role is trash, junk, sent or drafts, nor in or out of all_mail or flagged (use archive or star). Moving mail out of Trash or Spam is allowed. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
+            scope: ToolScope::Triage,
+            schema: object_schema(
+                Map::from_iter([
+                    ("thread_id".into(), prop("string", "Thread to move.")),
+                    ("to".into(), prop("string", "Destination folder name.")),
+                    (
+                        "from".into(),
+                        prop("string", "Folder to move the thread out of. Default INBOX."),
+                    ),
+                ]),
+                &["thread_id", "to"],
+            ),
+        },
+        Tool {
             name: "archive",
             description: "Archive a thread: set the archive bit and remove INBOX. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
             scope: ToolScope::Triage,
@@ -873,6 +1178,30 @@ fn all_tools() -> Vec<Tool> {
             ),
         },
         Tool {
+            name: "star",
+            description: "Star a thread, or unstar it with starred false. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
+            scope: ToolScope::Triage,
+            schema: object_schema(
+                Map::from_iter([
+                    ("thread_id".into(), prop("string", "Thread to star.")),
+                    (
+                        "starred".into(),
+                        prop("boolean", "false removes the star. Default true."),
+                    ),
+                ]),
+                &["thread_id"],
+            ),
+        },
+        Tool {
+            name: "mark_unread",
+            description: "Mark every message in a thread unread. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
+            scope: ToolScope::Triage,
+            schema: object_schema(
+                Map::from_iter([("thread_id".into(), prop("string", "Thread to mark unread."))]),
+                &["thread_id"],
+            ),
+        },
+        Tool {
             name: "snooze",
             description: "Snooze a thread until a unix timestamp. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
             scope: ToolScope::Triage,
@@ -885,6 +1214,15 @@ fn all_tools() -> Vec<Tool> {
                     ),
                 ]),
                 &["thread_id", "until_unix"],
+            ),
+        },
+        Tool {
+            name: "unsnooze",
+            description: "End a thread's snooze now. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
+            scope: ToolScope::Triage,
+            schema: object_schema(
+                Map::from_iter([("thread_id".into(), prop("string", "Thread to unsnooze."))]),
+                &["thread_id"],
             ),
         },
         Tool {
@@ -1045,11 +1383,17 @@ mod tests {
             [
                 "search",
                 "read_thread",
+                "list_folders",
+                "list_threads",
                 "list_labels",
                 "label",
+                "move",
                 "archive",
                 "mark_read",
+                "star",
+                "mark_unread",
                 "snooze",
+                "unsnooze",
                 "create_draft",
                 "list_drafts",
                 "get_draft",
@@ -1072,6 +1416,15 @@ mod tests {
         assert!(visible(&AgentGrant::DISABLED).is_empty());
         let read_only = visible(&AgentGrant::enabled(true, false, false));
         let names: Vec<_> = read_only.iter().map(|tool| tool.name).collect();
-        assert_eq!(names, ["search", "read_thread", "list_labels"]);
+        assert_eq!(
+            names,
+            [
+                "search",
+                "read_thread",
+                "list_folders",
+                "list_threads",
+                "list_labels"
+            ]
+        );
     }
 }

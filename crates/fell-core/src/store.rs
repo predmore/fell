@@ -27,7 +27,7 @@ pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
 
-pub use summaries::{FolderPage, FolderSpan, ListKey};
+pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS agent_action_messages (
     unread INTEGER NOT NULL,
     archived INTEGER NOT NULL,
     snooze_until INTEGER,
+    -- NULL on rows logged before star was undoable: undo leaves the star.
+    starred INTEGER,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
 
@@ -396,6 +398,7 @@ impl Store {
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
+        ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
@@ -857,6 +860,20 @@ impl Store {
         span: &FolderSpan,
     ) -> Result<FolderPage> {
         summaries::folder_page(&self.conn, account_id, folder, span)
+    }
+
+    /// Up to `limit` threads of a folder or label after `after` (from the
+    /// top when `None`) that pass `filter`, newest activity first. Paging by
+    /// key, as [`Store::folder_page`] does, so new mail never shifts a page.
+    pub fn thread_list(
+        &self,
+        account_id: &AccountId,
+        source: ListSource<'_>,
+        filter: &ListFilter,
+        after: Option<&ListKey>,
+        limit: usize,
+    ) -> Result<ThreadList> {
+        summaries::thread_list(&self.conn, account_id, source, filter, after, limit)
     }
 
     /// Where `thread` sits in `folder`'s list, or `None` when it is not in
@@ -2910,6 +2927,21 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
         {
             return Err(err.into());
         }
+    }
+    Ok(())
+}
+
+fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
+    let have = column_names(conn, "agent_action_messages")?;
+    if have.iter().any(|column| column == "starred") {
+        return Ok(());
+    }
+    if let Err(err) = conn.execute(
+        "ALTER TABLE agent_action_messages ADD COLUMN starred INTEGER",
+        [],
+    ) && !duplicate_column(&err)
+    {
+        return Err(err.into());
     }
     Ok(())
 }

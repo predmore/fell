@@ -20,8 +20,9 @@ Usage:
   fell-mcp revoke --store PATH --account ID --agent ID
 
 Scopes:
-  --read     search, read_thread, list_labels
-  --triage   label, archive, mark_read, snooze, and undo of those
+  --read     search, read_thread, list_folders, list_threads, list_labels
+  --triage   label, move, archive, star, mark_read, mark_unread, snooze,
+             unsnooze, and undo of those
   --draft    create_draft, list_drafts, and undo of those
 ";
 
