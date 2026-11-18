@@ -145,7 +145,9 @@ fn accept_loop(
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                // As long as the client's own timeout: a large fetch on a
+                // loaded machine can still be persisting when the reply ends.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
                 handle(stream, &state, &sent);
             }
             Err(_) => break,
