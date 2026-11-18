@@ -1,6 +1,6 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +18,14 @@ use gpui::{
 use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::draft_host::DraftHome;
+use crate::frame_log::{FrameLog, SharedFrameLog};
+use crate::inbox_motion::{InboxMotion, NoticeView, PaneEntry};
 use crate::keymap::KeyId;
 use crate::mailbox;
 use crate::model::{
     DRAFT_NOT_THREAD, Fetch, Overlay, QueryFault, Session, Step, SyncKind, row_key,
 };
+use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
@@ -133,6 +136,10 @@ fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
     }
 }
 
+/// Height of one thread row. Rows never change height, so the list can
+/// place, scroll to and animate any row from its index.
+const ROW_PX: f32 = 68.0;
+
 struct Inbox {
     focus: FocusHandle,
     /// The mailbox connection's own thread. The window never calls SQLite.
@@ -173,6 +180,12 @@ struct Inbox {
     draft_home: Option<DraftHome>,
     /// The compose drafts at the top of the Drafts list, as last read.
     drafts: Vec<DraftSummary>,
+    /// Transitions running in this window. See [`crate::motion`].
+    motion: InboxMotion,
+    /// The time this frame draws at, so every part of it agrees.
+    frame_now: Instant,
+    /// `FELL_FRAME_LOG`: frame times, for the key-to-frame budget.
+    frames: Option<SharedFrameLog>,
 }
 
 impl Inbox {
@@ -230,6 +243,9 @@ impl Inbox {
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
             drafts: Vec::new(),
+            motion: InboxMotion::new(Motion::from_env()),
+            frame_now: Instant::now(),
+            frames: FrameLog::from_env(),
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -506,6 +522,7 @@ impl Inbox {
             }
         }
         let row_height = self.list_row_height();
+        let drawn = self.drawn_rows(Instant::now());
         let before_id = self.session.cursor_id.clone();
         let before_index = before_id
             .as_ref()
@@ -536,6 +553,7 @@ impl Inbox {
         } else {
             self.scroll_list_to_cursor();
         }
+        self.start_list_shift(drawn);
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
         // A draft's preview follows its edits.
@@ -595,7 +613,7 @@ impl Inbox {
 
     /// Move the list viewport by `rows` rows of `row` pixels without moving
     /// the selection. GPUI offsets grow more negative further down the list.
-    fn shift_list(&self, rows: i64, row: f32) {
+    fn shift_list(&mut self, rows: i64, row: f32) {
         if rows == 0 {
             return;
         }
@@ -605,6 +623,105 @@ impl Inbox {
         let max = f32::from(handle.max_offset().height) + rows.max(0) as f32 * row;
         let next = (f32::from(offset.y) - rows as f32 * row).clamp(-max, 0.0);
         handle.set_offset(point(offset.x, px(next)));
+        // A glide in flight moves with the rows, so it still lands on the
+        // selection.
+        if let Some(glide) = &mut self.motion.list_glide {
+            glide.from = (glide.from - rows as f32 * row).clamp(-max, 0.0);
+            glide.to = (glide.to - rows as f32 * row).clamp(-max, 0.0);
+        }
+    }
+
+    /// The list's scroll offset as last drawn (0 at the top, negative below).
+    fn list_offset(&self) -> f32 {
+        f32::from(self.list_scroll.0.borrow().base_handle.offset().y)
+    }
+
+    fn set_list_offset(&self, y: f32) {
+        let state = self.list_scroll.0.borrow();
+        let offset = state.base_handle.offset();
+        state.base_handle.set_offset(point(offset.x, px(y)));
+    }
+
+    /// Height of the list viewport, once the list has been laid out.
+    fn list_viewport(&self) -> Option<f32> {
+        let state = self.list_scroll.0.borrow();
+        let height = f32::from(state.last_item_size?.item.height);
+        (height > 0.0).then_some(height)
+    }
+
+    /// The rows on screen and two past each edge, with their top in the
+    /// viewport as drawn: where a list change animates them from.
+    fn drawn_rows(&self, now: Instant) -> Vec<(ThreadRow, f32)> {
+        let Some(view) = self.list_viewport() else {
+            return Vec::new();
+        };
+        let offset = self.list_offset();
+        let first = ((-offset / ROW_PX).floor() as i64 - 2).max(0) as usize;
+        let last = (((-offset + view) / ROW_PX).ceil() as i64 + 2).max(0) as usize;
+        let rows = &self.session.threads;
+        (first.min(rows.len())..last.min(rows.len()))
+            .map(|index| {
+                let row = &rows[index];
+                let top = index as f32 * ROW_PX + offset + self.motion.row_offset(&row.id, now);
+                (row.clone(), top)
+            })
+            .collect()
+    }
+
+    /// Animate the rows from where `drawn` had them to where they are now.
+    /// Rows among them that left the list fade out where they were.
+    fn start_list_shift(&mut self, drawn: Vec<(ThreadRow, f32)>) {
+        let now = Instant::now();
+        let ids: std::collections::HashSet<&str> = self
+            .session
+            .threads
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        let before = drawn
+            .iter()
+            .map(|(row, top)| (row.id.clone(), *top))
+            .collect();
+        let left = drawn
+            .iter()
+            .filter(|(row, _)| !ids.contains(row.id.as_str()))
+            .cloned()
+            .collect();
+        let carried = self.motion.carried_ghosts();
+        let reach = self.list_viewport().unwrap_or(640.0);
+        self.motion.list = ListShift::start(&self.motion.motion, before, left, carried, reach, now);
+    }
+
+    /// Move each glide one frame along, and end the ones that arrived.
+    /// Offsets land on whole device pixels, so text stays crisp and its
+    /// glyphs come from the atlas instead of being rasterized again.
+    fn advance_glides(&mut self, now: Instant, scale: f32) {
+        if let Some(glide) = self.motion.list_glide {
+            self.set_list_offset(motion::snap(glide.value(now), scale));
+            if !glide.running(now) {
+                self.motion.list_glide = None;
+            }
+        }
+        if let Some(glide) = self.motion.conv_glide {
+            let offset = self.conv_scroll.offset();
+            self.conv_scroll
+                .set_offset(point(offset.x, px(motion::snap(glide.value(now), scale))));
+            if !glide.running(now) {
+                self.motion.conv_glide = None;
+            }
+        }
+    }
+
+    /// A key arrived: jump every transition to its end state first.
+    fn settle_motion(&mut self) {
+        let settled = self.motion.settle(Instant::now());
+        if let Some(y) = settled.list {
+            self.set_list_offset(y);
+        }
+        if let Some(y) = settled.conversation {
+            let offset = self.conv_scroll.offset();
+            self.conv_scroll.set_offset(point(offset.x, px(y)));
+        }
     }
 
     /// Read the selected thread on the store thread. A read that is stale
@@ -676,6 +793,7 @@ impl Inbox {
                             inbox.session.refresh_messages(view, bottom)
                         } else {
                             inbox.session.set_messages(view);
+                            inbox.motion.thread_arrived(Instant::now());
                             true
                         };
                         inbox.open_thread = Some(id);
@@ -903,8 +1021,10 @@ impl Inbox {
     /// the row that took its place.
     fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
         self.pending_removals.insert(id.to_string());
+        let drawn = self.drawn_rows(Instant::now());
         self.session.remove_thread(id);
         self.scroll_list_to_cursor();
+        self.start_list_shift(drawn);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
@@ -1178,6 +1298,12 @@ impl Inbox {
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
+        if let Some(log) = &self.frames {
+            log.borrow_mut()
+                .key(Instant::now(), event.keystroke.unparse());
+        }
+        // Input never waits on an animation.
+        self.settle_motion();
         window.focus(&self.focus);
         // The wheel moves the viewport without moving message_cursor. j, k,
         // and q aim at the message now on screen in either pane. Enter and o
@@ -1273,7 +1399,16 @@ impl Inbox {
         }
         let thread_moved = self.session.cursor_id != thread_before;
         if thread_moved {
-            self.scroll_list_to_cursor();
+            // Rows the selection moved by, when both rows are on the list.
+            let moved = thread_before
+                .as_ref()
+                .and_then(|id| self.session.threads.iter().position(|row| &row.id == id))
+                .zip(self.session.selected_index())
+                .map(|(from, to)| to as i64 - from as i64);
+            match moved {
+                Some(rows) => self.glide_list_to_cursor(rows),
+                None => self.scroll_list_to_cursor(),
+            }
         }
         // A tall message aligns to its top when scrolled into view. Skip that
         // unless the reader moved to another message, or a new thread loaded.
@@ -1282,7 +1417,11 @@ impl Inbox {
         if step.scroll_pages != 0 || step.scroll_lines != 0 {
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
         } else if self.session.message_cursor != message_before {
-            self.scroll_conversation();
+            if self.session.cursor_id == thread_before {
+                self.glide_conversation_to_cursor();
+            } else {
+                self.scroll_conversation();
+            }
         }
         if self.session.overlay == Overlay::Palette {
             self.palette_scroll
@@ -1291,6 +1430,7 @@ impl Inbox {
         if self.session.overlay == Overlay::Folders {
             self.folder_scroll.scroll_to_item(self.session.folder_index);
         }
+        self.motion.end_key();
         cx.notify();
     }
 
@@ -1313,7 +1453,50 @@ impl Inbox {
 
     fn scroll_conversation(&mut self) {
         if !self.session.messages.is_empty() {
+            self.motion.conv_glide = None;
             self.conv_scroll.scroll_to_item(self.session.message_cursor);
+        }
+    }
+
+    /// `j`/`k` in the conversation: glide to the message, by the rule
+    /// GPUI's `scroll_to_item` uses, once its bounds are known.
+    fn glide_conversation_to_cursor(&mut self) {
+        let index = self.session.message_cursor;
+        let Some(item) = self.conv_scroll.bounds_for_item(index) else {
+            self.scroll_conversation();
+            return;
+        };
+        let view = self.conv_scroll.bounds();
+        let offset = f32::from(self.conv_scroll.offset().y);
+        let max = f32::from(self.conv_scroll.max_offset().height);
+        let (top, bottom) = (f32::from(item.top()), f32::from(item.bottom()));
+        let target = if top + offset < f32::from(view.top()) {
+            f32::from(view.top()) - top
+        } else if bottom + offset > f32::from(view.bottom()) {
+            f32::from(view.bottom()) - bottom
+        } else {
+            offset
+        };
+        self.glide_conversation(offset, target.clamp(-max, 0.0));
+    }
+
+    /// Set the conversation's offset to `to`, gliding there from where it
+    /// is drawn. `offset` is the offset the key saw.
+    fn glide_conversation(&mut self, offset: f32, to: f32) {
+        let from = self.motion.glide_from_conversation(offset);
+        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
+        let x = self.conv_scroll.offset().x;
+        self.conv_scroll.set_offset(point(x, px(to)));
+        self.motion.conv_glide = Glide::start(
+            &self.motion.motion,
+            from,
+            to,
+            reach,
+            motion::SLIDE,
+            Instant::now(),
+        );
+        if let Some(glide) = self.motion.conv_glide {
+            self.conv_scroll.set_offset(point(x, px(glide.from)));
         }
     }
 
@@ -1340,7 +1523,7 @@ impl Inbox {
             next_y < measured_y,
             next_y != measured_y,
         );
-        self.conv_scroll.set_offset(point(measured.x, px(next_y)));
+        self.glide_conversation(measured_y, next_y);
     }
 
     fn arm_which(&mut self, cx: &mut Context<Self>) {
@@ -1382,11 +1565,50 @@ impl Inbox {
         ((height / row).floor() as usize).max(1)
     }
 
-    /// Nothing selected (the row after an archived one is loading): stay.
-    fn scroll_list_to_cursor(&self) {
-        if let Some(index) = self.session.selected_index() {
+    /// Bring the selection into view at once: a row off screen goes to the
+    /// top. Nothing selected (the row after an archived one is loading): stay.
+    fn scroll_list_to_cursor(&mut self) {
+        let Some(index) = self.session.selected_index() else {
+            return;
+        };
+        let Some(view) = self.list_viewport() else {
             self.list_scroll.scroll_to_item(index, ScrollStrategy::Top);
-        }
+            return;
+        };
+        let current = self
+            .motion
+            .list_glide
+            .map_or_else(|| self.list_offset(), |glide| glide.to);
+        let rows = self.session.threads.len();
+        let target = present::list_scroll_target(current, index, None, rows, ROW_PX, view);
+        self.motion.list_glide = None;
+        self.set_list_offset(target);
+    }
+
+    /// A key moved the selection by `moved` rows: glide the list so the
+    /// selection shows, moving the view by as many rows when the selection
+    /// would leave it (`Ctrl-d`, `G`), so it stays where the eye is.
+    fn glide_list_to_cursor(&mut self, moved: i64) {
+        let Some(index) = self.session.selected_index() else {
+            return;
+        };
+        let Some(view) = self.list_viewport() else {
+            self.list_scroll.scroll_to_item(index, ScrollStrategy::Top);
+            return;
+        };
+        let offset = self.list_offset();
+        let rows = self.session.threads.len();
+        let target = present::list_scroll_target(offset, index, Some(moved), rows, ROW_PX, view);
+        let from = self.motion.glide_from_list(offset);
+        self.motion.list_glide = Glide::start(
+            &self.motion.motion,
+            from,
+            target,
+            view * motion::GLIDE_MAX_VIEWPORTS,
+            motion::SLIDE,
+            Instant::now(),
+        );
+        self.set_list_offset(self.motion.list_glide.map_or(target, |glide| glide.from));
     }
 
     /// [`Session::cancel_pending_keys`], and the read that drops a jump it
@@ -1410,7 +1632,20 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        self.frame_now = now;
         let width = f32::from(window.viewport_size().width);
+        let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
+        self.motion.observe(&self.session, panes, now);
+        self.advance_glides(now, window.scale_factor());
+        let animating = self.motion.tick(now);
+        if animating {
+            window.request_animation_frame();
+        }
+        if let Some(log) = &self.frames {
+            log.borrow_mut().render_started(now, animating);
+        }
+        let frames = self.frames.clone();
         let theme = self.theme.clone();
         let session = &self.session;
         let list_scroll = self.list_scroll.clone();
@@ -1422,6 +1657,8 @@ impl Render for Inbox {
         shell(
             theme,
             session,
+            &self.motion,
+            now,
             width,
             split,
             list_scroll,
@@ -1432,6 +1669,18 @@ impl Render for Inbox {
             window,
             cx,
         )
+        .when_some(frames, |root, frames| {
+            frames.borrow_mut().built(Instant::now());
+            // Painted last, so it marks the end of the frame's paint.
+            root.child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, _, _| frames.borrow_mut().painted(Instant::now()),
+                )
+                .absolute()
+                .size_0(),
+            )
+        })
     }
 }
 
@@ -1439,6 +1688,8 @@ impl Render for Inbox {
 fn shell(
     theme: Theme,
     session: &Session,
+    motion: &InboxMotion,
+    now: Instant,
     width: f32,
     split: f32,
     list_scroll: UniformListScrollHandle,
@@ -1448,14 +1699,21 @@ fn shell(
     focus: FocusHandle,
     window: &Window,
     cx: &mut Context<Inbox>,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let (show_list, show_conv) = present::visible_panes(width, session.pane, session.full_width);
     let list_width = (width * split).clamp(280.0, (width - 400.0).max(280.0));
+    let list_entry = motion.pane_entry(Pane::List, now);
+    let conv_entry = motion.pane_entry(Pane::Conversation, now);
+    let notice = motion.notice(session, now);
     div()
         .id("fell-root")
         .track_focus(&focus)
         .on_key_down(cx.listener(|inbox, event: &KeyDownEvent, window, cx| {
             inbox.on_key_down(event, window, cx);
+        }))
+        // The wheel takes over from a glide where the viewport is.
+        .on_scroll_wheel(cx.listener(|inbox, _: &gpui::ScrollWheelEvent, _, _| {
+            inbox.motion.cancel_glides();
         }))
         .on_mouse_move(cx.listener(|inbox, event: &MouseMoveEvent, window, cx| {
             if !inbox.dragging {
@@ -1495,13 +1753,16 @@ fn shell(
                 .flex_row()
                 .overflow_hidden()
                 .when(show_list, |row| {
-                    row.child(thread_list(
-                        &theme,
-                        session,
-                        show_conv,
-                        if show_conv { list_width } else { width },
-                        list_scroll,
-                        cx,
+                    row.child(entering(
+                        thread_list(
+                            &theme,
+                            session,
+                            show_conv,
+                            if show_conv { list_width } else { width },
+                            list_scroll,
+                            cx,
+                        ),
+                        list_entry,
                     ))
                 })
                 .when(show_list && show_conv, |row| {
@@ -1513,30 +1774,46 @@ fn shell(
                     } else {
                         width
                     };
-                    row.child(conversation(
-                        &theme,
-                        session,
-                        conv_scroll,
-                        conv_width,
-                        window,
-                        cx,
+                    row.child(entering(
+                        conversation(
+                            &theme,
+                            session,
+                            motion,
+                            now,
+                            conv_scroll,
+                            conv_width,
+                            window,
+                            cx,
+                        ),
+                        conv_entry,
                     ))
                 }),
         )
-        .child(status_bar(&theme, session, width, window))
+        .child(status_bar(&theme, session, notice, width, window))
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
-            |root| root.child(which_key_popup(&theme, session)),
+            |root| root.child(which_key_popup(&theme, session, motion.which(now))),
         )
         .when(session.overlay != Overlay::None, |root| {
             root.child(overlay(
                 &theme,
                 session,
+                motion.overlay(now),
                 &palette_scroll,
                 &folder_scroll,
                 cx,
             ))
         })
+}
+
+/// A pane that just came into view slides in from its side as it fades in.
+fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful<gpui::Div> {
+    if entry.opacity >= 1.0 {
+        return pane;
+    }
+    pane.relative()
+        .left(px(entry.dx.round()))
+        .opacity(entry.opacity)
 }
 
 fn header(theme: &Theme, session: &Session) -> gpui::Div {
@@ -1624,18 +1901,64 @@ fn thread_list(
                 }
                 let highlighted = inbox.session.highlighted();
                 let text_width = (list_width - 2.0 - 3.0 - 24.0).max(48.0);
+                let now = inbox.frame_now;
+                let offset = inbox.list_offset();
+                let last = inbox.session.threads.len().saturating_sub(1);
                 range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
-                        thread_row(
-                            &theme_for_rows,
-                            &row,
-                            index,
-                            &highlighted,
-                            text_width,
-                            window,
-                            cx,
-                        )
+                        let selected = highlighted.contains(&row.id);
+                        let look = RowLook {
+                            selected,
+                            fading: inbox
+                                .motion
+                                .selection_left(&row.id, now)
+                                .filter(|_| !selected),
+                            ghost: false,
+                        };
+                        let element =
+                            thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
+                        let Some(shift) = inbox.motion.list.as_mut() else {
+                            return element;
+                        };
+                        // Where the row was before the list changed, and the
+                        // rows that left from under it.
+                        let top = index as f32 * ROW_PX + offset;
+                        let mut moving = shift.row(&row.id, top, now);
+                        moving.dy = motion::snap(moving.dy, window.scale_factor());
+                        let reach = if index == last { f32::INFINITY } else { ROW_PX };
+                        let ghosts = shift.ghosts_in(top, reach, now);
+                        if moving == RowMotion::STILL && ghosts.is_empty() {
+                            return element;
+                        }
+                        let ghosts: Vec<_> = ghosts
+                            .into_iter()
+                            .map(|(gone, dy, opacity)| {
+                                let dy = motion::snap(dy, window.scale_factor());
+                                let look = RowLook {
+                                    selected: false,
+                                    fading: None,
+                                    ghost: true,
+                                };
+                                slot_layer(dy, opacity).child(thread_row(
+                                    &theme_for_rows,
+                                    &gone,
+                                    index,
+                                    look,
+                                    text_width,
+                                    window,
+                                    cx,
+                                ))
+                            })
+                            .collect();
+                        div()
+                            .id(gpui::ElementId::named_usize("thread-slot", index))
+                            .relative()
+                            .h(px(ROW_PX))
+                            .w_full()
+                            .children(ghosts)
+                            .child(slot_layer(moving.dy, moving.opacity).child(element))
+                            .into_any_element()
                     })
                     .collect::<Vec<_>>()
             })
@@ -1665,48 +1988,78 @@ fn thread_list(
     }
 }
 
+/// One layer of a row slot while the list animates: a row drawn `dy` from
+/// its slot.
+fn slot_layer(dy: f32, opacity: f32) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(dy))
+        .left(px(0.))
+        .right(px(0.))
+        .h(px(ROW_PX))
+        .opacity(opacity)
+}
+
+/// How a thread row is drawn.
+#[derive(Clone, Copy)]
+struct RowLook {
+    selected: bool,
+    /// The selection just left this row: how much of its highlight shows.
+    fading: Option<f32>,
+    /// A row that left the list, fading where it was. Not clickable.
+    ghost: bool,
+}
+
 fn thread_row(
     theme: &Theme,
     row: &ThreadRow,
     index: usize,
-    highlighted: &std::collections::HashSet<String>,
+    look: RowLook,
     text_width: f32,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let selected = highlighted.contains(&row.id);
+    let selected = look.selected;
     let id = row.id.clone();
+    let element_id = if look.ghost {
+        gpui::ElementId::Name(format!("ghost-{}", row.id).into())
+    } else {
+        gpui::ElementId::named_usize("thread", index)
+    };
+    let background = match look.fading {
+        _ if selected => theme.selection,
+        Some(left) => motion::mix(theme.background, theme.selection, left),
+        None => theme.background,
+    };
     let weight = if row.unread {
         FontWeight::BOLD
     } else {
         FontWeight::NORMAL
     };
     div()
-        .id(gpui::ElementId::named_usize("thread", index))
-        .h(px(68.))
+        .id(element_id)
+        .h(px(ROW_PX))
         .w_full()
         .flex()
         .flex_row()
         .items_center()
         .overflow_hidden()
-        .bg(rgb(if selected {
-            theme.selection
-        } else {
-            theme.background
-        }))
+        .bg(rgb(background))
         .text_color(rgb(if selected {
             theme.on_selection
         } else {
             theme.foreground
         }))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |inbox, _, window, cx| {
-                window.focus(&inbox.focus);
-                inbox.select_thread(id.clone(), cx);
-                cx.notify();
-            }),
-        )
+        .when(!look.ghost, |row| {
+            row.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, window, cx| {
+                    window.focus(&inbox.focus);
+                    inbox.select_thread(id.clone(), cx);
+                    cx.notify();
+                }),
+            )
+        })
         // Shorter than the row, so bars on adjacent unread rows stay apart.
         // A read row keeps the gap but no fill, so a selected row's
         // highlight shows through it.
@@ -2000,9 +2353,12 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
         .child(div().w(px(1.)).h_full().bg(rgb(theme.border)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conversation(
     theme: &Theme,
     session: &Session,
+    motion: &InboxMotion,
+    now: Instant,
     scroll: ScrollHandle,
     conv_width: f32,
     window: &Window,
@@ -2031,11 +2387,11 @@ fn conversation(
         .flex_col()
         .overflow_hidden()
         .border_l(px(2.))
-        .border_color(rgb(if session.pane == Pane::Conversation {
-            theme.accent
-        } else {
-            theme.background
-        }))
+        .border_color(rgb(motion::mix(
+            theme.background,
+            theme.accent,
+            motion.focus_edge(session.pane, now),
+        )))
         .when(!subject.is_empty(), |pane| {
             pane.child(
                 div()
@@ -2059,6 +2415,9 @@ fn conversation(
                 .track_scroll(&scroll)
                 .px(px(20.))
                 .pb(px(28.))
+                .when(motion.arrival(now) < 1.0, |body| {
+                    body.opacity(motion.arrival(now))
+                })
                 .children(messages),
         )
 }
@@ -2448,10 +2807,23 @@ fn body_block(
     }
 }
 
-fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> gpui::Div {
+fn status_bar(
+    theme: &Theme,
+    session: &Session,
+    notice: Option<NoticeView>,
+    width: f32,
+    window: &Window,
+) -> gpui::Div {
+    // A notice a key cleared fades out over the bar as it is without one,
+    // while the key hints fade back in.
+    let showing = notice.as_ref().is_some_and(|notice| !notice.leaving);
+    let hint_opacity = match &notice {
+        Some(notice) if notice.leaving => 1.0 - notice.opacity,
+        _ => 1.0,
+    };
     let hint = if !session.chord.is_empty() {
         session.prefix_text()
-    } else if session.toast.is_some() {
+    } else if showing {
         // A notice takes the hints' room until the next key clears it, so
         // it is never cut short.
         String::new()
@@ -2474,7 +2846,7 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
     };
     // Key hints give up whole keys from the end until they fit beside the
     // mode and sync, so a narrow window never cuts one in half.
-    let hint = if session.chord.is_empty() && session.toast.is_none() {
+    let hint = if session.chord.is_empty() && !showing {
         let size = (theme.ui_px - 1.0).max(12.0);
         let ui = theme.ui_family.as_ref();
         let mono = theme.mono_family.as_ref();
@@ -2496,7 +2868,7 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
     } else {
         hint
     };
-    let toast = session.toast.as_ref().map(|toast| {
+    let toast = notice.as_ref().map(|notice| {
         // What the bar spends before the notice, measured as drawn: the
         // padding, the mode in mono, sync, the dots, the gaps between the
         // children, and the air after the notice.
@@ -2511,7 +2883,7 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         if session.detail_text().is_some() {
             used += 12.0 + bar_px(window, "· ? details", size, ui);
         }
-        present::fit_notice(&toast.text, (width - used).max(80.0), |text| {
+        present::fit_notice(&notice.toast.text, (width - used).max(80.0), |text| {
             bar_px(window, text, size, ui)
         })
     });
@@ -2549,7 +2921,7 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
-        .when(session.toast.is_some(), |bar| {
+        .when(showing, |bar| {
             bar.child(div().text_color(rgb(theme.dimmed)).child("·"))
         })
         .child(
@@ -2557,15 +2929,22 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
                 .flex_1()
                 .min_w(px(0.))
                 // Air before the key hints, so a long message never runs into them.
-                .when(session.toast.is_none(), |toast| toast.pr(px(16.)))
+                .when(!showing, |toast| toast.pr(px(16.)))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .text_color(rgb(match &session.toast {
+                .text_color(rgb(match notice.as_ref().map(|notice| &notice.toast) {
                     Some(toast) if toast.error => theme.error,
                     Some(_) => theme.foreground,
                     None => theme.dimmed,
                 }))
+                .when_some(
+                    notice
+                        .as_ref()
+                        .map(|notice| notice.opacity)
+                        .filter(|o| *o < 1.0),
+                    |toast, opacity| toast.opacity(opacity),
+                )
                 .child(toast.unwrap_or_default()),
         )
         .when(!count.is_empty() || !hint.is_empty(), |bar| {
@@ -2577,16 +2956,19 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
                     } else {
                         theme.accent
                     }))
+                    .when(hint_opacity < 1.0, |hints| hints.opacity(hint_opacity))
                     .child(format!("{count}{hint}")),
             )
         })
 }
 
-fn which_key_popup(theme: &Theme, session: &Session) -> gpui::Div {
+/// `(opacity, rise)`: the popup fades in as it rises the last few pixels.
+fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)) -> gpui::Div {
     let items = session.which_items();
     div()
         .absolute()
-        .bottom(px(40.))
+        .bottom(px(40. - rise))
+        .opacity(opacity)
         .left(px(16.))
         .min_w(px(220.))
         .bg(rgb(theme.surface))
@@ -2622,9 +3004,16 @@ fn which_key_popup(theme: &Theme, session: &Session) -> gpui::Div {
         }))
 }
 
+const PALETTE_PX: f32 = 560.0;
+const PICKER_PX: f32 = 420.0;
+const HELP_PX: f32 = 520.0;
+
+/// `(opacity, drop, scale)`: the card fades in as it settles the last few
+/// pixels down and grows to its full width.
 fn overlay(
     theme: &Theme,
     session: &Session,
+    (opacity, drop, scale): (f32, f32, f32),
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
     cx: &mut Context<Inbox>,
@@ -2637,7 +3026,7 @@ fn overlay(
         .bottom(px(0.))
         .flex()
         .justify_center()
-        .pt(px(72.))
+        .pt(px(72. - drop))
         .occlude()
         .on_mouse_down(
             MouseButton::Left,
@@ -2647,9 +3036,18 @@ fn overlay(
             }),
         )
         .child(match session.overlay {
-            Overlay::Palette => palette(theme, session, palette_scroll, cx).into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, folder_scroll, cx).into_any_element(),
-            Overlay::Help => help(theme, session, cx).into_any_element(),
+            Overlay::Palette => palette(theme, session, palette_scroll, cx)
+                .w(px(PALETTE_PX * scale))
+                .opacity(opacity)
+                .into_any_element(),
+            Overlay::Folders => folder_picker(theme, session, folder_scroll, cx)
+                .w(px(PICKER_PX * scale))
+                .opacity(opacity)
+                .into_any_element(),
+            Overlay::Help => help(theme, session, cx)
+                .w(px(HELP_PX * scale))
+                .opacity(opacity)
+                .into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }
@@ -2663,7 +3061,7 @@ fn palette(
     let items = session.palette();
     let selected = session.palette_index;
     div()
-        .w(px(560.))
+        .w(px(PALETTE_PX))
         .max_h(px(420.))
         .bg(rgb(theme.surface))
         .border_1()
@@ -2767,7 +3165,7 @@ fn folder_picker(
     let choices = session.folder_choices();
     let selected = session.folder_index;
     div()
-        .w(px(420.))
+        .w(px(PICKER_PX))
         .max_h(px(380.))
         .bg(rgb(theme.surface))
         .border_1()
@@ -2890,7 +3288,7 @@ fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div 
         })
         .collect();
     div()
-        .w(px(520.))
+        .w(px(HELP_PX))
         .max_h(px(460.))
         .bg(rgb(theme.surface))
         .border_1()

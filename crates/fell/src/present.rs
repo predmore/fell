@@ -243,6 +243,43 @@ pub fn visible_panes(width: f32, pane: Pane, full_width: bool) -> (bool, bool) {
     (true, true)
 }
 
+/// The list scroll offset (0 at the top, negative further down) that shows
+/// row `index` of `rows` rows of height `row` in a viewport `view` tall,
+/// starting from `offset`. A row already in full view stays put. `moved`:
+/// a key moved the selection by that many rows. The view then moves by as
+/// many rows, so the selection keeps its place on screen (`j` at the bottom
+/// edge scrolls one row, `Ctrl-d` a page, `gg` and `G` to the ends).
+/// Otherwise a row off screen goes to the top.
+pub fn list_scroll_target(
+    offset: f32,
+    index: usize,
+    moved: Option<i64>,
+    rows: usize,
+    row: f32,
+    view: f32,
+) -> f32 {
+    let max = (rows as f32 * row - view).max(0.0);
+    let top = index as f32 * row;
+    let shows = |offset: f32| top >= -offset - 0.5 && top + row <= -offset + view + 0.5;
+    if shows(offset) {
+        return offset.clamp(-max, 0.0);
+    }
+    let target = match moved {
+        Some(moved) => {
+            let shifted = offset - moved as f32 * row;
+            if shows(shifted) {
+                shifted
+            } else if top < -shifted {
+                -top
+            } else {
+                view - top - row
+            }
+        }
+        None => -top,
+    };
+    target.clamp(-max, 0.0)
+}
+
 pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
     threads
         .iter()
@@ -819,6 +856,42 @@ mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    #[test]
+    fn the_list_scrolls_only_as_far_as_the_selection_needs() {
+        // 100 rows of 68 px in a 680 px viewport: ten rows show.
+        let target =
+            |offset, index, moved| list_scroll_target(offset, index, moved, 100, 68.0, 680.0);
+        assert_eq!(target(0.0, 5, Some(1)), 0.0, "in view: stays");
+        assert_eq!(
+            target(0.0, 10, Some(1)),
+            -68.0,
+            "j at the bottom edge: one row"
+        );
+        assert_eq!(
+            target(-68.0, 0, Some(-1)),
+            0.0,
+            "k at the top edge: one row"
+        );
+        assert_eq!(
+            target(0.0, 13, Some(10)),
+            -680.0,
+            "ctrl-d keeps the row's place"
+        );
+        assert_eq!(target(-3400.0, 0, Some(-55)), 0.0, "gg");
+        assert_eq!(target(0.0, 99, Some(99)), -6120.0, "G stops at the end");
+        assert_eq!(
+            target(0.0, 40, None),
+            -2720.0,
+            "off screen, no key: to the top"
+        );
+        assert_eq!(target(0.0, 98, None), -6120.0, "never past the end");
+        assert_eq!(
+            list_scroll_target(0.0, 2, None, 3, 68.0, 680.0),
+            0.0,
+            "short list"
+        );
+    }
 
     #[test]
     fn a_draft_row_names_who_it_is_to() {

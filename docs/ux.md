@@ -14,6 +14,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Transitions are quick: 80–160 ms with an ease-out curve. Input never waits for one; a key press during a transition jumps straight to the new state.
 - No layout shift: reserve space for text that is still loading, keep row heights stable, and keep the selection where the eye is.
 - Animation is off when `reduce_motion` is set or the desktop asks for reduced motion. It never pushes a frame past the key-to-frame budget.
+- In the code: `crates/fell/src/motion.rs` holds the curve, the named durations and the helpers every view uses. Until there is a settings file, `FELL_REDUCE_MOTION=1` is the `reduce_motion` setting (`=0` forces motion on); otherwise `gtk-enable-animations=false` in the GTK settings turns it off. A key ends fades and overlay openings at once. A scroll or a row that is still moving starts its next move from where it is drawn instead of snapping first; what the key acts on is already the final state.
 
 ## Quiet: no noise
 - Do not print key hints for obvious actions (`Esc` to close, `Enter` to open, `j`/`k`, `q` to quit). An empty state says what is true ("No mail matches"), not how to leave it.
