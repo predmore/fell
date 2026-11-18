@@ -1434,7 +1434,7 @@ impl Render for ComposeView {
         };
         let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
             (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
-            (Mode::Normal, "esc normal") => "i insert".into(),
+            (Mode::Normal, "esc normal" | "normal") => "i insert".into(),
             _ => self.status.clone(),
         };
         let wide = window.viewport_size().width > px(640.);
@@ -1932,7 +1932,14 @@ fn field_row(
 ) -> gpui::Div {
     // While a field is being edited it shows the raw line. Otherwise each
     // address stands alone, and one the account never mailed says "new".
-    let shown = if active || addresses.is_empty() {
+    let shown = if active {
+        // The field being typed in shows the raw line and a caret at its end.
+        div()
+            .flex()
+            .items_center()
+            .child(SharedString::from(value.to_string()))
+            .child(caret(colors, Mode::Insert))
+    } else if addresses.is_empty() {
         div().child(if value.is_empty() {
             SharedString::from(" ")
         } else {
@@ -2031,7 +2038,10 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
                 .flex_1()
                 .min_w(px(0.))
                 .font_weight(FontWeight(560.))
-                .child(subject.to_string()),
+                .flex()
+                .items_center()
+                .child(subject.to_string())
+                .when(active, |row| row.child(caret(colors, Mode::Insert))),
         )
 }
 
@@ -3183,11 +3193,17 @@ fn status_bar(
             )
             .child(dot())
             .child(div().text_color(rgb(colors.fg)).child(":q close")),
+        // Narrow: the reason alone says send is blocked, and leaves the
+        // message on the left its room.
         Some(reason) => div()
             .flex()
+            .flex_shrink_0()
             .gap_2()
-            .child(div().text_color(rgb(colors.dim)).child("send blocked"))
-            .child(dot())
+            .when(wide, |right| {
+                right
+                    .child(div().text_color(rgb(colors.dim)).child("send blocked"))
+                    .child(dot())
+            })
             .child(div().text_color(rgb(colors.fg)).child(reason.clone())),
         None => {
             let mut right = div()
