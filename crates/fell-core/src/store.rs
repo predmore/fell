@@ -1084,6 +1084,7 @@ fn open_requested_or_canonical(
         drop(conn);
         Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?))
     } else {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok((requested.to_path_buf(), conn))
     }
@@ -1956,14 +1957,18 @@ fn absorb_duplicate(
 fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
     let mut after = 0i64;
     loop {
-        let groups = duplicate_fingerprint_groups(conn, after)?;
+        // Groups and rows are read under the write lock: a mark-read or a
+        // folder change committed while this waited is what gets merged.
+        let tx = begin_immediate(conn)?;
+        let groups = duplicate_fingerprint_groups(&tx, after)?;
         if groups.is_empty() {
+            tx.commit()?;
             break;
         }
         let mut batch = Vec::new();
         for group in &groups {
             after = group.min_rowid;
-            let mut stmt = conn.prepare(&format!(
+            let mut stmt = tx.prepare(&format!(
                 "SELECT {SELECT_MESSAGE_COLS} FROM messages
                  WHERE account_id = ?1 AND body_fingerprint = ?2
                  ORDER BY rowid"
@@ -1975,7 +1980,6 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             }
             drop(stmt);
         }
-        let tx = begin_immediate(conn)?;
         for message in &batch {
             let fingerprint = message_fingerprint(message);
             let Some((stored, via_alias)) =
@@ -2568,7 +2572,10 @@ const FINGERPRINT_BATCH: usize = 32;
 fn backfill_fingerprints(conn: &Connection) -> Result<()> {
     let mut after = 0i64;
     loop {
-        let mut stmt = conn.prepare(
+        // Read the batch inside the write transaction, so a body another
+        // connection changed while this one waited is the body hashed.
+        let tx = begin_immediate(conn)?;
+        let mut stmt = tx.prepare(
             "SELECT rowid, body_text FROM messages
              WHERE body_fingerprint = '' AND rowid > ?1
              ORDER BY rowid
@@ -2583,9 +2590,9 @@ fn backfill_fingerprints(conn: &Connection) -> Result<()> {
         }
         drop(stmt);
         if batch.is_empty() {
+            tx.commit()?;
             break;
         }
-        let tx = begin_immediate(conn)?;
         for (rowid, body) in &batch {
             after = *rowid;
             let fingerprint = fingerprint_of(body.as_deref());
@@ -2894,20 +2901,17 @@ impl WriteTx<'_> {
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {
+    // Most opens change nothing here. Check without the write lock, so an
+    // open does not hold up sync or the indexer for two counts.
+    if fts_is_current(conn)? {
+        return Ok(());
+    }
     // Drop, create, and copy commit together. A killed process rolls the
     // upgrade back, so the next open tries again instead of keeping an empty
     // index whose columns merely look current.
     let tx = begin_immediate(conn)?;
     let have = column_names(&tx, "messages_fts")?;
-    let needed = [
-        "subject",
-        "sender",
-        "recipients",
-        "body",
-        "account_id",
-        "message_id",
-    ];
-    let current = needed
+    let current = FTS_COLUMNS
         .iter()
         .all(|name| have.iter().any(|column| column == name));
     let messages: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
@@ -2928,6 +2932,58 @@ fn ensure_fts(conn: &Connection) -> Result<()> {
     tx.execute_batch(FTS_TRIGGERS)?;
     tx.commit()?;
     Ok(())
+}
+
+const FTS_COLUMNS: [&str; 6] = [
+    "subject",
+    "sender",
+    "recipients",
+    "body",
+    "account_id",
+    "message_id",
+];
+
+/// The index has the current columns, holds rows when messages do, and its
+/// triggers are exactly [`FTS_TRIGGERS`]. Reads only.
+fn fts_is_current(conn: &Connection) -> Result<bool> {
+    let have = column_names(conn, "messages_fts")?;
+    if !FTS_COLUMNS
+        .iter()
+        .all(|name| have.iter().any(|column| column == name))
+    {
+        return Ok(false);
+    }
+    let messages: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |row| {
+        row.get(0)
+    })?;
+    if messages != 0 {
+        let indexed: i64 =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM messages_fts)", [], |row| {
+                row.get(0)
+            })?;
+        if indexed == 0 {
+            return Ok(false);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_ad', 'messages_au')
+         ORDER BY name",
+    )?;
+    let stored: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let squash = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut wanted: Vec<String> = FTS_TRIGGERS
+        .split("END;")
+        .map(str::trim)
+        .filter(|sql| !sql.is_empty())
+        .map(|sql| squash(&format!("{sql} END")))
+        .collect();
+    wanted.sort();
+    let mut stored: Vec<String> = stored.iter().map(|sql| squash(sql)).collect();
+    stored.sort();
+    Ok(stored == wanted)
 }
 
 fn duplicate_column(err: &rusqlite::Error) -> bool {
@@ -6570,6 +6626,24 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod fts_check {
+    /// After the first open sets up the index and its triggers, later opens
+    /// find nothing to change, so they take no write lock there.
+    #[test]
+    fn a_settled_mailbox_needs_no_fts_write() {
+        let store = super::Store::open_in_memory().unwrap();
+        assert!(super::fts_is_current(&store.conn).unwrap());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER messages_au;")
+            .unwrap();
+        assert!(!super::fts_is_current(&store.conn).unwrap());
+        super::ensure_fts(&store.conn).unwrap();
+        assert!(super::fts_is_current(&store.conn).unwrap());
     }
 }
 

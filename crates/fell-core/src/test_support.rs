@@ -53,13 +53,17 @@ pub fn test_net_missing() -> Option<String> {
 /// lookups fall back to that path would read the person's own mail.
 #[doc(hidden)]
 pub fn real_mailbox_present() -> Option<String> {
-    let path = crate::compose::mailbox_db_path()?;
-    path.exists().then(|| {
-        format!(
-            "a real mailbox is at {}; run with XDG_DATA_HOME and XDG_RUNTIME_DIR pointing at empty directories",
-            path.display()
-        )
-    })
+    // A draft's mailbox is found through the compose index first, then the
+    // default path; either can lead to the person's mail.
+    let index = crate::compose::compose_index_file("probe")
+        .and_then(|file| file.parent().map(std::path::Path::to_path_buf))
+        .filter(|dir| dir.is_dir());
+    let mailbox = crate::compose::mailbox_db_path().filter(|path| path.exists());
+    let found = mailbox.or(index)?;
+    Some(format!(
+        "real Fell data is at {}; run with XDG_DATA_HOME and XDG_RUNTIME_DIR pointing at empty directories",
+        found.display()
+    ))
 }
 
 #[cfg(test)]
