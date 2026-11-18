@@ -408,7 +408,7 @@ pub(crate) fn fetch_imap(
                     uidnext,
                     exists,
                 },
-                previous_owned.as_ref().filter(|_| same_validity),
+                previous_owned.as_ref(),
                 &plan,
             )?
         } else {
@@ -472,19 +472,23 @@ struct Tracked {
 /// Report the copies that left this mailbox since the last pass.
 ///
 /// With QRESYNC on, the CHANGEDSINCE fetch already carried `VANISHED
-/// (EARLIER)`. Otherwise the mailbox is listed by sequence number in pages.
-/// A listing counts only when no expunge arrived while it ran and it holds
-/// one ascending UID per message EXAMINE counted; anything else waits for
-/// the next pass. When EXISTS and UIDNEXT match the last full listing,
-/// nothing was added or removed, so no listing is sent. The first listing of
-/// a mailbox also fetches Message-ID headers (`BODY.PEEK`), so copies of
-/// mail synced before copies were recorded are known before anything is
-/// judged gone.
+/// (EARLIER)`. That is enough when the UIDs it names account for the drop
+/// in EXISTS; otherwise, or when a set used `*`, the mailbox is listed too.
+/// A listing goes by sequence number in pages, and counts only when no
+/// expunge arrived while it ran and it holds one ascending UID per message
+/// EXAMINE counted; anything else waits for the next pass. When EXISTS and
+/// UIDNEXT match the last full listing, nothing was added or removed, so no
+/// listing is sent.
+///
+/// The first listing of a mailbox synced before (copies not yet recorded,
+/// or a new UIDVALIDITY) also fetches Message-ID headers (`BODY.PEEK`). The
+/// body fetch skips some mail (flagged `\Deleted`, too large), so only the
+/// headers record every copy still there before old ones are judged gone.
 fn track_removals(
     session: &mut session::Session,
     mailbox: &session::Listed,
     seen: Seen,
-    previous: Option<&MailboxCheckpoint>,
+    checkpoint: Option<&MailboxCheckpoint>,
     plan: &FetchPlan,
 ) -> Result<Tracked, Error> {
     let escaped = escape_mailbox(&mailbox.raw);
@@ -493,17 +497,29 @@ fn track_removals(
         folder: mailbox.decoded.clone(),
         kind,
     };
+    let previous = checkpoint.filter(|prev| prev.uidvalidity == seen.uidvalidity);
     let mut removals = Vec::new();
+    // `None`: a set used `*`. It is not applied, and cannot stand in for a
+    // listing.
     let vanished = session.take_vanished();
-    if !vanished.is_empty() {
+    let reported = vanished.as_deref().map_or(0, |ranges| {
+        vanished_below(ranges, seen.uidnext.unwrap_or(u32::MAX))
+    });
+    if let Some(ranges) = vanished
+        && !ranges.is_empty()
+    {
         removals.push(removal(RemovalKind::Vanished {
             uidvalidity: seen.uidvalidity,
-            ranges: vanished,
+            ranges,
         }));
     }
     let carried = previous.and_then(|prev| prev.pruned);
     let snapshot = (seen.exists, seen.uidnext.unwrap_or(0));
-    if carried.is_some() && session.qresync() && matches!(plan, FetchPlan::ChangedSince(_)) {
+    if let Some((then_exists, then_next)) = carried
+        && session.qresync()
+        && matches!(plan, FetchPlan::ChangedSince(_))
+        && vanished_accounts_for(then_exists, then_next, seen, reported)
+    {
         return Ok(Tracked {
             removals,
             pruned: Some(snapshot),
@@ -515,7 +531,7 @@ fn track_removals(
             pruned: carried,
         });
     }
-    let discover = carried.is_none() && !matches!(plan, FetchPlan::Full);
+    let discover = carried.is_none() && checkpoint.is_some();
     let Some((present, found)) = list_mailbox(session, mailbox, seen, discover)? else {
         return Ok(Tracked {
             removals,
@@ -544,6 +560,31 @@ fn track_removals(
         removals,
         pruned: Some(snapshot),
     })
+}
+
+/// How many UIDs below `uidnext` the ranges name.
+fn vanished_below(ranges: &[(u32, u32)], uidnext: u32) -> u64 {
+    ranges
+        .iter()
+        .filter(|(low, _)| *low < uidnext)
+        .map(|(low, high)| u64::from((*high).min(uidnext.saturating_sub(1)) - low) + 1)
+        .sum()
+}
+
+/// The VANISHED UIDs explain every message that left since the last full
+/// listing saw `then_exists` messages and UIDNEXT `then_next`.
+///
+/// Each UID assigned since then is either still here or expunged, so
+/// `then_exists + (UIDNEXT - then_next) - EXISTS` messages left. A server
+/// may name more (UIDs expunged earlier), never fewer. Without both UIDNEXT
+/// values nothing can be checked, so the mailbox is listed.
+fn vanished_accounts_for(then_exists: u32, then_next: u32, seen: Seen, reported: u64) -> bool {
+    let Some(next) = seen.uidnext.filter(|_| then_next != 0) else {
+        return false;
+    };
+    let assigned = u64::from(next.saturating_sub(then_next));
+    let left = (u64::from(then_exists) + assigned).saturating_sub(u64::from(seen.exists));
+    reported >= left
 }
 
 type Listing = (Vec<u32>, Vec<(u32, crate::MessageId)>);

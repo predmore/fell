@@ -47,6 +47,7 @@ fn sample_state() -> TestState {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -326,13 +327,23 @@ fn uidvalidity_change_refetches_without_duplicating_message_ids() {
     store
         .label_thread(&acct.id, &root_thread, LabelChange::Add("kept".into()))
         .unwrap();
+    let no_id_thread = thread_of(&store, &acct, "uid.20.5.INBOX@imap.fell");
+    store
+        .label_thread(&acct.id, &no_id_thread, LabelChange::Add("noted".into()))
+        .unwrap();
+    store
+        .snooze_thread(&acct.id, &no_id_thread, 1_900_000_000, "test")
+        .unwrap();
     sync_once(&acct, &backend, &store).unwrap();
     let threads = store.list_threads(&acct.id).unwrap();
     // The message with no Message-ID is keyed by UIDVALIDITY: its new row
-    // replaces the old one, whose copy went with the old UIDVALIDITY.
-    // Messages that have a Message-ID stay one row and lose nothing.
+    // replaces the old one and takes over its local state. Messages that
+    // have a Message-ID stay one row and lose nothing.
     assert_eq!(threads.len(), before);
-    assert!(stored(&store, &acct, "uid.99.5.INBOX@imap.fell").is_some());
+    let no_id = stored(&store, &acct, "uid.99.5.INBOX@imap.fell").unwrap();
+    assert!(no_id.labels.iter().any(|label| label == "noted"));
+    assert_eq!(no_id.snooze_until, Some(1_900_000_000));
+    assert_eq!(no_id.folders, vec!["INBOX"]);
     assert!(stored(&store, &acct, "uid.20.5.INBOX@imap.fell").is_none());
     let proton = threads
         .iter()
@@ -550,6 +561,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -615,6 +627,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -682,6 +695,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -798,6 +812,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -910,6 +925,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1053,6 +1069,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1149,6 +1166,7 @@ fn non_ascii_password_logs_in_as_a_literal() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1221,6 +1239,7 @@ fn fetch_batches_survive_a_dropped_connection() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1332,6 +1351,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1410,6 +1430,7 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1481,6 +1502,7 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1559,6 +1581,7 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         idle_bad: false,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -1931,6 +1954,7 @@ fn a_server_that_ends_idle_with_bad_returns_promptly() {
         idle_bad: true,
         qresync: false,
         expunge_during_search: false,
+        vanished_reply: None,
         ..idle_state()
     });
     let (acct, backend) = idle_backend(&server);
@@ -2315,5 +2339,148 @@ fn mail_that_moved_before_copies_were_recorded_still_leaves_the_old_folder() {
             .iter()
             .any(|line| line.contains("FETCH 1:4 (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"))
     );
+    assert_read_only(&server);
+}
+
+#[test]
+fn a_uidvalidity_change_keeps_mail_the_refetch_skips() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    // The reply lives only in INBOX. Flagged \Deleted (not expunged), the
+    // full refetch after the reset skips its body, but it is still there,
+    // under a UID that the old UIDVALIDITY gave nothing (UID 2 is free now).
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        inbox.uidvalidity = 99;
+        let index = inbox.messages.iter().position(|m| m.uid == 2).unwrap();
+        let mut reply = inbox.messages.remove(index);
+        reply.uid = 7;
+        reply.flags.push("\\Deleted".into());
+        inbox.messages.push(reply);
+    }
+    for _ in 0..3 {
+        sync_once(&acct, &backend, &store).unwrap();
+        let reply = stored(&store, &acct, "reply@x").expect("reply@x is kept");
+        assert_eq!(reply.folders, vec!["INBOX"]);
+    }
+    let proton = store
+        .list_threads(&acct.id)
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.thread_id == ThreadId::proton("conv-9"))
+        .unwrap();
+    assert_eq!(proton.message_count, 2);
+
+    // Expunged later, it goes like any other message.
+    expunge(&server, "INBOX", 7);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "reply@x").is_none());
+    assert!(stored(&store, &acct, "html@x").is_some());
+    assert_read_only(&server);
+}
+
+#[test]
+fn a_uidvalidity_change_keeps_a_skipped_message_with_no_message_id() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    // No Message-ID, so the headers cannot name its row. Its UID is still
+    // listed and no new copy was recorded, so the old copy stays.
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        inbox.uidvalidity = 99;
+        let no_id = inbox.messages.iter_mut().find(|m| m.uid == 5).unwrap();
+        no_id.flags.push("\\Deleted".into());
+    }
+    for _ in 0..3 {
+        sync_once(&acct, &backend, &store).unwrap();
+        let kept = stored(&store, &acct, "uid.20.5.INBOX@imap.fell").expect("row is kept");
+        assert_eq!(kept.folders, vec!["INBOX"]);
+    }
+    expunge(&server, "INBOX", 5);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "uid.20.5.INBOX@imap.fell").is_none());
+}
+
+#[test]
+fn a_vanished_set_ending_in_star_does_not_drop_higher_uids() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state.qresync = true;
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        let index = inbox.messages.iter().position(|m| m.uid == 2).unwrap();
+        inbox.messages.remove(index);
+        inbox.uidnext = Some(6);
+        // `*` is the highest UID in the mailbox, which is still present.
+        state.vanished_reply = Some("2:*".into());
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "html@x").is_some());
+    assert!(stored(&store, &acct, "uid.20.5.INBOX@imap.fell").is_some());
+    // The listing that replaced the VANISHED still finds the expunge.
+    assert!(stored(&store, &acct, "reply@x").is_none());
+    assert!(commands(&server).iter().any(|line| line.contains("SEARCH")));
+    // And the next pass does not trust the same reply either.
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "html@x").is_some());
+    assert!(stored(&store, &acct, "smile@x").is_some());
+    assert_read_only(&server);
+}
+
+#[test]
+fn an_expunge_qresync_did_not_report_is_still_found() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state.qresync = true;
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    // EXISTS drops by one, but no VANISHED names the UID.
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        let index = inbox.messages.iter().position(|m| m.uid == 2).unwrap();
+        inbox.messages.remove(index);
+        inbox.uidnext = Some(6);
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "reply@x").is_none());
+    assert!(stored(&store, &acct, "html@x").is_some());
+    assert!(commands(&server).iter().any(|line| line.contains("SEARCH")));
+
+    // With the drop accounted for, later passes go back to VANISHED alone.
+    server.state.lock().expect("state").commands.clear();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(!commands(&server).iter().any(|line| line.contains("SEARCH")));
     assert_read_only(&server);
 }

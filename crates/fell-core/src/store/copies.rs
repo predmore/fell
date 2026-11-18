@@ -19,7 +19,7 @@ use crate::backend::{FolderRemoval, RemovalKind, Settle};
 use crate::message::{Message, MessageId};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
-use super::{delete_stored, find_stored, join_tokens, split_field};
+use super::{delete_stored, find_stored, join_tokens, split_field, take_local_state};
 
 const COPIES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS message_copies (
@@ -159,12 +159,14 @@ pub(super) fn forget(conn: &Connection, account_id: &AccountId, message_id: &str
 }
 
 /// Drop the copies each removal names and queue the folders they backed.
-/// Rows do not change until [`settle`].
+/// Folders and rows do not change until [`settle`]. Returns whether a row
+/// took over another's local state (see [`take_over_reset_row`]).
 pub(super) fn apply_removals(
     conn: &Connection,
     account_id: &AccountId,
     removals: &[FolderRemoval],
-) -> Result<()> {
+) -> Result<bool> {
+    let mut changed = false;
     for removal in removals {
         match &removal.kind {
             RemovalKind::Listing {
@@ -177,23 +179,55 @@ pub(super) fn apply_removals(
                 for (uid, message_id) in found {
                     record_found(conn, account_id, removal, *uidvalidity, *uid, message_id)?;
                 }
-                let mut doomed = Vec::new();
-                {
+                let listed = |uid: u32| uid > *through || present.binary_search(&uid).is_ok();
+                let stored = {
                     let mut stmt = conn.prepare(
-                        "SELECT uidvalidity, uid FROM message_copies
+                        "SELECT uidvalidity, uid, message_id FROM message_copies
                          WHERE account_id = ?1 AND mailbox = ?2",
                     )?;
-                    let rows = stmt
-                        .query_map(params![account_id.as_str(), removal.mailbox], |row| {
-                            Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
-                        })?;
-                    for row in rows {
-                        let (validity, uid) = row?;
-                        let gone = validity != *uidvalidity
-                            || (uid <= *through && present.binary_search(&uid).is_err());
-                        if gone {
-                            doomed.push((validity, uid));
-                        }
+                    stmt.query_map(params![account_id.as_str(), removal.mailbox], |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, u32>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                // Rows with a copy here under the current UIDVALIDITY.
+                let current: HashSet<&str> = stored
+                    .iter()
+                    .filter(|(validity, _, _)| validity == uidvalidity)
+                    .map(|(_, _, id)| id.as_str())
+                    .collect();
+                let mut doomed = Vec::new();
+                for (validity, uid, message_id) in &stored {
+                    let gone = if validity == uidvalidity {
+                        !listed(*uid)
+                    } else if current.contains(message_id.as_str()) {
+                        // The row has its copy under the new UIDVALIDITY.
+                        true
+                    } else if take_over_reset_row(
+                        conn,
+                        account_id,
+                        removal,
+                        *uidvalidity,
+                        *validity,
+                        *uid,
+                        message_id,
+                        found,
+                    )? {
+                        changed = true;
+                        true
+                    } else {
+                        // Nothing names the row under the new UIDVALIDITY: the
+                        // body fetch can skip mail (flagged \Deleted, too
+                        // large), and mail with no Message-ID has a new id. Its
+                        // UID is still taken, so keep the copy until it is not.
+                        present.binary_search(uid).is_err()
+                    };
+                    if gone {
+                        doomed.push((*validity, *uid));
                     }
                 }
                 for (validity, uid) in doomed {
@@ -220,7 +254,66 @@ pub(super) fn apply_removals(
             }
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// After a UIDVALIDITY change, mail with no Message-ID is stored again under
+/// a new id (it is made from the UIDVALIDITY). When `message_id` is such a
+/// row for the old copy, find the new row the same mail made in this mailbox
+/// (same sender, subject, date, and body) and give it the old row's labels,
+/// star, archive bit, and snooze. Returns whether it did; the old row then
+/// has no copy left and goes at [`settle`].
+#[allow(clippy::too_many_arguments)]
+fn take_over_reset_row(
+    conn: &Connection,
+    account_id: &AccountId,
+    removal: &FolderRemoval,
+    uidvalidity: u32,
+    old_validity: u32,
+    old_uid: u32,
+    message_id: &str,
+    found: &[(u32, MessageId)],
+) -> Result<bool> {
+    let synthetic =
+        |validity: u32, uid: u32| format!("uid.{validity}.{uid}.{}@imap.fell", removal.mailbox);
+    if message_id != synthetic(old_validity, old_uid) {
+        return Ok(false);
+    }
+    let Some((old, _)) = find_stored(conn, account_id, &MessageId(message_id.into()))? else {
+        return Ok(false);
+    };
+    let old_fingerprint = fingerprint(conn, account_id, &old.canonical_id)?;
+    // The same UID first: a server that rebuilt the mailbox in order often
+    // keeps it.
+    let mut candidates: Vec<&(u32, MessageId)> = found
+        .iter()
+        .filter(|(uid, id)| id.as_str() == synthetic(uidvalidity, *uid))
+        .collect();
+    candidates.sort_by_key(|(uid, _)| (*uid != old_uid, *uid));
+    for (_, id) in candidates {
+        let Some((new, via_alias)) = find_stored(conn, account_id, id)? else {
+            continue;
+        };
+        let same = !via_alias
+            && new.canonical_id != old.canonical_id
+            && new.from_email == old.from_email
+            && new.subject == old.subject
+            && new.date_unix == old.date_unix
+            && fingerprint(conn, account_id, &new.canonical_id)? == old_fingerprint;
+        if same {
+            take_local_state(conn, account_id, &old, &new)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn fingerprint(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT body_fingerprint FROM messages WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn record_found(

@@ -84,6 +84,9 @@ pub(super) struct Session {
     expunged: bool,
     /// UID ranges from `VANISHED` replies since the caller last took them.
     vanished: Vec<(u32, u32)>,
+    /// A `VANISHED` set used `*` or could not be read, so `vanished` does not
+    /// say which UIDs left.
+    vanished_unknown: bool,
     host: String,
     pending_buf: Vec<u8>,
 }
@@ -110,6 +113,7 @@ impl Session {
                 qresync: false,
                 expunged: false,
                 vanished: Vec::new(),
+                vanished_unknown: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -121,6 +125,7 @@ impl Session {
                 qresync: false,
                 expunged: false,
                 vanished: Vec::new(),
+                vanished_unknown: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -217,6 +222,7 @@ impl Session {
             .ok_or_else(|| imap_err(format!("EXAMINE {mailbox} returned no UIDVALIDITY")))?;
         self.expunged = false;
         self.vanished.clear();
+        self.vanished_unknown = false;
         Ok(Some(Examined {
             uidvalidity,
             uidnext,
@@ -390,9 +396,16 @@ impl Session {
         self.expunged
     }
 
-    /// UID ranges reported by `VANISHED` since the last call.
-    pub(super) fn take_vanished(&mut self) -> Vec<(u32, u32)> {
-        std::mem::take(&mut self.vanished)
+    /// UID ranges reported by `VANISHED` since the last call. `None` when a
+    /// reply could not be trusted to name only UIDs that left (a `*`, which
+    /// stands for whatever UID is highest now, or a set that did not parse).
+    pub(super) fn take_vanished(&mut self) -> Option<Vec<(u32, u32)>> {
+        let ranges = std::mem::take(&mut self.vanished);
+        if std::mem::take(&mut self.vanished_unknown) {
+            None
+        } else {
+            Some(ranges)
+        }
     }
 
     /// Watch untagged replies for expunges. Sequence numbers shift after one,
@@ -411,7 +424,10 @@ impl Session {
             if !earlier {
                 self.expunged = true;
             }
-            self.vanished.extend(parse_uid_set(set));
+            match parse_uid_set(set) {
+                Some(ranges) => self.vanished.extend(ranges),
+                None => self.vanished_unknown = true,
+            }
             return;
         }
         let mut words = rest.split_whitespace();
@@ -1773,29 +1789,26 @@ fn enabled_lists(text: &str, capability: &str) -> bool {
         && words.any(|word| word.eq_ignore_ascii_case(capability))
 }
 
-/// An IMAP sequence set of UIDs (`1:3,7,9:*`) as inclusive ranges. `*` is
-/// read as the largest UID. Anything unparsable ends the set.
-fn parse_uid_set(set: &str) -> Vec<(u32, u32)> {
+/// An IMAP sequence set of UIDs (`1:3,7,9`) as inclusive ranges.
+///
+/// `None` for a set with `*` (RFC 7162 allows it; it means the highest UID
+/// in the mailbox, which may be a message that is still there) or one that
+/// does not parse. Dropping copies from such a set could drop live mail.
+fn parse_uid_set(set: &str) -> Option<Vec<(u32, u32)>> {
     let mut out = Vec::new();
     let token = set.split_whitespace().next().unwrap_or("");
     for part in token.split(',') {
-        let number = |raw: &str| -> Option<u32> {
-            if raw == "*" {
-                Some(u32::MAX)
-            } else {
-                raw.parse().ok()
+        let number = |raw: &str| -> Option<u32> { raw.parse().ok().filter(|uid| *uid > 0) };
+        let (low, high) = match part.split_once(':') {
+            Some((low, high)) => (number(low)?, number(high)?),
+            None => {
+                let uid = number(part)?;
+                (uid, uid)
             }
-        };
-        let range = match part.split_once(':') {
-            Some((low, high)) => number(low).zip(number(high)),
-            None => number(part).map(|uid| (uid, uid)),
-        };
-        let Some((low, high)) = range else {
-            break;
         };
         out.push((low.min(high), low.max(high)));
     }
-    out
+    Some(out)
 }
 
 fn imap_err(message: impl Into<String>) -> Error {
@@ -1830,7 +1843,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
 
-    use super::connect_addrs;
+    use super::{connect_addrs, parse_uid_set};
 
     #[test]
     fn oversized_literal_is_discarded_and_the_response_continues() {
@@ -2229,6 +2242,18 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("untagged"), "{text}");
         assert!(text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn a_vanished_set_with_star_is_not_read_as_uids() {
+        assert_eq!(
+            parse_uid_set("1:3,7,9:8"),
+            Some(vec![(1, 3), (7, 7), (8, 9)])
+        );
+        assert_eq!(parse_uid_set("2:*"), None);
+        assert_eq!(parse_uid_set("4,*"), None);
+        assert_eq!(parse_uid_set("4,x"), None);
+        assert_eq!(parse_uid_set("0:3"), None);
     }
 
     #[test]

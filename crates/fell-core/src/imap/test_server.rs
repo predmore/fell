@@ -73,6 +73,9 @@ pub(super) struct TestState {
     pub qresync: bool,
     /// Announce `* 1 EXPUNGE` before the next UID SEARCH reply, once.
     pub expunge_during_search: bool,
+    /// Answer every `VANISHED` fetch with `* VANISHED (EARLIER) {set}`,
+    /// verbatim, instead of the UIDs in `vanished`.
+    pub vanished_reply: Option<String>,
 }
 
 pub(super) struct TestServer {
@@ -413,12 +416,15 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                     && qresync_enabled
                     && rest.to_ascii_uppercase().contains("VANISHED")
                 {
-                    let gone: Vec<String> = mailbox
-                        .vanished
-                        .iter()
-                        .filter(|(_, modseq)| *modseq > since)
-                        .map(|(uid, _)| uid.to_string())
-                        .collect();
+                    let gone: Vec<String> = match &guard.vanished_reply {
+                        Some(set) => vec![set.clone()],
+                        None => mailbox
+                            .vanished
+                            .iter()
+                            .filter(|(_, modseq)| *modseq > since)
+                            .map(|(uid, _)| uid.to_string())
+                            .collect(),
+                    };
                     if !gone.is_empty() {
                         let _ = write.write_all(
                             format!("* VANISHED (EARLIER) {}\r\n", gone.join(",")).as_bytes(),

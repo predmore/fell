@@ -543,9 +543,9 @@ impl Store {
                 ],
             )?;
         }
-        copies::apply_removals(&tx, account_id, &delta.removals)?;
+        let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if !delta.messages.is_empty() || settled {
+        if !delta.messages.is_empty() || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -2103,6 +2103,53 @@ fn fold_doomed_local_state(keeper: &Arrival, doomed: &Arrival) -> Arrival {
     keeper.archived |= doomed.archived;
     keeper.snooze_until = kept_snooze(keeper.snooze_until, doomed.snooze_until);
     keeper
+}
+
+/// Give `into` the labels, star, archive bit, and snooze of `from`, a row
+/// for the same mail that is about to go.
+fn take_local_state(
+    conn: &Connection,
+    account_id: &AccountId,
+    from: &Arrival,
+    into: &Arrival,
+) -> Result<()> {
+    let mut labels = split_field(&into.labels);
+    for label in split_field(&from.labels) {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let labels = join_tokens(&labels);
+    let kept = fold_doomed_local_state(into, from);
+    let indexed = |labels: &str| {
+        terms_for_indexed(IndexedText {
+            subject: &into.subject,
+            from_name: into.from_name.as_deref(),
+            from_email: &into.from_email,
+            body: &into.body,
+            to_line: &into.to_line,
+            cc_line: &into.cc_line,
+            bcc_line: &into.bcc_line,
+            folders: &into.folders,
+            labels,
+        })
+    };
+    let old_terms = indexed(&into.labels);
+    let new_terms = indexed(&labels);
+    conn.execute(
+        "UPDATE messages SET labels = ?1, starred = ?2, archived = ?3, snooze_until = ?4
+         WHERE account_id = ?5 AND message_id = ?6",
+        params![
+            labels,
+            kept.starred,
+            kept.archived,
+            kept.snooze_until,
+            account_id.as_str(),
+            into.canonical_id
+        ],
+    )?;
+    sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+    Ok(())
 }
 
 fn rethread_accounts(conn: &Connection) -> Result<()> {
