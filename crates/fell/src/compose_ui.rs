@@ -1476,39 +1476,30 @@ impl Render for ComposeView {
             .as_ref()
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
+        let wide = window.viewport_size().width > px(640.);
+        let lock = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
+            .flatten();
         let mode = match self.editor.mode {
+            // Nothing to type into: a narrow bar gives the mode's room to
+            // the way forward and the warning.
+            _ if lock.is_some() && !wide => "",
             // A header field takes typing as insert mode does.
             _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
             Mode::Insert => "insert",
             Mode::Visual => "visual",
         };
-        let lock = self
-            .hub
-            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
-            .flatten();
-        let locked = lock.is_some();
-        let maybe_sent = lock == Some(SendLock::MaybeSent);
-        let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
+        let hint: SharedString = match (self.editor.mode, self.status.as_ref(), lock) {
             // Nothing to type into: the way out is the hint.
-            (_, "i insert" | "insert" | "esc normal" | "normal") if locked => {
-                if maybe_sent {
-                    // The way forward once Sent has been checked. Narrow,
-                    // the warning beside it says why it is read-only.
-                    if window.viewport_size().width > px(640.) {
-                        "read-only · :unlock if not in Sent · :q close".into()
-                    } else {
-                        ":unlock · :q close".into()
-                    }
-                } else {
-                    "read-only · :q close".into()
-                }
+            (_, "i insert" | "insert" | "esc normal" | "normal", Some(lock)) => {
+                locked_hint(lock, wide).into()
             }
-            (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
-            (Mode::Normal, "esc normal" | "normal") => "i insert".into(),
+            (Mode::Insert, "i insert" | "insert", _) => "esc normal".into(),
+            (Mode::Normal, "esc normal" | "normal", _) => "i insert".into(),
             _ => self.status.clone(),
         };
-        let wide = window.viewport_size().width > px(640.);
         let mono = self
             .look
             .as_ref()
@@ -3348,14 +3339,18 @@ fn status_bar(
     } else {
         // Narrow: the mode always shows; a message (an edit position, an
         // error) beats the hints and gives way first.
-        left = left.child(
-            div()
-                .flex_shrink_0()
-                .text_color(rgb(colors.dim))
-                .child(mode.to_string()),
-        );
+        if !mode.is_empty() {
+            left = left
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(colors.dim))
+                        .child(mode.to_string()),
+                )
+                .when(!idle, |left| left.child(dot()));
+        }
         if !idle {
-            left = left.child(dot()).child(
+            left = left.child(
                 div()
                     .min_w(px(0.))
                     .truncate()
@@ -3399,11 +3394,7 @@ fn status_bar(
         Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => div()
             .flex_shrink_0()
             .text_color(rgb(colors.error))
-            .child(if wide {
-                "may have been sent · check Sent"
-            } else {
-                "may have been sent"
-            }),
+            .child(MAYBE_SENT_WARNING),
         Some(reason) => div()
             .flex()
             .flex_shrink_0()
@@ -3604,6 +3595,21 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
+/// What a locked draft's bar offers. A draft that may have gone out can be
+/// unlocked, once Sent has been checked; one that went out only closes.
+fn locked_hint(lock: SendLock, wide: bool) -> &'static str {
+    match (lock, wide) {
+        (SendLock::MaybeSent, true) => "read-only · :unlock if not in Sent · :q close",
+        (SendLock::MaybeSent, false) => ":unlock · :q close",
+        (_, true) => "read-only · :q close",
+        (_, false) => ":q close",
+    }
+}
+
+/// The window's warning for a draft that may have gone out, at any width:
+/// the person checks Sent before unlocking or sending again.
+const MAYBE_SENT_WARNING: &str = "may have been sent · check Sent";
+
 fn palette_action(query: &str) -> Option<&'static str> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -3737,6 +3743,23 @@ pub fn open_demo(
 mod tests {
     use super::{Editor, cursor_line_covered, plain_markdown};
     use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn a_maybe_sent_draft_says_check_sent_at_every_width() {
+        use fell_core::compose::SendLock;
+        assert!(super::MAYBE_SENT_WARNING.contains("check Sent"));
+        for wide in [true, false] {
+            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":unlock"));
+            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":q close"));
+            assert!(!super::locked_hint(SendLock::Sent, wide).contains(":unlock"));
+        }
+        // Narrow, both sides share 460 px with room to spare.
+        let narrow = super::locked_hint(SendLock::MaybeSent, false)
+            .chars()
+            .count()
+            + super::MAYBE_SENT_WARNING.chars().count();
+        assert!(narrow <= 50, "{narrow}");
+    }
 
     #[test]
     fn was_text_drops_emphasis_marks_but_not_marks_inside_words() {

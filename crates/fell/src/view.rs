@@ -958,6 +958,7 @@ impl Inbox {
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
+            self.settle_opening_notice(cx);
             return;
         }
         let Some(home) = self.draft_home.clone() else {
@@ -988,7 +989,9 @@ impl Inbox {
                     Ok(id) => {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
-                        crate::draft_host::show_draft(&hub, &id);
+                        if crate::draft_host::show_draft(&hub, &id) {
+                            inbox.settle_opening_notice(cx);
+                        }
                     }
                     Err(err) => {
                         let what = if creating {
@@ -1002,6 +1005,27 @@ impl Inbox {
                     }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The window is on its way: once it has had time to show, the inbox's
+    /// "opening" notice has done its job and goes, unless something newer
+    /// replaced it.
+    fn settle_opening_notice(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(700))
+                .await;
+            let _ = this.update(cx, |inbox, cx| {
+                let opening = inbox.session.toast.as_ref().is_some_and(|toast| {
+                    toast.text.starts_with("opening draft") || toast.text == "new draft"
+                });
+                if opening {
+                    inbox.session.clear_toast();
+                    cx.notify();
+                }
             });
         })
         .detach();

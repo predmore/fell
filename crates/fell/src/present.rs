@@ -723,6 +723,18 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
             return fitted;
         }
     }
+    // Not one word of the name fits: a stub of it says nothing, so the
+    // name goes, and the outcome and key stay whole.
+    if let Some(at) = parts.iter().position(|part| part.contains('\u{201c}'))
+        && parts.len() > 1
+    {
+        let mut without = parts.clone();
+        without.remove(at);
+        let candidate = without.join(NOTICE_DOT);
+        if measure(&candidate) <= max_px {
+            return candidate;
+        }
+    }
     let text = parts.join(NOTICE_DOT);
     match quoted_span(&text) {
         Some((open, close)) => {
@@ -817,6 +829,11 @@ mod tests {
             "may have been sent  ·  \u{201c}Budget…\u{201d}  ·  gs sent"
         );
         assert!(width(&fitted) <= 48.0);
+        // Not one word of the subject fits: it goes, not a stub of it.
+        assert_eq!(
+            fit_notice(notice, 36.0, width),
+            "may have been sent  ·  gs sent"
+        );
     }
 
     #[test]
