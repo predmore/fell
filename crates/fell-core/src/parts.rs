@@ -131,7 +131,9 @@ impl PartCache {
         ))
     }
 
-    /// The cached copy of `request`, when there is one. Marks it used.
+    /// The cached copy of `request`, when there is one. Marks it used. A
+    /// file that is not the part's listed size (cut short, or changed on
+    /// disk) is removed and counts as a miss.
     pub fn lookup(&self, request: &PartRequest) -> Option<CachedPart> {
         let dir = self.entry_dir(request);
         if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
@@ -145,6 +147,11 @@ impl PartCache {
             .ok()?;
         let meta = file.metadata().ok()?;
         if !meta.is_file() || meta.uid() != user_id() {
+            return None;
+        }
+        if meta.len() != request.part.size {
+            drop(file);
+            let _ = fs::remove_file(&path);
             return None;
         }
         let _ = file.set_modified(SystemTime::now());
@@ -166,7 +173,7 @@ impl PartCache {
         let written = (|| {
             let mut file = create_private_file(&partial)?;
             file.write_all(bytes)?;
-            file.flush()?;
+            file.sync_all()?;
             fs::rename(&partial, &path)
         })();
         if let Err(err) = written {
@@ -594,12 +601,67 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_file_of_the_wrong_size_is_a_miss_and_is_refetched() {
+        struct Serves(&'static [u8]);
+        impl MailBackend for Serves {
+            fn kind(&self) -> crate::BackendKind {
+                crate::BackendKind::Imap
+            }
+            fn fetch_changes(
+                &self,
+                _cursor: Option<&crate::backend::SyncCursor>,
+            ) -> Result<crate::backend::MailboxDelta> {
+                unreachable!()
+            }
+            fn fetch_part(
+                &self,
+                _copy: &RemoteId,
+                _section: &str,
+                _encoded_size: u64,
+                _progress: &mut dyn FnMut(u64),
+            ) -> Result<Option<Vec<u8>>> {
+                Ok(Some(self.0.to_vec()))
+            }
+            fn submit_draft(&self, _draft: crate::Draft) -> Result<crate::PendingSend> {
+                unreachable!()
+            }
+            fn confirm_send(
+                &self,
+                _pending: crate::PendingSend,
+                _confirmation: crate::UserSendConfirmation,
+            ) -> Result<crate::SentMessage> {
+                unreachable!()
+            }
+        }
+        let root = temp_root("size");
+        let cache = PartCache::open(&root, DEFAULT_CACHE_BYTES).unwrap();
+        let wanted = request("m@x", "2", Some("a.pdf"));
+        let stored = cache.store(&wanted, b"%PDF").unwrap();
+        // Cut short on disk (a crash, a full disk, a hand edit).
+        fs::write(&stored.path, b"%P").unwrap();
+        assert!(cache.lookup(&wanted).is_none());
+        assert!(!stored.path.exists(), "the short file is removed");
+        fs::write(&stored.path, b"%PDF-and-more").unwrap();
+        let backend = Serves(b"JVBERg==");
+        let fetched = fetch_part(&backend, &cache, &wanted, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(&fetched.path).unwrap(), b"%PDF");
+        assert_eq!(fetched.size, 4);
+        assert_eq!(cache.lookup(&wanted), Some(fetched));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_least_recently_used_parts_go_past_the_cap() {
         let root = temp_root("lru");
         let cache = PartCache::open(&root, 250).unwrap();
-        let old = request("old@x", "2", Some("old.bin"));
-        let used = request("used@x", "2", Some("used.bin"));
-        let new = request("new@x", "2", Some("new.bin"));
+        let sized = |id: &str, name: &str, size: u64| {
+            let mut wanted = request(id, "2", Some(name));
+            wanted.part.size = size;
+            wanted
+        };
+        let old = sized("old@x", "old.bin", 100);
+        let used = sized("used@x", "used.bin", 100);
+        let new = sized("new@x", "new.bin", 100);
         let old_at = cache.store(&old, &[1; 100]).unwrap();
         let used_at = cache.store(&used, &[2; 100]).unwrap();
         let past = SystemTime::now() - Duration::from_secs(600);
@@ -618,7 +680,7 @@ mod tests {
         assert!(cache.lookup(&used).is_some());
         assert!(cache.lookup(&new).is_some());
         // One part larger than the whole cap is still kept, alone.
-        let huge = request("huge@x", "2", Some("huge.bin"));
+        let huge = sized("huge@x", "huge.bin", 300);
         cache.store(&huge, &[4; 300]).unwrap();
         assert!(cache.lookup(&huge).is_some());
         assert!(cache.lookup(&used).is_none() && cache.lookup(&new).is_none());
