@@ -1016,6 +1016,14 @@ mod tests {
     }
 
     #[test]
+    fn latin1_text_attachments_are_sized_by_their_transfer_decoded_bytes() {
+        let fixture = mime_fixtures::latin1_text_attachments("l1@x");
+        let (_, parts) = listed(&fixture);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_sections_hold_the_bytes(&fixture, &parts);
+    }
+
+    #[test]
     fn mixed_mail_lists_both_attachments_by_section() {
         let fixture = mime_fixtures::mixed_two_attachments("mix@x");
         let (message, parts) = listed(&fixture);

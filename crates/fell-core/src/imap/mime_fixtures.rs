@@ -240,3 +240,33 @@ pub(crate) fn large_attachment(id: &str, size: usize) -> MimeFixture {
         bytes: vec![("2", data)],
     }
 }
+
+/// multipart/mixed: a text body and a Latin-1 `notes.txt` and `page.html`
+/// (quoted-printable, non-ASCII). Their sizes are the bytes after transfer
+/// decoding, not after a charset conversion to UTF-8.
+pub(crate) fn latin1_text_attachments(id: &str) -> MimeFixture {
+    let notes = b"Caf\xe9 au lait\r\n".to_vec();
+    let page = b"<p>R\xe9sum\xe9</p>\r\n".to_vec();
+    let raw = format!(
+        "{}--l1\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\n\
+         Notes attached.\r\n\
+         --l1\r\n\
+         Content-Type: text/plain; charset=iso-8859-1; name=\"notes.txt\"\r\n\
+         Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+         Caf=E9 au lait\r\n\
+         \r\n\
+         --l1\r\n\
+         Content-Type: text/html; charset=windows-1252; name=\"page.html\"\r\n\
+         Content-Disposition: inline; filename=\"page.html\"\r\n\
+         Content-Transfer-Encoding: quoted-printable\r\n\r\n\
+         <p>R=E9sum=E9</p>\r\n\
+         \r\n\
+         --l1--\r\n",
+        headers(id, "Latin-1 notes", "multipart/mixed; boundary=\"l1\""),
+    );
+    MimeFixture {
+        raw: raw.into_bytes(),
+        bytes: vec![("2", notes), ("3", page)],
+    }
+}
