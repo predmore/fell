@@ -27,7 +27,7 @@ mod sync_tests;
 #[cfg(test)]
 mod test_server;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Error;
@@ -254,8 +254,9 @@ pub(crate) fn fetch_imap(
         // Flags of copies already stored, whose bodies were not fetched.
         let mut pending_flags = Vec::new();
         let mut highest: Option<u32> = None;
-        // Stored copies count toward the checkpoint only once the fetch is
-        // done: a body still to come may have a lower UID.
+        // Stored copies, and `\Deleted` ones whose bodies are not fetched,
+        // count toward the checkpoint only once the fetch is done: a body
+        // still to come may have a lower UID.
         let mut stored_highest: Option<u32> = None;
         let mut min_unparsed: Option<u32> = None;
         let flush_batch = |batch: &mut Vec<Message>,
@@ -319,6 +320,12 @@ pub(crate) fn fetch_imap(
                             &mut persist,
                             &done,
                         )?;
+                    }
+                    return Ok(());
+                }
+                Streamed::Deleted { uid } => {
+                    if seen_through.is_none_or(|floor| uid > floor) {
+                        stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                     }
                     return Ok(());
                 }
@@ -721,6 +728,9 @@ enum Streamed {
     Fetched(session::Fetched),
     /// Stored already: only its flags were fetched.
     Stored { uid: u32, flags: Vec<String> },
+    /// Not stored and flagged `\Deleted`: dropped either way, so its body
+    /// was not fetched.
+    Deleted { uid: u32 },
 }
 
 /// Report every message `plan` covers, fetching a body only for a UID the
@@ -803,42 +813,42 @@ fn flags_then_bodies(
             on_fetched(Streamed::Stored { uid, flags })?;
         } else if rfc822::is_deleted(&flags) {
             // Not stored either way, so its body is not worth the bytes.
-            on_fetched(Streamed::Fetched(session::Fetched {
-                uid,
-                flags,
-                body: Vec::new(),
-                skipped: false,
-                body_missing: false,
-            }))?;
+            on_fetched(Streamed::Deleted { uid })?;
         } else {
             wanted.push(uid);
         }
     }
+    // A fetch can finish without a UID it was asked for (expunged since the
+    // flags came, or a server that drops it): the checkpoint stays below the
+    // lowest such UID, as when a fetch stops early.
+    let mut first_missing: Option<u32> = None;
     for (index, chunk) in wanted.chunks(UIDS_PER_FETCH).enumerate() {
-        let mut delivered = Vec::with_capacity(chunk.len());
+        let mut delivered = HashSet::with_capacity(chunk.len());
         let stop =
             session.uid_fetch_each(&uid_set(chunk), None, session::FetchItems::Bodies, |item| {
-                delivered.push(item.uid);
+                delivered.insert(item.uid);
                 on_fetched(Streamed::Fetched(item))
             })?;
+        let missing = chunk.iter().find(|uid| !delivered.contains(uid)).copied();
         if !matches!(stop, session::FetchStop::Done) {
-            let first_left = chunk
-                .iter()
-                .find(|uid| !delivered.contains(uid))
-                .or_else(|| wanted.get((index + 1) * UIDS_PER_FETCH))
-                .copied();
-            let listed_from = cut.flatten();
-            let min_skipped_uid = match (first_left, listed_from) {
-                (Some(left), Some(listed)) => Some(left.min(listed)),
-                (left, listed) => left.or(listed),
-            };
-            return Ok(session::FetchStop::Truncated { min_skipped_uid });
+            let first_left = missing.or_else(|| wanted.get((index + 1) * UIDS_PER_FETCH).copied());
+            return Ok(session::FetchStop::Truncated {
+                min_skipped_uid: lowest([first_missing, first_left, cut.flatten()]),
+            });
         }
+        // Chunks ascend, so the first chunk missing a UID has the lowest.
+        first_missing = first_missing.or(missing);
     }
-    Ok(match cut {
-        None => session::FetchStop::Done,
-        Some(min_skipped_uid) => session::FetchStop::Truncated { min_skipped_uid },
+    Ok(match (cut, first_missing) {
+        (None, None) => session::FetchStop::Done,
+        (cut, missing) => session::FetchStop::Truncated {
+            min_skipped_uid: lowest([missing, cut.flatten()]),
+        },
     })
+}
+
+fn lowest<const N: usize>(uids: [Option<u32>; N]) -> Option<u32> {
+    uids.into_iter().flatten().min()
 }
 
 /// Ascending UIDs as an IMAP set, runs written `low:high`.

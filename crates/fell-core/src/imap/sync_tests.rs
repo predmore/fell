@@ -696,6 +696,134 @@ fn a_flag_change_after_trash_is_emptied_comes_back_with_undo() {
 }
 
 #[test]
+fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state.mailboxes = vec![FixtureMailbox {
+        messages: vec![literal(
+            1,
+            &["\\Seen"],
+            1,
+            raw_message("first@x", None, "First", "Ann <ann@x>", "one", ""),
+        )],
+        ..empty_mailbox("INBOX", 8)
+    }];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        inbox.messages.push(FixtureMessage {
+            body_form: BodyForm::Omitted,
+            ..literal(
+                2,
+                &[],
+                3,
+                raw_message("second@x", None, "Second", "Ann <ann@x>", "two", ""),
+            )
+        });
+        inbox.messages.push(literal(
+            3,
+            &[],
+            3,
+            raw_message("third@x", None, "Third", "Ann <ann@x>", "three", ""),
+        ));
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(
+        body_fetches(&server)
+            .iter()
+            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS BODY.PEEK[])")),
+        "{:?}",
+        commands(&server)
+    );
+    assert!(stored(&store, &acct, "third@x").is_some());
+    assert!(stored(&store, &acct, "second@x").is_none());
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t8\t1\t"),
+        "the fetch finished without UID 2, so the checkpoint stays below it: {cursor}"
+    );
+    mailbox(&mut server.state.lock().expect("state"), "INBOX").messages[1].body_form =
+        BodyForm::Literal;
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "second@x").is_some());
+}
+
+#[test]
+fn a_deleted_uid_does_not_move_the_checkpoint_before_lower_bodies_arrive() {
+    let _batch = super::limit_fetch_batch(1);
+    let mut state = sample_state();
+    state.mailboxes = vec![FixtureMailbox {
+        omit_uidnext: true,
+        messages: (1..=2)
+            .map(|uid| {
+                literal(
+                    uid,
+                    &["\\Seen"],
+                    1,
+                    raw_message(
+                        &format!("old{uid}@x"),
+                        None,
+                        "Old",
+                        "Ann <ann@x>",
+                        "old",
+                        "",
+                    ),
+                )
+            })
+            .collect(),
+        ..empty_mailbox("INBOX", 6)
+    }];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        for (uid, id) in [(3, "new3@x"), (4, "new4@x")] {
+            inbox.messages.push(literal(
+                uid,
+                &[],
+                2,
+                raw_message(id, None, "New", "Ann <ann@x>", "new", ""),
+            ));
+        }
+        inbox.messages.push(literal(
+            5,
+            &["\\Deleted"],
+            2,
+            raw_message("deleted@x", None, "Deleted", "Ann <ann@x>", "gone", ""),
+        ));
+        // The connection drops after UID 3's body, before UID 4's.
+        state.close_after_body_fetches = Some(1);
+    }
+    assert!(sync_once(&acct, &backend, &store).is_err());
+    assert!(stored(&store, &acct, "new3@x").is_some());
+    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    assert!(
+        cursor.contains("INBOX\t6\t3\t"),
+        "UID 4's body never came, so the checkpoint stays below it: {cursor}"
+    );
+    server.state.lock().expect("state").close_after_body_fetches = None;
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "new4@x").is_some());
+    assert!(stored(&store, &acct, "deleted@x").is_none());
+}
+
+#[test]
 fn bad_password_does_not_advance_the_cursor() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);

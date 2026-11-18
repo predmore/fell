@@ -19,6 +19,9 @@ pub(super) enum BodyForm {
     Quoted,
     Nil,
     Absent,
+    /// Listed with its flags, but a body fetch leaves it out and still
+    /// answers OK.
+    Omitted,
 }
 
 pub(super) struct FixtureMessage {
@@ -514,6 +517,9 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
                         }
                         continue;
                     }
+                    if matches!(message.body_form, BodyForm::Omitted) {
+                        continue;
+                    }
                     let flags = message.flags.join(" ");
                     match message.body_form {
                         BodyForm::Literal => {
@@ -545,6 +551,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
                                 .as_bytes(),
                             );
                         }
+                        BodyForm::Omitted => {}
                         BodyForm::Absent => {
                             let _ = write.write_all(
                                 format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
