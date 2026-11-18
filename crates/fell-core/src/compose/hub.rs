@@ -168,7 +168,7 @@ impl DraftHub {
             let line = match locked {
                 Some(reason) => format!("Review closed · {reason}"),
                 None if asked && unreviewed > 0 => format!(
-                    "Review closed · draft kept, not sent · {unreviewed} agent edit{} unreviewed",
+                    "Review closed · not sent · {unreviewed} edit{} unreviewed",
                     if unreviewed == 1 { "" } else { "s" }
                 ),
                 None => "Review closed · draft kept, not sent".to_string(),

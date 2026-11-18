@@ -790,7 +790,8 @@ impl ComposeView {
             self.status = "the draft changed under the cursor; the key was not applied".into();
             return;
         }
-        let key = event.keystroke.key.as_str();
+        let key = compose_key(&event.keystroke);
+        let key = key.as_str();
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
@@ -1276,7 +1277,12 @@ impl Render for ComposeView {
         div()
             .id("compose")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.on_key(event, cx);
+                // Every key can change what is on screen (cursor, focused
+                // edit, status), not only the ones that touch the draft.
+                cx.notify();
+            }))
             .flex()
             .flex_col()
             .size_full()
@@ -2935,6 +2941,29 @@ fn palette_action(query: &str) -> Option<&'static str> {
     found
 }
 
+/// The key as the compose window matches it. GPUI names keys ("space",
+/// "bracketright", "semicolon"); the window matches what they type: " ",
+/// "]", ":". Keys that type nothing keep their names ("escape", "enter").
+fn compose_key(stroke: &gpui::Keystroke) -> String {
+    if stroke.key == "space" {
+        return " ".into();
+    }
+    let named = matches!(
+        stroke.key.as_str(),
+        "escape" | "enter" | "backspace" | "tab" | "up" | "down" | "left" | "right" | "delete"
+    );
+    if !named
+        && !stroke.modifiers.control
+        && !stroke.modifiers.platform
+        && let Some(text) = stroke.key_char.as_deref()
+        && text.chars().count() == 1
+        && !text.chars().any(char::is_control)
+    {
+        return text.to_string();
+    }
+    stroke.key.clone()
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3015,6 +3044,21 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compose_keys_match_what_they_type() {
+        let stroke = |key: &str, char: Option<&str>| gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: key.into(),
+            key_char: char.map(str::to_string),
+        };
+        assert_eq!(super::compose_key(&stroke("space", Some(" "))), " ");
+        assert_eq!(super::compose_key(&stroke("bracketright", Some("]"))), "]");
+        assert_eq!(super::compose_key(&stroke("semicolon", Some(":"))), ":");
+        assert_eq!(super::compose_key(&stroke("escape", None)), "escape");
+        assert_eq!(super::compose_key(&stroke("enter", Some("\n"))), "enter");
+        assert_eq!(super::compose_key(&stroke("h", Some("h"))), "h");
+    }
 
     #[test]
     fn edits_are_ordered_header_first_then_by_body_line() {
