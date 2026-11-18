@@ -1,18 +1,30 @@
 # Fell UX spec (v1)
 
-Decided with Jon on 2026-11-16. This is the bar the UX judges score against (every score 9.5+), together with docs/scope.md.
+Decided with Jon on 2026-11-16. This is the bar the UX judges score against (every score 9+), together with docs/scope.md.
 
 ## Principles
 - Instant: no spinner between a key press and the next frame; the UI only reads the local store.
 - Keyboard first, vim grammar; the mouse works but is never required.
 - Calm and dense enough to scan: one folder, one list, one conversation.
 - Threads are the unit for every list, action and search hit.
+- Mail and agents together: an agent's drafts, notes and suggestions sit in the same lists and conversations as mail, reached with the same keys.
+
+## Motion: quick, never jumpy
+- Nothing jumps. Content that appears, leaves, grows or moves transitions instead of popping: rows slide or fade, panes and overlays fade and scale slightly, scrolls glide, counts and toasts cross-fade.
+- Transitions are quick: 80–160 ms with an ease-out curve. Input never waits for one; a key press during a transition jumps straight to the new state.
+- No layout shift: reserve space for text that is still loading, keep row heights stable, and keep the selection where the eye is.
+- Animation is off when `reduce_motion` is set or the desktop asks for reduced motion. It never pushes a frame past the key-to-frame budget.
+
+## Quiet: no noise
+- Do not print key hints for obvious actions (`Esc` to close, `Enter` to open, `j`/`k`, `q` to quit). An empty state says what is true ("No mail matches"), not how to leave it.
+- Show a key only where it is the answer to a question the user has right now and they could not guess it: a fix for an error, a pending agent suggestion, a destructive confirm. Discovery lives in which-key and the `:` palette.
+- One message at a time in the status bar; notices fade out on their own.
 
 ## Layout: two panes
 - Left: the thread list for the current folder (or search results).
 - Right: the open conversation.
 - No folder sidebar. Switch folders with `gi` / `gs` / `gd` and a fuzzy folder picker (`gf`, also in the `:` palette).
-- A one-line header above the list shows the account, the current folder, and the unread count; a one-line status bar at the bottom shows mode, sync state and which-key hints.
+- A one-line header above the list shows the account, the current folder, and the unread count; a one-line status bar at the bottom shows mode, sync state and, after the leader, which-key hints.
 - Pane split is resizable and remembered; `Enter`/`o` focuses the conversation, `Esc`/`h` returns to the list. A key toggles a full-width conversation for long mail.
 - Narrow windows (Hyprland tiles): below a width threshold show one pane at a time with the same keys, never a cramped split.
 
@@ -45,7 +57,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 
 ## Feedback and states
 - Every action gives immediate visual feedback in the same frame; network work happens after.
-- Empty folder, first sync, offline and auth-failed states each have a clear one-line message and the key to fix it.
+- Empty folder, first sync, offline and auth-failed states each have a clear one-line message; offline and auth-failed also name the fix.
 - Errors never block the UI; they appear in the status bar with a key to see details.
 
 ## Evidence for UX judges
