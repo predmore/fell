@@ -76,6 +76,12 @@ pub(super) struct TestState {
     /// Answer every `VANISHED` fetch with `* VANISHED (EARLIER) {set}`,
     /// verbatim, instead of the UIDs in `vanished`.
     pub vanished_reply: Option<String>,
+    /// Advertise SPECIAL-USE (RFC 6154). A plain LIST then leaves the role
+    /// attributes out, as a server may; `RETURN (SPECIAL-USE)` gets them.
+    /// Without it, `list_flags` go out on every LIST as written.
+    pub special_use: bool,
+    /// Advertise SPECIAL-USE but answer `RETURN (SPECIAL-USE)` with BAD.
+    pub reject_list_return: bool,
 }
 
 pub(super) struct TestServer {
@@ -249,12 +255,24 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
             }
             "LIST" => {
                 let guard = state.lock().expect("state");
+                let asks_roles = rest.to_ascii_uppercase().contains("RETURN (SPECIAL-USE)");
+                if asks_roles && (!guard.special_use || guard.reject_list_return) {
+                    let _ =
+                        write.write_all(format!("{tag} BAD unknown LIST option\r\n").as_bytes());
+                    continue;
+                }
                 for mailbox in &guard.mailboxes {
-                    let flags = if mailbox.list_flags.is_empty() {
-                        "\\HasNoChildren".to_string()
-                    } else {
-                        mailbox.list_flags.clone()
-                    };
+                    let mut flags = mailbox.list_flags.clone();
+                    if guard.special_use && !asks_roles {
+                        flags = flags
+                            .split_whitespace()
+                            .filter(|flag| !is_special_use(flag))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                    }
+                    if flags.is_empty() {
+                        flags = "\\HasNoChildren".to_string();
+                    }
                     if mailbox_needs_literal(&mailbox.name) {
                         let _ = write.write_all(
                             format!("* LIST ({flags}) \"/\" {{{}}}\r\n", mailbox.name.len())
@@ -652,7 +670,24 @@ fn capability_text(state: &TestState) -> String {
     if state.qresync {
         caps.push_str(" QRESYNC");
     }
+    if state.special_use || state.reject_list_return {
+        caps.push_str(" SPECIAL-USE");
+    }
     caps
+}
+
+fn is_special_use(flag: &str) -> bool {
+    [
+        "\\All",
+        "\\Archive",
+        "\\Drafts",
+        "\\Flagged",
+        "\\Junk",
+        "\\Sent",
+        "\\Trash",
+    ]
+    .iter()
+    .any(|known| known.eq_ignore_ascii_case(flag))
 }
 
 /// The `Message-ID` line of a raw message, as `HEADER.FIELDS` returns it.

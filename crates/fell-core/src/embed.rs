@@ -1329,7 +1329,8 @@ fn fnv_str(mut hash: u64, text: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::account::{Account, AccountId, BackendKind};
-    use crate::actions::{FOLDER_INBOX, FOLDER_TRASH};
+    use crate::actions::FOLDER_INBOX;
+    const FOLDER_TRASH: &str = "Trash";
     use crate::message::{Message, MessageHeaders, MessageId, RemoteId};
     use crate::store::Store;
     use crate::threading::ThreadId;

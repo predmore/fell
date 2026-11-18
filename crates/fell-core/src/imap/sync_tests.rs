@@ -1,6 +1,7 @@
 use crate::LabelChange;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
+use crate::folders::FolderRole;
 use crate::imap::{ImapConfig, ImapSecurity, InboxWait};
 use crate::store::Store;
 use crate::sync::sync_once;
@@ -27,6 +28,7 @@ fn config(port: u16) -> ImapConfig {
         password: "secret".into(),
         security: ImapSecurity::Plain,
         accept_invalid_certs: false,
+        folder_overrides: Vec::new(),
     }
 }
 
@@ -48,6 +50,8 @@ fn sample_state() -> TestState {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Parent".into(),
@@ -562,6 +566,8 @@ fn star_range_does_not_reapply_the_highest_uid() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -628,6 +634,8 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -696,6 +704,8 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -813,6 +823,8 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -926,6 +938,8 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1070,6 +1084,8 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1167,6 +1183,8 @@ fn non_ascii_password_logs_in_as_a_literal() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1240,6 +1258,8 @@ fn fetch_batches_survive_a_dropped_connection() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1352,6 +1372,8 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Sent".into(),
@@ -1431,6 +1453,8 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1503,6 +1527,8 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![FixtureMailbox {
             name: "INBOX".into(),
             list_flags: String::new(),
@@ -1582,6 +1608,8 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
         qresync: false,
         expunge_during_search: false,
         vanished_reply: None,
+        special_use: false,
+        reject_list_return: false,
         mailboxes: vec![
             FixtureMailbox {
                 name: "Bad\nName".into(),
@@ -2483,4 +2511,346 @@ fn an_expunge_qresync_did_not_report_is_still_found() {
     sync_once(&acct, &backend, &store).unwrap();
     assert!(!commands(&server).iter().any(|line| line.contains("SEARCH")));
     assert_read_only(&server);
+}
+
+/// A provider's folder layout: `(name, LIST attributes)`. One message sits in
+/// INBOX, and a copy of it in `also_in` (Gmail keeps every message in All Mail).
+fn provider_state(special_use: bool, folders: &[(&str, &str)], also_in: Option<&str>) -> TestState {
+    let message = || FixtureMessage {
+        uid: 1,
+        flags: vec!["\\Seen".into()],
+        modseq: 1,
+        body_form: BodyForm::Literal,
+        raw: raw_message(
+            "role@x",
+            None,
+            "Roles",
+            "Ann <ann@x>",
+            "where does it go",
+            "",
+        ),
+    };
+    let mut state = sample_state();
+    state.special_use = special_use;
+    state.mailboxes = folders
+        .iter()
+        .enumerate()
+        .map(|(index, (name, flags))| {
+            let mut mailbox = empty_mailbox(name, 100 + index as u32);
+            mailbox.list_flags = (*flags).to_string();
+            if *name == "INBOX" || Some(*name) == also_in {
+                mailbox.messages.push(message());
+            }
+            mailbox
+        })
+        .collect();
+    state
+}
+
+/// Sync `state`, then check what each role resolved to and where archive
+/// and delete put the INBOX message.
+fn assert_provider_roles(
+    state: TestState,
+    overrides: &[(FolderRole, &str)],
+    expected: &[(FolderRole, &str)],
+    archive_lands_in: &str,
+) -> TestServer {
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let mut imap = config(server.addr.port());
+    imap.folder_overrides = overrides
+        .iter()
+        .map(|(role, name)| (*role, (*name).to_string()))
+        .collect();
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: imap,
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let roles = store.folder_roles(&acct.id).unwrap();
+    for (role, name) in expected {
+        assert_eq!(roles.name(*role), *name, "{role:?}");
+        assert_eq!(roles.label(name), role.label(), "{name}");
+    }
+    assert_eq!(roles.archive_name(), archive_lands_in);
+
+    let thread = thread_of(&store, &acct, "role@x");
+    store.archive_thread(&acct.id, &thread, "INBOX").unwrap();
+    let archived = stored(&store, &acct, "role@x").unwrap();
+    assert!(
+        archived.folders.iter().any(|f| f == archive_lands_in),
+        "{:?}",
+        archived.folders
+    );
+    assert!(!archived.folders.iter().any(|f| f == "INBOX"));
+    assert_eq!(
+        folder_subjects(&store, &acct, archive_lands_in),
+        vec!["Roles"]
+    );
+    store.undo(&acct.id).unwrap();
+
+    let trash = roles.name(FolderRole::Trash).to_string();
+    store.delete_thread(&acct.id, &thread, "INBOX").unwrap();
+    let deleted = stored(&store, &acct, "role@x").unwrap();
+    assert!(deleted.folders.contains(&trash), "{:?}", deleted.folders);
+    assert!(!deleted.folders.iter().any(|f| f == "INBOX"));
+    // Delete from Trash drops the folder rather than moving it again.
+    store.delete_thread(&acct.id, &thread, &trash).unwrap();
+    assert!(folder_subjects(&store, &acct, &trash).is_empty());
+    server
+}
+
+#[test]
+fn an_xlist_inbox_mark_alone_keeps_the_name_table() {
+    // The server marks only INBOX (`\\Inbox` is XLIST, not RFC 6154), so
+    // Sent and Trash still come from their names.
+    let state = provider_state(
+        false,
+        &[
+            ("INBOX", "\\Inbox \\HasNoChildren"),
+            ("Sent Items", "\\HasNoChildren"),
+            ("Deleted Messages", "\\HasNoChildren"),
+            ("Archive", "\\HasNoChildren"),
+        ],
+        None,
+    );
+    assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Inbox, "INBOX"),
+            (FolderRole::Sent, "Sent Items"),
+            (FolderRole::Trash, "Deleted Messages"),
+            (FolderRole::Archive, "Archive"),
+        ],
+        "Archive",
+    );
+}
+
+#[test]
+fn proton_bridge_folders_marked_on_a_plain_list() {
+    let state = provider_state(
+        false,
+        &[
+            ("INBOX", ""),
+            ("Drafts", "\\Drafts"),
+            ("Sent", "\\Sent"),
+            ("Starred", "\\Flagged"),
+            ("Archive", "\\Archive"),
+            ("Spam", "\\Junk"),
+            ("Trash", "\\Trash"),
+            ("All Mail", "\\All"),
+            ("Folders", "\\Noselect \\HasChildren"),
+            ("Folders/Work", ""),
+            ("Labels", "\\Noselect \\HasChildren"),
+            ("Labels/Travel", ""),
+        ],
+        Some("All Mail"),
+    );
+    let server = assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Inbox, "INBOX"),
+            (FolderRole::Sent, "Sent"),
+            (FolderRole::Drafts, "Drafts"),
+            (FolderRole::Trash, "Trash"),
+            (FolderRole::Junk, "Spam"),
+            (FolderRole::Archive, "Archive"),
+            (FolderRole::All, "All Mail"),
+            (FolderRole::Flagged, "Starred"),
+        ],
+        "Archive",
+    );
+    let lists: Vec<String> = commands(&server)
+        .into_iter()
+        .filter(|command| command.to_ascii_uppercase().contains("LIST"))
+        .collect();
+    assert!(
+        lists.iter().all(|command| !command.contains("RETURN")),
+        "{lists:?}"
+    );
+}
+
+#[test]
+fn gmail_roles_come_from_special_use_and_archive_goes_to_all_mail() {
+    let state = provider_state(
+        true,
+        &[
+            ("INBOX", ""),
+            ("[Gmail]", "\\Noselect \\HasChildren"),
+            ("[Gmail]/All Mail", "\\All \\HasNoChildren"),
+            ("[Gmail]/Drafts", "\\Drafts \\HasNoChildren"),
+            ("[Gmail]/Important", "\\Important \\HasNoChildren"),
+            ("[Gmail]/Sent Mail", "\\Sent \\HasNoChildren"),
+            ("[Gmail]/Spam", "\\Junk \\HasNoChildren"),
+            ("[Gmail]/Starred", "\\Flagged \\HasNoChildren"),
+            ("[Gmail]/Trash", "\\Trash \\HasNoChildren"),
+            // A user label that happens to share a role's usual name.
+            ("Sent", ""),
+        ],
+        Some("[Gmail]/All Mail"),
+    );
+    let server = assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Sent, "[Gmail]/Sent Mail"),
+            (FolderRole::Drafts, "[Gmail]/Drafts"),
+            (FolderRole::Trash, "[Gmail]/Trash"),
+            (FolderRole::Junk, "[Gmail]/Spam"),
+            (FolderRole::All, "[Gmail]/All Mail"),
+            (FolderRole::Flagged, "[Gmail]/Starred"),
+        ],
+        "[Gmail]/All Mail",
+    );
+    assert!(
+        commands(&server)
+            .iter()
+            .any(|command| command.ends_with("LIST \"\" \"*\" RETURN (SPECIAL-USE)")),
+        "{:?}",
+        commands(&server)
+    );
+}
+
+#[test]
+fn fastmail_sent_items_is_sent() {
+    let state = provider_state(
+        true,
+        &[
+            ("INBOX", ""),
+            ("Archive", "\\Archive"),
+            ("Drafts", "\\Drafts"),
+            ("Sent Items", "\\Sent"),
+            ("Spam", "\\Junk"),
+            ("Trash", "\\Trash"),
+        ],
+        None,
+    );
+    assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Sent, "Sent Items"),
+            (FolderRole::Drafts, "Drafts"),
+            (FolderRole::Trash, "Trash"),
+            (FolderRole::Junk, "Spam"),
+            (FolderRole::Archive, "Archive"),
+        ],
+        "Archive",
+    );
+}
+
+#[test]
+fn a_server_without_special_use_falls_back_to_folder_names() {
+    let state = provider_state(
+        false,
+        &[
+            ("INBOX", ""),
+            ("Drafts", ""),
+            ("Sent Messages", ""),
+            ("INBOX/Trash", ""),
+            ("Junk", ""),
+            ("Projects", ""),
+        ],
+        None,
+    );
+    let server = assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Sent, "Sent Messages"),
+            (FolderRole::Drafts, "Drafts"),
+            (FolderRole::Trash, "INBOX/Trash"),
+            (FolderRole::Junk, "Junk"),
+        ],
+        // Nothing is an archive here, so archive keeps Fell's own folder.
+        "Archive",
+    );
+    let lists: Vec<String> = commands(&server)
+        .into_iter()
+        .filter(|command| command.to_ascii_uppercase().contains("LIST"))
+        .collect();
+    assert!(lists.iter().all(|command| !command.contains("RETURN")));
+}
+
+#[test]
+fn account_overrides_name_folders_a_server_does_not_mark() {
+    let state = provider_state(
+        false,
+        &[
+            ("INBOX", ""),
+            ("Gesendet", ""),
+            ("Papierkorb", ""),
+            ("Ablage", ""),
+        ],
+        None,
+    );
+    assert_provider_roles(
+        state,
+        &[
+            (FolderRole::Sent, "gesendet"),
+            (FolderRole::Trash, "Papierkorb"),
+            (FolderRole::Archive, "Ablage"),
+        ],
+        &[
+            (FolderRole::Sent, "Gesendet"),
+            (FolderRole::Trash, "Papierkorb"),
+            (FolderRole::Archive, "Ablage"),
+        ],
+        "Ablage",
+    );
+}
+
+#[test]
+fn a_server_that_refuses_list_return_still_gets_its_roles_read() {
+    let mut state = provider_state(
+        false,
+        &[("INBOX", ""), ("Sent Items", "\\Sent"), ("Bin", "\\Trash")],
+        None,
+    );
+    state.reject_list_return = true;
+    let server = assert_provider_roles(
+        state,
+        &[],
+        &[(FolderRole::Sent, "Sent Items"), (FolderRole::Trash, "Bin")],
+        "Archive",
+    );
+    let lists: Vec<String> = commands(&server)
+        .into_iter()
+        .filter(|command| command.to_ascii_uppercase().contains(" LIST "))
+        .collect();
+    assert!(lists.iter().any(|command| command.contains("RETURN")));
+    assert!(lists.iter().any(|command| !command.contains("RETURN")));
+}
+
+#[test]
+fn a_later_listing_replaces_the_stored_roles() {
+    let server = TestServer::spawn(provider_state(
+        true,
+        &[("INBOX", ""), ("Sent", "\\Sent")],
+        None,
+    ));
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(
+        store.folder_roles(&acct.id).unwrap().name(FolderRole::Sent),
+        "Sent"
+    );
+    {
+        let mut state = server.state.lock().expect("state");
+        mailbox(&mut state, "Sent").list_flags = String::new();
+        state.mailboxes.push(empty_mailbox("Sent Items", 77));
+        mailbox(&mut state, "Sent Items").list_flags = "\\Sent".into();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    let roles = store.folder_roles(&acct.id).unwrap();
+    assert_eq!(roles.name(FolderRole::Sent), "Sent Items");
+    assert_eq!(roles.get(FolderRole::Sent).unwrap().raw, "Sent Items");
 }

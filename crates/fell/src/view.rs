@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fell_core::{AccountConfig, AccountId, FolderSpan, ListKey, ThreadId};
+use fell_core::{AccountConfig, AccountId, FolderRole, FolderRoles, FolderSpan, ListKey, ThreadId};
 use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
@@ -114,6 +114,7 @@ struct ListRead {
     /// In Drafts, the person's compose drafts, shown above the synced rows
     /// when the window reaches the top of the folder.
     drafts: Vec<DraftSummary>,
+    roles: FolderRoles,
 }
 
 type ThreadsResult = Result<ListRead, String>;
@@ -130,10 +131,6 @@ fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
         ReplyKind::ReplyAll => "reply all · ",
         ReplyKind::Forward => "forward · ",
     }
-}
-
-fn is_drafts(folder: &str) -> bool {
-    folder.eq_ignore_ascii_case("drafts")
 }
 
 struct Inbox {
@@ -224,7 +221,7 @@ impl Inbox {
             open_thread: None,
             moved_thread: None,
             sync: None,
-            list_folder: "INBOX".into(),
+            list_folder: FolderRole::Inbox.default_name().into(),
             read_in_flight: false,
             refresh_in_flight: false,
             read_gen: 0,
@@ -352,6 +349,7 @@ impl Inbox {
                 .folder_page(&account, &reading, &span)
                 .map_err(|err| err.to_string())?;
             let names = store.folder_names(&account).unwrap_or_default();
+            let roles = store.folder_roles(&account).unwrap_or_default();
             let followed = match follow {
                 Some(id) if !page.threads.iter().any(|thread| thread.thread_id.0 == id) => store
                     .folder_key_of(&account, &reading, &ThreadId(id))
@@ -359,7 +357,7 @@ impl Inbox {
                     .flatten(),
                 _ => None,
             };
-            let drafts = if is_drafts(&reading) {
+            let drafts = if roles.is(FolderRole::Drafts, &reading) {
                 store
                     .unsent_compose_drafts(&account)
                     .map_err(|err| err.to_string())?
@@ -374,6 +372,7 @@ impl Inbox {
                 names,
                 followed,
                 drafts,
+                roles,
             })
         };
         // Only sync asked: nobody is waiting, so keep the interactive lane
@@ -443,6 +442,7 @@ impl Inbox {
             names,
             followed,
             drafts,
+            roles,
         } = match result {
             Ok(found) => found,
             Err(err) => {
@@ -468,6 +468,7 @@ impl Inbox {
         if !names.is_empty() {
             self.session.folders = names;
         }
+        self.session.roles = roles;
         let switched = folder != self.list_folder;
         if !switched {
             // A read from before the write still counts the rows taken out.
@@ -640,6 +641,8 @@ impl Inbox {
         let current = self.conv_gen.clone();
         let account = self.account_id.clone();
         let me = self.session.account_email.clone();
+        let roles = self.session.roles.clone();
+        let names = self.session.folders.clone();
         let thread = id.clone();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
@@ -648,7 +651,7 @@ impl Inbox {
             Some(
                 store
                     .thread_messages(&account, &ThreadId(thread))
-                    .map(|messages| present::conversation(&messages, &me))
+                    .map(|messages| present::conversation(&messages, &me, &roles, &names))
                     .map_err(|err| err.to_string()),
             )
         });
@@ -735,7 +738,7 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         // A draft changed, was sent, or is new: the drafts
                         // list on screen follows.
-                        if is_drafts(&inbox.session.folder) {
+                        if inbox.session.in_drafts() {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                         if let Some((line, warn)) = closed.last().cloned() {
@@ -875,7 +878,7 @@ impl Inbox {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
                     inbox.moved_thread = key;
-                    let label = present::folder_label(&destination);
+                    let label = inbox.session.folder_text(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
                     Some(ReadIntent {
                         changed: true,
@@ -1560,11 +1563,31 @@ fn header(theme: &Theme, session: &Session) -> gpui::Div {
         .child(div().flex_1())
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(session.folder_title()),
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(6.))
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(session.folder_title()),
+                )
+                // The folder's own name gives way first in a narrow window.
+                .children(session.folder_title_detail().map(|name| {
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(theme.dimmed))
+                        .child(name)
+                })),
         )
         .child(
             div()
+                .flex_none()
                 .text_color(rgb(if unread > 0 {
                     theme.accent
                 } else {
@@ -2793,7 +2816,13 @@ fn folder_picker(
                 .py(px(4.))
                 .children(choices.iter().enumerate().map(|(index, name)| {
                     let name = name.clone();
-                    let label = present::folder_label(&name);
+                    let label = session.roles.label(&name);
+                    let detail = session.folder_detail(&name);
+                    let detail_color = if index == selected {
+                        theme.on_selection_dim
+                    } else {
+                        theme.dimmed
+                    };
                     div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(34.))
@@ -2832,7 +2861,18 @@ fn folder_picker(
                                 );
                             }),
                         )
-                        .child(label)
+                        .gap(px(8.))
+                        .overflow_hidden()
+                        .child(div().flex_none().child(label))
+                        .children(detail.map(|name| {
+                            div()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(rgb(detail_color))
+                                .child(name)
+                        }))
                 })),
         )
 }

@@ -11,6 +11,7 @@ use crate::embed::{
     Embedding, dequeue_message, enqueue_message, invalidate_message_embedding,
     remove_message_embedding,
 };
+use crate::folders::FolderRoles;
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses, is_short_reply_body,
@@ -21,6 +22,7 @@ use crate::search::{
 use crate::threading::{ThreadId, resolve_thread_id};
 
 mod copies;
+mod roles;
 pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
@@ -415,6 +417,7 @@ impl Store {
         // threading tables, which the version 3 upgrade below already reads.
         summaries::ensure_thread_summaries(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
+        conn.execute_batch(roles::ROLES_TABLE)?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -554,6 +557,9 @@ impl Store {
                     flag.remote_id.0
                 ],
             )?;
+        }
+        if let Some(found) = &delta.roles {
+            roles::replace(&tx, account_id, found)?;
         }
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
@@ -812,6 +818,18 @@ impl Store {
     /// Reads the per-thread folder index, not every message.
     pub fn folder_names(&self, account_id: &AccountId) -> Result<Vec<String>> {
         summaries::folder_names(&self.conn, account_id)
+    }
+
+    /// Which folder is Sent, Trash, Archive and the rest for this account.
+    ///
+    /// What the last server listing found. An account no server has listed
+    /// (the demo mailbox, or mail stored before roles were recorded) gets
+    /// [`FolderRoles::from_names`] over its stored folders.
+    pub fn folder_roles(&self, account_id: &AccountId) -> Result<FolderRoles> {
+        if let Some(found) = roles::listed(&self.conn, account_id)? {
+            return Ok(found);
+        }
+        Ok(FolderRoles::from_names(&self.folder_names(account_id)?))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -1363,19 +1381,6 @@ pub fn folder_aliases(name: &str) -> &'static [&'static str] {
         "spam" | "junk" => &["spam", "junk"],
         "trash" | "deleted" => &["trash", "deleted"],
         _ => &[],
-    }
-}
-
-/// Picker name for a stored folder. Aliases share one row.
-pub fn canonical_folder_name(name: &str) -> Option<&'static str> {
-    match name.to_ascii_lowercase().as_str() {
-        "inbox" => Some("INBOX"),
-        "sent" => Some("Sent"),
-        "drafts" => Some("Drafts"),
-        "archive" | "archived" => Some("Archive"),
-        "spam" | "junk" => Some("Spam"),
-        "trash" | "deleted" => Some("Trash"),
-        _ => None,
     }
 }
 

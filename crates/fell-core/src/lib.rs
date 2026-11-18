@@ -12,6 +12,7 @@ pub mod agent;
 pub mod backend;
 pub mod compose;
 pub mod embed;
+pub mod folders;
 pub mod imap;
 pub mod message;
 pub mod search;
@@ -35,6 +36,7 @@ pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
     LocalHashV1, embed_body,
 };
+pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
 pub use imap::{ImapConfig, ImapSecurity, InboxWait};
 pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
 pub use search::{SearchHit, SearchResults};
@@ -45,7 +47,7 @@ pub use send::{
 pub use smtp::SmtpConfig;
 pub use store::{
     FolderPage, FolderSpan, FolderThread, ListKey, Participant, SearchPage, Store, ThreadSummary,
-    canonical_folder_name, folder_aliases,
+    folder_aliases,
 };
 pub use sync::{SyncReport, sync_once, sync_with_progress};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};

@@ -7,7 +7,8 @@
 //!
 //! Archive and delete change one folder on the messages in a thread. Any
 //! other folder on the same row, such as Sent, stays. Labels are a second
-//! list, not folders.
+//! list, not folders. Archive and Trash are the account's folders for those
+//! roles ([`Store::folder_roles`]), not fixed names.
 //!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
@@ -24,21 +25,15 @@ use crate::account::AccountId;
 use crate::embed::{
     dequeue_message, enqueue_message, invalidate_message_embedding, remove_message_embedding,
 };
+use crate::folders::FolderRole;
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
-/// IMAP inbox. Matching a folder ignores ASCII case.
+/// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
-/// Destination for archive.
-pub const FOLDER_ARCHIVE: &str = "Archive";
-/// Destination for delete. A delete that starts here removes the row when it
-/// is the last folder.
-pub const FOLDER_TRASH: &str = "Trash";
-/// Sent mail stays put unless the caller names this folder as the source.
-pub const FOLDER_SENT: &str = "Sent";
 
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
     in_reply_to, references_header, from_name, from_email, subject,
@@ -200,7 +195,9 @@ struct Planned {
 }
 
 impl Store {
-    /// Move `from_folder` to [`FOLDER_ARCHIVE`] on messages in the thread that have it.
+    /// Move `from_folder` to the account's archive folder on messages in the
+    /// thread that have it: Archive, or All Mail on a server with no Archive
+    /// (see [`FolderRoles::archive_name`](crate::folders::FolderRoles::archive_name)).
     ///
     /// Other folders on those rows stay. The call is one undo entry.
     pub fn archive_thread(
@@ -210,11 +207,16 @@ impl Store {
         from_folder: &str,
     ) -> Result<LocalAction> {
         let from_folder = canonical_folder(from_folder)?;
-        if from_folder.eq_ignore_ascii_case(FOLDER_ARCHIVE) {
-            return Err(Error::Action("archive moves messages into Archive".into()));
+        let roles = self.folder_roles(account_id)?;
+        let archive = roles.archive_name().to_string();
+        if from_folder.eq_ignore_ascii_case(&archive) {
+            return Err(Error::Action(format!(
+                "archive moves messages into {}",
+                roles.label(&archive)
+            )));
         }
         self.apply_thread(account_id, thread_id, ActionKind::Archive, |rows| {
-            let plans = plan_relocate(rows, &from_folder, FOLDER_ARCHIVE);
+            let plans = plan_relocate(rows, &from_folder, &archive);
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
             }
@@ -283,7 +285,8 @@ impl Store {
         })
     }
 
-    /// Move `from_folder` to [`FOLDER_TRASH`] on messages in the thread that have it.
+    /// Move `from_folder` to the account's Trash folder on messages in the
+    /// thread that have it.
     ///
     /// When `from_folder` is Trash, that folder is dropped. A row whose last
     /// folder was Trash is deleted, and undo inserts it again.
@@ -294,11 +297,13 @@ impl Store {
         from_folder: &str,
     ) -> Result<LocalAction> {
         let from_folder = canonical_folder(from_folder)?;
+        let roles = self.folder_roles(account_id)?;
+        let trash = roles.name(FolderRole::Trash).to_string();
         self.apply_thread(account_id, thread_id, ActionKind::Delete, |rows| {
-            let plans = if from_folder.eq_ignore_ascii_case(FOLDER_TRASH) {
+            let plans = if from_folder.eq_ignore_ascii_case(&trash) {
                 plan_expunge(rows, &from_folder)
             } else {
-                plan_relocate(rows, &from_folder, FOLDER_TRASH)
+                plan_relocate(rows, &from_folder, &trash)
             };
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
@@ -1404,6 +1409,11 @@ mod tests {
     use crate::account::{Account, BackendKind};
     use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
     use crate::{MailboxDelta, SyncCursor};
+
+    // An account no server has listed: each role is its default name.
+    const FOLDER_ARCHIVE: &str = "Archive";
+    const FOLDER_TRASH: &str = "Trash";
+    const FOLDER_SENT: &str = "Sent";
 
     fn open(ids: &[(&str, &str)]) -> Store {
         let store = Store::open_in_memory().unwrap();

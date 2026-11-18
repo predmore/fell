@@ -30,6 +30,7 @@ use std::fmt;
 use crate::Error;
 use crate::account::AccountId;
 use crate::backend::{FlagUpdate, FolderRemoval, MailboxDelta, RemovalKind, Settle, SyncCursor};
+use crate::folders::{FolderRole, FolderRoles, ListedMailbox};
 use crate::message::{Message, RemoteId};
 
 /// Messages held in memory before they are persisted. A larger mailbox is
@@ -181,6 +182,12 @@ pub(crate) fn fetch_imap(
             .then_with(|| left.decoded.cmp(&right.decoded))
             .then_with(|| left.raw.cmp(&right.raw))
     });
+    // Roles first, so `gs` and archive find the right folder while the
+    // first pass is still reading mail.
+    persist(MailboxDelta {
+        roles: Some(listed_roles(&mailboxes, &config.folder_overrides)),
+        ..MailboxDelta::default()
+    })?;
     let prior: HashMap<String, MailboxCheckpoint> = decode_cursor(cursor).into_iter().collect();
     let mut done: HashMap<String, MailboxCheckpoint> = HashMap::new();
     // Every mailbox was read to the end, so a copy moved on the server has
@@ -728,6 +735,7 @@ fn emit_progress(
         cursor: Some(encode_cursor(snapshot.account_id.as_str(), &pairs)),
         removals,
         settle: Settle::Later,
+        roles: None,
     })
 }
 
@@ -740,6 +748,19 @@ fn uid_fetch_refused(err: &Error) -> bool {
 /// The untagged-reply cap. The command was drained, so later mailboxes can run.
 fn untagged_overflow(err: &Error) -> bool {
     matches!(err, Error::Backend(message) if message.contains("exceeded") && message.contains("untagged"))
+}
+
+fn listed_roles(listed: &[session::Listed], overrides: &[(FolderRole, String)]) -> FolderRoles {
+    let mailboxes: Vec<ListedMailbox> = listed
+        .iter()
+        .map(|mailbox| ListedMailbox {
+            raw: mailbox.raw.clone(),
+            name: mailbox.decoded.clone(),
+            delimiter: mailbox.delimiter,
+            attributes: mailbox.attributes.clone(),
+        })
+        .collect();
+    FolderRoles::detect(&mailboxes, overrides)
 }
 
 fn inbox_rank(name: &str) -> u8 {
@@ -831,6 +852,9 @@ pub struct ImapConfig {
     /// Bridge's local certificate is not a public CA. Leave this false for
     /// any host that is not the user's own machine.
     pub accept_invalid_certs: bool,
+    /// Folders `account.toml` names for a role. They win over what the
+    /// server marks.
+    pub folder_overrides: Vec<(FolderRole, String)>,
 }
 
 impl fmt::Debug for ImapConfig {
@@ -842,6 +866,7 @@ impl fmt::Debug for ImapConfig {
             .field("password", &"<redacted>")
             .field("security", &self.security)
             .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field("folder_overrides", &self.folder_overrides)
             .finish()
     }
 }
@@ -856,6 +881,7 @@ impl ImapConfig {
             password: password.into(),
             security: ImapSecurity::StartTls,
             accept_invalid_certs: true,
+            folder_overrides: Vec::new(),
         }
     }
 }
