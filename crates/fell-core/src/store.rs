@@ -863,16 +863,7 @@ impl Store {
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.
-                tx.execute(
-                    "UPDATE messages SET has_attachment = ?1, attachment_names = ?2
-                     WHERE account_id = ?3 AND message_id = ?4",
-                    params![
-                        i64::from(crate::imap::has_attachment(list)),
-                        union_tokens("", &crate::imap::attachment_names(list), false),
-                        account_id.as_str(),
-                        canonical,
-                    ],
-                )?;
+                set_attachments_from_list(&tx, account_id, &canonical, list)?;
             }
         }
         tx.commit()?;
@@ -1922,26 +1913,50 @@ fn write_kept(
     let to_line = union_addresses(&stored.to_line, &message.to);
     let cc_line = union_addresses(&stored.cc_line, &message.cc);
     let bcc_line = union_addresses(&stored.bcc_line, &message.bcc);
-    // A row whose part list was never taken has flags from an older
-    // classifier (a signature counted as a file). The first parsed list
-    // replaces them; after that, any copy with a file keeps the marker.
-    let relist = message.parts.is_some()
-        && !bodies::parts_listed(conn, &message.account_id, &stored.canonical_id)?;
-    let has_attachment = if relist {
-        message.has_attachment
-    } else {
-        stored.has_attachment || message.has_attachment
+    // The attachment marker and names describe the row's part list. A
+    // write that sets the list sets them from it, which also replaces flags
+    // an older classifier gave a row never listed (a signature counted as a
+    // file). A copy whose list was not taken changes neither, so no name
+    // appears that `message_parts` does not hold. Only a row with no list
+    // at all unions them, as before lists were kept.
+    let listed_before = bodies::parts_listed(conn, &message.account_id, &stored.canonical_id)?;
+    let new_list = match &message.parts {
+        Some(parts) => {
+            // Parts follow the body: a collapsed copy only fills a gap.
+            let mode = if like_alias {
+                bodies::Write::FillGap
+            } else {
+                bodies::Write::Replace
+            };
+            let parts = bodies::StoredParts::new(parts);
+            let wrote = bodies::write(
+                conn,
+                &message.account_id,
+                &stored.canonical_id,
+                &parts,
+                mode,
+            )?;
+            wrote.then(|| parts.mime_parts().map(<[crate::MimePart]>::to_vec))
+        }
+        None => None,
+    }
+    .flatten();
+    let (has_attachment, attachment_names) = match &new_list {
+        Some(list) => (
+            crate::imap::has_attachment(list),
+            union_tokens("", &crate::imap::attachment_names(list), false),
+        ),
+        None if listed_before => (stored.has_attachment, stored.attachment_names.clone()),
+        None => (
+            stored.has_attachment || message.has_attachment,
+            union_tokens(&stored.attachment_names, &message.attachment_names, false),
+        ),
     };
     // The first copy's Reply-To stands; a copy that names none adds nothing.
     let reply_to_line = if stored.reply_to_line.is_empty() {
         encode_addresses(&message.reply_to)
     } else {
         stored.reply_to_line.clone()
-    };
-    let attachment_names = if relist {
-        union_tokens("", &message.attachment_names, false)
-    } else {
-        union_tokens(&stored.attachment_names, &message.attachment_names, false)
     };
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
     let from_email = if alias {
@@ -2060,22 +2075,6 @@ fn write_kept(
             stored.canonical_id,
         ],
     )?;
-    if let Some(parts) = &message.parts {
-        // Parts follow the body: a collapsed copy only fills a gap.
-        let mode = if like_alias {
-            bodies::Write::FillGap
-        } else {
-            bodies::Write::Replace
-        };
-        let parts = bodies::StoredParts::new(parts);
-        bodies::write(
-            conn,
-            &message.account_id,
-            &stored.canonical_id,
-            &parts,
-            mode,
-        )?;
-    }
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
     // The vector belongs to the row that stays, not to the id this copy
     // arrived under (which may be an alias).
@@ -2286,6 +2285,27 @@ fn find_list_collapse(
     Ok(Some(only))
 }
 
+/// Set a row's attachment marker and names from the part list just stored
+/// for it, so they never disagree with `message_parts`.
+fn set_attachments_from_list(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    list: &[crate::MimePart],
+) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET has_attachment = ?1, attachment_names = ?2
+         WHERE account_id = ?3 AND message_id = ?4",
+        params![
+            i64::from(crate::imap::has_attachment(list)),
+            union_tokens("", &crate::imap::attachment_names(list), false),
+            account_id.as_str(),
+            message_id,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Fold `message`'s existing row into `keeper`, then drop the duplicate row.
 ///
 /// Local triage lives on the stored row. The sync payload only carries the
@@ -2302,12 +2322,14 @@ fn absorb_duplicate(
     let thread = write_kept(conn, message, &keeper, true, &extra_folders, &extra_labels)?;
     // The stored parts of the doomed row fill what the keeper lacks; the
     // delete below drops the rest with the row.
-    bodies::move_into(
+    if let Some(list) = bodies::move_into(
         conn,
         &message.account_id,
         &doomed.canonical_id,
         &keeper.canonical_id,
-    )?;
+    )? {
+        set_attachments_from_list(conn, &message.account_id, &keeper.canonical_id, &list)?;
+    }
     let old_terms = terms_for_indexed(IndexedText {
         subject: &doomed.subject,
         from_name: doomed.from_name.as_deref(),
@@ -7105,6 +7127,13 @@ mod tests {
                 .unwrap(),
             Some(parsed.mime_parts.clone())
         );
+        // The marker and names come with the list.
+        let row = store
+            .message(&account().id, &MessageId::new("list@x"))
+            .unwrap()
+            .unwrap();
+        assert!(row.has_attachment);
+        assert_eq!(row.attachment_names, vec!["report.pdf", "totals.csv"]);
         // The deleted row's own rows went with it.
         let left: i64 = store
             .conn

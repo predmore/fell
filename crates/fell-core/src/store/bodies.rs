@@ -516,13 +516,13 @@ const FILL_GAP_SQL: &str = "INSERT INTO message_bodies
 
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
 /// parts it lacks from `from`, as stored. `to` leaves the backfill queue
-/// when it gains a body.
+/// when it gains a body. Returns the part list when `to` took `from`'s.
 pub(super) fn move_into(
     conn: &Connection,
     account_id: &AccountId,
     from: &str,
     to: &str,
-) -> Result<()> {
+) -> Result<Option<Vec<MimePart>>> {
     let moved = conn.execute(
         "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
          SELECT account_id, ?3, codec, html, plain, bulk_headers FROM message_bodies
@@ -552,8 +552,9 @@ pub(super) fn move_into(
             params![account_id.as_str(), to, CODEC_DEFLATE],
         )?;
         replace_list(conn, account_id, to, &list)?;
+        return Ok(Some(list));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Stored parts for a canonical message id, or `None` when there is no row.
@@ -1087,11 +1088,44 @@ mod tests {
         let list = attachments(&store, "pdf@x").unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].role, crate::PartRole::Signature);
-        // The marker is a union over copies once a list is kept.
+        // The marker and names follow the list that replaced the old one.
         let kept = store
             .message(&account().id, &MessageId::new("pdf@x"))
             .unwrap()
             .unwrap();
+        assert!(!kept.has_attachment);
+        assert!(kept.attachment_names.is_empty());
+        assert!(
+            store
+                .search(&account().id, "has:attachment")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_collapsed_copy_whose_list_is_not_kept_adds_no_names() {
+        let mut sent = with_attachments("post@x", "Sent", 1);
+        sent.folders = vec!["Sent".into()];
+        // The list echo of it, with a footer file the Sent copy never had.
+        let mut echo = with_attachments("echo@lists.x", "INBOX", 2);
+        echo.list_id = Some("list.x".into());
+        echo.headers.subject = format!("[list] {}", sent.headers.subject);
+        let mut footer = echo.parts.as_ref().unwrap().mime_parts[1].clone();
+        footer.section = "4".into();
+        footer.filename = Some("footer.txt".into());
+        echo.parts.as_mut().unwrap().mime_parts.push(footer);
+        echo.attachment_names.push("footer.txt".into());
+        let store = store_with(vec![sent]);
+        store.upsert_message(&echo).unwrap();
+        let kept = store
+            .message(&account().id, &MessageId::new("echo@lists.x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.headers.message_id.as_str(), "post@x", "collapsed");
+        assert_eq!(attachments(&store, "post@x").unwrap().len(), 2);
+        assert_eq!(kept.attachment_names, vec!["report.pdf", "totals.csv"]);
         assert!(kept.has_attachment);
     }
 
