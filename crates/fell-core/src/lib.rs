@@ -44,8 +44,8 @@ pub use send::{
 };
 pub use smtp::SmtpConfig;
 pub use store::{
-    FolderThread, Participant, SearchPage, Store, ThreadSummary, canonical_folder_name,
-    folder_aliases,
+    FolderPage, FolderSpan, FolderThread, ListKey, Participant, SearchPage, Store, ThreadSummary,
+    canonical_folder_name, folder_aliases,
 };
 pub use sync::{SyncReport, sync_once, sync_with_progress};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};

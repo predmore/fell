@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fell_core::{AccountConfig, AccountId, ThreadId};
+use fell_core::{AccountConfig, AccountId, FolderSpan, ListKey, ThreadId};
 use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::keymap::KeyId;
 use crate::mailbox;
-use crate::model::{Overlay, QueryFault, Session, Step, SyncKind};
+use crate::model::{Fetch, Overlay, QueryFault, Session, Step, SyncKind, row_key};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
@@ -66,8 +66,11 @@ struct ReadIntent {
     /// Archive, move, or undo wrote to the store. Scroll to the selection
     /// instead of holding the viewport still.
     changed: bool,
-    /// Undo: select this thread when it is back in the folder.
-    select: Option<String>,
+    /// Undo: select this thread when it is back in the folder, loading the
+    /// rows around it if they are not loaded.
+    select: Option<ListKey>,
+    /// Rows the list asked for beyond the ones it holds.
+    fetch: Fetch,
 }
 
 impl ReadIntent {
@@ -75,16 +78,34 @@ impl ReadIntent {
         self.switch |= later.switch;
         self.changed |= later.changed;
         self.select = later.select.or(self.select);
+        self.fetch = self.fetch.merge(later.fetch);
         self
     }
 
-    /// Only sync asked: keep the selected row still on screen.
+    /// Only sync asked: nobody is waiting, so the read can use the
+    /// background lane.
     fn is_refresh(&self) -> bool {
+        !self.switch && !self.changed && self.select.is_none() && self.fetch.is_empty()
+    }
+
+    /// The selected row should stay where it is on screen, because nothing
+    /// asked to move to another one.
+    fn holds_viewport(&self) -> bool {
         !self.switch && !self.changed && self.select.is_none()
     }
 }
 
-type ThreadsResult = Result<(Vec<ThreadRow>, Vec<String>), String>;
+/// One folder read: a window of rows, its edges, the unread count, and the
+/// folder names for the picker.
+struct ListRead {
+    rows: Vec<ThreadRow>,
+    more_before: bool,
+    more_after: bool,
+    unread: usize,
+    names: Vec<String>,
+}
+
+type ThreadsResult = Result<ListRead, String>;
 
 struct Inbox {
     focus: FocusHandle,
@@ -101,7 +122,7 @@ struct Inbox {
     dragging: bool,
     open_thread: Option<String>,
     /// Thread `m` just moved. `u` selects it again when it returns to this folder.
-    moved_thread: Option<String>,
+    moved_thread: Option<ListKey>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// The folder the rows on screen came from. `session.folder` changes on
@@ -271,12 +292,27 @@ impl Inbox {
         let folder = self.session.folder.clone();
         let me = self.session.account_email.clone();
         let reading = folder.clone();
+        // A folder the rows on screen do not come from opens at its top.
+        let span = if folder != self.list_folder || self.session.threads.is_empty() {
+            FolderSpan::Top {
+                rows: self.session.load_rows,
+            }
+        } else {
+            self.session
+                .span(intent.fetch, intent.select.as_ref(), self.visible_rows())
+        };
         let read = move |store: &fell_core::Store| -> ThreadsResult {
-            let threads = store
-                .folder_threads(&account, &reading)
+            let page = store
+                .folder_page(&account, &reading, &span)
                 .map_err(|err| err.to_string())?;
             let names = store.folder_names(&account).unwrap_or_default();
-            Ok((present::thread_rows(&threads, &me), names))
+            Ok(ListRead {
+                rows: present::thread_rows(&page.threads, &me),
+                more_before: page.more_before,
+                more_after: page.more_after,
+                unread: page.unread,
+                names,
+            })
         };
         // Only sync asked: nobody is waiting, so keep the interactive lane
         // free for the conversation the reader opens next.
@@ -337,7 +373,13 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) {
         self.session.loading = false;
-        let (mut rows, names) = match result {
+        let ListRead {
+            mut rows,
+            more_before,
+            more_after,
+            unread,
+            names,
+        } = match result {
             Ok(found) => found,
             Err(err) => {
                 if intent.switch {
@@ -357,12 +399,14 @@ impl Inbox {
             rows.retain(|row| !self.pending_removals.contains(&row.id));
         }
         self.list_folder = folder;
-        if switched
-            && let Some(id) = &self.session.cursor_id
-            && !rows.iter().any(|row| &row.id == id)
-        {
-            // A new folder opens at its top, not at the old folder's index.
-            self.session.cursor_id = None;
+        if switched {
+            self.session.forget_window();
+            if let Some(id) = &self.session.cursor_id
+                && !rows.iter().any(|row| &row.id == id)
+            {
+                // A new folder opens at its top, not at the old folder's index.
+                self.session.cursor_id = None;
+            }
         }
         let row_height = self.list_row_height();
         let before_id = self.session.cursor_id.clone();
@@ -374,9 +418,9 @@ impl Inbox {
                 .find(|row| &row.id == id)
                 .map(|row| row.message_count)
         });
-        self.session.set_threads(rows);
-        if let Some(id) = &intent.select {
-            self.session.select_if_present(id);
+        self.session.set_page(rows, more_before, more_after, unread);
+        if let Some(key) = &intent.select {
+            self.session.select_if_present(&key.thread_id.0);
         }
         let after_index = self
             .session
@@ -384,9 +428,10 @@ impl Inbox {
             .as_ref()
             .and_then(|id| self.session.threads.iter().position(|row| &row.id == id));
         let same_thread = self.session.cursor_id == before_id;
-        if intent.is_refresh() && !switched && same_thread {
-            // Rows sync put above the selection push it down. Scroll by the
-            // same amount so the selected row stays where the reader left it.
+        if intent.holds_viewport() && !switched && same_thread {
+            // Rows sync put above the selection, or rows loaded above the
+            // first one, push it down. Scroll by the same amount so the
+            // selected row stays where the reader left it.
             if let (Some(before), Some(after), Some(row)) = (before_index, after_index, row_height)
             {
                 self.shift_list(after as i64 - before as i64, row);
@@ -399,7 +444,40 @@ impl Inbox {
         if open_changed || grew {
             self.request_messages(true, cx);
         }
+        // A cursor move that waited for these rows may need more.
+        self.issue_fetch(cx);
         cx.notify();
+    }
+
+    /// Read the rows the list asked for. While the reader's own read is in
+    /// flight the ask is dropped: when that read lands, the list asks again
+    /// for whatever it still lacks.
+    fn issue_fetch(&mut self, cx: &mut Context<Self>) {
+        let Some(fetch) = self.session.take_fetch() else {
+            return;
+        };
+        if self.read_in_flight && !self.refresh_in_flight {
+            return;
+        }
+        self.request_threads(
+            ReadIntent {
+                fetch,
+                ..ReadIntent::default()
+            },
+            cx,
+        );
+    }
+
+    /// Rows the list viewport shows, from its scroll offset and row height.
+    fn visible_rows(&self) -> Option<std::ops::Range<usize>> {
+        let row = self.list_row_height()?;
+        let state = self.list_scroll.0.borrow();
+        let size = state.last_item_size?;
+        let top = (-f32::from(state.base_handle.offset().y)).max(0.0);
+        let start = (top / row).floor() as usize;
+        let shown = (f32::from(size.item.height) / row).ceil() as usize + 1;
+        let end = start.saturating_add(shown).min(self.session.threads.len());
+        (start < end).then_some(start..end)
     }
 
     /// One row's height as the list last laid it out. GPUI records the
@@ -618,13 +696,14 @@ impl Inbox {
         let folder = self.list_folder.clone();
         let account = self.account_id.clone();
         let thread = ThreadId(id.clone());
+        let key = self.selected_key();
         self.take_out_of_list(&id, cx);
         self.change_mailbox(
             move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
             move |inbox, result| match result {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = Some(id);
+                    inbox.moved_thread = key;
                     inbox.session.show_toast("Archived · u", false);
                     Some(ReadIntent {
                         changed: true,
@@ -636,7 +715,7 @@ impl Inbox {
                     inbox.session.show_toast(archive_failure(&err), true);
                     Some(ReadIntent {
                         changed: true,
-                        select: Some(id),
+                        select: key,
                         ..ReadIntent::default()
                     })
                 }
@@ -658,13 +737,14 @@ impl Inbox {
         let thread = ThreadId(id.clone());
         let from = self.list_folder.clone();
         let to = destination.clone();
+        let key = self.selected_key();
         self.take_out_of_list(&id, cx);
         self.change_mailbox(
             move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
             move |inbox, result| match result {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = Some(id);
+                    inbox.moved_thread = key;
                     let label = present::folder_label(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
                     Some(ReadIntent {
@@ -677,7 +757,7 @@ impl Inbox {
                     inbox.session.show_toast(err.to_string(), true);
                     Some(ReadIntent {
                         changed: true,
-                        select: Some(id),
+                        select: key,
                         ..ReadIntent::default()
                     })
                 }
@@ -693,6 +773,19 @@ impl Inbox {
         self.session.remove_thread(id);
         self.scroll_list_to_cursor();
         self.request_messages(true, cx);
+        // The removed row was the last one loaded: load the row after it.
+        self.issue_fetch(cx);
+    }
+
+    /// List position of the selected row, so undo can find it again even
+    /// after it scrolled out of the loaded rows.
+    fn selected_key(&self) -> Option<ListKey> {
+        let id = self.session.cursor_id.as_ref()?;
+        self.session
+            .threads
+            .iter()
+            .find(|row| &row.id == id)
+            .map(row_key)
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
@@ -808,6 +901,8 @@ impl Inbox {
         } else if step.reload_messages {
             self.request_messages(true, cx);
         }
+        // A move past the loaded rows, or near their end, asks for more.
+        self.issue_fetch(cx);
         if step.arm_which {
             self.arm_which(cx);
         }
@@ -1128,6 +1223,11 @@ fn thread_list(
         session.threads.len(),
         move |range, window, app| {
             entity.update(app, |inbox, cx| {
+                // Scrolling near an end of the loaded rows loads more.
+                inbox.session.need_rows(Some(range.clone()));
+                if inbox.session.has_fetch() {
+                    cx.defer_in(window, |inbox, _, cx| inbox.issue_fetch(cx));
+                }
                 let highlighted = inbox.session.highlighted();
                 let text_width = (list_width - 2.0 - 3.0 - 24.0).max(48.0);
                 range

@@ -12,8 +12,12 @@
 //! unknown and computes it from `messages`, so a list is right even when a
 //! writer skipped the refresh.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
+use std::ops::RangeBounds;
 
+use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::{FolderThread, decode_participants, folder_query_names, split_field, unique_tokens};
@@ -38,24 +42,6 @@ CREATE TABLE IF NOT EXISTS thread_summary (
     PRIMARY KEY (account_id, thread_id)
 ) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS thread_folders (
-    account_id TEXT NOT NULL,
-    folder_key TEXT NOT NULL,
-    thread_id TEXT NOT NULL,
-    -- Name as stored on the earliest message with it. NULL for Inbox implied
-    -- by a message with no folder, which is not a folder name.
-    display TEXT,
-    first_rowid INTEGER NOT NULL,
-    -- Position of the name in that message's folder list.
-    first_pos INTEGER NOT NULL,
-    unread INTEGER NOT NULL,
-    PRIMARY KEY (account_id, thread_id, folder_key)
-) WITHOUT ROWID;
--- Folder lists read this, and the earliest copy of a folder name is its
--- first entry. A refresh deletes through the primary key.
-CREATE INDEX IF NOT EXISTS idx_thread_folders_folder
-    ON thread_folders(account_id, folder_key, first_rowid, first_pos);
-
 -- One row per folder name in the account: its earliest stored spelling.
 CREATE TABLE IF NOT EXISTS account_folders (
     account_id TEXT NOT NULL,
@@ -72,6 +58,42 @@ CREATE TABLE IF NOT EXISTS thread_summary_dirty (
     PRIMARY KEY (account_id, thread_id)
 ) WITHOUT ROWID;
 "#;
+
+/// Created apart from [`SUMMARY_TABLES`]: a mailbox summarized by an older
+/// version has this table without `last_date`, and its indexes cannot be
+/// built until [`ensure_thread_summaries`] has replaced it.
+const FOLDER_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS thread_folders (
+    account_id TEXT NOT NULL,
+    folder_key TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    -- Name as stored on the earliest message with it. NULL for Inbox implied
+    -- by a message with no folder, which is not a folder name.
+    display TEXT,
+    first_rowid INTEGER NOT NULL,
+    -- Position of the name in that message's folder list.
+    first_pos INTEGER NOT NULL,
+    unread INTEGER NOT NULL,
+    -- The thread's latest message date, copied from its summary, so a folder
+    -- list can be read in order a window at a time.
+    last_date INTEGER NOT NULL,
+    PRIMARY KEY (account_id, thread_id, folder_key)
+) WITHOUT ROWID;
+-- The earliest copy of a folder name is the first entry here. A refresh
+-- deletes through the primary key.
+CREATE INDEX IF NOT EXISTS idx_thread_folders_folder
+    ON thread_folders(account_id, folder_key, first_rowid, first_pos);
+-- A folder list in list order: newest activity first, then thread id.
+CREATE INDEX IF NOT EXISTS idx_thread_folders_list
+    ON thread_folders(account_id, folder_key, last_date DESC, thread_id);
+-- Only the unread rows, so the header's count reads nothing else.
+CREATE INDEX IF NOT EXISTS idx_thread_folders_unread
+    ON thread_folders(account_id, folder_key, thread_id) WHERE unread = 1;
+"#;
+
+/// Value of `meta.thread_summary` once the tables match this code. Version 2
+/// added `thread_folders.last_date`.
+const SUMMARY_VERSION: &str = "2";
 
 /// Bump when [`SUMMARY_TRIGGERS`] changes. They are rebuilt only then, in
 /// one transaction (see [`super::ensure_triggers`]).
@@ -132,20 +154,28 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
         SUMMARY_TRIGGERS,
     )?;
     if summaries_are_current(conn)? {
+        conn.execute_batch(FOLDER_TABLE)?;
         return Ok(());
     }
     let tx = super::immediate_transaction(conn)?;
     if summaries_are_current(&tx)? {
-        return Ok(());
+        tx.execute_batch(FOLDER_TABLE)?;
+        return tx.commit();
     }
+    // An older `thread_folders` lacks columns. Every row is rebuilt below,
+    // so replace the table instead of altering it.
+    tx.execute_batch("DROP TABLE IF EXISTS thread_folders;")?;
+    tx.execute_batch(FOLDER_TABLE)?;
     tx.execute_batch(
         "DELETE FROM thread_summary;
-         DELETE FROM thread_folders;
          DELETE FROM account_folders;
          INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
-             SELECT DISTINCT account_id, thread_id FROM messages;
-         INSERT INTO meta (key, value) VALUES ('thread_summary', '1')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+             SELECT DISTINCT account_id, thread_id FROM messages;",
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('thread_summary', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SUMMARY_VERSION],
     )?;
     // Commit recomputes every queued thread.
     tx.commit()
@@ -159,7 +189,7 @@ fn summaries_are_current(conn: &Connection) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(value.as_deref() == Some("1"))
+    Ok(value.as_deref() == Some(SUMMARY_VERSION))
 }
 
 /// Recompute every queued thread and empty the queue. Runs inside the write
@@ -188,8 +218,9 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
     )?;
     let mut put_folder = conn.prepare_cached(
         "INSERT INTO thread_folders (
-            account_id, folder_key, thread_id, display, first_rowid, first_pos, unread
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            account_id, folder_key, thread_id, display, first_rowid, first_pos, unread,
+            last_date
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     let mut unqueue = conn.prepare_cached(
         "DELETE FROM thread_summary_dirty WHERE account_id = ?1 AND thread_id = ?2",
@@ -231,6 +262,7 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
                     folder.first_rowid,
                     folder.first_pos as i64,
                     i64::from(folder.unread),
+                    summary.last_date,
                 ])?;
             }
         }
@@ -418,37 +450,381 @@ fn folder_thread(thread: &str, summary: &Summary, unread: bool) -> FolderThread 
     }
 }
 
-/// Rows for one folder. Without statistics SQLite would walk every row in
-/// the account and probe each one, so the plan is pinned: the folder index
-/// first (`INDEXED BY`), then each summary by key (`CROSS JOIN`).
-fn folder_list_sql(keys: usize) -> String {
+/// Where a thread sits in a folder list. Lists are ordered newest activity
+/// first, then by thread id, and `Ord` follows that order: a key that sorts
+/// lower is higher on screen.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ListKey {
+    pub date_unix: i64,
+    pub thread_id: ThreadId,
+}
+
+impl ListKey {
+    pub fn of(thread: &FolderThread) -> Self {
+        Self {
+            date_unix: thread.last_date_unix,
+            thread_id: thread.thread_id.clone(),
+        }
+    }
+}
+
+impl Ord for ListKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .date_unix
+            .cmp(&self.date_unix)
+            .then_with(|| self.thread_id.0.cmp(&other.thread_id.0))
+    }
+}
+
+impl PartialOrd for ListKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Which part of a folder list to read. Positions are keys, not offsets, so
+/// rows that sync adds elsewhere in the folder never shift a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderSpan {
+    /// Up to `rows` rows from the top of the list.
+    Top { rows: usize },
+    /// The last `rows` rows of the list.
+    Bottom { rows: usize },
+    /// Every row from `first` through `last`, both included (`first: None`
+    /// starts at the top), plus up to `before` rows above `first` and up to
+    /// `after` rows below `last`.
+    Window {
+        first: Option<ListKey>,
+        last: ListKey,
+        before: usize,
+        after: usize,
+    },
+}
+
+/// One window of a folder list, read in one snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderPage {
+    pub threads: Vec<FolderThread>,
+    /// The folder has rows above the first one returned.
+    pub more_before: bool,
+    /// The folder has rows below the last one returned.
+    pub more_after: bool,
+    /// Unread threads in the whole folder, not only this window.
+    pub unread: usize,
+}
+
+/// Reads one folder's list. Built inside a snapshot, so every read through
+/// it sees the same moment.
+struct ListReader<'a> {
+    conn: &'a Connection,
+    account: &'a str,
+    /// Folder keys the name matches: one, or a few aliases.
+    keys: Vec<String>,
+    /// Threads still in the refresh queue that are in this folder, computed
+    /// from `messages`, in list order. Usually empty.
+    queued: Vec<FolderThread>,
+    /// The account has threads in the refresh queue, in any folder.
+    any_queued: bool,
+}
+
+impl<'a> ListReader<'a> {
+    fn new(conn: &'a Connection, account_id: &'a AccountId, folder: &str) -> Result<Self> {
+        let account = account_id.as_str();
+        let keys: Vec<String> = folder_query_names(folder)
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let mut queued = Vec::new();
+        let waiting = queued_threads(conn, account)?;
+        let any_queued = !waiting.is_empty();
+        for thread in waiting {
+            let Some(summary) = compute(conn, account, &thread)? else {
+                continue;
+            };
+            let mut unread = None;
+            for membership in &summary.folders {
+                if keys.contains(&membership.key) {
+                    unread = Some(unread.unwrap_or(false) | membership.unread);
+                }
+            }
+            if let Some(unread) = unread {
+                queued.push(folder_thread(&thread, &summary, unread));
+            }
+        }
+        queued.sort_by_key(ListKey::of);
+        Ok(Self {
+            conn,
+            account,
+            keys,
+            queued,
+            any_queued,
+        })
+    }
+
+    /// Rows between `lower` and `upper` in list order, at most `limit` of
+    /// them: the first ones, or the last ones when `from_end` is set.
+    /// Returned in list order either way.
+    fn rows(
+        &self,
+        lower: Bound<&ListKey>,
+        upper: Bound<&ListKey>,
+        from_end: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<FolderThread>> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut found: Vec<FolderThread> = Vec::new();
+        for key in &self.keys {
+            let (sql, bind) = window_sql(self.account, key, lower, upper, from_end, limit);
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params_from_iter(bind.iter()), list_row)?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+        found.extend(
+            self.queued
+                .iter()
+                .filter(|thread| (lower, upper).contains(&ListKey::of(thread)))
+                .cloned(),
+        );
+        found.sort_by_key(ListKey::of);
+        // A thread in two alias folders comes back once per folder, with the
+        // same key. Keep one row, unread if either copy is.
+        let mut threads: Vec<FolderThread> = Vec::with_capacity(found.len());
+        for thread in found {
+            match threads.last_mut() {
+                Some(last) if last.thread_id == thread.thread_id => last.unread |= thread.unread,
+                _ => threads.push(thread),
+            }
+        }
+        if let Some(limit) = limit
+            && threads.len() > limit
+        {
+            if from_end {
+                threads.drain(..threads.len() - limit);
+            } else {
+                threads.truncate(limit);
+            }
+        }
+        Ok(threads)
+    }
+
+    fn any(&self, lower: Bound<&ListKey>, upper: Bound<&ListKey>) -> Result<bool> {
+        Ok(!self.rows(lower, upper, false, Some(1))?.is_empty())
+    }
+
+    fn page(&self, span: &FolderSpan) -> Result<FolderPage> {
+        let threads = match span {
+            FolderSpan::Top { rows } => self.rows(Unbounded, Unbounded, false, Some(*rows))?,
+            FolderSpan::Bottom { rows } => self.rows(Unbounded, Unbounded, true, Some(*rows))?,
+            FolderSpan::Window {
+                first,
+                last,
+                before,
+                after,
+            } => {
+                // A start below the end would list the rows between twice.
+                let first = first.as_ref().map(|first| first.min(last));
+                let mut threads = match first {
+                    Some(first) => self.rows(Unbounded, Excluded(first), true, Some(*before))?,
+                    None => Vec::new(),
+                };
+                let lower = first.map_or(Unbounded, Included);
+                threads.extend(self.rows(lower, Included(last), false, None)?);
+                threads.extend(self.rows(Excluded(last), Unbounded, false, Some(*after))?);
+                threads
+            }
+        };
+        let (more_before, more_after) = match (threads.first(), threads.last()) {
+            (Some(top), Some(bottom)) => (
+                self.any(Unbounded, Excluded(&ListKey::of(top)))?,
+                self.any(Excluded(&ListKey::of(bottom)), Unbounded)?,
+            ),
+            // Nothing left inside the window. Say which side still has rows.
+            _ => match span {
+                FolderSpan::Window { first, last, .. } => (
+                    match first {
+                        Some(first) => self.any(Unbounded, Excluded(first))?,
+                        None => false,
+                    },
+                    self.any(Excluded(last), Unbounded)?,
+                ),
+                FolderSpan::Top { .. } => (false, self.any(Unbounded, Unbounded)?),
+                FolderSpan::Bottom { .. } => (self.any(Unbounded, Unbounded)?, false),
+            },
+        };
+        Ok(FolderPage {
+            threads,
+            more_before,
+            more_after,
+            unread: self.unread()?,
+        })
+    }
+
+    /// Unread threads in the folder. Reads only the unread rows.
+    fn unread(&self) -> Result<usize> {
+        let sql = unread_sql(self.keys.len(), self.any_queued);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut bind = Vec::with_capacity(1 + self.keys.len());
+        bind.push(self.account.to_string());
+        bind.extend(self.keys.iter().cloned());
+        let listed: i64 = stmt.query_row(params_from_iter(bind.iter()), |row| row.get(0))?;
+        let queued = self.queued.iter().filter(|thread| thread.unread).count();
+        Ok(listed as usize + queued)
+    }
+}
+
+fn list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderThread> {
+    let participants: String = row.get(10)?;
+    let labels: String = row.get(11)?;
+    Ok(FolderThread {
+        thread_id: ThreadId(row.get(0)?),
+        subject: row.get(1)?,
+        snippet: row.get(2)?,
+        last_date_unix: row.get(3)?,
+        message_count: row.get::<_, i64>(4)? as usize,
+        unread: row.get::<_, i64>(5)? != 0,
+        starred: row.get::<_, i64>(6)? != 0,
+        has_attachment: row.get::<_, i64>(7)? != 0,
+        latest_email: row.get(8)?,
+        latest_name: row.get(9)?,
+        participants: decode_participants(&participants),
+        labels: unique_tokens(&labels),
+    })
+}
+
+/// Rows of one folder key between two list positions. Without statistics
+/// SQLite would walk every row in the account and probe each one, so the
+/// plan is pinned: the list index first (`INDEXED BY`), in its own order so
+/// `LIMIT` stops the walk, then each summary by key (`CROSS JOIN`).
+///
+/// A bound on `(date, thread)` is a range on the date column, which the
+/// index seeks to, plus a filter that only drops rows tied on that date.
+fn window_sql(
+    account: &str,
+    key: &str,
+    lower: Bound<&ListKey>,
+    upper: Bound<&ListKey>,
+    from_end: bool,
+    limit: Option<usize>,
+) -> (String, Vec<Value>) {
+    let mut bind: Vec<Value> = vec![account.to_string().into(), key.to_string().into()];
+    let mut sql = String::from(
+        "SELECT ts.thread_id, ts.subject, ts.snippet, tf.last_date, ts.message_count,
+                tf.unread, ts.starred, ts.has_attachment, ts.latest_email,
+                ts.latest_name, ts.participants, ts.labels
+         FROM thread_folders tf INDEXED BY idx_thread_folders_list
+         CROSS JOIN thread_summary ts
+           ON ts.account_id = tf.account_id AND ts.thread_id = tf.thread_id
+         WHERE tf.account_id = ?1 AND tf.folder_key = ?2",
+    );
+    // Below `lower` in list order: older, or the same date and a later id.
+    if let Included(at) | Excluded(at) = lower {
+        let id = if matches!(lower, Included(_)) {
+            ">="
+        } else {
+            ">"
+        };
+        bind.push(at.date_unix.into());
+        bind.push(at.thread_id.0.clone().into());
+        let (date, thread) = (bind.len() - 1, bind.len());
+        sql.push_str(&format!(
+            "\n           AND tf.last_date <= ?{date}
+           AND (tf.last_date < ?{date} OR tf.thread_id {id} ?{thread})"
+        ));
+    }
+    // Above `upper` in list order: newer, or the same date and an earlier id.
+    if let Included(at) | Excluded(at) = upper {
+        let id = if matches!(upper, Included(_)) {
+            "<="
+        } else {
+            "<"
+        };
+        bind.push(at.date_unix.into());
+        bind.push(at.thread_id.0.clone().into());
+        let (date, thread) = (bind.len() - 1, bind.len());
+        sql.push_str(&format!(
+            "\n           AND tf.last_date >= ?{date}
+           AND (tf.last_date > ?{date} OR tf.thread_id {id} ?{thread})"
+        ));
+    }
+    let order = if from_end {
+        "tf.last_date ASC, tf.thread_id DESC"
+    } else {
+        "tf.last_date DESC, tf.thread_id ASC"
+    };
+    // SQLite reads a negative limit as no limit.
+    bind.push(
+        limit
+            .map_or(-1, |rows| rows.min(i64::MAX as usize) as i64)
+            .into(),
+    );
+    sql.push_str(&format!(
+        "\n           AND NOT EXISTS (
+               SELECT 1 FROM thread_summary_dirty d
+               WHERE d.account_id = tf.account_id AND d.thread_id = tf.thread_id
+           )
+         ORDER BY {order}
+         LIMIT ?{}",
+        bind.len()
+    ));
+    (sql, bind)
+}
+
+/// `skip_queued` leaves out threads in the refresh queue, whose rows may be
+/// stale. With the queue empty, the per-row check is skipped.
+fn unread_sql(keys: usize, skip_queued: bool) -> String {
     let placeholders = (0..keys)
         .map(|index| format!("?{}", index + 2))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "SELECT ts.thread_id, ts.subject, ts.snippet, ts.last_date, ts.message_count,
-                MAX(tf.unread), ts.starred, ts.has_attachment, ts.latest_email,
-                ts.latest_name, ts.participants, ts.labels
-         FROM thread_folders tf INDEXED BY idx_thread_folders_folder
-         CROSS JOIN thread_summary ts
-           ON ts.account_id = tf.account_id AND ts.thread_id = tf.thread_id
-         WHERE tf.account_id = ?1 AND tf.folder_key IN ({placeholders})
-           AND NOT EXISTS (
+    // One key has one row per thread. Aliases can share a thread, and
+    // DISTINCT costs a sort, so only they pay for it.
+    let count = if keys == 1 {
+        "COUNT(*)"
+    } else {
+        "COUNT(DISTINCT tf.thread_id)"
+    };
+    let queued = if skip_queued {
+        "AND NOT EXISTS (
                SELECT 1 FROM thread_summary_dirty d
                WHERE d.account_id = tf.account_id AND d.thread_id = tf.thread_id
-           )
-         GROUP BY ts.thread_id"
+           )"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT {count}
+         FROM thread_folders tf INDEXED BY idx_thread_folders_unread
+         WHERE tf.account_id = ?1 AND tf.folder_key IN ({placeholders}) AND tf.unread = 1
+           {queued}"
     )
 }
 
-/// Threads with at least one message in `folder`, newest activity first.
+/// Every thread with at least one message in `folder`, in list order.
 pub(super) fn folder_threads(
     conn: &Connection,
     account_id: &AccountId,
     folder: &str,
 ) -> Result<Vec<FolderThread>> {
-    in_one_snapshot(conn, || folder_threads_in(conn, account_id, folder))
+    in_one_snapshot(conn, || {
+        ListReader::new(conn, account_id, folder)?.rows(Unbounded, Unbounded, false, None)
+    })
+}
+
+/// One window of `folder`'s list, its edges, and the folder's unread count.
+pub(super) fn folder_page(
+    conn: &Connection,
+    account_id: &AccountId,
+    folder: &str,
+    span: &FolderSpan,
+) -> Result<FolderPage> {
+    in_one_snapshot(conn, || {
+        ListReader::new(conn, account_id, folder)?.page(span)
+    })
 }
 
 /// Run `read` inside one read transaction. The summary rows and the queue
@@ -463,64 +839,6 @@ fn in_one_snapshot<T>(conn: &Connection, read: impl FnOnce() -> Result<T>) -> Re
     let out = out?;
     released?;
     Ok(out)
-}
-
-fn folder_threads_in(
-    conn: &Connection,
-    account_id: &AccountId,
-    folder: &str,
-) -> Result<Vec<FolderThread>> {
-    let account = account_id.as_str();
-    let keys: Vec<String> = folder_query_names(folder)
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    let sql = folder_list_sql(keys.len());
-    let mut bind = Vec::with_capacity(1 + keys.len());
-    bind.push(account.to_string());
-    bind.extend(keys.iter().cloned());
-    let mut threads = {
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(bind.iter()), |row| {
-            let participants: String = row.get(10)?;
-            let labels: String = row.get(11)?;
-            Ok(FolderThread {
-                thread_id: ThreadId(row.get(0)?),
-                subject: row.get(1)?,
-                snippet: row.get(2)?,
-                last_date_unix: row.get(3)?,
-                message_count: row.get::<_, i64>(4)? as usize,
-                unread: row.get::<_, i64>(5)? != 0,
-                starred: row.get::<_, i64>(6)? != 0,
-                has_attachment: row.get::<_, i64>(7)? != 0,
-                latest_email: row.get(8)?,
-                latest_name: row.get(9)?,
-                participants: decode_participants(&participants),
-                labels: unique_tokens(&labels),
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for thread in queued_threads(conn, account)? {
-        let Some(summary) = compute(conn, account, &thread)? else {
-            continue;
-        };
-        let mut unread = None;
-        for membership in &summary.folders {
-            if keys.contains(&membership.key) {
-                unread = Some(unread.unwrap_or(false) | membership.unread);
-            }
-        }
-        if let Some(unread) = unread {
-            threads.push(folder_thread(&thread, &summary, unread));
-        }
-    }
-    threads.sort_by(|a, b| {
-        b.last_date_unix
-            .cmp(&a.last_date_unix)
-            .then_with(|| a.thread_id.0.cmp(&b.thread_id.0))
-    });
-    Ok(threads)
 }
 
 /// Distinct folder names, as first stored, in the order they first appeared.
@@ -703,14 +1021,115 @@ mod tests {
         (!threads.is_empty()).then(|| ThreadId(threads[rng.below(threads.len())].clone()))
     }
 
-    fn assert_lists_match(store: &Store, context: &str) {
+    /// The page `span` should return, cut from the whole list by key.
+    fn expected_page(full: &[FolderThread], span: &FolderSpan) -> (Vec<FolderThread>, bool, bool) {
+        let keys: Vec<ListKey> = full.iter().map(ListKey::of).collect();
+        let (start, end) = match span {
+            FolderSpan::Top { rows } => (0, (*rows).min(full.len())),
+            FolderSpan::Bottom { rows } => (full.len().saturating_sub(*rows), full.len()),
+            FolderSpan::Window {
+                first,
+                last,
+                before,
+                after,
+            } => {
+                let low = first
+                    .as_ref()
+                    .map_or(0, |first| keys.iter().filter(|key| *key < first).count());
+                let high = keys.iter().filter(|key| *key <= last).count();
+                (
+                    low.saturating_sub(*before),
+                    (high + after).min(full.len()).max(low),
+                )
+            }
+        };
+        let page = full[start..end].to_vec();
+        if page.is_empty()
+            && let FolderSpan::Window { first, last, .. } = span
+        {
+            let before = first
+                .as_ref()
+                .is_some_and(|first| keys.iter().any(|key| key < first));
+            return (page, before, keys.iter().any(|key| key > last));
+        }
+        (page, start > 0, end < full.len())
+    }
+
+    /// A key that sorts just after `key`: same date, and no stored id lies
+    /// between the two.
+    fn just_after(key: &ListKey) -> ListKey {
+        ListKey {
+            date_unix: key.date_unix,
+            thread_id: ThreadId(format!("{}\0", key.thread_id.0)),
+        }
+    }
+
+    /// Windows of every size and position, with bounds on stored rows and
+    /// between them, must be the matching cut of the whole list.
+    fn assert_pages_match(store: &Store, folder: &str, full: &[FolderThread], context: &str) {
+        let account = account().id;
+        let unread = full.iter().filter(|thread| thread.unread).count();
+        let keys: Vec<ListKey> = full.iter().map(ListKey::of).collect();
+        let mut spans = Vec::new();
+        for rows in [0, 1, 3, full.len() + 2] {
+            spans.push(FolderSpan::Top { rows });
+            spans.push(FolderSpan::Bottom { rows });
+        }
+        // The ends, the rows next to them, and the middle.
+        let len = keys.len();
+        let mut picked: Vec<usize> = [0, 1, len / 2, len.saturating_sub(2), len.saturating_sub(1)]
+            .into_iter()
+            .filter(|index| *index < len)
+            .collect();
+        picked.dedup();
+        for index in picked {
+            let key = &keys[index];
+            let end = &keys[(index + 2).min(len - 1)];
+            for (before, after) in [(0, 0), (2, 1)] {
+                spans.push(FolderSpan::Window {
+                    first: Some(key.clone()),
+                    last: end.clone(),
+                    before,
+                    after,
+                });
+                spans.push(FolderSpan::Window {
+                    first: None,
+                    last: key.clone(),
+                    before,
+                    after,
+                });
+                spans.push(FolderSpan::Window {
+                    first: Some(just_after(key)),
+                    last: just_after(key),
+                    before,
+                    after,
+                });
+            }
+        }
+        for span in spans {
+            let page = store.folder_page(&account, folder, &span).unwrap();
+            let (threads, more_before, more_after) = expected_page(full, &span);
+            assert_eq!(
+                (page.threads, page.more_before, page.more_after, page.unread),
+                (threads, more_before, more_after, unread),
+                "{context}: folder {folder}, {span:?}"
+            );
+        }
+    }
+
+    /// `pages` also checks windows of each list, which is much slower.
+    fn assert_lists_match(store: &Store, context: &str, pages: bool) {
         let account = account().id;
         for folder in QUERIES {
+            let full = store.folder_threads_scan(&account, folder).unwrap();
             assert_eq!(
                 store.folder_threads(&account, folder).unwrap(),
-                store.folder_threads_scan(&account, folder).unwrap(),
+                full,
                 "{context}: folder {folder}"
             );
+            if pages {
+                assert_pages_match(store, folder, &full, context);
+            }
         }
         assert_eq!(
             store.folder_names(&account).unwrap(),
@@ -882,7 +1301,7 @@ mod tests {
                         }
                     }
                 }
-                assert_lists_match(&store, &context);
+                assert_lists_match(&store, &context, step % 10 == 9);
             }
         }
     }
@@ -920,7 +1339,7 @@ mod tests {
             })
             .unwrap();
         assert!(queued > 0);
-        assert_lists_match(&store, "after a raw write");
+        assert_lists_match(&store, "after a raw write", true);
     }
 
     #[test]
@@ -967,41 +1386,200 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queued, 0, "the open filled every summary");
-        assert_lists_match(&store, "after the upgrade");
+        assert_lists_match(&store, "after the upgrade", true);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 
-    #[test]
-    fn a_folder_read_does_not_scan_messages() {
-        let store = Store::open_in_memory().unwrap();
-        let plan: Vec<String> = {
-            let mut stmt = store
-                .conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {}", folder_list_sql(2)))
-                .unwrap();
-            stmt.query_map(params!["acct", "archive", "archived"], |row| {
-                row.get::<_, String>(3)
-            })
+    fn plan(store: &Store, sql: &str, bind: &[Value]) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        stmt.query_map(params_from_iter(bind.iter()), |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn a_folder_read_does_not_scan_messages() {
+        let store = Store::open_in_memory().unwrap();
+        let key = ListKey {
+            date_unix: 1_700_000_000,
+            thread_id: ThreadId("t".into()),
         };
-        assert!(
-            plan.iter().all(|step| !step.contains("messages")),
-            "{plan:?}"
+        for (lower, upper, from_end) in [
+            (Unbounded, Unbounded, false),
+            (Excluded(&key), Unbounded, false),
+            (Included(&key), Included(&key), false),
+            (Unbounded, Excluded(&key), true),
+        ] {
+            let (sql, bind) = window_sql("acct", "inbox", lower, upper, from_end, Some(10));
+            let plan = plan(&store, &sql, &bind);
+            assert!(
+                plan.iter().all(|step| !step.contains("messages")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.starts_with("SCAN")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_thread_folders_list")),
+                "{plan:?}"
+            );
+            // Read in index order, so LIMIT ends the walk. A sort would
+            // read the whole folder first.
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+        let bind: Vec<Value> = vec!["acct".to_string().into(), "inbox".to_string().into()];
+        for skip_queued in [false, true] {
+            let plan = plan(&store, &unread_sql(1, skip_queued), &bind);
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_thread_folders_unread")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.starts_with("SCAN")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    /// One thread per message, each in `folder`, a minute apart.
+    fn fill_folder(store: &Store, folder: &str, threads: usize) {
+        let mut rng = Rng(3);
+        for start in (0..threads).step_by(500) {
+            let batch: Vec<Message> = (start..(start + 500).min(threads))
+                .map(|index| {
+                    let mut message = message(&mut rng, index, &[]);
+                    message.folders = vec![folder.to_string()];
+                    message.archived = false;
+                    message.headers.date_unix = 1_700_000_000 + index as i64 * 60;
+                    message
+                })
+                .collect();
+            store
+                .apply_delta(
+                    &account().id,
+                    &MailboxDelta {
+                        messages: batch,
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    /// VM steps SQLite spends reading `limit` rows after the middle of a
+    /// folder of `threads` threads.
+    fn window_steps(threads: usize, limit: usize) -> i32 {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        fill_folder(&store, "INBOX", threads);
+        let full = store.folder_threads(&account().id, "INBOX").unwrap();
+        let middle = ListKey::of(&full[threads / 2]);
+        let (sql, bind) = window_sql(
+            "acct",
+            "inbox",
+            Excluded(&middle),
+            Unbounded,
+            false,
+            Some(limit),
         );
+        let mut stmt = store.conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(params_from_iter(bind.iter()), list_row)
+            .unwrap()
+            .count();
+        assert_eq!(rows, limit);
+        assert_eq!(stmt.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        stmt.get_status(rusqlite::StatementStatus::VmStep)
+    }
+
+    #[test]
+    fn a_window_read_touches_only_its_rows() {
+        // The same window from a folder twenty times larger costs the same:
+        // the read seeks to its first row and stops after its last.
+        let small = window_steps(100, 20);
+        let large = window_steps(2_000, 20);
         assert!(
-            plan.iter().all(|step| !step.starts_with("SCAN tf")),
-            "{plan:?}"
+            large <= small + small / 10,
+            "{small} steps at 100 threads, {large} at 2000"
         );
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("idx_thread_folders_folder")),
-            "{plan:?}"
-        );
+        // And it grows with the window, not the folder.
+        let wider = window_steps(2_000, 40);
+        assert!(wider > large, "{large} steps for 20 rows, {wider} for 40");
+    }
+
+    #[test]
+    fn a_version_one_mailbox_gets_list_dates() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-thread-folders-v1-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account()).unwrap();
+            let mut rng = Rng(13);
+            let batch: Vec<Message> = (0..30).map(|index| message(&mut rng, index, &[])).collect();
+            store
+                .apply_delta(
+                    &account().id,
+                    &MailboxDelta {
+                        messages: batch,
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+            // The table as version 1 made it, without `last_date`.
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE thread_folders;
+                     CREATE TABLE thread_folders (
+                         account_id TEXT NOT NULL,
+                         folder_key TEXT NOT NULL,
+                         thread_id TEXT NOT NULL,
+                         display TEXT,
+                         first_rowid INTEGER NOT NULL,
+                         first_pos INTEGER NOT NULL,
+                         unread INTEGER NOT NULL,
+                         PRIMARY KEY (account_id, thread_id, folder_key)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX idx_thread_folders_folder
+                         ON thread_folders(account_id, folder_key, first_rowid, first_pos);
+                     UPDATE meta SET value = '1' WHERE key = 'thread_summary';",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'thread_summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SUMMARY_VERSION);
+        assert_lists_match(&store, "after the version 1 upgrade", true);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]
@@ -1099,5 +1677,112 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// Times Inbox reads in a mailbox of 100k messages: 20k threads of five
+    /// replies across four folders, every thread in Inbox. Run with
+    /// `cargo test --release -p fell-core --lib measure_inbox_reads -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "builds a 100k-message mailbox; run by hand in release"]
+    fn measure_inbox_reads_at_100k_messages() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("fell-measure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&account()).unwrap();
+        let account = account().id;
+        let folders = ["INBOX", "Sent", "INBOX", "Archive", "Work"];
+        let mut rng = Rng(17);
+        let built = Instant::now();
+        for start in (0..100_000).step_by(1_000) {
+            let batch: Vec<Message> = (start..start + 1_000)
+                .map(|index| {
+                    let mut message = message(&mut rng, index, &[]);
+                    let position = index % 5;
+                    let root = MessageId::new(format!("m{}@x", index - position));
+                    if position > 0 {
+                        let parent = MessageId::new(format!("m{}@x", index - 1));
+                        message.headers.in_reply_to = Some(parent.clone());
+                        message.headers.references = vec![parent];
+                    }
+                    message.thread_id = ThreadId::from_message_id(&root);
+                    message.folders = vec![folders[position].to_string()];
+                    message.archived = false;
+                    message.headers.date_unix = 1_600_000_000 + index as i64 * 60;
+                    message
+                })
+                .collect();
+            store
+                .apply_delta(
+                    &account,
+                    &MailboxDelta {
+                        messages: batch,
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+        }
+        println!("built 100k messages in {:.1?}", built.elapsed());
+
+        fn median(mut runs: Vec<Duration>) -> Duration {
+            runs.sort();
+            runs[runs.len() / 2]
+        }
+        let time = |label: &str, read: &dyn Fn() -> usize| {
+            let rows = read();
+            let runs: Vec<Duration> = (0..21)
+                .map(|_| {
+                    let started = Instant::now();
+                    read();
+                    started.elapsed()
+                })
+                .collect();
+            println!("{label}: {rows} rows, median {:.2?}", median(runs));
+        };
+        let full = store.folder_threads(&account, "INBOX").unwrap();
+        assert_eq!(full.len(), 20_000);
+        time("whole Inbox (folder_threads)", &|| {
+            store.folder_threads(&account, "INBOX").unwrap().len()
+        });
+        time("first window, Top 100", &|| {
+            store
+                .folder_page(&account, "INBOX", &FolderSpan::Top { rows: 100 })
+                .unwrap()
+                .threads
+                .len()
+        });
+        let middle = 10_000;
+        time("refresh of 100 rows mid-folder, plus 40 after", &|| {
+            store
+                .folder_page(
+                    &account,
+                    "INBOX",
+                    &FolderSpan::Window {
+                        first: Some(ListKey::of(&full[middle])),
+                        last: ListKey::of(&full[middle + 99]),
+                        before: 0,
+                        after: 40,
+                    },
+                )
+                .unwrap()
+                .threads
+                .len()
+        });
+        time("G: Bottom 100", &|| {
+            store
+                .folder_page(&account, "INBOX", &FolderSpan::Bottom { rows: 100 })
+                .unwrap()
+                .threads
+                .len()
+        });
+        time("unread count only (Top 0)", &|| {
+            store
+                .folder_page(&account, "INBOX", &FolderSpan::Top { rows: 0 })
+                .unwrap()
+                .unread
+        });
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
