@@ -594,7 +594,7 @@ mod tests {
     use super::*;
     use crate::account::{Account, BackendKind};
     use crate::actions::LabelChange;
-    use crate::backend::{FlagUpdate, MailboxDelta};
+    use crate::backend::{FlagUpdate, FolderRemoval, MailboxDelta, RemovalKind, Settle};
     use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
     use crate::store::Store;
 
@@ -663,7 +663,11 @@ mod tests {
                 // Ties on purpose: order must still match.
                 date_unix: 1_700_000_000 + rng.below(50) as i64 * 60,
             },
-            remote_id: RemoteId(format!("r{index}")),
+            // An IMAP copy, UID `index` in its first folder, so removals find it.
+            remote_id: RemoteId(match folders.first() {
+                Some(folder) => format!("imap:1:{index}:{folder}"),
+                None => format!("r{index}"),
+            }),
             thread_id: ThreadId::from_message_id(&message_id),
             snippet: format!("snippet {index}"),
             body_text: Some(format!("body {index} {}", rng.next())),
@@ -723,15 +727,18 @@ mod tests {
             store.upsert_account(&account()).unwrap();
             let account = account().id;
             let mut made = Vec::new();
+            let mut copies: Vec<Message> = Vec::new();
             let mut index = 0;
             for step in 0..60 {
                 let context = format!("seed {seed}, step {step}");
-                match rng.below(10) {
+                match rng.below(12) {
                     0..=4 => {
                         let size = 1 + rng.below(12);
                         let mut batch = Vec::new();
                         for _ in 0..size {
-                            batch.push(message(&mut rng, index, &made));
+                            let next = message(&mut rng, index, &made);
+                            copies.push(next.clone());
+                            batch.push(next);
                             made.push(format!("m{index}@x"));
                             index += 1;
                         }
@@ -742,6 +749,7 @@ mod tests {
                                     messages: batch,
                                     flags: Vec::new(),
                                     cursor: None,
+                                    ..MailboxDelta::default()
                                 },
                             )
                             .unwrap();
@@ -778,11 +786,85 @@ mod tests {
                             let _ = store.delete_thread(&account, &thread, from);
                         }
                     }
+                    9 => {
+                        // Expunged on the server: a UID range, or a listing
+                        // that leaves some UIDs out.
+                        let folder = FOLDERS[rng.below(FOLDERS.len() - 1)];
+                        let kind = if rng.chance(50) {
+                            let low = rng.below(index.max(1)) as u32;
+                            RemovalKind::Vanished {
+                                uidvalidity: 1,
+                                ranges: vec![(low, low + rng.below(4) as u32)],
+                            }
+                        } else {
+                            RemovalKind::Listing {
+                                uidvalidity: 1,
+                                present: (0..index as u32).filter(|_| rng.chance(80)).collect(),
+                                through: index as u32,
+                                found: Vec::new(),
+                                sweep: false,
+                            }
+                        };
+                        let settle = match rng.below(3) {
+                            0 => Settle::Later,
+                            1 => Settle::KeepRows,
+                            _ => Settle::All,
+                        };
+                        store
+                            .apply_delta(
+                                &account,
+                                &MailboxDelta {
+                                    removals: vec![FolderRemoval {
+                                        mailbox: folder.into(),
+                                        folder: folder.into(),
+                                        kind,
+                                    }],
+                                    settle,
+                                    ..MailboxDelta::default()
+                                },
+                            )
+                            .unwrap();
+                    }
+                    10 => {
+                        // Moved on the server: a new copy elsewhere, and the
+                        // old UID gone, settled at the end of the pass.
+                        if !copies.is_empty() {
+                            let mut copy = copies[rng.below(copies.len())].clone();
+                            let old = crate::imap::parse_remote_id(&copy.remote_id.0);
+                            let folder = FOLDERS[rng.below(FOLDERS.len() - 1)];
+                            copy.folders = vec![folder.to_string()];
+                            copy.remote_id = RemoteId(format!("imap:1:{index}:{folder}"));
+                            index += 1;
+                            copies.push(copy.clone());
+                            let removals = old
+                                .map(|old| FolderRemoval {
+                                    mailbox: old.mailbox,
+                                    folder: old.folder,
+                                    kind: RemovalKind::Vanished {
+                                        uidvalidity: old.uidvalidity,
+                                        ranges: vec![(old.uid, old.uid)],
+                                    },
+                                })
+                                .into_iter()
+                                .collect();
+                            store
+                                .apply_delta(
+                                    &account,
+                                    &MailboxDelta {
+                                        messages: vec![copy],
+                                        removals,
+                                        settle: Settle::All,
+                                        ..MailboxDelta::default()
+                                    },
+                                )
+                                .unwrap();
+                        }
+                    }
                     _ => {
-                        if index > 0 {
+                        if !copies.is_empty() {
                             let flags = (0..3)
                                 .map(|_| FlagUpdate {
-                                    remote_id: RemoteId(format!("r{}", rng.below(index))),
+                                    remote_id: copies[rng.below(copies.len())].remote_id.clone(),
                                     unread: rng.chance(50),
                                 })
                                 .collect();
@@ -793,6 +875,7 @@ mod tests {
                                         messages: Vec::new(),
                                         flags,
                                         cursor: None,
+                                        ..MailboxDelta::default()
                                     },
                                 )
                                 .unwrap();
@@ -817,6 +900,7 @@ mod tests {
                     messages: batch,
                     flags: Vec::new(),
                     cursor: None,
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -861,6 +945,7 @@ mod tests {
                         messages: batch,
                         flags: Vec::new(),
                         cursor: None,
+                        ..MailboxDelta::default()
                     },
                 )
                 .unwrap();
@@ -957,6 +1042,7 @@ mod tests {
                     messages: batch,
                     flags: Vec::new(),
                     cursor: None,
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();

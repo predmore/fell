@@ -22,12 +22,66 @@ pub struct FlagUpdate {
     pub unread: bool,
 }
 
-/// Messages and flag updates to apply to the local store.
+/// Server copies that one mailbox no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRemoval {
+    /// The mailbox as remote ids spell it (`imap:{uidvalidity}:{uid}:{mailbox}`).
+    pub mailbox: String,
+    /// The folder name copies from this mailbox add to a row.
+    pub folder: String,
+    pub kind: RemovalKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalKind {
+    /// Every UID the mailbox held under `uidvalidity` when the pass began.
+    /// A stored copy at or below `through` that is not listed is gone, and so
+    /// is every copy stored under another UIDVALIDITY.
+    Listing {
+        uidvalidity: u32,
+        /// Sorted.
+        present: Vec<u32>,
+        through: u32,
+        /// Message-IDs of present copies the store may not know yet (mail
+        /// synced before copies were recorded). Empty on later passes.
+        found: Vec<(u32, crate::MessageId)>,
+        /// Every present copy is now recorded, so a row that lists this
+        /// folder with no copy here (and no local action) lost it earlier.
+        sweep: bool,
+    },
+    /// UID ranges (inclusive) the server reported expunged (QRESYNC `VANISHED`).
+    Vanished {
+        uidvalidity: u32,
+        ranges: Vec<(u32, u32)>,
+    },
+}
+
+/// What the end of a sync pass does with folders whose last copy vanished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Settle {
+    /// Not the end of a pass: leave them for later.
+    #[default]
+    Later,
+    /// Take the folder off rows that keep another folder. Rows with nothing
+    /// left wait, because a mailbox this pass could not read may hold the
+    /// copy a server move made.
+    KeepRows,
+    /// Every mailbox was read: also delete rows with no folder and no copy.
+    All,
+}
+
+/// Messages, flag updates, and vanished copies to apply to the local store.
+///
+/// Removals drop server copies only. The folders they backed come off the
+/// rows at [`Settle`], so mail moved on the server keeps its row once the
+/// copy in the new folder has arrived, whichever mailbox syncs first.
 #[derive(Debug, Clone, Default)]
 pub struct MailboxDelta {
     pub messages: Vec<Message>,
     pub flags: Vec<FlagUpdate>,
     pub cursor: Option<SyncCursor>,
+    pub removals: Vec<FolderRemoval>,
+    pub settle: Settle,
 }
 
 /// Mail transport. IMAP/Proton live behind this trait; the UI never calls them directly.
@@ -264,6 +318,10 @@ fn collect_imap(
     crate::imap::fetch_imap(account_id, config, cursor, |mut delta| {
         combined.messages.append(&mut delta.messages);
         combined.flags.append(&mut delta.flags);
+        combined.removals.append(&mut delta.removals);
+        if delta.settle != Settle::Later {
+            combined.settle = delta.settle;
+        }
         if delta.cursor.is_some() {
             combined.cursor = delta.cursor;
         }
@@ -290,7 +348,7 @@ impl MailBackend for FixtureBackend {
                 account_key: "fixture".into(),
                 token: "1".into(),
             }),
-            flags: Vec::new(),
+            ..MailboxDelta::default()
         })
     }
 

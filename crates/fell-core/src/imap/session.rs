@@ -1,5 +1,5 @@
 //! Blocking IMAP session. Read-only commands only: CAPABILITY, STARTTLS,
-//! LOGIN, LIST, EXAMINE, UID FETCH, ENABLE, IDLE, LOGOUT.
+//! LOGIN, LIST, EXAMINE, FETCH, UID FETCH, UID SEARCH, ENABLE, IDLE, LOGOUT.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -68,12 +68,25 @@ pub(super) enum FetchStop {
     Truncated { min_skipped_uid: Option<u32> },
 }
 
+/// A UID and the header bytes fetched for it.
+pub(super) type HeaderRow = (u32, Vec<u8>);
+
 pub(super) struct Session {
     io: Option<Io>,
     tag: u32,
     caps: Vec<String>,
     /// Server advertised CONDSTORE after login, so EXAMINE sends that modifier.
     condstore: bool,
+    /// `ENABLE QRESYNC` succeeded, so a CHANGEDSINCE fetch can ask for VANISHED.
+    qresync: bool,
+    /// The server announced an expunge since the last EXAMINE, so message
+    /// sequence numbers no longer match the EXISTS count EXAMINE reported.
+    expunged: bool,
+    /// UID ranges from `VANISHED` replies since the caller last took them.
+    vanished: Vec<(u32, u32)>,
+    /// A `VANISHED` set used `*` or could not be read, so `vanished` does not
+    /// say which UIDs left.
+    vanished_unknown: bool,
     host: String,
     pending_buf: Vec<u8>,
 }
@@ -97,6 +110,10 @@ impl Session {
                 tag: 0,
                 caps: Vec::new(),
                 condstore: false,
+                qresync: false,
+                expunged: false,
+                vanished: Vec::new(),
+                vanished_unknown: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -105,6 +122,10 @@ impl Session {
                 tag: 0,
                 caps: Vec::new(),
                 condstore: false,
+                qresync: false,
+                expunged: false,
+                vanished: Vec::new(),
+                vanished_unknown: false,
                 host: config.host.clone(),
                 pending_buf: Vec::new(),
             },
@@ -124,6 +145,18 @@ impl Session {
         }
         if session.has_cap("CONDSTORE") {
             let _ = session.command("ENABLE", "ENABLE CONDSTORE");
+            session.condstore = true;
+        }
+        // RFC 7162: QRESYNC implies CONDSTORE. Only a server that confirms it
+        // is asked for VANISHED; anything else falls back to a UID listing.
+        if session.has_cap("QRESYNC")
+            && let Ok(reply) = session.command("ENABLE", "ENABLE QRESYNC")
+            && reply
+                .untagged
+                .iter()
+                .any(|line| enabled_lists(&line.text, "QRESYNC"))
+        {
+            session.qresync = true;
             session.condstore = true;
         }
         Ok(session)
@@ -187,6 +220,9 @@ impl Session {
         }
         let uidvalidity = uidvalidity
             .ok_or_else(|| imap_err(format!("EXAMINE {mailbox} returned no UIDVALIDITY")))?;
+        self.expunged = false;
+        self.vanished.clear();
+        self.vanished_unknown = false;
         Ok(Some(Examined {
             uidvalidity,
             uidnext,
@@ -225,6 +261,9 @@ impl Session {
         mut on_fetched: impl FnMut(Fetched) -> Result<(), Error>,
     ) -> Result<FetchStop, Error> {
         let cmd = match changed_since {
+            Some(modseq) if self.qresync => format!(
+                "UID FETCH {range} (UID FLAGS BODY.PEEK[]) (CHANGEDSINCE {modseq} VANISHED)"
+            ),
             Some(modseq) => {
                 format!("UID FETCH {range} (UID FLAGS BODY.PEEK[]) (CHANGEDSINCE {modseq})")
             }
@@ -251,6 +290,7 @@ impl Session {
                 }
                 return Ok(FetchStop::Done);
             }
+            self.note_untagged(&text);
             seen += 1;
             if discarding || seen > untagged_limit() {
                 discarding = true;
@@ -284,6 +324,122 @@ impl Session {
         uids.sort_unstable();
         uids.dedup();
         Ok(uids)
+    }
+
+    /// UIDs of messages `first..=last` by sequence number, in order.
+    /// `Ok(None)` when the server refuses the search.
+    pub(super) fn uid_search_seq(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<Option<Vec<u32>>, Error> {
+        let lines = match self.command("UID SEARCH", &format!("UID SEARCH {first}:{last}")) {
+            Ok(reply) => reply.untagged,
+            Err(Error::Backend(message)) if message.contains("UID SEARCH failed:") => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let mut uids = Vec::new();
+        for line in lines {
+            let Some(rest) = line.text.trim().strip_prefix('*') else {
+                continue;
+            };
+            let Some(rest) = strip_prefix_ignore_ascii_case(rest.trim_start(), "SEARCH") else {
+                continue;
+            };
+            for word in rest.split_whitespace() {
+                match word.parse() {
+                    Ok(uid) => uids.push(uid),
+                    // A modifier such as `(MODSEQ n)`, not a UID.
+                    Err(_) => break,
+                }
+            }
+        }
+        uids.sort_unstable();
+        Ok(Some(uids))
+    }
+
+    /// UID and `Message-ID` header of messages `first..=last` by sequence
+    /// number. Headers only, with `BODY.PEEK`, so nothing is marked read.
+    /// `Ok(None)` when the server refuses the fetch.
+    pub(super) fn fetch_message_ids(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<Option<Vec<HeaderRow>>, Error> {
+        let cmd = format!("FETCH {first}:{last} (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])");
+        let lines = match self.command("FETCH", &cmd) {
+            Ok(reply) => reply.untagged,
+            Err(Error::Backend(message)) if message.contains("FETCH failed:") => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let mut out = Vec::new();
+        for line in lines {
+            if let Some(fetched) = parse_fetch(&line.text, line.literals) {
+                out.push((fetched.uid, fetched.body));
+            }
+        }
+        out.sort_by_key(|(uid, _)| *uid);
+        Ok(Some(out))
+    }
+
+    /// `ENABLE QRESYNC` succeeded on this session.
+    pub(super) fn qresync(&self) -> bool {
+        self.qresync
+    }
+
+    /// The server announced an expunge since the last EXAMINE.
+    pub(super) fn saw_expunge(&self) -> bool {
+        self.expunged
+    }
+
+    /// UID ranges reported by `VANISHED` since the last call. `None` when a
+    /// reply could not be trusted to name only UIDs that left (a `*`, which
+    /// stands for whatever UID is highest now, or a set that did not parse).
+    pub(super) fn take_vanished(&mut self) -> Option<Vec<(u32, u32)>> {
+        let ranges = std::mem::take(&mut self.vanished);
+        if std::mem::take(&mut self.vanished_unknown) {
+            None
+        } else {
+            Some(ranges)
+        }
+    }
+
+    /// Watch untagged replies for expunges. Sequence numbers shift after one,
+    /// and with QRESYNC the `VANISHED` reply names the UIDs that left.
+    fn note_untagged(&mut self, text: &str) {
+        let Some(rest) = text.trim().strip_prefix('*') else {
+            return;
+        };
+        let rest = rest.trim_start();
+        if let Some(set) = strip_prefix_ignore_ascii_case(rest, "VANISHED ") {
+            let set = set.trim_start();
+            let (earlier, set) = match strip_prefix_ignore_ascii_case(set, "(EARLIER)") {
+                Some(after) => (true, after.trim_start()),
+                None => (false, set),
+            };
+            if !earlier {
+                self.expunged = true;
+            }
+            match parse_uid_set(set) {
+                Some(ranges) => self.vanished.extend(ranges),
+                None => self.vanished_unknown = true,
+            }
+            return;
+        }
+        let mut words = rest.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|word| word.bytes().all(|byte| byte.is_ascii_digit()))
+            && words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("EXPUNGE"))
+        {
+            self.expunged = true;
+        }
     }
 
     pub(super) fn has_idle(&self) -> bool {
@@ -531,6 +687,7 @@ impl Session {
                 }
                 return Err(imap_err(format!("{label} failed: {rest}")));
             }
+            self.note_untagged(&text);
             if overflow || untagged.len() >= untagged_limit() {
                 overflow = true;
                 continue;
@@ -1612,11 +1769,46 @@ fn idle_news(line: &[u8]) -> bool {
     let Some(number) = words.next() else {
         return false;
     };
+    // With QRESYNC enabled, an expunge arrives as `* VANISHED uids`.
+    if number == "VANISHED" {
+        return true;
+    }
     number.chars().all(|ch| ch.is_ascii_digit())
         && matches!(
             words.next(),
             Some("EXISTS" | "EXPUNGE" | "RECENT" | "FETCH")
         )
+}
+
+/// `* ENABLED ...` that names `capability`.
+fn enabled_lists(text: &str, capability: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    let mut words = upper.split_whitespace();
+    words.next() == Some("*")
+        && words.next() == Some("ENABLED")
+        && words.any(|word| word.eq_ignore_ascii_case(capability))
+}
+
+/// An IMAP sequence set of UIDs (`1:3,7,9`) as inclusive ranges.
+///
+/// `None` for a set with `*` (RFC 7162 allows it; it means the highest UID
+/// in the mailbox, which may be a message that is still there) or one that
+/// does not parse. Dropping copies from such a set could drop live mail.
+fn parse_uid_set(set: &str) -> Option<Vec<(u32, u32)>> {
+    let mut out = Vec::new();
+    let token = set.split_whitespace().next().unwrap_or("");
+    for part in token.split(',') {
+        let number = |raw: &str| -> Option<u32> { raw.parse().ok().filter(|uid| *uid > 0) };
+        let (low, high) = match part.split_once(':') {
+            Some((low, high)) => (number(low)?, number(high)?),
+            None => {
+                let uid = number(part)?;
+                (uid, uid)
+            }
+        };
+        out.push((low.min(high), low.max(high)));
+    }
+    Some(out)
 }
 
 fn imap_err(message: impl Into<String>) -> Error {
@@ -1651,7 +1843,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
 
-    use super::connect_addrs;
+    use super::{connect_addrs, parse_uid_set};
 
     #[test]
     fn oversized_literal_is_discarded_and_the_response_continues() {
@@ -2050,6 +2242,18 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("untagged"), "{text}");
         assert!(text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn a_vanished_set_with_star_is_not_read_as_uids() {
+        assert_eq!(
+            parse_uid_set("1:3,7,9:8"),
+            Some(vec![(1, 3), (7, 7), (8, 9)])
+        );
+        assert_eq!(parse_uid_set("2:*"), None);
+        assert_eq!(parse_uid_set("4,*"), None);
+        assert_eq!(parse_uid_set("4,x"), None);
+        assert_eq!(parse_uid_set("0:3"), None);
     }
 
     #[test]

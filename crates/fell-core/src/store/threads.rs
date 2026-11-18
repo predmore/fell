@@ -1094,6 +1094,7 @@ mod tests {
                         messages: messages.clone(),
                         flags: Vec::new(),
                         cursor: None,
+                        ..MailboxDelta::default()
                     },
                 )
                 .unwrap(),
