@@ -126,20 +126,33 @@ fn login(endpoint: &Endpoint) -> Result<(Pipe, Reply)> {
         )?),
         ImapSecurity::StartTls | ImapSecurity::Plain => Pipe::plain(tcp),
     };
-    expect(read_reply(&mut pipe)?, 220, "greeting")?;
-    let mut hello = expect(command(&mut pipe, "EHLO localhost")?, 250, "EHLO")?;
+    match handshake(&mut pipe, endpoint) {
+        Ok(hello) => Ok((pipe, hello)),
+        Err(err) => {
+            // Leave politely on every refusal once a session is open.
+            let _ = command(&mut pipe, "QUIT");
+            Err(err)
+        }
+    }
+}
+
+/// Greeting, `EHLO`, `STARTTLS` when required, and `AUTH` on an open socket.
+fn handshake(pipe: &mut Pipe, endpoint: &Endpoint) -> Result<Reply> {
+    let pipe = &mut *pipe;
+    expect(read_reply(pipe)?, 220, "greeting")?;
+    let mut hello = expect(command(pipe, "EHLO localhost")?, 250, "EHLO")?;
     if endpoint.security == ImapSecurity::StartTls {
         if !offers(&hello, "STARTTLS") {
             return Err(smtp_err(
                 "smtp: the server does not offer STARTTLS and this account requires TLS",
             ));
         }
-        expect(command(&mut pipe, "STARTTLS")?, 220, "STARTTLS")?;
+        expect(command(pipe, "STARTTLS")?, 220, "STARTTLS")?;
         pipe.upgrade(&endpoint.host, endpoint.accept_invalid_certs)?;
-        hello = expect(command(&mut pipe, "EHLO localhost")?, 250, "EHLO")?;
+        hello = expect(command(pipe, "EHLO localhost")?, 250, "EHLO")?;
     }
-    authenticate(&mut pipe, &hello, endpoint)?;
-    Ok((pipe, hello))
+    authenticate(pipe, &hello, endpoint)?;
+    Ok(hello)
 }
 
 /// Write the message after `354` and read the server's verdict.
@@ -662,6 +675,7 @@ Bcc: this is body text\r\n"
         assert!(err.to_string().contains("STARTTLS"), "{err}");
         assert!(got.auth.is_empty(), "the login went out: {}", got.auth);
         assert!(got.data.is_empty());
+        assert!(got.quit, "a refused session still says QUIT");
     }
 
     #[test]

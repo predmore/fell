@@ -34,8 +34,15 @@ setup options (anything missing is asked for on a terminal):
 pub fn account_command(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("setup") => setup(&args[1..]),
-        Some("show") => show(),
-        Some("check") => check(),
+        Some(cmd @ ("show" | "check")) => match args.get(1).map(String::as_str) {
+            Some("--help" | "-h" | "help") => {
+                println!("{USAGE}");
+                Ok(())
+            }
+            Some(other) => Err(format!("unknown option {other:?}\n\n{USAGE}")),
+            None if cmd == "show" => show(),
+            None => check(),
+        },
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -46,7 +53,9 @@ pub fn account_command(args: &[String]) -> i32 {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("fell: {err}");
-            1
+            // Usage errors end with the usage text; they exit 2 like the
+            // top-level parser. Anything else (a failed login) exits 1.
+            if err.ends_with(USAGE) { 2 } else { 1 }
         }
     }
 }
@@ -81,7 +90,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         let mut value = |name: &str| {
             args.next()
                 .cloned()
-                .ok_or_else(|| format!("{name} needs a value"))
+                .ok_or_else(|| format!("{name} needs a value\n\n{USAGE}"))
         };
         match arg.as_str() {
             "--imap" => flags.imap = true,
@@ -479,6 +488,19 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn show_and_check_take_help_and_refuse_stray_words() {
+        // Help and usage errors return before any account file is read or
+        // any server is contacted.
+        for cmd in ["show", "check"] {
+            assert_eq!(account_command(&args(&[cmd, "--help"])), 0, "{cmd}");
+            assert_eq!(account_command(&args(&[cmd, "--bogus"])), 2, "{cmd}");
+        }
+        assert_eq!(account_command(&args(&["--bogus"])), 2);
+        assert_eq!(account_command(&args(&["setup", "--bogus"])), 2);
+        assert_eq!(account_command(&args(&["setup", "--email"])), 2);
     }
 
     #[test]

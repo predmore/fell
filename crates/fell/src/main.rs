@@ -71,7 +71,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         };
         match arg.as_str() {
             "--help" | "-h" | "help" => return Ok(Command::Help),
-            "--fixture" => fixture = Some(value("--fixture")?.to_string()),
+            "--fixture" => match value("--fixture")? {
+                "--help" | "-h" => return Ok(Command::Help),
+                name => fixture = Some(name.to_string()),
+            },
             "--theme" => {
                 light = Some(match value("--theme")? {
                     "dark" => false,
@@ -243,6 +246,8 @@ mod tests {
             &["-h"],
             &["help"],
             &["--fixture", "x", "--help"],
+            &["--fixture", "--help"],
+            &["--fixture", "-h"],
             &["--narrow", "-h"],
         ] {
             assert_eq!(parse(args), Ok(Command::Help), "{args:?}");
