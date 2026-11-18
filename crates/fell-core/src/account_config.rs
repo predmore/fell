@@ -372,6 +372,19 @@ impl AccountConfig {
         crate::imap::check_login(&self.imap_config()?)
     }
 
+    /// Log in to [`AccountConfig::smtp_config`] with the account's username
+    /// and password, then quit. Sends `EHLO`, `STARTTLS` when required, and
+    /// `AUTH`, never `MAIL FROM`, so no mail can go out. Errors classify
+    /// with [`classify_sync_error`] like an IMAP login.
+    pub fn check_smtp(&self) -> Result<()> {
+        let password = self.resolve_password()?;
+        crate::smtp::check_login(&crate::smtp::Endpoint::new(
+            &self.smtp_config(),
+            &self.username,
+            &password,
+        ))
+    }
+
     fn imap_config(&self) -> Result<ImapConfig> {
         let password = self.resolve_password()?;
         Ok(ImapConfig {
@@ -425,10 +438,11 @@ impl AccountConfig {
     }
 }
 
-/// Why a sync attempt failed, in the terms the window shows.
+/// Why a sync attempt or a login check failed, in the terms the window shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncFailureKind {
-    /// Nothing answered on the IMAP port (Bridge not running, wrong port, no network).
+    /// Nothing answered on the IMAP or SMTP port (Bridge not running, wrong
+    /// port, no network).
     Unreachable,
     /// The server refused the username or password.
     LoginRejected,
@@ -452,7 +466,19 @@ pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
         // A NO to LOGIN without a response code is a refused credential on
         // the servers we know; UNAVAILABLE or SERVERBUG is the server's fault.
         SyncFailureKind::LoginRejected
-    } else if message.starts_with("imap: connect ") || message.starts_with("imap: resolve ") {
+    } else if message.starts_with("smtp: AUTH rejected: 535") {
+        // 535 is "authentication credentials invalid" (RFC 4954); a 454 or
+        // other code is the server's trouble, not the password.
+        SyncFailureKind::LoginRejected
+    } else if [
+        "imap: connect ",
+        "imap: resolve ",
+        "smtp: connect ",
+        "smtp: resolve ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+    {
         SyncFailureKind::Unreachable
     } else {
         SyncFailureKind::Other
@@ -760,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_imap_errors() {
+    fn classifies_imap_and_smtp_errors() {
         let cases = [
             (
                 "imap: connect 127.0.0.1:1143 failed: Connection refused",
@@ -785,6 +811,26 @@ mod tests {
             (
                 "imap: LOGIN failed: NO bad password",
                 SyncFailureKind::LoginRejected,
+            ),
+            (
+                "smtp: connect 127.0.0.1:1025 failed: Connection refused",
+                SyncFailureKind::Unreachable,
+            ),
+            (
+                "smtp: resolve smtp.nope:465 failed: x",
+                SyncFailureKind::Unreachable,
+            ),
+            (
+                "smtp: AUTH rejected: 535 5.7.8 Authentication failed",
+                SyncFailureKind::LoginRejected,
+            ),
+            (
+                "smtp: AUTH rejected: 454 4.7.0 Temporary failure",
+                SyncFailureKind::Other,
+            ),
+            (
+                "smtp: the server does not offer STARTTLS and this account requires TLS",
+                SyncFailureKind::Other,
             ),
         ];
         for (message, kind) in cases {
