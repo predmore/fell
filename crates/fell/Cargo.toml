@@ -20,3 +20,6 @@ notify = { version = "=8.2.2", default-features = false }
 smallvec = "1"
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { version = "0.57.2", default-features = false, features = ["os-webview"] }
+
+[dev-dependencies]
+rusqlite.workspace = true

@@ -1,4 +1,9 @@
 //! In-process IMAP server for tests. Speaks the read-only subset the client uses.
+//!
+//! Tests change the mailboxes between syncs to stand in for the server: a
+//! message dropped from `messages` was expunged, one pushed with a new UID
+//! arrived. Give `uidnext` when the highest UID goes, as a real server keeps
+//! UIDNEXT where it was.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -37,6 +42,8 @@ pub(super) struct FixtureMailbox {
     /// EXAMINE succeeds, but UID FETCH answers NO/BAD.
     pub reject_fetch: bool,
     pub messages: Vec<FixtureMessage>,
+    /// Expunged UIDs and the modseq of each expunge, for QRESYNC `VANISHED`.
+    pub vanished: Vec<(u32, u64)>,
 }
 
 pub(super) struct TestState {
@@ -62,6 +69,13 @@ pub(super) struct TestState {
     pub idle_news_first: bool,
     /// End IDLE at once with a tagged BAD after the continuation.
     pub idle_bad: bool,
+    /// Advertise QRESYNC (RFC 7162) and answer `VANISHED` fetches.
+    pub qresync: bool,
+    /// Announce `* 1 EXPUNGE` before the next UID SEARCH reply, once.
+    pub expunge_during_search: bool,
+    /// Answer every `VANISHED` fetch with `* VANISHED (EARLIER) {set}`,
+    /// verbatim, instead of the UIDs in `vanished`.
+    pub vanished_reply: Option<String>,
 }
 
 pub(super) struct TestServer {
@@ -127,6 +141,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
     let mut condstore_enabled = false;
     let mut utf8_enabled = false;
     let mut selected_condstore = false;
+    let mut qresync_enabled = false;
     while let Some((line, literals)) = read_client_command(&mut read, &mut write) {
         if line.is_empty() {
             continue;
@@ -159,7 +174,22 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
             "ENABLE" => {
                 let upper = rest.to_ascii_uppercase();
                 let wants_utf8 = upper.contains("UTF8=ACCEPT");
+                let wants_qresync = upper.contains("QRESYNC");
                 let wants_condstore = upper.contains("CONDSTORE");
+                if wants_qresync {
+                    let offered = state.lock().expect("state").qresync;
+                    if authed && offered {
+                        qresync_enabled = true;
+                        condstore_enabled = true;
+                        let _ = write.write_all(
+                            format!("* ENABLED QRESYNC\r\n{tag} OK ENABLE\r\n").as_bytes(),
+                        );
+                    } else {
+                        let _ = write.write_all(format!("{tag} OK ENABLE\r\n").as_bytes());
+                    }
+                    let _ = write.flush();
+                    continue;
+                }
                 if !authed && !(wants_utf8 && state.lock().expect("state").utf8_accept) {
                     let _ = write.write_all(
                         format!("{tag} NO ENABLE is only valid in the authenticated state\r\n")
@@ -276,6 +306,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                         .messages
                         .iter()
                         .map(|message| message.modseq)
+                        .chain(mailbox.vanished.iter().map(|(_, modseq)| *modseq))
                         .max()
                         .unwrap_or(1);
                     let _ = write.write_all(
@@ -284,6 +315,70 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 }
                 let _ = write
                     .write_all(format!("{tag} OK [READ-ONLY] EXAMINE completed\r\n").as_bytes());
+            }
+            "UID" if strip_prefix_ignore(rest.trim(), "SEARCH").is_some() => {
+                let mut guard = state.lock().expect("state");
+                let Some(name) = last_examined(&guard.commands) else {
+                    let _ = write.write_all(format!("{tag} BAD no mailbox\r\n").as_bytes());
+                    continue;
+                };
+                if std::mem::take(&mut guard.expunge_during_search) {
+                    let _ = write.write_all(b"* 1 EXPUNGE\r\n");
+                }
+                let Some(mailbox) = guard.mailboxes.iter().find(|item| item.name == name) else {
+                    let _ = write.write_all(format!("{tag} NO no mailbox\r\n").as_bytes());
+                    continue;
+                };
+                let range = strip_prefix_ignore(rest.trim(), "SEARCH")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let count = mailbox.messages.len() as u32;
+                let mut line = String::from("* SEARCH");
+                for (index, message) in mailbox.messages.iter().enumerate() {
+                    if uid_in_range(index as u32 + 1, &range, count) {
+                        line.push_str(&format!(" {}", message.uid));
+                    }
+                }
+                let _ = write.write_all(format!("{line}\r\n{tag} OK SEARCH\r\n").as_bytes());
+            }
+            "FETCH" => {
+                let guard = state.lock().expect("state");
+                let Some(name) = last_examined(&guard.commands) else {
+                    let _ = write.write_all(format!("{tag} BAD no mailbox\r\n").as_bytes());
+                    continue;
+                };
+                let Some(mailbox) = guard.mailboxes.iter().find(|item| item.name == name) else {
+                    let _ = write.write_all(format!("{tag} NO no mailbox\r\n").as_bytes());
+                    continue;
+                };
+                if !rest
+                    .to_ascii_uppercase()
+                    .contains("HEADER.FIELDS (MESSAGE-ID)")
+                {
+                    let _ = write.write_all(format!("{tag} BAD unsupported fetch\r\n").as_bytes());
+                    continue;
+                }
+                let range = rest.split_whitespace().next().unwrap_or("").to_string();
+                let count = mailbox.messages.len() as u32;
+                for (index, message) in mailbox.messages.iter().enumerate() {
+                    let seq = index as u32 + 1;
+                    if !uid_in_range(seq, &range, count) {
+                        continue;
+                    }
+                    let header = message_id_header(&message.raw);
+                    let _ = write.write_all(
+                        format!(
+                            "* {seq} FETCH (UID {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n",
+                            message.uid,
+                            header.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = write.write_all(&header);
+                    let _ = write.write_all(b")\r\n");
+                }
+                let _ = write.write_all(format!("{tag} OK FETCH\r\n").as_bytes());
             }
             "UID" => {
                 if state.lock().expect("state").close_during_uid_fetch {
@@ -316,6 +411,25 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                 if mailbox.reject_fetch {
                     let _ = write.write_all(format!("{tag} BAD UID FETCH denied\r\n").as_bytes());
                     continue;
+                }
+                if let Some(since) = changed_since
+                    && qresync_enabled
+                    && rest.to_ascii_uppercase().contains("VANISHED")
+                {
+                    let gone: Vec<String> = match &guard.vanished_reply {
+                        Some(set) => vec![set.clone()],
+                        None => mailbox
+                            .vanished
+                            .iter()
+                            .filter(|(_, modseq)| *modseq > since)
+                            .map(|(uid, _)| uid.to_string())
+                            .collect(),
+                    };
+                    if !gone.is_empty() {
+                        let _ = write.write_all(
+                            format!("* VANISHED (EARLIER) {}\r\n", gone.join(",")).as_bytes(),
+                        );
+                    }
                 }
                 let mut bodies_left = guard.close_after_body_fetches;
                 let highest = mailbox
@@ -535,7 +649,27 @@ fn capability_text(state: &TestState) -> String {
     if state.idle {
         caps.push_str(" IDLE");
     }
+    if state.qresync {
+        caps.push_str(" QRESYNC");
+    }
     caps
+}
+
+/// The `Message-ID` line of a raw message, as `HEADER.FIELDS` returns it.
+fn message_id_header(raw: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = String::new();
+    for line in text.split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
+        if line.to_ascii_lowercase().starts_with("message-id:") {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\r\n");
+    out.into_bytes()
 }
 
 fn read_client_command(

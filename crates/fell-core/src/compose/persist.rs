@@ -13,6 +13,7 @@ use crate::{AccountId, Result};
 
 use super::frontmatter::{AttachmentRef, DraftFields};
 use super::mime::ResolvedFile;
+use super::session::SendLock;
 use super::workspace;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,13 @@ CREATE TABLE IF NOT EXISTS compose_review (
     FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
 );
 ";
+
+/// `compose_send.state` values. The draft folder is writable by agents, so
+/// the record of a send lives here: deleting files there cannot unlock a
+/// draft that went out.
+const SEND_MAYBE_SENT: &str = "maybe-sent";
+const SEND_SENT: &str = "sent";
+const SEND_CLEAR: &str = "clear";
 
 const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
@@ -164,6 +172,147 @@ impl Store {
             .optional()?)
     }
 
+    /// Claim `draft_id` for one send, before anything is transmitted. The
+    /// record reads "may have been sent" until [`Self::finish_compose_send`]
+    /// says otherwise, so a crash mid-send leaves the draft locked.
+    ///
+    /// One statement, so two claims cannot both win. A draft that went, or
+    /// may have gone, out is not claimed again: its lock is returned instead.
+    pub(crate) fn claim_compose_send(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<Option<SendLock>> {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let claimed = self.conn.execute(
+            "INSERT INTO compose_send (account_id, draft_id, state, message_id, updated_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, draft_id) DO UPDATE SET
+                state = excluded.state,
+                message_id = excluded.message_id,
+                updated_unix = excluded.updated_unix
+             WHERE compose_send.state = ?6",
+            params![
+                account_id.as_str(),
+                draft_id,
+                SEND_MAYBE_SENT,
+                message_id,
+                now_unix(),
+                SEND_CLEAR,
+            ],
+        )?;
+        if claimed == 1 {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.load_compose_send(account_id, draft_id)?
+                .unwrap_or(SendLock::MaybeSent),
+        ))
+    }
+
+    /// Record how a send ended: `None` when nothing was transmitted and the
+    /// draft may be sent again. Only a "may have been sent" claim can be
+    /// cleared; a recorded `sent` is never undone by a late or stray clear.
+    pub(crate) fn finish_compose_send(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+        lock: Option<SendLock>,
+    ) -> Result<()> {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        match lock {
+            None => {
+                self.conn.execute(
+                    "UPDATE compose_send SET state = ?3, updated_unix = ?4
+                     WHERE account_id = ?1 AND draft_id = ?2 AND state = ?5",
+                    params![
+                        account_id.as_str(),
+                        draft_id,
+                        SEND_CLEAR,
+                        now_unix(),
+                        SEND_MAYBE_SENT
+                    ],
+                )?;
+            }
+            Some(lock) => {
+                let state = match lock {
+                    SendLock::Sent => SEND_SENT,
+                    SendLock::MaybeSent | SendLock::InFlight => SEND_MAYBE_SENT,
+                };
+                // `sent` only moves up; "may have been sent" never replaces it.
+                self.conn.execute(
+                    "INSERT INTO compose_send (account_id, draft_id, state, updated_unix)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(account_id, draft_id) DO UPDATE SET
+                        state = excluded.state,
+                        updated_unix = excluded.updated_unix
+                     WHERE compose_send.state != ?5",
+                    params![account_id.as_str(), draft_id, state, now_unix(), SEND_SENT],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// First record of a draft's send state, from an old `send-state` file.
+    /// A record that is already there wins, whoever wrote it, and is returned:
+    /// two opens racing to migrate cannot replace `sent` with `clear`.
+    pub(crate) fn migrate_compose_send(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+        legacy: Option<SendLock>,
+    ) -> Result<Option<SendLock>> {
+        let state = match legacy {
+            None => SEND_CLEAR,
+            Some(SendLock::Sent) => SEND_SENT,
+            Some(SendLock::MaybeSent | SendLock::InFlight) => SEND_MAYBE_SENT,
+        };
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        self.conn.execute(
+            "INSERT INTO compose_send (account_id, draft_id, state, updated_unix)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, draft_id) DO NOTHING",
+            params![account_id.as_str(), draft_id, state, now_unix()],
+        )?;
+        Ok(self
+            .compose_send_record(account_id, draft_id)?
+            .unwrap_or(Some(SendLock::MaybeSent)))
+    }
+
+    /// The send record of a draft: `Ok(None)` when it has none, and
+    /// `Ok(Some(None))` when its last send transmitted nothing.
+    pub(crate) fn compose_send_record(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+    ) -> Result<Option<Option<SendLock>>> {
+        let state = self
+            .conn
+            .query_row(
+                "SELECT state FROM compose_send WHERE account_id = ?1 AND draft_id = ?2",
+                params![account_id.as_str(), draft_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(state.map(|state| match state.as_str() {
+            SEND_CLEAR => None,
+            SEND_SENT => Some(SendLock::Sent),
+            // Anything else, damaged or not, errs toward "may have been sent".
+            _ => Some(SendLock::MaybeSent),
+        }))
+    }
+
+    /// The lock the mailbox holds on a draft, if any.
+    pub(crate) fn load_compose_send(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+    ) -> Result<Option<SendLock>> {
+        Ok(self.compose_send_record(account_id, draft_id)?.flatten())
+    }
+
     pub fn load_compose(&self, id: &str) -> Result<Option<StoredCompose>> {
         let row = self
             .conn
@@ -264,6 +413,10 @@ impl Store {
                     known.insert(address);
                 }
             }
+        }
+        // Bcc of mail sent from Fell, which the Sent copy does not carry.
+        for address in crate::store::sent_bcc::recorded_bcc_addresses(&self.conn, account_id)? {
+            known.insert(address.email.to_ascii_lowercase());
         }
         Ok(known)
     }

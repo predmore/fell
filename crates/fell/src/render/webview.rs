@@ -920,9 +920,12 @@ mod fetch_proof {
             eprintln!("skip private_targets_receive_no_requests: no DISPLAY");
             return;
         }
-        let _ = std::process::Command::new("sudo")
-            .args(["/usr/bin/ip", "addr", "add", "192.0.2.1/32", "dev", "lo"])
-            .status();
+        if fell_core::test_support::skip_unless_available(
+            "private_targets_receive_no_requests",
+            fell_core::test_support::test_net_missing(),
+        ) {
+            return;
+        }
         let private_hits = Arc::new(AtomicUsize::new(0));
         let private_port = serve_private(Arc::clone(&private_hits));
         let redirect_hits = Arc::new(AtomicUsize::new(0));

@@ -34,6 +34,28 @@ struct Checkpoint {
     notices: Vec<String>,
 }
 
+/// Bcc recipients of one sent message, for the mailbox's local record.
+/// The server's Sent copy has no Bcc header; see [`crate::Store::record_sent_bcc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentBcc {
+    store: PathBuf,
+    account_id: AccountId,
+    message_id: crate::MessageId,
+    bcc: Vec<crate::Address>,
+}
+
+impl SentBcc {
+    /// Write the record. Opens the mailbox for this one write, like a draft
+    /// save, so no connection outlives the send.
+    pub fn save(&self) -> crate::Result<()> {
+        crate::Store::open(&self.store)?.record_sent_bcc(
+            &self.account_id,
+            &self.message_id,
+            &self.bcc,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressView {
     pub raw: String,
@@ -156,8 +178,9 @@ pub struct DraftSession {
     owner: String,
     agent_seen: HashMap<String, String>,
     quoted: Option<String>,
-    /// In memory only: set before a send starts and kept after it may have
-    /// gone out, so no second press or reopened view sends it again.
+    /// Set before a send starts and kept after it may have gone out, so no
+    /// second press or reopened view sends it again. The mailbox holds the
+    /// record a restart reads; see [`Self::begin_send`].
     send_lock: Option<SendLock>,
 }
 
@@ -221,7 +244,6 @@ impl DraftSession {
             quoted: None,
             send_lock: None,
         };
-        session.send_lock = read_send_state(&session.folder);
         if let Some(email) = email_of(&session.fields.from) {
             session.identities.insert(email);
         }
@@ -288,9 +310,47 @@ impl DraftSession {
             Some(review) => session.resume_review(review),
             None => session.import_legacy_hunks(),
         }
+        session.send_lock = session.load_send_lock(store);
         session.settled = session.serialize();
         session.flush()?;
         Ok(session)
+    }
+
+    /// The send lock the mailbox holds for this draft. A draft first opened
+    /// by this build reads the `send-state` file older builds kept in the
+    /// control folder once, moves it into the mailbox and deletes it. After
+    /// that the file is ignored: agents can write that folder.
+    fn load_send_lock(&mut self, store: &crate::Store) -> Option<SendLock> {
+        let legacy = workspace::control_dir(&self.folder).join(LEGACY_SEND_STATE);
+        let record = match store.compose_send_record(&self.account_id, &self.id) {
+            Ok(record) => record,
+            Err(err) => {
+                // Unknown is treated as "may have been sent".
+                self.notices
+                    .push(format!("could not read this draft's send record: {err}"));
+                return Some(SendLock::MaybeSent);
+            }
+        };
+        if let Some(lock) = record {
+            let _ = std::fs::remove_file(&legacy);
+            return lock;
+        }
+        let lock = read_legacy_send_state(&legacy);
+        match store.migrate_compose_send(&self.account_id, &self.id, lock) {
+            Ok(recorded) => {
+                let _ = std::fs::remove_file(&legacy);
+                recorded
+            }
+            Err(err) => {
+                if lock.is_some() {
+                    self.notices.push(format!(
+                        "could not move this draft's send record into the mailbox: {err}"
+                    ));
+                }
+                // The file is read again on the next open.
+                lock
+            }
+        }
     }
 
     /// A draft saved before review state moved into the mailbox kept it in
@@ -923,6 +983,31 @@ impl DraftSession {
         workspace::resolve_closure(&self.folder, &self.fields, &self.body).files
     }
 
+    /// The Bcc to remember once `outgoing` has gone out, or may have.
+    /// `None` when it has no Bcc or this draft has no mailbox to record in.
+    pub fn sent_bcc(&self, outgoing: &Outgoing) -> Option<SentBcc> {
+        let bcc: Vec<crate::Address> = outgoing
+            .draft
+            .bcc
+            .iter()
+            .filter_map(|raw| super::frontmatter::mailbox_parts(raw))
+            .map(|(name, email)| crate::Address { name, email })
+            .collect();
+        if bcc.is_empty() {
+            return None;
+        }
+        let store = self
+            .store_path
+            .clone()
+            .or_else(|| persist::remembered_store_path(&self.id))?;
+        Some(SentBcc {
+            store,
+            account_id: outgoing.draft.account_id.clone(),
+            message_id: outgoing.message_id.clone(),
+            bcc,
+        })
+    }
+
     pub fn send_lock(&self) -> Option<SendLock> {
         self.send_lock
     }
@@ -937,18 +1022,37 @@ impl DraftSession {
         }
     }
 
-    /// Claim this draft for one send. Fails while another send is running
-    /// and after one went, or may have gone, out.
+    /// Claim this draft for one send. Fails while another send is running,
+    /// after one went, or may have gone, out, and when the claim cannot be
+    /// recorded in the mailbox.
+    ///
+    /// The mailbox records the claim as "may have been sent" before anything
+    /// is transmitted: if Fell stops mid-send, the next start must not send
+    /// the draft again without the person checking Sent. A send that cannot
+    /// leave that record does not start.
     pub fn begin_send(&mut self) -> Result<(), String> {
         if let Some(lock) = self.send_lock {
             return Err(lock.reason().into());
         }
-        self.send_lock = Some(SendLock::InFlight);
-        // On disk a send in progress reads as "may have been sent": if Fell
-        // stops mid-send, the next start must not send the draft again
-        // without the person checking Sent.
-        write_send_state(&self.folder, Some(SendLock::MaybeSent));
-        Ok(())
+        // The outgoing Message-ID is not known here yet; the column stays
+        // empty until the message carries one.
+        let claimed = self.send_store().and_then(|store| {
+            store
+                .claim_compose_send(&self.account_id, &self.id, None)
+                .map_err(|err| err.to_string())
+        });
+        match claimed {
+            Ok(None) => {
+                self.send_lock = Some(SendLock::InFlight);
+                Ok(())
+            }
+            // The mailbox knows of a send this session did not see.
+            Ok(Some(lock)) => {
+                self.send_lock = Some(lock);
+                Err(lock.reason().into())
+            }
+            Err(err) => Err(format!("could not record this send in the mailbox ({err})")),
+        }
     }
 
     /// Record how [`DraftSession::begin_send`]'s send ended. `None` means
@@ -956,7 +1060,34 @@ impl DraftSession {
     pub fn end_send(&mut self, lock: Option<SendLock>) {
         debug_assert_ne!(lock, Some(SendLock::InFlight));
         self.send_lock = lock;
-        write_send_state(&self.folder, lock);
+        if lock == Some(SendLock::MaybeSent) {
+            // What the claim already recorded.
+            return;
+        }
+        let recorded = self.send_store().and_then(|store| {
+            store
+                .finish_compose_send(&self.account_id, &self.id, lock)
+                .map_err(|err| err.to_string())
+        });
+        if let Err(err) = recorded {
+            // The claim stays in the mailbox, which errs toward "may have
+            // been sent".
+            self.notices.push(format!(
+                "could not record how this send ended ({err}); after a restart this draft will read as possibly sent"
+            ));
+        }
+    }
+
+    /// The mailbox this draft's send record lives in. Opened for one write,
+    /// like a save. Never creates a mailbox.
+    fn send_store(&self) -> Result<crate::Store, String> {
+        let path = self
+            .store_path
+            .clone()
+            .or_else(|| persist::remembered_store_path(&self.id))
+            .filter(|path| path.is_file())
+            .ok_or_else(|| String::from("this draft has no mailbox"))?;
+        crate::Store::open(&path).map_err(|err| err.to_string())
     }
 
     /// Keep the lock of the session this one replaces in the hub.
@@ -1229,13 +1360,12 @@ fn review_matches_row(text: &str, stored: &persist::StoredCompose) -> bool {
         && parsed.fields.subject == stored.fields.subject
 }
 
-/// Where a sent or possibly sent draft records it, so a restart keeps it
-/// from going out twice.
-const SEND_STATE: &str = "send-state";
+/// Where builds before the mailbox record kept a draft's send state, in
+/// the agent-writable control folder. Read once, on open, to migrate it.
+const LEGACY_SEND_STATE: &str = "send-state";
 
-fn read_send_state(folder: &Path) -> Option<SendLock> {
-    let path = workspace::control_dir(folder).join(SEND_STATE);
-    if !path.exists() {
+fn read_legacy_send_state(path: &Path) -> Option<SendLock> {
+    if std::fs::symlink_metadata(path).is_err() {
         return None;
     }
     // Any record other than a clean "sent" (unreadable, empty, or partial)
@@ -1243,24 +1373,6 @@ fn read_send_state(folder: &Path) -> Option<SendLock> {
     match std::fs::read_to_string(path).ok().as_deref().map(str::trim) {
         Some("sent") => Some(SendLock::Sent),
         _ => Some(SendLock::MaybeSent),
-    }
-}
-
-fn write_send_state(folder: &Path, lock: Option<SendLock>) {
-    let path = workspace::control_dir(folder).join(SEND_STATE);
-    let value = match lock {
-        Some(SendLock::Sent) => "sent",
-        Some(SendLock::MaybeSent | SendLock::InFlight) => "maybe-sent",
-        None => {
-            let _ = std::fs::remove_file(path);
-            return;
-        }
-    };
-    let _ = std::fs::create_dir_all(workspace::control_dir(folder));
-    // Replace by rename so a crash never leaves a truncated record.
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, value).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -1864,7 +1976,7 @@ mod tests {
 
     #[test]
     fn a_sent_draft_is_locked_against_another_send() {
-        let (_root, mut session) = temp_session("body\n");
+        let (_root, _store, mut session) = stored_session("body\n");
         session.mark_seen();
         assert!(session.prepare_send().is_ok());
         session.begin_send().unwrap();
@@ -1876,7 +1988,9 @@ mod tests {
             (SendLock::Sent, "was sent"),
             (SendLock::MaybeSent, "may already have been sent"),
         ] {
-            session.end_send(None);
+            // A recorded send is never cleared, so each case is a new draft.
+            let (_root, _store, mut session) = stored_session("body\n");
+            session.mark_seen();
             session.begin_send().unwrap();
             session.end_send(Some(lock));
             assert!(session.prepare_send().unwrap_err().contains(needle));
@@ -2470,7 +2584,7 @@ mod tests {
 
     #[test]
     fn a_draft_cannot_change_while_it_is_sent() {
-        let (root, mut session) = temp_session("body\n");
+        let (root, _store, mut session) = stored_session("body\n");
         session.begin_send().unwrap();
         let before = session.serialize();
         session.set_body_from_user("typed during send\n".into());
@@ -2496,75 +2610,181 @@ mod tests {
     }
 
     #[test]
-    fn a_sent_draft_stays_locked_after_a_restart() {
-        let (root, mut session) = temp_session("body\n");
-        let folder = session.folder().to_path_buf();
+    fn a_claim_without_end_send_reopens_as_maybe_sent() {
+        let (root, store, mut session) = stored_session("body\n");
+        session.mark_seen();
         session.begin_send().unwrap();
-        // Fell stops mid-send.
-        drop(session);
-        let fields = DraftFields {
-            from: "jon@example.com".into(),
-            ..DraftFields::default()
-        };
-        let reopened = DraftSession::create(
-            folder.clone(),
-            "d1",
-            AccountId("local".into()),
-            fields,
-            "body\n",
-        )
-        .unwrap();
+        // Fell stops mid-send: end_send never runs.
+        let reopened = reopen(session, &store);
         assert_eq!(reopened.send_lock(), Some(SendLock::MaybeSent));
-        // A send that failed before the server had it clears the record.
-        let mut reopened = reopened;
-        reopened.end_send(None);
-        drop(reopened);
-        let fields = DraftFields {
-            from: "jon@example.com".into(),
-            ..DraftFields::default()
-        };
-        let clean = DraftSession::create(folder, "d1", AccountId("local".into()), fields, "body\n")
-            .unwrap();
-        assert_eq!(clean.send_lock(), None);
+        assert!(
+            reopened
+                .prepare_send()
+                .unwrap_err()
+                .contains("may already have been sent")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_damaged_send_record_still_locks_the_draft() {
-        let (root, session) = temp_session("body\n");
+    fn deleting_the_control_folder_does_not_unlock_a_sent_draft() {
+        let (root, store, mut session) = stored_session("body\n");
+        session.mark_seen();
+        session.begin_send().unwrap();
+        session.end_send(Some(SendLock::Sent));
+        let folder = session.folder().to_path_buf();
+        let control = workspace::control_dir(&folder);
+        drop(session);
+        // An agent, or anything else that can write the draft folder,
+        // removes everything Fell keeps beside the draft.
+        fs::remove_dir_all(&control).unwrap();
+        let mut reopened =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
+        reopened.mark_seen();
+        assert!(reopened.begin_send().unwrap_err().contains("was sent"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_send_that_transmitted_nothing_reopens_unlocked() {
+        let (root, store, mut session) = stored_session("body\n");
+        session.begin_send().unwrap();
+        session.end_send(None);
+        let mut reopened = reopen(session, &store);
+        assert_eq!(reopened.send_lock(), None);
+        reopened.begin_send().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_draft_with_no_mailbox_is_not_claimed() {
+        let (root, mut session) = temp_session("body\n");
+        let err = session.begin_send().unwrap_err();
+        assert!(err.contains("could not record this send"), "{err}");
+        assert_eq!(session.send_lock(), None);
+        // A mailbox path that is gone is not created by the claim.
+        let missing = root.join("gone.db");
+        session.bind_store(&missing);
+        assert!(session.begin_send().is_err());
+        assert!(!missing.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_send_the_mailbox_recorded_locks_a_session_that_missed_it() {
+        let (root, store, mut session) = stored_session("body\n");
+        store
+            .finish_compose_send(&AccountId("local".into()), "d1", Some(SendLock::Sent))
+            .unwrap();
+        // This session was opened before the record was written.
+        assert!(session.begin_send().unwrap_err().contains("was sent"));
+        assert_eq!(session.send_lock(), Some(SendLock::Sent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_old_send_state_file_is_migrated_once() {
+        for (old, lock) in [
+            ("", SendLock::MaybeSent),
+            ("se", SendLock::MaybeSent),
+            ("garbage", SendLock::MaybeSent),
+            ("maybe-sent", SendLock::MaybeSent),
+            ("sent", SendLock::Sent),
+        ] {
+            let (root, store, session) = stored_session("body\n");
+            let folder = session.folder().to_path_buf();
+            drop(session);
+            // The first open by this build already happened; start as if
+            // the draft came from an older Fell.
+            store.conn.execute("DELETE FROM compose_send", []).unwrap();
+            let file = workspace::control_dir(&folder).join(LEGACY_SEND_STATE);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, old).unwrap();
+            let reopened =
+                DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+            assert_eq!(reopened.send_lock(), Some(lock), "{old:?}");
+            assert!(!file.exists(), "{old:?}");
+            drop(reopened);
+            let reopened =
+                DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+            assert_eq!(reopened.send_lock(), Some(lock), "{old:?}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn a_send_state_file_written_after_migration_is_ignored() {
+        let (root, store, session) = stored_session("body\n");
+        let folder = session.folder().to_path_buf();
+        let reopened = reopen(session, &store);
+        drop(reopened);
+        let file = workspace::control_dir(&folder).join(LEGACY_SEND_STATE);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "sent").unwrap();
+        let reopened =
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
+        assert_eq!(reopened.send_lock(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_late_clear_never_unlocks_a_sent_draft() {
+        let (root, store, session) = stored_session("body\n");
+        let account = AccountId("local".into());
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::Sent))
+            .unwrap();
+        // A second session's "nothing went out" and a stray "may have been
+        // sent" both arrive after the send was recorded.
+        store.finish_compose_send(&account, "d1", None).unwrap();
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::MaybeSent))
+            .unwrap();
+        assert_eq!(
+            store.compose_send_record(&account, "d1").unwrap(),
+            Some(Some(SendLock::Sent))
+        );
+        let reopened = reopen(session, &store);
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_migration_racing_another_keeps_the_sent_record() {
+        let (root, store, session) = stored_session("body\n");
+        let account = AccountId("local".into());
         let folder = session.folder().to_path_buf();
         drop(session);
-        let control = workspace::control_dir(&folder);
-        fs::create_dir_all(&control).unwrap();
-        for damaged in ["", "se", "garbage"] {
-            fs::write(control.join(SEND_STATE), damaged).unwrap();
-            assert_eq!(
-                read_send_state(&folder),
-                Some(SendLock::MaybeSent),
-                "{damaged:?}"
-            );
-        }
-        fs::write(control.join(SEND_STATE), "sent").unwrap();
-        assert_eq!(read_send_state(&folder), Some(SendLock::Sent));
+        store.conn.execute("DELETE FROM compose_send", []).unwrap();
+        // The first open moved `sent` out of the file and deleted it.
+        assert_eq!(
+            store
+                .migrate_compose_send(&account, "d1", Some(SendLock::Sent))
+                .unwrap(),
+            Some(SendLock::Sent)
+        );
+        // A second open that raced it finds no file and would say "clear".
+        assert_eq!(
+            store.migrate_compose_send(&account, "d1", None).unwrap(),
+            Some(SendLock::Sent)
+        );
+        let reopened = DraftSession::open_with_store(&folder, account, &store).unwrap();
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_reopen_during_a_send_keeps_the_live_claim() {
-        let (root, mut live) = temp_session("body\n");
+        let (root, store, mut live) = stored_session("body\n");
         let folder = live.folder().to_path_buf();
         live.begin_send().unwrap();
-        let fields = DraftFields {
-            from: "jon@example.com".into(),
-            ..DraftFields::default()
-        };
         let mut reopened =
-            DraftSession::create(folder, "d1", AccountId("local".into()), fields, "body\n")
-                .unwrap();
+            DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(
             reopened.send_lock(),
             Some(SendLock::MaybeSent),
-            "the disk record"
+            "the mailbox record"
         );
         reopened.inherit_send_lock(&live);
         assert_eq!(reopened.send_lock(), Some(SendLock::InFlight));

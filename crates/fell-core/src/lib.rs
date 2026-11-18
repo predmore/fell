@@ -19,6 +19,8 @@ pub mod send;
 mod smtp;
 pub mod store;
 pub mod sync;
+#[doc(hidden)]
+pub mod test_support;
 pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
@@ -26,8 +28,8 @@ pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classif
 pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
-    BridgeBackend, FixtureBackend, ImapBackend, MailBackend, MailboxDelta, ProtonApiBackend,
-    SyncCursor, backend_for, is_demo_account,
+    BridgeBackend, FixtureBackend, FolderRemoval, ImapBackend, MailBackend, MailboxDelta,
+    ProtonApiBackend, RemovalKind, Settle, SyncCursor, backend_for, is_demo_account,
 };
 pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,

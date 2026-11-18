@@ -28,6 +28,9 @@ pub struct ResolvedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
     pub draft: Draft,
+    /// The `Message-ID` header in [`Self::mime`]. The Sent copy the server
+    /// files carries it, so a local record of the Bcc can find that copy.
+    pub message_id: crate::MessageId,
     pub mime: Vec<u8>,
     pub plain: String,
     pub html: String,
@@ -46,7 +49,8 @@ pub fn build_outgoing(
     };
     let html = doc_to_html(&markdown_to_doc(&plain));
     let digest = attachment_digest(files);
-    let mime = render_mime(fields, &plain, &html, files);
+    let message_id = fresh_message_id();
+    let mime = render_mime(fields, &message_id, &plain, &html, files);
     let in_reply_to = fields
         .in_reply_to
         .as_ref()
@@ -63,13 +67,20 @@ pub fn build_outgoing(
             in_reply_to,
             attachments_digest: digest,
         },
+        message_id: crate::MessageId::new(&message_id),
         mime,
         plain,
         html,
     }
 }
 
-fn render_mime(fields: &DraftFields, plain: &str, html: &str, files: &[ResolvedFile]) -> Vec<u8> {
+fn render_mime(
+    fields: &DraftFields,
+    message_id: &str,
+    plain: &str,
+    html: &str,
+    files: &[ResolvedFile],
+) -> Vec<u8> {
     let blobs = content_blobs(plain, html, files);
     let mixed = fresh_boundary("mix", &blobs);
     let related = fresh_boundary("rel", &blobs);
@@ -87,7 +98,7 @@ fn render_mime(fields: &DraftFields, plain: &str, html: &str, files: &[ResolvedF
         &encode_unstructured(&fields.subject),
     ));
     headers.push_str(&header_line("Date", &rfc5322_now()));
-    headers.push_str(&header_line("Message-ID", &angle_id(&fresh_message_id())));
+    headers.push_str(&header_line("Message-ID", &angle_id(message_id)));
     if let Some(reply) = fields
         .in_reply_to
         .as_ref()

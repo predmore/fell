@@ -20,6 +20,8 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
+mod copies;
+pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
 
@@ -169,6 +171,17 @@ CREATE TABLE IF NOT EXISTS compose_attachments (
     bytes BLOB NOT NULL,
     PRIMARY KEY (draft_id, path),
     FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
+);
+
+-- How the last send of a draft ended: 'maybe-sent' from the claim on,
+-- then 'sent', or 'clear' when nothing went out. See compose::persist.
+CREATE TABLE IF NOT EXISTS compose_send (
+    account_id TEXT NOT NULL,
+    draft_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    message_id TEXT,
+    updated_unix INTEGER NOT NULL,
+    PRIMARY KEY (account_id, draft_id)
 );
 "#;
 
@@ -369,6 +382,7 @@ impl Store {
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
+        copies::ensure_copies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
                 ON messages(account_id, body_fingerprint);
@@ -388,6 +402,7 @@ impl Store {
         // including the one that installs the threading triggers. Then the
         // threading tables, which the version 3 upgrade below already reads.
         summaries::ensure_thread_summaries(&conn)?;
+        conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -528,7 +543,9 @@ impl Store {
                 ],
             )?;
         }
-        if !delta.messages.is_empty() {
+        let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
+        let settled = copies::settle(&tx, account_id, delta.settle)?;
+        if !delta.messages.is_empty() || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -571,40 +588,12 @@ impl Store {
     /// transaction that deletes the row. `false` means the message was not stored.
     pub fn delete_message(&self, account_id: &AccountId, message_id: &MessageId) -> Result<bool> {
         let tx = immediate_transaction(&self.conn)?;
-        let Some((stored, _)) = find_stored(&tx, account_id, message_id)? else {
+        let Some(removed) = delete_stored(&tx, account_id, message_id)? else {
             tx.rollback()?;
             return Ok(false);
         };
-        let old_terms = terms_for_indexed(IndexedText {
-            subject: &stored.subject,
-            from_name: stored.from_name.as_deref(),
-            from_email: &stored.from_email,
-            body: &stored.body,
-            to_line: &stored.to_line,
-            cc_line: &stored.cc_line,
-            bcc_line: &stored.bcc_line,
-            folders: &stored.folders,
-            labels: &stored.labels,
-        });
-        sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
-        remove_message_embedding(&tx, account_id.as_str(), message_id.as_str())?;
-        dequeue_message(&tx, account_id.as_str(), message_id.as_str())?;
-        let removed = tx.execute(
-            "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id.as_str(), stored.canonical_id],
-        )?;
-        tx.execute(
-            "DELETE FROM message_aliases
-             WHERE account_id = ?1
-               AND (message_id = ?2 OR canonical_message_id = ?2 OR message_id = ?3)",
-            params![
-                account_id.as_str(),
-                stored.canonical_id,
-                message_id.as_str()
-            ],
-        )?;
         tx.commit()?;
-        Ok(removed > 0)
+        Ok(removed)
     }
 
     /// Vector stored for this message body, if the indexer has written one.
@@ -668,6 +657,8 @@ impl Store {
         for row in rows {
             out.push(row?);
         }
+        drop(stmt);
+        sent_bcc::add_recorded_bcc(&self.conn, &mut out)?;
         Ok(out)
     }
 
@@ -1084,6 +1075,7 @@ fn open_requested_or_canonical(
         drop(conn);
         Ok((canonical.to_path_buf(), open_mailbox_db(canonical)?))
     } else {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok((requested.to_path_buf(), conn))
     }
@@ -1100,6 +1092,9 @@ fn canonical_wal_has_frames(canonical: &Path) -> bool {
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Wait for other writers from the first statement on, including the
+    // journal mode below, not only after `from_connection` sets it.
+    conn.busy_timeout(Duration::from_secs(5))?;
     // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
@@ -1442,6 +1437,12 @@ fn thread_id_for_message_id(
 }
 
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
+    let thread = insert_arrival(conn, message)?;
+    copies::record(conn, message)?;
+    Ok(thread)
+}
+
+fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -1815,6 +1816,53 @@ fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
     })
 }
 
+/// Delete a stored message with its search postings, body vector, queue
+/// entry, aliases, and server copies. `message_id` may be an alias of the row.
+/// `None` means nothing was stored under it.
+fn delete_stored(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &MessageId,
+) -> Result<Option<bool>> {
+    let Some((stored, _)) = find_stored(conn, account_id, message_id)? else {
+        return Ok(None);
+    };
+    let old_terms = terms_for_indexed(IndexedText {
+        subject: &stored.subject,
+        from_name: stored.from_name.as_deref(),
+        from_email: &stored.from_email,
+        body: &stored.body,
+        to_line: &stored.to_line,
+        cc_line: &stored.cc_line,
+        bcc_line: &stored.bcc_line,
+        folders: &stored.folders,
+        labels: &stored.labels,
+    });
+    sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
+    for id in [stored.canonical_id.as_str(), message_id.as_str()] {
+        remove_message_embedding(conn, account_id.as_str(), id)?;
+        dequeue_message(conn, account_id.as_str(), id)?;
+    }
+    let removed = conn.execute(
+        "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), stored.canonical_id],
+    )?;
+    conn.execute(
+        "DELETE FROM message_aliases
+         WHERE account_id = ?1
+           AND (message_id = ?2 OR canonical_message_id = ?2 OR message_id = ?3)",
+        params![
+            account_id.as_str(),
+            stored.canonical_id,
+            message_id.as_str()
+        ],
+    )?;
+    copies::forget(conn, account_id, &stored.canonical_id)?;
+    sent_bcc::forget_if_gone(conn, account_id, &stored.canonical_id)?;
+    sent_bcc::forget_if_gone(conn, account_id, message_id.as_str())?;
+    Ok(Some(removed > 0))
+}
+
 fn find_stored(
     conn: &Connection,
     account_id: &AccountId,
@@ -1942,6 +1990,12 @@ fn absorb_duplicate(
             doomed.canonical_id,
         ],
     )?;
+    copies::repoint(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
     Ok(thread)
 }
 
@@ -1953,14 +2007,18 @@ fn absorb_duplicate(
 fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
     let mut after = 0i64;
     loop {
-        let groups = duplicate_fingerprint_groups(conn, after)?;
+        // Groups and rows are read under the write lock: a mark-read or a
+        // folder change committed while this waited is what gets merged.
+        let tx = begin_immediate(conn)?;
+        let groups = duplicate_fingerprint_groups(&tx, after)?;
         if groups.is_empty() {
+            tx.commit()?;
             break;
         }
         let mut batch = Vec::new();
         for group in &groups {
             after = group.min_rowid;
-            let mut stmt = conn.prepare(&format!(
+            let mut stmt = tx.prepare(&format!(
                 "SELECT {SELECT_MESSAGE_COLS} FROM messages
                  WHERE account_id = ?1 AND body_fingerprint = ?2
                  ORDER BY rowid"
@@ -1972,7 +2030,6 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             }
             drop(stmt);
         }
-        let tx = conn.unchecked_transaction()?;
         for message in &batch {
             let fingerprint = message_fingerprint(message);
             let Some((stored, via_alias)) =
@@ -2046,6 +2103,53 @@ fn fold_doomed_local_state(keeper: &Arrival, doomed: &Arrival) -> Arrival {
     keeper.archived |= doomed.archived;
     keeper.snooze_until = kept_snooze(keeper.snooze_until, doomed.snooze_until);
     keeper
+}
+
+/// Give `into` the labels, star, archive bit, and snooze of `from`, a row
+/// for the same mail that is about to go.
+fn take_local_state(
+    conn: &Connection,
+    account_id: &AccountId,
+    from: &Arrival,
+    into: &Arrival,
+) -> Result<()> {
+    let mut labels = split_field(&into.labels);
+    for label in split_field(&from.labels) {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let labels = join_tokens(&labels);
+    let kept = fold_doomed_local_state(into, from);
+    let indexed = |labels: &str| {
+        terms_for_indexed(IndexedText {
+            subject: &into.subject,
+            from_name: into.from_name.as_deref(),
+            from_email: &into.from_email,
+            body: &into.body,
+            to_line: &into.to_line,
+            cc_line: &into.cc_line,
+            bcc_line: &into.bcc_line,
+            folders: &into.folders,
+            labels,
+        })
+    };
+    let old_terms = indexed(&into.labels);
+    let new_terms = indexed(&labels);
+    conn.execute(
+        "UPDATE messages SET labels = ?1, starred = ?2, archived = ?3, snooze_until = ?4
+         WHERE account_id = ?5 AND message_id = ?6",
+        params![
+            labels,
+            kept.starred,
+            kept.archived,
+            kept.snooze_until,
+            account_id.as_str(),
+            into.canonical_id
+        ],
+    )?;
+    sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
+    Ok(())
 }
 
 fn rethread_accounts(conn: &Connection) -> Result<()> {
@@ -2565,7 +2669,10 @@ const FINGERPRINT_BATCH: usize = 32;
 fn backfill_fingerprints(conn: &Connection) -> Result<()> {
     let mut after = 0i64;
     loop {
-        let mut stmt = conn.prepare(
+        // Read the batch inside the write transaction, so a body another
+        // connection changed while this one waited is the body hashed.
+        let tx = begin_immediate(conn)?;
+        let mut stmt = tx.prepare(
             "SELECT rowid, body_text FROM messages
              WHERE body_fingerprint = '' AND rowid > ?1
              ORDER BY rowid
@@ -2580,9 +2687,9 @@ fn backfill_fingerprints(conn: &Connection) -> Result<()> {
         }
         drop(stmt);
         if batch.is_empty() {
+            tx.commit()?;
             break;
         }
-        let tx = conn.unchecked_transaction()?;
         for (rowid, body) in &batch {
             after = *rowid;
             let fingerprint = fingerprint_of(body.as_deref());
@@ -2849,6 +2956,18 @@ pub(crate) fn ensure_triggers(
 
 /// Write lock from the first statement, so an embedding commit cannot
 /// invalidate a snapshot this transaction already read.
+/// A plain transaction that takes the write lock up front.
+///
+/// A deferred transaction that reads and then writes cannot wait for
+/// another writer: in WAL mode SQLite answers the upgrade with "database is
+/// locked" at once, ignoring the busy timeout. Opening the mailbox while the
+/// indexer, sync, or `fell-mcp` was writing failed that way. Starting with
+/// `BEGIN IMMEDIATE` lets the busy timeout apply. Use it for writes that run
+/// before the summary tables exist; later writes use [`immediate_transaction`].
+pub(crate) fn begin_immediate(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<WriteTx<'_>> {
     rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map(WriteTx)
@@ -2879,20 +2998,17 @@ impl WriteTx<'_> {
 }
 
 fn ensure_fts(conn: &Connection) -> Result<()> {
+    // Most opens change nothing here. Check without the write lock, so an
+    // open does not hold up sync or the indexer for two counts.
+    if fts_is_current(conn)? {
+        return Ok(());
+    }
     // Drop, create, and copy commit together. A killed process rolls the
     // upgrade back, so the next open tries again instead of keeping an empty
     // index whose columns merely look current.
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_immediate(conn)?;
     let have = column_names(&tx, "messages_fts")?;
-    let needed = [
-        "subject",
-        "sender",
-        "recipients",
-        "body",
-        "account_id",
-        "message_id",
-    ];
-    let current = needed
+    let current = FTS_COLUMNS
         .iter()
         .all(|name| have.iter().any(|column| column == name));
     let messages: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
@@ -2913,6 +3029,58 @@ fn ensure_fts(conn: &Connection) -> Result<()> {
     tx.execute_batch(FTS_TRIGGERS)?;
     tx.commit()?;
     Ok(())
+}
+
+const FTS_COLUMNS: [&str; 6] = [
+    "subject",
+    "sender",
+    "recipients",
+    "body",
+    "account_id",
+    "message_id",
+];
+
+/// The index has the current columns, holds rows when messages do, and its
+/// triggers are exactly [`FTS_TRIGGERS`]. Reads only.
+fn fts_is_current(conn: &Connection) -> Result<bool> {
+    let have = column_names(conn, "messages_fts")?;
+    if !FTS_COLUMNS
+        .iter()
+        .all(|name| have.iter().any(|column| column == name))
+    {
+        return Ok(false);
+    }
+    let messages: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |row| {
+        row.get(0)
+    })?;
+    if messages != 0 {
+        let indexed: i64 =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM messages_fts)", [], |row| {
+                row.get(0)
+            })?;
+        if indexed == 0 {
+            return Ok(false);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name IN ('messages_ai', 'messages_ad', 'messages_au')
+         ORDER BY name",
+    )?;
+    let stored: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let squash = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut wanted: Vec<String> = FTS_TRIGGERS
+        .split("END;")
+        .map(str::trim)
+        .filter(|sql| !sql.is_empty())
+        .map(|sql| squash(&format!("{sql} END")))
+        .collect();
+    wanted.sort();
+    let mut stored: Vec<String> = stored.iter().map(|sql| squash(sql)).collect();
+    stored.sort();
+    Ok(stored == wanted)
 }
 
 fn duplicate_column(err: &rusqlite::Error) -> bool {
@@ -3233,6 +3401,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3243,6 +3412,7 @@ mod tests {
                     messages: vec![msg("root@x", Some("conv-9"), None, "Root", "root")],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3266,6 +3436,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3289,6 +3460,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3324,6 +3496,7 @@ mod tests {
                         token: "cursor-only".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3355,6 +3528,7 @@ mod tests {
                         token: "should-not-stick".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap_err();
@@ -3391,6 +3565,7 @@ mod tests {
                         token: "must-not-advance".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap_err();
@@ -3542,6 +3717,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3610,6 +3786,7 @@ mod tests {
                     messages: vec![sent, alias_a, alias_b],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -5148,6 +5325,177 @@ mod tests {
     }
 
     #[test]
+    fn a_list_parent_rewritten_to_the_list_copy_of_the_same_parent_still_joins() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let root_thread = store
+            .upsert_message(&msg("patch@x", None, None, "Patch", "patch notes"))
+            .unwrap();
+        // The list's own copy of the parent, under the id the list gave it.
+        let mut root_copy = msg(
+            "patch-list@x",
+            None,
+            Some("patch@x"),
+            "[list] Patch",
+            "patch notes as the list delivered them",
+        );
+        root_copy.list_id = Some("list.example".into());
+        assert_eq!(store.upsert_message(&root_copy).unwrap(), root_thread);
+        let at = 1_700_000_000;
+        let mut sent = msg(
+            "sent-a@x",
+            None,
+            Some("patch@x"),
+            "Re: Patch",
+            "Looks right to me, merging this afternoon.",
+        );
+        sent.headers.date_unix = at;
+        sent.folders = vec!["Sent".into()];
+        let mut echo = msg(
+            "echo@x",
+            None,
+            Some("patch-list@x"),
+            "[list] Re: Patch",
+            "Looks right to me, merging this afternoon.",
+        );
+        echo.list_id = Some("list.example".into());
+        echo.headers.date_unix = at + 60;
+        echo.folders = vec!["INBOX".into()];
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(alias_target(&store, "echo@x").as_deref(), Some("sent-a@x"));
+        assert!(!message_row_present(&store, "echo@x"));
+    }
+
+    /// Insert a row as an older Fell stored it, before the copies were joined.
+    fn insert_raw_row(
+        store: &Store,
+        (id, subject, parent, folder, list_id, date): (&str, &str, &str, &str, Option<&str>, i64),
+    ) {
+        let fingerprint = crate::message::body_fingerprint("Sounds good to me");
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    account_id, message_id, remote_id, thread_id, in_reply_to,
+                    references_header, from_email, subject, date_unix, snippet, body_text,
+                    unread, folders, body_fingerprint, list_id
+                 ) VALUES (
+                    'a1', ?1, ?1, ?2, ?3, ?3, 'from@x', ?4, ?5, 'Sounds good to me',
+                    'Sounds good to me', 1, ?6, ?7, ?8
+                 )",
+                params![
+                    id,
+                    format!("msgid:{id}"),
+                    parent,
+                    subject,
+                    date,
+                    folder,
+                    fingerprint,
+                    list_id
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resync_from_three_rows_joins_only_the_send_and_its_own_echo() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let at = 1_700_000_000_i64;
+        insert_raw_row(
+            &store,
+            ("sent-a@x", "Re: Patch", "patch@x", "Sent", None, at),
+        );
+        insert_raw_row(
+            &store,
+            (
+                "sent-b@x",
+                "Re: Budget",
+                "budget@x",
+                "Sent",
+                None,
+                at + 5 * 60,
+            ),
+        );
+        insert_raw_row(
+            &store,
+            (
+                "list-b@x",
+                "[list] Re: Budget",
+                "budget@x",
+                "INBOX",
+                Some("list.example"),
+                at + 10 * 60,
+            ),
+        );
+        for (id, subject, parent, folder, date) in [
+            ("sent-a@x", "Re: Patch", "patch@x", "Sent", at),
+            ("sent-b@x", "Re: Budget", "budget@x", "Sent", at + 5 * 60),
+        ] {
+            let mut again = msg(id, None, Some(parent), subject, "Sounds good to me");
+            again.headers.date_unix = date;
+            again.folders = vec![folder.into()];
+            store.upsert_message(&again).unwrap();
+        }
+        // Sent A is another post and keeps its row. Sent B and its list echo
+        // are one message: exactly one of the two rows stays.
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert_eq!(alias_target(&store, "sent-a@x"), None);
+        let b_rows = ["sent-b@x", "list-b@x"]
+            .iter()
+            .filter(|id| message_row_present(&store, id))
+            .count();
+        assert_eq!(b_rows, 1);
+        assert_eq!(listed(&store).len(), 2);
+    }
+
+    #[test]
+    fn a_sent_copy_reusing_the_list_posts_id_joins_that_post() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (sent_a, list_b) = sent_a_and_list_b();
+        store.upsert_message(&sent_a).unwrap();
+        store.upsert_message(&list_b).unwrap();
+        // The Sent original of B: the list kept its Message-ID.
+        let mut sent_b = msg(
+            "list-b@x",
+            None,
+            Some("budget@x"),
+            "Re: Budget",
+            "Sounds good to me",
+        );
+        sent_b.headers.date_unix = list_b.headers.date_unix - 60;
+        sent_b.folders = vec!["Sent".into()];
+        store.upsert_message(&sent_b).unwrap();
+        assert!(message_row_present(&store, "sent-a@x"));
+        assert!(message_row_present(&store, "list-b@x"));
+        assert_eq!(alias_target(&store, "sent-a@x"), None);
+        assert_eq!(alias_target(&store, "list-b@x"), None);
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 2);
+        let b = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "list-b@x")
+            .unwrap();
+        assert!(
+            b.folders.iter().any(|folder| folder == "Sent"),
+            "{:?}",
+            b.folders
+        );
+        assert!(
+            b.folders.iter().any(|folder| folder == "INBOX"),
+            "{:?}",
+            b.folders
+        );
+        let a = rows
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "sent-a@x")
+            .unwrap();
+        assert_eq!(a.folders, vec!["Sent"]);
+    }
+
+    #[test]
     fn upgrade_keeps_a_sent_copy_beside_a_list_post_on_another_subject() {
         let path = std::env::temp_dir().join(format!(
             "fell-schema-v2-{}-sent-subject.sqlite",
@@ -5741,6 +6089,7 @@ mod tests {
                         unread: false,
                     }],
                     cursor: None,
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -6555,5 +6904,66 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod fts_check {
+    /// After the first open sets up the index and its triggers, later opens
+    /// find nothing to change, so they take no write lock there.
+    #[test]
+    fn a_settled_mailbox_needs_no_fts_write() {
+        let store = super::Store::open_in_memory().unwrap();
+        assert!(super::fts_is_current(&store.conn).unwrap());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER messages_au;")
+            .unwrap();
+        assert!(!super::fts_is_current(&store.conn).unwrap());
+        super::ensure_fts(&store.conn).unwrap();
+        assert!(super::fts_is_current(&store.conn).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod open_while_writing {
+    /// Opens of one mailbox from several threads, beside a held store whose
+    /// indexer writes, all succeed. Each open runs schema checks that write;
+    /// a deferred transaction there failed at once with "database is locked"
+    /// instead of waiting, about one open in five.
+    #[test]
+    fn concurrent_opens_wait_instead_of_failing() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-open-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mail.db");
+        let _held = super::Store::open(&db).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    (0..15)
+                        .filter_map(|_| super::Store::open(&db).err().map(|err| err.to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let failures: Vec<String> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

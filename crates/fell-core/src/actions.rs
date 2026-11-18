@@ -2165,6 +2165,7 @@ mod tests {
                     messages: vec![message],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -2397,6 +2398,7 @@ mod tests {
                         token: "cursor-2".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();

@@ -92,7 +92,7 @@ pub(crate) fn rebuild_vocabulary_if_empty(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     let outcome = {
-        let tx = conn.unchecked_transaction()?;
+        let tx = crate::store::begin_immediate(conn)?;
         match rebuild_vocabulary_rows(&tx) {
             Ok(()) => tx.commit().map_err(crate::Error::from),
             Err(err) => {
