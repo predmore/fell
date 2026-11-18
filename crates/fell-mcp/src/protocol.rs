@@ -939,7 +939,7 @@ mod tests {
         // machine with real mail this test would open it.
         if fell_core::test_support::skip_unless_available(
             "request_send_and_draft_edits_never_transmit",
-            fell_core::test_support::real_mailbox_present(),
+            fell_core::test_support::real_mailbox_present("r1"),
         ) {
             return;
         }

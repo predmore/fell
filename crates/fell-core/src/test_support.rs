@@ -49,17 +49,15 @@ pub fn test_net_missing() -> Option<String> {
     }
 }
 
-/// `None` when no real Fell mailbox is at the default path. Tests whose draft
-/// lookups fall back to that path would read the person's own mail.
+/// `None` when draft `draft_id`'s lookups cannot reach real mail: no Fell
+/// mailbox at the default path, and no compose index entry for that id
+/// naming an existing database. Either would let a test read the person's
+/// own mail.
 #[doc(hidden)]
-pub fn real_mailbox_present() -> Option<String> {
-    // A draft's mailbox is found through the compose index first, then the
-    // default path; either can lead to the person's mail.
-    let index = crate::compose::compose_index_file("probe")
-        .and_then(|file| file.parent().map(std::path::Path::to_path_buf))
-        .filter(|dir| dir.is_dir());
+pub fn real_mailbox_present(draft_id: &str) -> Option<String> {
+    let indexed = crate::compose::remembered_store_path(draft_id);
     let mailbox = crate::compose::mailbox_db_path().filter(|path| path.exists());
-    let found = mailbox.or(index)?;
+    let found = indexed.or(mailbox)?;
     Some(format!(
         "real Fell data is at {}; run with XDG_DATA_HOME and XDG_RUNTIME_DIR pointing at empty directories",
         found.display()
