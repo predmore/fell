@@ -45,6 +45,13 @@ pub(super) fn copy_message_id(
     message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid)
 }
 
+/// Whether Fell made the id from a UID because the message has no
+/// Message-ID header ([`message_id_or_uid`]). Such an id cannot be searched
+/// for on the server.
+pub(crate) fn is_uid_message_id(message_id: &str) -> bool {
+    message_id.starts_with("uid.") && message_id.ends_with("@imap.fell")
+}
+
 /// The Message-ID header, or one made from the UID when there is none.
 fn message_id_or_uid(
     parsed: Option<&mail_parser::Message<'_>>,

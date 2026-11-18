@@ -373,24 +373,7 @@ impl Session {
             }
             Err(err) => return Err(err),
         };
-        let mut uids = Vec::new();
-        for line in lines {
-            let Some(rest) = line.text.trim().strip_prefix('*') else {
-                continue;
-            };
-            let Some(rest) = strip_prefix_ignore_ascii_case(rest.trim_start(), "SEARCH") else {
-                continue;
-            };
-            for word in rest.split_whitespace() {
-                match word.parse() {
-                    Ok(uid) => uids.push(uid),
-                    // A modifier such as `(MODSEQ n)`, not a UID.
-                    Err(_) => break,
-                }
-            }
-        }
-        uids.sort_unstable();
-        Ok(Some(uids))
+        Ok(Some(search_uids(&lines)))
     }
 
     /// UID and `Message-ID` header of messages `first..=last` by sequence
@@ -992,6 +975,28 @@ impl Session {
 enum LiteralBytes {
     Kept(Vec<u8>),
     Discarded,
+}
+
+/// The UIDs in a `UID SEARCH` reply's `* SEARCH` lines, ascending.
+fn search_uids(lines: &[Logical]) -> Vec<u32> {
+    let mut uids = Vec::new();
+    for line in lines {
+        let Some(rest) = line.text.trim().strip_prefix('*') else {
+            continue;
+        };
+        let Some(rest) = strip_prefix_ignore_ascii_case(rest.trim_start(), "SEARCH") else {
+            continue;
+        };
+        for word in rest.split_whitespace() {
+            match word.parse() {
+                Ok(uid) => uids.push(uid),
+                // A modifier such as `(MODSEQ n)`, not a UID.
+                Err(_) => break,
+            }
+        }
+    }
+    uids.sort_unstable();
+    uids
 }
 
 struct Logical {

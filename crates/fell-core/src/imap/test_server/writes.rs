@@ -1,6 +1,8 @@
 //! The test server's write verbs, for the write-back outbox: `SELECT`,
-//! `UID MOVE`, `UID COPY`, `UID STORE`, and `UID EXPUNGE`. They are off
-//! unless a test turns them on in [`WriteFixture`]; sync tests never do.
+//! `UID MOVE`, `UID COPY`, `UID STORE`, and `UID EXPUNGE`, plus the
+//! `UID SEARCH HEADER Message-ID` replay uses to find a moved message. They
+//! are off unless a test turns them on in [`WriteFixture`]; sync tests
+//! never do.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -18,6 +20,9 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse: Option<String>,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
+    /// Apply the next command with this verb (`"MOVE"`, `"COPY"`,
+    /// `"STORE"`, `"EXPUNGE"`), then drop the connection before any reply.
+    pub lose_reply_to: Option<&'static str>,
 }
 
 pub(super) fn caps(writes: &Mutex<WriteFixture>) -> String {
@@ -48,7 +53,12 @@ pub(super) fn handle(
             let rest = rest.trim();
             let mut state = state.lock().expect("state");
             let mut writes = writes.lock().expect("writes");
-            if let Some(args) = strip_prefix_ignore(rest, "MOVE ") {
+            let lose = writes
+                .lose_reply_to
+                .is_some_and(|verb| strip_prefix_ignore(rest, &format!("{verb} ")).is_some());
+            let reply = if let Some(args) = strip_prefix_ignore(rest, "SEARCH HEADER Message-ID ") {
+                search_message_id(tag, args, &state)
+            } else if let Some(args) = strip_prefix_ignore(rest, "MOVE ") {
                 if !writes.moves {
                     format!("{tag} BAD MOVE not offered\r\n")
                 } else {
@@ -77,7 +87,13 @@ pub(super) fn handle(
                 }
             } else {
                 return false;
+            };
+            if lose {
+                writes.lose_reply_to = None;
+                let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                return true;
             }
+            reply
         }
         "EXPUNGE" | "STORE" | "COPY" | "MOVE" => format!("{tag} BAD use UID commands\r\n"),
         _ => return false,
@@ -206,6 +222,31 @@ fn place(
         reply.push_str(&format!("{tag} OK {copyuid}{verb} completed\r\n"));
     }
     reply
+}
+
+/// `UID SEARCH HEADER Message-ID "<id>"` in the selected mailbox. Matches
+/// the whole header value, which is all replay asks for.
+fn search_message_id(tag: &str, args: &str, state: &TestState) -> String {
+    let Some(source) = selected(state) else {
+        return format!("{tag} BAD no mailbox selected\r\n");
+    };
+    let Some(mailbox) = state.mailboxes.iter().find(|item| item.name == source) else {
+        return format!("{tag} NO no mailbox\r\n");
+    };
+    let wanted = mailbox_name(args);
+    let mut line = String::from("* SEARCH");
+    for message in &mailbox.messages {
+        let raw = String::from_utf8_lossy(&message.raw);
+        let found = raw
+            .split("\r\n")
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .any(|(name, value)| name.eq_ignore_ascii_case("Message-ID") && value.trim() == wanted);
+        if found {
+            line.push_str(&format!(" {}", message.uid));
+        }
+    }
+    format!("{line}\r\n{tag} OK SEARCH completed\r\n")
 }
 
 fn store_deleted(tag: &str, args: &str, state: &mut TestState) -> String {

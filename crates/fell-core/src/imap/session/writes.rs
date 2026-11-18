@@ -11,7 +11,7 @@
 use crate::Error;
 
 use super::super::ImapConfig;
-use super::{Listed, Reply, Session, bracket_u32, quote_imap};
+use super::{Listed, Reply, Session, bracket_u32, quote_imap, search_uids};
 
 /// How a write command failed.
 #[derive(Debug)]
@@ -23,7 +23,10 @@ pub(in crate::imap) enum WriteError {
 }
 
 /// Where the server put the messages a move or copy took: the target's
-/// UIDVALIDITY and `(source UID, new UID)` pairs, from `COPYUID`.
+/// UIDVALIDITY and `(source UID, new UID)` pairs, from `COPYUID`. A UID
+/// with no pair was not placed by this command, or the server did not say
+/// (no UIDPLUS, or nothing matched because an earlier try already moved
+/// it); replay then looks for the message in the target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::imap) struct Placed {
     pub uidvalidity: Option<u32>,
@@ -94,6 +97,21 @@ impl WriteSession {
         let target = quote_imap(target).map_err(|err| WriteError::Refused(err.to_string()))?;
         let reply = self.run("UID COPY", &format!("UID COPY {} {target}", uid_set(uids)))?;
         Ok(copyuid(&reply.ok).unwrap_or_default())
+    }
+
+    /// UIDs in the selected mailbox whose `Message-ID` header names
+    /// `message_id` (stored without its angle brackets).
+    pub(in crate::imap) fn search_message_id(
+        &mut self,
+        message_id: &str,
+    ) -> Result<Vec<u32>, WriteError> {
+        let value = quote_imap(&format!("<{message_id}>"))
+            .map_err(|err| WriteError::Refused(err.to_string()))?;
+        let reply = self.run(
+            "UID SEARCH",
+            &format!("UID SEARCH HEADER Message-ID {value}"),
+        )?;
+        Ok(search_uids(&reply.untagged))
     }
 
     /// Flag the UIDs `\Deleted`, then `UID EXPUNGE` exactly those. Only for

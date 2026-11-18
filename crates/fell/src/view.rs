@@ -143,6 +143,7 @@ fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String
         DropReason::Refused => format!("The server refused to move {messages}"),
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
         DropReason::NoMove => "This server can't move mail; moves stay in Fell".to_string(),
+        DropReason::Abandoned => format!("Write-back off: {messages} left half moved in {folder}"),
     }
 }
 
@@ -4477,11 +4478,16 @@ mod tests {
             notice(DropReason::NotFound, 1),
             "1 message not found in Inbox on the server"
         );
+        assert_eq!(
+            notice(DropReason::Abandoned, 1),
+            "Write-back off: 1 message left half moved in Inbox"
+        );
         for reason in [
             DropReason::FolderReset,
             DropReason::Refused,
             DropReason::NotFound,
             DropReason::NoMove,
+            DropReason::Abandoned,
         ] {
             let text = notice(reason, 2);
             assert!(!text.contains('\n') && text.chars().count() <= 64, "{text}");
