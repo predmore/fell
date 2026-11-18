@@ -2602,6 +2602,33 @@ fn assert_provider_roles(
 }
 
 #[test]
+fn an_xlist_inbox_mark_alone_keeps_the_name_table() {
+    // The server marks only INBOX (`\\Inbox` is XLIST, not RFC 6154), so
+    // Sent and Trash still come from their names.
+    let state = provider_state(
+        false,
+        &[
+            ("INBOX", "\\Inbox \\HasNoChildren"),
+            ("Sent Items", "\\HasNoChildren"),
+            ("Deleted Messages", "\\HasNoChildren"),
+            ("Archive", "\\HasNoChildren"),
+        ],
+        None,
+    );
+    assert_provider_roles(
+        state,
+        &[],
+        &[
+            (FolderRole::Inbox, "INBOX"),
+            (FolderRole::Sent, "Sent Items"),
+            (FolderRole::Trash, "Deleted Messages"),
+            (FolderRole::Archive, "Archive"),
+        ],
+        "Archive",
+    );
+}
+
+#[test]
 fn proton_bridge_folders_marked_on_a_plain_list() {
     let state = provider_state(
         false,

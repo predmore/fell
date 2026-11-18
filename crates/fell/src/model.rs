@@ -403,6 +403,27 @@ impl Session {
         self.roles.label(&self.folder)
     }
 
+    /// The open folder's own name, shown dimmed beside its title only when
+    /// another folder would read the same (see [`Self::folder_detail`]).
+    pub fn folder_title_detail(&self) -> Option<String> {
+        self.folder_detail(&self.folder)
+    }
+
+    /// `folder`'s own name when its label alone would read like another of
+    /// the account's folders: Gmail's `[Gmail]/Sent Mail` beside a label
+    /// called `Sent`. `None` for every folder in the usual case.
+    pub fn folder_detail(&self, folder: &str) -> Option<String> {
+        self.roles
+            .label_detail(folder, &self.folders)
+            .map(str::to_string)
+    }
+
+    /// `folder` as one line of text, told apart from a folder that reads
+    /// the same: `Sent ([Gmail]/Sent Mail)`.
+    pub fn folder_text(&self, folder: &str) -> String {
+        self.roles.label_among(folder, &self.folders)
+    }
+
     /// The folder on screen is the account's drafts folder.
     pub fn in_drafts(&self) -> bool {
         self.roles.is(FolderRole::Drafts, &self.folder)
@@ -1943,6 +1964,65 @@ mod tests {
         );
         session.folder_query = "spam".into();
         assert_eq!(session.folder_choices(), vec!["Junk"]);
+    }
+
+    #[test]
+    fn a_label_named_sent_does_not_read_like_the_sent_folder() {
+        let mut session = session();
+        let folder = |role, name: &str| fell_core::RoleFolder {
+            role,
+            name: name.into(),
+            raw: name.into(),
+            source: fell_core::RoleSource::Server,
+        };
+        session.roles = FolderRoles::new(vec![
+            folder(FolderRole::Inbox, "INBOX"),
+            folder(FolderRole::Sent, "[Gmail]/Sent Mail"),
+            folder(FolderRole::Junk, "[Gmail]/Spam"),
+        ]);
+        session.folders = vec![
+            "INBOX".into(),
+            "[Gmail]/Sent Mail".into(),
+            "[Gmail]/Spam".into(),
+            "Sent".into(),
+        ];
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('f'), 4);
+        let choices = session.folder_choices();
+        let sent: Vec<(String, Option<String>)> = choices
+            .iter()
+            .filter(|name| session.roles.label(name) == "Sent")
+            .map(|name| (session.roles.label(name), session.folder_detail(name)))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                ("Sent".to_string(), Some("[Gmail]/Sent Mail".to_string())),
+                ("Sent".to_string(), None),
+            ]
+        );
+        // Spam has no twin, so it stays a plain label.
+        assert_eq!(session.folder_detail("[Gmail]/Spam"), None);
+
+        // Filtering by the server's name finds the role folder.
+        session.folder_query = "sent mail".into();
+        assert_eq!(session.folder_choices(), vec!["[Gmail]/Sent Mail"]);
+
+        session.folder_query.clear();
+        session.on_key(KeyId::Escape, 4);
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('s'), 4);
+        assert_eq!(session.folder, "[Gmail]/Sent Mail");
+        assert_eq!(session.folder_title(), "Sent");
+        assert_eq!(
+            session.folder_title_detail().as_deref(),
+            Some("[Gmail]/Sent Mail")
+        );
+        assert_eq!(
+            session.folder_text("[Gmail]/Sent Mail"),
+            "Sent ([Gmail]/Sent Mail)"
+        );
+        assert_eq!(session.folder_text("Sent"), "Sent");
     }
 
     #[test]

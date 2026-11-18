@@ -202,7 +202,8 @@ impl FolderRoles {
 
     /// Roles from a LIST reply. `overrides` (from `account.toml`) win. Then
     /// SPECIAL-USE attributes; the name table is used only when the server
-    /// marked no mailbox at all. INBOX is always the inbox.
+    /// marked no mailbox for any role but the inbox. INBOX is always the
+    /// inbox.
     pub fn detect(listed: &[ListedMailbox], overrides: &[(FolderRole, String)]) -> Self {
         let mut found: Vec<RoleFolder> = Vec::new();
         let put = |found: &mut Vec<RoleFolder>, folder: RoleFolder| {
@@ -246,7 +247,10 @@ impl FolderRoles {
         for mailbox in listed {
             for attribute in &mailbox.attributes {
                 if let Some(role) = FolderRole::from_attribute(attribute) {
-                    marked = true;
+                    // XLIST's `\Inbox` can name an inbox not called INBOX,
+                    // but it is not RFC 6154: a server that marks only its
+                    // inbox has said nothing about Sent or Trash.
+                    marked |= role != FolderRole::Inbox;
                     put(&mut found, role_folder(role, mailbox, RoleSource::Server));
                 }
             }
@@ -263,14 +267,15 @@ impl FolderRoles {
 
     /// Roles for an account no server has listed yet (the demo mailbox, or
     /// mail stored before roles were recorded): the name table over the
-    /// folder names already stored.
+    /// folder names already stored. The delimiter is not stored, so a name
+    /// under INBOX may use either `/` or `.` (`INBOX.Sent`).
     pub fn from_names(names: &[String]) -> Self {
         let listed: Vec<ListedMailbox> = names
             .iter()
             .map(|name| ListedMailbox {
                 raw: name.clone(),
                 name: name.clone(),
-                delimiter: Some('/'),
+                delimiter: Some(stored_delimiter(name)),
                 attributes: Vec::new(),
             })
             .collect();
@@ -337,6 +342,36 @@ impl FolderRoles {
         }
     }
 
+    /// The folder's own name, when its label alone reads like another
+    /// folder in `names`: on Gmail `[Gmail]/Sent Mail` shows as "Sent", and
+    /// so does a label called `Sent`. Only the folder shown under a role's
+    /// label gets one; a folder shown under its own name never does, and
+    /// neither does any folder when no label is shared.
+    pub fn label_detail<'a>(&self, folder: &'a str, names: &[String]) -> Option<&'a str> {
+        let label = self.label(folder);
+        if label.eq_ignore_ascii_case(folder) {
+            return None;
+        }
+        names
+            .iter()
+            .map(String::as_str)
+            .chain(self.folders.iter().map(|have| have.name.as_str()))
+            .filter(|other| !other.eq_ignore_ascii_case(folder))
+            .any(|other| self.label(other).eq_ignore_ascii_case(&label))
+            .then_some(folder)
+    }
+
+    /// [`Self::label`] on one line of text, with the folder's own name in
+    /// brackets when [`Self::label_detail`] has one: `Sent ([Gmail]/Sent
+    /// Mail)`.
+    pub fn label_among(&self, folder: &str, names: &[String]) -> String {
+        let label = self.label(folder);
+        match self.label_detail(folder, names) {
+            Some(name) => format!("{label} ({name})"),
+            None => label,
+        }
+    }
+
     /// Folders for the picker: Inbox, Sent, Drafts, Archive, Spam, and Trash
     /// always, then All Mail and Starred when the account has them, then the
     /// rest of `stored` in order. Each folder appears once.
@@ -371,6 +406,15 @@ fn role_folder(role: FolderRole, mailbox: &ListedMailbox, source: RoleSource) ->
         name: mailbox.name.clone(),
         raw: mailbox.raw.clone(),
         source,
+    }
+}
+
+/// The hierarchy delimiter a stored name seems to use: `.` for a name
+/// directly under INBOX written `INBOX.`, else `/`.
+fn stored_delimiter(name: &str) -> char {
+    match name.get(..6) {
+        Some(head) if head.eq_ignore_ascii_case("INBOX.") => '.',
+        _ => '/',
     }
 }
 
@@ -504,6 +548,105 @@ mod tests {
         );
         assert_eq!(marked.name(FolderRole::Sent), "Sent Items");
         assert_eq!(marked.get(FolderRole::Trash), None);
+    }
+
+    #[test]
+    fn an_xlist_inbox_alone_still_leaves_the_name_table_on() {
+        let roles = FolderRoles::detect(
+            &[
+                mailbox("INBOX", &["\\Inbox", "\\HasNoChildren"]),
+                mailbox("Sent Items", &["\\HasNoChildren"]),
+                mailbox("Deleted Messages", &["\\HasNoChildren"]),
+            ],
+            &[],
+        );
+        assert_eq!(roles.name(FolderRole::Inbox), "INBOX");
+        assert_eq!(roles.name(FolderRole::Sent), "Sent Items");
+        assert_eq!(roles.name(FolderRole::Trash), "Deleted Messages");
+        assert_eq!(
+            roles.get(FolderRole::Sent).unwrap().source,
+            RoleSource::Name
+        );
+
+        // `\Inbox` still names an inbox that is not called INBOX.
+        let roles = FolderRoles::detect(
+            &[mailbox("Posteingang", &["\\Inbox"]), mailbox("Sent", &[])],
+            &[],
+        );
+        assert_eq!(roles.name(FolderRole::Inbox), "Posteingang");
+        assert_eq!(roles.name(FolderRole::Sent), "Sent");
+        assert_eq!(
+            roles.get(FolderRole::Sent).unwrap().source,
+            RoleSource::Name
+        );
+    }
+
+    #[test]
+    fn a_label_named_like_a_role_is_told_apart_from_the_role_folder() {
+        let roles = FolderRoles::detect(
+            &[
+                mailbox("INBOX", &[]),
+                mailbox("[Gmail]/Sent Mail", &["\\Sent"]),
+                mailbox("[Gmail]/Spam", &["\\Junk"]),
+                mailbox("[Gmail]/Trash", &["\\Trash"]),
+                mailbox("Sent", &[]),
+                mailbox("Receipts", &[]),
+            ],
+            &[],
+        );
+        let names: Vec<String> = [
+            "INBOX",
+            "[Gmail]/Sent Mail",
+            "[Gmail]/Spam",
+            "Sent",
+            "Receipts",
+        ]
+        .map(String::from)
+        .to_vec();
+        // Both read "Sent": the server's folder says which it is, the
+        // label stays plain.
+        assert_eq!(roles.label("[Gmail]/Sent Mail"), "Sent");
+        assert_eq!(roles.label("Sent"), "Sent");
+        assert_eq!(
+            roles.label_detail("[Gmail]/Sent Mail", &names),
+            Some("[Gmail]/Sent Mail")
+        );
+        assert_eq!(roles.label_detail("Sent", &names), None);
+        assert_eq!(
+            roles.label_among("[Gmail]/Sent Mail", &names),
+            "Sent ([Gmail]/Sent Mail)"
+        );
+        assert_eq!(roles.label_among("Sent", &names), "Sent");
+        // No collision, no detail.
+        assert_eq!(roles.label_detail("[Gmail]/Spam", &names), None);
+        assert_eq!(roles.label_detail("[Gmail]/Trash", &names), None);
+        assert_eq!(roles.label_detail("Receipts", &names), None);
+        assert_eq!(roles.label_detail("INBOX", &names), None);
+
+        // A case-only difference still reads the same.
+        let names = vec!["[Gmail]/Spam".to_string(), "spam".to_string()];
+        assert_eq!(
+            roles.label_detail("[Gmail]/Spam", &names),
+            Some("[Gmail]/Spam")
+        );
+        assert_eq!(roles.label_detail("spam", &names), None);
+    }
+
+    #[test]
+    fn stored_names_under_inbox_match_with_either_delimiter() {
+        let dotted = FolderRoles::from_names(&[
+            "INBOX".into(),
+            "INBOX.Sent".into(),
+            "INBOX.Trash".into(),
+            "INBOX.Work".into(),
+        ]);
+        assert_eq!(dotted.name(FolderRole::Sent), "INBOX.Sent");
+        assert_eq!(dotted.name(FolderRole::Trash), "INBOX.Trash");
+        assert_eq!(dotted.label("INBOX.Sent"), "Sent");
+        assert_eq!(dotted.role_of("INBOX.Work"), None);
+
+        let slashed = FolderRoles::from_names(&["INBOX".into(), "INBOX/Drafts".into()]);
+        assert_eq!(slashed.name(FolderRole::Drafts), "INBOX/Drafts");
     }
 
     #[test]

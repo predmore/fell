@@ -386,7 +386,7 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
         attachment_names: Vec::new(),
     };
     // The folder line is replaced below, so no account roles are needed.
-    let mut shown = conversation(&[message], me, &FolderRoles::default());
+    let mut shown = conversation(&[message], me, &FolderRoles::default(), &[]);
     for message in &mut shown {
         message.folders = if draft.maybe_sent {
             "Draft · may have been sent · check Sent before sending again".into()
@@ -422,8 +422,15 @@ fn address_name(raw: &str) -> String {
     }
 }
 
-/// `roles` names each message's folders the way the account uses them.
-pub fn conversation(messages: &[Message], me: &str, roles: &FolderRoles) -> Vec<ConvMessage> {
+/// `roles` names each message's folders the way the account uses them;
+/// `names` are the account's folders, so a label that two folders share
+/// carries the folder's own name ([`FolderRoles::label_among`]).
+pub fn conversation(
+    messages: &[Message],
+    me: &str,
+    roles: &FolderRoles,
+    names: &[String],
+) -> Vec<ConvMessage> {
     let last = messages.len().saturating_sub(1);
     messages
         .iter()
@@ -437,7 +444,7 @@ pub fn conversation(messages: &[Message], me: &str, roles: &FolderRoles) -> Vec<
                 folders: message
                     .folders
                     .iter()
-                    .map(|folder| roles.label(folder))
+                    .map(|folder| roles.label_among(folder, names))
                     .collect::<Vec<_>>()
                     .join(" · "),
                 date_unix: message.headers.date_unix,
@@ -1102,6 +1109,7 @@ mod tests {
             ],
             "me@x",
             &FolderRoles::default(),
+            &[],
         );
         assert!(!messages[0].expanded);
         assert!(!messages[1].expanded);

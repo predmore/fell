@@ -642,6 +642,7 @@ impl Inbox {
         let account = self.account_id.clone();
         let me = self.session.account_email.clone();
         let roles = self.session.roles.clone();
+        let names = self.session.folders.clone();
         let thread = id.clone();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
@@ -650,7 +651,7 @@ impl Inbox {
             Some(
                 store
                     .thread_messages(&account, &ThreadId(thread))
-                    .map(|messages| present::conversation(&messages, &me, &roles))
+                    .map(|messages| present::conversation(&messages, &me, &roles, &names))
                     .map_err(|err| err.to_string()),
             )
         });
@@ -877,7 +878,7 @@ impl Inbox {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
                     inbox.moved_thread = key;
-                    let label = inbox.session.roles.label(&destination);
+                    let label = inbox.session.folder_text(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
                     Some(ReadIntent {
                         changed: true,
@@ -1562,11 +1563,31 @@ fn header(theme: &Theme, session: &Session) -> gpui::Div {
         .child(div().flex_1())
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(session.folder_title()),
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(6.))
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(session.folder_title()),
+                )
+                // The folder's own name gives way first in a narrow window.
+                .children(session.folder_title_detail().map(|name| {
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(theme.dimmed))
+                        .child(name)
+                })),
         )
         .child(
             div()
+                .flex_none()
                 .text_color(rgb(if unread > 0 {
                     theme.accent
                 } else {
@@ -2796,6 +2817,12 @@ fn folder_picker(
                 .children(choices.iter().enumerate().map(|(index, name)| {
                     let name = name.clone();
                     let label = session.roles.label(&name);
+                    let detail = session.folder_detail(&name);
+                    let detail_color = if index == selected {
+                        theme.on_selection_dim
+                    } else {
+                        theme.dimmed
+                    };
                     div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(34.))
@@ -2834,7 +2861,18 @@ fn folder_picker(
                                 );
                             }),
                         )
-                        .child(label)
+                        .gap(px(8.))
+                        .overflow_hidden()
+                        .child(div().flex_none().child(label))
+                        .children(detail.map(|name| {
+                            div()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(rgb(detail_color))
+                                .child(name)
+                        }))
                 })),
         )
 }
