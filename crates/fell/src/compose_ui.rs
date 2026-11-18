@@ -2412,8 +2412,10 @@ fn reply_row(
             }
             context_row("In reply to", &who, &what, Some(when), colors)
         }
+        // The original is gone from the mailbox: said in words, as the
+        // drafts list says it, not as a raw Message-ID.
         (None, Some(id)) if !id.trim().is_empty() => {
-            context_row("In reply to", &display_safe(id), "", None, colors)
+            context_row("In reply to", crate::present::REPLY_GONE, "", None, colors)
         }
         _ => context_row("In reply to", "none (new message)", "", None, colors),
     }

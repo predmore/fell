@@ -342,9 +342,13 @@ pub fn draft_row_id(id: &str) -> String {
     format!("draft:{id}")
 }
 
+/// What an original no longer in the mailbox reads as, after "In reply
+/// to", in the drafts list and in the compose window.
+pub const REPLY_GONE: &str = "a message not in this mailbox";
+
 /// Rows for compose drafts, shown above the synced Drafts folder: who the
-/// draft is to, a `draft` chip (or `may have been sent`), and the agent it
-/// belongs to.
+/// draft is to, `check Sent` when it may have gone out, and the agent it
+/// belongs to. Inside Drafts every row is a draft, so none says so.
 pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
     drafts
         .iter()
@@ -358,11 +362,10 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
             // "to Ada": the column names who a draft is to, not who sent
             // it, as it does for threads.
             let spans = to_spans(&names);
-            let mut labels = vec![if draft.maybe_sent {
-                "check Sent".to_string()
-            } else {
-                "draft".to_string()
-            }];
+            let mut labels = Vec::new();
+            if draft.maybe_sent {
+                labels.push("check Sent".to_string());
+            }
             let agent: String = draft
                 .owner
                 .trim_start_matches("agent:")
@@ -447,7 +450,9 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
     let mut shown = conversation(&[message], me, &FolderRoles::default(), &[]);
     for message in &mut shown {
         message.folders = if draft.maybe_sent {
-            "Draft · may have been sent · check Sent before sending again".into()
+            // The row's chip says what to do, in the error colour; here,
+            // only why, so the warning is said once.
+            "Draft · may have been sent".into()
         } else {
             "Draft".into()
         };
@@ -494,13 +499,13 @@ pub fn draft_context(draft: &DraftSummary, me: &str, now: i64) -> Option<String>
             Some(parent.date_unix),
         ));
     }
-    // The original is gone from the mailbox: its id, as the editor shows.
-    if let Some(id) = draft
+    // The original is gone from the mailbox: say so, not its raw id.
+    if draft
         .in_reply_to
         .as_deref()
-        .filter(|id| !id.trim().is_empty())
+        .is_some_and(|id| !id.trim().is_empty())
     {
-        return Some(line("In reply to", id, "", None));
+        return Some(line("In reply to", REPLY_GONE, "", None));
     }
     draft.forwarded.as_ref().map(|forward| {
         // The block's Date line is wall-clock time where it was written.
@@ -1192,6 +1197,26 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_row_names_only_what_sets_it_apart() {
+        // Round 3: every row in Drafts is a draft, so a `draft` chip was
+        // noise; the agent it belongs to still shows.
+        let mine = draft("hi\n");
+        assert!(draft_rows(std::slice::from_ref(&mine))[0].labels.is_empty());
+        let mut agents = mine.clone();
+        agents.owner = "agent:bot".into();
+        assert_eq!(draft_rows(&[agents])[0].labels, vec!["bot"]);
+        // A draft that may have gone out says "check Sent" once, in the
+        // error colour on its row; the preview says only why.
+        let mut maybe = mine;
+        maybe.maybe_sent = true;
+        let row = &draft_rows(&[maybe.clone()])[0];
+        assert_eq!(row.labels, vec!["check Sent"]);
+        assert!(row.warn);
+        let shown = draft_conversation(&maybe, "me@example.com", 2_000);
+        assert_eq!(shown[0].folders, "Draft · may have been sent");
+    }
+
+    #[test]
     fn a_draft_row_and_preview_show_an_unnamed_address_as_typed() {
         // #160: "fell-qa-test@example.com" read as "Fell-qa-test".
         let row = &draft_rows(&[draft("hi\n")])[0];
@@ -1255,12 +1280,12 @@ mod tests {
         });
         let line = draft_context(&mine, "me@example.com", 2_000).unwrap();
         assert!(line.starts_with("In reply to me · Plans"), "{line}");
-        // The original is not in the mailbox: its id, as the editor shows.
+        // The original is not in the mailbox: said in words, not its id.
         let mut gone = draft("hi\n");
         gone.in_reply_to = Some("<lost\u{202e}@example.com>".into());
         assert_eq!(
             draft_context(&gone, "me@example.com", 2_000).as_deref(),
-            Some("In reply to <lost@example.com>")
+            Some("In reply to a message not in this mailbox")
         );
     }
 

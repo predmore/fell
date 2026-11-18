@@ -3271,11 +3271,11 @@ fn expanded_message(
                         .child(message.email.clone()),
                 )
                 .when(!message.folders.is_empty(), |row| {
-                    // A draft that may have gone out says so as its row does.
-                    let warn = message.folders.contains("may have been sent");
+                    // A draft that may have gone out: its row's chip carries
+                    // the warning colour, so this says why once, quietly.
                     row.child(
                         div()
-                            .text_color(rgb(if warn { theme.error } else { dim }))
+                            .text_color(rgb(dim))
                             .text_size(px(theme.ui_px - 1.0))
                             .child(message.folders.clone()),
                     )
