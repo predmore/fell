@@ -603,6 +603,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_agent_reply_in_a_long_old_thread_keeps_its_root() {
+        // Synced before In-Reply-To was appended: [mid, root, m0..m19].
+        let account = me();
+        let home = temp_home("agent-long", &account);
+        let store = fell_core::Store::open(&home.store).unwrap();
+        let mut parent = parent_message(&account);
+        parent.headers.in_reply_to = Some(fell_core::MessageId::new("mid@x"));
+        let mut chain = vec![
+            fell_core::MessageId::new("mid@x"),
+            fell_core::MessageId::new("root@x"),
+        ];
+        chain.extend((0..20).map(|n| fell_core::MessageId::new(format!("m{n}@x"))));
+        parent.headers.references = chain;
+        store.upsert_message(&parent).unwrap();
+        store
+            .save_compose(&fell_core::compose::StoredCompose {
+                id: "c1".into(),
+                account_id: account.id.clone(),
+                fields: DraftFields {
+                    from: account.email.clone(),
+                    to: vec!["ada@x".into()],
+                    subject: "Re: Plans".into(),
+                    in_reply_to: Some("parent@x".into()),
+                    ..DraftFields::default()
+                },
+                body: "Yes.\n".into(),
+                files: Vec::new(),
+                identities: vec![account.email.clone()],
+                owner: String::new(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        drop(store);
+        let hub = DraftHub::new();
+        home.open(&hub, "c1", &account.id).unwrap();
+        let references = hub
+            .with_session("c1", |session| session.reply_parts().references.clone())
+            .unwrap();
+        assert_eq!(references.len(), fell_core::compose::MAX_REFERENCES);
+        assert_eq!(&references[..2], ["mid@x", "root@x"]);
+        assert_eq!(references.last().map(String::as_str), Some("parent@x"));
+    }
+
+    #[test]
     fn a_new_draft_whose_folder_cannot_be_made_leaves_no_row() {
         let account = me();
         let home = temp_home("no-folder", &account);

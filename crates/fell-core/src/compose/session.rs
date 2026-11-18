@@ -427,13 +427,9 @@ impl DraftSession {
                 .ok()
                 .flatten();
             if let Some(message) = found {
-                let chain: Vec<String> = message
-                    .headers
-                    .references
-                    .iter()
-                    .map(|id| id.as_str().to_string())
-                    .collect();
-                session.reply.references = super::reply::build_references(&chain, parent);
+                // The rule a reply started here uses, so a long chain keeps
+                // its root either way.
+                session.reply.references = super::reply::reply_references(&message, parent);
             }
         }
         session.issues = parsed.issues;

@@ -75,26 +75,6 @@ pub fn start_reply_in_zone(
     match kind {
         ReplyKind::Reply | ReplyKind::ReplyAll => {
             let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll);
-            let references: Vec<String> = parent
-                .headers
-                .references
-                .iter()
-                .map(|id| id.as_str().to_string())
-                .collect();
-            // Mail synced before In-Reply-To was appended has it in front of
-            // the chain it was missing from, so the root may be second. The
-            // order stays as sent; a capped chain keeps both heads.
-            let head = if references.len() > 1
-                && parent
-                    .headers
-                    .in_reply_to
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == references[0])
-            {
-                2
-            } else {
-                1
-            };
             let (quote_text, quote_html) = reply_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
@@ -106,7 +86,7 @@ pub fn start_reply_in_zone(
                     ..DraftFields::default()
                 },
                 parts: ReplyParts {
-                    references: build_references_keeping(&references, parent_id, head),
+                    references: reply_references(parent, parent_id),
                     quote_text,
                     quote_html,
                 },
@@ -232,6 +212,32 @@ pub fn reply_recipients(parent: &Message, own: &[String], all: bool) -> (Vec<Str
         }
     }
     (to, cc)
+}
+
+/// The References a reply to `parent` sends. Mail synced before In-Reply-To
+/// was appended has it in front of the chain it was missing from, so the
+/// root may be second: the order stays as sent, and a cap keeps both heads.
+/// `parent_id` is the id the reply cites, which may be an alias of the
+/// stored row's.
+pub fn reply_references(parent: &Message, parent_id: &str) -> Vec<String> {
+    let references: Vec<String> = parent
+        .headers
+        .references
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect();
+    let head = if references.len() > 1
+        && parent
+            .headers
+            .in_reply_to
+            .as_ref()
+            .is_some_and(|id| id.as_str() == references[0])
+    {
+        2
+    } else {
+        1
+    };
+    build_references_keeping(&references, parent_id, head)
 }
 
 /// References for a reply: the parent's References and then the parent's
