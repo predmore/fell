@@ -74,8 +74,8 @@ pub enum Settle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedBody {
     pub remote_id: crate::RemoteId,
-    /// The RFC 822 message. `None` when the server answered without this copy
-    /// (expunged, too large, or a new UIDVALIDITY).
+    /// The RFC 822 message. `None` when the server no longer has this copy
+    /// (expunged, too large, a refused mailbox, or a new UIDVALIDITY).
     pub raw: Option<Vec<u8>>,
 }
 
@@ -124,8 +124,10 @@ pub trait MailBackend {
     }
 
     /// Fetch stored copies again by remote id, for body parts the store does
-    /// not have yet. Read-only: nothing is marked read. A copy that could not
-    /// be asked about is left out. Backends with nothing to fetch return none.
+    /// not have yet. Read-only: nothing is marked read. A copy the server
+    /// answered without comes back with `raw: None`; one not fetched this
+    /// time (a byte cap) is left out and asked for again later. A refused or
+    /// cut-short fetch is an error. Backends with nothing to fetch return none.
     fn fetch_bodies(&self, _copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         Ok(Vec::new())
     }

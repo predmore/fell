@@ -2995,3 +2995,101 @@ fn a_new_uidvalidity_records_old_copies_without_bodies() {
         Some(crate::MessageParts::default())
     );
 }
+
+/// A synced store whose mail is queued again, as if stored before parts.
+fn synced_without_parts(server: &TestServer, acct: &Account, backend: &ImapBackend) -> Store {
+    let store = Store::open_in_memory().unwrap();
+    sync_once(acct, backend, &store).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "DELETE FROM message_bodies;
+             INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+        )
+        .unwrap();
+    server.state.lock().expect("state").commands.clear();
+    store
+}
+
+#[test]
+fn a_refused_or_cut_short_body_fetch_stores_nothing_and_is_tried_again() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = synced_without_parts(&server, &acct, &backend);
+    let queued = store.missing_bodies(&acct.id, 100).unwrap();
+    let body = |id: &str| {
+        store
+            .message_body(&acct.id, &crate::MessageId::new(id))
+            .unwrap()
+    };
+
+    mailbox(&mut server.state.lock().expect("state"), "INBOX").reject_fetch = true;
+    assert!(crate::fetch_missing_bodies(&acct.id, &backend, &store, 5).is_err());
+    assert_eq!(body("root@x"), None, "not recorded as gone");
+    assert_eq!(store.missing_bodies(&acct.id, 100).unwrap(), queued);
+    mailbox(&mut server.state.lock().expect("state"), "INBOX").reject_fetch = false;
+
+    {
+        // A reply cut off past the untagged cap.
+        let _limit = super::session::limit_untagged_to(2);
+        assert!(crate::fetch_missing_bodies(&acct.id, &backend, &store, 5).is_err());
+    }
+    assert_eq!(body("root@x"), None);
+    assert_eq!(store.missing_bodies(&acct.id, 100).unwrap(), queued);
+
+    assert_eq!(
+        crate::fetch_missing_bodies(&acct.id, &backend, &store, 5).unwrap(),
+        queued.len()
+    );
+    assert_eq!(
+        body("root@x").unwrap().plain.as_deref().map(str::trim),
+        Some("hello body")
+    );
+    assert_read_only(&server);
+}
+
+#[test]
+fn a_body_backfill_batch_stops_at_its_byte_cap() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = synced_without_parts(&server, &acct, &backend);
+    let queued = store.missing_bodies(&acct.id, 100).unwrap().len();
+    assert!(queued > 2, "{queued}");
+    let _cap = super::bodies::limit_body_bytes(1);
+    // Each batch keeps one message's source and asks for the rest later.
+    assert_eq!(
+        crate::fetch_missing_bodies(&acct.id, &backend, &store, 1).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.missing_bodies(&acct.id, 100).unwrap().len(),
+        queued - 1
+    );
+    let fetches = commands(&server)
+        .iter()
+        .filter(|line| line.contains("UID FETCH"))
+        .count();
+    assert_eq!(fetches, 1, "no fetch is sent past the cap");
+    assert_eq!(
+        crate::fetch_missing_bodies(&acct.id, &backend, &store, 100).unwrap(),
+        queued - 1
+    );
+    assert!(store.missing_bodies(&acct.id, 100).unwrap().is_empty());
+    let empty = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_bodies WHERE html IS NULL AND plain IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(empty, 0, "nothing deferred was recorded as gone");
+}

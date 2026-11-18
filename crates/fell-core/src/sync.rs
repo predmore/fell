@@ -52,7 +52,9 @@ pub fn sync_with_progress(
 /// A copy the server no longer has, or whose mailbox it refuses, falls back
 /// to the message's next copy; when none is left, the message is recorded as
 /// fetched so later passes do not ask again ([`fetch_message_body`] still
-/// does). A connection error stores nothing, so the batch is tried again.
+/// does). A connection error, or a fetch the server refused or cut short,
+/// stores nothing for that batch, so it is tried again. A batch holds about
+/// 8 MB of message source at most; the rest waits for the next batch.
 pub fn fetch_missing_bodies(
     account_id: &AccountId,
     backend: &dyn MailBackend,
@@ -87,7 +89,13 @@ pub fn fetch_message_body(
     store.message_body(account_id, message_id)
 }
 
-/// Fetch `wanted` and record every one of them. Returns how many were recorded.
+/// Fetch `wanted` and record what the server answered. Returns how many
+/// were recorded.
+///
+/// A copy the server no longer has falls back to the message's next copy,
+/// and a message with none left is recorded without parts. A copy the
+/// backend left out (its byte cap was reached) keeps the message queued, and
+/// no further copies are asked for in this call.
 fn fetch_bodies(
     account_id: &AccountId,
     backend: &dyn MailBackend,
@@ -106,24 +114,30 @@ fn fetch_bodies(
         if asks.is_empty() {
             break;
         }
-        let answers = backend.fetch_bodies(&asks)?;
+        let mut answers: std::collections::HashMap<RemoteId, Option<Vec<u8>>> = backend
+            .fetch_bodies(&asks)?
+            .into_iter()
+            .map(|answer| (answer.remote_id, answer.raw))
+            .collect();
         let mut next = Vec::new();
+        let mut capped = false;
         for request in waiting {
             let Some(asked) = request.copies.get(round) else {
                 continue;
             };
-            let raw = answers
-                .iter()
-                .find(|answer| &answer.remote_id == asked)
-                .and_then(|answer| answer.raw.as_deref());
-            match raw {
-                Some(raw) => results.push((
+            match answers.remove(asked) {
+                // Parsed one at a time, so each source is dropped once read.
+                Some(Some(raw)) => results.push((
                     request.message_id.clone(),
-                    Some(crate::imap::parts_from_raw(raw)),
+                    Some(crate::imap::parts_from_raw(&raw)),
                 )),
-                None if round + 1 < request.copies.len() => next.push(request),
-                None => results.push((request.message_id.clone(), None)),
+                Some(None) if round + 1 < request.copies.len() => next.push(request),
+                Some(None) => results.push((request.message_id.clone(), None)),
+                None => capped = true,
             }
+        }
+        if capped {
+            break;
         }
         waiting = next;
         round += 1;
