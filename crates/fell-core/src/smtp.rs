@@ -69,11 +69,42 @@ impl Endpoint {
 }
 
 pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
-    if endpoint.username.is_empty() {
-        return Err(smtp_err("SMTP username is empty"));
-    }
     if pending.mime.is_empty() {
         return Err(smtp_err("smtp: message is empty"));
+    }
+    let from = sender(&pending.mime)?;
+    let recipients = envelope(&pending.draft)?;
+    let (mut pipe, hello) = login(endpoint)?;
+    let mail_from = if offers(&hello, "8BITMIME") {
+        format!("MAIL FROM:<{from}> BODY=8BITMIME")
+    } else {
+        format!("MAIL FROM:<{from}>")
+    };
+    expect(command(&mut pipe, &mail_from)?, 250, "MAIL FROM")?;
+    for recipient in &recipients {
+        expect(
+            command(&mut pipe, &format!("RCPT TO:<{recipient}>"))?,
+            250,
+            "RCPT TO",
+        )?;
+    }
+    expect(command(&mut pipe, "DATA")?, 354, "DATA")?;
+    transfer(&mut pipe, &pending.mime)
+}
+
+/// Log in and quit: greeting, `EHLO`, `STARTTLS` when the account asks for
+/// it, `AUTH`, `QUIT`. Never `MAIL FROM`, so nothing can be sent.
+pub(crate) fn check_login(endpoint: &Endpoint) -> Result<()> {
+    let (mut pipe, _) = login(endpoint)?;
+    let _ = command(&mut pipe, "QUIT");
+    Ok(())
+}
+
+/// Connect and authenticate. Returns the session and the last `EHLO` reply.
+/// Every refusal here comes before any envelope command.
+fn login(endpoint: &Endpoint) -> Result<(Pipe, Reply)> {
+    if endpoint.username.is_empty() {
+        return Err(smtp_err("SMTP username is empty"));
     }
     let loopback = host_is_loopback(&endpoint.host);
     if endpoint.accept_invalid_certs && !loopback {
@@ -86,8 +117,6 @@ pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<Stri
             "smtp: plaintext is only allowed for a loopback address like 127.0.0.1",
         ));
     }
-    let from = sender(&pending.mime)?;
-    let recipients = envelope(&pending.draft)?;
     let tcp = connect(&endpoint.host, endpoint.port)?;
     let mut pipe = match endpoint.security {
         ImapSecurity::Tls => Pipe::tls(wrap_tcp_as_tls(
@@ -110,21 +139,7 @@ pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<Stri
         hello = expect(command(&mut pipe, "EHLO localhost")?, 250, "EHLO")?;
     }
     authenticate(&mut pipe, &hello, endpoint)?;
-    let mail_from = if offers(&hello, "8BITMIME") {
-        format!("MAIL FROM:<{from}> BODY=8BITMIME")
-    } else {
-        format!("MAIL FROM:<{from}>")
-    };
-    expect(command(&mut pipe, &mail_from)?, 250, "MAIL FROM")?;
-    for recipient in &recipients {
-        expect(
-            command(&mut pipe, &format!("RCPT TO:<{recipient}>"))?,
-            250,
-            "RCPT TO",
-        )?;
-    }
-    expect(command(&mut pipe, "DATA")?, 354, "DATA")?;
-    transfer(&mut pipe, &pending.mime)
+    Ok((pipe, hello))
 }
 
 /// Write the message after `354` and read the server's verdict.
@@ -704,6 +719,74 @@ Bcc: this is body text\r\n"
         assert!(!clear.contains("bridge-secret"), "{clear}");
     }
 
+    #[test]
+    fn the_login_check_authenticates_and_sends_nothing() {
+        for (wire, security) in [
+            (Wire::Clear, ImapSecurity::Plain),
+            (Wire::StartTls, ImapSecurity::StartTls),
+            (Wire::Tls, ImapSecurity::Tls),
+        ] {
+            let (port, rx, join) = serve(wire, AfterData::Accept);
+            let backend = backend(port, security);
+            let endpoint = Endpoint::new(&backend.smtp, "bridge-user", "bridge-secret");
+            check_login(&endpoint).unwrap();
+            let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            join.join().unwrap();
+            let mut token = vec![0];
+            token.extend_from_slice(b"bridge-user\0bridge-secret");
+            assert_eq!(got.auth, b64(&token), "{wire:?}");
+            assert!(got.quit, "{wire:?}");
+            assert!(got.from.is_empty() && got.rcpt.is_empty() && got.data.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_login_check_through_the_account_file_classifies_failures() {
+        use crate::{AccountConfig, SyncFailureKind, classify_sync_error};
+
+        let config = |port: u16| {
+            AccountConfig::parse(&format!(
+                "email = \"a@b\"\nusername = \"bridge-user\"\npassword = \"bridge-secret\"\n\
+                 smtp_port = {port}\nsmtp_security = \"plain\"\n"
+            ))
+            .unwrap()
+        };
+        let (port, rx, join) = serve(Wire::Clear, AfterData::Accept);
+        config(port).check_smtp().unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().quit);
+        join.join().unwrap();
+
+        let (port, rx, join) = serve(Wire::Clear, AfterData::RejectAuth);
+        let err = config(port).check_smtp().unwrap_err();
+        assert_eq!(
+            classify_sync_error(&err),
+            SyncFailureKind::LoginRejected,
+            "{err}"
+        );
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        join.join().unwrap();
+
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let err = config(port).check_smtp().unwrap_err();
+        assert_eq!(
+            classify_sync_error(&err),
+            SyncFailureKind::Unreachable,
+            "{err}"
+        );
+
+        // A server without STARTTLS never sees the password.
+        let (port, rx, join) = serve(Wire::Clear, AfterData::Accept);
+        let mut required = config(port);
+        required.smtp_security = Some(ImapSecurity::StartTls);
+        let err = required.check_smtp().unwrap_err();
+        assert!(err.to_string().contains("STARTTLS"), "{err}");
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        join.join().unwrap();
+        assert!(got.auth.is_empty());
+    }
+
     fn assert_delivery(got: &Captured) {
         let mut token = vec![0];
         token.extend_from_slice(b"bridge-user");
@@ -778,6 +861,8 @@ Bcc: this is body text\r\n"
         RejectRcpt,
         /// Close the socket at RCPT TO, before DATA.
         HangupAtRcpt,
+        /// `535` to AUTH.
+        RejectAuth,
     }
 
     struct Captured {
@@ -786,6 +871,7 @@ Bcc: this is body text\r\n"
         rcpt: Vec<String>,
         data: Vec<u8>,
         clear: Vec<u8>,
+        quit: bool,
     }
 
     fn serve(
@@ -842,6 +928,7 @@ Bcc: this is body text\r\n"
             rcpt: Vec::new(),
             data: Vec::new(),
             clear,
+            quit: false,
         };
         loop {
             let line = read_cmd(&mut sock, &mut Vec::new());
@@ -853,7 +940,11 @@ Bcc: this is body text\r\n"
                 write_reply(&mut sock, "250-localhost\r\n250 AUTH PLAIN\r\n");
             } else if let Some(token) = line.strip_prefix("AUTH PLAIN ") {
                 captured.auth = token.to_string();
-                write_reply(&mut sock, "235 ok\r\n");
+                if after == AfterData::RejectAuth {
+                    write_reply(&mut sock, "535 5.7.8 Authentication failed\r\n");
+                } else {
+                    write_reply(&mut sock, "235 ok\r\n");
+                }
             } else if upper.starts_with("MAIL FROM:") {
                 captured.from = angles(&line);
                 write_reply(&mut sock, "250 ok\r\n");
@@ -873,6 +964,7 @@ Bcc: this is body text\r\n"
                     _ => write_reply(&mut sock, "250 queued as test-id\r\n"),
                 }
             } else if upper.starts_with("QUIT") {
+                captured.quit = true;
                 write_reply(&mut sock, "221 bye\r\n");
                 break;
             } else {

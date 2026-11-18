@@ -12,7 +12,7 @@ use crate::mailbox::{load_account_file, write_account_config};
 const USAGE: &str = "\
 fell account setup [options]   write ~/.config/fell/account.toml after a login check
 fell account show              print the account file without the password
-fell account check             log in with the account file and log out
+fell account check             log in to IMAP and SMTP with the account file, send nothing
 
 setup options (anything missing is asked for on a terminal):
   --imap                       a plain IMAP account instead of Proton Mail Bridge
@@ -23,6 +23,11 @@ setup options (anything missing is asked for on a terminal):
   --password-command CMD       run CMD (sh -c) for the password at each sync
   --host HOST --port PORT      default 127.0.0.1:1143 for Bridge, PORT 993 for IMAP
   --security starttls|tls|plain
+  --smtp-host HOST --smtp-port PORT
+                               where mail goes; default the IMAP host, and
+                               1025 for Bridge or 465/587 for IMAP
+  --smtp-security starttls|tls|plain
+                               default tls on port 465, otherwise starttls
   --no-check                   write the file without logging in first";
 
 /// Run `fell account ...`. Returns the process exit code.
@@ -57,7 +62,16 @@ struct Flags {
     host: Option<String>,
     port: Option<u16>,
     security: Option<ImapSecurity>,
+    smtp: SmtpFlags,
     no_check: bool,
+    help: bool,
+}
+
+#[derive(Debug, Default)]
+struct SmtpFlags {
+    host: Option<String>,
+    port: Option<u16>,
+    security: Option<ImapSecurity>,
 }
 
 fn parse_flags(args: &[String]) -> Result<Flags, String> {
@@ -77,20 +91,15 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--password-stdin" => flags.password_stdin = true,
             "--password-command" => flags.password_command = Some(value("--password-command")?),
             "--host" => flags.host = Some(value("--host")?),
-            "--port" => {
-                let raw = value("--port")?;
-                flags.port = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
-            }
-            "--security" => {
-                flags.security = Some(match value("--security")?.as_str() {
-                    "starttls" => ImapSecurity::StartTls,
-                    "tls" => ImapSecurity::Tls,
-                    "plain" => ImapSecurity::Plain,
-                    other => return Err(format!("bad --security {other:?}")),
-                });
+            "--port" => flags.port = Some(port(&value("--port")?)?),
+            "--security" => flags.security = Some(security("--security", &value("--security")?)?),
+            "--smtp-host" => flags.smtp.host = Some(value("--smtp-host")?),
+            "--smtp-port" => flags.smtp.port = Some(port(&value("--smtp-port")?)?),
+            "--smtp-security" => {
+                flags.smtp.security = Some(security("--smtp-security", &value("--smtp-security")?)?)
             }
             "--no-check" => flags.no_check = true,
-            "--help" | "-h" => return Err(USAGE.into()),
+            "--help" | "-h" => flags.help = true,
             other => return Err(format!("unknown option {other:?}\n\n{USAGE}")),
         }
     }
@@ -100,8 +109,77 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     Ok(flags)
 }
 
+fn port(raw: &str) -> Result<u16, String> {
+    match raw.parse() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(format!("bad port {raw:?}")),
+    }
+}
+
+fn security(flag: &str, raw: &str) -> Result<ImapSecurity, String> {
+    match raw {
+        "starttls" => Ok(ImapSecurity::StartTls),
+        "tls" => Ok(ImapSecurity::Tls),
+        "plain" => Ok(ImapSecurity::Plain),
+        other => Err(format!("bad {flag} {other:?} (starttls, tls, or plain)")),
+    }
+}
+
+/// Where the account sends mail. A flag wins; on a terminal an IMAP
+/// account is asked for host and port, defaulting to what
+/// [`AccountConfig::smtp_config`] picks. Security follows the port (465 is
+/// implicit TLS, anything else STARTTLS) unless `--smtp-security` says
+/// otherwise; plaintext is never chosen for you. Only keys that differ from
+/// those defaults are stored, so the file stays as short as before.
+fn choose_smtp(
+    config: &mut AccountConfig,
+    flags: &SmtpFlags,
+    ask: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+) -> Result<(), String> {
+    let defaults = config.smtp_config();
+    let host = match &flags.host {
+        Some(host) => host.clone(),
+        None => ask("SMTP host", &defaults.host)?,
+    };
+    let port_for = |config: &AccountConfig, security| {
+        let mut probe = config.clone();
+        probe.smtp_security = Some(security);
+        probe.smtp_port = None;
+        probe.smtp_config().port
+    };
+    let (port, security) = match (flags.port, flags.security) {
+        (Some(port), Some(security)) => (port, security),
+        (None, Some(security)) => {
+            let default = port_for(config, security).to_string();
+            (self::port(&ask("SMTP port", &default)?)?, security)
+        }
+        (port, None) => {
+            let port = match port {
+                Some(port) => port,
+                None => self::port(&ask("SMTP port", &defaults.port.to_string())?)?,
+            };
+            let security = if port == defaults.port {
+                defaults.security
+            } else if port == 465 {
+                ImapSecurity::Tls
+            } else {
+                ImapSecurity::StartTls
+            };
+            (port, security)
+        }
+    };
+    config.smtp_host = (host != config.host).then_some(host);
+    config.smtp_security = (security != defaults.security).then_some(security);
+    config.smtp_port = (port != port_for(config, security)).then_some(port);
+    Ok(())
+}
+
 fn setup(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args)?;
+    if flags.help {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let tty = io::stdin().is_terminal() && !flags.password_stdin;
     let backend = if flags.imap {
         BackendKind::Imap
@@ -176,19 +254,25 @@ fn setup(args: &[String]) -> Result<(), String> {
     if let Some(port) = flags.port {
         config.port = port;
     }
+    // Bridge's SMTP is on this machine at a fixed port; only an IMAP
+    // account is asked where it sends.
+    let ask_smtp = tty && backend == BackendKind::Imap;
+    choose_smtp(&mut config, &flags.smtp, &mut |label, default| {
+        if ask_smtp {
+            prompt(label, Some(default))
+        } else {
+            Ok(default.to_string())
+        }
+    })?;
     // Same rules the app applies when it reads the file back.
     let config = AccountConfig::parse(&config.render()).map_err(|err| err.to_string())?;
 
     if !flags.no_check {
-        print!("Logging in to {}:{} … ", config.host, config.port);
-        let _ = io::stdout().flush();
-        match config.check_login() {
-            Ok(count) => println!("ok, {count} folders"),
-            Err(err) => {
-                println!("failed");
-                return Err(explain(&config, &err));
-            }
-        }
+        check_both(&config).map_err(|err| {
+            format!(
+                "{err}\nFix the settings and run setup again, or add --no-check to save anyway."
+            )
+        })?;
     }
     let path = write_account_config(&config)?;
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
@@ -208,18 +292,61 @@ fn show() -> Result<(), String> {
 
 fn check() -> Result<(), String> {
     let (_, config) = load_account_file()?;
+    check_both(&config)
+}
+
+/// Log in to IMAP, then SMTP, printing one line for each. SMTP is tried
+/// even when IMAP fails, so one run shows both, unless the password itself
+/// could not be read.
+fn check_both(config: &AccountConfig) -> Result<(), String> {
+    let mut failures = Vec::new();
+    print!("Logging in to IMAP at {}:{} … ", config.host, config.port);
+    let _ = io::stdout().flush();
     match config.check_login() {
-        Ok(count) => {
-            println!("ok: logged in as {}, {count} folders", config.username);
-            Ok(())
+        Ok(count) => println!("ok, {count} folders"),
+        Err(err) => {
+            println!("failed");
+            failures.push(err);
         }
-        Err(err) => Err(explain(&config, &err)),
+    }
+    let password = failures
+        .iter()
+        .any(|err| classify_sync_error(err) == fell_core::SyncFailureKind::Password);
+    if !password {
+        let smtp = config.smtp_config();
+        print!("Logging in to SMTP at {}:{} … ", smtp.host, smtp.port);
+        let _ = io::stdout().flush();
+        match config.check_smtp() {
+            Ok(()) => println!("ok"),
+            Err(err) => {
+                println!("failed");
+                failures.push(err);
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(explain(config, &failures))
     }
 }
 
-fn explain(config: &AccountConfig, err: &fell_core::Error) -> String {
+/// Each error on its own line, then what to do about them. A hint two
+/// failures share is said once.
+fn explain(config: &AccountConfig, errors: &[fell_core::Error]) -> String {
+    let mut lines: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    for err in errors {
+        let hint = hint(config, err);
+        if !hint.is_empty() && !lines.iter().any(|line| line == hint) {
+            lines.push(hint.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+fn hint(config: &AccountConfig, err: &fell_core::Error) -> &'static str {
     let bridge = config.backend == BackendKind::Bridge;
-    let hint = match classify_sync_error(err) {
+    match classify_sync_error(err) {
         fell_core::SyncFailureKind::Unreachable if bridge => {
             "Nothing is listening there. Start Proton Mail Bridge and sign in, then try again."
         }
@@ -233,11 +360,6 @@ fn explain(config: &AccountConfig, err: &fell_core::Error) -> String {
         fell_core::SyncFailureKind::LoginRejected => "The server refused the username or password.",
         fell_core::SyncFailureKind::Password => "The password command did not print a password.",
         fell_core::SyncFailureKind::Other => "",
-    };
-    if hint.is_empty() {
-        err.to_string()
-    } else {
-        format!("{err}\n{hint}")
     }
 }
 
@@ -360,6 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_hint_is_said_once() {
+        let config = AccountConfig::bridge("a@b", "a@b", PasswordSource::Inline("x".into()));
+        let err = |text: &str| fell_core::Error::Backend(text.into());
+        let text = explain(
+            &config,
+            &[
+                err("imap: connect 127.0.0.1:1143 failed: refused"),
+                err("smtp: connect 127.0.0.1:1025 failed: refused"),
+            ],
+        );
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(text.ends_with("then try again."), "{text}");
+        let text = explain(
+            &config,
+            &[err(
+                "smtp: the server does not offer STARTTLS and this account requires TLS",
+            )],
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    #[test]
     fn hidden_input_edits_and_cancels() {
         let read = |bytes: &[u8]| read_hidden(&mut &bytes[..]);
         assert_eq!(read(b"hunter2\n").unwrap(), "hunter2");
@@ -393,6 +537,126 @@ mod tests {
                 .contains("not both")
         );
         assert!(parse_flags(&args(&["--port", "nope"])).is_err());
+        assert!(parse_flags(&args(&["--smtp-port", "0"])).is_err());
+        assert!(parse_flags(&args(&["--smtp-security", "none"])).is_err());
         assert!(parse_flags(&args(&["--bogus"])).is_err());
+        assert!(parse_flags(&args(&["--imap", "-h"])).unwrap().help);
+        let smtp = parse_flags(&args(&[
+            "--smtp-host",
+            "smtp.b",
+            "--smtp-port",
+            "2525",
+            "--smtp-security",
+            "tls",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                smtp.smtp.host.as_deref(),
+                smtp.smtp.port,
+                smtp.smtp.security
+            ),
+            (Some("smtp.b"), Some(2525), Some(ImapSecurity::Tls))
+        );
+    }
+
+    fn imap_account(security: ImapSecurity) -> AccountConfig {
+        let mut config = AccountConfig::bridge("a@b", "a@b", PasswordSource::Inline("x".into()));
+        config.backend = BackendKind::Imap;
+        config.host = "imap.b".into();
+        config.security = security;
+        config
+    }
+
+    /// Run [`choose_smtp`] with these flags and typed answers ("" takes the
+    /// default), then read the file back the way the app does.
+    fn smtp_after(
+        mut config: AccountConfig,
+        flag_list: &[&str],
+        answers: &[&str],
+    ) -> (fell_core::SmtpConfig, AccountConfig, Vec<String>) {
+        let flags = parse_flags(&args(flag_list)).unwrap();
+        let mut answers = answers.iter();
+        let mut asked = Vec::new();
+        choose_smtp(&mut config, &flags.smtp, &mut |label, default| {
+            asked.push(format!("{label} [{default}]"));
+            let answer = answers.next().copied().unwrap_or("");
+            Ok(if answer.is_empty() { default } else { answer }.to_string())
+        })
+        .unwrap();
+        let config = AccountConfig::parse(&config.render()).unwrap();
+        (config.smtp_config(), config, asked)
+    }
+
+    #[test]
+    fn smtp_defaults_are_offered_and_not_written() {
+        let (smtp, config, asked) = smtp_after(imap_account(ImapSecurity::Tls), &[], &[]);
+        assert_eq!(asked, ["SMTP host [imap.b]", "SMTP port [465]"]);
+        assert_eq!(
+            (smtp.host.as_str(), smtp.port, smtp.security),
+            ("imap.b", 465, ImapSecurity::Tls)
+        );
+        assert_eq!(
+            (config.smtp_host, config.smtp_port, config.smtp_security),
+            (None, None, None)
+        );
+
+        let bridge = AccountConfig::bridge("a@b", "u", PasswordSource::Inline("x".into()));
+        let (smtp, config, _) = smtp_after(bridge, &[], &[]);
+        assert_eq!(smtp, fell_core::SmtpConfig::bridge_local());
+        assert_eq!(config.render().matches("smtp").count(), 0);
+    }
+
+    #[test]
+    fn smtp_security_follows_the_port_unless_given() {
+        // A TLS IMAP account with submission on 587 talks STARTTLS there.
+        let (smtp, _, _) = smtp_after(imap_account(ImapSecurity::Tls), &[], &["smtp.b", "587"]);
+        assert_eq!(
+            (smtp.host.as_str(), smtp.port, smtp.security),
+            ("smtp.b", 587, ImapSecurity::StartTls)
+        );
+        let (smtp, _, _) = smtp_after(
+            imap_account(ImapSecurity::StartTls),
+            &["--smtp-port", "465"],
+            &[],
+        );
+        assert_eq!((smtp.port, smtp.security), (465, ImapSecurity::Tls));
+        // Security alone picks its usual port as the default.
+        let (smtp, _, asked) = smtp_after(
+            imap_account(ImapSecurity::Tls),
+            &["--smtp-security", "starttls"],
+            &[],
+        );
+        assert_eq!(asked[1], "SMTP port [587]");
+        assert_eq!((smtp.port, smtp.security), (587, ImapSecurity::StartTls));
+        let (smtp, _, asked) = smtp_after(
+            imap_account(ImapSecurity::Tls),
+            &[
+                "--smtp-host",
+                "s",
+                "--smtp-port",
+                "2465",
+                "--smtp-security",
+                "tls",
+            ],
+            &[],
+        );
+        assert!(asked.is_empty());
+        assert_eq!(
+            (smtp.host.as_str(), smtp.port, smtp.security),
+            ("s", 2465, ImapSecurity::Tls)
+        );
+    }
+
+    #[test]
+    fn smtp_plaintext_is_refused_off_loopback() {
+        let mut config = imap_account(ImapSecurity::Tls);
+        let flags = parse_flags(&args(&["--smtp-security", "plain", "--smtp-port", "25"])).unwrap();
+        choose_smtp(&mut config, &flags.smtp, &mut |_, default| {
+            Ok(default.into())
+        })
+        .unwrap();
+        let err = AccountConfig::parse(&config.render()).unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
     }
 }
