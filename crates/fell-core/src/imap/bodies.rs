@@ -112,7 +112,7 @@ pub(crate) fn fetch_bodies(
             let mut answered: BTreeMap<u32, Option<Vec<u8>>> = BTreeMap::new();
             // Answered past the cap: read off the wire, dropped, asked again.
             let mut deferred: Vec<u32> = Vec::new();
-            let stop = session.uid_fetch_each(&set, None, |item| {
+            let stop = session.uid_fetch_each(&set, None, session::FetchItems::Bodies, |item| {
                 if item.body_missing {
                     return Ok(());
                 }

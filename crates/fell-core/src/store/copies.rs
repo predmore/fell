@@ -127,6 +127,73 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
     Ok(())
 }
 
+/// UIDs from `low` to `high` that have a stored copy in `mailbox` (escaped
+/// as remote ids spell it) under `uidvalidity`, ascending.
+///
+/// A copy counts only while its flags have somewhere to land: its row, or
+/// the snapshot of an open action that deleted the row (undo restores it).
+/// Any other copy is fetched again like new mail, so a flag change on it is
+/// never dropped while the checkpoint moves past it.
+pub(super) fn stored_uids(
+    conn: &Connection,
+    account_id: &AccountId,
+    mailbox: &str,
+    uidvalidity: u32,
+    (low, high): (u32, u32),
+) -> Result<Vec<u32>> {
+    let snapshot = if table_exists(conn, "local_action_messages")? {
+        "OR EXISTS (
+             SELECT 1 FROM local_action_messages s
+             JOIN local_actions a ON a.id = s.action_id
+             WHERE a.account_id = c.account_id AND a.undone = 0
+               AND s.message_id = c.message_id
+         )"
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT c.uid FROM message_copies c
+         WHERE c.account_id = ?1 AND c.mailbox = ?2 AND c.uidvalidity = ?3
+           AND c.uid BETWEEN ?4 AND ?5
+           AND (
+               EXISTS (
+                   SELECT 1 FROM messages m
+                   WHERE m.account_id = c.account_id AND m.message_id = c.message_id
+               )
+               {snapshot}
+           )
+         ORDER BY c.uid"
+    ))?;
+    let uids = stmt
+        .query_map(
+            params![account_id.as_str(), mailbox, uidvalidity, low, high],
+            |row| row.get::<_, u32>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(uids)
+}
+
+/// The row a recorded server copy backs, if the copy is recorded.
+pub(super) fn row_of(
+    conn: &Connection,
+    account_id: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT message_id FROM message_copies
+         WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+        params![
+            account_id.as_str(),
+            copy.mailbox,
+            copy.uidvalidity,
+            copy.uid
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// A merge folded `from` into `to`: its copies now back `to`.
 pub(super) fn repoint(
     conn: &Connection,
@@ -669,6 +736,44 @@ mod tests {
         .unwrap()
         .collect::<std::result::Result<_, _>>()
         .unwrap()
+    }
+
+    #[test]
+    fn a_copy_counts_as_stored_only_while_its_flags_can_land() {
+        let store = Store::open_in_memory().unwrap();
+        let account = AccountId("a".into());
+        store
+            .upsert_account(&Account {
+                id: account.clone(),
+                display_name: "A".into(),
+                email: "a@x".into(),
+                backend_kind: BackendKind::Imap,
+            })
+            .unwrap();
+        store
+            .apply_delta(
+                &account,
+                &MailboxDelta {
+                    messages: vec![message("bin@x", "imap:7:3:Trash", "Trash")],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        let stored = || store.stored_uids(&account, "Trash", 7, (1, 10)).unwrap();
+        assert_eq!(stored(), vec![3]);
+        // Emptied from Trash in Fell: the open action's snapshot holds it.
+        let thread = ThreadId::from_message_id(&MessageId::new("bin@x"));
+        store.delete_thread(&account, &thread, "Trash").unwrap();
+        assert_eq!(stored(), vec![3]);
+        store.undo(&account).unwrap();
+        assert_eq!(stored(), vec![3]);
+        // A row gone with nothing to restore it: fetch the copy like new mail.
+        store
+            .conn
+            .execute("DELETE FROM messages WHERE message_id = 'bin@x'", [])
+            .unwrap();
+        assert!(stored().is_empty());
+        assert_eq!(copies(&store).len(), 1);
     }
 
     #[test]

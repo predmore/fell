@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -19,6 +19,9 @@ pub(super) enum BodyForm {
     Quoted,
     Nil,
     Absent,
+    /// Listed with its flags, but a body fetch leaves it out and still
+    /// answers OK.
+    Omitted,
 }
 
 pub(super) struct FixtureMessage {
@@ -87,6 +90,8 @@ pub(super) struct TestState {
 pub(super) struct TestServer {
     pub addr: std::net::SocketAddr,
     pub state: Arc<Mutex<TestState>>,
+    /// Bytes the server has written to clients, greetings and replies alike.
+    pub sent: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -97,12 +102,17 @@ impl TestServer {
         let addr = listener.local_addr().expect("local addr");
         let state = Arc::new(Mutex::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
         let thread_state = Arc::clone(&state);
         let thread_shutdown = Arc::clone(&shutdown);
-        let thread = thread::spawn(move || accept_loop(listener, thread_state, thread_shutdown));
+        let thread_sent = Arc::clone(&sent);
+        let thread = thread::spawn(move || {
+            accept_loop(listener, thread_state, thread_shutdown, thread_sent)
+        });
         Self {
             addr,
             state,
+            sent,
             shutdown,
             thread: Some(thread),
         }
@@ -119,7 +129,12 @@ impl Drop for TestServer {
     }
 }
 
-fn accept_loop(listener: TcpListener, state: Arc<Mutex<TestState>>, shutdown: Arc<AtomicBool>) {
+fn accept_loop(
+    listener: TcpListener,
+    state: Arc<Mutex<TestState>>,
+    shutdown: Arc<AtomicBool>,
+    sent: Arc<AtomicUsize>,
+) {
     listener.set_nonblocking(false).expect("blocking");
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -130,16 +145,39 @@ fn accept_loop(listener: TcpListener, state: Arc<Mutex<TestState>>, shutdown: Ar
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                handle(stream, &state);
+                // As long as the client's own timeout: a large fetch on a
+                // loaded machine can still be persisting when the reply ends.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                handle(stream, &state, &sent);
             }
             Err(_) => break,
         }
     }
 }
 
-fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
-    let mut write = stream.try_clone().expect("clone");
+/// The server's half of a connection, counting the bytes it sends.
+struct Counted {
+    stream: TcpStream,
+    sent: Arc<AtomicUsize>,
+}
+
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.stream.write(buf)?;
+        self.sent.fetch_add(written, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsize>) {
+    let mut write = Counted {
+        stream: stream.try_clone().expect("clone"),
+        sent: Arc::clone(sent),
+    };
     let mut read = BufReader::new(stream);
     let _ = write.write_all(b"* OK fell-test ready\r\n");
     let _ = write.flush();
@@ -481,6 +519,9 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                         }
                         continue;
                     }
+                    if matches!(message.body_form, BodyForm::Omitted) {
+                        continue;
+                    }
                     let flags = message.flags.join(" ");
                     match message.body_form {
                         BodyForm::Literal => {
@@ -512,6 +553,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>) {
                                 .as_bytes(),
                             );
                         }
+                        BodyForm::Omitted => {}
                         BodyForm::Absent => {
                             let _ = write.write_all(
                                 format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
@@ -715,7 +757,7 @@ fn message_id_header(raw: &[u8]) -> Vec<u8> {
 
 fn read_client_command(
     read: &mut BufReader<TcpStream>,
-    write: &mut TcpStream,
+    write: &mut impl Write,
 ) -> Option<(String, Vec<Vec<u8>>)> {
     let mut line = String::new();
     let mut literals = Vec::new();

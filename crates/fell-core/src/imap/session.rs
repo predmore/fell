@@ -71,6 +71,15 @@ pub(super) enum FetchStop {
     Truncated { min_skipped_uid: Option<u32> },
 }
 
+/// What a streaming UID FETCH asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FetchItems {
+    /// `UID FLAGS`: enough to update a message already stored.
+    Flags,
+    /// `UID FLAGS BODY.PEEK[]`: the whole message, for mail not stored yet.
+    Bodies,
+}
+
 /// A UID and the header bytes fetched for it.
 pub(super) type HeaderRow = (u32, Vec<u8>);
 
@@ -276,20 +285,26 @@ impl Session {
     /// Deliver each FETCH as it arrives. Bodies are not kept after `on_fetched`
     /// returns. Past the untagged cap, further replies are read and dropped so
     /// the next command stays in sync.
+    ///
+    /// With [`FetchItems::Flags`] no body is asked for, and each [`Fetched`]
+    /// has an empty body that is neither skipped nor missing.
     pub(super) fn uid_fetch_each(
         &mut self,
         range: &str,
         changed_since: Option<u64>,
+        items: FetchItems,
         mut on_fetched: impl FnMut(Fetched) -> Result<(), Error>,
     ) -> Result<FetchStop, Error> {
+        let wanted = match items {
+            FetchItems::Flags => "(UID FLAGS)",
+            FetchItems::Bodies => "(UID FLAGS BODY.PEEK[])",
+        };
         let cmd = match changed_since {
-            Some(modseq) if self.qresync => format!(
-                "UID FETCH {range} (UID FLAGS BODY.PEEK[]) (CHANGEDSINCE {modseq} VANISHED)"
-            ),
-            Some(modseq) => {
-                format!("UID FETCH {range} (UID FLAGS BODY.PEEK[]) (CHANGEDSINCE {modseq})")
+            Some(modseq) if self.qresync => {
+                format!("UID FETCH {range} {wanted} (CHANGEDSINCE {modseq} VANISHED)")
             }
-            None => format!("UID FETCH {range} (UID FLAGS BODY.PEEK[])"),
+            Some(modseq) => format!("UID FETCH {range} {wanted} (CHANGEDSINCE {modseq})"),
+            None => format!("UID FETCH {range} {wanted}"),
         };
         self.tag += 1;
         let tag = format!("a{}", self.tag);
@@ -321,31 +336,14 @@ impl Session {
                 }
                 continue;
             }
-            if let Some(fetched) = parse_fetch(&text, literals) {
+            let fetched = match items {
+                FetchItems::Bodies => parse_fetch(&text, literals),
+                FetchItems::Flags => parse_flags(&text),
+            };
+            if let Some(fetched) = fetched {
                 on_fetched(fetched)?;
             }
         }
-    }
-
-    /// UIDs in `range` without message bodies. `n:*` may still name the current
-    /// highest UID; callers drop anything at or below the checkpoint.
-    pub(super) fn uid_find(&mut self, range: &str) -> Result<Vec<u32>, Error> {
-        let lines = self
-            .command("UID FETCH", &format!("UID FETCH {range} (UID)"))?
-            .untagged;
-        let mut uids = Vec::new();
-        for line in lines {
-            let upper = line.text.to_ascii_uppercase();
-            if !upper.contains("FETCH") {
-                continue;
-            }
-            if let Some(uid) = number_after(&upper, "UID ") {
-                uids.push(uid);
-            }
-        }
-        uids.sort_unstable();
-        uids.dedup();
-        Ok(uids)
     }
 
     /// UIDs of messages `first..=last` by sequence number, in order.
@@ -1551,6 +1549,24 @@ fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
         body,
         skipped,
         body_missing,
+    })
+}
+
+/// A `UID FLAGS` reply. Any literal the server sent along is dropped unread.
+fn parse_flags(text: &str) -> Option<Fetched> {
+    if !text.trim_start().starts_with('*') {
+        return None;
+    }
+    let upper = text.to_ascii_uppercase();
+    if !upper.contains(" FETCH ") && !upper.contains(" FETCH(") {
+        return None;
+    }
+    Some(Fetched {
+        uid: number_after(&upper, "UID ")?,
+        flags: paren_after(text, "FLAGS").unwrap_or_default(),
+        body: Vec::new(),
+        skipped: false,
+        body_missing: false,
     })
 }
 

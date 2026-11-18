@@ -32,7 +32,10 @@ pub fn sync_with_progress(
     store.upsert_account(account)?;
     let cursor = store.sync_cursor(&account.id)?;
     let mut report = SyncReport::default();
-    backend.sync_changes(cursor.as_ref(), &mut |delta| {
+    let known = |mailbox: &str, uidvalidity: u32, range: (u32, u32)| {
+        store.stored_uids(&account.id, mailbox, uidvalidity, range)
+    };
+    backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
         let count = delta.messages.len();
         store.apply_delta(&account.id, &delta)?;
         report.upserted += count;

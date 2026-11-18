@@ -551,21 +551,7 @@ impl Store {
             insert_message(&tx, &message)?;
         }
         for flag in &delta.flags {
-            tx.execute(
-                "UPDATE messages SET unread = ?1
-                 WHERE account_id = ?2 AND (
-                     remote_id = ?3
-                     OR message_id IN (
-                         SELECT canonical_message_id FROM message_aliases
-                         WHERE account_id = ?2 AND remote_id = ?3
-                     )
-                 )",
-                params![
-                    i64::from(flag.unread),
-                    account_id.as_str(),
-                    flag.remote_id.0
-                ],
-            )?;
+            apply_flag(&tx, account_id, flag)?;
         }
         if let Some(found) = &delta.roles {
             roles::replace(&tx, account_id, found)?;
@@ -581,6 +567,19 @@ impl Store {
         tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// UIDs from `low` to `high` with a stored copy in one mailbox (named as
+    /// remote ids spell it) under `uidvalidity`, ascending. Sync asks so it
+    /// never downloads a body the store has.
+    pub fn stored_uids(
+        &self,
+        account_id: &AccountId,
+        mailbox: &str,
+        uidvalidity: u32,
+        range: (u32, u32),
+    ) -> Result<Vec<u32>> {
+        copies::stored_uids(&self.conn, account_id, mailbox, uidvalidity, range)
     }
 
     /// Re-resolve the threads this transaction's writes touched.
@@ -2612,6 +2611,65 @@ fn subject_has_list_prefix(subject: &str) -> bool {
         rest = after.trim();
     }
     strip_list_prefix(rest).is_some()
+}
+
+/// Apply one server copy's read state to the row it backs.
+///
+/// The row is found by its remote id, an alias, or the copy recorded for it:
+/// a second copy of one Message-ID (INBOX and Sent, INBOX and All Mail) has
+/// no alias, and `remote_id` names only the copy written last. A row deleted
+/// in Fell (Trash expunged) whose copy is still recorded takes the flag on
+/// the snapshot undo would restore.
+fn apply_flag(
+    conn: &Connection,
+    account_id: &AccountId,
+    flag: &crate::backend::FlagUpdate,
+) -> Result<()> {
+    let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
+    let targets: Vec<String> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id FROM messages
+             WHERE account_id = ?1 AND (
+                 remote_id = ?2
+                 OR message_id IN (
+                     SELECT canonical_message_id FROM message_aliases
+                     WHERE account_id = ?1 AND remote_id = ?2
+                 )
+                 OR message_id IN (
+                     SELECT message_id FROM message_copies
+                     WHERE account_id = ?1 AND mailbox = ?3
+                       AND uidvalidity = ?4 AND uid = ?5
+                 )
+             )",
+        )?;
+        stmt.query_map(
+            params![
+                account_id.as_str(),
+                flag.remote_id.0,
+                copy.as_ref().map(|copy| copy.mailbox.as_str()),
+                copy.as_ref().map(|copy| copy.uidvalidity),
+                copy.as_ref().map(|copy| copy.uid),
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    if targets.is_empty() {
+        if let Some(copy) = &copy
+            && let Some(message_id) = copies::row_of(conn, account_id, copy)?
+        {
+            crate::actions::fold_flag_into_snapshots(conn, account_id, &message_id, flag.unread)?;
+        }
+        return Ok(());
+    }
+    for message_id in targets {
+        conn.execute(
+            "UPDATE messages SET unread = ?1
+             WHERE account_id = ?2 AND message_id = ?3 AND unread != ?1",
+            params![i64::from(flag.unread), account_id.as_str(), message_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn remember_alias(conn: &Connection, message: &Message, canonical_id: &str) -> Result<()> {
