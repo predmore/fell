@@ -7,6 +7,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{Message, MessageId};
 use crate::store::{SELECT_MESSAGE_COLS, join_tokens, row_to_message, split_field};
 use crate::threading::ThreadId;
@@ -346,6 +347,12 @@ impl crate::Store {
     ///
     /// Folder names match ignoring ASCII case and the aliases in
     /// [`crate::folder_aliases`]. Fails when no message is in `from`.
+    ///
+    /// Roles come from [`crate::Store::folder_roles`], so the server's own names
+    /// count (`Sent Items`, `Deleted Messages`, `[Gmail]/Trash`). Agents
+    /// cannot move into a folder whose role is in [`AGENT_MOVE_REFUSED`],
+    /// nor in or out of a view such as All Mail or Starred
+    /// ([`AGENT_MOVE_VIEWS`]). Moving out of Trash or Spam is allowed.
     pub fn agent_move_thread(
         &self,
         account_id: &AccountId,
@@ -359,8 +366,11 @@ impl crate::Store {
         if same_folder(&from, &to) {
             return Err(Error::Invalid("move needs a different folder".into()));
         }
+        let roles = self.folder_roles(account_id)?;
+        check_agent_move(&roles, &from, &to)?;
         let to_inbox = same_folder(&to, "INBOX");
-        let to_archive = same_folder(&to, "Archive");
+        let to_archive = role_with_alias(&roles, &to) == Some(FolderRole::Archive)
+            || same_folder(&to, "Archive");
         let from_inbox = same_folder(&from, "INBOX");
         let summary = format!("moved thread from {from} to {to}");
         let mut found = false;
@@ -691,6 +701,53 @@ fn require_token<'a>(value: &'a str, what: &str) -> Result<&'a str> {
         )));
     }
     Ok(value)
+}
+
+/// Roles an agent may not move mail into. Trash and Spam would make `move`
+/// a back door to delete and report spam, which agents do not get; Sent and
+/// Drafts are not places to file mail.
+pub const AGENT_MOVE_REFUSED: [FolderRole; 4] = [
+    FolderRole::Trash,
+    FolderRole::Junk,
+    FolderRole::Sent,
+    FolderRole::Drafts,
+];
+
+/// Folders that show mail filed elsewhere rather than hold it: Gmail's All
+/// Mail and Starred. Moving into one is archive or star by another name, and
+/// moving out of one would drop it from a view the server keeps it in.
+pub const AGENT_MOVE_VIEWS: [FolderRole; 2] = [FolderRole::All, FolderRole::Flagged];
+
+/// Whether an agent may move mail from `from` to `to`, by the folders'
+/// roles: see [`crate::Store::agent_move_thread`].
+pub fn check_agent_move(roles: &FolderRoles, from: &str, to: &str) -> Result<()> {
+    let to = to.trim();
+    if let Some(role) = role_with_alias(roles, to).filter(|role| AGENT_MOVE_REFUSED.contains(role))
+    {
+        return Err(Error::Invalid(format!(
+            "agents cannot move mail to Trash, Spam, Sent or Drafts ({to} is {})",
+            role.label()
+        )));
+    }
+    for folder in [from.trim(), to] {
+        if let Some(role) =
+            role_with_alias(roles, folder).filter(|role| AGENT_MOVE_VIEWS.contains(role))
+        {
+            return Err(Error::Invalid(format!(
+                "{folder} is {}, a view of other folders; use archive or star instead",
+                role.label()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The folder's role, trying its alias group too, so `deleted` reads as
+/// Trash wherever `Trash` does.
+fn role_with_alias(roles: &FolderRoles, folder: &str) -> Option<FolderRole> {
+    roles
+        .role_of(folder)
+        .or_else(|| roles.role_of(crate::folder_aliases(folder).first()?))
 }
 
 fn canonical_folder(folder: &str) -> Result<String> {
@@ -1321,6 +1378,47 @@ mod tests {
                 .agent_move_thread(&account_id, &thread_id, "INBOX", "bad\nname", "user")
                 .is_err()
         );
+    }
+
+    /// The store refuses by the server's roles itself, whatever the caller
+    /// checked first, and also through an alias spelling.
+    #[test]
+    fn agent_move_refuses_folders_the_server_marks_sent_or_trash() {
+        use crate::folders::{RoleFolder, RoleSource};
+        let (store, account_id, thread) = seeded();
+        let marked = |role, name: &str| RoleFolder {
+            role,
+            name: name.into(),
+            raw: name.into(),
+            source: RoleSource::Server,
+        };
+        store
+            .apply_delta(
+                &account_id,
+                &crate::MailboxDelta {
+                    roles: Some(FolderRoles::new(vec![
+                        marked(FolderRole::Sent, "Sent Items"),
+                        marked(FolderRole::Trash, "Deleted Messages"),
+                        marked(FolderRole::Junk, "Junk E-mail"),
+                        marked(FolderRole::All, "All Mail"),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for to in ["Sent Items", "deleted messages", "Junk E-mail", "All Mail"] {
+            let err = store
+                .agent_move_thread(&account_id, &thread, "INBOX", to, "user")
+                .unwrap_err();
+            assert!(matches!(err, Error::Invalid(_)), "{to}: {err}");
+        }
+        assert!(store.list_actions(&account_id).unwrap().is_empty());
+        // Marked folders replace the name table, so a folder that is only
+        // called Trash is an ordinary one here.
+        store
+            .agent_move_thread(&account_id, &thread, "INBOX", "Trash", "user")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

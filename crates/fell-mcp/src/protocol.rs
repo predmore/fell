@@ -1304,6 +1304,196 @@ mod tests {
         assert_eq!(rescued["summary"], "moved thread from Spam to INBOX");
     }
 
+    /// Record `roles` as if the server's LIST reply had marked them
+    /// (SPECIAL-USE), as sync does.
+    fn mark_roles(session: &Session, roles: &[(fell_core::FolderRole, &str)]) {
+        let folders = roles
+            .iter()
+            .map(|(role, name)| fell_core::RoleFolder {
+                role: *role,
+                name: (*name).into(),
+                raw: (*name).into(),
+                source: fell_core::RoleSource::Server,
+            })
+            .collect();
+        session
+            .store
+            .apply_delta(
+                &session.account_id,
+                &fell_core::MailboxDelta {
+                    roles: Some(fell_core::FolderRoles::new(folders)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn stored_in(session: &Session, id: &str, folders: &[&str]) -> ThreadId {
+        let mut filed = message("a1", id, id, "body", "");
+        filed.folders = folders.iter().map(|name| (*name).to_string()).collect();
+        session.store.upsert_message(&filed).unwrap()
+    }
+
+    /// A server that names its Sent or Trash its own way still has them
+    /// refused: the check reads the server's marks, not a name table.
+    #[test]
+    fn move_refuses_server_marked_trash_sent_spam_and_drafts() {
+        use fell_core::FolderRole;
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        init(&mut session);
+        for (role, folder) in [
+            (FolderRole::Sent, "Sent Items"),
+            (FolderRole::Trash, "Deleted Messages"),
+            (FolderRole::Trash, "[Gmail]/Trash"),
+            (FolderRole::Junk, "Bulk"),
+            (FolderRole::Drafts, "Brouillons"),
+        ] {
+            stored_in(&session, &format!("{folder}@x"), &[folder]);
+            mark_roles(&session, &[(FolderRole::Inbox, "INBOX"), (role, folder)]);
+            let listed = tool_json(&call(&mut session, "list_folders", json!({})));
+            let entry = listed["folders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == folder)
+                .unwrap_or_else(|| panic!("{folder} not listed: {listed}"));
+            assert_eq!(entry["role"], role.key(), "{folder}");
+            for to in [folder.to_string(), folder.to_ascii_lowercase()] {
+                let refused = call(
+                    &mut session,
+                    "move",
+                    json!({ "thread_id": thread.as_str(), "to": to }),
+                );
+                assert_eq!(refused["result"]["isError"], true, "{to}");
+                assert!(
+                    tool_text(&refused).contains("cannot move mail to Trash, Spam, Sent or Drafts"),
+                    "{to}: {refused}"
+                );
+            }
+        }
+        // Gmail's All Mail and Starred are views: moving into one is
+        // archive or star, and moving out would drop it from the view.
+        stored_in(&session, "all@x", &["[Gmail]/All Mail", "[Gmail]/Starred"]);
+        mark_roles(
+            &session,
+            &[
+                (FolderRole::All, "[Gmail]/All Mail"),
+                (FolderRole::Flagged, "[Gmail]/Starred"),
+            ],
+        );
+        for args in [
+            json!({ "thread_id": thread.as_str(), "to": "[Gmail]/All Mail" }),
+            json!({ "thread_id": thread.as_str(), "to": "[Gmail]/Starred" }),
+            json!({ "thread_id": thread.as_str(), "from": "[Gmail]/All Mail", "to": "Work" }),
+        ] {
+            let refused = call(&mut session, "move", args.clone());
+            assert!(
+                tool_text(&refused).contains("use archive or star"),
+                "{args}: {refused}"
+            );
+        }
+        assert!(
+            session
+                .store
+                .list_actions(&session.account_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Once the server marks its folders, a user folder that happens to be
+    /// called Sent or Trash is just a folder, and mail can be moved out of
+    /// Trash and Spam and back again with undo.
+    #[test]
+    fn move_files_into_user_folders_and_out_of_trash_and_spam() {
+        use fell_core::FolderRole;
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+        let trashed = stored_in(&session, "trashed@x", &["[Gmail]/Trash"]);
+        let spam = stored_in(&session, "spam@x", &["[Gmail]/Spam"]);
+        stored_in(&session, "label@x", &["Projects", "Trash"]);
+        mark_roles(
+            &session,
+            &[
+                (FolderRole::Inbox, "INBOX"),
+                (FolderRole::Trash, "[Gmail]/Trash"),
+                (FolderRole::Junk, "[Gmail]/Spam"),
+            ],
+        );
+        init(&mut session);
+        for to in ["Projects", "Trash"] {
+            let moved = tool_json(&call(
+                &mut session,
+                "move",
+                json!({ "thread_id": thread.as_str(), "from": "Work", "to": to }),
+            ));
+            assert_eq!(moved["kind"], "move", "{to}: {moved}");
+            let undone = tool_json(&call(&mut session, "undo", json!({})));
+            assert_eq!(undone["kind"], "move");
+        }
+        for (id, from) in [(&trashed, "[Gmail]/Trash"), (&spam, "[Gmail]/Spam")] {
+            let rescued = tool_json(&call(
+                &mut session,
+                "move",
+                json!({ "thread_id": id.as_str(), "from": from, "to": "INBOX" }),
+            ));
+            assert_eq!(
+                rescued["summary"],
+                format!("moved thread from {from} to INBOX")
+            );
+            let read = tool_json(&call(
+                &mut session,
+                "read_thread",
+                json!({ "thread_id": id.as_str() }),
+            ));
+            assert_eq!(read["messages"][0]["folders"], json!(["INBOX"]));
+            assert_eq!(
+                tool_json(&call(&mut session, "undo", json!({})))["kind"],
+                "move"
+            );
+            let back = tool_json(&call(
+                &mut session,
+                "read_thread",
+                json!({ "thread_id": id.as_str() }),
+            ));
+            assert_eq!(back["messages"][0]["folders"], json!([from]));
+        }
+    }
+
+    /// A message with more names than read_thread lists says how many it
+    /// left out, as a cut body says it was truncated.
+    #[test]
+    fn read_thread_counts_attachment_names_it_leaves_out() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        let mut many = message("a1", "many@x", "Scans", "see attached", "");
+        many.has_attachment = true;
+        many.attachment_names = (1..=25).map(|n| format!("scan-{n:02}.pdf")).collect();
+        let many = session.store.upsert_message(&many).unwrap();
+        let mut few = message("a1", "few@x", "One scan", "see attached", "");
+        few.has_attachment = true;
+        few.attachment_names = vec!["scan.pdf".into()];
+        let few = session.store.upsert_message(&few).unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": many.as_str() }),
+        ));
+        let message = &read["messages"][0];
+        let names = message["attachments"].as_array().unwrap();
+        assert_eq!(names.len(), 20);
+        assert_eq!(
+            names[19]["name"]["untrusted_email_content"]["text"],
+            "scan-20.pdf"
+        );
+        assert_eq!(message["attachments_omitted"], 5);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": few.as_str() }),
+        ));
+        assert_eq!(read["messages"][0]["attachments_omitted"], 0);
+    }
+
     #[test]
     fn read_thread_lists_attachment_names_inside_the_envelope() {
         let (mut session, _) = session_with(AgentGrant::enabled(true, false, false), "bot");

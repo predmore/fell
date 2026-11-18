@@ -194,24 +194,8 @@ fn same_folder(a: &str, b: &str) -> bool {
             .any(|alias| alias.eq_ignore_ascii_case(b))
 }
 
-/// The folder's role, or `None` for an ordinary folder.
-///
-/// Today this is the name table the app's folder picker uses, so a server
-/// that calls Sent "Sent Items" gets no role. When the store keeps roles
-/// from SPECIAL-USE (#101), read them here instead.
-fn folder_role(name: &str) -> Option<&'static str> {
-    Some(match fell_core::canonical_folder_name(name)? {
-        "INBOX" => "inbox",
-        "Sent" => "sent",
-        "Drafts" => "drafts",
-        "Archive" => "archive",
-        "Spam" => "spam",
-        "Trash" => "trash",
-        _ => return None,
-    })
-}
-
 fn list_folders(session: &Session) -> Result<Value, String> {
+    let roles = folder_roles(session)?;
     let mut folders = Vec::new();
     for name in folder_names(session)? {
         let unread = session
@@ -225,7 +209,7 @@ fn list_folders(session: &Session) -> Result<Value, String> {
             .unread;
         folders.push(json!({
             "name": name,
-            "role": folder_role(&name),
+            "role": roles.role_of(&name).map(fell_core::FolderRole::key),
             "unread_threads": unread,
         }));
     }
@@ -347,9 +331,14 @@ fn label(session: &Session, args: &Value) -> Result<Value, String> {
     Ok(mutation_json(action))
 }
 
-/// Agents may not move mail into these. Delete and spam are left to the
-/// person, and Sent and Drafts are not places to file mail.
-const MOVE_REFUSED_ROLES: &[&str] = &["trash", "spam", "sent", "drafts"];
+/// What each folder is for, from the server's SPECIAL-USE marks when it
+/// gave any (see [`fell_core::Store::folder_roles`]).
+fn folder_roles(session: &Session) -> Result<fell_core::FolderRoles, String> {
+    session
+        .store
+        .folder_roles(&session.account_id)
+        .map_err(store_error)
+}
 
 fn move_thread(session: &Session, args: &Value) -> Result<Value, String> {
     let thread_id = thread_arg(session, args)?;
@@ -357,15 +346,17 @@ fn move_thread(session: &Session, args: &Value) -> Result<Value, String> {
     let from = optional_string(args, "from")?
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "INBOX".to_string());
-    if folder_role(to.trim()).is_some_and(|role| MOVE_REFUSED_ROLES.contains(&role)) {
-        return Err("agents cannot move mail to Trash, Spam, Sent or Drafts".into());
-    }
-    // Only folders the mailbox has, so a typo does not invent one. Archive
-    // is always a destination, as it is for the archive tool.
+    // Refuse by role before the name is resolved, so `to: "Trash"` says why
+    // even on an account whose Trash has another name. The store checks the
+    // resolved folder again.
+    let roles = folder_roles(session)?;
+    fell_core::agent::check_agent_move(&roles, &from, &to).map_err(store_error)?;
+    // Only folders the mailbox has, so a typo does not invent one. The
+    // archive folder is always a destination, as it is for the archive tool.
     let known = folder_names(session)?;
     let to = known
         .into_iter()
-        .chain(std::iter::once("Archive".to_string()))
+        .chain(std::iter::once(roles.archive_name().to_string()))
         .find(|name| same_folder(name, to.trim()))
         .ok_or("unknown folder; pass a name from list_folders")?;
     let action = session
@@ -772,6 +763,7 @@ fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -
             .take(MAX_ATTACHMENT_NAMES)
             .map(|name| json!({ "name": untrusted::envelope(name, SNIPPET_CHARS) }))
             .collect::<Vec<_>>(),
+        "attachments_omitted": message.attachment_names.len().saturating_sub(MAX_ATTACHMENT_NAMES),
         "folders": message.folders,
         "labels": message.labels,
         "archived": message.archived,
@@ -1057,7 +1049,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "read_thread",
-            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name only, never their contents; has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
+            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name only, never their contents, at most 20 per message; attachments_omitted counts the rest. has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
             scope: ToolScope::Read,
             schema: object_schema(
                 Map::from_iter([
@@ -1078,7 +1070,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "list_folders",
-            description: "List this account's folders, Inbox first: name, role (inbox, sent, drafts, archive, spam, trash, or null for an ordinary folder), and the number of unread threads. Pass a name to list_threads or move.",
+            description: "List this account's folders, Inbox first: name, role (inbox, sent, drafts, trash, junk, archive, all_mail, flagged, or null for an ordinary folder; from the server's own folder marks when it has them), and the number of unread threads. Pass a name to list_threads or move.",
             scope: ToolScope::Read,
             schema: object_schema(Map::new(), &[]),
         },
@@ -1153,7 +1145,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "move",
-            description: "Move a thread's messages from one folder to another. Only messages in the from folder move; copies elsewhere, such as Sent, stay. The destination must be a folder from list_folders, or Archive. Agents cannot move mail to Trash, Spam, Sent or Drafts. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
+            description: "Move a thread's messages from one folder to another. Only messages in the from folder move; copies elsewhere, such as Sent, stay. The destination must be a folder from list_folders, or Archive. Agents cannot move mail to a folder whose role is trash, junk, sent or drafts, nor in or out of all_mail or flagged (use archive or star). Moving mail out of Trash or Spam is allowed. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited.",
             scope: ToolScope::Triage,
             schema: object_schema(
                 Map::from_iter([
