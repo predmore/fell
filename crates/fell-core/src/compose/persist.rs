@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::store::Store;
 use crate::{AccountId, Result};
 
-use super::frontmatter::{AttachmentRef, DraftFields};
+use super::frontmatter::{AttachmentRef, DraftFields, write_draft};
 use super::mime::ResolvedFile;
 use super::session::SendLock;
 use super::workspace;
@@ -510,6 +510,57 @@ impl Store {
         let Some(stored) = self.load_compose(id)? else {
             return Ok(None);
         };
+        write_compose_folder(&stored, id, folder)?;
+        Ok(Some(stored))
+    }
+
+    /// Ready draft `id`'s folder for opening. The mailbox row is Fell's own
+    /// copy, so the folder is written from it, except when `draft.md` holds
+    /// the text Fell saved last: a save whose mailbox row did not land is
+    /// newer than the row, and is kept. What it has over the row is then
+    /// marked for review when the draft opens, as for any outside change.
+    /// `None` when the mailbox has no such draft.
+    pub fn refresh_compose_folder(&self, id: &str, folder: &Path) -> Result<Option<StoredCompose>> {
+        let Some(stored) = self.load_compose(id)? else {
+            return Ok(None);
+        };
+        let own = workspace::read_draft_file(folder)
+            .is_ok_and(|text| workspace::is_own_save(folder, &text));
+        if own {
+            for file in &stored.files {
+                workspace::write_inside(folder, &file.path, &file.bytes)
+                    .map_err(crate::Error::Invalid)?;
+            }
+            return Ok(Some(stored));
+        }
+        write_compose_folder(&stored, id, folder)?;
+        // The folder is the row again; an older note no longer applies.
+        let _ = workspace::note_own_save(folder, &write_draft(&stored.fields, &stored.body));
+        Ok(Some(stored))
+    }
+
+    /// Forget draft `id`: its row, attachments, review and send record.
+    pub(crate) fn delete_compose(&self, id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(REVIEW_SCHEMA)?;
+        tx.execute(
+            "DELETE FROM compose_review WHERE draft_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM compose_attachments WHERE draft_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM compose_send WHERE draft_id = ?1", params![id])?;
+        tx.execute("DELETE FROM compose_drafts WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Write `stored` out as draft `id`'s folder, attachments included.
+fn write_compose_folder(stored: &StoredCompose, id: &str, folder: &Path) -> Result<()> {
+    {
         workspace::materialize_in(
             folder.parent().unwrap_or(folder),
             id,
@@ -522,7 +573,7 @@ impl Store {
             workspace::write_inside(folder, &file.path, &file.bytes)
                 .map_err(crate::Error::Invalid)?;
         }
-        Ok(Some(stored))
+        Ok(())
     }
 }
 

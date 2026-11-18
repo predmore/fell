@@ -20,15 +20,14 @@ use fell_core::compose::DraftSummary;
 use crate::draft_host::DraftHome;
 use crate::keymap::KeyId;
 use crate::mailbox;
-use crate::model::{Fetch, Overlay, QueryFault, Session, Step, SyncKind, row_key};
+use crate::model::{
+    DRAFT_NOT_THREAD, Fetch, Overlay, QueryFault, Session, Step, SyncKind, row_key,
+};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
-
-/// Archive and move act on threads. A draft row is not one.
-const DRAFT_NOT_THREAD: &str = "That is a draft · enter opens it in the editor";
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -957,7 +956,7 @@ impl Inbox {
                 .show_toast(format!("opening draft \u{201c}{subject}\u{201d}"), false);
         }
         if let Some(id) = &id
-            && crate::draft_host::show_draft(&hub, None, id)
+            && crate::draft_host::show_draft(&hub, id)
         {
             return;
         }
@@ -971,19 +970,25 @@ impl Inbox {
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let creating = id.is_none();
-        let task = cx.background_executor().spawn(async move {
-            match id {
-                Some(id) => home.open(&id, &account),
-                None => home.new_draft(&account, &email),
+        // The draft goes live in the hub off this thread; only showing it
+        // happens here.
+        let task = cx.background_executor().spawn({
+            let hub = hub.clone();
+            async move {
+                match id {
+                    Some(id) => home.open(&hub, &id, &account).map(|()| id),
+                    None => home.new_draft(&hub, &account, &email),
+                }
             }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |inbox, cx| {
                 match result {
-                    Ok(session) => {
-                        let id = session.id().to_string();
-                        crate::draft_host::show_draft(&hub, Some(session), &id);
+                    Ok(id) => {
+                        // `false` while another open of it is still reading
+                        // it; that one shows it when it lands.
+                        crate::draft_host::show_draft(&hub, &id);
                     }
                     Err(err) => {
                         let what = if creating {

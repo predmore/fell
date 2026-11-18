@@ -18,7 +18,9 @@ use super::mime::{self, Outgoing, ResolvedFile};
 use super::persist::{self, StoredReview};
 use super::review::{self, Hunk};
 use super::workspace::{self, Closure, FileStamp, ListedFile};
-use super::writer::{DraftWriter, MailboxSave, OwnWrites, SaveCache, SaveJob, SaveWaiter};
+use super::writer::{
+    DraftWriter, MailboxSave, OwnWrites, SaveCache, SaveError, SaveJob, SaveWaiter,
+};
 
 const DEBOUNCE_MS: u64 = 150;
 
@@ -226,6 +228,50 @@ impl DraftSession {
         let mut session = Self::unsaved(folder, id.into(), account_id, fields, body.into());
         session.flush()?;
         Ok(session)
+    }
+
+    /// Start draft `id` under `root`: its row in the mailbox at `store`
+    /// first, then its folder. A crash in between leaves a row, which the
+    /// drafts list shows and opening writes a folder for, never a folder no
+    /// list knows of. A folder that cannot be made takes the row with it.
+    pub fn start_in(
+        root: &Path,
+        id: &str,
+        account_id: AccountId,
+        fields: DraftFields,
+        body: &str,
+        store: &Path,
+    ) -> Result<PathBuf, String> {
+        workspace::validate_id(id)?;
+        if !store.is_file() {
+            return Err("the mailbox file is missing".into());
+        }
+        let folder = root.join(id);
+        let mut session = Self::unsaved(
+            folder.clone(),
+            id.to_string(),
+            account_id.clone(),
+            fields.clone(),
+            body.to_string(),
+        );
+        session.store_path = Some(store.to_path_buf());
+        let text = session.serialize();
+        super::writer::persist_mailbox(
+            &folder,
+            session.mailbox_save(&text),
+            &mut SaveCache::default(),
+        )?;
+        match workspace::materialize_in(root, id, &fields, body, &account_id) {
+            Ok(folder) => Ok(folder),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&folder);
+                let _ = std::fs::remove_dir_all(workspace::control_dir(&folder));
+                if let Ok(opened) = crate::Store::open(store) {
+                    let _ = opened.delete_compose(id);
+                }
+                Err(err)
+            }
+        }
     }
 
     fn unsaved(
@@ -867,11 +913,21 @@ impl DraftSession {
             if let Some(err) = writer.take_error() {
                 self.notices.push(format!("could not save draft.md: {err}"));
             }
+            if let Some(err) = writer.take_mailbox_error() {
+                note_mailbox_error(&mut self.notices, &err);
+            }
             let number = writer.submit(job);
             self.own_writes.note(number, text);
             return Ok(());
         }
-        job.run(&mut self.save_cache)
+        match job.run(&mut self.save_cache) {
+            Ok(()) => Ok(()),
+            Err(SaveError::File(err)) => Err(err),
+            Err(SaveError::Mailbox(err)) => {
+                note_mailbox_error(&mut self.notices, &err);
+                Ok(())
+            }
+        }
     }
 
     /// Run later saves on a thread of their own. The app attaches one for
@@ -1414,6 +1470,15 @@ impl DraftSession {
 /// A review row belongs to the compose row it was saved with. One left by
 /// another draft with this id, or by a save that did not reach the row, is
 /// not used.
+/// `draft.md` holds a save, but the mailbox row, Fell's own copy, does not.
+/// Each distinct failure is said once.
+fn note_mailbox_error(notices: &mut Vec<String>, err: &str) {
+    let notice = format!("could not save this draft to the mailbox: {err}");
+    if !notices.contains(&notice) {
+        notices.push(notice);
+    }
+}
+
 fn review_matches_row(text: &str, stored: &persist::StoredCompose) -> bool {
     let Ok(parsed) = parse_draft(text) else {
         return false;
@@ -1507,6 +1572,44 @@ mod tests {
         let session =
             DraftSession::create(folder, "d1", AccountId("local".into()), fields, body).unwrap();
         (root, session)
+    }
+
+    #[test]
+    fn a_save_the_mailbox_refused_is_said_as_a_notice() {
+        let (root, mut session) = temp_session("Hello\n");
+        // A mailbox file that is not a mailbox: opening it fails.
+        let broken = root.join("broken.db");
+        fs::write(&broken, "not sqlite, and longer than a header would be").unwrap();
+        session.bind_store(&broken);
+        session.set_body_from_user("typed\n".into());
+        session.flush().unwrap();
+        assert!(
+            fs::read_to_string(session.folder().join("draft.md"))
+                .unwrap()
+                .contains("typed")
+        );
+        let notices = session.snapshot().notices;
+        let said: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.starts_with("could not save this draft to the mailbox"))
+            .collect();
+        assert_eq!(said.len(), 1, "{notices:?}");
+        // Through the writer thread too, reported on the next save.
+        session.attach_writer();
+        session.flush().unwrap();
+        session.save_waiter().unwrap().wait().unwrap();
+        session.flush().unwrap();
+        let notices = session.snapshot().notices;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.starts_with("could not save this draft to the mailbox")),
+            "{notices:?}"
+        );
+        // draft.md holds Fell's own save, so a cold open keeps it.
+        let text = fs::read_to_string(session.folder().join("draft.md")).unwrap();
+        assert!(workspace::is_own_save(session.folder(), &text));
+        assert!(!workspace::is_own_save(session.folder(), "something else"));
     }
 
     #[test]

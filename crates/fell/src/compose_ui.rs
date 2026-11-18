@@ -241,8 +241,9 @@ pub struct ComposeView {
     palette: Option<String>,
     status: SharedString,
     sent: bool,
-    /// A send is talking to the server. Another send waits for it.
-    sending: bool,
+    /// The draft whose send is talking to the server. Another send of it
+    /// waits. The window may have moved to another draft meanwhile.
+    sending: Option<String>,
     watching: bool,
     flush_pending: bool,
     flush_gen: u64,
@@ -305,7 +306,7 @@ impl ComposeView {
             palette: None,
             status: "i insert".into(),
             sent: false,
-            sending: false,
+            sending: None,
             watching: false,
             flush_pending: false,
             flush_gen: 0,
@@ -797,11 +798,11 @@ impl ComposeView {
     /// answers. The draft is claimed for the send before it starts, so a
     /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.sending {
+        let id = self.draft_id.to_string();
+        if self.sending.as_deref() == Some(id.as_str()) {
             self.status = "Sending…".into();
             return;
         }
-        let id = self.draft_id.to_string();
         if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
             self.status = lock.reason().into();
             return;
@@ -826,49 +827,45 @@ impl ComposeView {
                 return;
             }
         };
-        self.sending = true;
+        self.sending = Some(id.clone());
         self.status = "Sending…".into();
         let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
+            let sent_id = id.clone();
             let outcome = cx
                 .background_executor()
-                .spawn(async move { transmit_from_hub(&hub, &id, prepared, account_backend) })
+                .spawn({
+                    let hub = hub.clone();
+                    async move { transmit_from_hub(&hub, &id, prepared, account_backend) }
+                })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.sending = false;
-                match outcome {
-                    Ok(_) => {
-                        this.sent = true;
-                        let id = this.draft_id.to_string();
-                        let unrecorded = this
-                            .hub
-                            .with_session(&id, |session| {
-                                session.snapshot().notices.iter().any(|notice| {
-                                    notice.starts_with("could not record how this send ended")
-                                })
-                            })
-                            .unwrap_or(false);
-                        this.status = if unrecorded {
-                            "Sent; the mailbox did not record it, so this draft will read as possibly sent"
-                        } else {
-                            "Sent from the editor"
-                        }
-                        .into();
-                        // Back to the inbox, which says it was sent. A send the
-                        // mailbox did not record keeps the window, so the
-                        // person reads why.
-                        if this.close_on_send && !unrecorded {
-                            this.closing = true;
-                            this.hub.note_hidden(this.draft_id.as_ref());
-                        }
-                    }
-                    Err(err) => {
-                        this.sent = matches!(err, SendFailure::MaybeSent(_));
-                        this.status = err.to_string().into();
-                    }
+            let shown = this.update(cx, |this, cx| {
+                if this.sending.as_deref() == Some(sent_id.as_str()) {
+                    this.sending = None;
+                }
+                let end = finish_send(
+                    &this.hub,
+                    &sent_id,
+                    this.draft_id.as_ref(),
+                    this.close_on_send,
+                    &outcome,
+                );
+                if let Some(status) = end.status {
+                    this.sent = end.sent;
+                    this.status = status.into();
+                }
+                if end.close {
+                    this.closing = true;
                 }
                 cx.notify();
             });
+            if shown.is_err() {
+                // The window closed while the send ran.
+                hub.report_send(
+                    &sent_id,
+                    send_failure_line(&hub, &sent_id, &outcome).as_deref(),
+                );
+            }
         })
         .detach();
     }
@@ -1727,6 +1724,97 @@ impl std::fmt::Display for SendFailure {
                 )
             }
         }
+    }
+}
+
+/// What the compose window does once a send of `sent` finished, while it
+/// shows `on_screen`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SendEnd {
+    /// The window's new status line. `None` leaves the draft on screen alone.
+    pub status: Option<String>,
+    /// The window shows sent mail.
+    pub sent: bool,
+    /// Close the window: it shows the draft that went out.
+    pub close: bool,
+}
+
+/// Said when a send went out but the mailbox could not record it.
+const SENT_UNRECORDED: &str =
+    "Sent; the mailbox did not record it, so this draft will read as possibly sent";
+
+/// The window is one, and `c`, Enter or an agent's `request_send` can move
+/// it to another draft while a send is still in flight. Only the draft that
+/// was sent is closed, and its outcome reaches the inbox even when the
+/// window no longer shows it.
+pub(crate) fn finish_send(
+    hub: &DraftHub,
+    sent: &str,
+    on_screen: &str,
+    close_on_send: bool,
+    outcome: &Result<fell_core::SentMessage, SendFailure>,
+) -> SendEnd {
+    if sent != on_screen {
+        hub.report_send(sent, send_failure_line(hub, sent, outcome).as_deref());
+        return SendEnd {
+            status: None,
+            sent: false,
+            close: false,
+        };
+    }
+    match outcome {
+        Ok(_) => {
+            let unrecorded = send_unrecorded(hub, sent);
+            // Back to the inbox, which says it was sent. A send the mailbox
+            // did not record keeps the window, so the person reads why.
+            let close = close_on_send && !unrecorded;
+            if close {
+                hub.note_hidden(sent);
+            }
+            SendEnd {
+                status: Some(
+                    if unrecorded {
+                        SENT_UNRECORDED
+                    } else {
+                        "Sent from the editor"
+                    }
+                    .into(),
+                ),
+                sent: true,
+                close,
+            }
+        }
+        Err(err) => SendEnd {
+            status: Some(err.to_string()),
+            sent: matches!(err, SendFailure::MaybeSent(_)),
+            close: false,
+        },
+    }
+}
+
+/// The mailbox could not record how the send of `id` ended.
+fn send_unrecorded(hub: &DraftHub, id: &str) -> bool {
+    hub.with_session(id, |session| {
+        session
+            .snapshot()
+            .notices
+            .iter()
+            .any(|notice| notice.starts_with("could not record how this send ended"))
+    })
+    .unwrap_or(false)
+}
+
+/// What went wrong with a send of `id`, for the inbox. `None` for a send
+/// that went out and was recorded.
+fn send_failure_line(
+    hub: &DraftHub,
+    id: &str,
+    outcome: &Result<fell_core::SentMessage, SendFailure>,
+) -> Option<String> {
+    match outcome {
+        Ok(_) if send_unrecorded(hub, id) => Some(SENT_UNRECORDED.into()),
+        Ok(_) => None,
+        Err(err) => Some(err.to_string()),
     }
 }
 

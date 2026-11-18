@@ -136,35 +136,54 @@ impl DraftHome {
         }
     }
 
-    /// A new, empty draft from `email` on `account`, saved to the mailbox and
-    /// opened as a live session. Disk only; run it off the UI thread.
-    pub fn new_draft(&self, account: &AccountId, email: &str) -> Result<DraftSession, String> {
+    /// Start a new, empty draft from `email` on `account` and make it live
+    /// in `hub`. Its mailbox row is written before its folder. Disk only;
+    /// run it off the UI thread. Returns the draft's id.
+    pub fn new_draft(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        email: &str,
+    ) -> Result<String, String> {
         let id = new_draft_id();
         let fields = DraftFields {
             from: email.to_string(),
             ..DraftFields::default()
         };
-        let folder = fell_core::compose::materialize_in(&self.root, &id, &fields, "", account)?;
-        let mut session = DraftSession::create(folder, &id, account.clone(), fields, "")?;
-        session.bind_store(&self.store);
-        session.flush()?;
-        drop(session);
-        self.open(&id, account)
+        DraftSession::start_in(&self.root, &id, account.clone(), fields, "", &self.store)?;
+        self.open(hub, &id, account)?;
+        Ok(id)
     }
 
-    /// Draft `id` as the mailbox holds it. The folder is written from the
-    /// mailbox row first: the row is Fell's own copy, while anything on the
-    /// machine may have changed the folder since the draft was last open.
-    pub fn open(&self, id: &str, account: &AccountId) -> Result<DraftSession, String> {
+    /// Make draft `id` live in `hub` as the mailbox holds it. Its folder is
+    /// written from the mailbox row first: the row is Fell's own copy, while
+    /// anything on the machine may have changed the folder since the draft
+    /// was last open. `draft.md` is kept when it holds Fell's own last save,
+    /// which is newer than a row that save could not write.
+    ///
+    /// A draft that is live already, or that another open is reading, is
+    /// left alone: its folder may hold typing the mailbox does not have yet.
+    /// The caller shows it either way. Disk only; run it off the UI thread.
+    pub fn open(&self, hub: &DraftHub, id: &str, account: &AccountId) -> Result<(), String> {
+        let Some(_opening) = hub.begin_open(id) else {
+            return Ok(());
+        };
         let folder = self.root.join(id);
         let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
-        let restored = store
-            .restore_compose_folder(id, &folder)
+        let refreshed = store
+            .refresh_compose_folder(id, &folder)
             .map_err(|err| err.to_string())?;
-        if restored.is_none() {
+        if refreshed.is_none() {
             return Err("the draft is no longer in the mailbox".into());
         }
-        DraftSession::open_with_store(&folder, account.clone(), &store)
+        let session = DraftSession::open_with_store(&folder, account.clone(), &store)?;
+        drop(store);
+        if !hub.insert_new(session) {
+            // The socket made it live meanwhile, and the copy read here has
+            // just saved over its folder. Put the live text back.
+            hub.with_session(id, |live| live.flush()).transpose()?;
+        }
+        Ok(())
     }
 }
 
@@ -182,13 +201,9 @@ pub(crate) struct AgentDrafts(pub Arc<DraftHub>);
 
 impl gpui::Global for AgentDrafts {}
 
-/// Put `session` in the hub unless that draft is already live, then bring
-/// the compose window up on it. There is one window and one hub: an open
-/// window moves to this draft.
-pub(crate) fn show_draft(hub: &DraftHub, session: Option<DraftSession>, id: &str) -> bool {
-    if let Some(session) = session {
-        hub.insert_new(session);
-    }
+/// Bring the compose window up on live draft `id`. There is one window and
+/// one hub: an open window moves to this draft.
+pub(crate) fn show_draft(hub: &DraftHub, id: &str) -> bool {
     hub.show(id)
 }
 
@@ -399,24 +414,138 @@ pub(crate) mod tests {
     fn c_keeps_a_new_draft_in_the_drafts_folder_and_the_mailbox() {
         let account = me();
         let home = temp_home("new", &account);
-        let session = home.new_draft(&account.id, &account.email).unwrap();
-        assert!(session.folder().starts_with(&home.root));
-        assert!(session.folder().join("draft.md").is_file());
-        assert_eq!(session.fields().from, "jon@example.com");
-        assert!(session.owner().is_empty(), "the person's own draft");
+        let hub = DraftHub::new();
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        let (folder, from, owner) = hub
+            .with_session(&id, |session| {
+                (
+                    session.folder().to_path_buf(),
+                    session.fields().from.clone(),
+                    session.owner().to_string(),
+                )
+            })
+            .expect("the new draft is live");
+        assert!(folder.starts_with(&home.root));
+        assert!(folder.join("draft.md").is_file());
+        assert_eq!(from, "jon@example.com");
+        assert!(owner.is_empty(), "the person's own draft");
         let listed = fell_core::Store::open(&home.store)
             .unwrap()
             .unsent_compose_drafts(&account.id)
             .unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, session.id());
+        assert_eq!(listed[0].id, id);
         // Reopening reads the mailbox's copy, even with the folder gone.
-        let id = session.id().to_string();
-        drop(session);
+        drop(hub);
         std::fs::remove_dir_all(home.root.join(&id)).unwrap();
-        let reopened = home.open(&id, &account.id).unwrap();
-        assert_eq!(reopened.id(), id);
-        assert!(home.open("c0", &account.id).is_err());
+        let hub = DraftHub::new();
+        home.open(&hub, &id, &account.id).unwrap();
+        assert!(hub.with_session(&id, |_| ()).is_some());
+        assert!(home.open(&hub, "c0", &account.id).is_err());
+    }
+
+    #[test]
+    fn a_new_draft_whose_folder_cannot_be_made_leaves_no_row() {
+        let account = me();
+        let home = temp_home("no-folder", &account);
+        // The drafts root is a file, so no draft folder can go under it.
+        std::fs::write(&home.root, "not a folder").unwrap();
+        let hub = DraftHub::new();
+        assert!(home.new_draft(&hub, &account.id, &account.email).is_err());
+        let listed = fell_core::Store::open(&home.store)
+            .unwrap()
+            .unsent_compose_drafts(&account.id)
+            .unwrap();
+        assert!(listed.is_empty(), "{listed:?}");
+        assert!(hub.snapshot_ids().is_empty());
+    }
+
+    /// Write `text` into draft `id`'s `draft.md` as something outside Fell.
+    fn write_outside(home: &DraftHome, id: &str, text: &str) -> std::path::PathBuf {
+        let file = home.root.join(id).join("draft.md");
+        let mut current = std::fs::read_to_string(&file).unwrap();
+        current.push_str(text);
+        std::fs::write(&file, &current).unwrap();
+        file
+    }
+
+    #[test]
+    fn opening_a_live_draft_again_leaves_its_folder_and_typing_alone() {
+        let account = me();
+        let home = temp_home("open-live", &account);
+        let hub = DraftHub::new();
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        hub.with_session(&id, |session| {
+            session.set_body_from_user("typed, not saved yet\n".into());
+            session.arm_outbound(u64::MAX);
+        });
+        // Not the mailbox's copy: an open that restored the folder would
+        // write over it, and the watcher would merge that into the draft.
+        let file = write_outside(&home, &id, "outside\n");
+        let before = std::fs::read_to_string(&file).unwrap();
+        home.open(&hub, &id, &account.id).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        let body = hub
+            .with_session(&id, |session| session.body().to_string())
+            .unwrap();
+        assert_eq!(body, "typed, not saved yet\n");
+    }
+
+    #[test]
+    fn a_second_open_while_the_first_reads_the_draft_writes_nothing() {
+        let account = me();
+        let home = temp_home("open-twice", &account);
+        let hub = DraftHub::new();
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        hub.settle_all();
+        let cold = DraftHub::new();
+        let file = write_outside(&home, &id, "outside\n");
+        let before = std::fs::read_to_string(&file).unwrap();
+        // Another Enter's open is still reading this draft.
+        let first = cold.begin_open(&id).expect("nothing opens it yet");
+        home.open(&cold, &id, &account.id).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        assert!(
+            cold.with_session(&id, |_| ()).is_none(),
+            "the first open adds it"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn a_cold_open_keeps_fells_own_save_that_the_mailbox_missed() {
+        let account = me();
+        let home = temp_home("own-save", &account);
+        let hub = DraftHub::new();
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        // A save whose mailbox row did not land: draft.md is newer than it.
+        let missing = home.store.with_file_name("gone.db");
+        hub.with_session(&id, |session| {
+            session.bind_store(&missing);
+            session.set_body_from_user("saved to draft.md only\n".into());
+            session.flush().unwrap();
+        });
+        hub.settle_all();
+        drop(hub);
+        let row = fell_core::Store::open(&home.store)
+            .unwrap()
+            .load_compose(&id)
+            .unwrap()
+            .unwrap();
+        assert!(row.body.is_empty(), "the row is the older copy");
+        let hub = DraftHub::new();
+        home.open(&hub, &id, &account.id).unwrap();
+        let body = hub
+            .with_session(&id, |session| session.body().to_string())
+            .unwrap();
+        assert_eq!(body, "saved to draft.md only\n");
+        // A change Fell did not save is not kept: the row wins.
+        drop(hub);
+        let file = write_outside(&home, &id, "outside\n");
+        let hub = DraftHub::new();
+        home.open(&hub, &id, &account.id).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("outside"), "{text}");
     }
 
     #[test]
@@ -426,9 +555,8 @@ pub(crate) mod tests {
         let hub = Arc::new(DraftHub::new());
         let socket = home.root.with_file_name("live.sock");
         serve_socket_at(hub.clone(), &socket).unwrap();
-        let session = home.new_draft(&account.id, &account.email).unwrap();
-        let id = session.id().to_string();
-        assert!(show_draft(&hub, Some(session), &id));
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        assert!(show_draft(&hub, &id));
         assert_eq!(hub.focused_id().as_deref(), Some(id.as_str()));
         let reveals = hub.reveal_count();
         // The compose window is up, and the person has typed, not yet saved.

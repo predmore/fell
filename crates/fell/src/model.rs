@@ -1415,6 +1415,11 @@ impl Session {
                     self.show_toast("No conversation", true);
                     return Step::default();
                 }
+                if self.cursor_draft().is_some() {
+                    // Said now, not after a folder is picked for nothing.
+                    self.show_toast(DRAFT_NOT_THREAD, true);
+                    return Step::default();
+                }
                 self.folder_intent = FolderIntent::Move;
                 self.overlay = Overlay::Folders;
                 self.folder_query.clear();
@@ -1692,6 +1697,9 @@ impl Session {
     }
 }
 
+/// Archive and move act on threads. A draft row is not one.
+pub const DRAFT_NOT_THREAD: &str = "That is a draft · enter opens it in the editor";
+
 /// Where `row` sits in its folder list.
 pub fn row_key(row: &ThreadRow) -> ListKey {
     ListKey {
@@ -1748,6 +1756,20 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn m_on_a_draft_row_explains_without_opening_the_picker() {
+        let mut session = session();
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        let step = session.on_key(KeyId::Char('m'), 10);
+        assert!(!step.apply_move);
+        assert_eq!(session.overlay, Overlay::None);
+        let toast = session.toast.as_ref().expect("m says why");
+        assert_eq!(toast.text, DRAFT_NOT_THREAD);
     }
 
     fn session() -> Session {
@@ -2239,6 +2261,91 @@ mod tests {
 
     fn ids(session: &Session) -> Vec<String> {
         session.threads.iter().map(|row| row.id.clone()).collect()
+    }
+
+    /// What the view shows for `span` in Drafts: the compose drafts above
+    /// the rows read, when those reach the top of the folder.
+    fn read_with_drafts(
+        session: &mut Session,
+        folder: &Folder,
+        drafts: &[ThreadRow],
+        span: FolderSpan,
+    ) {
+        let (rows, before, after) = folder.read(&span);
+        let mut shown = if before { Vec::new() } else { drafts.to_vec() };
+        shown.extend(rows);
+        session.set_page(shown, before, after, 0);
+    }
+
+    fn land_with_drafts(session: &mut Session, folder: &Folder, drafts: &[ThreadRow]) {
+        let mut reads = 0;
+        while let Some(fetch) = session.take_fetch() {
+            reads += 1;
+            assert!(reads < 20, "the list keeps asking for rows");
+            let span = session.span(fetch, None, None);
+            read_with_drafts(session, folder, drafts, span);
+        }
+    }
+
+    #[test]
+    fn drafts_above_the_folder_do_not_move_its_window() {
+        let (mut session, folder) = paged(30, 10, 2);
+        // One draft older than every thread, one newer: neither sorts with
+        // the folder, and paging must not read from either.
+        let drafts: Vec<ThreadRow> = [("draft-old", 1), ("draft-new", 2_000_000)]
+            .into_iter()
+            .map(|(id, date)| ThreadRow {
+                draft: Some(id.into()),
+                ..dated(id, date)
+            })
+            .collect();
+        read_with_drafts(&mut session, &folder, &drafts, FolderSpan::Top { rows: 10 });
+        assert_eq!(&ids(&session)[..3], ["draft-old", "draft-new", "t00"]);
+        session.cursor_id = Some("draft-old".into());
+        let FolderSpan::Window { first, last, .. } = session.span(Fetch::default(), None, None)
+        else {
+            panic!("a refresh rereads the loaded rows");
+        };
+        assert_eq!(first, None, "from the folder's top");
+        assert_eq!(last.thread_id.0, "t09");
+        // Keeping few rows past the reader puts the window's end at the
+        // cursor. On a draft that is the folder's first row, not the draft,
+        // whose date would end the read above every thread.
+        session.keep_rows = 0;
+        session.cursor_id = Some("draft-new".into());
+        let span = session.span(Fetch::default(), None, None);
+        let FolderSpan::Window { first, last, .. } = &span else {
+            panic!("a refresh rereads the loaded rows");
+        };
+        assert_eq!(*first, None);
+        assert_eq!(last.thread_id.0, "t00");
+        read_with_drafts(&mut session, &folder, &drafts, span);
+        assert_eq!(&ids(&session)[..3], ["draft-old", "draft-new", "t00"]);
+        session.keep_rows = 1_000;
+        read_with_drafts(&mut session, &folder, &drafts, FolderSpan::Top { rows: 10 });
+        session.cursor_id = Some("draft-old".into());
+        // Down past the loaded rows: more load below, in order.
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        let loaded = ids(&session);
+        let threads: Vec<&String> = loaded.iter().skip(2).collect();
+        let expected: Vec<String> = (0..threads.len())
+            .map(|index| format!("t{index:02}"))
+            .collect();
+        assert_eq!(threads, expected.iter().collect::<Vec<_>>());
+        assert_eq!(session.cursor_id.as_deref(), Some("t09"));
+        // The bottom does not reach the top, so the drafts are not shown.
+        session.on_key(KeyId::Char('G'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        assert_eq!(session.cursor_id.as_deref(), Some("t29"));
+        assert!(session.threads.iter().all(|row| row.draft.is_none()));
+        // And back at the top, they are again.
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('g'), 4);
+        land_with_drafts(&mut session, &folder, &drafts);
+        assert_eq!(session.cursor_id.as_deref(), Some("draft-old"));
     }
 
     #[test]
