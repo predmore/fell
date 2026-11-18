@@ -59,9 +59,9 @@ CREATE TABLE IF NOT EXISTS thread_summary_dirty (
 ) WITHOUT ROWID;
 "#;
 
-/// Created apart from [`SUMMARY_TABLES`]: a mailbox summarized by an older
-/// version has this table without `last_date`, and its indexes cannot be
-/// built until [`ensure_thread_summaries`] has replaced it.
+/// Created apart from [`SUMMARY_TABLES`]: a mailbox summarized by version 1
+/// has this table without `last_date`, and its indexes cannot be built until
+/// [`ensure_thread_summaries`] has added the column.
 const FOLDER_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS thread_folders (
     account_id TEXT NOT NULL,
@@ -75,8 +75,10 @@ CREATE TABLE IF NOT EXISTS thread_folders (
     first_pos INTEGER NOT NULL,
     unread INTEGER NOT NULL,
     -- The thread's latest message date, copied from its summary, so a folder
-    -- list can be read in order a window at a time.
-    last_date INTEGER NOT NULL,
+    -- list can be read in order a window at a time. The default lets a
+    -- version 1 binary, which does not know the column, still write rows.
+    -- The next open of this version copies the dates back in.
+    last_date INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, thread_id, folder_key)
 ) WITHOUT ROWID;
 -- The earliest copy of a folder name is the first entry here. A refresh
@@ -158,12 +160,40 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     let tx = super::immediate_transaction(conn)?;
-    if summaries_are_current(&tx)? {
+    let version = summary_version(&tx)?;
+    if version.as_deref() == Some(SUMMARY_VERSION) {
         tx.execute_batch(FOLDER_TABLE)?;
         return tx.commit();
     }
-    // An older `thread_folders` lacks columns. Every row is rebuilt below,
-    // so replace the table instead of altering it.
+    if version.as_deref() == Some("1") && table_exists(&tx, "thread_folders")? {
+        // Version 1 rows are right apart from the date. Add it from the
+        // summaries instead of recomputing every thread under the write
+        // lock: fell and fell-mcp share the file, and a recompute of a large
+        // mailbox would outlast the other opener's busy timeout. Threads
+        // still queued are recomputed at commit, as with any write.
+        if !has_column(&tx, "thread_folders", "last_date")? {
+            tx.execute_batch(
+                "ALTER TABLE thread_folders ADD COLUMN last_date INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // Also repairs rows a version 1 binary wrote after an upgrade,
+        // which took the default.
+        tx.execute_batch(
+            "UPDATE thread_folders SET last_date = COALESCE((
+                 SELECT s.last_date FROM thread_summary s
+                 WHERE s.account_id = thread_folders.account_id
+                   AND s.thread_id = thread_folders.thread_id
+             ), 0);",
+        )?;
+        // The indexes go in after the dates, so the update does not keep
+        // them current row by row.
+        tx.execute_batch(FOLDER_TABLE)?;
+        stamp_version(&tx)?;
+        return tx.commit();
+    }
+    // No summaries yet, or a version this code does not know: build them
+    // from `messages`. An unknown `thread_folders` may lack columns, and
+    // every row is rebuilt below, so replace the table.
     tx.execute_batch("DROP TABLE IF EXISTS thread_folders;")?;
     tx.execute_batch(FOLDER_TABLE)?;
     tx.execute_batch(
@@ -172,24 +202,54 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
          INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
              SELECT DISTINCT account_id, thread_id FROM messages;",
     )?;
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('thread_summary', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![SUMMARY_VERSION],
-    )?;
+    stamp_version(&tx)?;
     // Commit recomputes every queued thread.
     tx.commit()
 }
 
-fn summaries_are_current(conn: &Connection) -> Result<bool> {
-    let value: Option<String> = conn
+fn stamp_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('thread_summary', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SUMMARY_VERSION],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn summary_version(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'thread_summary'",
             [],
             |row| row.get(0),
         )
-        .optional()?;
-    Ok(value.as_deref() == Some(SUMMARY_VERSION))
+        .optional()?)
+}
+
+fn summaries_are_current(conn: &Connection) -> Result<bool> {
+    Ok(summary_version(conn)?.as_deref() == Some(SUMMARY_VERSION))
 }
 
 /// Recompute every queued thread and empty the queue. Runs inside the write
@@ -1520,36 +1580,73 @@ mod tests {
         assert!(wider > large, "{large} steps for 20 rows, {wider} for 40");
     }
 
-    #[test]
-    fn a_version_one_mailbox_gets_list_dates() {
-        let path = std::env::temp_dir().join(format!(
-            "fell-thread-folders-v1-{}-{}.sqlite",
+    fn temp_mailbox(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fell-{name}-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        {
+        ))
+    }
+
+    fn remove_mailbox(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    fn summary_version_of(store: &Store) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'thread_summary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn snippet_of(store: &Store, thread: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT snippet FROM thread_summary WHERE thread_id = ?1",
+                params![thread],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fill(store: &Store, seed: u64, count: usize) {
+        store.upsert_account(&account()).unwrap();
+        let mut rng = Rng(seed);
+        let batch: Vec<Message> = (0..count)
+            .map(|index| message(&mut rng, index, &[]))
+            .collect();
+        store
+            .apply_delta(
+                &account().id,
+                &MailboxDelta {
+                    messages: batch,
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_version_one_mailbox_gets_list_dates_without_a_recompute() {
+        let path = temp_mailbox("thread-folders-v1");
+        let (kept, queued, kept_snippet) = {
             let store = Store::open(&path).unwrap();
-            store.upsert_account(&account()).unwrap();
-            let mut rng = Rng(13);
-            let batch: Vec<Message> = (0..30).map(|index| message(&mut rng, index, &[])).collect();
-            store
-                .apply_delta(
-                    &account().id,
-                    &MailboxDelta {
-                        messages: batch,
-                        ..MailboxDelta::default()
-                    },
-                )
-                .unwrap();
-            // The table as version 1 made it, without `last_date`.
+            fill(&store, 13, 30);
+            // The table as version 1 left it: the same rows, no `last_date`.
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE thread_folders;
-                     CREATE TABLE thread_folders (
+                    "CREATE TABLE thread_folders_v1 (
                          account_id TEXT NOT NULL,
                          folder_key TEXT NOT NULL,
                          thread_id TEXT NOT NULL,
@@ -1559,27 +1656,100 @@ mod tests {
                          unread INTEGER NOT NULL,
                          PRIMARY KEY (account_id, thread_id, folder_key)
                      ) WITHOUT ROWID;
+                     INSERT INTO thread_folders_v1
+                         SELECT account_id, folder_key, thread_id, display, first_rowid,
+                                first_pos, unread
+                         FROM thread_folders;
+                     DROP TABLE thread_folders;
+                     ALTER TABLE thread_folders_v1 RENAME TO thread_folders;
                      CREATE INDEX idx_thread_folders_folder
                          ON thread_folders(account_id, folder_key, first_rowid, first_pos);
                      UPDATE meta SET value = '1' WHERE key = 'thread_summary';",
                 )
                 .unwrap();
-        }
+            let threads: Vec<String> = store
+                .conn
+                .prepare("SELECT thread_id FROM thread_summary ORDER BY thread_id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            let (kept, queued) = (threads[0].clone(), threads[1].clone());
+            let kept_snippet = snippet_of(&store, &kept);
+            // Marks only a recompute would undo. `queued` waits in the
+            // refresh queue, as a writer that crashed would leave it.
+            store
+                .conn
+                .execute(
+                    "UPDATE thread_summary SET snippet = 'marker' WHERE thread_id IN (?1, ?2)",
+                    params![kept, queued],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO thread_summary_dirty (account_id, thread_id) VALUES (?1, ?2)",
+                    params![account().id.0, queued],
+                )
+                .unwrap();
+            (kept, queued, kept_snippet)
+        };
         let store = Store::open(&path).unwrap();
-        let version: String = store
+        assert_eq!(summary_version_of(&store), SUMMARY_VERSION);
+        assert_eq!(
+            snippet_of(&store, &kept),
+            "marker",
+            "the upgrade must not recompute threads from messages"
+        );
+        assert_ne!(
+            snippet_of(&store, &queued),
+            "marker",
+            "queued threads refresh"
+        );
+        store
             .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'thread_summary'",
-                [],
-                |row| row.get(0),
+            .execute(
+                "UPDATE thread_summary SET snippet = ?1 WHERE thread_id = ?2",
+                params![kept_snippet, kept],
             )
             .unwrap();
-        assert_eq!(version, SUMMARY_VERSION);
         assert_lists_match(&store, "after the version 1 upgrade", true);
         drop(store);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        remove_mailbox(&path);
+    }
+
+    #[test]
+    fn a_version_one_binary_can_still_write_folder_rows() {
+        let path = temp_mailbox("thread-folders-old-binary");
+        {
+            let store = Store::open(&path).unwrap();
+            fill(&store, 17, 30);
+            // What a version 1 binary does on seeing version 2: rebuild the
+            // rows with its own INSERT, which has no `last_date`, and stamp 1.
+            store
+                .conn
+                .execute_batch(
+                    "CREATE TEMP TABLE old_rows AS SELECT * FROM thread_folders;
+                     DELETE FROM thread_folders;
+                     INSERT INTO thread_folders (
+                         account_id, folder_key, thread_id, display, first_rowid, first_pos,
+                         unread
+                     )
+                     SELECT account_id, folder_key, thread_id, display, first_rowid,
+                            first_pos, unread
+                     FROM temp.old_rows;
+                     DROP TABLE temp.old_rows;
+                     UPDATE meta SET value = '1' WHERE key = 'thread_summary';",
+                )
+                .unwrap();
         }
+        // This version opens it again and puts the dates back.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(summary_version_of(&store), SUMMARY_VERSION);
+        assert_lists_match(&store, "after a version 1 binary wrote rows", true);
+        drop(store);
+        remove_mailbox(&path);
     }
 
     #[test]
