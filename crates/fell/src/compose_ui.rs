@@ -300,6 +300,11 @@ pub struct ComposeView {
     touched: bool,
     /// Agent edits already announced, so an arrival can be named.
     known_hunks: Vec<u64>,
+    /// Send was tried: a missing recipient now says it blocks send.
+    send_tried: bool,
+    /// The header took the keyboard: Cc and Bcc keep their own rows from
+    /// then on, so tabbing through them never moves the body.
+    header_open: bool,
 }
 
 impl ComposeView {
@@ -339,7 +344,7 @@ impl ComposeView {
             leader_at: None,
             which_visible: false,
             palette: None,
-            status: "i insert".into(),
+            status: "".into(),
             sent: false,
             sending: None,
             watching: false,
@@ -353,6 +358,8 @@ impl ComposeView {
             focus_by_user: false,
             touched: false,
             known_hunks: Vec::new(),
+            send_tried: false,
+            header_open: false,
         }
     }
 
@@ -396,7 +403,7 @@ impl ComposeView {
                     this.editor.row = row;
                     this.editor.col = this.editor.lines[row].chars().count();
                     this.editor.mode = Mode::Insert;
-                    this.status = "esc normal".into();
+                    this.status = "".into();
                 }
                 cx.notify();
             });
@@ -407,7 +414,7 @@ impl ComposeView {
                 this.insert_str(" now");
                 this.push_body();
                 this.arm_debounced_flush(cx);
-                this.status = "esc normal".into();
+                this.status = "".into();
                 cx.notify();
             });
             cx.background_executor()
@@ -416,7 +423,7 @@ impl ComposeView {
             let _ = this.update(cx, |this, cx| {
                 this.editor.mode = Mode::Normal;
                 this.end_insert();
-                this.status = "i insert".into();
+                this.status = "".into();
                 cx.notify();
             });
         })
@@ -561,7 +568,7 @@ impl ComposeView {
         if snap.to.is_empty() && snap.cc.is_empty() && snap.bcc.is_empty() && snap.hunks.is_empty()
         {
             self.field = Field::To;
-            self.status = "to · tab next".into();
+            self.status = "".into();
             // Tab from Subject carries the typing on after what is written.
             self.editor.cursor_to_end_of_text();
         }
@@ -678,8 +685,10 @@ impl ComposeView {
         self.bcc_line = join_addrs(&snap.bcc);
         self.subject_line = snap.subject.clone();
         self.sent = false;
+        self.send_tried = false;
+        self.header_open = false;
         self.quote_open = false;
-        self.status = "i insert".into();
+        self.status = "".into();
         self.start_on_recipients_if_empty(&snap);
     }
 
@@ -831,7 +840,7 @@ impl ComposeView {
                     return false;
                 }
                 self.mark_painted();
-                self.status = "draft".into();
+                self.status = "".into();
                 true
             }
             Some(Err(err)) => {
@@ -848,6 +857,7 @@ impl ComposeView {
     /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
         let id = self.draft_id.to_string();
+        self.send_tried = true;
         if self.sending.as_deref() == Some(id.as_str()) {
             self.status = "Sending…".into();
             return;
@@ -1398,7 +1408,7 @@ impl ComposeView {
             }
             "tab" => {
                 self.field = Field::To;
-                self.status = "to".into();
+                self.status = "".into();
             }
             _ => {
                 let _ = typed;
@@ -1484,6 +1494,7 @@ impl ComposeView {
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.editor.caret_hidden = self.field != Field::Body;
+        self.header_open |= self.field != Field::Body;
         if self.closing {
             window.remove_window();
         }
@@ -1538,14 +1549,12 @@ impl Render for ComposeView {
             Mode::Insert => "insert",
             Mode::Visual => "visual",
         };
-        let hint: SharedString = match (self.editor.mode, self.status.as_ref(), lock) {
+        // The mode word says it all; how to change mode is not news.
+        let hint: SharedString = match (idle_status(&self.status), lock) {
             // Nothing to type into: the way out is the hint.
-            (_, "i insert" | "insert" | "esc normal" | "normal", Some(lock)) => {
-                locked_hint(lock, wide).into()
-            }
-            (Mode::Insert, "i insert" | "insert", _) => "esc normal".into(),
-            (Mode::Normal, "esc normal" | "normal", _) => "i insert".into(),
-            _ => self.status.clone(),
+            (true, Some(lock)) => locked_hint(lock, wide).into(),
+            (true, None) => "".into(),
+            (false, _) => self.status.clone(),
         };
         let mono = self
             .look
@@ -1580,7 +1589,9 @@ impl Render for ComposeView {
                     .map(|quote| quote.flex_shrink_0()),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
-            .child(status_bar(mode, &hint, &snap, colors, wide, mono).flex_shrink_0())
+            .child(
+                status_bar(mode, &hint, &snap, self.send_tried, colors, wide, mono).flex_shrink_0(),
+            )
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
@@ -1613,11 +1624,12 @@ impl ComposeView {
         let none = HashSet::new();
         // An empty To says what it needs, in the error colour while it
         // blocks send.
-        let to_hint = if snap.send_block.as_deref() == Some(NO_RECIPIENT) {
-            ("add a recipient", colors.error)
-        } else {
-            ("add a recipient", colors.dim)
-        };
+        let to_hint =
+            if shown_send_block(snap, self.send_tried).map(String::as_str) == Some(NO_RECIPIENT) {
+                ("add a recipient", colors.error)
+            } else {
+                ("add a recipient", colors.dim)
+            };
         column = field_row(
             column,
             "To",
@@ -1630,8 +1642,10 @@ impl ComposeView {
             Some(to_hint),
         );
         let copies_empty = snap.cc.is_empty() && snap.bcc.is_empty();
-        let copies_active = matches!(self.field, Field::Cc | Field::Bcc);
-        if copies_empty && !copies_active {
+        // Once the header has the keyboard, Cc and Bcc keep a row each, so
+        // tabbing through them does not move the body.
+        let copies_open = self.header_open;
+        if copies_empty && !copies_open {
             // Two empty rows would push the message down; tab still reaches each.
             column = column.child(
                 div()
@@ -1752,6 +1766,7 @@ impl ComposeView {
                     &self.folder,
                     &body_edit_ranges(snap),
                     self.focused_hunk,
+                    draft_links(snap),
                     colors,
                 )
             });
@@ -2561,12 +2576,32 @@ fn hunk_banner(
 
 /// The body line (from 1) where a body hunk starts, as the editor counts it.
 fn body_edit_line(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<usize> {
-    let slice = snap.text.get(hunk.start..hunk.end)?.trim();
-    if slice.is_empty() {
+    let (at, _) = hunk_body_range(snap, hunk)?;
+    Some(snap.body[..at].matches('\n').count() + 1)
+}
+
+/// A body hunk's own range in the body, without the blank space around
+/// it: mapped from where it sits in the draft file, never searched for,
+/// so the same text earlier in the body is not taken for it.
+fn hunk_body_range(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<(usize, usize)> {
+    let (start, end) = snap.body_range(hunk.start, hunk.end)?;
+    let slice = snap.body.get(start..end)?;
+    let trimmed = slice.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let at = snap.body.find(slice)?;
-    Some(snap.body[..at].matches('\n').count() + 1)
+    let lead = slice.len() - slice.trim_start().len();
+    Some((start + lead, start + lead + trimmed.len()))
+}
+
+/// How the styled body shows where links go: an agent's draft is the
+/// agent's words until sent, so each link says where it goes.
+fn draft_links(snap: &Snapshot) -> Links {
+    if snap.agent_authored {
+        Links::Host
+    } else {
+        Links::Label
+    }
 }
 
 /// Every agent edit in reading order: header changes first, then body
@@ -2729,17 +2764,8 @@ fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String, u64)> {
         .iter()
         .filter(|hunk| hunk.kind == HunkKind::Body)
         .filter_map(|hunk| {
-            let slice = snap.text.get(hunk.start..hunk.end)?.trim();
-            if slice.is_empty() {
-                return None;
-            }
-            let at = snap.body.find(slice)?;
-            Some((
-                at,
-                at + slice.len(),
-                hunk.previous.trim().to_string(),
-                hunk.id,
-            ))
+            let (start, end) = hunk_body_range(snap, hunk)?;
+            Some((start, end, hunk.previous.trim().to_string(), hunk.id))
         })
         .collect()
 }
@@ -2749,6 +2775,7 @@ fn styled_body(
     folder: &Path,
     hunks: &[(usize, usize, String, u64)],
     focused: Option<u64>,
+    links: Links,
     colors: Palette,
 ) -> gpui::Div {
     let text = editor.text();
@@ -2781,9 +2808,9 @@ fn styled_body(
                     })
                     .unwrap_or_default();
                 let painted = if raw || !edits.is_empty() {
-                    raw_source_block(block, &text, editor, &edits, focused, colors)
+                    raw_source_block(block, &text, editor, &edits, focused, links, colors)
                 } else {
-                    render_block(block, folder, Links::Label, colors)
+                    render_block(block, folder, links, colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -2864,7 +2891,14 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
         .get(editor.row)
         .map(String::as_str)
         .unwrap_or("");
-    raw_line(line, Some(editor.col), true, true, editor.mode, colors)
+    raw_line(
+        line,
+        Some(editor.col),
+        true,
+        Urls::Source,
+        editor.mode,
+        colors,
+    )
 }
 
 fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
@@ -2875,7 +2909,7 @@ fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
             line,
             cursor.then_some(editor.col),
             true,
-            true,
+            Urls::Source,
             editor.mode,
             colors,
         ));
@@ -2889,10 +2923,11 @@ fn raw_source_block(
     editor: &Editor,
     edits: &[&(usize, usize, String, u64)],
     focused: Option<u64>,
+    links: Links,
     colors: Palette,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
-        return render_block(block, Path::new(""), Links::Label, colors);
+        return render_block(block, Path::new(""), links, colors);
     };
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
@@ -2916,14 +2951,12 @@ fn raw_source_block(
             .collect();
         // Markers fold off the cursor line. A link's URL does too, except
         // on a line an agent changed: a new destination must be seen.
-        let mut painted = raw_line(
-            line,
-            cursor,
-            cursor.is_some(),
-            cursor.is_some() || !touching.is_empty(),
-            editor.mode,
-            colors,
-        );
+        let urls = if cursor.is_some() || !touching.is_empty() {
+            Urls::Source
+        } else {
+            Urls::Fold(links)
+        };
+        let mut painted = raw_line(line, cursor, cursor.is_some(), urls, editor.mode, colors);
         if !touching.is_empty() {
             // A new edit right under another one starts its own block.
             let mut gap =
@@ -2990,21 +3023,53 @@ fn raw_source_block(
     column
 }
 
+/// How a source line shows a link's `](url)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Urls {
+    /// As written: the cursor line, the raw view, a line an agent changed.
+    Source,
+    /// Folded away, with the destination after the label when `Links`
+    /// says the reader needs it, as the styled body shows it.
+    Fold(Links),
+}
+
 /// Whether a span of a source line is left out: markers off the cursor
-/// line, and a link's `](url)` unless URLs show.
-fn folds(kind: StyleKind, show_markers: bool, show_urls: bool) -> bool {
+/// line, and a link's `](url)` when URLs fold.
+fn folds(kind: StyleKind, show_markers: bool, urls: Urls) -> bool {
     match kind {
         StyleKind::Marker => !show_markers,
-        StyleKind::LinkUrl => !show_urls,
+        StyleKind::LinkUrl => matches!(urls, Urls::Fold(_)),
         _ => false,
     }
+}
+
+/// What a source line shows after a link's `](url)` span, if anything:
+/// where a folded link goes when the label alone could mislead, or an
+/// IDN host in `xn--` form beside a URL shown as written.
+fn url_note(label: &str, url_span: &str, urls: Urls) -> Option<String> {
+    let href = span_href(url_span)?;
+    match urls {
+        Urls::Source => idn_host(href).map(|host| format!("({host})")),
+        Urls::Fold(links) => shown_target(&plain_markdown(label), href, links),
+    }
+}
+
+/// The target inside a link's `](url "title")` span.
+fn span_href(span: &str) -> Option<&str> {
+    let inner = span.strip_prefix("](")?.strip_suffix(')')?;
+    let href = inner.split_whitespace().next()?;
+    let href = href
+        .strip_prefix('<')
+        .and_then(|href| href.strip_suffix('>'))
+        .unwrap_or(href);
+    (!href.is_empty()).then_some(href)
 }
 
 fn raw_line(
     line: &str,
     cursor: Option<usize>,
     show_markers: bool,
-    show_urls: bool,
+    urls: Urls,
     mode: Mode,
     colors: Palette,
 ) -> gpui::Div {
@@ -3029,14 +3094,24 @@ fn raw_line(
         return row;
     }
     let cursor_byte = cursor.map(|col| byte_index(line, col));
+    let mut label = "";
     for span in styles {
-        if folds(span.kind, show_markers, show_urls) {
+        let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
+        if span.kind == StyleKind::LinkText {
+            label = slice;
+        }
+        let note = (span.kind == StyleKind::LinkUrl)
+            .then(|| url_note(label, slice, urls))
+            .flatten();
+        if folds(span.kind, show_markers, urls) {
             if span.start == 0 && span.kind == StyleKind::Marker {
                 row = row.child(folded_marker(line, colors));
             }
+            if let Some(note) = note {
+                row = row.child(link_note(note, colors));
+            }
             continue;
         }
-        let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
         if span.start == 0
             && span.kind == StyleKind::Marker
             && matches!(slice, "- " | "-" | "* " | "*")
@@ -3084,9 +3159,15 @@ fn raw_line(
                     row = row.child(styled_span(right, color, weight, span.kind, colors.code));
                 }
             }
+            if let Some(note) = note {
+                row = row.child(link_note(note, colors));
+            }
             continue;
         }
         row = row.child(styled_span(slice, color, weight, span.kind, colors.code));
+        if let Some(note) = note {
+            row = row.child(link_note(note, colors));
+        }
     }
     if cursor_byte.is_some_and(|at| at >= line.len()) {
         row = row.child(caret(colors, mode));
@@ -3194,9 +3275,20 @@ enum Links {
     /// the cursor is not on. A label that reads as an address but goes
     /// somewhere else still shows where.
     Label,
+    /// The label, then the host it goes to, dimmed: an agent's draft,
+    /// whose every link the person has not yet checked.
+    Host,
     /// The label, then the destination, dimmed: the HTML preview before
     /// send and the quoted original.
     Target,
+}
+
+/// Where a link goes, dimmed after its label.
+fn link_note(note: String, colors: Palette) -> gpui::Div {
+    div()
+        .pl(px(4.))
+        .text_color(rgb(colors.dim))
+        .child(display_safe(&note))
 }
 
 fn render_block(
@@ -3310,12 +3402,7 @@ fn render_inlines(
                         .underline()
                         .child(text.clone()),
                 )
-                .children(shown_target(text, href, links).map(|target| {
-                    div()
-                        .pl(px(4.))
-                        .text_color(rgb(colors.marker))
-                        .child(target)
-                })),
+                .children(shown_target(text, href, links).map(|target| link_note(target, colors))),
             fell_core::compose::Inline::Image { alt, .. } => row.child(div().child(alt.clone())),
         };
     }
@@ -3621,12 +3708,26 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
     }))
 }
 
+/// Why send is blocked, as the status bar says it. A new draft has nobody
+/// to send to yet: that is a block only once the person tries to send it.
+fn shown_send_block(snap: &Snapshot, send_tried: bool) -> Option<&String> {
+    snap.send_block
+        .as_ref()
+        .filter(|reason| send_tried || reason.as_str() != NO_RECIPIENT)
+}
+
+/// A status that says nothing the mode word does not.
+fn idle_status(status: &str) -> bool {
+    matches!(status, "" | "normal" | "insert")
+}
+
 /// One line, in the inbox's style: mode and hints on the left, send on
 /// the right, `key action` pairs separated by ` · `, in the mono face.
 fn status_bar(
     mode: &str,
     status: &SharedString,
     snap: &Snapshot,
+    send_tried: bool,
     colors: Palette,
     wide: bool,
     mono: Option<String>,
@@ -3654,22 +3755,20 @@ fn status_bar(
         .gap_2()
         .min_w(px(0.))
         .overflow_hidden();
-    let idle = matches!(
-        status.as_ref(),
-        "i insert" | "esc normal" | "normal" | "insert"
-    );
+    let idle = idle_status(status);
     if wide {
         left = left
             .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
-            .child(dot())
             // The message gives way first, so it never runs under send.
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_color(rgb(colors.fg))
-                    .child(status.to_string()),
-            );
+            .when(!idle, |left| {
+                left.child(dot()).child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(colors.fg))
+                        .child(status.to_string()),
+                )
+            });
         // The header tags each first-time address; the count only fills
         // an idle bar, so it never crowds out a message.
         if let Some(label) = fresh_label.filter(|_| idle) {
@@ -3693,18 +3792,6 @@ fn status_bar(
                 )
                 .when(!idle, |left| left.child(dot()));
         }
-        // How to change mode is the hint that matters most: after `r` the
-        // next key is a letter.
-        let hint = match status.as_ref() {
-            "i insert" if mode == "normal" => Some("i insert"),
-            "insert" | "esc normal" if mode == "insert" => Some("esc normal"),
-            _ => None,
-        };
-        if let Some(hint) = hint.filter(|_| idle) {
-            left = left
-                .child(dot())
-                .child(div().flex_shrink_0().text_color(rgb(colors.fg)).child(hint));
-        }
         if !idle {
             left = left.child(
                 div()
@@ -3727,7 +3814,7 @@ fn status_bar(
             );
         }
     }
-    let right = match &snap.send_block {
+    let right = match shown_send_block(snap, send_tried) {
         // Gone out: say so plainly, not as a block.
         Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => div()
             .flex()
@@ -3902,6 +3989,7 @@ fn empty_snapshot(id: &str) -> Snapshot {
         send_requested_by: None,
         reply_context: None,
         forwarded: None,
+        agent_authored: false,
     }
 }
 
@@ -3924,50 +4012,172 @@ fn stored_quote(snap: &Snapshot) -> Option<&str> {
 /// before send. Omitted when the label already is the URL.
 fn link_target(text: &str, href: &str) -> Option<String> {
     let href = href.trim();
-    if href.is_empty() || href == text.trim() {
+    if href.is_empty() || href == text.trim() && idn_host(href).is_none() {
         return None;
     }
-    Some(format!("({href})"))
+    Some(format!("({})", ascii_target(href)))
 }
 
 /// The destination a styled link shows after its label, if any.
+///
+/// The person's own words show the label alone, unless the label reads as
+/// an address that is not where the link goes. An agent's words show the
+/// host too, unless the label already names it. A host in another script
+/// always shows, in its `xn--` form, so a look-alike cannot pass.
 fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    let host = || Some(format!("({})", link_host(href)));
     match links {
         Links::Target => link_target(text, href),
-        Links::Label if reads_as_address(text) && !same_place(text, href) => {
-            link_target(text, href)
+        _ if idn_host(href).is_some() || label_misleads(text, href) => host(),
+        Links::Host if !label_names(text, href) => host(),
+        Links::Host | Links::Label => None,
+    }
+}
+
+/// Where a link goes, in brief: its host (`xn--` for an IDN), the address
+/// of a `mailto:`, or else the whole target.
+fn link_host(href: &str) -> String {
+    match place_of_href(href) {
+        Some(Place::Host(host)) => host,
+        Some(Place::Mail { address, .. }) => address,
+        None => ascii_target(href),
+    }
+}
+
+/// The whole target, an IDN host in `xn--` form.
+fn ascii_target(href: &str) -> String {
+    let href = href.trim();
+    if href.is_ascii() {
+        return href.to_string();
+    }
+    url::Url::parse(href)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| href.to_string())
+}
+
+/// The `xn--` form of a link's host, when the host is not plain ASCII.
+fn idn_host(href: &str) -> Option<String> {
+    let url = url::Url::parse(href.trim()).ok()?;
+    let host = url.host_str()?;
+    host.split('.')
+        .any(|label| label.starts_with("xn--"))
+        .then(|| host.to_string())
+}
+
+/// A place a label or a link names: a host, or a mail address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    /// Lowercase, `xn--` form, without a leading `www.`.
+    Host(String),
+    Mail {
+        address: String,
+        domain: String,
+    },
+}
+
+impl Place {
+    fn domain(&self) -> &str {
+        match self {
+            Place::Host(host) => host,
+            Place::Mail { domain, .. } => domain,
         }
-        Links::Label => None,
     }
 }
 
-/// A label that a reader takes for where the link goes: one word with a
-/// scheme, a `www.`, an `@`, or a dot between letters ("example.com").
-fn reads_as_address(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() || text.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let lower = text.to_ascii_lowercase();
-    lower.contains("://")
-        || lower.starts_with("www.")
-        || lower.contains('@')
-        || lower.split('.').filter(|part| !part.is_empty()).count() >= 2
+/// The ASCII (`xn--`) lowercase form of a host, without `www.`.
+fn ascii_host(host: &str) -> Option<String> {
+    let url = url::Url::parse(&format!("http://{host}/")).ok()?;
+    let host = url.host_str()?.to_string();
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
 }
 
-/// Whether an address-like label names the place the link goes.
-fn same_place(text: &str, href: &str) -> bool {
-    let bare = |value: &str| {
-        let value = value.trim().to_ascii_lowercase();
-        let value = value
-            .strip_prefix("mailto:")
-            .or_else(|| value.split_once("://").map(|(_, rest)| rest))
-            .unwrap_or(&value)
-            .to_string();
-        let value = value.strip_prefix("www.").unwrap_or(&value).to_string();
-        value.trim_end_matches('/').to_string()
-    };
-    bare(text) == bare(href)
+fn place_of_href(href: &str) -> Option<Place> {
+    let url = url::Url::parse(href.trim()).ok()?;
+    if url.scheme().eq_ignore_ascii_case("mailto") {
+        let (local, domain) = url.path().rsplit_once('@')?;
+        let domain = ascii_host(domain)?;
+        return Some(Place::Mail {
+            address: format!("{}@{domain}", local.to_lowercase()),
+            domain,
+        });
+    }
+    let host = url.host_str()?;
+    Some(Place::Host(
+        host.strip_prefix("www.").unwrap_or(host).to_string(),
+    ))
+}
+
+/// The place one word of a label reads as, if it reads as one at all:
+/// a scheme (`https://…`), a `www.`, an address with `@`, or a dotted name
+/// ending in letters (`bank.com`, not `v1.2` or `e.g.`).
+fn place_of_word(word: &str) -> Option<Place> {
+    let word = word.trim_matches(|ch: char| {
+        !(ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~'))
+    });
+    let lower = word.to_lowercase();
+    let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
+    if lower.contains("://") {
+        let url = url::Url::parse(lower).ok()?;
+        return url.host_str().and_then(ascii_host).map(Place::Host);
+    }
+    if let Some((local, domain)) = lower.rsplit_once('@')
+        && !local.is_empty()
+    {
+        let domain = ascii_host(dotted_name(domain)?)?;
+        return Some(Place::Mail {
+            address: format!("{local}@{domain}"),
+            domain,
+        });
+    }
+    let name = lower.split(['/', '?', '#']).next()?;
+    let name = name.rsplit_once(':').map_or(name, |(host, port)| {
+        if port.chars().all(|ch| ch.is_ascii_digit()) {
+            host
+        } else {
+            name
+        }
+    });
+    ascii_host(dotted_name(name)?).map(Place::Host)
+}
+
+/// `name` when it reads as a domain: two or more dotted parts, the last
+/// of them letters.
+fn dotted_name(name: &str) -> Option<&str> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let last = parts.last()?;
+    let letters = last.chars().count() >= 2 && last.chars().all(char::is_alphabetic)
+        || last.starts_with("xn--");
+    (parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()) && letters).then_some(name)
+}
+
+/// The places a label's words read as.
+fn label_places(text: &str) -> Vec<Place> {
+    text.split_whitespace().filter_map(place_of_word).collect()
+}
+
+/// Whether a word of the label reads as an address that is not where the
+/// link goes: "Sign in at paypal.com" to another host.
+fn label_misleads(text: &str, href: &str) -> bool {
+    let target = place_of_href(href);
+    label_places(text)
+        .iter()
+        .any(|place| match (&target, place) {
+            (None, _) => true,
+            (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => {
+                address != word
+            }
+            (Some(target), place) => target.domain() != place.domain(),
+        })
+}
+
+/// Whether the label already names where the link goes.
+fn label_names(text: &str, href: &str) -> bool {
+    let places = label_places(text);
+    !places.is_empty() && !label_misleads(text, href)
 }
 
 fn canonical_body(body: &str) -> String {
@@ -4689,32 +4899,78 @@ mod tests {
         assert_eq!((empty.row, empty.col), (0, 0));
     }
 
-    /// The text a source line shows with these fold settings.
-    fn shown(line: &str, show_markers: bool, show_urls: bool) -> String {
-        fell_core::compose::line_styles(line)
-            .into_iter()
-            .filter(|span| !super::folds(span.kind, show_markers, show_urls))
-            .map(|span| &line[span.start..span.end])
-            .collect()
+    /// The text a source line shows with these fold settings, a link's
+    /// note after it with a space, as `raw_line` paints them.
+    fn shown(line: &str, show_markers: bool, urls: super::Urls) -> String {
+        let mut out = String::new();
+        let mut label = "";
+        for span in fell_core::compose::line_styles(line) {
+            let slice = &line[span.start..span.end];
+            if span.kind == super::StyleKind::LinkText {
+                label = slice;
+            }
+            if !super::folds(span.kind, show_markers, urls) {
+                out.push_str(slice);
+            }
+            if span.kind == super::StyleKind::LinkUrl
+                && let Some(note) = super::url_note(label, slice, urls)
+            {
+                out.push(' ');
+                out.push_str(&note);
+            }
+        }
+        out
     }
 
     #[test]
     fn a_link_url_folds_away_off_the_cursor_line() {
+        use super::{Links, Urls};
         // #158: the URL (and its "]") stayed on every line.
         let line = "See [the plan](https://example.com/plan) for dates.";
-        assert_eq!(shown(line, false, false), "See the plan for dates.");
+        assert_eq!(
+            shown(line, false, Urls::Fold(Links::Label)),
+            "See the plan for dates."
+        );
         // The cursor line shows the source, dimmed markers and all.
-        assert_eq!(shown(line, true, true), line);
+        assert_eq!(shown(line, true, Urls::Source), line);
         // A line an agent changed keeps its destination in view.
         assert_eq!(
-            shown(line, false, true),
+            shown(line, false, Urls::Source),
             "See the plan](https://example.com/plan) for dates."
         );
     }
 
     #[test]
-    fn a_styled_link_shows_its_label_unless_the_label_misleads() {
-        use super::{Links, shown_target};
+    fn agent_words_show_where_each_link_goes() {
+        use super::{Links, Urls, shown_target};
+        // An agent's create_draft body has no hunks: every link in it
+        // says where it goes, styled and on a raw line alike.
+        let label = "pay the invoice";
+        let href = "https://evil.example/login";
+        assert_eq!(shown_target(label, href, Links::Label), None);
+        assert_eq!(
+            shown_target(label, href, Links::Host).as_deref(),
+            Some("(evil.example)")
+        );
+        let line = "Please [pay the invoice](https://evil.example/login) today.";
+        assert_eq!(
+            shown(line, false, Urls::Fold(Links::Host)),
+            "Please pay the invoice (evil.example) today."
+        );
+        // A label that already names the host says it once.
+        assert_eq!(
+            shown_target("evil.example", "https://www.evil.example/", Links::Host),
+            None
+        );
+        assert_eq!(
+            shown_target("write to ada", "mailto:ada@example.com", Links::Host).as_deref(),
+            Some("(ada@example.com)")
+        );
+    }
+
+    #[test]
+    fn a_label_that_reads_as_an_address_shows_where_it_goes() {
+        use super::{Links, Urls, shown_target};
         assert_eq!(
             shown_target("the plan", "https://example.com/plan", Links::Label),
             None
@@ -4723,20 +4979,136 @@ mod tests {
             shown_target("example.com", "https://www.example.com/", Links::Label),
             None
         );
-        // A label that reads as an address but goes elsewhere says where.
         assert_eq!(
             shown_target("bank.example", "https://other.example/login", Links::Label).as_deref(),
-            Some("(https://other.example/login)")
+            Some("(other.example)")
+        );
+        // Any word of the label, not only a one-word label.
+        assert_eq!(
+            shown_target(
+                "Sign in at paypal.com",
+                "https://evil.example/login",
+                Links::Label
+            )
+            .as_deref(),
+            Some("(evil.example)")
+        );
+        assert_eq!(
+            shown_target(
+                "Sign in at paypal.com.",
+                "https://www.paypal.com/signin",
+                Links::Label
+            ),
+            None
+        );
+        // A host that only starts like the label's is somewhere else.
+        assert_eq!(
+            shown_target("bank.com", "https://bank.com.evil.example/", Links::Label).as_deref(),
+            Some("(bank.com.evil.example)")
         );
         assert_eq!(
             shown_target("ada@example.com", "mailto:ada@example.com", Links::Label),
             None
+        );
+        assert_eq!(
+            shown_target("ada@example.com", "mailto:eve@example.com", Links::Label).as_deref(),
+            Some("(eve@example.com)")
+        );
+        // Words with dots that are not addresses.
+        for label in ["v1.2 notes", "see e.g. the plan", "3.5 stars"] {
+            assert_eq!(
+                shown_target(label, "https://example.com/", Links::Label),
+                None,
+                "{label}"
+            );
+        }
+        // On a raw line off the cursor, the same check runs.
+        let line = "[bank.com](https://evil.example/login) and more";
+        assert_eq!(
+            shown(line, false, Urls::Fold(Links::Label)),
+            "bank.com (evil.example) and more"
+        );
+        assert_eq!(
+            shown(
+                "[**bank.com**](https://evil.example/)",
+                false,
+                Urls::Fold(Links::Label)
+            ),
+            "**bank.com** (evil.example)"
         );
         // The HTML preview before send shows every destination.
         assert_eq!(
             shown_target("the plan", "https://example.com/plan", Links::Target).as_deref(),
             Some("(https://example.com/plan)")
         );
+    }
+
+    #[test]
+    fn an_idn_host_shows_in_its_ascii_form() {
+        use super::{Links, Urls, shown_target};
+        // Cyrillic letters that read as "paypal".
+        let href = "https://\u{440}\u{430}\u{443}\u{440}\u{430}l.com/login";
+        let note = |links| shown_target("the account", href, links).unwrap();
+        for links in [Links::Label, Links::Host] {
+            let note = note(links);
+            assert!(
+                note.starts_with("(xn--") && note.ends_with(".com)"),
+                "{note}"
+            );
+        }
+        assert!(note(Links::Target).starts_with("(https://xn--"));
+        // A label that is the URL still shows where it really goes.
+        assert!(shown_target(href, href, Links::Target).is_some());
+        // As written, on the cursor line, the ASCII form sits beside it.
+        let line = format!("[the account]({href})");
+        let raw = shown(&line, true, Urls::Source);
+        assert!(raw.starts_with(&line) && raw.contains("(xn--"), "{raw}");
+    }
+
+    #[test]
+    fn a_hunk_is_found_where_it_is_not_where_its_text_first_appears() {
+        // The same link earlier in the body is not the agent's edit.
+        let link = "[pay](https://example.com/pay)";
+        let mut snap = super::empty_snapshot("d");
+        snap.body = format!("{link}\n\nThanks,\n{link}\n");
+        snap.text = format!("---\nto: []\n---\n{}", snap.body);
+        let base = snap.text.len() - snap.body.len();
+        let second = snap.body.rfind(link).unwrap();
+        snap.hunks = vec![fell_core::compose::HunkView {
+            id: 4,
+            kind: super::HunkKind::Body,
+            start: base + second,
+            end: base + second + link.len() + 1,
+            label: String::new(),
+            previous: "old".into(),
+        }];
+        assert_eq!(
+            super::body_edit_ranges(&snap),
+            vec![(second, second + link.len(), "old".to_string(), 4)]
+        );
+        assert_eq!(super::ordered_hunks(&snap), vec![(4, Some(4))]);
+    }
+
+    #[test]
+    fn the_status_bar_says_the_mode_and_nothing_obvious() {
+        for status in ["", "insert", "normal"] {
+            assert!(super::idle_status(status), "{status}");
+        }
+        assert!(!super::idle_status("Sending…"));
+    }
+
+    #[test]
+    fn a_missing_recipient_blocks_send_only_once_send_is_tried() {
+        let mut snap = super::empty_snapshot("d");
+        snap.send_block = Some(super::NO_RECIPIENT.into());
+        assert_eq!(super::shown_send_block(&snap, false), None);
+        assert_eq!(
+            super::shown_send_block(&snap, true).map(String::as_str),
+            Some(super::NO_RECIPIENT)
+        );
+        // Any other block shows at once.
+        snap.send_block = Some("from is not this account".into());
+        assert!(super::shown_send_block(&snap, false).is_some());
     }
 
     #[test]
