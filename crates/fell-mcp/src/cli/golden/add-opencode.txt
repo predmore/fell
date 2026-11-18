@@ -1,19 +1,20 @@
 --- stdout
 {
   "mcp": {
-    "fell": {
-      "type": "local",
-      "command": [
-        "/opt/fell/fell-mcp",
-        "serve",
-        "--store",
-        "$TMP/mail.db",
-        "--account",
-        "demo",
-        "--agent",
-        "opencode"
-      ],
-      "enabled": true
+    "servers": {
+      "fell": {
+        "type": "local",
+        "command": [
+          "/opt/fell/fell-mcp",
+          "serve",
+          "--store",
+          "$TMP/mail.db",
+          "--account",
+          "demo",
+          "--agent",
+          "opencode"
+        ]
+      }
     }
   }
 }

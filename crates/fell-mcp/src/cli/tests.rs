@@ -52,6 +52,8 @@ struct Ctx {
     dir: TempDir,
     appimage: Option<PathBuf>,
     name: &'static str,
+    /// HOME unset (or relative, which `Env::from_process` also drops).
+    no_home: bool,
 }
 
 struct Ran {
@@ -77,6 +79,7 @@ impl Ctx {
             dir,
             appimage: None,
             name: "fell-mcp",
+            no_home: false,
         }
     }
 
@@ -99,7 +102,7 @@ impl Ctx {
             err: &mut err,
             tty,
             env: Env {
-                home: Some(self.home()),
+                home: (!self.no_home).then(|| self.home()),
                 ..Env::default()
             },
             default_store: Some(self.store()),
@@ -167,6 +170,13 @@ fn add_prints_the_exact_entry_for_each_harness() {
 
 #[test]
 fn add_at_a_terminal_asks_for_scopes_and_writes_after_a_yes() {
+    // Under umask 077 a create mode of 0640 would come out 0600.
+    if !crate::setup::tests::in_child_with_umask(
+        "cli::tests::add_at_a_terminal_asks_for_scopes_and_writes_after_a_yes",
+        0o077,
+    ) {
+        return;
+    }
     let ctx = Ctx::new();
     let codex = ctx.home().join(".codex");
     std::fs::create_dir_all(&codex).unwrap();
@@ -277,7 +287,7 @@ fn add_without_a_terminal_grants_read_and_draft_and_does_not_write() {
     let path = ctx.home().join(".config/opencode/opencode.json");
     let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
-        value["mcp"]["fell"]["command"]
+        value["mcp"]["servers"]["fell"]["command"]
             .as_array()
             .unwrap()
             .last()
@@ -330,10 +340,24 @@ fn write_refuses_symlinks_and_files_it_cannot_parse() {
     std::fs::create_dir_all(&dir).unwrap();
     std::os::unix::fs::symlink(&elsewhere, dir.join("settings.json")).unwrap();
     let ran = ctx.run(&["fell-mcp", "add", "gemini", "--write"], "", false);
-    ran.result.unwrap();
+    // A write that was asked for and refused exits non-zero, and says the
+    // grant stands.
+    assert_eq!(
+        ran.result.unwrap_err().to_string(),
+        "did not write ~/.gemini/settings.json"
+    );
+    assert_eq!(ctx.grant("gemini"), AgentGrant::enabled(true, false, true));
     assert!(
         ran.err
             .contains("Did not write: ~/.gemini/settings.json is a symlink"),
+        "{}",
+        ran.err
+    );
+    assert!(
+        ran.err.contains(
+            "The grant is saved. Paste the entry above into ~/.gemini/settings.json yourself, \
+             or undo the grant with `fell-mcp revoke gemini`."
+        ),
         "{}",
         ran.err
     );
@@ -346,7 +370,7 @@ fn write_refuses_symlinks_and_files_it_cannot_parse() {
     std::fs::create_dir_all(ctx.home().join(".config")).unwrap();
     std::os::unix::fs::symlink(&real, ctx.home().join(".config/goose")).unwrap();
     let ran = ctx.run(&["fell-mcp", "add", "goose", "--write"], "", false);
-    ran.result.unwrap();
+    assert!(ran.result.is_err());
     assert!(
         ran.err
             .contains("Did not write: ~/.config/goose is a symlink"),
@@ -360,7 +384,7 @@ fn write_refuses_symlinks_and_files_it_cannot_parse() {
     std::fs::create_dir_all(&oc).unwrap();
     std::fs::write(oc.join("opencode.jsonc"), "{ // mine\n}").unwrap();
     let ran = ctx.run(&["fell-mcp", "add", "opencode", "--write"], "", false);
-    ran.result.unwrap();
+    assert!(ran.result.is_err());
     assert!(ran.err.contains("opencode.jsonc exists"), "{}", ran.err);
     assert!(!oc.join("opencode.json").exists());
 
@@ -369,7 +393,7 @@ fn write_refuses_symlinks_and_files_it_cannot_parse() {
     std::fs::create_dir_all(&codex).unwrap();
     std::fs::write(codex.join("config.toml"), "[broken\n").unwrap();
     let ran = ctx.run(&["fell-mcp", "add", "codex", "--write"], "", false);
-    ran.result.unwrap();
+    assert!(ran.result.is_err());
     assert!(
         ran.err.contains("~/.codex/config.toml is not valid TOML"),
         "{}",
@@ -672,23 +696,78 @@ fn inside_an_appimage_harnesses_start_the_appimage() {
             .contains("`~/Apps/fell-x86_64.AppImage mcp revoke codex`")
     );
 
-    let mount = Path::new("/tmp/.mount_fellX/usr/bin/fell-mcp");
-    let found = inside_appimage(
-        Some(mount),
-        Some("/apps/fell.AppImage".into()),
-        Some("/tmp/.mount_fellX".into()),
-    );
-    assert_eq!(found, Some(PathBuf::from("/apps/fell.AppImage")));
-    let elsewhere = inside_appimage(
-        Some(Path::new("/usr/bin/fell-mcp")),
-        Some("/apps/fell.AppImage".into()),
-        Some("/tmp/.mount_fellX".into()),
-    );
-    assert_eq!(elsewhere, None);
+    // A mounted AppDir with this program in usr/bin, and the AppImage file.
+    let root = ctx.dir.path();
+    let appdir = root.join(".mount_fellX");
+    std::fs::create_dir_all(appdir.join("usr/bin")).unwrap();
+    let bundled = appdir.join("usr/bin/fell-mcp");
+    std::fs::write(&bundled, "").unwrap();
+    let image = root.join("fell.AppImage");
+    std::fs::write(&image, "").unwrap();
+    let detect = |exe: &Path, image: &Path, appdir: &Path| {
+        inside_appimage(Some(exe), Some(image.into()), Some(appdir.into()))
+    };
+    assert_eq!(detect(&bundled, &image, &appdir), Some(image.clone()));
+    // A hard link is the same file.
+    let linked = root.join("linked-fell-mcp");
+    std::fs::hard_link(&bundled, &linked).unwrap();
+    assert_eq!(detect(&linked, &image, &appdir), Some(image.clone()));
+
+    // A program outside the AppDir, even one under it, is not bundled.
+    let other = appdir.join("usr/bin/other");
+    std::fs::write(&other, "").unwrap();
+    assert_eq!(detect(&other, &image, &appdir), None);
+    let installed = root.join("usr/bin/fell-mcp");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, "").unwrap();
+    assert_eq!(detect(&installed, &image, &appdir), None);
+    // `APPDIR=/` or an install prefix would make an installed fell-mcp look
+    // bundled; `..` could spell the same.
+    for spoofed in ["/", "/usr", "/usr/local", "/opt"] {
+        assert_eq!(
+            detect(&bundled, &image, Path::new(spoofed)),
+            None,
+            "{spoofed}"
+        );
+    }
+    assert_eq!(detect(&bundled, &image, &appdir.join("usr/..")), None);
+    // APPIMAGE must be a real file, given as a plain absolute path.
     assert_eq!(
-        inside_appimage(Some(mount), None, Some("/tmp/.mount_fellX".into())),
+        detect(&bundled, &root.join("missing.AppImage"), &appdir),
         None
     );
+    assert_eq!(detect(&bundled, &appdir, &appdir), None);
+    assert_eq!(detect(&bundled, Path::new("fell.AppImage"), &appdir), None);
+    assert_eq!(
+        inside_appimage(Some(&bundled), None, Some(appdir.clone())),
+        None
+    );
+    assert_eq!(inside_appimage(Some(&bundled), Some(image), None), None);
+}
+
+#[test]
+fn without_home_add_says_so_and_a_write_fails() {
+    let mut ctx = Ctx::new();
+    ctx.no_home = true;
+    let ran = ctx.run(&["fell-mcp", "add", "codex"], "", false);
+    ran.result.unwrap();
+    assert!(
+        ran.err.contains(
+            "HOME is not set to an absolute path, so Fell cannot find Codex's config. \
+             Add this to it yourself:"
+        ),
+        "{}",
+        ran.err
+    );
+    assert!(!ran.err.contains("rewrites that file"), "{}", ran.err);
+    assert!(ran.out.contains("[mcp_servers.fell]"));
+    let ran = ctx.run(&["fell-mcp", "add", "goose", "--write"], "", false);
+    assert_eq!(
+        ran.result.unwrap_err().to_string(),
+        "did not write the config: HOME is not set to an absolute path"
+    );
+    assert!(ran.out.contains("extensions:"));
+    assert_eq!(std::fs::read_dir(ctx.home()).unwrap().count(), 0);
 }
 
 #[test]

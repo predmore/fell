@@ -64,13 +64,13 @@ One command per harness. It finds your mailbox and account, asks which scopes to
 fell mcp add claude-code   # prints a `claude mcp add --scope user …` command to run
 fell mcp add codex         # ~/.codex/config.toml, [mcp_servers.fell]
 fell mcp add gemini        # ~/.gemini/settings.json, mcpServers
-fell mcp add opencode      # ~/.config/opencode/opencode.json, mcp
+fell mcp add opencode      # ~/.config/opencode/opencode.json ($OPENCODE_CONFIG_DIR), mcp.servers
 fell mcp add goose         # ~/.config/goose/config.yaml, extensions
 ```
 
 `fell-mcp add …` is the same command. Pass `--read`, `--triage` or `--draft` to choose scopes without the questions, `--write` to write without asking, and `--print` to only print. `--account ID` picks an account when there is more than one, and `--agent NAME` gives the agent another name. The entry only starts `fell-mcp serve`. It has no API key, token or environment: Fell never sees model keys, and scopes live in Fell's mailbox, not in the harness config.
 
-Fell edits only files it can parse exactly. It prints the entry instead for Claude Code (which rewrites `~/.claude.json` while it runs), for OpenCode's `opencode.jsonc`, and for JSON with comments or YAML it cannot place safely.
+Fell edits only files it can parse exactly. It prints the entry instead for Claude Code (which rewrites `~/.claude.json` while it runs), for OpenCode's `opencode.jsonc`, and for JSON with comments or YAML it cannot place safely. When it can't write, it exits non-zero and the grant stays, so pasting the printed entry is enough. If the harness saves its own file while Fell writes, Fell starts over once with the new contents, then asks you to try again.
 
 ```sh
 fell mcp list              # agents, scopes, and when each last triaged or drafted

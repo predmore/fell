@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use fell_core::{Account, AccountId, AgentGrant, Store};
 
@@ -141,13 +141,39 @@ where
     run(&args, &mut io)
 }
 
+/// The AppImage to start, when this program is the `usr/bin/fell-mcp` of
+/// the AppImage's mounted folder.
+///
+/// `APPIMAGE` and `APPDIR` are plain environment variables, so they are not
+/// trusted alone: this binary must be the same file as
+/// `$APPDIR/usr/bin/fell-mcp`, `APPDIR` must not be `/` or an install prefix
+/// (`APPDIR=/` would make `/usr/bin/fell-mcp` look bundled), and `APPIMAGE`
+/// must be a regular file.
 fn inside_appimage(
     exe: Option<&Path>,
     appimage: Option<PathBuf>,
     appdir: Option<PathBuf>,
 ) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
     let (exe, appimage, appdir) = (exe?, appimage?, appdir?);
-    (appimage.is_absolute() && appdir.is_absolute() && exe.starts_with(&appdir)).then_some(appimage)
+    let plain = |path: &Path| {
+        path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    };
+    if !plain(&appimage) || !plain(&appdir) {
+        return None;
+    }
+    let prefixes = ["/", "/usr", "/usr/local", "/opt"];
+    if prefixes.iter().any(|prefix| appdir == Path::new(prefix)) {
+        return None;
+    }
+    let bundled = std::fs::metadata(appdir.join("usr/bin/fell-mcp")).ok()?;
+    let running = std::fs::metadata(exe).ok()?;
+    let same = bundled.dev() == running.dev() && bundled.ino() == running.ino();
+    let image = std::fs::metadata(&appimage).ok()?;
+    (same && image.is_file()).then_some(appimage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +598,23 @@ fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     );
 
     let Some(config) = harness.config_path(&io.env) else {
+        if harness.edits_config() {
+            // Without an absolute HOME there is no config path to write.
+            writeln!(
+                io.err,
+                "\nHOME is not set to an absolute path, so Fell cannot find {}'s config. \
+                 Add this to it yourself:\n",
+                harness.title()
+            )?;
+            write!(io.out, "{snippet}")?;
+            writeln!(io.err, "\n{revoke_hint}")?;
+            if opts.write {
+                return Err(CliError::new(
+                    "did not write the config: HOME is not set to an absolute path",
+                ));
+            }
+            return Ok(());
+        }
         writeln!(io.err, "\nRun this to add Fell to {}:\n", harness.title())?;
         write!(io.out, "{snippet}")?;
         if opts.write {
@@ -628,10 +671,16 @@ fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
             writeln!(io.err, "Restart {} to load it.", harness.title())?;
         }
         Err(reason) => {
+            // The grant is already saved, so the printed entry works once
+            // pasted. Exit non-zero: the write that was asked for failed.
+            writeln!(io.err, "Did not write: {reason}.")?;
             writeln!(
                 io.err,
-                "Did not write: {reason}. Paste the entry above into it yourself."
+                "The grant is saved. Paste the entry above into {shown} yourself, \
+                 or undo the grant with `{} revoke {agent}`.",
+                self_command(io)
             )?;
+            return Err(CliError::new(format!("did not write {shown}")));
         }
     }
     writeln!(io.err, "{revoke_hint}")?;

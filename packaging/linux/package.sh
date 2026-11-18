@@ -55,10 +55,33 @@ if [[ ! -x $mcp_bin ]]; then
   exit 1
 fi
 # The agent server has no UI and must not pull in WebKitGTK.
-if readelf -d "$mcp_bin" | grep NEEDED | grep -Eqi 'webkit|javascriptcore|gtk'; then
+mcp_needed=$(readelf -d "$mcp_bin" | grep NEEDED || true)
+if grep -Eqi 'webkit|javascriptcore|gtk' <<<"$mcp_needed"; then
   echo "fell-mcp links a UI library; it must stay a plain stdio server" >&2
   exit 1
 fi
+# Only the UI may mint a send confirmation. fell-mcp builds fell-core without
+# its `ui-confirm` feature, so fell-confirm must not be in its dependency
+# graph, and its symbols must not be in the binary.
+# Outputs are captured before `grep -q`: under pipefail, grep closing the
+# pipe early would turn a match into a miss.
+mcp_deps=$(cd "$root" && cargo tree --locked -p fell-mcp -e normal,build --prefix none)
+if grep -q '^fell-confirm ' <<<"$mcp_deps"; then
+  echo "fell-mcp depends on fell-confirm; it must not be able to confirm a send" >&2
+  exit 1
+fi
+mkdir -p "$dist"
+nm -C "$mcp_bin" >"$dist/fell-mcp-symbols.txt" 2>/dev/null || true
+if [[ ! -s $dist/fell-mcp-symbols.txt ]]; then
+  echo "fell-mcp has no symbol table; cannot check that it leaves out fell-confirm" >&2
+  exit 1
+fi
+if grep -Eq 'fell_confirm|for_fell_app' "$dist/fell-mcp-symbols.txt"; then
+  echo "fell-mcp links fell-confirm; it must not be able to confirm a send" >&2
+  grep -E 'fell_confirm|for_fell_app' "$dist/fell-mcp-symbols.txt" | head >&2
+  exit 1
+fi
+rm -f "$dist/fell-mcp-symbols.txt"
 
 rm -rf "$stage" "$appdir" "$work"
 mkdir -p "$stage" "$work" "$tools"
@@ -206,7 +229,8 @@ fi
 echo "fell dynamically links WebKitGTK; launch requires the distro package, artifacts do not bundle it"
 
 # The packaged fell-mcp starts and lists its commands.
-if ! "$stage/fell-mcp" --help | grep -q 'fell-mcp add HARNESS'; then
+mcp_help=$("$stage/fell-mcp" --help || true)
+if ! grep -q 'fell-mcp add HARNESS' <<<"$mcp_help"; then
   echo "packaged fell-mcp did not run" >&2
   exit 1
 fi

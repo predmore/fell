@@ -1963,6 +1963,7 @@ version = "0.1.0"
 dependencies = [
  "fell-core",
  "libc",
+ "rustix 1.1.6",
  "saphyr",
  "serde_json",
  "thiserror 2.0.21",

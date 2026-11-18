@@ -10,10 +10,15 @@
 //! symlinks, and refuses files it cannot parse exactly (JSON with comments,
 //! for instance). Those cases fall back to printing the snippet.
 
-use std::fs::{self, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, Metadata};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, CWD, FlockOperation, Mode, OFlags, RenameFlags};
+use rustix::io::Errno;
 
 use saphyr::{LoadableYamlNode, YamlOwned};
 use serde_json::{Map, Value, json};
@@ -76,13 +81,17 @@ impl Harness {
     ///
     /// - Codex: `~/.codex/config.toml` (`$CODEX_HOME`), `[mcp_servers.NAME]`.
     /// - Gemini CLI: `~/.gemini/settings.json`, `mcpServers`.
-    /// - OpenCode: `~/.config/opencode/opencode.json`, `mcp`.
+    /// - OpenCode: `$OPENCODE_CONFIG_DIR/opencode.json`, else
+    ///   `~/.config/opencode/opencode.json`, `mcp.servers` (a server under
+    ///   `mcp.servers` wins over one of the same name directly under `mcp`,
+    ///   OpenCode's older layout).
     /// - Goose: `~/.config/goose/config.yaml`, `extensions`.
     ///
     /// Claude Code is `None`. Its user-level servers live in `~/.claude.json`
     /// next to state Claude Code rewrites while it runs, so a write from here
     /// could be lost or clobber that state. Fell prints Claude Code's own
-    /// `claude mcp add` command instead.
+    /// `claude mcp add` command instead. The others are `None` only when
+    /// home is unknown.
     pub(crate) fn config_path(self, env: &Env) -> Option<PathBuf> {
         let home = env.home.as_deref();
         let xdg_config = env
@@ -97,9 +106,18 @@ impl Harness {
                 .or_else(|| home.map(|home| home.join(".codex")))
                 .map(|dir| dir.join("config.toml")),
             Self::Gemini => home.map(|home| home.join(".gemini/settings.json")),
-            Self::OpenCode => xdg_config.map(|dir| dir.join("opencode/opencode.json")),
+            Self::OpenCode => env
+                .opencode_config_dir
+                .clone()
+                .or_else(|| xdg_config.map(|dir| dir.join("opencode")))
+                .map(|dir| dir.join("opencode.json")),
             Self::Goose => xdg_config.map(|dir| dir.join("goose/config.yaml")),
         }
+    }
+
+    /// Whether Fell ever edits this harness's config file.
+    pub(crate) fn edits_config(self) -> bool {
+        self != Self::ClaudeCode
     }
 
     /// A file next to the config that, when present, means the harness reads
@@ -118,6 +136,7 @@ pub(crate) struct Env {
     pub home: Option<PathBuf>,
     pub xdg_config: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    pub opencode_config_dir: Option<PathBuf>,
 }
 
 impl Env {
@@ -131,6 +150,7 @@ impl Env {
             home: dir("HOME"),
             xdg_config: dir("XDG_CONFIG_HOME"),
             codex_home: dir("CODEX_HOME"),
+            opencode_config_dir: dir("OPENCODE_CONFIG_DIR"),
         }
     }
 
@@ -172,7 +192,9 @@ pub(crate) fn snippet(harness: Harness, spec: &ServerSpec) -> String {
         Harness::Gemini => {
             json_text(&json!({ "mcpServers": { ENTRY: json_entry(harness, spec) } }))
         }
-        Harness::OpenCode => json_text(&json!({ "mcp": { ENTRY: json_entry(harness, spec) } })),
+        Harness::OpenCode => {
+            json_text(&json!({ "mcp": { OPENCODE_SERVERS: { ENTRY: json_entry(harness, spec) } } }))
+        }
         Harness::Codex => toml_document(None, spec)
             .map(|(text, _)| text)
             .unwrap_or_default(),
@@ -193,6 +215,12 @@ pub(crate) enum Written {
 
 /// Merge Fell's entry into the harness config at `path`. `Err` is a reason
 /// for the person; nothing was written.
+///
+/// The path is walked from home (or `/` when it is elsewhere) one folder at
+/// a time, never through a symlink, and every write goes through the final
+/// folder's descriptor. The old file is locked from the read to the swap,
+/// and the swap is refused when the file changed meanwhile (a harness saving
+/// its own settings): Fell then starts over once with the new contents.
 pub(crate) fn write_config(
     harness: Harness,
     path: &Path,
@@ -201,122 +229,338 @@ pub(crate) fn write_config(
     stamp: i64,
 ) -> Result<Written, String> {
     let shown = env.display(path);
-    let Some(dir) = path.parent() else {
-        return Err(format!("{shown} has no parent folder"));
+    let Some(walk) = Walk::new(path, env) else {
+        return Err(format!("{shown} is not a plain absolute path"));
     };
-    if let Some(other) = harness.shadowing_file(path)
-        && fs::symlink_metadata(&other).is_ok()
+    for _ in 0..2 {
+        if let Some(written) = write_once(harness, &walk, spec, env, stamp)? {
+            return Ok(written);
+        }
+    }
+    Err(format!(
+        "{} rewrote {shown} while Fell was writing it; try again",
+        harness.title()
+    ))
+}
+
+/// A config path split for a walk that never follows symlinks.
+struct Walk<'a> {
+    path: &'a Path,
+    /// Where the walk starts: home when the path is under it, else `/`.
+    /// This one folder is opened normally (home may itself be a symlink, as
+    /// on some distributions).
+    root: PathBuf,
+    /// Folders below `root`, each opened with `O_NOFOLLOW`.
+    dirs: Vec<&'a OsStr>,
+    name: &'a OsStr,
+}
+
+impl<'a> Walk<'a> {
+    fn new(path: &'a Path, env: &Env) -> Option<Self> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let (root, rest) = match env
+            .home
+            .as_deref()
+            .and_then(|home| Some((home, path.strip_prefix(home).ok()?)))
+        {
+            Some((home, rest)) => (home.to_path_buf(), rest),
+            None => (PathBuf::from("/"), path.strip_prefix("/").ok()?),
+        };
+        let mut dirs = Vec::new();
+        for component in rest.components() {
+            match component {
+                Component::Normal(part) => dirs.push(part),
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        let name = dirs.pop()?;
+        Some(Self {
+            path,
+            root,
+            dirs,
+            name,
+        })
+    }
+
+    /// The folder holding the config. Missing folders are created 0700 when
+    /// `create` is set, else `Ok(None)`.
+    fn open_dir(&self, create: bool, env: &Env) -> Result<Option<OwnedFd>, String> {
+        let mut at = self.root.clone();
+        let mut dir = fs::openat(
+            CWD,
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| failed(&at, err, env))?;
+        for part in &self.dirs {
+            at.push(part);
+            let next = match fs::openat(&dir, *part, DIR_FLAGS, Mode::empty()) {
+                Ok(next) => next,
+                Err(Errno::NOENT) if create => {
+                    let made = match fs::mkdirat(&dir, *part, Mode::from_raw_mode(0o700)) {
+                        Ok(()) => true,
+                        Err(Errno::EXIST) => false,
+                        Err(err) => return Err(failed(&at, err, env)),
+                    };
+                    let next = fs::openat(&dir, *part, DIR_FLAGS, Mode::empty())
+                        .map_err(|err| refusal(&dir, part, &at, err, env))?;
+                    if made {
+                        // mkdir's mode is masked by the umask.
+                        fs::fchmod(&next, Mode::from_raw_mode(0o700))
+                            .map_err(|err| failed(&at, err, env))?;
+                    }
+                    next
+                }
+                Err(Errno::NOENT) => return Ok(None),
+                Err(err) => return Err(refusal(&dir, part, &at, err, env)),
+            };
+            dir = next;
+        }
+        Ok(Some(dir))
+    }
+}
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// The config as Fell read it, locked until this is dropped.
+struct Existing {
+    _file: File,
+    meta: Metadata,
+    text: String,
+}
+
+/// One read, merge and swap. `Ok(None)`: the file changed under Fell.
+fn write_once(
+    harness: Harness,
+    walk: &Walk<'_>,
+    spec: &ServerSpec,
+    env: &Env,
+    stamp: i64,
+) -> Result<Option<Written>, String> {
+    let path = walk.path;
+    let shown = env.display(path);
+    let dir = walk.open_dir(false, env)?;
+    if let (Some(dir), Some(other)) = (&dir, harness.shadowing_file(path))
+        && let Some(other_name) = other.file_name()
+        && lstat_at(dir, other_name).is_ok()
     {
         return Err(format!(
             "{} exists, and Fell does not rewrite JSON with comments",
             env.display(&other)
         ));
     }
-    match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "{} is a symlink, and Fell does not follow symlinks",
-                env.display(dir)
-            ));
-        }
-        Ok(meta) if !meta.is_dir() => {
-            return Err(format!("{} is not a folder", env.display(dir)));
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("{}: {err}", env.display(dir))),
-    }
-    let existing = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "{shown} is a symlink, and Fell does not follow symlinks"
-            ));
-        }
-        Ok(meta) if !meta.is_file() => return Err(format!("{shown} is not a regular file")),
-        Ok(meta) => Some((
-            read_no_follow(path).map_err(|err| format!("{shown}: {err}"))?,
-            meta.permissions().mode() & 0o777,
-        )),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(format!("{shown}: {err}")),
+    let existing = match &dir {
+        Some(dir) => open_existing(dir, walk.name, path, env)?,
+        None => None,
     };
     let merged = merge(
         harness,
-        existing.as_ref().map(|(text, _)| text.as_str()),
+        existing.as_ref().map(|old| old.text.as_str()),
         spec,
     )
     .map_err(|reason| format!("{shown} {reason}"))?;
     if merged.unchanged {
-        return Ok(Written::Unchanged);
+        return Ok(Some(Written::Unchanged));
     }
-    if existing.is_none() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|err| format!("{}: {err}", env.display(dir)))?;
-    }
+    let dir = match dir {
+        Some(dir) => dir,
+        None => walk
+            .open_dir(true, env)?
+            .ok_or_else(|| format!("{shown}: could not create its folder"))?,
+    };
     let backup = match &existing {
-        Some((text, _)) => {
-            let mut n = 0;
-            loop {
-                let suffix = match n {
-                    0 => format!("fell-backup-{stamp}"),
-                    n => format!("fell-backup-{stamp}-{n}"),
-                };
-                let backup = sibling(path, &suffix);
-                match write_new(&backup, text.as_bytes(), 0o600) {
-                    Ok(()) => break Some(backup),
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => {
-                        n += 1;
-                    }
-                    Err(err) => return Err(format!("{}: {err}", env.display(&backup))),
-                }
-            }
-        }
+        Some(old) => Some(write_backup(&dir, walk.name, &old.text, stamp).map_err(
+            |(name, err)| format!("{}: {err}", env.display(&path.with_file_name(name))),
+        )?),
         None => None,
     };
-    let mode = existing.as_ref().map_or(0o600, |(_, mode)| *mode);
-    let temp = sibling(path, &format!("fell-tmp-{}-{stamp}", std::process::id()));
-    let result =
-        write_new(&temp, merged.text.as_bytes(), mode).and_then(|()| fs::rename(&temp, path));
-    if let Err(err) = result {
-        let _ = fs::remove_file(&temp);
+    let mode = existing
+        .as_ref()
+        .map_or(0o600, |old| old.meta.mode() & 0o777);
+    let temp = suffixed(
+        walk.name,
+        &format!("fell-tmp-{}-{stamp}", std::process::id()),
+    );
+    let discard = |also_temp: bool| {
+        if also_temp {
+            let _ = fs::unlinkat(&dir, &temp, AtFlags::empty());
+        }
+        if let Some(backup) = &backup {
+            let _ = fs::unlinkat(&dir, backup, AtFlags::empty());
+        }
+    };
+    if let Err(err) = write_new_at(&dir, &temp, merged.text.as_bytes(), mode) {
+        discard(true);
         return Err(format!("{shown}: {err}"));
     }
-    Ok(Written::Wrote {
-        backup,
+    #[cfg(test)]
+    tests::before_swap(path);
+    let swapped = match &existing {
+        Some(old) => {
+            if lstat_at(&dir, walk.name).is_ok_and(|now| same_version(&old.meta, &now)) {
+                fs::renameat(&dir, &temp, &dir, walk.name).map(|()| true)
+            } else {
+                Ok(false)
+            }
+        }
+        // A file that appeared meanwhile is never replaced.
+        None => match fs::renameat_with(&dir, &temp, &dir, walk.name, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(true),
+            Err(Errno::EXIST) => Ok(false),
+            // A filesystem without RENAME_NOREPLACE.
+            Err(Errno::INVAL | Errno::NOSYS)
+                if lstat_at(&dir, walk.name)
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                fs::renameat(&dir, &temp, &dir, walk.name).map(|()| true)
+            }
+            Err(err) => Err(err),
+        },
+    };
+    match swapped {
+        Ok(true) => {}
+        Ok(false) => {
+            discard(true);
+            return Ok(None);
+        }
+        Err(err) => {
+            discard(true);
+            return Err(failed(path, err, env));
+        }
+    }
+    // Make the rename itself durable. The new file is already in place, so
+    // a failure here is not a reason to report that nothing was written.
+    let _ = fs::fsync(&dir);
+    let created = existing.is_none();
+    drop(existing);
+    Ok(Some(Written::Wrote {
+        backup: backup.map(|name| path.with_file_name(name)),
         replaced: merged.replaced,
-        created: existing.is_none(),
-    })
+        created,
+    }))
 }
 
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
+/// The same file at the same version: same inode, size and change times.
+fn same_version(before: &Metadata, now: &Metadata) -> bool {
+    let key = |meta: &Metadata| {
+        (
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    };
+    key(before) == key(now)
+}
+
+/// Open, lock and read the config. `Ok(None)` when there is none yet.
+fn open_existing(
+    dir: &OwnedFd,
+    name: &OsStr,
+    path: &Path,
+    env: &Env,
+) -> Result<Option<Existing>, String> {
+    let shown = env.display(path);
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
+    let fd = match fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(err) => return Err(refusal(dir, name, path, err, env)),
+    };
+    let mut file = File::from(fd);
+    let meta = file.metadata().map_err(|err| format!("{shown}: {err}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    match fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(Errno::WOULDBLOCK) => {
+            return Err(format!("another program is writing {shown}; try again"));
+        }
+        Err(err) => return Err(failed(path, err, env)),
+    }
+    // The version the swap is checked against: read after the lock.
+    let meta = file.metadata().map_err(|err| format!("{shown}: {err}"))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|err| format!("{shown}: {err}"))?;
+    Ok(Some(Existing {
+        _file: file,
+        meta,
+        text,
+    }))
+}
+
+/// `<name>.fell-backup-<stamp>`, never overwriting an older backup.
+fn write_backup(
+    dir: &OwnedFd,
+    name: &OsStr,
+    text: &str,
+    stamp: i64,
+) -> Result<OsString, (OsString, std::io::Error)> {
+    let mut n = 0;
+    loop {
+        let suffix = match n {
+            0 => format!("fell-backup-{stamp}"),
+            n => format!("fell-backup-{stamp}-{n}"),
+        };
+        let backup = suffixed(name, &suffix);
+        match write_new_at(dir, &backup, text.as_bytes(), 0o600) {
+            Ok(()) => return Ok(backup),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(err) => return Err((backup, err)),
+        }
+    }
+}
+
+fn suffixed(name: &OsStr, suffix: &str) -> OsString {
+    let mut name = name.to_os_string();
     name.push(".");
     name.push(suffix);
-    path.with_file_name(name)
+    name
 }
 
-fn read_no_follow(path: &Path) -> std::io::Result<String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    Ok(text)
-}
-
-fn write_new(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+/// Create `name` in `dir` with exactly `mode` (not masked by the umask),
+/// write it and sync it.
+fn write_new_at(dir: &OwnedFd, name: &OsStr, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut file = File::from(fs::openat(dir, name, flags, Mode::from_raw_mode(mode))?);
     file.write_all(bytes)?;
+    fs::fchmod(&file, Mode::from_raw_mode(mode))?;
     file.sync_all()
+}
+
+/// `lstat` of `name` in `dir`.
+fn lstat_at(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Metadata> {
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    File::from(fs::openat(dir, name, flags, Mode::empty())?).metadata()
+}
+
+/// Why `name` in `dir` (shown as `at`) could not be opened.
+fn refusal(dir: &OwnedFd, name: &OsStr, at: &Path, err: Errno, env: &Env) -> String {
+    let shown = env.display(at);
+    match lstat_at(dir, name) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            format!("{shown} is a symlink, and Fell does not follow symlinks")
+        }
+        Ok(meta) if err == Errno::NOTDIR && !meta.is_dir() => format!("{shown} is not a folder"),
+        _ => failed(at, err, env),
+    }
+}
+
+fn failed(at: &Path, err: Errno, env: &Env) -> String {
+    format!("{}: {}", env.display(at), std::io::Error::from(err))
 }
 
 #[derive(Debug)]
@@ -342,12 +586,8 @@ pub(crate) fn merge(
     }
 }
 
-fn json_container(harness: Harness) -> &'static str {
-    match harness {
-        Harness::OpenCode => "mcp",
-        _ => "mcpServers",
-    }
-}
+/// OpenCode keeps servers in `mcp.servers`, next to `mcp.timeout`.
+const OPENCODE_SERVERS: &str = "servers";
 
 /// One argument for a POSIX shell, quoted only when it needs to be.
 pub(crate) fn shell_word(text: &str) -> String {
@@ -367,7 +607,8 @@ fn json_entry(harness: Harness, spec: &ServerSpec) -> Value {
         Harness::OpenCode => {
             let mut command = vec![spec.program.clone()];
             command.extend(spec.args.iter().cloned());
-            json!({ "type": "local", "command": command, "enabled": true })
+            // OpenCode's `disabled` defaults to false; there is no `enabled`.
+            json!({ "type": "local", "command": command })
         }
         _ => json!({ "command": spec.program, "args": spec.args }),
     }
@@ -384,7 +625,6 @@ fn merge_json(
     existing: Option<&str>,
     spec: &ServerSpec,
 ) -> Result<Merged, String> {
-    let container = json_container(harness);
     let entry = json_entry(harness, spec);
     let mut root = match existing {
         None => {
@@ -400,11 +640,24 @@ fn merge_json(
             Err(_) => return Err("has comments or is not plain JSON".into()),
         },
     };
-    let servers = root
-        .entry(container)
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(servers) = servers.as_object_mut() else {
-        return Err(format!("has a `{container}` that is not an object"));
+    let servers = match harness {
+        Harness::OpenCode => {
+            let mcp = root
+                .entry("mcp")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(mcp) = mcp.as_object_mut() else {
+                return Err("has an `mcp` that is not an object".into());
+            };
+            mcp.entry(OPENCODE_SERVERS)
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| format!("has an `mcp.{OPENCODE_SERVERS}` that is not an object"))?
+        }
+        _ => root
+            .entry("mcpServers")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| "has an `mcpServers` that is not an object".to_string())?,
     };
     let previous = servers.insert(ENTRY.into(), entry.clone());
     Ok(Merged {
@@ -706,8 +959,413 @@ fn yaml_merge_kept_everything(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    type SwapHook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static BEFORE_SWAP: RefCell<Option<SwapHook>> = const { RefCell::new(None) };
+    }
+
+    /// Called by `write_once` after the new file is written and before it
+    /// replaces the old one: where a harness saving its settings would race.
+    pub(super) fn before_swap(path: &Path) {
+        BEFORE_SWAP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
+
+    /// Runs `hook` before every swap until dropped.
+    struct OnSwap;
+
+    impl OnSwap {
+        fn new(hook: impl FnMut(&Path) + 'static) -> Self {
+            BEFORE_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for OnSwap {
+        fn drop(&mut self) {
+            BEFORE_SWAP.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// A fresh folder with no symlink anywhere in its path.
+    pub(crate) struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new() -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let dir = base.join(format!(
+                "fell-mcp-setup-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Under a test's strict umask the folder would not be writable.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const UMASK_CHILD: &str = "FELL_MCP_TEST_UMASK";
+
+    /// Mode checks must not depend on the umask `cargo test` runs with. The
+    /// umask is per process, so the test reruns itself in a child process
+    /// with `umask`. Returns true in that child, where the test body runs;
+    /// the parent only checks the child passed.
+    pub(crate) fn in_child_with_umask(test: &str, umask: u32) -> bool {
+        if let Some(value) = std::env::var_os(UMASK_CHILD) {
+            assert_eq!(value.to_str(), Some(format!("{umask:03o}").as_str()));
+            assert_eq!(
+                current_umask(),
+                umask,
+                "the child runs with umask {umask:03o}"
+            );
+            return true;
+        }
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("umask {umask:03o} && exec \"$0\" \"$@\""))
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1", "--nocapture"])
+            .env(UMASK_CHILD, format!("{umask:03o}"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "{test} failed under umask {umask:03o}");
+        false
+    }
+
+    fn current_umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))
+            .unwrap();
+        u32::from_str_radix(line.trim(), 8).unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A home folder in a temp dir, and an env pointing at it.
+    fn home() -> (TempDir, PathBuf, Env) {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = Env {
+            home: Some(home.clone()),
+            ..Env::default()
+        };
+        (tmp, home, env)
+    }
+
+    /// What a harness does when it saves: write a new file, rename it over.
+    fn harness_saves(path: &Path, text: &str) {
+        let temp = path.with_extension("harness-tmp");
+        std::fs::write(&temp, text).unwrap();
+        std::fs::rename(&temp, path).unwrap();
+    }
+
+    #[test]
+    fn a_harness_rewrite_during_the_write_is_kept_and_fell_starts_over_once() {
+        let (_tmp, home, env) = home();
+        let dir = home.join(".codex");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"o4\"\n").unwrap();
+
+        // The harness saves once, between Fell's read and its swap.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let _hook = OnSwap::new(move |path| {
+            seen.set(seen.get() + 1);
+            if seen.get() == 1 {
+                harness_saves(path, "model = \"o4\"\nhistory = \"save-all\"\n");
+            }
+        });
+        let written = write_config(Harness::Codex, &path, &spec(), &env, 7).unwrap();
+        assert_eq!(calls.get(), 2, "Fell read the file again and retried once");
+        let Written::Wrote { backup, .. } = written else {
+            panic!("{written:?}");
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("history = \"save-all\""), "{text}");
+        assert!(text.contains("[mcp_servers.fell]"), "{text}");
+        // The backup is the version Fell merged into: the harness's.
+        assert_eq!(
+            std::fs::read_to_string(backup.unwrap()).unwrap(),
+            "model = \"o4\"\nhistory = \"save-all\"\n"
+        );
+        assert_eq!(names(&dir), ["config.toml", "config.toml.fell-backup-7"]);
+    }
+
+    #[test]
+    fn a_harness_that_keeps_rewriting_wins_and_fell_says_try_again() {
+        let (_tmp, home, env) = home();
+        let dir = home.join(".codex");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"o4\"\n").unwrap();
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let _hook = OnSwap::new(move |path| {
+            seen.set(seen.get() + 1);
+            // Written in place this time: same inode, new size and mtime.
+            std::fs::write(path, format!("model = \"o{}\"\n# saved\n", seen.get())).unwrap();
+        });
+        let err = write_config(Harness::Codex, &path, &spec(), &env, 7).unwrap_err();
+        assert_eq!(
+            err,
+            "Codex rewrote ~/.codex/config.toml while Fell was writing it; try again"
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"o2\"\n# saved\n"
+        );
+        // No temp file and no backup of a version that was never replaced.
+        assert_eq!(names(&dir), ["config.toml"]);
+    }
+
+    #[test]
+    fn a_config_created_meanwhile_is_merged_not_replaced() {
+        let (_tmp, home, env) = home();
+        let path = home.join(".gemini/settings.json");
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let _hook = OnSwap::new(move |path| {
+            seen.set(seen.get() + 1);
+            if seen.get() == 1 {
+                std::fs::write(path, r#"{"theme":"Dracula"}"#).unwrap();
+            }
+        });
+        let written = write_config(Harness::Gemini, &path, &spec(), &env, 7).unwrap();
+        assert!(
+            matches!(written, Written::Wrote { created: false, .. }),
+            "{written:?}"
+        );
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["theme"], "Dracula");
+        assert_eq!(value["mcpServers"]["fell"]["command"], "/opt/fell/fell-mcp");
+    }
+
+    #[test]
+    fn a_config_locked_by_another_program_is_not_written() {
+        let (_tmp, home, env) = home();
+        let dir = home.join(".codex");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"o4\"\n").unwrap();
+        let other = File::open(&path).unwrap();
+        fs::flock(&other, FlockOperation::LockExclusive).unwrap();
+        let err = write_config(Harness::Codex, &path, &spec(), &env, 7).unwrap_err();
+        assert_eq!(
+            err,
+            "another program is writing ~/.codex/config.toml; try again"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \"o4\"\n");
+        assert_eq!(names(&dir), ["config.toml"]);
+    }
+
+    #[test]
+    fn a_symlinked_folder_anywhere_below_home_is_refused() {
+        let (tmp, home, env) = home();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+
+        // ~/.config itself is the symlink, two levels above the file.
+        std::os::unix::fs::symlink(&elsewhere, home.join(".config")).unwrap();
+        let path = Harness::OpenCode.config_path(&env).unwrap();
+        let err = write_config(Harness::OpenCode, &path, &spec(), &env, 7).unwrap_err();
+        assert_eq!(
+            err,
+            "~/.config is a symlink, and Fell does not follow symlinks"
+        );
+        let err = write_config(
+            Harness::Goose,
+            &home.join(".config/goose/config.yaml"),
+            &spec(),
+            &env,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "~/.config is a symlink, and Fell does not follow symlinks"
+        );
+        assert!(
+            names(&elsewhere).is_empty(),
+            "nothing was written through it"
+        );
+
+        // The same when the folder already holds a config.
+        std::fs::create_dir(elsewhere.join("opencode")).unwrap();
+        std::fs::write(elsewhere.join("opencode/opencode.json"), "{}").unwrap();
+        let err = write_config(Harness::OpenCode, &path, &spec(), &env, 7).unwrap_err();
+        assert!(err.starts_with("~/.config is a symlink"), "{err}");
+        assert_eq!(names(&elsewhere.join("opencode")), ["opencode.json"]);
+
+        // A file where a folder should be.
+        std::fs::write(home.join(".gemini"), "").unwrap();
+        let err = write_config(
+            Harness::Gemini,
+            &home.join(".gemini/settings.json"),
+            &spec(),
+            &env,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(err, "~/.gemini is not a folder");
+    }
+
+    #[test]
+    fn a_symlink_outside_home_is_refused_too() {
+        let (tmp, _home, env) = home();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let env = Env {
+            xdg_config: Some(tmp.path().join("link/xdg")),
+            ..env
+        };
+        let path = Harness::Goose.config_path(&env).unwrap();
+        let err = write_config(Harness::Goose, &path, &spec(), &env, 7).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "{} is a symlink, and Fell does not follow symlinks",
+                tmp.path().join("link").display()
+            )
+        );
+        assert!(names(&real).is_empty());
+        let relative = Path::new("goose/config.yaml");
+        assert!(write_config(Harness::Goose, relative, &spec(), &env, 7).is_err());
+        let dotted = tmp.path().join("real/../real/config.yaml");
+        assert!(
+            write_config(Harness::Goose, &dotted, &spec(), &env, 7)
+                .unwrap_err()
+                .contains("not a plain absolute path")
+        );
+    }
+
+    #[test]
+    fn modes_are_exact_under_a_strict_umask() {
+        // 0277 would turn mkdir 0700 into 0500 and create 0600 into 0400.
+        if !in_child_with_umask("setup::tests::modes_are_exact_under_a_strict_umask", 0o277) {
+            return;
+        }
+        let (_tmp, home, env) = home();
+
+        // New folders and a new file.
+        let path = home.join(".config/goose/config.yaml");
+        let written = write_config(Harness::Goose, &path, &spec(), &env, 7).unwrap();
+        assert!(matches!(written, Written::Wrote { created: true, .. }));
+        assert_eq!(mode(&home.join(".config")), 0o700);
+        assert_eq!(mode(&home.join(".config/goose")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        // An existing file keeps its own mode; the backup is owner-only.
+        let dir = home.join(".codex");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "model = \"o4\"\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let written = write_config(Harness::Codex, &config, &spec(), &env, 7).unwrap();
+        let Written::Wrote { backup, .. } = written else {
+            panic!("{written:?}");
+        };
+        assert_eq!(mode(&config), 0o644);
+        assert_eq!(mode(&backup.unwrap()), 0o600);
+        // An existing folder keeps its mode.
+        assert_eq!(mode(&dir), 0o755);
+    }
+
+    #[test]
+    fn opencode_goes_under_mcp_servers_and_keeps_timeout_and_older_entries() {
+        let existing = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "timeout": { "startup": 10000 },
+    "servers": {
+      "docs": { "type": "local", "command": ["docs-mcp"], "disabled": true }
+    },
+    "legacy": { "type": "local", "command": ["old-mcp"], "enabled": true }
+  }
+}"#;
+        let merged = merge(Harness::OpenCode, Some(existing), &spec()).unwrap();
+        assert!(!merged.replaced && !merged.unchanged);
+        let value: Value = serde_json::from_str(&merged.text).unwrap();
+        let mcp = value["mcp"].as_object().unwrap();
+        assert_eq!(
+            mcp.keys().collect::<Vec<_>>(),
+            ["timeout", "servers", "legacy"]
+        );
+        assert_eq!(value["mcp"]["timeout"]["startup"], 10000);
+        assert_eq!(value["mcp"]["legacy"]["command"][0], "old-mcp");
+        let servers = value["mcp"]["servers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), ["docs", "fell"]);
+        assert_eq!(servers["docs"]["disabled"], true);
+        let fell = servers["fell"].as_object().unwrap();
+        assert_eq!(fell.keys().collect::<Vec<_>>(), ["type", "command"]);
+        assert_eq!(fell["type"], "local");
+        assert_eq!(fell["command"][0], "/opt/fell/fell-mcp");
+
+        let again = merge(Harness::OpenCode, Some(&merged.text), &spec()).unwrap();
+        assert!(again.unchanged);
+        // An `mcp` with only older-style entries gains a `servers` map.
+        let merged = merge(
+            Harness::OpenCode,
+            Some(r#"{"mcp":{"x":{"type":"local","command":["x"]}}}"#),
+            &spec(),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&merged.text).unwrap();
+        assert_eq!(value["mcp"]["x"]["command"][0], "x");
+        assert_eq!(value["mcp"]["servers"]["fell"]["type"], "local");
+        for bad in [r#"{"mcp": 3}"#, r#"{"mcp": {"servers": []}}"#] {
+            assert!(
+                merge(Harness::OpenCode, Some(bad), &spec()).is_err(),
+                "{bad}"
+            );
+        }
+    }
 
     fn spec() -> ServerSpec {
         ServerSpec {
@@ -759,6 +1417,12 @@ mod tests {
         );
         env.xdg_config = Some("/x".into());
         env.codex_home = Some("/c".into());
+        env.opencode_config_dir = Some("/oc".into());
+        assert_eq!(
+            path(Harness::OpenCode, &env),
+            Path::new("/oc/opencode.json")
+        );
+        env.opencode_config_dir = None;
         assert_eq!(path(Harness::Codex, &env), Path::new("/c/config.toml"));
         assert_eq!(
             path(Harness::OpenCode, &env),
@@ -857,9 +1521,11 @@ mod tests {
         let merged = merge(Harness::OpenCode, None, &spec()).unwrap();
         let value: Value = serde_json::from_str(&merged.text).unwrap();
         assert_eq!(value["$schema"], "https://opencode.ai/config.json");
-        assert_eq!(value["mcp"]["fell"]["type"], "local");
-        assert_eq!(value["mcp"]["fell"]["command"][0], "/opt/fell/fell-mcp");
-        assert_eq!(value["mcp"]["fell"]["command"][1], "serve");
+        let fell = &value["mcp"]["servers"]["fell"];
+        assert_eq!(fell["type"], "local");
+        assert_eq!(fell["command"][0], "/opt/fell/fell-mcp");
+        assert_eq!(fell["command"][1], "serve");
+        assert!(fell.get("enabled").is_none() && fell.get("disabled").is_none());
     }
 
     #[test]
