@@ -54,6 +54,22 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
     let stamp = now();
     let rows = [
         DraftMail {
+            id: "offsite@fell.test",
+            name: "Caleb",
+            email: "caleb@fell.test",
+            subject: "Offsite plan for March",
+            body: "Booked the lodge for the 12th to the 14th. Agenda to follow; send me anything you want on it by Friday.",
+            ago: 5 * 60,
+            unread: false,
+            // Sent to the team list, which delivers a copy back to the inbox.
+            folders: &["Sent", "INBOX"],
+            labels: &["work"],
+            reply_to: None,
+            proton: None,
+            starred: false,
+            attachment: false,
+        },
+        DraftMail {
             id: "thread-a-1@fell.test",
             name: "Jon",
             email: "jon@fell.test",
@@ -335,6 +351,18 @@ fn recipients(row: &DraftMail, me: &str) -> (People, People, People) {
             &[("Sam", "sam@fell.test")],
         ),
         "thread-a-3@fell.test" => (&[("Caleb", "caleb@fell.test")], EVERYONE, &[]),
+        "offsite@fell.test" => (
+            &[("Ada", "ada@fell.test")],
+            &[
+                ("Maya", "maya@fell.test"),
+                ("Sam", "sam@fell.test"),
+                ("Priya Natarajan", "priya@fell.test"),
+                ("Jon", "jon@fell.test"),
+                ("Bob Stone", "bob@fell.test"),
+                ("Lena Ortiz", "lena@fell.test"),
+            ],
+            &[("Riya", "riya@fell.test")],
+        ),
         _ if row.email == me => (&[("Jon", "jon@fell.test")], &[], &[]),
         _ => (&[("Caleb", "caleb@fell.test")], &[], &[]),
     }

@@ -61,9 +61,11 @@ pub struct RecipientLine {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientGroup {
-    /// "to", "cc", or "bcc (only you)".
+    /// "to", "cc", or "bcc".
     pub label: &'static str,
     pub people: Vec<String>,
+    /// Bcc on the person's own mail: shown to them alone.
+    pub only_you: bool,
 }
 
 /// Names on the short line. One more than this shows the last name instead
@@ -78,11 +80,7 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
     let groups: [(&str, &'static str, &[fell_core::Address]); 3] = [
         ("to", "to", &message.to),
         ("cc", "cc", &message.cc),
-        (
-            "bcc",
-            "bcc (only you)",
-            if from_me { &message.bcc } else { &[] },
-        ),
+        ("bcc", "bcc", if from_me { &message.bcc } else { &[] }),
     ];
     let total: usize = groups.iter().map(|(_, _, people)| people.len()).sum();
     if total == 0 {
@@ -111,6 +109,7 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
         }
         full.push(RecipientGroup {
             label: full_label,
+            only_you: label == "bcc",
             people: people
                 .iter()
                 .zip(&names)
@@ -785,10 +784,7 @@ mod tests {
         let mine = addressed("ME@x", &[("Ada", "ada@x")], &[], &bcc);
         let line = recipient_line(&mine, "me@x").unwrap();
         assert_eq!(line.short, "to Ada · bcc Hidden");
-        assert_eq!(
-            people(&line)[1],
-            ("bcc (only you)", "Hidden <hidden@x>".to_string())
-        );
+        assert_eq!(people(&line)[1], ("bcc", "Hidden <hidden@x>".to_string()));
         // Someone else's message never shows a Bcc, even if one was stored.
         let theirs = addressed("ada@x", &[("Caleb", "me@x")], &[], &bcc);
         let line = recipient_line(&theirs, "me@x").unwrap();

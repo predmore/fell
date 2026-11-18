@@ -177,6 +177,9 @@ pub struct Session {
     /// Messages whose collapsed parts (quotes, signature, every recipient)
     /// are open, by Message-ID, so a reread that shifts rows keeps them.
     pub quotes_open: HashSet<String>,
+    /// Messages whose full recipient list is open, by Message-ID. A click
+    /// on the recipient line opens only this; `q` opens everything.
+    pub recipients_open: HashSet<String>,
     pub overlay: Overlay,
     pub chord: Vec<KeyId>,
     pub chord_gen: u64,
@@ -224,6 +227,7 @@ impl Session {
             messages: Vec::new(),
             message_cursor: 0,
             quotes_open: HashSet::new(),
+            recipients_open: HashSet::new(),
             overlay: Overlay::None,
             chord: Vec::new(),
             chord_gen: 0,
@@ -463,13 +467,37 @@ impl Session {
             .all(|thread| old_ids.contains(&thread.id))
     }
 
-    /// Open or close the collapsed parts of the message at `index`.
+    /// `q`: open or close every collapsed part of the message at `index`,
+    /// quoted text and recipients together.
     pub fn toggle_open(&mut self, index: usize) {
         let Some(id) = self.messages.get(index).map(|message| message.id.clone()) else {
             return;
         };
-        if !self.quotes_open.remove(&id) {
+        let open = !(self.quotes_open.contains(&id) || self.recipients_open.contains(&id));
+        for set in [&mut self.quotes_open, &mut self.recipients_open] {
+            if open {
+                set.insert(id.clone());
+            } else {
+                set.remove(&id);
+            }
+        }
+    }
+
+    /// A click on a quote or signature block.
+    pub fn toggle_quotes(&mut self, index: usize) {
+        if let Some(id) = self.messages.get(index).map(|message| message.id.clone())
+            && !self.quotes_open.remove(&id)
+        {
             self.quotes_open.insert(id);
+        }
+    }
+
+    /// A click on the recipient line.
+    pub fn toggle_recipients(&mut self, index: usize) {
+        if let Some(id) = self.messages.get(index).map(|message| message.id.clone())
+            && !self.recipients_open.remove(&id)
+        {
+            self.recipients_open.insert(id);
         }
     }
 
@@ -479,9 +507,16 @@ impl Session {
             .is_some_and(|message| self.quotes_open.contains(&message.id))
     }
 
+    pub fn recipients_are_open(&self, index: usize) -> bool {
+        self.messages
+            .get(index)
+            .is_some_and(|message| self.recipients_open.contains(&message.id))
+    }
+
     pub fn set_messages(&mut self, messages: Vec<ConvMessage>) {
         self.messages = messages;
         self.quotes_open.clear();
+        self.recipients_open.clear();
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
@@ -510,8 +545,9 @@ impl Session {
         }
         let cursor = self.message_cursor;
         let len = messages.len();
-        self.quotes_open
-            .retain(|id| messages.iter().any(|message| &message.id == id));
+        for set in [&mut self.quotes_open, &mut self.recipients_open] {
+            set.retain(|id| messages.iter().any(|message| &message.id == id));
+        }
         self.messages = messages;
         self.message_cursor = cursor.min(len.saturating_sub(1));
         false
@@ -1484,6 +1520,21 @@ mod tests {
         // The opened message leaves the thread: nothing else opens in its place.
         session.refresh_messages(vec![empty_message(true)], false);
         assert!(!session.is_open(0));
+    }
+
+    #[test]
+    fn a_click_on_recipients_opens_only_them_and_q_opens_everything() {
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        session.set_messages(vec![empty_message(true)]);
+        session.toggle_recipients(0);
+        assert!(session.recipients_are_open(0));
+        assert!(!session.is_open(0), "quoted text stays closed");
+        session.toggle_recipients(0);
+        session.toggle_open(0);
+        assert!(session.recipients_are_open(0) && session.is_open(0));
+        session.toggle_open(0);
+        assert!(!session.recipients_are_open(0) && !session.is_open(0));
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

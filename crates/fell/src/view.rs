@@ -1671,12 +1671,9 @@ fn expanded_message(
                         .child(present::relative_date(now_unix(), message.date_unix)),
                 ),
         )
-        .children(
-            message
-                .recipients
-                .as_ref()
-                .map(|line| recipient_lines(theme, line, quotes, index, cx)),
-        )
+        .children(message.recipients.as_ref().map(|line| {
+            recipient_lines(theme, line, session.recipients_are_open(index), index, cx)
+        }))
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
@@ -1713,7 +1710,7 @@ fn recipient_lines(
         inbox.session.cancel_pending_keys();
         inbox.session.pane = Pane::Conversation;
         inbox.session.message_cursor = index;
-        inbox.session.toggle_open(index);
+        inbox.session.toggle_recipients(index);
         cx.notify();
     });
     let size = px(theme.ui_px - 1.0);
@@ -1729,36 +1726,51 @@ fn recipient_lines(
                     .child(
                         div()
                             .flex_shrink_0()
-                            .min_w(px(28.))
+                            .w(px(28.))
                             .text_color(rgb(theme.dimmed))
                             .child(group.label),
                     )
-                    .child(
+                    .child({
+                        // One run of text, so a long list wraps like prose.
+                        let mut text = group.people.join(", ");
+                        let mut marks = Vec::new();
+                        if group.only_you {
+                            text.push_str("   ");
+                            let start = text.len();
+                            text.push_str("only you");
+                            marks.push((
+                                start..text.len(),
+                                gpui::HighlightStyle {
+                                    color: Some(rgb(theme.dimmed).into()),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
                         div()
                             .flex_1()
                             .min_w(px(0.))
                             .text_color(rgb(theme.foreground))
-                            .child(group.people.join(", ")),
-                    )
+                            .child(
+                                gpui::StyledText::new(SharedString::from(text))
+                                    .with_highlights(marks),
+                            )
+                    })
             }))
     } else {
-        let more = (line.hidden > 0).then(|| format!(" +{} more", line.hidden));
+        // Only the names give way to an ellipsis; the count and the key
+        // always show. The text takes the box's colour, so hover reaches it.
+        let tail = if line.hidden > 0 {
+            format!(" +{} more · q for all", line.hidden)
+        } else {
+            " · q for addresses".to_string()
+        };
         div()
             .flex()
             .min_w(px(0.))
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_color(rgb(theme.dimmed))
-                    .child(format!("{}{}", line.short, more.unwrap_or_default())),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(theme.dimmed))
-                    .child(" · q for all"),
-            )
+            .text_color(rgb(theme.dimmed))
+            .hover(|style| style.text_color(rgb(theme.foreground)))
+            .child(div().min_w(px(0.)).truncate().child(line.short.clone()))
+            .child(div().flex_shrink_0().child(tail))
     };
     div()
         .id(gpui::ElementId::named_usize("recipients", index))
@@ -1767,7 +1779,6 @@ fn recipient_lines(
         .text_size(size)
         .child(
             body.cursor_pointer()
-                .hover(|style| style.text_color(rgb(theme.foreground)))
                 .on_mouse_down(MouseButton::Left, toggle),
         )
         .into_any_element()
@@ -1824,7 +1835,7 @@ fn body_block(
                             inbox.session.cancel_pending_keys();
                             inbox.session.pane = Pane::Conversation;
                             inbox.session.message_cursor = index;
-                            inbox.session.toggle_open(index);
+                            inbox.session.toggle_quotes(index);
                             cx.notify();
                         }),
                     )
