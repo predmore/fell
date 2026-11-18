@@ -70,6 +70,8 @@ pub struct HunkView {
     pub start: usize,
     pub end: usize,
     pub label: String,
+    /// The text this change replaced, so the person can judge it.
+    pub previous: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,19 @@ pub struct Snapshot {
     pub focused: bool,
     pub send_block: Option<String>,
     pub text: String,
+    /// The agent whose `request_send` opened this draft, if one did.
+    pub send_requested_by: Option<String>,
+    /// The message this draft replies to, as "sender · subject · date",
+    /// when the mailbox has it.
+    pub reply_context: Option<ReplyContext>,
+}
+
+/// The parent message of a reply, read from the mailbox when the draft opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyContext {
+    pub sender: String,
+    pub subject: String,
+    pub date_unix: i64,
 }
 
 /// Why the editor will not send a draft (again).
@@ -113,6 +128,19 @@ pub enum SendLock {
     Sent,
     /// The connection failed after the server had the whole message.
     MaybeSent,
+}
+
+impl Snapshot {
+    /// Why this draft cannot be sent again, when a send went out or may have.
+    pub fn send_lock_reason(&self) -> Option<&'static str> {
+        match self.send_block.as_deref() {
+            Some(reason) if reason == SendLock::Sent.reason() => Some(SendLock::Sent.reason()),
+            Some(reason) if reason == SendLock::MaybeSent.reason() => {
+                Some(SendLock::MaybeSent.reason())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl SendLock {
@@ -158,6 +186,9 @@ pub struct DraftSession {
     settled: String,
     /// Mailbox database that should receive this draft on flush.
     store_path: Option<PathBuf>,
+    /// The agent that last asked the person to review and send this draft.
+    send_requested_by: Option<String>,
+    reply_context: Option<ReplyContext>,
     /// When the latest unflushed editor change was armed. `None` when the file is current.
     outbound_since: Option<u64>,
     /// Synchronous saves: the attachment stamp last copied into the mailbox.
@@ -227,6 +258,8 @@ impl DraftSession {
             last_written: String::new(),
             settled: String::new(),
             store_path: None,
+            send_requested_by: None,
+            reply_context: None,
             outbound_since: None,
             save_cache: SaveCache::default(),
             writer: None,
@@ -306,6 +339,16 @@ impl DraftSession {
         if let Ok(known) = store.mailed_addresses(session.account_id()) {
             session.known = known;
         }
+        session.reply_context = session
+            .locked_reply
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .and_then(|id| {
+                store
+                    .message_summary(session.account_id(), &crate::MessageId::new(id))
+                    .ok()
+                    .flatten()
+            });
         match review {
             Some(review) => session.resume_review(review),
             None => session.import_legacy_hunks(),
@@ -488,11 +531,22 @@ impl DraftSession {
         self.focused = true;
     }
 
+    /// The window showing this draft closed. Agents may delete it again.
+    pub fn close_editor(&mut self) {
+        self.open = false;
+        self.focused = false;
+    }
+
     /// Focus the editor. Does not transmit.
     pub fn request_send(&mut self) -> bool {
         self.open = true;
         self.focused = true;
         false
+    }
+
+    /// Remember which agent asked for the editor, so it can say so.
+    pub fn note_send_request(&mut self, agent: &str) {
+        self.send_requested_by = Some(agent.to_string());
     }
 
     pub fn try_agent_delete(&self) -> Result<(), String> {
@@ -960,6 +1014,8 @@ impl DraftSession {
             focused: self.focused,
             send_block,
             text,
+            send_requested_by: self.send_requested_by.clone(),
+            reply_context: self.reply_context.clone(),
         }
     }
 
@@ -1407,6 +1463,7 @@ fn hunk_view(hunk: &Hunk, text: &str) -> Option<HunkView> {
         start: hunk.at,
         end: hunk.end(),
         label: label.to_string(),
+        previous: hunk.previous.clone(),
     })
 }
 

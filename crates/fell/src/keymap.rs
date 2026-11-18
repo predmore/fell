@@ -43,6 +43,7 @@ pub enum Action {
     ToggleQuotes,
     Palette,
     Help,
+    ReopenReview,
 }
 
 impl Action {
@@ -70,6 +71,7 @@ impl Action {
             Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
+            Self::ReopenReview => "Reopen the agent review that closed",
         }
     }
 
@@ -78,7 +80,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 22] = [
+const ALL_ACTIONS: [Action; 23] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -101,6 +103,7 @@ const ALL_ACTIONS: [Action; 22] = [
     Action::ToggleQuotes,
     Action::Palette,
     Action::Help,
+    Action::ReopenReview,
 ];
 
 #[derive(Clone, Debug)]
@@ -218,6 +221,11 @@ fn default_bindings() -> Vec<Binding> {
         Some("folders"),
     );
     bind(&[KeyId::Leader, KeyId::Char('s')], Action::SyncNow, None);
+    bind(
+        &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('r')],
+        Action::ReopenReview,
+        Some("agents"),
+    );
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,

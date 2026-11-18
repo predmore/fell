@@ -8,7 +8,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -20,12 +21,35 @@ use super::workspace::{self, draft_socket_path};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubEvent;
 
+/// The draft socket and the lock that makes this process its only server.
+pub struct HubListener {
+    listener: UnixListener,
+    _lock: std::fs::File,
+}
+
+impl HubListener {
+    pub fn incoming(&self) -> std::os::unix::net::Incoming<'_> {
+        self.listener.incoming()
+    }
+}
+
+/// Called on every hub change. Returns `false` once its subscriber is gone,
+/// and is then dropped.
+type Listener = Box<dyn Fn() -> bool + Send>;
+
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
-    listeners: Mutex<Vec<Sender<()>>>,
+    listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
     shown: Mutex<Option<String>>,
     shown_cv: Condvar,
+    /// Bumped by every `request_send`, so a host can bring the editor up
+    /// again for a draft that is already focused.
+    reveals: AtomicU64,
+    /// One line per review window that closed, for the inbox to show.
+    closed: Mutex<Vec<String>>,
+    /// The draft whose review window closed last, for the inbox to reopen.
+    last_closed: Mutex<Option<String>>,
 }
 
 impl Default for DraftHub {
@@ -42,13 +66,26 @@ impl DraftHub {
             focused: Mutex::new(None),
             shown: Mutex::new(None),
             shown_cv: Condvar::new(),
+            reveals: AtomicU64::new(0),
+            closed: Mutex::new(Vec::new()),
+            last_closed: Mutex::new(None),
         }
     }
 
     pub fn subscribe(&self) -> Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        self.listeners.lock().expect("listeners").push(tx);
+        let (tx, rx) = mpsc::channel::<()>();
+        self.subscribe_with(move || tx.send(()).is_ok());
         rx
+    }
+
+    /// Run `notify` after every change, from whichever thread made it. Keep
+    /// it cheap and non-blocking, such as a send on an async channel; return
+    /// `false` when nobody listens any more.
+    pub fn subscribe_with(&self, notify: impl Fn() -> bool + Send + 'static) {
+        self.listeners
+            .lock()
+            .expect("listeners")
+            .push(Box::new(notify));
     }
 
     /// Add a live draft. Its saves run on a writer thread from now on, so
@@ -109,6 +146,75 @@ impl DraftHub {
         self.shown_cv.notify_all();
     }
 
+    /// The compose window showing `id` closed. A later `request_send` waits
+    /// for a window to show it again before it reports the draft opened.
+    pub fn note_hidden(&self, id: &str) {
+        let was_shown = {
+            let mut shown = self.shown.lock().expect("shown");
+            let was = shown.as_deref() == Some(id);
+            if was {
+                *shown = None;
+            }
+            was
+        };
+        // No window has it open for editing any more.
+        let summary = self.with_session(id, |session| {
+            session.close_editor();
+            let snap = session.snapshot();
+            (
+                snap.send_lock_reason(),
+                snap.unreviewed,
+                snap.send_requested_by.is_some(),
+                snap.subject.clone(),
+            )
+        });
+        if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
+            // Outcome, which draft, what is left, then the way back; spaced
+            // like the rest of the inbox status bar.
+            let name = if subject.trim().is_empty() {
+                String::new()
+            } else {
+                let short: String = subject.chars().take(60).collect();
+                let more = if subject.chars().count() > 60 {
+                    "…"
+                } else {
+                    ""
+                };
+                format!("  ·  \u{201c}{short}{more}\u{201d}")
+            };
+            let line = match locked {
+                Some(reason) => format!("{reason}{name}"),
+                None if asked && unreviewed > 0 => {
+                    format!("not sent{name}  ·  {unreviewed} unreviewed  ·  space a r reopen")
+                }
+                None => format!("not sent{name}  ·  space a r reopen"),
+            };
+            *self.last_closed.lock().expect("last closed") = Some(id.to_string());
+            self.closed.lock().expect("closed").push(line);
+            self.emit();
+        }
+    }
+
+    /// Show the review window that closed last again, as a `request_send`
+    /// would. `false` when there is none, or its draft is gone.
+    pub fn reopen_last(&self) -> bool {
+        let Some(id) = self.last_closed.lock().expect("last closed").clone() else {
+            return false;
+        };
+        if self.with_session(&id, DraftSession::request_send).is_none() {
+            return false;
+        }
+        *self.focused.lock().expect("focused") = Some(id);
+        self.reveals.fetch_add(1, Ordering::SeqCst);
+        self.emit();
+        true
+    }
+
+    /// Lines about review windows that closed since the last call.
+    pub fn take_closed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.closed.lock().expect("closed"))
+    }
+
     fn wait_shown(&self, id: &str) -> bool {
         {
             let shown = self.shown.lock().expect("shown");
@@ -137,6 +243,12 @@ impl DraftHub {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// How many `request_send` calls have asked for the editor. A host opens
+    /// or raises the compose window when this changes.
+    pub fn reveal_count(&self) -> u64 {
+        self.reveals.load(Ordering::SeqCst)
     }
 
     pub fn focused_id(&self) -> Option<String> {
@@ -284,7 +396,9 @@ impl DraftHub {
             "request_send" => {
                 let changes = session.take_user_changes(&agent);
                 let transmitted = session.request_send();
+                session.note_send_request(&agent);
                 *self.focused.lock().expect("focused") = Some(draft_id.clone());
+                self.reveals.fetch_add(1, Ordering::SeqCst);
                 reveal = Some(draft_id.clone());
                 let snap = session.snapshot();
                 json!({
@@ -341,17 +455,39 @@ impl DraftHub {
         reply.to_string()
     }
 
-    pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    /// Serve agent drafts at `path`. One Fell process owns the socket: a
+    /// lock beside it is held for as long as the returned listener lives, and
+    /// a second process gets an error instead of taking the path over. A
+    /// socket file left by a process that exited is replaced.
+    pub fn bind(path: &Path) -> std::io::Result<HubListener> {
+        use fs4::fs_std::FileExt;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+        if !lock.try_lock_exclusive()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another Fell is serving agent drafts",
+            ));
         }
         if path.exists() {
             std::fs::remove_file(path)?;
         }
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(listener)
+        Ok(HubListener {
+            listener,
+            _lock: lock,
+        })
     }
 
     pub fn serve_one(self: &Arc<Self>, stream: UnixStream) {
@@ -370,7 +506,7 @@ impl DraftHub {
 
     fn emit(&self) {
         let mut listeners = self.listeners.lock().expect("listeners");
-        listeners.retain(|listener| listener.send(()).is_ok());
+        listeners.retain(|listener| listener());
     }
 }
 
@@ -776,6 +912,167 @@ mod tests {
         let requested: Value = serde_json::from_str(&requested).unwrap();
         assert_eq!(requested["opened"], true);
         assert_eq!(requested["transmitted"], false);
+    }
+
+    fn hub_with_d1(name: &str) -> Arc<DraftHub> {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
+        let mut session =
+            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        session.set_owner("bot");
+        let hub = Arc::new(DraftHub::new());
+        hub.insert(session);
+        hub
+    }
+
+    fn request_send_d1(hub: &DraftHub) -> Value {
+        let reply = hub.handle_line(
+            &json!({ "id": 1, "op": "request_send", "draft_id": "d1", "agent": "bot" }).to_string(),
+        );
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    #[test]
+    fn each_request_send_asks_the_host_to_show_the_editor_again() {
+        let hub = hub_with_d1("reveal");
+        assert_eq!(hub.reveal_count(), 0);
+        request_send_d1(&hub);
+        assert_eq!(hub.reveal_count(), 1);
+        // Same draft, already focused: still a new request to bring it up.
+        request_send_d1(&hub);
+        assert_eq!(hub.reveal_count(), 2);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        let snap = hub
+            .with_session("d1", |session| session.snapshot())
+            .unwrap();
+        assert_eq!(snap.send_requested_by.as_deref(), Some("bot"));
+        // Reading or editing a draft never asks for the editor.
+        hub.handle_line(
+            &json!({ "id": 2, "op": "get_draft", "draft_id": "d1", "agent": "bot" }).to_string(),
+        );
+        assert_eq!(hub.reveal_count(), 2);
+    }
+
+    #[test]
+    fn a_closed_window_does_not_count_as_showing_the_draft() {
+        let hub = hub_with_d1("hidden");
+        let _host = hub.subscribe();
+        hub.note_shown("d1");
+        assert_eq!(request_send_d1(&hub)["opened"], true);
+        hub.note_hidden("d1");
+        let started = std::time::Instant::now();
+        let reply = request_send_d1(&hub);
+        assert_eq!(reply["opened"], false);
+        assert_eq!(reply["transmitted"], false);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+        // Hiding another draft leaves this one shown.
+        hub.note_shown("d1");
+        hub.note_hidden("other");
+        assert_eq!(request_send_d1(&hub)["opened"], true);
+    }
+
+    #[test]
+    fn a_second_process_cannot_take_over_the_draft_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-bind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("live.sock");
+        let first = DraftHub::bind(&path).unwrap();
+        let second = DraftHub::bind(&path);
+        assert_eq!(
+            second.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+        // The first server still owns the path it bound.
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(first);
+        // A socket file left behind is replaced once nobody holds the lock.
+        let _again = DraftHub::bind(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_listener_that_is_gone_is_dropped() {
+        let hub = hub_with_d1("listeners");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        hub.subscribe_with(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+        request_send_d1(&hub);
+        request_send_d1(&hub);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hiding_the_window_closes_the_draft_for_editing() {
+        let hub = hub_with_d1("closed");
+        request_send_d1(&hub);
+        assert!(
+            hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
+        hub.note_hidden("d1");
+        assert!(
+            !hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_closed_review_window_leaves_one_notice() {
+        let hub = hub_with_d1("notice");
+        let _host = hub.subscribe();
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        // The window's own release reports it again; that adds nothing.
+        hub.note_hidden("d1");
+        let lines = hub.take_closed();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("not sent"), "{lines:?}");
+        assert!(hub.take_closed().is_empty());
+    }
+
+    #[test]
+    fn the_inbox_can_reopen_the_review_that_closed() {
+        let hub = hub_with_d1("reopen");
+        let _host = hub.subscribe();
+        assert!(!hub.reopen_last(), "nothing has closed yet");
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        let before = hub.reveal_count();
+        assert!(hub.take_closed()[0].contains("space a r reopen"));
+        assert!(hub.reopen_last());
+        assert_eq!(hub.reveal_count(), before + 1);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        assert!(
+            hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
     }
 
     #[test]

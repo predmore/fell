@@ -533,11 +533,79 @@ fn utc_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     (year, month, day, hour, minute, wday)
 }
 
+/// Fit a notice to `max_px`, as `measure` sizes text. A quoted name gives
+/// up whole words first, so the outcome before it and the key after it
+/// stay whole; only a first word too long alone is cut inside.
+pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_px {
+        return text.to_string();
+    }
+    let quoted = text.find('\u{201c}').and_then(|open| {
+        text[open..]
+            .find('\u{201d}')
+            .map(|close| (open, open + close))
+    });
+    let Some((open, close)) = quoted else {
+        return cut_to(text, "", "", max_px, &measure);
+    };
+    let before = &text[..open + '\u{201c}'.len_utf8()];
+    let after = &text[close..];
+    let name = text[before.len()..close].trim_end_matches('…');
+    let words: Vec<&str> = name.split_whitespace().collect();
+    for count in (1..words.len()).rev() {
+        let candidate = format!("{before}{}…{after}", words[..count].join(" "));
+        if measure(&candidate) <= max_px {
+            return candidate;
+        }
+    }
+    cut_to(name, before, after, max_px, &measure)
+}
+
+/// The longest start of `middle` that fits between `before` and `after`,
+/// with an ellipsis.
+fn cut_to(
+    middle: &str,
+    before: &str,
+    after: &str,
+    max_px: f32,
+    measure: &impl Fn(&str) -> f32,
+) -> String {
+    let chars: Vec<char> = middle.chars().collect();
+    let mut best = format!("{before}…{after}");
+    let (mut lo, mut hi) = (1, chars.len());
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let short: String = chars[..mid].iter().collect();
+        let candidate = format!("{before}{}…{after}", short.trim_end());
+        if measure(&candidate) <= max_px {
+            best = candidate;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    #[test]
+    fn a_notice_gives_up_whole_words_of_the_subject_first() {
+        let notice = "not sent · \u{201c}Re: Sent copies in the thread\u{201d} · space a r reopen";
+        let width = |text: &str| text.chars().count() as f32;
+        assert_eq!(fit_notice(notice, 200.0, width), notice);
+        assert_eq!(
+            fit_notice(notice, 50.0, width),
+            "not sent · \u{201c}Re: Sent copies…\u{201d} · space a r reopen"
+        );
+        // Not even one word fits: the name is cut, the key stays.
+        let fitted = fit_notice(notice, 33.0, width);
+        assert!(fitted.ends_with("\u{201d} · space a r reopen"), "{fitted}");
+    }
 
     fn person(name: &str, email: &str) -> fell_core::Participant {
         fell_core::Participant {

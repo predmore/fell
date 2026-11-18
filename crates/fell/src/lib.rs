@@ -6,6 +6,7 @@
 pub mod render;
 
 mod compose_ui;
+pub mod draft_host;
 mod embeddings;
 mod fixtures;
 mod keymap;

@@ -34,7 +34,7 @@ pub use persist::{
     remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub use session::{
-    AddressView, AttachmentView, DraftSession, HunkView, SendLock, SentBcc, Snapshot,
+    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
 };
 pub use workspace::{
     draft_file_is_symlink, draft_folder, draft_root, draft_socket_path, image_file, materialize_in,

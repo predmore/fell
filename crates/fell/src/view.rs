@@ -26,6 +26,8 @@ use crate::theme::{self, Theme};
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
+        // Agents' drafts open in a compose window from here; see draft_host.
+        let _hub = crate::draft_host::host_agent_drafts(cx);
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let view = cx.open_window(
@@ -184,6 +186,7 @@ impl Inbox {
         })
         .detach();
         inbox.watch_theme(cx);
+        inbox.watch_reviews(cx);
         inbox.watch_dates(cx);
         inbox
     }
@@ -517,6 +520,38 @@ impl Inbox {
         .detach();
     }
 
+    /// Say so in the status bar when a review window an agent opened closes,
+    /// so the person knows the draft was kept and nothing was sent.
+    fn watch_reviews(&self, cx: &mut Context<Self>) {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            return;
+        };
+        let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
+        hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
+        cx.spawn(async move |this, cx| {
+            while events.next().await.is_some() {
+                while events.try_recv().is_ok() {}
+                let closed = hub.take_closed();
+                let Some(line) = closed.last().cloned() else {
+                    continue;
+                };
+                let alive = this
+                    .update(cx, |inbox, cx| {
+                        inbox.session.show_toast(line, false);
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
     /// inotify wakes this; without it, a slow poll does.
     fn watch_theme(&self, cx: &mut Context<Self>) {
@@ -738,6 +773,14 @@ impl Inbox {
         }
         if step.archive {
             self.archive_current(cx);
+        }
+        if step.reopen_review {
+            let reopened = cx
+                .try_global::<crate::draft_host::AgentDrafts>()
+                .is_some_and(|drafts| drafts.0.reopen_last());
+            if !reopened {
+                self.session.show_toast("no agent review to reopen", false);
+            }
         }
         if step.sync_now {
             match &self.sync {
@@ -1011,7 +1054,7 @@ fn shell(
                     ))
                 }),
         )
-        .child(status_bar(&theme, session))
+        .child(status_bar(&theme, session, width, window))
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
             |root| root.child(which_key_popup(&theme, session)),
@@ -1390,6 +1433,25 @@ fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> St
         }
     }
     best
+}
+
+/// The width of `text` as the status bar draws it: its size and family.
+fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let mut style = window.text_style();
+    if let Some(family) = family {
+        style.font_family = SharedString::from(family.clone());
+    }
+    let run = style.to_run(text.len());
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(size),
+        &[run],
+        None,
+    );
+    f32::from(line.width)
 }
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
@@ -1888,9 +1950,13 @@ fn body_block(
     }
 }
 
-fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
+fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> gpui::Div {
     let hint = if !session.chord.is_empty() {
         session.prefix_text()
+    } else if session.toast.is_some() {
+        // A notice takes the hints' room until the next key clears it, so
+        // it is never cut short.
+        String::new()
     } else if session.pane == Pane::Conversation {
         "j k  ·  esc  ·  ctrl-d  ·  space  ·  :".to_string()
     } else {
@@ -1901,6 +1967,25 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
     } else {
         format!("{} ", session.count)
     };
+    let toast = session.toast.as_ref().map(|toast| {
+        // What the bar spends before the notice, measured as drawn: the
+        // padding, the mode in mono, sync, the dots, the gaps between the
+        // children, and the air after the notice.
+        let size = (theme.ui_px - 1.0).max(12.0);
+        let ui = theme.ui_family.as_ref();
+        let mode = session.mode_label().to_string();
+        // No key hints show beside a notice, so no gap or air after it.
+        let mut used = 28.0 + 4.0 * 12.0;
+        used += bar_px(window, &mode, size, theme.mono_family.as_ref())
+            + bar_px(window, &session.sync.status(), size, ui)
+            + 2.0 * bar_px(window, "·", size, ui);
+        if session.detail_text().is_some() {
+            used += 12.0 + bar_px(window, "· ? details", size, ui);
+        }
+        present::fit_notice(&toast.text, (width - used).max(80.0), |text| {
+            bar_px(window, text, size, ui)
+        })
+    });
     div()
         .h(px(30.))
         .px(px(14.))
@@ -1935,10 +2020,15 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
+        .when(session.toast.is_some(), |bar| {
+            bar.child(div().text_color(rgb(theme.dimmed)).child("·"))
+        })
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
+                // Air before the key hints, so a long message never runs into them.
+                .when(session.toast.is_none(), |toast| toast.pr(px(16.)))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
@@ -1947,24 +2037,20 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
                     Some(_) => theme.foreground,
                     None => theme.dimmed,
                 }))
-                .child(
-                    session
-                        .toast
-                        .as_ref()
-                        .map(|toast| toast.text.clone())
-                        .unwrap_or_default(),
-                ),
+                .child(toast.unwrap_or_default()),
         )
-        .child(
-            div()
-                .font_family_opt(theme.mono_family.clone())
-                .text_color(rgb(if session.chord.is_empty() {
-                    theme.dimmed
-                } else {
-                    theme.accent
-                }))
-                .child(format!("{count}{hint}")),
-        )
+        .when(!count.is_empty() || !hint.is_empty(), |bar| {
+            bar.child(
+                div()
+                    .font_family_opt(theme.mono_family.clone())
+                    .text_color(rgb(if session.chord.is_empty() {
+                        theme.dimmed
+                    } else {
+                        theme.accent
+                    }))
+                    .child(format!("{count}{hint}")),
+            )
+        })
 }
 
 fn which_key_popup(theme: &Theme, session: &Session) -> gpui::Div {
