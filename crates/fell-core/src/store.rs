@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS messages (
     snooze_until INTEGER,
     body_fingerprint TEXT NOT NULL DEFAULT '',
     list_id TEXT,
+    reply_to_line TEXT NOT NULL DEFAULT '',
+    attachment_names TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(account_id) REFERENCES accounts(id),
     UNIQUE (account_id, message_id)
 );
@@ -163,6 +165,9 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     identities TEXT NOT NULL DEFAULT '',
     owner TEXT NOT NULL DEFAULT '',
     updated_unix INTEGER NOT NULL,
+    references_header TEXT NOT NULL DEFAULT '',
+    quote_text TEXT NOT NULL DEFAULT '',
+    quote_html TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
 
@@ -267,7 +272,8 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
     "account_id, message_id, remote_id, thread_id, proton_conversation_id,
         in_reply_to, references_header, from_name, from_email, subject,
         date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-        to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until, list_id";
+        to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until, list_id,
+        reply_to_line, attachment_names";
 
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
@@ -669,6 +675,31 @@ impl Store {
     }
 
     /// True when `token` is already a message id, thread id, reply id, or address.
+    /// One stored message by its id, or by an id that collapsed into it.
+    pub fn message(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<Message>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {SELECT_MESSAGE_COLS} FROM messages
+                     WHERE account_id = ?1 AND (
+                         message_id = ?2 OR message_id IN (
+                             SELECT canonical_message_id FROM message_aliases
+                             WHERE account_id = ?1 AND message_id = ?2
+                         )
+                     )
+                     LIMIT 1"
+                ),
+                params![account_id.as_str(), message_id.as_str()],
+                row_to_message,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn id_is_stored(&self, account_id: &AccountId, token: &str) -> Result<bool> {
         let found: Option<i64> = self
             .conn
@@ -1520,10 +1551,10 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until,
-            body_fingerprint, list_id
+            body_fingerprint, list_id, reply_to_line, attachment_names
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+            ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
          )",
         params![
             message.account_id.as_str(),
@@ -1552,6 +1583,8 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             message.snooze_until,
             fingerprint,
             list_id,
+            encode_addresses(&message.reply_to),
+            union_tokens("", &message.attachment_names, false),
         ],
     )?;
     let body = message.body_text.as_deref().unwrap_or(&message.snippet);
@@ -1656,6 +1689,13 @@ fn write_kept(
     let cc_line = union_addresses(&stored.cc_line, &message.cc);
     let bcc_line = union_addresses(&stored.bcc_line, &message.bcc);
     let has_attachment = stored.has_attachment || message.has_attachment;
+    // The first copy's Reply-To stands; a copy that names none adds nothing.
+    let reply_to_line = if stored.reply_to_line.is_empty() {
+        encode_addresses(&message.reply_to)
+    } else {
+        stored.reply_to_line.clone()
+    };
+    let attachment_names = union_tokens(&stored.attachment_names, &message.attachment_names, false);
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
     let from_email = if alias {
         prefer_nonempty(&stored.from_email, &message.headers.from.email)
@@ -1738,8 +1778,10 @@ fn write_kept(
             archived = ?21,
             snooze_until = ?22,
             body_fingerprint = ?23,
-            list_id = ?24
-         WHERE account_id = ?25 AND message_id = ?26",
+            list_id = ?24,
+            reply_to_line = ?25,
+            attachment_names = ?26
+         WHERE account_id = ?27 AND message_id = ?28",
         params![
             remote_id,
             thread_id.as_str(),
@@ -1765,6 +1807,8 @@ fn write_kept(
             kept_snooze(stored.snooze_until, message.snooze_until),
             fingerprint,
             list_id,
+            reply_to_line,
+            attachment_names,
             message.account_id.as_str(),
             stored.canonical_id,
         ],
@@ -1806,12 +1850,15 @@ struct Arrival {
     archived: bool,
     snooze_until: Option<i64>,
     list_id: Option<String>,
+    reply_to_line: String,
+    attachment_names: String,
 }
 
 const ARRIVAL_COLS: &str = "m.message_id, m.remote_id, m.proton_conversation_id, m.in_reply_to,
     m.references_header, m.from_name, m.from_email, m.subject, m.date_unix, m.snippet,
     m.body_text, m.folders, m.labels, m.arrived_via, m.to_line, m.cc_line, m.bcc_line,
-    m.has_attachment, m.archived, m.starred, m.list_id, m.snooze_until";
+    m.has_attachment, m.archived, m.starred, m.list_id, m.snooze_until, m.reply_to_line,
+    m.attachment_names";
 
 fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
     let snippet: String = row.get(9)?;
@@ -1844,6 +1891,8 @@ fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
         starred: row.get::<_, i64>(19)? != 0,
         list_id: row.get(20)?,
         snooze_until: row.get(21)?,
+        reply_to_line: row.get(22)?,
+        attachment_names: row.get(23)?,
     })
 }
 
@@ -1914,7 +1963,7 @@ fn find_stored(
     let hit = stmt
         .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
             let stored = map_arrival(row)?;
-            let via_alias: i64 = row.get(22)?;
+            let via_alias: i64 = row.get(24)?;
             Ok((stored, via_alias != 0))
         })
         .optional()?;
@@ -2835,6 +2884,18 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
             "owner",
             "ALTER TABLE compose_drafts ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
         ),
+        (
+            "references_header",
+            "ALTER TABLE compose_drafts ADD COLUMN references_header TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "quote_text",
+            "ALTER TABLE compose_drafts ADD COLUMN quote_text TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "quote_html",
+            "ALTER TABLE compose_drafts ADD COLUMN quote_html TEXT NOT NULL DEFAULT ''",
+        ),
     ] {
         if have.iter().any(|column| column == name) {
             continue;
@@ -2931,6 +2992,14 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE messages ADD COLUMN body_fingerprint TEXT NOT NULL DEFAULT ''",
         ),
         ("list_id", "ALTER TABLE messages ADD COLUMN list_id TEXT"),
+        (
+            "reply_to_line",
+            "ALTER TABLE messages ADD COLUMN reply_to_line TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "attachment_names",
+            "ALTER TABLE messages ADD COLUMN attachment_names TEXT NOT NULL DEFAULT ''",
+        ),
     ];
     let have = column_names(conn, "messages")?;
     for (name, ddl) in missing {
@@ -3163,6 +3232,8 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
         archived: row.get::<_, i64>(22)? != 0,
         snooze_until: row.get(23)?,
         list_id: row.get(24)?,
+        reply_to: decode_addresses(&row.get::<_, String>(25)?),
+        attachment_names: split_field(&row.get::<_, String>(26)?),
     })
 }
 
@@ -3228,6 +3299,8 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
+            reply_to: Vec::new(),
+            attachment_names: Vec::new(),
         }
     }
 
@@ -6935,6 +7008,43 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reply_to_and_attachment_names_survive_a_second_copy() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut first = msg_for("a1", "rt@x", None, None, "Report", "see attached");
+        first.reply_to = vec![Address {
+            name: Some("List".into()),
+            email: "list@x".into(),
+        }];
+        first.attachment_names = vec!["report.pdf".into()];
+        first.has_attachment = true;
+        store.upsert_message(&first).unwrap();
+        let read = store
+            .message(&account().id, &MessageId::new("<rt@x>"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.reply_to, first.reply_to);
+        assert_eq!(read.attachment_names, vec!["report.pdf"]);
+        // A later copy with no Reply-To keeps the first; names are unioned.
+        let mut second = first.clone();
+        second.reply_to.clear();
+        second.attachment_names = vec!["report.pdf".into(), "chart.png".into()];
+        store.upsert_message(&second).unwrap();
+        let read = store
+            .message(&account().id, &MessageId::new("rt@x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.reply_to, first.reply_to);
+        assert_eq!(read.attachment_names, vec!["report.pdf", "chart.png"]);
+        assert!(
+            store
+                .message(&account().id, &MessageId::new("missing@x"))
+                .unwrap()
+                .is_none()
+        );
     }
 }
 

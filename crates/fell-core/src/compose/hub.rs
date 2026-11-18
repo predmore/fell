@@ -1553,6 +1553,7 @@ mod tests {
                 files: Vec::new(),
                 identities: vec!["jon@example.com".into()],
                 owner: "agent:ada".into(),
+                reply: Default::default(),
             })
             .unwrap();
         super::super::persist::remember_compose_store(&id, &db).unwrap();

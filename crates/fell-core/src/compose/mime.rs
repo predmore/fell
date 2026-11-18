@@ -1,6 +1,7 @@
 //! Multipart message built from the markdown the editor is showing.
 //!
 //! `text/plain` is that markdown. `text/html` comes from the shared renderer.
+//! A reply or forward adds its quoted original after both.
 //! Inline images are CID parts. Remote URLs are not fetched.
 //!
 //! The bytes in [`Outgoing::mime`] are the message that leaves the machine.
@@ -14,6 +15,7 @@ use crate::send::Draft;
 
 use super::frontmatter::{DraftFields, mailbox_parts};
 use super::markdown::{doc_to_html, markdown_to_doc};
+use super::reply::{ReplyParts, build_references};
 
 static TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -41,16 +43,30 @@ pub fn build_outgoing(
     fields: &DraftFields,
     body: &str,
     files: &[ResolvedFile],
+    reply: &ReplyParts,
 ) -> Outgoing {
-    let plain = if body.ends_with('\n') || body.is_empty() {
+    let mut plain = if body.ends_with('\n') || body.is_empty() {
         body.to_string()
     } else {
         format!("{body}\n")
     };
-    let html = doc_to_html(&markdown_to_doc(&plain));
+    let mut html = doc_to_html(&markdown_to_doc(&plain));
+    // The quoted original goes after what the person wrote, in both parts.
+    if !reply.quote_text.trim().is_empty() {
+        if !plain.is_empty() {
+            plain.push('\n');
+        }
+        plain.push_str(&reply.quote_text);
+        if !plain.ends_with('\n') {
+            plain.push('\n');
+        }
+    }
+    if !reply.quote_html.trim().is_empty() {
+        html.push_str(&reply.quote_html);
+    }
     let digest = attachment_digest(files);
     let message_id = fresh_message_id();
-    let mime = render_mime(fields, &message_id, &plain, &html, files);
+    let mime = render_mime(fields, &message_id, &plain, &html, files, &reply.references);
     let in_reply_to = fields
         .in_reply_to
         .as_ref()
@@ -80,6 +96,7 @@ fn render_mime(
     plain: &str,
     html: &str,
     files: &[ResolvedFile],
+    references: &[String],
 ) -> Vec<u8> {
     let blobs = content_blobs(plain, html, files);
     let mixed = fresh_boundary("mix", &blobs);
@@ -104,9 +121,16 @@ fn render_mime(
         .as_ref()
         .filter(|value| !value.trim().is_empty())
     {
-        let id = angle_id(reply);
-        headers.push_str(&header_line("In-Reply-To", &id));
-        headers.push_str(&header_line("References", &id));
+        headers.push_str(&header_line("In-Reply-To", &angle_id(reply)));
+        // The parent's References and then the parent (RFC 5322 §3.6.4), so
+        // a reader missing a message in between still has the chain.
+        let chain = build_references(references, reply);
+        let line = chain
+            .iter()
+            .map(|id| angle_id(id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        headers.push_str(&header_line("References", &line));
     }
     headers.push_str("MIME-Version: 1.0\r\n");
     let mut body = String::new();
@@ -390,7 +414,7 @@ fn rfc5322_now() -> String {
     rfc5322_date(unix)
 }
 
-fn rfc5322_date(unix: i64) -> String {
+pub(super) fn rfc5322_date(unix: i64) -> String {
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -559,7 +583,13 @@ mod tests {
     }
 
     fn sample(body: &str, files: Vec<ResolvedFile>) -> Outgoing {
-        build_outgoing(AccountId("a".into()), &fields(), body, &files)
+        build_outgoing(
+            AccountId("a".into()),
+            &fields(),
+            body,
+            &files,
+            &ReplyParts::default(),
+        )
     }
 
     fn parse(bytes: &[u8]) -> mail_parser::Message<'_> {
@@ -661,6 +691,7 @@ mod tests {
                 bytes: image.clone(),
                 inline: true,
             }],
+            &ReplyParts::default(),
         );
         assert_smtp_lines(&outgoing.mime);
         let raw = String::from_utf8(outgoing.mime.clone()).unwrap();
@@ -713,5 +744,53 @@ mod tests {
                 .parts()
                 .any(|part| part.decoded().as_ref() == image.as_slice())
         );
+    }
+
+    #[test]
+    fn a_reply_sends_the_whole_reference_chain_and_its_quote() {
+        let reply = ReplyParts {
+            references: (0..30).map(|n| format!("m{n}@example.com")).collect(),
+            quote_text: "On a day, Ada wrote:\n> the original\n".into(),
+            quote_html: "<p>On a day, Ada wrote:</p><blockquote><p>the original</p></blockquote>"
+                .into(),
+        };
+        let outgoing = build_outgoing(
+            AccountId("a".into()),
+            &fields(),
+            "My answer.\n",
+            &[],
+            &reply,
+        );
+        assert_smtp_lines(&outgoing.mime);
+        let message = parse(&outgoing.mime);
+        let references: Vec<String> = message
+            .references()
+            .unwrap()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(references.len(), super::super::MAX_REFERENCES);
+        assert_eq!(references[0], "m0@example.com");
+        assert_eq!(references[1], "m12@example.com");
+        assert_eq!(references.last().unwrap(), "abc@example.com");
+        let text = message.body_text(0).unwrap().replace("\r\n", "\n");
+        assert!(
+            text.starts_with("My answer.\n\nOn a day, Ada wrote:\n> the original"),
+            "{text}"
+        );
+        let html = message.body_html(0).unwrap().to_string();
+        assert!(html.contains("<blockquote><p>the original</p></blockquote>"));
+        // The confirmation covers the quote: it is in the body the person sends.
+        assert!(outgoing.draft.body.contains("> the original"));
+        // A reply with no stored chain still names its parent.
+        let bare = sample("hi\n", Vec::new());
+        let message = parse(&bare.mime);
+        let references: Vec<String> = message
+            .references()
+            .unwrap()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(references, vec!["abc@example.com".to_string()]);
     }
 }

@@ -13,6 +13,7 @@ use crate::{AccountId, Result};
 
 use super::frontmatter::{AttachmentRef, DraftFields, write_draft};
 use super::mime::ResolvedFile;
+use super::reply::ReplyParts;
 use super::session::SendLock;
 use super::workspace;
 
@@ -25,6 +26,8 @@ pub struct StoredCompose {
     pub files: Vec<ResolvedFile>,
     pub identities: Vec<String>,
     pub owner: String,
+    /// A reply's References and a reply or forward's quoted original.
+    pub reply: ReplyParts,
 }
 
 /// One compose draft as the inbox's drafts list shows it.
@@ -75,8 +78,9 @@ const SEND_CLEAR: &str = "clear";
 
 const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-        subject, body, in_reply_to, identities, owner, updated_unix
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        subject, body, in_reply_to, identities, owner, updated_unix,
+        references_header, quote_text, quote_html
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
      ON CONFLICT(id) DO UPDATE SET
         from_addr = excluded.from_addr,
         to_addrs = excluded.to_addrs,
@@ -87,7 +91,13 @@ const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         in_reply_to = excluded.in_reply_to,
         identities = excluded.identities,
         owner = CASE WHEN excluded.owner = '' THEN compose_drafts.owner ELSE excluded.owner END,
-        updated_unix = excluded.updated_unix";
+        updated_unix = excluded.updated_unix,
+        references_header = CASE WHEN excluded.references_header = ''
+            THEN compose_drafts.references_header ELSE excluded.references_header END,
+        quote_text = CASE WHEN excluded.quote_text = ''
+            THEN compose_drafts.quote_text ELSE excluded.quote_text END,
+        quote_html = CASE WHEN excluded.quote_html = ''
+            THEN compose_drafts.quote_html ELSE excluded.quote_html END";
 
 impl Store {
     pub fn save_compose(&self, draft: &StoredCompose) -> Result<()> {
@@ -123,6 +133,9 @@ impl Store {
                 join_list(&draft.identities),
                 draft.owner,
                 now_unix(),
+                join_list(&draft.reply.references),
+                draft.reply.quote_text,
+                draft.reply.quote_html,
             ],
         )?;
         if let Some(files) = files {
@@ -336,7 +349,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-                        subject, body, in_reply_to, identities, owner
+                        subject, body, in_reply_to, identities, owner,
+                        references_header, quote_text, quote_html
                  FROM compose_drafts WHERE id = ?1",
                 params![id],
                 |row| {
@@ -351,11 +365,17 @@ impl Store {
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, String>(8)?,
                         row.get::<_, String>(9)?,
+                        ReplyParts {
+                            references: split_list(&row.get::<_, String>(10)?),
+                            quote_text: row.get(11)?,
+                            quote_html: row.get(12)?,
+                        },
                     ))
                 },
             )
             .optional()?;
-        let Some((account, from, to, cc, bcc, subject, body, reply, identities, owner)) = row
+        let Some((account, from, to, cc, bcc, subject, body, reply, identities, owner, parts)) =
+            row
         else {
             return Ok(None);
         };
@@ -395,6 +415,7 @@ impl Store {
             files,
             identities: split_list(&identities),
             owner,
+            reply: parts,
         }))
     }
 
@@ -790,6 +811,8 @@ mod tests {
                 archived: false,
                 snooze_until: None,
                 list_id: None,
+                reply_to: Vec::new(),
+                attachment_names: Vec::new(),
             })
             .unwrap();
         let summary = store.message_summary(&account.id, &id).unwrap().unwrap();
@@ -839,6 +862,7 @@ mod tests {
                     files: Vec::new(),
                     identities: vec!["me@x".into()],
                     owner: owner.into(),
+                    reply: Default::default(),
                 })
                 .unwrap();
         };
@@ -910,6 +934,7 @@ mod tests {
                 }],
                 identities: vec!["jon@example.com".into()],
                 owner: String::new(),
+                reply: Default::default(),
             })
             .unwrap();
         let loaded = store.load_compose("d1").unwrap().unwrap();
@@ -946,6 +971,7 @@ mod tests {
                 files: vec![file("chart.png", b"old"), file("logo.png", b"logo")],
                 identities: vec!["jon@example.com".into()],
                 owner: String::new(),
+                reply: Default::default(),
             })
             .unwrap();
         let folder = std::env::temp_dir().join(format!(
@@ -1071,6 +1097,7 @@ mod tests {
                 files: Vec::new(),
                 identities: vec!["jon@example.com".into()],
                 owner: "agent:ada".into(),
+                reply: Default::default(),
             })
             .unwrap();
         let opened = super::super::session::DraftSession::open_with_store(
@@ -1138,6 +1165,7 @@ mod tests {
                 }],
                 identities: vec!["jon@example.com".into()],
                 owner: "agent:ada".into(),
+                reply: Default::default(),
             })
             .unwrap();
         let err = store.restore_compose_folder("keep", &folder).unwrap_err();

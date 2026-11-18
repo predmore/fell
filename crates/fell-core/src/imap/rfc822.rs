@@ -56,7 +56,7 @@ fn message_id_or_uid(
         })
 }
 
-pub(super) fn to_message(
+pub(crate) fn to_message(
     account_id: &AccountId,
     mailbox_raw: &str,
     folder: &str,
@@ -158,7 +158,23 @@ pub(super) fn to_message(
         archived: false,
         snooze_until: None,
         list_id,
+        reply_to: address_list(parsed.as_ref().and_then(|message| message.reply_to())),
+        attachment_names: parsed.as_ref().map(attachment_names).unwrap_or_default(),
     }
+}
+
+/// File names of the attachments, as a forward lists them. A part with no
+/// name is called "attachment".
+fn attachment_names(message: &mail_parser::Message<'_>) -> Vec<String> {
+    message
+        .attachments()
+        .map(|part| {
+            part.attachment_name()
+                .map(|name| name.trim().replace(['\u{1e}', '\u{1f}'], " "))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "attachment".to_string())
+        })
+        .collect()
 }
 
 fn address_list(list: Option<mail_parser::AddressList<'_>>) -> Vec<Address> {
@@ -276,5 +292,57 @@ mod tests {
         assert_eq!(message.list_id.as_deref(), Some("dev.example"));
         assert_eq!(message.headers.subject, "[list] 会議");
         assert_eq!(message.body_text.as_deref().map(str::trim), Some("hello"));
+    }
+
+    #[test]
+    fn reply_to_and_attachment_names_are_kept() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Reply-To: Plans list <plans@lists.x>, bob@x\r\n\
+                   To: jon@example.com\r\n\
+                   Subject: Report\r\n\
+                   Message-ID: <r@x>\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+                   \r\n\
+                   --b\r\n\
+                   Content-Type: text/plain\r\n\
+                   \r\n\
+                   see attached\r\n\
+                   --b\r\n\
+                   Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+                   Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   \r\n\
+                   JVBERi0=\r\n\
+                   --b\r\n\
+                   Content-Type: application/octet-stream\r\n\
+                   Content-Disposition: attachment\r\n\
+                   \r\n\
+                   xyz\r\n\
+                   --b--\r\n";
+        let message = to_message(
+            &AccountId("a1".into()),
+            "INBOX",
+            "INBOX",
+            1,
+            2,
+            &[],
+            raw.as_bytes(),
+        );
+        assert_eq!(
+            message.reply_to,
+            vec![
+                Address {
+                    name: Some("Plans list".into()),
+                    email: "plans@lists.x".into(),
+                },
+                Address {
+                    name: None,
+                    email: "bob@x".into(),
+                },
+            ]
+        );
+        assert!(message.has_attachment);
+        assert_eq!(message.attachment_names, vec!["report.pdf", "attachment"]);
     }
 }

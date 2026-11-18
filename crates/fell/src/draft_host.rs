@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fell_core::AccountId;
-use fell_core::compose::{DraftFields, DraftHub, DraftSession};
+use fell_core::compose::{DraftFields, DraftHub, DraftSession, ReplyParts, ReplyStart};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
     px, size,
@@ -145,12 +145,39 @@ impl DraftHome {
         account: &AccountId,
         email: &str,
     ) -> Result<String, String> {
-        let id = new_draft_id();
         let fields = DraftFields {
             from: email.to_string(),
             ..DraftFields::default()
         };
-        DraftSession::start_in(&self.root, &id, account.clone(), fields, "", &self.store)?;
+        self.new_reply(
+            hub,
+            account,
+            ReplyStart {
+                fields,
+                parts: ReplyParts::default(),
+            },
+        )
+    }
+
+    /// Start a reply or forward on `account` from `start`, as
+    /// [`Self::new_draft`] starts a new draft. Its References and quoted
+    /// original go into the mailbox row with it. Disk only.
+    pub fn new_reply(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        start: ReplyStart,
+    ) -> Result<String, String> {
+        let id = new_draft_id();
+        DraftSession::start_reply_in(
+            &self.root,
+            &id,
+            account.clone(),
+            start.fields,
+            "",
+            &start.parts,
+            &self.store,
+        )?;
         self.open(hub, &id, account)?;
         Ok(id)
     }
@@ -445,6 +472,123 @@ pub(crate) mod tests {
         home.open(&hub, &id, &account.id).unwrap();
         assert!(hub.with_session(&id, |_| ()).is_some());
         assert!(home.open(&hub, "c0", &account.id).is_err());
+    }
+
+    fn parent_message(account: &fell_core::Account) -> fell_core::Message {
+        let id = fell_core::MessageId::new("parent@x");
+        fell_core::Message {
+            account_id: account.id.clone(),
+            headers: fell_core::MessageHeaders {
+                message_id: id.clone(),
+                proton_conversation_id: None,
+                in_reply_to: Some(fell_core::MessageId::new("root@x")),
+                references: vec![fell_core::MessageId::new("root@x")],
+                from: fell_core::Address {
+                    name: Some("Ada".into()),
+                    email: "ada@x".into(),
+                },
+                subject: "Re: Plans".into(),
+                date_unix: 1_700_000_000,
+            },
+            remote_id: fell_core::RemoteId("r".into()),
+            thread_id: fell_core::ThreadId::from_message_id(&id),
+            snippet: "See you".into(),
+            body_text: Some("See you at noon.".into()),
+            unread: false,
+            folders: vec!["INBOX".into()],
+            labels: Vec::new(),
+            arrived_via: Vec::new(),
+            to: vec![fell_core::Address {
+                name: None,
+                email: account.email.clone(),
+            }],
+            cc: vec![fell_core::Address {
+                name: Some("Sam".into()),
+                email: "sam@x".into(),
+            }],
+            bcc: Vec::new(),
+            starred: false,
+            has_attachment: false,
+            archived: false,
+            snooze_until: None,
+            list_id: None,
+            reply_to: Vec::new(),
+            attachment_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_reply_keeps_its_quote_and_references_when_reopened() {
+        let account = me();
+        let home = temp_home("reply", &account);
+        let parent = parent_message(&account);
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::ReplyAll,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+        );
+        let hub = DraftHub::new();
+        let id = home.new_reply(&hub, &account.id, start).unwrap();
+        let check = |hub: &DraftHub| {
+            hub.with_session(&id, |session| {
+                let snap = session.snapshot();
+                let to: Vec<String> = snap.to.iter().map(|item| item.raw.clone()).collect();
+                let cc: Vec<String> = snap.cc.iter().map(|item| item.raw.clone()).collect();
+                assert_eq!(to, vec!["Ada <ada@x>"]);
+                assert_eq!(cc, vec!["Sam <sam@x>"]);
+                assert_eq!(snap.subject, "Re: Plans");
+                assert_eq!(snap.in_reply_to.as_deref(), Some("parent@x"));
+                let quoted = snap.quoted.expect("the quote shows below the draft");
+                assert!(quoted.contains("See you at noon."), "{quoted}");
+                assert_eq!(
+                    session.reply_parts().references,
+                    vec!["root@x".to_string(), "parent@x".to_string()]
+                );
+            })
+            .expect("the reply is live")
+        };
+        check(&hub);
+        hub.settle_all();
+        drop(hub);
+        // gd, then Enter: the mailbox's copy, quote and chain included.
+        let hub = DraftHub::new();
+        home.open(&hub, &id, &account.id).unwrap();
+        check(&hub);
+    }
+
+    #[test]
+    fn a_reply_started_without_its_chain_gets_it_from_the_parent() {
+        let account = me();
+        let home = temp_home("agent-reply", &account);
+        let store = fell_core::Store::open(&home.store).unwrap();
+        store.upsert_message(&parent_message(&account)).unwrap();
+        // An agent's reply names only its parent.
+        store
+            .save_compose(&fell_core::compose::StoredCompose {
+                id: "c1".into(),
+                account_id: account.id.clone(),
+                fields: DraftFields {
+                    from: account.email.clone(),
+                    to: vec!["ada@x".into()],
+                    subject: "Re: Plans".into(),
+                    in_reply_to: Some("parent@x".into()),
+                    ..DraftFields::default()
+                },
+                body: "Yes.\n".into(),
+                files: Vec::new(),
+                identities: vec![account.email.clone()],
+                owner: String::new(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        drop(store);
+        let hub = DraftHub::new();
+        home.open(&hub, "c1", &account.id).unwrap();
+        let references = hub
+            .with_session("c1", |session| session.reply_parts().references.clone())
+            .unwrap();
+        assert_eq!(references, vec!["root@x", "parent@x"]);
     }
 
     #[test]

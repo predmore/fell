@@ -10,6 +10,7 @@ mod markdown;
 mod merge;
 mod mime;
 mod persist;
+mod reply;
 mod review;
 mod session;
 mod workspace;
@@ -32,6 +33,10 @@ pub use mime::{Outgoing, ResolvedFile};
 pub use persist::{
     DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
+};
+pub use reply::{
+    MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references, forward_subject,
+    reply_recipients, reply_subject, start_reply,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,

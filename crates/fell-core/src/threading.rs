@@ -100,6 +100,28 @@ pub(crate) fn thread_subject(subject: &str) -> (String, bool) {
     (key, reply)
 }
 
+/// `subject` without its leading reply and forward markers, case and
+/// spacing kept, for the subject of a new reply or forward. Markers right
+/// after a leading list tag go too: `[team] Re: Plans` is `[team] Plans`.
+pub(crate) fn strip_reply_markers(subject: &str) -> String {
+    fn markers(mut rest: &str) -> &str {
+        while let Some(after) = strip_marker(rest) {
+            rest = after.trim_start();
+        }
+        rest
+    }
+    let rest = markers(subject.trim());
+    if let Some(after) = strip_list_tag(rest) {
+        let after = after.trim_start();
+        let inner = markers(after);
+        if inner.len() != after.len() {
+            let tag = &rest[..rest.len() - after.len()];
+            return format!("{} {inner}", tag.trim_end()).trim().to_string();
+        }
+    }
+    rest.trim_end().to_string()
+}
+
 fn strip_marker(subject: &str) -> Option<&str> {
     for marker in CJK_MARKERS {
         if let Some(after) = subject.strip_prefix(marker) {

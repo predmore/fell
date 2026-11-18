@@ -172,6 +172,8 @@ pub fn round_trip_body(body: &str, subject: &str) -> fell_core::Result<Message> 
         archived: false,
         snooze_until: None,
         list_id: None,
+        reply_to: Vec::new(),
+        attachment_names: Vec::new(),
     };
     let thread_id = store.upsert_message(&message)?;
     let mut messages = store.thread_messages(&account.id, &thread_id)?;

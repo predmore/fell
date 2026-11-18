@@ -840,7 +840,7 @@ fn is_remote_url(src: &str) -> bool {
         || lower.contains("://")
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {

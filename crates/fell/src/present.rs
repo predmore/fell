@@ -382,6 +382,8 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
         archived: false,
         snooze_until: None,
         list_id: None,
+        reply_to: Vec::new(),
+        attachment_names: Vec::new(),
     };
     let mut shown = conversation(&[message], me);
     for message in &mut shown {
@@ -1044,6 +1046,8 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
+            reply_to: Vec::new(),
+            attachment_names: Vec::new(),
         };
         let messages = conversation(
             &[
@@ -1103,6 +1107,8 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
+            reply_to: Vec::new(),
+            attachment_names: Vec::new(),
         }
     }
 

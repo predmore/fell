@@ -75,6 +75,10 @@ pub struct Message {
     pub snooze_until: Option<i64>,
     /// Set when a mailing list rewrote this copy (`List-Id`).
     pub list_id: Option<String>,
+    /// `Reply-To` addresses. A reply goes to these instead of `from`.
+    pub reply_to: Vec<Address>,
+    /// File names of the message's attachments, for a forward to list.
+    pub attachment_names: Vec<String>,
 }
 
 pub(crate) fn encode_addresses(addrs: &[Address]) -> String {

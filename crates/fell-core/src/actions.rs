@@ -43,7 +43,7 @@ pub const FOLDER_SENT: &str = "Sent";
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
     in_reply_to, references_header, from_name, from_email, subject,
     date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-    to_line, cc_line, bcc_line, has_attachment, list_id";
+    to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line, attachment_names";
 
 const ACTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_actions (
@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS local_action_messages (
     bcc_line TEXT NOT NULL,
     has_attachment INTEGER NOT NULL,
     list_id TEXT,
+    reply_to_line TEXT NOT NULL DEFAULT '',
+    attachment_names TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
 
@@ -179,6 +181,8 @@ struct SavedRow {
     bcc_line: String,
     has_attachment: i64,
     list_id: Option<String>,
+    reply_to_line: String,
+    attachment_names: String,
 }
 
 #[derive(Clone)]
@@ -457,6 +461,14 @@ fn ensure_snapshot_columns(conn: &Connection) -> Result<()> {
             "list_id",
             "ALTER TABLE local_action_messages ADD COLUMN list_id TEXT",
         ),
+        (
+            "reply_to_line",
+            "ALTER TABLE local_action_messages ADD COLUMN reply_to_line TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "attachment_names",
+            "ALTER TABLE local_action_messages ADD COLUMN attachment_names TEXT NOT NULL DEFAULT ''",
+        ),
     ];
     for (name, ddl) in missing {
         if !names.iter().any(|column| column == name) {
@@ -686,7 +698,7 @@ fn replace_message_row(
     values.push(Value::Text(fingerprint));
     values.push(Value::Text(account_id.as_str().to_string()));
     values.push(message_id);
-    debug_assert_eq!(values.len(), 23);
+    debug_assert_eq!(values.len(), 25);
     let changed = conn.execute(
         "UPDATE messages SET
             remote_id = ?1,
@@ -709,8 +721,10 @@ fn replace_message_row(
             bcc_line = ?18,
             has_attachment = ?19,
             list_id = ?20,
-            body_fingerprint = ?21
-         WHERE account_id = ?22 AND message_id = ?23",
+            reply_to_line = ?21,
+            attachment_names = ?22,
+            body_fingerprint = ?23
+         WHERE account_id = ?24 AND message_id = ?25",
         params_from_iter(values),
     )?;
     expect_one(changed, &snapshot.message_id)?;
@@ -989,8 +1003,8 @@ fn read_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     Ok(Snapshot {
         removed: row.get::<_, i64>(0)? != 0,
         row: read_saved_from(row, 1)?,
-        after_folders: row.get(22)?,
-        after_labels: row.get(23)?,
+        after_folders: row.get(24)?,
+        after_labels: row.get(25)?,
         aliases: Vec::new(),
     })
 }
@@ -1022,6 +1036,8 @@ fn read_saved_from(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Saved
         bcc_line: row.get(at + 18)?,
         has_attachment: row.get(at + 19)?,
         list_id: row.get(at + 20)?,
+        reply_to_line: row.get(at + 21)?,
+        attachment_names: row.get(at + 22)?,
     })
 }
 
@@ -1038,16 +1054,18 @@ fn insert_snapshot(
     values.extend(saved_values(&plan.before));
     values.push(Value::Text(plan.folders.clone()));
     values.push(Value::Text(plan.labels.clone()));
-    debug_assert_eq!(values.len(), 25);
+    debug_assert_eq!(values.len(), 27);
     conn.execute(
         "INSERT INTO local_action_messages (
             action_id, removed, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment, list_id, after_folders, after_labels
+            to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line,
+            attachment_names, after_folders, after_labels
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+            ?26, ?27
          )",
         params_from_iter(values),
     )?;
@@ -1308,16 +1326,17 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
         _ => String::new(),
     };
     values.push(Value::Text(fingerprint));
-    debug_assert_eq!(values.len(), 23);
+    debug_assert_eq!(values.len(), 25);
     conn.execute(
         "INSERT INTO messages (
             account_id, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
-            to_line, cc_line, bcc_line, has_attachment, list_id, body_fingerprint
+            to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line,
+            attachment_names, body_fingerprint
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
          )",
         params_from_iter(values),
     )?;
@@ -1349,6 +1368,8 @@ fn saved_values(row: &SavedRow) -> Vec<Value> {
         Value::Text(row.bcc_line.clone()),
         Value::Integer(row.has_attachment),
         opt_text(&row.list_id),
+        Value::Text(row.reply_to_line.clone()),
+        Value::Text(row.attachment_names.clone()),
     ]
 }
 
@@ -1423,6 +1444,8 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
+            reply_to: Vec::new(),
+            attachment_names: Vec::new(),
         }
     }
 
@@ -2049,6 +2072,8 @@ mod tests {
                     bcc_line: String::new(),
                     has_attachment: 0,
                     list_id: None,
+                    reply_to_line: String::new(),
+                    attachment_names: String::new(),
                 },
                 after_folders: String::new(),
                 after_labels: String::new(),

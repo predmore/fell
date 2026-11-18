@@ -418,7 +418,30 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
         archived: false,
         snooze_until: None,
         list_id: None,
+        reply_to: reply_address(row.id),
+        attachment_names: attachment_names(&row),
     }
+}
+
+/// The newsletter answers at its own address, so `r` on it shows Reply-To.
+fn reply_address(id: &str) -> Vec<Address> {
+    match id {
+        "weekly@fell.test" => people(&[("Weekly replies", "weekly-replies@fell.test")]),
+        _ => Vec::new(),
+    }
+}
+
+/// Names for the fixture attachments, as a forward lists them.
+fn attachment_names(row: &DraftMail) -> Vec<String> {
+    if !row.attachment {
+        return Vec::new();
+    }
+    let names: &[&str] = match row.id {
+        "rows@fell.test" => &["inbox-rows.png"],
+        "tickets@fell.test" => &["tickets-friday.pdf", "seat-map.png"],
+        _ => &["attachment"],
+    };
+    names.iter().map(|name| (*name).to_string()).collect()
 }
 
 fn first_line(body: &str) -> String {

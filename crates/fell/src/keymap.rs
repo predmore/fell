@@ -33,6 +33,9 @@ pub enum Action {
     Sent,
     Drafts,
     Compose,
+    Reply,
+    ReplyAll,
+    Forward,
     FolderPicker,
     Move,
     Archive,
@@ -62,6 +65,9 @@ impl Action {
             Self::Sent => "Go to Sent",
             Self::Drafts => "Go to Drafts",
             Self::Compose => "Compose",
+            Self::Reply => "Reply",
+            Self::ReplyAll => "Reply all",
+            Self::Forward => "Forward",
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
@@ -82,7 +88,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 24] = [
+const ALL_ACTIONS: [Action; 27] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -95,6 +101,9 @@ const ALL_ACTIONS: [Action; 24] = [
     Action::Sent,
     Action::Drafts,
     Action::Compose,
+    Action::Reply,
+    Action::ReplyAll,
+    Action::Forward,
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
@@ -189,6 +198,9 @@ fn default_bindings() -> Vec<Binding> {
         Some("go"),
     );
     bind(&[KeyId::Char('c')], Action::Compose, None);
+    bind(&[KeyId::Char('r')], Action::Reply, None);
+    bind(&[KeyId::Char('R')], Action::ReplyAll, None);
+    bind(&[KeyId::Char('f')], Action::Forward, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
@@ -573,6 +585,40 @@ mod tests {
             which_key(&keymap, &[])
                 .iter()
                 .any(|item| item.key == "c" && item.label == "Compose")
+        );
+    }
+
+    #[test]
+    fn r_shift_r_and_f_answer_and_the_palette_lists_them() {
+        let keymap = Keymap::default();
+        for (key, action, label) in [
+            ('r', Action::Reply, "Reply"),
+            ('R', Action::ReplyAll, "Reply all"),
+            ('f', Action::Forward, "Forward"),
+        ] {
+            assert_eq!(
+                match_seq(&keymap, &[KeyId::Char(key)]),
+                SeqMatch::Action(action)
+            );
+            let item = palette_items(&keymap, "", &[])
+                .into_iter()
+                .find(|item| item.action == action)
+                .expect("in the palette");
+            assert_eq!(item.binding, key.to_string());
+            assert_eq!(item.label, label);
+        }
+        assert_eq!(
+            palette_items(&keymap, "reply all", &[])[0].action,
+            Action::ReplyAll
+        );
+        assert_eq!(
+            palette_items(&keymap, "forward", &[])[0].action,
+            Action::Forward
+        );
+        // The folders chord under the leader still starts with f.
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Leader, KeyId::Char('f')]),
+            SeqMatch::Prefix
         );
     }
 
