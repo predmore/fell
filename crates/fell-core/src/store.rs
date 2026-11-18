@@ -27,6 +27,7 @@ mod roles;
 pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
+mod write_lock;
 
 pub use bodies::BodyRequest;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
@@ -281,6 +282,28 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
         to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until, list_id,
         reply_to_line, attachment_names";
 
+/// Flags and found copies one sync transaction writes before it commits
+/// and lets a waiting write in. About 50 ms of work.
+const SYNC_SLICE: usize = 1_000;
+
+/// The rows one server copy's flag lands on: the row it is, the row a
+/// merged copy joined, and the row its recorded copy backs. Each part seeks
+/// its own index. As one `OR`, SQLite walked every message in the account
+/// for each flag, and the flags at the end of a large mailbox held the
+/// write lock for many minutes.
+const FLAG_TARGETS: &str = "SELECT message_id FROM messages
+     WHERE account_id = ?1 AND message_id IN (
+         SELECT message_id FROM messages
+         WHERE account_id = ?1 AND remote_id = ?2
+         UNION ALL
+         SELECT canonical_message_id FROM message_aliases
+         WHERE account_id = ?1 AND remote_id = ?2
+         UNION ALL
+         SELECT message_id FROM message_copies
+         WHERE account_id = ?1 AND mailbox = ?3
+           AND uidvalidity = ?4 AND uid = ?5
+     )";
+
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
     /// File-backed stores fill body vectors here. In-memory stores leave this
@@ -288,6 +311,9 @@ pub struct Store {
     indexer: Option<crate::embed::Indexer>,
     pub(crate) conn: Connection,
     path: Option<std::path::PathBuf>,
+    /// This connection's busy handler, shared with the file's other stores
+    /// in this process so sync lets their writes go first.
+    lock_wait: std::sync::Arc<write_lock::LockWait>,
     /// Shared lock on the mailbox inode, held until this store is dropped.
     /// Dropped after the SQLite connection so a new opener cannot migrate
     /// the WAL while this connection still has the file.
@@ -322,7 +348,8 @@ impl Store {
         // One path string per inode. A symlink or a second hard link must not
         // open a different `-wal` while another connection still has the file.
         let claimed = claim_mailbox(requested)?;
-        let mut store = Self::from_connection(claimed.conn)?;
+        let turns = write_lock::Turns::for_file(&claimed.path);
+        let mut store = Self::from_connection(claimed.conn, turns)?;
         store.path = Some(claimed.path.clone());
         #[cfg(unix)]
         {
@@ -342,29 +369,25 @@ impl Store {
     /// instead of holding writers back for the busy timeout. Returns the
     /// frames left in the log, or -1 when the reset was skipped.
     pub fn checkpoint(&self, truncate: bool) -> Result<i64> {
-        /// Puts the normal lock wait back however the checkpoint ends.
-        struct RestoreTimeout<'a>(&'a Connection);
-        impl Drop for RestoreTimeout<'_> {
-            fn drop(&mut self) {
-                let _ = self.0.busy_timeout(Duration::from_secs(5));
-            }
-        }
         let sql = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE)"
         } else {
             "PRAGMA wal_checkpoint(PASSIVE)"
         };
-        let _restore = truncate.then(|| RestoreTimeout(&self.conn));
-        if truncate {
-            self.conn.busy_timeout(Duration::ZERO)?;
-        }
-        let result = self.conn.query_row(sql, [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        });
+        let run = || {
+            self.conn.query_row(sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+        };
+        let result = if truncate {
+            self.lock_wait.without_waiting(run)
+        } else {
+            run()
+        };
         match result {
             Ok((busy, _, _)) if busy != 0 => Ok(-1),
             Ok((_, log, done)) => Ok((log - done).max(0)),
@@ -384,11 +407,14 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, std::sync::Arc::default())
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
-        conn.busy_timeout(Duration::from_secs(5))?;
+    fn from_connection(
+        mut conn: Connection,
+        turns: std::sync::Arc<write_lock::Turns>,
+    ) -> Result<Self> {
+        let lock_wait = write_lock::LockWait::install(&mut conn, turns)?;
         // Sync writes and a folder read, whose window bounds come in several
         // shapes, together use more than rusqlite's default of 16 cached
         // statements. Past that, each read prepares its SQL again.
@@ -410,7 +436,14 @@ impl Store {
              -- thread's first subject and latest sender). Without it SQLite
              -- walks every message in the account once per thread.
              CREATE INDEX IF NOT EXISTS idx_messages_thread_date
-                ON messages(account_id, thread_id, date_unix);",
+                ON messages(account_id, thread_id, date_unix);
+             -- Sync sets unread by server copy. Without these, each flag
+             -- walked every message in the account, and the flags for a
+             -- large mailbox held the write lock for many minutes.
+             CREATE INDEX IF NOT EXISTS idx_messages_remote
+                ON messages(account_id, remote_id);
+             CREATE INDEX IF NOT EXISTS idx_message_aliases_remote
+                ON message_aliases(account_id, remote_id);",
         )?;
         ensure_fts(&conn)?;
         crate::search::ensure_vocabulary(&conn)?;
@@ -461,6 +494,7 @@ impl Store {
             indexer: None,
             conn,
             path: None,
+            lock_wait,
             #[cfg(test)]
             full_rethread: std::cell::Cell::new(false),
             #[cfg(unix)]
@@ -539,8 +573,17 @@ impl Store {
         sync_cursor_on(&self.conn, account_id)
     }
 
+    /// Write one sync delta.
+    ///
+    /// The end of a mailbox can carry a flag for every copy and, on its first
+    /// listing, every copy's Message-ID. That work commits every
+    /// [`SYNC_SLICE`] rows and begins again behind any write that is waiting,
+    /// so an archive or a draft save never waits for a whole mailbox. Each
+    /// slice is safe to repeat, and the cursor is written only in the last
+    /// one, so a pass cut short is done again by the next. A smaller delta is
+    /// one transaction.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
-        let tx = immediate_transaction(&self.conn)?;
+        let mut tx = self.begin_sync_write()?;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -555,15 +598,22 @@ impl Store {
             };
             insert_message(&tx, &message)?;
         }
+        let inserted = !delta.messages.is_empty();
+        let mut rows = 0usize;
         for flag in &delta.flags {
             apply_flag(&tx, account_id, flag)?;
+            tx = self.next_sync_slice(tx, &mut rows, account_id, inserted)?;
         }
         if let Some(found) = &delta.roles {
             roles::replace(&tx, account_id, found)?;
         }
+        for (removal, uidvalidity, uid, message_id) in copies::found_copies(&delta.removals) {
+            copies::record_found(&tx, account_id, removal, uidvalidity, uid, message_id)?;
+            tx = self.next_sync_slice(tx, &mut rows, account_id, inserted)?;
+        }
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if !delta.messages.is_empty() || took_over || settled {
+        if inserted || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -585,6 +635,34 @@ impl Store {
         range: (u32, u32),
     ) -> Result<Vec<u32>> {
         copies::stored_uids(&self.conn, account_id, mailbox, uidvalidity, range)
+    }
+
+    /// Sync begins its batches back to back. A write already waiting for
+    /// the lock goes first.
+    fn begin_sync_write(&self) -> Result<WriteTx<'_>> {
+        self.lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))
+    }
+
+    /// Count one row of a delta's flags and found copies, and every
+    /// [`SYNC_SLICE`] rows commit `tx` and begin the next slice. Threads the
+    /// delta's new messages joined are resolved before their first commit.
+    fn next_sync_slice<'a>(
+        &'a self,
+        tx: WriteTx<'a>,
+        rows: &mut usize,
+        account_id: &AccountId,
+        inserted: bool,
+    ) -> Result<WriteTx<'a>> {
+        *rows += 1;
+        if !rows.is_multiple_of(SYNC_SLICE) {
+            return Ok(tx);
+        }
+        if inserted {
+            self.rethread_written(&tx, account_id)?;
+        }
+        tx.commit()?;
+        self.begin_sync_write()
     }
 
     /// Re-resolve the threads this transaction's writes touched.
@@ -2751,21 +2829,7 @@ fn apply_flag(
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
     let targets: Vec<String> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT message_id FROM messages
-             WHERE account_id = ?1 AND (
-                 remote_id = ?2
-                 OR message_id IN (
-                     SELECT canonical_message_id FROM message_aliases
-                     WHERE account_id = ?1 AND remote_id = ?2
-                 )
-                 OR message_id IN (
-                     SELECT message_id FROM message_copies
-                     WHERE account_id = ?1 AND mailbox = ?3
-                       AND uidvalidity = ?4 AND uid = ?5
-                 )
-             )",
-        )?;
+        let mut stmt = conn.prepare_cached(FLAG_TARGETS)?;
         stmt.query_map(
             params![
                 account_id.as_str(),
@@ -3442,7 +3506,8 @@ pub(crate) fn ensure_triggers(
 /// locked" at once, ignoring the busy timeout. Opening the mailbox while the
 /// indexer, sync, or `fell-mcp` was writing failed that way. Starting with
 /// `BEGIN IMMEDIATE` lets the busy timeout apply. Use it for writes that run
-/// before the summary tables exist; later writes use [`immediate_transaction`].
+/// before the summary tables exist and for writes that never touch
+/// `messages` (compose drafts); other writes use [`immediate_transaction`].
 pub(crate) fn begin_immediate(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
 }

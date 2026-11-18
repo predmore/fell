@@ -225,9 +225,29 @@ pub(super) fn forget(conn: &Connection, account_id: &AccountId, message_id: &str
     Ok(())
 }
 
+/// The present copies each listing found, for [`record_found`].
+pub(super) fn found_copies(
+    removals: &[FolderRemoval],
+) -> impl Iterator<Item = (&FolderRemoval, u32, u32, &MessageId)> {
+    removals.iter().flat_map(|removal| {
+        let found = match &removal.kind {
+            RemovalKind::Listing {
+                uidvalidity, found, ..
+            } => Some((*uidvalidity, found)),
+            RemovalKind::Vanished { .. } => None,
+        };
+        found.into_iter().flat_map(move |(uidvalidity, found)| {
+            found
+                .iter()
+                .map(move |(uid, message_id)| (removal, uidvalidity, *uid, message_id))
+        })
+    })
+}
+
 /// Drop the copies each removal names and queue the folders they backed.
 /// Folders and rows do not change until [`settle`]. Returns whether a row
-/// took over another's local state (see [`take_over_reset_row`]).
+/// took over another's local state (see [`take_over_reset_row`]). Record
+/// [`found_copies`] first: a copy a listing found is not gone.
 pub(super) fn apply_removals(
     conn: &Connection,
     account_id: &AccountId,
@@ -243,9 +263,6 @@ pub(super) fn apply_removals(
                 found,
                 sweep,
             } => {
-                for (uid, message_id) in found {
-                    record_found(conn, account_id, removal, *uidvalidity, *uid, message_id)?;
-                }
                 let listed = |uid: u32| uid > *through || present.binary_search(&uid).is_ok();
                 let stored = {
                     let mut stmt = conn.prepare(
@@ -383,7 +400,7 @@ fn fingerprint(conn: &Connection, account_id: &AccountId, message_id: &str) -> R
     )?)
 }
 
-fn record_found(
+pub(super) fn record_found(
     conn: &Connection,
     account_id: &AccountId,
     removal: &FolderRemoval,
@@ -434,25 +451,30 @@ fn drop_copy(
     Ok(())
 }
 
+/// Rows in folder `?2` with no copy in mailbox `?3` under UIDVALIDITY `?4`.
+pub(super) const SWEEP_STALE: &str = "SELECT m.message_id FROM messages m
+     WHERE m.account_id = ?1
+       AND instr(char(30) || m.folders || char(30), char(30) || ?2 || char(30)) > 0
+       AND NOT EXISTS (
+           SELECT 1 FROM message_copies c INDEXED BY idx_message_copies_row
+           WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+             AND c.mailbox = ?3 AND c.uidvalidity = ?4
+       )";
+
 /// Rows that list this folder but have no copy in the mailbox. Only for a
 /// listing that recorded every present copy. A row a local action touched
 /// keeps its folders: that folder may be one the action added.
+///
+/// The copy lookup goes by row. Left to itself SQLite reads every copy in
+/// the mailbox for each row, and a 50,000-message mailbox held the write
+/// lock for minutes.
 fn sweep_folder(
     conn: &Connection,
     account_id: &AccountId,
     removal: &FolderRemoval,
     uidvalidity: u32,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT m.message_id FROM messages m
-         WHERE m.account_id = ?1
-           AND instr(char(30) || m.folders || char(30), char(30) || ?2 || char(30)) > 0
-           AND NOT EXISTS (
-               SELECT 1 FROM message_copies c
-               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-                 AND c.mailbox = ?3 AND c.uidvalidity = ?4
-           )",
-    )?;
+    let mut stmt = conn.prepare(SWEEP_STALE)?;
     let stale = stmt
         .query_map(
             params![

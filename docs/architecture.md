@@ -41,6 +41,8 @@ The UI and MCP crates take `dyn MailBackend` (or a store already populated by sy
 
 SQLite is the source of truth for the UI. Sync writes messages, threads, and an FTS5 index. Reads do not block on the network. If Bridge or the API is down, the last synced mailbox still renders.
 
+The window, sync, compose, and the indexer each write on their own connection, and SQLite lets one write at a time. Every write transaction takes the lock at `BEGIN IMMEDIATE`, before it reads, so waiting for the lock is safe (a deferred transaction that read first could not wait and failed at once; compose drafts did that). A store connection that finds the lock taken tries again every few milliseconds for up to 30 seconds, not every 100 ms for 5 seconds. A write that is waiting marks the file, and sync lets it go first before the next batch: sync commits batches back to back while the server streams, and archive, undo, or a draft save used to lose that race and fail with "database is locked". The end of a mailbox can carry a flag and a found copy for every message. Sync writes them through indexes on `remote_id` and by row (one walk of the account each used to make that delta take about 20 minutes on 50,000 messages) and commits every 1,000, beginning again behind any waiting write. The cursor lands in the last slice and each slice is safe to repeat, so a pass cut short is redone by the next. Another process (`fell-mcp`) gets the same 30-second wait but not the turn.
+
 Each IMAP mailbox is one folder on the message. A message with no Message-ID is stored under a stable id from the mailbox, UIDVALIDITY, and UID. Copies with the same Message-ID stay one row; see Threading.
 
 ## Folder lists

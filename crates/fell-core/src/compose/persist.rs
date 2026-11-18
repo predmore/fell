@@ -117,7 +117,7 @@ impl Store {
         files: Option<&[ResolvedFile]>,
         review: Option<&StoredReview>,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::begin_immediate(&self.conn)?;
         tx.execute(
             UPSERT_COMPOSE,
             params![
@@ -584,7 +584,7 @@ impl Store {
 
     /// Forget draft `id`: its row, attachments, review and send record.
     pub(crate) fn delete_compose(&self, id: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::begin_immediate(&self.conn)?;
         tx.execute_batch(REVIEW_SCHEMA)?;
         tx.execute(
             "DELETE FROM compose_review WHERE draft_id = ?1",
