@@ -193,6 +193,23 @@ impl Editor {
         }
     }
 
+    /// The cursor after the last written text, or at the top of an empty
+    /// body.
+    fn cursor_to_end_of_text(&mut self) {
+        match self.lines.iter().rposition(|line| !line.trim().is_empty()) {
+            Some(row) => {
+                self.row = row;
+                self.col = self.lines[row].chars().count();
+            }
+            None => {
+                self.row = 0;
+                self.col = 0;
+            }
+        }
+        self.preferred = self.col;
+        self.clamp();
+    }
+
     fn text(&self) -> String {
         let mut text = self.lines.join("\n");
         text.push('\n');
@@ -213,6 +230,24 @@ impl Editor {
         self.count = 0;
         count
     }
+}
+
+/// Tab or Enter on a header field: the next field. Leaving Subject, the
+/// typing carries on in the body in insert mode, as it did in the field, so
+/// the next keys are text and not commands.
+fn leave_header(field: Field, editor: &mut Editor) -> Field {
+    let next = match field {
+        Field::To => Field::Cc,
+        Field::Cc => Field::Bcc,
+        Field::Bcc => Field::Subject,
+        Field::Subject | Field::Body => Field::Body,
+    };
+    if next == Field::Body {
+        editor.mode = Mode::Insert;
+        editor.anchor = None;
+        editor.clamp();
+    }
+    next
 }
 
 pub struct ComposeView {
@@ -527,6 +562,8 @@ impl ComposeView {
         {
             self.field = Field::To;
             self.status = "to · tab next".into();
+            // Tab from Subject carries the typing on after what is written.
+            self.editor.cursor_to_end_of_text();
         }
     }
 
@@ -1210,12 +1247,10 @@ impl ComposeView {
             "tab" | "enter" => {
                 let field = self.field;
                 if self.commit_field(field) {
-                    self.field = match self.field {
-                        Field::To => Field::Cc,
-                        Field::Cc => Field::Bcc,
-                        Field::Bcc => Field::Subject,
-                        _ => Field::Body,
-                    };
+                    self.field = leave_header(field, &mut self.editor);
+                    if self.field == Field::Body {
+                        self.status = "insert".into();
+                    }
                 }
             }
             "j" | "k" if typed.is_none() => {}
@@ -1769,7 +1804,12 @@ impl ComposeView {
             .border_color(rgb(colors.rule))
             .child(label);
         if self.quote_open {
-            block = block.child(render_doc(&html_to_doc(html), &self.folder, colors));
+            block = block.child(render_doc(
+                &html_to_doc(html),
+                &self.folder,
+                Links::Target,
+                colors,
+            ));
         }
         Some(block)
     }
@@ -2743,7 +2783,7 @@ fn styled_body(
                 let painted = if raw || !edits.is_empty() {
                     raw_source_block(block, &text, editor, &edits, focused, colors)
                 } else {
-                    render_block(block, folder, colors)
+                    render_block(block, folder, Links::Label, colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -2824,7 +2864,7 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
         .get(editor.row)
         .map(String::as_str)
         .unwrap_or("");
-    raw_line(line, Some(editor.col), true, editor.mode, colors)
+    raw_line(line, Some(editor.col), true, true, editor.mode, colors)
 }
 
 fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
@@ -2834,6 +2874,7 @@ fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
         column = column.child(raw_line(
             line,
             cursor.then_some(editor.col),
+            true,
             true,
             editor.mode,
             colors,
@@ -2851,7 +2892,7 @@ fn raw_source_block(
     colors: Palette,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
-        return render_block(block, Path::new(""), colors);
+        return render_block(block, Path::new(""), Links::Label, colors);
     };
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
@@ -2863,7 +2904,6 @@ fn raw_source_block(
         let row = base_line + offset;
         let line_end = line_start + line.len();
         let cursor = (!editor.caret_hidden && row == editor.row).then_some(editor.col);
-        let mut painted = raw_line(line, cursor, cursor.is_some(), editor.mode, colors);
         // Only the lines an agent changed carry the tint, with what they
         // replaced directly above the first of them.
         let touching: Vec<usize> = edits
@@ -2874,6 +2914,16 @@ fn raw_source_block(
             })
             .map(|(index, _)| index)
             .collect();
+        // Markers fold off the cursor line. A link's URL does too, except
+        // on a line an agent changed: a new destination must be seen.
+        let mut painted = raw_line(
+            line,
+            cursor,
+            cursor.is_some(),
+            cursor.is_some() || !touching.is_empty(),
+            editor.mode,
+            colors,
+        );
         if !touching.is_empty() {
             // A new edit right under another one starts its own block.
             let mut gap =
@@ -2940,10 +2990,21 @@ fn raw_source_block(
     column
 }
 
+/// Whether a span of a source line is left out: markers off the cursor
+/// line, and a link's `](url)` unless URLs show.
+fn folds(kind: StyleKind, show_markers: bool, show_urls: bool) -> bool {
+    match kind {
+        StyleKind::Marker => !show_markers,
+        StyleKind::LinkUrl => !show_urls,
+        _ => false,
+    }
+}
+
 fn raw_line(
     line: &str,
     cursor: Option<usize>,
     show_markers: bool,
+    show_urls: bool,
     mode: Mode,
     colors: Palette,
 ) -> gpui::Div {
@@ -2969,8 +3030,8 @@ fn raw_line(
     }
     let cursor_byte = cursor.map(|col| byte_index(line, col));
     for span in styles {
-        if !show_markers && span.kind == StyleKind::Marker {
-            if span.start == 0 {
+        if folds(span.kind, show_markers, show_urls) {
+            if span.start == 0 && span.kind == StyleKind::Marker {
                 row = row.child(folded_marker(line, colors));
             }
             continue;
@@ -3112,11 +3173,11 @@ fn caret(colors: Palette, mode: Mode) -> gpui::Div {
         .bg(rgb(colors.caret))
 }
 
-fn render_doc(doc: &StyledDoc, folder: &Path, colors: Palette) -> gpui::Div {
+fn render_doc(doc: &StyledDoc, folder: &Path, links: Links, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col();
     let mut previous = None;
     for block in &doc.blocks {
-        let mut painted = render_block(block, folder, colors);
+        let mut painted = render_block(block, folder, links, colors);
         if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
             painted = painted.mt_2();
         }
@@ -3126,12 +3187,29 @@ fn render_doc(doc: &StyledDoc, folder: &Path, colors: Palette) -> gpui::Div {
     column
 }
 
-fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palette) -> gpui::Div {
+/// How a styled link shows where it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Links {
+    /// The draft as the recipient reads it: the label alone, as on a line
+    /// the cursor is not on. A label that reads as an address but goes
+    /// somewhere else still shows where.
+    Label,
+    /// The label, then the destination, dimmed: the HTML preview before
+    /// send and the quoted original.
+    Target,
+}
+
+fn render_block(
+    block: &fell_core::compose::Block,
+    folder: &Path,
+    links: Links,
+    colors: Palette,
+) -> gpui::Div {
     match &block.body {
         BlockBody::Heading { level, inlines } => div()
             .font_weight(FontWeight(680.))
             .text_size(px(if *level <= 1 { 28. } else { 22. }))
-            .child(render_inlines(inlines, colors)),
+            .child(render_inlines(inlines, links, colors)),
         BlockBody::Paragraph { inlines } => match plain_lines(inlines) {
             // Plain text wraps at the window's edge, one line per break,
             // so a long quoted line in a narrow window is not cut off.
@@ -3140,7 +3218,7 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                 .fold(div().flex().flex_col(), |column, line| {
                     column.child(div().w_full().child(line))
                 }),
-            None => div().child(render_inlines(inlines, colors)),
+            None => div().child(render_inlines(inlines, links, colors)),
         },
         BlockBody::List { ordered, items } => {
             let mut list = div().flex().flex_col();
@@ -3161,7 +3239,7 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                                 .text_color(rgb(colors.accent))
                                 .child(marker),
                         )
-                        .child(render_inlines(item, colors)),
+                        .child(render_inlines(item, links, colors)),
                 );
             }
             list
@@ -3173,7 +3251,7 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                 .pl_3()
                 .text_color(rgb(colors.dim));
             for block in blocks {
-                quote = quote.child(render_block(block, folder, colors));
+                quote = quote.child(render_block(block, folder, links, colors));
             }
             quote
         }
@@ -3199,7 +3277,11 @@ fn plain_lines(inlines: &[fell_core::compose::Inline]) -> Option<Vec<String>> {
     Some(text.split('\n').map(str::to_string).collect())
 }
 
-fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gpui::Div {
+fn render_inlines(
+    inlines: &[fell_core::compose::Inline],
+    links: Links,
+    colors: Palette,
+) -> gpui::Div {
     let mut row = div().flex().flex_row().flex_wrap();
     for inline in inlines {
         row = match inline {
@@ -3208,10 +3290,10 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
                 div()
                     .font_weight(FontWeight(700.))
                     .font_family("Liberation Sans")
-                    .child(render_inlines(inner, colors)),
+                    .child(render_inlines(inner, links, colors)),
             ),
             fell_core::compose::Inline::Em(inner) => {
-                row.child(div().italic().child(render_inlines(inner, colors)))
+                row.child(div().italic().child(render_inlines(inner, links, colors)))
             }
             fell_core::compose::Inline::Code(text) => row.child(
                 div()
@@ -3228,7 +3310,7 @@ fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gp
                         .underline()
                         .child(text.clone()),
                 )
-                .children(link_target(text, href).map(|target| {
+                .children(shown_target(text, href, links).map(|target| {
                     div()
                         .pl(px(4.))
                         .text_color(rgb(colors.marker))
@@ -3785,7 +3867,7 @@ fn preview_layer(snap: &Snapshot, colors: Palette) -> impl IntoElement {
                 .text_color(rgb(colors.dim))
                 .child("HTML preview"),
         )
-        .child(render_doc(&doc, Path::new(""), colors))
+        .child(render_doc(&doc, Path::new(""), Links::Target, colors))
 }
 
 fn join_addrs(addresses: &[fell_core::compose::AddressView]) -> String {
@@ -3846,6 +3928,46 @@ fn link_target(text: &str, href: &str) -> Option<String> {
         return None;
     }
     Some(format!("({href})"))
+}
+
+/// The destination a styled link shows after its label, if any.
+fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
+    match links {
+        Links::Target => link_target(text, href),
+        Links::Label if reads_as_address(text) && !same_place(text, href) => {
+            link_target(text, href)
+        }
+        Links::Label => None,
+    }
+}
+
+/// A label that a reader takes for where the link goes: one word with a
+/// scheme, a `www.`, an `@`, or a dot between letters ("example.com").
+fn reads_as_address(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.starts_with("www.")
+        || lower.contains('@')
+        || lower.split('.').filter(|part| !part.is_empty()).count() >= 2
+}
+
+/// Whether an address-like label names the place the link goes.
+fn same_place(text: &str, href: &str) -> bool {
+    let bare = |value: &str| {
+        let value = value.trim().to_ascii_lowercase();
+        let value = value
+            .strip_prefix("mailto:")
+            .or_else(|| value.split_once("://").map(|(_, rest)| rest))
+            .unwrap_or(&value)
+            .to_string();
+        let value = value.strip_prefix("www.").unwrap_or(&value).to_string();
+        value.trim_end_matches('/').to_string()
+    };
+    bare(text) == bare(href)
 }
 
 fn canonical_body(body: &str) -> String {
@@ -4529,6 +4651,92 @@ mod tests {
             None
         );
         assert_eq!(super::link_target("empty", "  "), None);
+    }
+
+    #[test]
+    fn tab_from_subject_keeps_typing_in_the_body() {
+        // #157: the body was left in normal mode, so "# Heading" typed
+        // after Tab ran as commands and left "ding".
+        let mut editor = super::Editor::from_body("");
+        assert!(editor.mode == super::Mode::Normal);
+        let next = super::leave_header(super::Field::Subject, &mut editor);
+        assert!(next == super::Field::Body);
+        assert!(editor.mode == super::Mode::Insert, "typing goes on as text");
+        assert_eq!((editor.row, editor.col), (0, 0));
+    }
+
+    #[test]
+    fn tab_between_header_fields_leaves_the_body_alone() {
+        let mut editor = super::Editor::from_body("Hi Ada,\n");
+        for (from, to) in [
+            (super::Field::To, super::Field::Cc),
+            (super::Field::Cc, super::Field::Bcc),
+            (super::Field::Bcc, super::Field::Subject),
+        ] {
+            assert!(super::leave_header(from, &mut editor) == to);
+            assert!(editor.mode == super::Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn a_draft_started_on_its_header_resumes_after_its_text() {
+        let mut editor = super::Editor::from_body("Hi Ada,\n\nThanks for the notes\n\n");
+        editor.cursor_to_end_of_text();
+        assert_eq!((editor.row, editor.col), (2, "Thanks for the notes".len()));
+        let mut empty = super::Editor::from_body("\n\n");
+        empty.row = 1;
+        empty.cursor_to_end_of_text();
+        assert_eq!((empty.row, empty.col), (0, 0));
+    }
+
+    /// The text a source line shows with these fold settings.
+    fn shown(line: &str, show_markers: bool, show_urls: bool) -> String {
+        fell_core::compose::line_styles(line)
+            .into_iter()
+            .filter(|span| !super::folds(span.kind, show_markers, show_urls))
+            .map(|span| &line[span.start..span.end])
+            .collect()
+    }
+
+    #[test]
+    fn a_link_url_folds_away_off_the_cursor_line() {
+        // #158: the URL (and its "]") stayed on every line.
+        let line = "See [the plan](https://example.com/plan) for dates.";
+        assert_eq!(shown(line, false, false), "See the plan for dates.");
+        // The cursor line shows the source, dimmed markers and all.
+        assert_eq!(shown(line, true, true), line);
+        // A line an agent changed keeps its destination in view.
+        assert_eq!(
+            shown(line, false, true),
+            "See the plan](https://example.com/plan) for dates."
+        );
+    }
+
+    #[test]
+    fn a_styled_link_shows_its_label_unless_the_label_misleads() {
+        use super::{Links, shown_target};
+        assert_eq!(
+            shown_target("the plan", "https://example.com/plan", Links::Label),
+            None
+        );
+        assert_eq!(
+            shown_target("example.com", "https://www.example.com/", Links::Label),
+            None
+        );
+        // A label that reads as an address but goes elsewhere says where.
+        assert_eq!(
+            shown_target("bank.example", "https://other.example/login", Links::Label).as_deref(),
+            Some("(https://other.example/login)")
+        );
+        assert_eq!(
+            shown_target("ada@example.com", "mailto:ada@example.com", Links::Label),
+            None
+        );
+        // The HTML preview before send shows every destination.
+        assert_eq!(
+            shown_target("the plan", "https://example.com/plan", Links::Target).as_deref(),
+            Some("(https://example.com/plan)")
+        );
     }
 
     #[test]
