@@ -19,7 +19,9 @@ use crate::backend::{FolderRemoval, RemovalKind, Settle};
 use crate::message::{Message, MessageId};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
-use super::{delete_stored, find_stored, join_tokens, split_field, take_local_state};
+use super::{
+    canonical_id_on, delete_stored, find_stored, join_tokens, split_field, take_local_state,
+};
 
 const COPIES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS message_copies (
@@ -393,22 +395,22 @@ fn record_found(
 ) -> Result<()> {
     // A copy sync never stored (oversized, flagged deleted, removed here) has
     // no row to back.
-    let Some((stored, _)) = find_stored(conn, account_id, message_id)? else {
+    let Some(row) = canonical_id_on(conn, account_id, message_id)? else {
         return Ok(());
     };
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO message_copies
             (account_id, mailbox, uidvalidity, uid, message_id, folder)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            account_id.as_str(),
-            removal.mailbox,
-            uidvalidity,
-            uid,
-            stored.canonical_id,
-            removal.folder
-        ],
-    )?;
+    )?
+    .execute(params![
+        account_id.as_str(),
+        removal.mailbox,
+        uidvalidity,
+        uid,
+        row,
+        removal.folder
+    ])?;
     Ok(())
 }
 
@@ -434,25 +436,30 @@ fn drop_copy(
     Ok(())
 }
 
+/// Rows in folder `?2` with no copy in mailbox `?3` under UIDVALIDITY `?4`.
+pub(super) const SWEEP_STALE: &str = "SELECT m.message_id FROM messages m
+     WHERE m.account_id = ?1
+       AND instr(char(30) || m.folders || char(30), char(30) || ?2 || char(30)) > 0
+       AND NOT EXISTS (
+           SELECT 1 FROM message_copies c INDEXED BY idx_message_copies_row
+           WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+             AND c.mailbox = ?3 AND c.uidvalidity = ?4
+       )";
+
 /// Rows that list this folder but have no copy in the mailbox. Only for a
 /// listing that recorded every present copy. A row a local action touched
 /// keeps its folders: that folder may be one the action added.
+///
+/// The copy lookup goes by row. Left to itself SQLite reads every copy in
+/// the mailbox for each row, and a 50,000-message mailbox held the write
+/// lock for minutes.
 fn sweep_folder(
     conn: &Connection,
     account_id: &AccountId,
     removal: &FolderRemoval,
     uidvalidity: u32,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT m.message_id FROM messages m
-         WHERE m.account_id = ?1
-           AND instr(char(30) || m.folders || char(30), char(30) || ?2 || char(30)) > 0
-           AND NOT EXISTS (
-               SELECT 1 FROM message_copies c
-               WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-                 AND c.mailbox = ?3 AND c.uidvalidity = ?4
-           )",
-    )?;
+    let mut stmt = conn.prepare(SWEEP_STALE)?;
     let stale = stmt
         .query_map(
             params![
