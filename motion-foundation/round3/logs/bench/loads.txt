@@ -1,0 +1,12 @@
+    before G run 1 load 5.80
+    before folders run 1 load 5.73
+    after G run 1 load 5.40
+    after folders run 1 load 5.13
+    before G run 2 load 4.87
+    before folders run 2 load 4.27
+    after G run 2 load 4.40
+    after folders run 2 load 4.98
+    before G run 3 load 4.74
+    before folders run 3 load 4.70
+    after G run 3 load 4.37
+    after folders run 3 load 4.10

@@ -1,0 +1,12 @@
+before-folders-1.jsonl: gs: 9 frames/137 ms, gap max 20 ms, cpu max 3.8 ms | gi: 9 frames/132 ms, gap max 15 ms, cpu max 18.4 ms | gs: 9 frames/124 ms, gap max 16 ms, cpu max 3.7 ms | gi: 9 frames/150 ms, gap max 26 ms, cpu max 10.0 ms
+before-folders-2.jsonl: gs: 8 frames/130 ms, gap max 24 ms, cpu max 3.8 ms | gi: 7 frames/132 ms, gap max 24 ms, cpu max 23.1 ms | gs: 9 frames/146 ms, gap max 27 ms, cpu max 3.9 ms | gi: 7 frames/127 ms, gap max 24 ms, cpu max 17.8 ms
+before-folders-3.jsonl: gs: 8 frames/138 ms, gap max 27 ms, cpu max 3.7 ms | gi: 8 frames/149 ms, gap max 27 ms, cpu max 17.4 ms | gs: 8 frames/125 ms, gap max 28 ms, cpu max 3.6 ms | gi: 7 frames/127 ms, gap max 23 ms, cpu max 21.2 ms
+before-G-1.jsonl: G: 9 frames/130 ms, gap max 16 ms, cpu max 8.4 ms | G: 9 frames/135 ms, gap max 17 ms, cpu max 7.6 ms
+before-G-2.jsonl: G: 9 frames/144 ms, gap max 18 ms, cpu max 5.3 ms | G: 8 frames/128 ms, gap max 26 ms, cpu max 7.2 ms
+before-G-3.jsonl: G: 8 frames/150 ms, gap max 24 ms, cpu max 11.4 ms | G: 8 frames/138 ms, gap max 24 ms, cpu max 7.6 ms
+after-folders-1.jsonl: gs: 8 frames/130 ms, gap max 32 ms, cpu max 3.3 ms | gi: 7 frames/125 ms, gap max 30 ms, cpu max 6.8 ms | gs: 9 frames/147 ms, gap max 27 ms, cpu max 2.6 ms | gi: 8 frames/126 ms, gap max 22 ms, cpu max 3.8 ms
+after-folders-2.jsonl: gs: 9 frames/133 ms, gap max 26 ms, cpu max 2.7 ms | gi: 9 frames/142 ms, gap max 26 ms, cpu max 4.2 ms | gs: 9 frames/136 ms, gap max 30 ms, cpu max 3.5 ms | gi: 8 frames/130 ms, gap max 27 ms, cpu max 4.4 ms
+after-folders-3.jsonl: gs: 9 frames/154 ms, gap max 27 ms, cpu max 3.7 ms | gi: 9 frames/133 ms, gap max 25 ms, cpu max 4.7 ms | gs: 9 frames/138 ms, gap max 28 ms, cpu max 3.6 ms | gi: 9 frames/134 ms, gap max 29 ms, cpu max 3.6 ms
+after-G-1.jsonl: G: 8 frames/132 ms, gap max 25 ms, cpu max 7.3 ms | G: 9 frames/144 ms, gap max 26 ms, cpu max 4.1 ms
+after-G-2.jsonl: G: 8 frames/140 ms, gap max 25 ms, cpu max 7.3 ms | G: 7 frames/126 ms, gap max 30 ms, cpu max 3.8 ms
+after-G-3.jsonl: G: 8 frames/143 ms, gap max 24 ms, cpu max 7.4 ms | G: 9 frames/129 ms, gap max 14 ms, cpu max 4.5 ms
