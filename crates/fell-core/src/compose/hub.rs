@@ -439,6 +439,11 @@ impl DraftHub {
             .to_string();
         let mut sessions = self.sessions.lock().expect("sessions");
         if !draft_id.is_empty() && !sessions.contains_key(&draft_id) {
+            // The inbox is reading this draft from its folder: a second
+            // reader now could take a half-written folder as the draft.
+            if self.opening.lock().expect("opening").contains(&draft_id) {
+                return denied(&id, "the draft is opening in Fell; try again");
+            }
             let Some(account) = super::persist::stored_compose_account(&draft_id) else {
                 return denied(&id, "draft has no mailbox record");
             };
@@ -1410,6 +1415,22 @@ mod tests {
         assert!(hub.begin_open("d1").is_some());
         let live = hub_with_d1("open-guard");
         assert!(live.begin_open("d1").is_none(), "d1 is live");
+    }
+
+    #[test]
+    fn the_socket_waits_for_a_draft_the_inbox_is_opening() {
+        let hub = DraftHub::new();
+        let _opening = hub.begin_open("d9").unwrap();
+        let reply: Value = serde_json::from_str(&hub.handle_line(
+            &json!({ "id": 1, "op": "get_draft", "draft_id": "d9", "agent": "bot" }).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("opening"),
+            "{reply}"
+        );
+        assert!(hub.with_session("d9", |_| ()).is_none());
     }
 
     #[test]

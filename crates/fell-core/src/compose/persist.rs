@@ -530,9 +530,15 @@ impl Store {
         let own = workspace::read_draft_file(folder)
             .is_ok_and(|text| workspace::is_own_save(folder, &text));
         if own {
+            // The folder's files belong with the text kept: only ones it has
+            // lost come back from the row, never older bytes over newer.
             for file in &stored.files {
-                workspace::write_inside(folder, &file.path, &file.bytes)
-                    .map_err(crate::Error::Invalid)?;
+                let present =
+                    workspace::resolve_inside(folder, &file.path).is_ok_and(|path| path.exists());
+                if !present {
+                    workspace::write_inside(folder, &file.path, &file.bytes)
+                        .map_err(crate::Error::Invalid)?;
+                }
             }
             return Ok(Some(stored));
         }
@@ -910,6 +916,57 @@ mod tests {
         assert_eq!(loaded.body, "![chart](chart.png)\n");
         assert_eq!(loaded.files[0].bytes, b"png");
         assert_eq!(loaded.fields.to, vec!["ada@example.com".to_string()]);
+    }
+
+    #[test]
+    fn keeping_fells_own_save_keeps_its_newer_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("a".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let file = |path: &str, bytes: &[u8]| ResolvedFile {
+            path: path.into(),
+            display_name: path.into(),
+            bytes: bytes.to_vec(),
+            inline: true,
+        };
+        store
+            .save_compose(&StoredCompose {
+                id: "d1".into(),
+                account_id: account.id.clone(),
+                fields: DraftFields {
+                    from: "jon@example.com".into(),
+                    ..DraftFields::default()
+                },
+                body: "![chart](chart.png) ![logo](logo.png)\n".into(),
+                files: vec![file("chart.png", b"old"), file("logo.png", b"logo")],
+                identities: vec!["jon@example.com".into()],
+                owner: String::new(),
+            })
+            .unwrap();
+        let folder = std::env::temp_dir().join(format!(
+            "fell-own-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        // Fell saved a new chart and its text; the mailbox row missed both.
+        let text = "---\nfrom: jon@example.com\n---\n![chart](chart.png) ![logo](logo.png) v2\n";
+        std::fs::write(folder.join("draft.md"), text).unwrap();
+        workspace::note_own_save(&folder, text).unwrap();
+        std::fs::write(folder.join("chart.png"), b"new").unwrap();
+        store.refresh_compose_folder("d1", &folder).unwrap();
+        assert_eq!(std::fs::read(folder.join("chart.png")).unwrap(), b"new");
+        // A file the folder lost still comes back from the row.
+        assert_eq!(std::fs::read(folder.join("logo.png")).unwrap(), b"logo");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
