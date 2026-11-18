@@ -1456,6 +1456,7 @@ mod tests {
             snippet: "snip".into(),
             body: crate::text_render::render_stored_body(Some("body"), "snip"),
             expanded,
+            recipients: None,
         }
     }
 }

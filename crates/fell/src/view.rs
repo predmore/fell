@@ -1670,14 +1670,48 @@ fn expanded_message(
                         .child(present::relative_date(now_unix(), message.date_unix)),
                 ),
         )
+        .children(message.recipients.as_ref().map(|line| {
+            // Cut short until `q` (or a click) opens the message's collapsed
+            // parts; then every name with its address.
+            // A cut list is the first collapsed part, so it names the key.
+            let text = if quotes {
+                line.full.clone()
+            } else if line.truncated {
+                format!("{}  ·  q", line.short)
+            } else {
+                line.short.clone()
+            };
+            div()
+                .id(gpui::ElementId::named_usize("recipients", index))
+                .max_w(px(680.))
+                .mt(px(-4.))
+                .pb(px(8.))
+                .text_color(rgb(dim))
+                .text_size(px(theme.ui_px - 1.0))
+                .child(text)
+                .when(line.truncated || line.full != line.short, |row| {
+                    row.cursor_pointer()
+                        .on_click(cx.listener(move |inbox, _, _, cx| {
+                            if !inbox.session.quotes_open.remove(&index) {
+                                inbox.session.quotes_open.insert(index);
+                            }
+                            cx.notify();
+                        }))
+                })
+        }))
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
+            let recipients_named_it = message
+                .recipients
+                .as_ref()
+                .is_some_and(|line| line.truncated);
             let first_hidden = message
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)));
+                .position(|block| !matches!(block, BodyBlock::Text(_)))
+                .filter(|_| !recipients_named_it);
             message
                 .body
                 .blocks

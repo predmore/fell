@@ -314,7 +314,43 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         .collect()
 }
 
+/// Who each fixture message went to. Mail to the person by default, and a
+/// longer list on the first thread so the conversation shows cc, "+N more",
+/// and the Bcc Fell keeps on the person's own sent copy.
+type People = &'static [(&'static str, &'static str)];
+
+fn recipients(row: &DraftMail, me: &str) -> (People, People, People) {
+    const TEAM: People = &[("Ada", "ada@fell.test"), ("Maya", "maya@fell.test")];
+    const EVERYONE: People = &[
+        ("Ada", "ada@fell.test"),
+        ("Maya", "maya@fell.test"),
+        ("Sam", "sam@fell.test"),
+        ("Priya Natarajan", "priya@fell.test"),
+    ];
+    match row.id {
+        "thread-a-1@fell.test" => (&[("Caleb", "caleb@fell.test")], TEAM, &[]),
+        "thread-a-2@fell.test" => (
+            &[("Jon", "jon@fell.test")],
+            TEAM,
+            &[("Sam", "sam@fell.test")],
+        ),
+        "thread-a-3@fell.test" => (&[("Caleb", "caleb@fell.test")], EVERYONE, &[]),
+        _ if row.email == me => (&[("Jon", "jon@fell.test")], &[], &[]),
+        _ => (&[("Caleb", "caleb@fell.test")], &[], &[]),
+    }
+}
+
+fn people(list: People) -> Vec<Address> {
+    list.iter()
+        .map(|(name, email)| Address {
+            name: Some((*name).into()),
+            email: (*email).into(),
+        })
+        .collect()
+}
+
 fn message(account: &Account, now: i64, row: DraftMail) -> Message {
+    let (to, cc, bcc) = recipients(&row, &account.email);
     let references = row.reply_to.map(MessageId::new).into_iter().collect();
     Message {
         account_id: account.id.clone(),
@@ -346,9 +382,9 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
             .map(|label| (*label).to_string())
             .collect(),
         arrived_via: vec![row.email.into()],
-        to: Vec::new(),
-        cc: Vec::new(),
-        bcc: Vec::new(),
+        to: people(to),
+        cc: people(cc),
+        bcc: people(bcc),
         starred: row.starred,
         has_attachment: row.attachment,
         archived: false,
