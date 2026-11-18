@@ -779,7 +779,7 @@ impl Inbox {
                 .try_global::<crate::draft_host::AgentDrafts>()
                 .is_some_and(|drafts| drafts.0.reopen_last());
             if !reopened {
-                self.session.show_toast("No agent review to reopen", true);
+                self.session.show_toast("no agent review to reopen", false);
             }
         }
         if step.sync_now {
@@ -1435,40 +1435,23 @@ fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> St
     best
 }
 
-/// Fit a notice to `max_px`. A quoted name gives up its letters first, so
-/// the outcome before it and the key after it stay whole.
-fn fit_notice(window: &Window, text: &str, max_px: f32) -> String {
-    if line_px(window, text, FontWeight::NORMAL) <= max_px {
-        return text.to_string();
+/// The width of `text` as the status bar draws it: its size and family.
+fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f32 {
+    if text.is_empty() {
+        return 0.0;
     }
-    let quoted = text.find('\u{201c}').and_then(|open| {
-        text[open..]
-            .find('\u{201d}')
-            .map(|close| (open, open + close))
-    });
-    let Some((open, close)) = quoted else {
-        return clip_line(window, text, max_px, FontWeight::NORMAL);
-    };
-    let before = &text[..open + '\u{201c}'.len_utf8()];
-    let after = &text[close..];
-    let name: Vec<char> = text[before.len()..close]
-        .trim_end_matches('…')
-        .chars()
-        .collect();
-    let mut best = None;
-    let (mut lo, mut hi) = (1, name.len());
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        let short: String = name[..mid].iter().collect();
-        let candidate = format!("{before}{}…{after}", short.trim_end());
-        if line_px(window, &candidate, FontWeight::NORMAL) <= max_px {
-            best = Some(candidate);
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
+    let mut style = window.text_style();
+    if let Some(family) = family {
+        style.font_family = SharedString::from(family.clone());
     }
-    best.unwrap_or_else(|| clip_line(window, text, max_px, FontWeight::NORMAL))
+    let run = style.to_run(text.len());
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(size),
+        &[run],
+        None,
+    );
+    f32::from(line.width)
 }
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
@@ -1985,18 +1968,23 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         format!("{} ", session.count)
     };
     let toast = session.toast.as_ref().map(|toast| {
-        // What the bar spends before the notice: padding, mode, sync, the
-        // dots and gaps between them, and the air after it.
+        // What the bar spends before the notice, measured as drawn: the
+        // padding, the mode in mono, sync, the dots, the gaps between the
+        // children, and the air after the notice.
+        let size = (theme.ui_px - 1.0).max(12.0);
+        let ui = theme.ui_family.as_ref();
         let mode = session.mode_label().to_string();
-        let sync = session.sync.status();
-        let mut used = 28.0 + 16.0 + 4.0 * 12.0;
-        used += line_px(window, &mode, FontWeight::NORMAL)
-            + line_px(window, &sync, FontWeight::NORMAL)
-            + 2.0 * line_px(window, "·", FontWeight::NORMAL);
+        // No key hints show beside a notice, so no gap or air after it.
+        let mut used = 28.0 + 4.0 * 12.0;
+        used += bar_px(window, &mode, size, theme.mono_family.as_ref())
+            + bar_px(window, &session.sync.status(), size, ui)
+            + 2.0 * bar_px(window, "·", size, ui);
         if session.detail_text().is_some() {
-            used += 12.0 + line_px(window, "· ? details", FontWeight::NORMAL);
+            used += 12.0 + bar_px(window, "· ? details", size, ui);
         }
-        fit_notice(window, &toast.text, (width - used).max(80.0))
+        present::fit_notice(&toast.text, (width - used).max(80.0), |text| {
+            bar_px(window, text, size, ui)
+        })
     });
     div()
         .h(px(30.))
@@ -2040,7 +2028,7 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
                 .flex_1()
                 .min_w(px(0.))
                 // Air before the key hints, so a long message never runs into them.
-                .pr(px(16.))
+                .when(session.toast.is_none(), |toast| toast.pr(px(16.)))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
@@ -2051,16 +2039,18 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
                 }))
                 .child(toast.unwrap_or_default()),
         )
-        .child(
-            div()
-                .font_family_opt(theme.mono_family.clone())
-                .text_color(rgb(if session.chord.is_empty() {
-                    theme.dimmed
-                } else {
-                    theme.accent
-                }))
-                .child(format!("{count}{hint}")),
-        )
+        .when(!count.is_empty() || !hint.is_empty(), |bar| {
+            bar.child(
+                div()
+                    .font_family_opt(theme.mono_family.clone())
+                    .text_color(rgb(if session.chord.is_empty() {
+                        theme.dimmed
+                    } else {
+                        theme.accent
+                    }))
+                    .child(format!("{count}{hint}")),
+            )
+        })
 }
 
 fn which_key_popup(theme: &Theme, session: &Session) -> gpui::Div {

@@ -40,6 +40,8 @@ struct Palette {
     panel: u32,
     rule: u32,
     hunk: u32,
+    /// The focused agent edit: a stronger tint than the others.
+    hunk_focus: u32,
 }
 
 fn palette(kind: ThemeKind) -> Palette {
@@ -57,6 +59,7 @@ fn palette(kind: ThemeKind) -> Palette {
             panel: 0x242320,
             rule: 0x6e675f,
             hunk: 0x243044,
+            hunk_focus: 0x2e3f5c,
         },
         ThemeKind::Light => Palette {
             bg: 0xf7f5f2,
@@ -71,6 +74,7 @@ fn palette(kind: ThemeKind) -> Palette {
             panel: 0xfffdfb,
             rule: 0x8f877e,
             hunk: 0xe7eef8,
+            hunk_focus: 0xd3e0f2,
         },
     }
 }
@@ -83,13 +87,26 @@ fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
     let panel = theme.surface;
     let code = mix(bg, theme.foreground, 0.10);
     let hunk = mix(bg, theme.accent, 0.16);
-    let fg = ensure_all(theme.foreground, &[bg, panel, code, hunk], TEXT_CONTRAST);
+    let hunk_focus = mix(bg, theme.accent, 0.28);
+    let fg = ensure_all(
+        theme.foreground,
+        &[bg, panel, code, hunk, hunk_focus],
+        TEXT_CONTRAST,
+    );
     Palette {
         bg,
         fg,
-        dim: ensure_all(theme.dimmed, &[bg, panel, code, hunk], TEXT_CONTRAST),
-        marker: ensure_all(mix(theme.dimmed, bg, 0.2), &[bg, code, hunk], MARK_CONTRAST),
-        accent: ensure_all(theme.accent, &[bg, panel, hunk], TEXT_CONTRAST),
+        dim: ensure_all(
+            theme.dimmed,
+            &[bg, panel, code, hunk, hunk_focus],
+            TEXT_CONTRAST,
+        ),
+        marker: ensure_all(
+            mix(theme.dimmed, bg, 0.2),
+            &[bg, code, hunk, hunk_focus],
+            MARK_CONTRAST,
+        ),
+        accent: ensure_all(theme.accent, &[bg, panel, hunk, hunk_focus], TEXT_CONTRAST),
         caret: fg,
         code,
         selection: theme.selection,
@@ -97,6 +114,7 @@ fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
         panel,
         rule: theme.border,
         hunk,
+        hunk_focus,
     }
 }
 
@@ -500,6 +518,19 @@ impl ComposeView {
         self.known_hunks = order.iter().map(|(hunk, _)| *hunk).collect();
         if !order.is_empty() {
             self.focus_hunk_at(&order, 0);
+            return;
+        }
+        // No edits yet: start on the first line of text, so the first view
+        // shows headings as headings, not as the raw line under the cursor.
+        if let Some(row) = self
+            .editor
+            .lines
+            .iter()
+            .position(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        {
+            self.editor.row = row;
+            self.editor.col = content_column(&self.editor.lines[row]);
+            self.editor.clamp();
         }
     }
 
@@ -1398,7 +1429,10 @@ impl Render for ComposeView {
             .font_weight(FontWeight(400.))
             .font_family(ui_family)
             .child(header(&snap, colors).flex_shrink_0())
-            .child(self.fields_view(&snap, colors, wide).flex_shrink_0())
+            .child(
+                self.fields_view(&snap, colors, wide, window)
+                    .flex_shrink_0(),
+            )
             .child(self.body_view(&snap, colors))
             .children(
                 self.quote_view(&snap, colors)
@@ -1417,7 +1451,13 @@ impl Render for ComposeView {
 }
 
 impl ComposeView {
-    fn fields_view(&self, snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
+    fn fields_view(
+        &self,
+        snap: &Snapshot,
+        colors: Palette,
+        wide: bool,
+        window: &Window,
+    ) -> gpui::Div {
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         column = field_row(
             column,
@@ -1472,7 +1512,21 @@ impl ComposeView {
             ))
             .child(reply_row(snap, colors))
             .children(if !snap.hunks.is_empty() {
-                Some(hunk_banner(snap, self.focused_hunk, colors, wide))
+                // Room for the edit's words: the row, less the keys beside
+                // them on a wide window.
+                let width = f32::from(window.viewport_size().width) - 64.0;
+                let keys = if wide {
+                    text_px(
+                        window,
+                        "  ·  ]h [h move  ·  u undo  ·  space a k keep  ·  space a x reject",
+                        16.0,
+                    )
+                } else {
+                    0.0
+                };
+                let room = width - keys;
+                let fits = |label: &str| text_px(window, label, 16.0) <= room;
+                Some(hunk_banner(snap, self.focused_hunk, colors, wide, &fits))
             } else if snap.send_requested_by.is_some() {
                 // The row stays, so an edit arriving later does not push the
                 // message down under the reader.
@@ -1977,7 +2031,13 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette, wide: bool) -> gpui::Div {
+fn hunk_banner(
+    snap: &Snapshot,
+    focused: Option<u64>,
+    colors: Palette,
+    wide: bool,
+    fits: &dyn Fn(&str) -> bool,
+) -> gpui::Div {
     let order = ordered_hunks(snap);
     let at = focused
         .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
@@ -1990,10 +2050,20 @@ fn hunk_banner(snap: &Snapshot, focused: Option<u64>, colors: Palette, wide: boo
             HunkKind::Recipients => "agent changed recipients".to_string(),
             HunkKind::Subject => "agent changed the subject".to_string(),
             HunkKind::Attachments => "agent changed attachments".to_string(),
-            HunkKind::Body => match edit_preview(snap, hunk) {
-                Some(words) => format!("agent edit \u{201c}{words}\u{201d}"),
-                None => "agent edit".to_string(),
-            },
+            HunkKind::Body => {
+                // As many words as the row has room for.
+                let count = format!(" · {} of {}", at + 1, order.len().max(1));
+                (1..=12)
+                    .rev()
+                    .filter_map(|words| edit_preview_words(snap, hunk, words))
+                    .map(|words| format!("agent edit \u{201c}{words}\u{201d}"))
+                    .find(|label| fits(&format!("{label}{count}")))
+                    .or_else(|| {
+                        edit_preview_words(snap, hunk, 1)
+                            .map(|words| format!("agent edit \u{201c}{words}\u{201d}"))
+                    })
+                    .unwrap_or_else(|| "agent edit".to_string())
+            }
         })
         .unwrap_or_else(|| "agent edit".into());
     let label = format!("{what} · {} of {}", at + 1, order.len().max(1));
@@ -2056,12 +2126,37 @@ fn ordered_hunks(snap: &Snapshot) -> Vec<(u64, Option<usize>)> {
 
 /// The first few words of a body edit's new text, for the edit bar.
 fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<String> {
+    edit_preview_words(snap, hunk, 4)
+}
+
+/// The width of one line of text at `size` pixels, in the window's font.
+fn text_px(window: &Window, text: &str, size: f32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let style = window.text_style();
+    let run = style.to_run(text.len());
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(size),
+        &[run],
+        None,
+    );
+    f32::from(line.width)
+}
+
+/// The edit's first words, at most `limit`, with an ellipsis when cut.
+fn edit_preview_words(
+    snap: &Snapshot,
+    hunk: &fell_core::compose::HunkView,
+    limit: usize,
+) -> Option<String> {
     let slice = snap.text.get(hunk.start..hunk.end)?;
     let line = slice
         .lines()
         .map(plain_markdown)
         .find(|line| !line.is_empty())?;
-    let mut words: Vec<&str> = line.split_whitespace().take(4).collect();
+    let mut words: Vec<&str> = line.split_whitespace().take(limit).collect();
     let more = line.split_whitespace().count() > words.len();
     if words.is_empty() {
         return None;
@@ -2097,12 +2192,50 @@ fn edit_name(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> String {
 /// emphasis marks dropped, so "was *March*" reads like the new text.
 fn plain_markdown(text: &str) -> String {
     let line = text.trim();
-    let line = &line[content_byte(line)..];
-    line.chars()
-        .filter(|ch| !matches!(ch, '*' | '_' | '`'))
-        .collect::<String>()
-        .trim()
-        .to_string()
+    let mut line = line[content_byte(line)..].to_string();
+    for mark in ["**", "__", "*", "_", "`"] {
+        line = strip_paired(&line, mark);
+    }
+    line.trim().to_string()
+}
+
+/// Drop `mark` where it opens and closes a run of words ("*March*"), and
+/// leave it inside words ("snake_case", "a*b").
+fn strip_paired(text: &str, mark: &str) -> String {
+    let opens = |at: usize| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + mark.len()..].chars().next();
+        before.is_none_or(|ch| !ch.is_alphanumeric()) && after.is_some_and(|ch| !ch.is_whitespace())
+    };
+    let closes = |at: usize| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + mark.len()..].chars().next();
+        before.is_some_and(|ch| !ch.is_whitespace()) && after.is_none_or(|ch| !ch.is_alphanumeric())
+    };
+    let mut out = String::new();
+    let mut rest = 0;
+    let mut search = 0;
+    while let Some(found) = text[search..].find(mark) {
+        let open = search + found;
+        if !opens(open) {
+            search = open + mark.len();
+            continue;
+        }
+        let inner = open + mark.len();
+        let close = text[inner..]
+            .match_indices(mark)
+            .map(|(at, _)| inner + at)
+            .find(|at| *at > inner && closes(*at));
+        let Some(close) = close else {
+            break;
+        };
+        out.push_str(&text[rest..open]);
+        out.push_str(&text[inner..close]);
+        rest = close + mark.len();
+        search = rest;
+    }
+    out.push_str(&text[rest..]);
+    out
 }
 
 fn content_byte(line: &str) -> usize {
@@ -2329,9 +2462,14 @@ fn raw_source_block(
                     column = column.child(
                         div()
                             .when(gap, |row| row.mt(px(6.)))
+                            .ml(px(-3.))
                             .flex()
                             .gap_2()
-                            .bg(rgb(colors.hunk))
+                            .bg(rgb(if is_focused {
+                                colors.hunk_focus
+                            } else {
+                                colors.hunk
+                            }))
                             .border_l(px(3.))
                             .border_color(rgb(if is_focused {
                                 colors.accent
@@ -2350,10 +2488,16 @@ fn raw_source_block(
             let is_focused = touching
                 .iter()
                 .any(|index| Some(edits[*index].3) == focused);
+            // The 3px bar sits in the margin, so the text lines up with the
+            // lines around the block.
             painted = div()
                 .when(gap, |row| row.mt(px(6.)))
-                .w_full()
-                .bg(rgb(colors.hunk))
+                .ml(px(-3.))
+                .bg(rgb(if is_focused {
+                    colors.hunk_focus
+                } else {
+                    colors.hunk
+                }))
                 .border_l(px(3.))
                 .border_color(rgb(if is_focused {
                     colors.accent
@@ -3313,6 +3457,25 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
+    use super::{Editor, cursor_line_covered, plain_markdown};
+    use fell_core::compose::markdown_to_doc;
+
+    #[test]
+    fn was_text_drops_emphasis_marks_but_not_marks_inside_words() {
+        assert_eq!(
+            plain_markdown("- Launch moves to *March*"),
+            "Launch moves to March"
+        );
+        assert_eq!(
+            plain_markdown("**Hiring** closes `Friday`"),
+            "Hiring closes Friday"
+        );
+        assert_eq!(
+            plain_markdown("rename snake_case_name"),
+            "rename snake_case_name"
+        );
+        assert_eq!(plain_markdown("2*3*4 is _fine_"), "2*3*4 is fine");
+    }
 
     #[test]
     fn compose_keys_match_what_they_type() {
@@ -3408,8 +3571,6 @@ mod tests {
             );
         }
     }
-    use super::{Editor, cursor_line_covered};
-    use fell_core::compose::markdown_to_doc;
 
     fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
         out.extend((data.len() as u32).to_be_bytes());
