@@ -20,6 +20,7 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
+mod sent_bcc;
 mod summaries;
 mod threads;
 
@@ -388,6 +389,7 @@ impl Store {
         // including the one that installs the threading triggers. Then the
         // threading tables, which the version 3 upgrade below already reads.
         summaries::ensure_thread_summaries(&conn)?;
+        conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -1442,6 +1444,13 @@ fn thread_id_for_message_id(
 }
 
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
+    match sent_bcc::with_recorded_bcc(conn, message)? {
+        Some(merged) => insert_arrival(conn, &merged),
+        None => insert_arrival(conn, message),
+    }
+}
+
+fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
