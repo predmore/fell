@@ -385,7 +385,7 @@ impl AccountConfig {
     /// Send the archive and move rows queued for this account on a separate
     /// `SELECT` session. Run it on the sync thread; it connects only when a
     /// row is due. Sends nothing while `write_back` is off, but still
-    /// reports, once, a move left half done when write-back was turned off.
+    /// reports, once, a copy an earlier build of write-back left half done.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
         let abandoned = crate::outbox::take_abandoned(store, &account_id)?;

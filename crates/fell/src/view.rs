@@ -125,8 +125,6 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
-/// What the inbox says while a reply or forward's window comes up:
-/// "reply all · Jon".
 /// One line for moves the server will never get. The change stays in Fell,
 /// and no key would fix it, so none is shown.
 fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String {
@@ -142,11 +140,13 @@ fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String
         }
         DropReason::Refused => format!("The server refused to move {messages}"),
         DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
-        DropReason::NoMove => "This server can't move mail; moves stay in Fell".to_string(),
-        DropReason::Abandoned => format!("Write-back off: {messages} left half moved in {folder}"),
+        DropReason::NoMove => "This server can't move mail; archive stays in Fell".to_string(),
+        DropReason::Abandoned => format!("{messages} left half moved in {folder} on the server"),
     }
 }
 
+/// What the inbox says while a reply or forward's window comes up:
+/// "reply all · Jon".
 fn reply_notice(kind: ReplyKind, sender: &str) -> String {
     format!("{}{sender}", reply_notice_prefix(kind))
 }
@@ -4479,8 +4479,12 @@ mod tests {
             "1 message not found in Inbox on the server"
         );
         assert_eq!(
+            notice(DropReason::NoMove, 1),
+            "This server can't move mail; archive stays in Fell"
+        );
+        assert_eq!(
             notice(DropReason::Abandoned, 1),
-            "Write-back off: 1 message left half moved in Inbox"
+            "1 message left half moved in Inbox on the server"
         );
         for reason in [
             DropReason::FolderReset,

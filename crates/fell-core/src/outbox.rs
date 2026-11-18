@@ -19,12 +19,13 @@
 //! Undo of an action removes its rows that were not sent. Rows the server
 //! already applied stay, and undo queues the reverse move for each.
 //!
-//! Turning write-back off starts a new generation. Rows not sent yet are
-//! deleted, and a row half done on a server without MOVE (copied, the
-//! source not yet expunged) is abandoned and reported once: Fell sends
-//! nothing while write-back is off. No row from an earlier generation is
-//! ever sent, finished, or reversed, even when write-back is turned on
-//! again or a command on the wire when it went off is answered late.
+//! Moves go out only as `UID MOVE` (RFC 6851). A server without MOVE keeps
+//! the change in Fell: Fell never copies, flags `\Deleted`, or expunges.
+//!
+//! Turning write-back off starts a new generation, and rows not sent yet
+//! are deleted. No row from an earlier generation is ever sent or
+//! reversed, even when write-back is turned on again or a command on the
+//! wire when it went off is answered late.
 //!
 //! Only moves exist so far. [`OutboxKind`] names what a row asks for, and
 //! replay dispatches on it, so flags (#104), delete to Trash (#105), labels
@@ -44,7 +45,9 @@ CREATE TABLE IF NOT EXISTS write_back_accounts (
     account_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL,
     -- Bumped each time write-back is turned off; see the module doc.
-    generation INTEGER NOT NULL DEFAULT 0
+    generation INTEGER NOT NULL DEFAULT 0,
+    -- 1 once the user was told the server has no MOVE.
+    move_missing INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS server_outbox (
@@ -75,8 +78,13 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     settled_unix INTEGER,
     -- write_back_accounts.generation when the row was queued.
     generation INTEGER NOT NULL DEFAULT 0,
-    -- 1 once a COPY or MOVE for the row may have reached the server.
-    sent INTEGER NOT NULL DEFAULT 0
+    -- 1 once a MOVE for the row may have reached the server.
+    sent INTEGER NOT NULL DEFAULT 0,
+    -- The target's UIDVALIDITY and UIDNEXT just before the first MOVE was
+    -- sent: a copy found there later counts only at or above this UIDNEXT.
+    -- 0 when unknown.
+    target_uidvalidity INTEGER NOT NULL DEFAULT 0,
+    target_uidnext INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -85,10 +93,13 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 ";
 
 /// Columns added after the tables first shipped on a branch build.
-const ADDED_COLUMNS: [(&str, &str); 3] = [
+const ADDED_COLUMNS: [(&str, &str); 6] = [
     ("write_back_accounts", "generation"),
+    ("write_back_accounts", "move_missing"),
     ("server_outbox", "generation"),
     ("server_outbox", "sent"),
+    ("server_outbox", "target_uidvalidity"),
+    ("server_outbox", "target_uidnext"),
 ];
 
 /// Sent and dropped rows are kept this long, so undo can still reverse a
@@ -122,15 +133,13 @@ impl OutboxKind {
 pub enum OutboxState {
     /// Not sent yet, or sent and to be retried.
     Pending,
-    /// Copied to the target on a server without MOVE; the source copy is
-    /// still to be removed.
-    Copied,
     /// The server applied it.
     Done,
     /// Never applied: see `error`.
     Dropped,
-    /// Copied when write-back was turned off: the source copy was never
-    /// expunged (it may be flagged `\Deleted`). Reported once, then Dropped.
+    /// Copied by an earlier build of write-back on a server without MOVE,
+    /// with the source copy not yet expunged. Fell no longer copies, so it
+    /// never finishes one: reported once, then Dropped.
     Abandoned,
 }
 
@@ -138,7 +147,6 @@ impl OutboxState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Copied => "copied",
             Self::Done => "done",
             Self::Dropped => "dropped",
             Self::Abandoned => "abandoned",
@@ -148,7 +156,8 @@ impl OutboxState {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "pending" => Ok(Self::Pending),
-            "copied" => Ok(Self::Copied),
+            // An earlier build's half-done copy; `ensure_schema` renames it.
+            "copied" => Ok(Self::Abandoned),
             "done" => Ok(Self::Done),
             "dropped" => Ok(Self::Dropped),
             "abandoned" => Ok(Self::Abandoned),
@@ -178,7 +187,7 @@ pub struct OutboxEntry {
     pub error: String,
     /// The write-back generation the row was queued in.
     pub generation: i64,
-    /// A COPY or MOVE for the row may have reached the server.
+    /// A MOVE for the row may have reached the server.
     pub sent: bool,
 }
 
@@ -213,11 +222,11 @@ pub enum DropReason {
     Refused,
     /// The folder, or the message in it, never turned up on the server.
     NotFound,
-    /// The server has neither MOVE nor UIDPLUS, so Fell cannot move mail
-    /// there without a bare EXPUNGE.
+    /// The server has no MOVE. Fell does not copy and expunge instead, so
+    /// the change stays in Fell.
     NoMove,
-    /// Write-back was turned off after the copy reached the target but
-    /// before the source copy was expunged; the source still has it.
+    /// An earlier build copied the message to the target on a server
+    /// without MOVE and never expunged the source copy. Fell leaves it.
     Abandoned,
 }
 
@@ -230,8 +239,8 @@ impl Store {
     /// `account.toml`). Off is the default.
     ///
     /// Turning it off starts a new generation: rows never sent are deleted,
-    /// and a half-done copy is abandoned (see [`take_abandoned`]). Fell
-    /// sends nothing more for either, even if write-back comes back on.
+    /// and Fell sends nothing more for any row queued before, even if
+    /// write-back comes back on.
     pub fn set_write_back(&self, account_id: &AccountId, enabled: bool) -> Result<()> {
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_schema(&tx)?;
@@ -252,12 +261,6 @@ impl Store {
             tx.execute(
                 "DELETE FROM server_outbox WHERE account_id = ?1 AND state = 'pending'",
                 params![account_id.as_str()],
-            )?;
-            tx.execute(
-                "UPDATE server_outbox
-                 SET state = 'abandoned', error = 'write-back turned off', settled_unix = ?2
-                 WHERE account_id = ?1 AND state = 'copied'",
-                params![account_id.as_str(), now_unix()],
             )?;
         }
         tx.commit()
@@ -302,6 +305,16 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
+    // Earlier builds of write-back copied, flagged, and expunged on a server
+    // without MOVE. A row they left half done is never finished: the
+    // source copy stays (maybe flagged `\Deleted`), and it is reported once.
+    conn.execute(
+        "UPDATE server_outbox
+         SET state = 'abandoned', error = 'half-done copy from an earlier build',
+             settled_unix = ?1
+         WHERE state = 'copied'",
+        params![now_unix()],
+    )?;
     Ok(())
 }
 
@@ -363,7 +376,7 @@ pub(crate) fn queue_moves(
         }
         let follows = match inbound(conn, account_id, generation, message_id)? {
             Some((folder, state, placed)) if folder.eq_ignore_ascii_case(from) => match state {
-                OutboxState::Pending | OutboxState::Copied => true,
+                OutboxState::Pending => true,
                 // Sent, but the server did not say where the copy went: a
                 // sync pass records it.
                 OutboxState::Done => !placed && copies.is_empty(),
@@ -408,8 +421,8 @@ pub(crate) fn queue_moves(
 }
 
 /// Undo of `action_id`, in the undo transaction: rows not sent yet go, and
-/// each row the server applied (or half-applied) in this write-back
-/// generation gets its reverse move. With write-back off, undo is local.
+/// each row the server applied in this write-back generation gets its
+/// reverse move. With write-back off, undo is local.
 pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
     ensure_schema(conn)?;
     conn.execute(
@@ -428,7 +441,7 @@ pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: 
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND action_id = {action_id}
-               AND state IN ('copied', 'done') AND generation = {generation}
+               AND state = 'done' AND generation = {generation}
              ORDER BY id"
         ),
         account_id,
@@ -558,7 +571,7 @@ fn claimed(conn: &Connection, account_id: &AccountId, copy: &(String, u32, u32))
     let found: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM server_outbox
-             WHERE account_id = ?1 AND state IN ('pending', 'copied')
+             WHERE account_id = ?1 AND state = 'pending'
                AND source_mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4
              LIMIT 1",
             params![account_id.as_str(), copy.0, copy.1, copy.2],
@@ -580,7 +593,7 @@ fn inbound(
         .query_row(
             "SELECT target_folder, state, placed_uid IS NOT NULL FROM server_outbox
              WHERE account_id = ?1 AND message_id = ?2 AND generation = ?3
-               AND state IN ('pending', 'copied', 'done')
+               AND state IN ('pending', 'done')
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str(), message_id, generation],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -683,7 +696,7 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
         &tx,
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
-             WHERE account_id = ?1 AND state IN ('pending', 'copied')
+             WHERE account_id = ?1 AND state = 'pending'
                AND generation = {generation}
              ORDER BY id"
         ),
@@ -701,7 +714,7 @@ pub(crate) fn any_due(store: &Store, account_id: &AccountId) -> Result<bool> {
     let due: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM server_outbox
-             WHERE account_id = ?1 AND state IN ('pending', 'copied') AND retry_unix <= ?2
+             WHERE account_id = ?1 AND state = 'pending' AND retry_unix <= ?2
                AND generation = (SELECT COALESCE(MAX(generation), 0)
                                  FROM write_back_accounts WHERE account_id = ?1)
              LIMIT 1",
@@ -732,7 +745,7 @@ pub(crate) fn find_copy(
                AND c.uidvalidity = ?4
                AND NOT EXISTS (
                    SELECT 1 FROM server_outbox o
-                   WHERE o.account_id = ?1 AND o.state IN ('pending', 'copied')
+                   WHERE o.account_id = ?1 AND o.state = 'pending'
                      AND o.source_mailbox = ?5 AND o.uidvalidity = c.uidvalidity
                      AND o.uid = c.uid)",
             params![
@@ -763,21 +776,75 @@ pub(crate) fn is_claimed(
     )
 }
 
-/// Record that a COPY or MOVE for these rows is about to go out, so a retry
-/// after a lost reply looks in the target before copying again.
-pub(crate) fn mark_sent(store: &Store, ids: &[i64]) -> Result<()> {
+/// A target's `(UIDVALIDITY, UIDNEXT)` before a move into it.
+pub(crate) type Bound = (u32, u32);
+
+/// Record that a MOVE for these rows is about to go out. `target` is the
+/// target's `(UIDVALIDITY, UIDNEXT)` just now; a row not sent before keeps
+/// it, so a later look for its copy there trusts only UIDs from it up.
+///
+/// Only rows still pending in the current generation, with write-back on,
+/// are marked: one that undo removed, or that turning write-back off
+/// retired, since the pass loaded it is not sent. Returns each marked id
+/// with the bound it keeps (`None` when unknown, from an earlier build).
+pub(crate) fn mark_sent(
+    store: &Store,
+    account_id: &AccountId,
+    ids: &[i64],
+    target: Bound,
+) -> Result<Vec<(i64, Option<Bound>)>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
-    for id in ids {
-        tx.execute(
-            "UPDATE server_outbox SET sent = 1 WHERE id = ?1",
-            params![id],
-        )?;
+    ensure_schema(&tx)?;
+    let mut marked = Vec::new();
+    if enabled(&tx, account_id)? {
+        let generation = generation(&tx, account_id)?;
+        for id in ids {
+            // SET reads the old `sent`, so only a first send records the bound.
+            let changed = tx.execute(
+                "UPDATE server_outbox
+                 SET sent = 1,
+                     target_uidvalidity = CASE WHEN sent = 0 THEN ?2 ELSE target_uidvalidity END,
+                     target_uidnext = CASE WHEN sent = 0 THEN ?3 ELSE target_uidnext END
+                 WHERE id = ?1 AND account_id = ?4 AND state = 'pending' AND generation = ?5",
+                params![id, target.0, target.1, account_id.as_str(), generation],
+            )?;
+            if changed == 0 {
+                continue;
+            }
+            let bound: Bound = tx.query_row(
+                "SELECT target_uidvalidity, target_uidnext FROM server_outbox WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            marked.push((*id, (bound.1 > 0).then_some(bound)));
+        }
     }
-    tx.commit()
+    tx.commit()?;
+    Ok(marked)
 }
 
-/// Half-done moves abandoned when write-back was turned off, each reported
-/// once. Opens no connection, so it runs with write-back off too.
+/// Whether the user was already told this account's server has no MOVE,
+/// after recording that it has (`missing`) or has not. The notice is shown
+/// once, not on every archive.
+pub(crate) fn note_move_missing(
+    store: &Store,
+    account_id: &AccountId,
+    missing: bool,
+) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    ensure_schema(&tx)?;
+    let changed = tx.execute(
+        "UPDATE write_back_accounts SET move_missing = ?2
+         WHERE account_id = ?1 AND move_missing != ?2",
+        params![account_id.as_str(), i64::from(missing)],
+    )?;
+    tx.commit()?;
+    Ok(missing && changed == 0)
+}
+
+/// Half-done copies an earlier build left (see [`OutboxState::Abandoned`]),
+/// each reported once. Opens no connection, so it runs with write-back off
+/// too.
 pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Vec<DroppedMove>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
@@ -806,20 +873,22 @@ pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Ve
 
 /// What replay learned about one row.
 pub(crate) enum Outcome<'a> {
-    /// Copied (no MOVE): the source copy is still to be removed.
-    Copied {
-        placed: Option<(u32, u32)>,
-    },
-    /// The server applied it. `placed` is the new copy, when COPYUID said.
+    /// The server applied it, and `placed` is the new copy: from COPYUID,
+    /// or found in the target. A move whose new copy is not known is not
+    /// done: it stays [`Outcome::Retry`] until it is dropped, so the source
+    /// copy stays in `message_copies` until a new one replaces it.
     Done {
-        placed: Option<(u32, u32)>,
+        placed: (u32, u32),
     },
     /// Try again at `retry_unix`. `counts` is false for a dropped connection,
-    /// which says nothing about the row.
+    /// which says nothing about the row. `refused`: the server answered the
+    /// MOVE with NO or BAD, so it did not move it, and the next try is a
+    /// first send again.
     Retry {
         error: &'a str,
         retry_unix: i64,
         counts: bool,
+        refused: bool,
     },
     Dropped {
         error: &'a str,
@@ -860,19 +929,20 @@ pub(crate) fn settle(
         tx.commit()?;
         return Ok(false);
     }
-    let (state, placed) = match outcome {
-        Outcome::Copied { placed } => (OutboxState::Copied, placed),
-        Outcome::Done { placed } => (OutboxState::Done, placed),
+    let placed = match outcome {
+        Outcome::Done { placed } => placed,
         Outcome::Retry {
             error,
             retry_unix,
             counts,
+            refused,
         } => {
             tx.execute(
                 "UPDATE server_outbox
-                 SET attempts = attempts + ?2, retry_unix = ?3, error = ?4
+                 SET attempts = attempts + ?2, retry_unix = ?3, error = ?4,
+                     sent = CASE WHEN ?5 THEN 0 ELSE sent END
                  WHERE id = ?1",
-                params![entry.id, i64::from(counts), retry_unix, error],
+                params![entry.id, i64::from(counts), retry_unix, error, refused],
             )?;
             tx.commit()?;
             return Ok(true);
@@ -891,7 +961,7 @@ pub(crate) fn settle(
         resolved.ok_or_else(|| Error::Action("a sent move needs its copy".into()))?;
     // Undo ran while this was on the wire: it found the row still pending
     // and removed it, but the server has acted on it. Put the row back (no
-    // longer tied to the action) so a copy still finishes, then reverse it.
+    // longer tied to the action), then reverse it.
     let undone_meanwhile = live.is_none() && entry.state == OutboxState::Pending;
     if undone_meanwhile {
         tx.execute(
@@ -912,22 +982,21 @@ pub(crate) fn settle(
         )?;
     }
     let mut sent = entry.clone();
-    sent.state = state;
+    sent.state = OutboxState::Done;
     sent.source_mailbox = Some(source_mailbox.to_string());
     sent.uidvalidity = Some(uidvalidity);
     sent.uid = Some(uid);
     sent.target_mailbox = target_mailbox.map(str::to_string);
-    sent.placed_uidvalidity = placed.map(|(uidvalidity, _)| uidvalidity);
-    sent.placed_uid = placed.map(|(_, uid)| uid);
+    sent.placed_uidvalidity = Some(placed.0);
+    sent.placed_uid = Some(placed.1);
     tx.execute(
         "UPDATE server_outbox
          SET state = ?2, source_mailbox = ?3, uidvalidity = ?4, uid = ?5, target_mailbox = ?6,
-             placed_uidvalidity = ?7, placed_uid = ?8, error = '',
-             settled_unix = CASE WHEN ?2 = 'done' THEN ?9 ELSE settled_unix END
+             placed_uidvalidity = ?7, placed_uid = ?8, error = '', settled_unix = ?9
          WHERE id = ?1",
         params![
             entry.id,
-            state.as_str(),
+            OutboxState::Done.as_str(),
             sent.source_mailbox,
             sent.uidvalidity,
             sent.uid,
@@ -937,9 +1006,7 @@ pub(crate) fn settle(
             now,
         ],
     )?;
-    if state == OutboxState::Done {
-        move_copy(&tx, account_id, &sent)?;
-    }
+    move_copy(&tx, account_id, &sent)?;
     if undone_meanwhile {
         queue_reverse(&tx, account_id, &sent, now)?;
     }
@@ -947,10 +1014,25 @@ pub(crate) fn settle(
     Ok(true)
 }
 
-/// The server moved `sent`'s copy: record it where it went.
+/// The server moved `sent`'s copy: record it where it went. The source copy
+/// goes only together with a known new one, so the message never loses
+/// every copy it has on record.
 fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> Result<()> {
-    let (Some(source), Some(uidvalidity), Some(uid)) =
-        (&sent.source_mailbox, sent.uidvalidity, sent.uid)
+    let (
+        Some(source),
+        Some(uidvalidity),
+        Some(uid),
+        Some(target),
+        Some(placed_uidvalidity),
+        Some(placed_uid),
+    ) = (
+        &sent.source_mailbox,
+        sent.uidvalidity,
+        sent.uid,
+        &sent.target_mailbox,
+        sent.placed_uidvalidity,
+        sent.placed_uid,
+    )
     else {
         return Ok(());
     };
@@ -964,13 +1046,6 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             uid
         ],
     )?;
-    let (Some(target), Some(placed_uidvalidity), Some(placed_uid)) = (
-        &sent.target_mailbox,
-        sent.placed_uidvalidity,
-        sent.placed_uid,
-    ) else {
-        return Ok(());
-    };
     let row_exists: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2",
