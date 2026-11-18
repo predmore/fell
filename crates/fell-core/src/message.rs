@@ -79,6 +79,27 @@ pub struct Message {
     pub reply_to: Vec<Address>,
     /// File names of the message's attachments, for a forward to list.
     pub attachment_names: Vec<String>,
+    /// The body parts sync parsed from the server copy. `None` when the
+    /// source had no MIME to read (fixtures, local writes), which leaves any
+    /// stored parts alone. Store reads leave it `None` so a folder list never
+    /// carries bodies; [`crate::Store::message_body`] reads them.
+    pub parts: Option<MessageParts>,
+}
+
+/// What a received message shows in the conversation view: its HTML and
+/// plain-text parts, decoded and otherwise as sent, plus the few headers the
+/// renderer uses to spot bulk mail. HTML is untrusted and is sanitized when
+/// it is rendered, never here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MessageParts {
+    /// The `text/html` body parts, in reading order. `None` when there is none.
+    pub html: Option<String>,
+    /// The `text/plain` body parts, in reading order. `None` for HTML-only
+    /// mail; `body_text` then holds the HTML flattened to text.
+    pub plain: Option<String>,
+    /// Bulk-mail signals (`List-Unsubscribe`, `Precedence`, ESP markers) as
+    /// `(name, value)`, unfolded, in header order.
+    pub bulk_headers: Vec<(String, String)>,
 }
 
 pub(crate) fn encode_addresses(addrs: &[Address]) -> String {

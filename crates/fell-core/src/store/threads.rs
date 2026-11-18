@@ -941,6 +941,7 @@ mod tests {
             list_id: list_id.map(str::to_string),
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 

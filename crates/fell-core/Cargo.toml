@@ -10,6 +10,9 @@ rust-version.workspace = true
 [dependencies]
 fell-confirm.workspace = true
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
+# Stored body parts (src/store/bodies.rs). Pure Rust DEFLATE, MIT OR Zlib OR
+# Apache-2.0, already in the tree through `png`.
+miniz_oxide = "0.8.9"
 mail-parser = { version = "1.0.1", default-features = false, features = ["full_encoding"] }
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -28,6 +31,8 @@ unicode-normalization = "0.1.24"
 unicode-properties = { version = "0.1.3", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
+# Checks that stored bulk headers drive the renderer's bulk-mail check.
+fell-render.workspace = true
 # Builds a tiny ONNX graph in tests. Same major version tract-onnx uses.
 prost = "0.14"
 rcgen = "0.13"

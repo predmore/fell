@@ -384,6 +384,7 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
         list_id: None,
         reply_to: Vec::new(),
         attachment_names: Vec::new(),
+        parts: None,
     };
     // The folder line is replaced below, so no account roles are needed.
     let mut shown = conversation(&[message], me, &FolderRoles::default(), &[]);
@@ -1100,6 +1101,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         };
         let messages = conversation(
             &[
@@ -1163,6 +1165,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 

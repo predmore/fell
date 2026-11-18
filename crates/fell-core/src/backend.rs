@@ -70,6 +70,15 @@ pub enum Settle {
     All,
 }
 
+/// The bytes of one server copy, fetched again to fill its stored parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedBody {
+    pub remote_id: crate::RemoteId,
+    /// The RFC 822 message. `None` when the server no longer has this copy
+    /// (expunged, too large, a refused mailbox, or a new UIDVALIDITY).
+    pub raw: Option<Vec<u8>>,
+}
+
 /// Messages, flag updates, and vanished copies to apply to the local store.
 ///
 /// Removals drop server copies only. The folders they backed come off the
@@ -112,6 +121,15 @@ pub trait MailBackend {
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
         persist(self.fetch_changes(cursor)?)
+    }
+
+    /// Fetch stored copies again by remote id, for body parts the store does
+    /// not have yet. Read-only: nothing is marked read. A copy the server
+    /// answered without comes back with `raw: None`; one not fetched this
+    /// time (a byte cap) is left out and asked for again later. A refused or
+    /// cut-short fetch is an error. Backends with nothing to fetch return none.
+    fn fetch_bodies(&self, _copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
+        Ok(Vec::new())
     }
 
     /// Accept a draft for later send. Must not transmit.
@@ -185,6 +203,10 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, persist)
     }
 
+    fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
+        crate::imap::fetch_bodies(&self.imap, copies)
+    }
+
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
         Ok(PendingSend::new("bridge", draft))
     }
@@ -239,6 +261,10 @@ impl MailBackend for ImapBackend {
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
         crate::imap::fetch_imap(&self.account_id, &self.config, cursor, persist)
+    }
+
+    fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
+        crate::imap::fetch_bodies(&self.config, copies)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {

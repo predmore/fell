@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, InboxWait, Store, SyncFailureKind, classify_sync_error,
-    sync_with_progress,
+    fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
@@ -38,6 +38,9 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(750);
 const CHECKPOINT_EVERY: usize = 16;
 /// Quiet retries of opening the mailbox before the window shows an error.
 const OPEN_RETRIES_BEFORE_ERROR: usize = 3;
+/// Batches of old mail (200 messages each) whose body parts are fetched
+/// after a pass. A request for a pass is checked between batches.
+const BODY_BATCHES_AFTER_PASS: usize = 5;
 
 /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean the
 /// store has new rows.
@@ -160,10 +163,12 @@ fn run(
                 delay
             }
         };
-        let woke = if synced && idle {
-            wait_on_inbox(&config, &store, &account, delay, &wake, &mut idle)
-        } else {
-            wait_on_timer(&wake, delay)
+        let woke = match synced.then(|| fill_old_bodies(&config, &store, &account, &wake)) {
+            Some(Some(woke)) => woke,
+            _ if synced && idle => {
+                wait_on_inbox(&config, &store, &account, delay, &wake, &mut idle)
+            }
+            _ => wait_on_timer(&wake, delay),
         };
         match woke {
             Woke::Asked => {
@@ -176,6 +181,32 @@ fn run(
             Woke::Closed => return,
         }
     }
+}
+
+/// Fetch body parts for mail stored before they were kept, a batch at a
+/// time. Best effort: a failure waits for the next pass. `Some` when the
+/// window asked for a pass, or closed, in the meantime.
+fn fill_old_bodies(
+    config: &AccountConfig,
+    store: &Store,
+    account: &Account,
+    wake: &Receiver<()>,
+) -> Option<Woke> {
+    let Ok(backend) = config.backend() else {
+        return None;
+    };
+    for _ in 0..BODY_BATCHES_AFTER_PASS {
+        match wake.try_recv() {
+            Ok(()) => return Some(Woke::Asked),
+            Err(TryRecvError::Disconnected) => return Some(Woke::Closed),
+            Err(TryRecvError::Empty) => {}
+        }
+        match fetch_missing_bodies(&account.id, backend.as_ref(), store, 1) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    None
 }
 
 /// Why the wait between passes ended.
