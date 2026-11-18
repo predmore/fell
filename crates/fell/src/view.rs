@@ -944,6 +944,18 @@ impl Inbox {
                 .show_toast("Compose is not available here", true);
             return;
         };
+        // The window takes a moment to appear: say what is coming now.
+        if id.is_none() {
+            self.session.show_toast("New draft", false);
+        } else {
+            let subject = self
+                .session
+                .cursor_thread()
+                .map(|row| row.subject.clone())
+                .unwrap_or_default();
+            self.session
+                .show_toast(format!("opening draft \u{201c}{subject}\u{201d}"), false);
+        }
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, None, id)
         {
@@ -959,9 +971,6 @@ impl Inbox {
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let creating = id.is_none();
-        if creating {
-            self.session.show_toast("New draft", false);
-        }
         let task = cx.background_executor().spawn(async move {
             match id {
                 Some(id) => home.open(&id, &account),
@@ -1606,15 +1615,17 @@ fn thread_line_one(
         .when(row.has_attachment, |line| {
             line.child(div().text_color(rgb(dim)).child("⧉"))
         })
-        .children(row.labels.iter().take(2).map(|label| {
+        .children(row.labels.iter().take(2).enumerate().map(|(index, label)| {
+            let warn = row.warn && index == 0;
             div()
+                .flex_shrink_0()
                 .px(px(6.))
                 .py(px(1.))
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(theme.border))
+                .border_color(rgb(if warn { theme.error } else { theme.border }))
                 .text_size(px((theme.ui_px - 2.0).max(11.0)))
-                .text_color(rgb(dim))
+                .text_color(rgb(if warn { theme.error } else { dim }))
                 .child(label.clone())
         }))
         .child(div().flex_1())
@@ -2299,6 +2310,30 @@ fn status_bar(theme: &Theme, session: &Session, width: f32, window: &Window) -> 
         String::new()
     } else {
         format!("{} ", session.count)
+    };
+    // Key hints give up whole keys from the end until they fit beside the
+    // mode and sync, so a narrow window never cuts one in half.
+    let hint = if session.chord.is_empty() && session.toast.is_none() {
+        let size = (theme.ui_px - 1.0).max(12.0);
+        let ui = theme.ui_family.as_ref();
+        let mono = theme.mono_family.as_ref();
+        let mut room = width
+            - 28.0
+            - 4.0 * 12.0
+            - 16.0
+            - bar_px(window, session.mode_label(), size, mono)
+            - bar_px(window, &session.sync.status(), size, ui)
+            - bar_px(window, "·", size, ui);
+        if session.detail_text().is_some() {
+            room -= 12.0 + bar_px(window, "· ? details", size, ui);
+        }
+        let mut parts: Vec<&str> = hint.split("  ·  ").collect();
+        while parts.len() > 1 && bar_px(window, &parts.join("  ·  "), size, mono) > room {
+            parts.pop();
+        }
+        parts.join("  ·  ")
+    } else {
+        hint
     };
     let toast = session.toast.as_ref().map(|toast| {
         // What the bar spends before the notice, measured as drawn: the

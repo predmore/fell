@@ -398,6 +398,11 @@ impl Session {
     }
 
     /// The compose draft the selected row stands for, in the drafts list.
+    pub fn cursor_thread(&self) -> Option<&ThreadRow> {
+        let id = self.cursor_id.as_ref()?;
+        self.threads.iter().find(|thread| &thread.id == id)
+    }
+
     pub fn cursor_draft(&self) -> Option<&str> {
         let id = self.cursor_id.as_ref()?;
         self.threads
@@ -1720,6 +1725,7 @@ mod tests {
             subject: id.into(),
             snippet: "snippet".into(),
             labels: vec![],
+            warn: false,
             unread: false,
             draft: None,
         }

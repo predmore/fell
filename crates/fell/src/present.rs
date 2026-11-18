@@ -31,6 +31,9 @@ pub struct ThreadRow {
     pub subject: String,
     pub snippet: String,
     pub labels: Vec<String>,
+    /// The first label is a warning (a draft that may have gone out), drawn
+    /// in the error colour, not as a tag.
+    pub warn: bool,
     pub unread: bool,
     /// The compose draft this row stands for, in the drafts list. `None`
     /// for a thread.
@@ -254,6 +257,7 @@ pub fn thread_rows(threads: &[FolderThread], me: &str) -> Vec<ThreadRow> {
             subject: one_line(&thread.subject),
             snippet: one_line(&thread.snippet),
             labels: thread.labels.clone(),
+            warn: false,
             unread: thread.unread,
             draft: None,
         })
@@ -276,7 +280,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 .to
                 .iter()
                 .chain(&draft.cc)
-                .map(|raw| address_name(raw))
+                .map(|raw| recipient_label(raw))
                 .collect();
             let spans = if names.is_empty() {
                 vec![NameSpan {
@@ -284,17 +288,24 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                     emphasis: false,
                 }]
             } else {
+                // "to Ada": the column names who a draft is to, not who
+                // sent it, as it does for threads.
                 names
                     .iter()
                     .take(3)
-                    .map(|name| NameSpan {
-                        text: name.clone(),
+                    .enumerate()
+                    .map(|(index, name)| NameSpan {
+                        text: if index == 0 {
+                            format!("to {name}")
+                        } else {
+                            name.clone()
+                        },
                         emphasis: false,
                     })
                     .collect()
             };
             let mut labels = vec![if draft.maybe_sent {
-                "may have been sent · check Sent".to_string()
+                "check Sent".to_string()
             } else {
                 "draft".to_string()
             }];
@@ -323,6 +334,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 },
                 snippet: one_line(&draft.body),
                 labels,
+                warn: draft.maybe_sent,
                 unread: false,
                 draft: Some(draft.id.clone()),
             }
@@ -369,10 +381,30 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str) -> Vec<ConvMessage> {
     };
     let mut shown = conversation(&[message], me);
     for message in &mut shown {
-        message.folders = "Draft".into();
+        message.folders = if draft.maybe_sent {
+            "Draft · may have been sent · check Sent before sending again".into()
+        } else {
+            "Draft".into()
+        };
         message.expanded = true;
     }
     shown
+}
+
+/// A recipient as a draft row names them: the display name, or the
+/// address's local part with a capital, as a name would have.
+fn recipient_label(raw: &str) -> String {
+    let named = fell_core::compose::mailbox_parts(raw)
+        .is_some_and(|(name, _)| name.as_deref().is_some_and(|name| !name.trim().is_empty()));
+    let label = address_name(raw);
+    if named {
+        return label;
+    }
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => label,
+    }
 }
 
 /// The name a draft row shows for one recipient.
@@ -720,6 +752,16 @@ mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    #[test]
+    fn a_draft_row_names_who_it_is_to() {
+        assert_eq!(recipient_label("ada@example.com"), "Ada");
+        assert_eq!(
+            recipient_label("Ada Lovelace <ada@example.com>"),
+            "Ada Lovelace"
+        );
+        assert_eq!(recipient_label("jon.smith@example.com"), "Jon.smith");
+    }
 
     #[test]
     fn a_notice_gives_up_whole_words_of_the_subject_first() {

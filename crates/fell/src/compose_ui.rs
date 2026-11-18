@@ -139,6 +139,8 @@ struct Editor {
     row: usize,
     col: usize,
     mode: Mode,
+    /// A header field takes the typing, so the body draws no caret.
+    caret_hidden: bool,
     anchor: Option<(usize, usize)>,
     preferred: usize,
     count: usize,
@@ -184,6 +186,7 @@ impl Editor {
             col,
             lines,
             mode: Mode::Normal,
+            caret_hidden: false,
             anchor: None,
             preferred: 0,
             count: 0,
@@ -540,6 +543,20 @@ impl ComposeView {
             return;
         }
         self.start_on_recipients_if_empty(&snap);
+        if snap.send_requested_by.is_none() {
+            // The person's own draft: pick up where the text ends.
+            if let Some(row) = self
+                .editor
+                .lines
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+            {
+                self.editor.row = row;
+                self.editor.col = self.editor.lines[row].chars().count();
+                self.editor.clamp();
+            }
+            return;
+        }
         // No edits yet: start on the first line of text, so the first view
         // shows headings as headings, not as the raw line under the cursor.
         if let Some(row) = self
@@ -1388,6 +1405,7 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.editor.caret_hidden = self.field != Field::Body;
         if self.closing {
             window.remove_window();
         }
@@ -1542,7 +1560,17 @@ impl ComposeView {
                 self.field == Field::Subject,
                 colors,
             ))
-            .child(reply_row(snap, colors))
+            // A new message of the person's own has nothing to reply to;
+            // an agent's draft always says what it answers, even nothing.
+            .when(
+                snap.send_requested_by.is_some()
+                    || snap.reply_context.is_some()
+                    || snap
+                        .in_reply_to
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty()),
+                |column| column.child(reply_row(snap, colors)),
+            )
             .children(if !snap.hunks.is_empty() {
                 // Room for the edit's words: the row, less the keys beside
                 // them on a wide window.
@@ -2339,10 +2367,16 @@ fn styled_body(
     let doc = markdown_to_doc(&text);
     let mut column = div().flex().flex_col();
     let mut previous: Option<&BlockBody> = None;
-    for (index, item) in body_layout(&text, editor.row, editor.col, &doc)
-        .into_iter()
-        .enumerate()
-    {
+    let items: Vec<BodyItem> = if editor.caret_hidden {
+        // Typing goes to a header field: every block shows styled, with
+        // no caret line, so there is one caret on screen.
+        (0..doc.blocks.len())
+            .map(|index| BodyItem::Block { index, raw: false })
+            .collect()
+    } else {
+        body_layout(&text, editor.row, editor.col, &doc)
+    };
+    for (index, item) in items.into_iter().enumerate() {
         let (body, mut painted) = match item {
             BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
             BodyItem::Block { index, raw } => {
@@ -2448,7 +2482,7 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
 fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
     for (index, line) in editor.lines.iter().enumerate() {
-        let cursor = (editor.mode != Mode::Normal || true) && index == editor.row;
+        let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
             cursor.then_some(editor.col),
@@ -2480,7 +2514,7 @@ fn raw_source_block(
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
         let line_end = line_start + line.len();
-        let cursor = (row == editor.row).then_some(editor.col);
+        let cursor = (!editor.caret_hidden && row == editor.row).then_some(editor.col);
         let mut painted = raw_line(line, cursor, cursor.is_some(), editor.mode, colors);
         // Only the lines an agent changed carry the tint, with what they
         // replaced directly above the first of them.
@@ -3171,12 +3205,13 @@ fn status_bar(
         // The header tags each first-time address; the count fills an idle
         // bar only, so it is never read as a count of edits.
         if fresh > 0 && idle {
-            left = left.child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(colors.fg))
-                    .child(format!("{fresh} first-time")),
-            );
+            left = left.child(div().flex_shrink_0().text_color(rgb(colors.fg)).child(
+                if fresh == 1 {
+                    "1 first-time recipient".to_string()
+                } else {
+                    format!("{fresh} first-time recipients")
+                },
+            ));
         }
     }
     let right = match &snap.send_block {
