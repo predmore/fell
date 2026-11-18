@@ -2387,7 +2387,12 @@ fn reply_row(
                 .to
                 .iter()
                 .any(|address| redirects.contains(&address.email.trim().to_lowercase()));
-            let sender = if redirected && parent.sender_email != parent.sender {
+            // The person's own message is "me", as the inbox says it.
+            let mine = fell_core::compose::email_of(&snap.from)
+                .is_some_and(|me| me.eq_ignore_ascii_case(parent.sender_email.trim()));
+            let sender = if mine {
+                "me".to_string()
+            } else if redirected && parent.sender_email != parent.sender {
                 format!("{} <{}>", parent.sender, parent.sender_email)
             } else {
                 parent.sender.clone()
@@ -2399,7 +2404,7 @@ fn reply_row(
             );
             let subject = display_safe(&parent.subject);
             let what = fit(&who, &dot_before(&subject), &when);
-            if what.chars().count() < 12 && who != parent.sender {
+            if what.chars().count() < 12 && who != parent.sender && !mine {
                 // Too little room beside the sender's address: the subject
                 // and date take the next line.
                 let what = fit("", &subject, &when);
@@ -3629,13 +3634,98 @@ fn caret(colors: Palette, mode: Mode) -> gpui::Div {
 }
 
 /// A compose draft in the inbox's reading pane: the compose window's
-/// rendering, at the inbox's text size, links by their label.
-pub(crate) fn render_draft_doc(doc: &StyledDoc, theme: &crate::theme::Theme) -> gpui::Div {
+/// rendering, at the inbox's text size. Links show where they go by the
+/// editor's rules: an agent's draft shows each link's host, the person's
+/// own a label that reads as an address and goes elsewhere. Its text loses
+/// bidi and invisible format characters, as headers do.
+pub(crate) fn render_draft_doc(
+    doc: &StyledDoc,
+    agent: bool,
+    theme: &crate::theme::Theme,
+) -> gpui::Div {
     let paint = Paint {
-        links: Links::Label,
+        links: if agent { Links::Host } else { Links::Label },
         text_px: theme.ui_px,
     };
-    render_doc(doc, Path::new(""), paint, palette_from_theme(theme))
+    render_doc(
+        &safe_doc(doc),
+        Path::new(""),
+        paint,
+        palette_from_theme(theme),
+    )
+}
+
+/// `doc` with each text run through [`text_safe`].
+fn safe_doc(doc: &StyledDoc) -> StyledDoc {
+    fn inlines(items: &[fell_core::compose::Inline]) -> Vec<fell_core::compose::Inline> {
+        use fell_core::compose::Inline;
+        items
+            .iter()
+            .map(|item| match item {
+                Inline::Text(text) => Inline::Text(text_safe(text)),
+                Inline::Code(text) => Inline::Code(text_safe(text)),
+                Inline::Em(inner) => Inline::Em(inlines(inner)),
+                Inline::Strong(inner) => Inline::Strong(inlines(inner)),
+                Inline::Link { text, href } => Inline::Link {
+                    text: text_safe(text),
+                    href: href.clone(),
+                },
+                Inline::Image { alt, src } => Inline::Image {
+                    alt: text_safe(alt),
+                    src: src.clone(),
+                },
+            })
+            .collect()
+    }
+    fn safe_block(block: &fell_core::compose::Block) -> fell_core::compose::Block {
+        let body = match &block.body {
+            BlockBody::Heading {
+                level,
+                inlines: items,
+            } => BlockBody::Heading {
+                level: *level,
+                inlines: inlines(items),
+            },
+            BlockBody::Paragraph { inlines: items } => BlockBody::Paragraph {
+                inlines: inlines(items),
+            },
+            BlockBody::List { ordered, items } => BlockBody::List {
+                ordered: *ordered,
+                items: items.iter().map(|item| inlines(item)).collect(),
+            },
+            BlockBody::Quote { blocks } => BlockBody::Quote {
+                blocks: blocks.iter().map(safe_block).collect(),
+            },
+            BlockBody::Code { text } => BlockBody::Code {
+                text: text_safe(text),
+            },
+            BlockBody::Image { alt, src } => BlockBody::Image {
+                alt: text_safe(alt),
+                src: src.clone(),
+            },
+        };
+        fell_core::compose::Block {
+            source: block.source,
+            body,
+        }
+    }
+    StyledDoc {
+        blocks: doc.blocks.iter().map(safe_block).collect(),
+    }
+}
+
+/// Body text without bidi controls and invisible format characters, which
+/// could reorder what a line reads as. Line breaks and tabs stay.
+fn text_safe(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            line.split('\t')
+                .map(display_safe)
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_doc(doc: &StyledDoc, folder: &Path, paint: Paint, colors: Palette) -> gpui::Div {
@@ -5971,6 +6061,28 @@ mod tests {
             assert!(super::idle_status(status), "{status}");
         }
         assert!(!super::idle_status("Sending…"));
+    }
+
+    #[test]
+    fn a_draft_preview_loses_bidi_controls_but_keeps_its_lines() {
+        let doc = fell_core::compose::markdown_to_doc(
+            "Pay \u{202e}eciovni\u{202c} [here\u{200b}](https://example.com)\nnow\n",
+        );
+        let safe = super::safe_doc(&doc);
+        let fell_core::compose::BlockBody::Paragraph { inlines } = &safe.blocks[0].body else {
+            panic!("{safe:?}");
+        };
+        let text: String = inlines
+            .iter()
+            .map(|inline| match inline {
+                fell_core::compose::Inline::Text(text) => text.clone(),
+                fell_core::compose::Inline::Link { text, .. } => format!("[{text}]"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(text, "Pay eciovni [here] now");
+        // Breaks and tabs, which plain lines and code keep, stay.
+        assert_eq!(super::text_safe("a\nb\u{202e}c\td"), "a\nbc\td");
     }
 
     #[test]

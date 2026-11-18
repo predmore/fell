@@ -1,7 +1,7 @@
 //! Row and conversation presentation. Pure functions, no GPUI.
 
 use fell_core::compose::DraftSummary;
-use fell_core::{FolderRoles, FolderThread, Message};
+use fell_core::{FolderRole, FolderRoles, FolderThread, Message};
 
 use crate::text_render::{BodyBlock, RenderedBody, render_stored_body};
 
@@ -181,8 +181,12 @@ pub fn fit_recipients(
             .as_ref()
             .map(|bcc| format!(" · {bcc}"))
             .unwrap_or_default();
+        // `q` opens the groups. Its key shows only when they hold more
+        // than the line: names left off, or a Bcc.
         if hidden > 0 {
             format!(" +{hidden} more{bcc} · q")
+        } else if bcc.is_empty() {
+            String::new()
         } else {
             format!("{bcc} · q")
         }
@@ -349,7 +353,7 @@ pub fn draft_rows(drafts: &[DraftSummary]) -> Vec<ThreadRow> {
                 .to
                 .iter()
                 .chain(&draft.cc)
-                .map(|raw| recipient_label(raw))
+                .map(|raw| recipient_label(raw, &draft.known_names))
                 .collect();
             // "to Ada": the column names who a draft is to, not who sent
             // it, as it does for threads.
@@ -397,10 +401,12 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
     let address = |raw: &String| {
         let (name, email) = fell_core::compose::mailbox_parts(raw)
             .unwrap_or_else(|| (None, raw.trim().to_string()));
-        // The name the draft gives, or else the address, as the row and the
-        // compose window's To line show it: never the bare local part.
+        // The name the draft gives, or the one the mailbox knows from mail
+        // the address sent, or else the address, as the row shows it:
+        // never the bare local part.
         let name = name
             .filter(|name| !name.trim().is_empty())
+            .or_else(|| draft.known_names.get(&email.to_lowercase()).cloned())
             .or_else(|| Some(email.clone()));
         fell_core::Address { name, email }
     };
@@ -450,19 +456,21 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
         // the recipient see it, not as source.
         if !draft.body.trim().is_empty() {
             message.body = RenderedBody {
-                blocks: vec![BodyBlock::Markdown(std::sync::Arc::new(
-                    fell_core::compose::markdown_to_doc(&draft.body),
-                ))],
+                blocks: vec![BodyBlock::Markdown {
+                    doc: std::sync::Arc::new(fell_core::compose::markdown_to_doc(&draft.body)),
+                    agent: !draft.owner.trim().is_empty(),
+                }],
             };
         }
-        message.context = draft_context(draft, now);
+        message.context = draft_context(draft, me, now);
     }
     shown
 }
 
 /// "In reply to Jon · Plans (2d)" or "Forwarding Ada · Q3 (Nov 2)": what a
 /// draft answers, in the compose window's words.
-pub fn draft_context(draft: &DraftSummary, now: i64) -> Option<String> {
+/// A reply to the person's own message says "me", as the list does.
+pub fn draft_context(draft: &DraftSummary, me: &str, now: i64) -> Option<String> {
     let line = |label: &str, who: &str, subject: &str, when: Option<i64>| {
         let who = display_safe(&one_line(who));
         let subject = display_safe(&one_line(subject));
@@ -476,12 +484,23 @@ pub fn draft_context(draft: &DraftSummary, now: i64) -> Option<String> {
         line
     };
     if let Some(parent) = &draft.reply_context {
+        let mine =
+            !me.trim().is_empty() && parent.sender_email.trim().eq_ignore_ascii_case(me.trim());
+        let who = if mine { "me" } else { parent.sender.as_str() };
         return Some(line(
             "In reply to",
-            &parent.sender,
+            who,
             &parent.subject,
             Some(parent.date_unix),
         ));
+    }
+    // The original is gone from the mailbox: its id, as the editor shows.
+    if let Some(id) = draft
+        .in_reply_to
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        return Some(line("In reply to", id, "", None));
     }
     draft.forwarded.as_ref().map(|forward| {
         // The block's Date line is wall-clock time where it was written.
@@ -603,10 +622,16 @@ pub fn display_safe(text: &str) -> String {
 /// gives, or else the address as typed. A name is never made up from the
 /// address: "fell-qa-test" read as "Fell-qa-test" looks chosen, and hides
 /// which address it is.
-fn recipient_label(raw: &str) -> String {
+///
+/// The name the mailbox knows for the address from mail it sent (`known`,
+/// by lowercase address) is a real name, so it shows.
+fn recipient_label(raw: &str, known: &std::collections::BTreeMap<String, String>) -> String {
     match fell_core::compose::mailbox_parts(raw) {
-        Some((Some(name), _)) if !name.trim().is_empty() => one_line(&name),
-        Some((_, email)) => one_line(&email),
+        Some((Some(name), _)) if !name.trim().is_empty() => display_safe(&one_line(&name)),
+        Some((_, email)) => match known.get(&email.to_lowercase()) {
+            Some(name) if !name.trim().is_empty() => display_safe(&one_line(name)),
+            _ => one_line(&email),
+        },
         None => one_line(raw),
     }
 }
@@ -633,7 +658,15 @@ pub fn conversation(
                 folders: message
                     .folders
                     .iter()
-                    .map(|folder| roles.label_among(folder, names))
+                    // A message in Drafts is a draft: "Draft", as a compose
+                    // draft's preview says it.
+                    .map(|folder| {
+                        if roles.is(FolderRole::Drafts, folder) {
+                            "Draft".to_string()
+                        } else {
+                            roles.label_among(folder, names)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" · "),
                 date_unix: message.headers.date_unix,
@@ -1061,20 +1094,48 @@ mod tests {
 
     #[test]
     fn a_draft_row_names_who_it_is_to() {
+        let none = std::collections::BTreeMap::new();
         assert_eq!(
-            recipient_label("Ada Lovelace <ada@example.com>"),
+            recipient_label("Ada Lovelace <ada@example.com>", &none),
             "Ada Lovelace"
         );
         // #160: no name made up from the address.
-        assert_eq!(recipient_label("ada@example.com"), "ada@example.com");
+        assert_eq!(recipient_label("ada@example.com", &none), "ada@example.com");
         assert_eq!(
-            recipient_label("fell-qa-test@example.com"),
+            recipient_label("fell-qa-test@example.com", &none),
             "fell-qa-test@example.com"
         );
         assert_eq!(
-            recipient_label("<j.smith@example.com>"),
+            recipient_label("<j.smith@example.com>", &none),
             "j.smith@example.com"
         );
+    }
+
+    #[test]
+    fn a_draft_names_a_recipient_the_mailbox_knows() {
+        // A name from mail the address sent is real, so it shows; the
+        // address the draft has typed is still what it is sent to.
+        let known: std::collections::BTreeMap<String, String> = [(
+            "ada@example.com".to_string(),
+            "Ada\u{202e} Lovelace".to_string(),
+        )]
+        .into();
+        assert_eq!(recipient_label("Ada@Example.com", &known), "Ada Lovelace");
+        assert_eq!(
+            recipient_label("Countess <ada@example.com>", &known),
+            "Countess",
+            "a name the draft gives wins"
+        );
+        let mut summary = draft("hi\n");
+        summary.to = vec!["ada@example.com".into()];
+        summary.cc = Vec::new();
+        summary.known_names = [("ada@example.com".to_string(), "Ada Lovelace".to_string())].into();
+        let row = &draft_rows(std::slice::from_ref(&summary))[0];
+        assert_eq!(row.spans[0].text, "to Ada Lovelace");
+        let shown = draft_conversation(&summary, "me@example.com", 2_000);
+        let line = shown[0].recipients.as_ref().unwrap();
+        assert!(line.short.contains("Ada Lovelace"), "{line:?}");
+        assert_eq!(shown[0].folders, "Draft");
     }
 
     fn draft(body: &str) -> DraftSummary {
@@ -1091,6 +1152,8 @@ mod tests {
             maybe_sent: false,
             reply_context: None,
             forwarded: None,
+            in_reply_to: None,
+            known_names: Default::default(),
         }
     }
 
@@ -1115,7 +1178,7 @@ mod tests {
     fn a_draft_preview_paints_its_markdown_styled() {
         let shown = draft_conversation(&draft(STYLED), "me@example.com", 2_000);
         let blocks = &shown[0].body.blocks;
-        let [BodyBlock::Markdown(doc)] = blocks.as_slice() else {
+        let [BodyBlock::Markdown { doc, .. }] = blocks.as_slice() else {
             panic!("the draft paints as markdown, not as source text: {blocks:?}");
         };
         assert_eq!(*doc.as_ref(), fell_core::compose::markdown_to_doc(STYLED));
@@ -1171,10 +1234,49 @@ mod tests {
             not_forwarded: None,
         });
         assert_eq!(
-            draft_context(&forward, 2_000).as_deref(),
+            draft_context(&forward, "me@example.com", 2_000).as_deref(),
             Some("Forwarding Ada Lovelace · Budget")
         );
-        assert_eq!(draft_context(&draft("new\n"), 2_000), None);
+        assert_eq!(
+            draft_context(&draft("new\n"), "me@example.com", 2_000),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reply_to_my_own_mail_or_to_mail_that_is_gone_says_so() {
+        let mut mine = draft("more\n");
+        mine.reply_context = Some(fell_core::compose::ReplyContext {
+            sender: "Caleb".into(),
+            sender_email: "Me@Example.com".into(),
+            reply_to: Vec::new(),
+            subject: "Plans".into(),
+            date_unix: 2_000,
+        });
+        let line = draft_context(&mine, "me@example.com", 2_000).unwrap();
+        assert!(line.starts_with("In reply to me · Plans"), "{line}");
+        // The original is not in the mailbox: its id, as the editor shows.
+        let mut gone = draft("hi\n");
+        gone.in_reply_to = Some("<lost\u{202e}@example.com>".into());
+        assert_eq!(
+            draft_context(&gone, "me@example.com", 2_000).as_deref(),
+            Some("In reply to <lost@example.com>")
+        );
+    }
+
+    #[test]
+    fn an_agent_draft_preview_shows_where_links_go() {
+        let mut summary = draft("Please [pay](https://evil.example/login)\n");
+        let agent = |summary: &DraftSummary| {
+            let shown = draft_conversation(summary, "me@example.com", 2_000);
+            match shown[0].body.blocks.as_slice() {
+                [BodyBlock::Markdown { agent, .. }] => *agent,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!agent(&summary));
+        summary.owner = "agent:bot".into();
+        assert!(agent(&summary), "the editor's rule for an agent's draft");
     }
 
     #[test]
@@ -1231,34 +1333,34 @@ mod tests {
 
     #[test]
     fn a_narrow_warning_drops_its_middle_clause_before_its_key() {
-        let notice = "may have been sent  ·  check Sent before sending again  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent";
+        let notice = "May have been sent  ·  check Sent before sending again  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent";
         let width = |text: &str| text.chars().count() as f32;
         let fitted = fit_notice(notice, 60.0, width);
         assert_eq!(
             fitted,
-            "may have been sent  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent"
+            "May have been sent  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent"
         );
         let fitted = fit_notice(notice, 48.0, width);
         assert_eq!(
             fitted,
-            "may have been sent  ·  \u{201c}Budget…\u{201d}  ·  gs sent"
+            "May have been sent  ·  \u{201c}Budget…\u{201d}  ·  gs sent"
         );
         assert!(width(&fitted) <= 48.0);
         // Not one word of the subject fits: it goes, not a stub of it.
         assert_eq!(
             fit_notice(notice, 36.0, width),
-            "may have been sent  ·  gs sent"
+            "May have been sent  ·  gs sent"
         );
     }
 
     #[test]
     fn a_notice_gives_up_whole_words_of_the_subject_first() {
-        let notice = "not sent · \u{201c}Re: Sent copies in the thread\u{201d} · space a r reopen";
+        let notice = "Not sent · \u{201c}Re: Sent copies in the thread\u{201d} · space a r reopen";
         let width = |text: &str| text.chars().count() as f32;
         assert_eq!(fit_notice(notice, 200.0, width), notice);
         assert_eq!(
             fit_notice(notice, 50.0, width),
-            "not sent · \u{201c}Re: Sent copies…\u{201d} · space a r reopen"
+            "Not sent · \u{201c}Re: Sent copies…\u{201d} · space a r reopen"
         );
         // Not even one word fits: the name is cut, the key stays.
         let fitted = fit_notice(notice, 33.0, width);
@@ -1695,6 +1797,17 @@ mod tests {
         let (text, _, hidden) = fit_recipients(&line, |_, _| false);
         assert_eq!(text, "to Ada");
         assert_eq!(hidden, 6);
+    }
+
+    #[test]
+    fn the_q_key_shows_only_when_the_groups_hold_more() {
+        // Quiet: "to Ada · q" said nothing the line did not.
+        let alone = addressed("me@x", &[("Ada", "ada@x")], &[], &[]);
+        let line = recipient_line(&alone, "me@x").unwrap();
+        assert_eq!(fit_recipients(&line, |_, _| true).1, "");
+        let bcc = addressed("me@x", &[("Ada", "ada@x")], &[], &[("Riya", "riya@x")]);
+        let line = recipient_line(&bcc, "me@x").unwrap();
+        assert_eq!(fit_recipients(&line, |_, _| true).1, " · bcc Riya · q");
     }
 
     #[test]

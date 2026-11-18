@@ -405,7 +405,7 @@ impl Inbox {
                 _ => None,
             };
             let mut rows = present::thread_rows(&page.threads, &me);
-            let mut unread = page.unread;
+            let unread = page.unread;
             let drafts = if roles.is(FolderRole::Drafts, &reading) {
                 // Synced drafts name who they are to, and none is unread.
                 let ids: Vec<ThreadId> = page
@@ -416,8 +416,9 @@ impl Inbox {
                 let recipients = store
                     .folder_recipients(&account, &reading, &ids)
                     .unwrap_or_default();
+                // The header shows no count in Drafts; the folder's own
+                // count stays, so leaving Drafts never reads "0 unread".
                 present::address_draft_rows(&mut rows, &recipients, &me);
-                unread = 0;
                 store
                     .unsent_compose_drafts(&account)
                     .map_err(|err| err.to_string())?
@@ -1399,7 +1400,7 @@ impl Inbox {
         };
         // The window takes a moment to appear: say what is coming now.
         if id.is_none() {
-            self.session.show_toast("new draft", false);
+            self.session.show_toast("New draft", false);
         } else {
             let subject = self
                 .session
@@ -1407,7 +1408,7 @@ impl Inbox {
                 .map(|row| row.subject.clone())
                 .unwrap_or_default();
             self.session
-                .show_toast(format!("opening draft \u{201c}{subject}\u{201d}"), false);
+                .show_toast(format!("Opening draft \u{201c}{subject}\u{201d}"), false);
         }
         let notice = self.session.toast_generation();
         if let Some(id) = &id
@@ -1597,6 +1598,7 @@ impl Inbox {
                 draft.from = snap.from;
                 draft.reply_context = snap.reply_context;
                 draft.forwarded = snap.forwarded;
+                draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
                 Some(draft)
             })
             .collect()
@@ -1693,7 +1695,7 @@ impl Inbox {
                 .try_global::<crate::draft_host::AgentDrafts>()
                 .is_some_and(|drafts| drafts.0.reopen_last());
             if !reopened {
-                self.session.show_toast("no agent review to reopen", false);
+                self.session.show_toast("No agent review to reopen", false);
             }
         }
         if step.compose {
@@ -2326,6 +2328,7 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
 
 fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
     let unread = session.unread_threads();
+    let drafts = session.roles.is(FolderRole::Drafts, folder);
     div()
         .h(px(44.))
         .px(px(16.))
@@ -2372,7 +2375,7 @@ fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
                 })),
         )
         // Drafts are not mail to read: no count there.
-        .when(!session.in_drafts(), |row| {
+        .when(!drafts, |row| {
             row.child(
                 div()
                     .flex_none()
@@ -3474,11 +3477,11 @@ fn body_block(
             .line_height(px(theme.ui_px * 1.45))
             .child(text.clone())
             .into_any_element(),
-        BodyBlock::Markdown(doc) => div()
+        BodyBlock::Markdown { doc, agent } => div()
             .max_w(px(680.))
             .pb(px(8.))
             .line_height(px(theme.ui_px * 1.45))
-            .child(crate::compose_ui::render_draft_doc(doc, theme))
+            .child(crate::compose_ui::render_draft_doc(doc, *agent, theme))
             .into_any_element(),
         BodyBlock::Quote(text) | BodyBlock::Signature(text) => {
             let label = if matches!(block, BodyBlock::Quote(_)) {

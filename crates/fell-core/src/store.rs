@@ -1138,6 +1138,42 @@ impl Store {
         summaries::folder_threads(&self.conn, account_id, folder)
     }
 
+    /// The name each address last sent mail under, by lowercase address,
+    /// for addresses that have sent this account mail with a name. Reads
+    /// the account's latest 20,000 messages at most, newest first.
+    pub fn sender_names(
+        &self,
+        account_id: &AccountId,
+        emails: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let wanted: std::collections::HashSet<String> = emails
+            .iter()
+            .map(|email| email.trim().to_lowercase())
+            .filter(|email| !email.is_empty())
+            .collect();
+        let mut out = std::collections::HashMap::new();
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT from_email, from_name FROM messages
+             WHERE account_id = ?1 AND trim(coalesce(from_name, '')) <> ''
+             ORDER BY date_unix DESC LIMIT 20000",
+        )?;
+        let mut rows = stmt.query(params![account_id.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let email = row.get::<_, String>(0)?.trim().to_lowercase();
+            if wanted.contains(&email) && !out.contains_key(&email) {
+                let name: String = row.get(1)?;
+                out.insert(email, name.trim().to_string());
+                if out.len() == wanted.len() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Who each thread's latest message in `folder` is addressed to: its To,
     /// then its Cc. The Drafts list names a synced draft by who it is to, as
     /// it does a compose draft. A thread with no message in the folder is
@@ -3863,6 +3899,37 @@ mod tests {
         let plan = plan.join("\n");
         assert!(plan.contains("idx_messages_thread_date"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn a_sender_is_named_as_their_latest_mail_names_them() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut old = msg("old@x", None, None, "One", "first");
+        old.headers.from = Address {
+            name: Some("Ada L".into()),
+            email: "Ada@X".into(),
+        };
+        old.headers.date_unix = 10;
+        store.upsert_message(&old).unwrap();
+        let mut new = msg("new@x", None, None, "Two", "second");
+        new.headers.from = Address {
+            name: Some("Ada Lovelace".into()),
+            email: "ada@x".into(),
+        };
+        new.headers.date_unix = 20;
+        store.upsert_message(&new).unwrap();
+        let mut unnamed = msg("bare@x", None, None, "Three", "third");
+        unnamed.headers.from = Address {
+            name: None,
+            email: "sam@x".into(),
+        };
+        store.upsert_message(&unnamed).unwrap();
+        let names = store
+            .sender_names(&AccountId("a1".into()), &["ADA@x".into(), "sam@x".into()])
+            .unwrap();
+        assert_eq!(names.get("ada@x").map(String::as_str), Some("Ada Lovelace"));
+        assert_eq!(names.get("sam@x"), None, "no name is made up");
     }
 
     #[test]

@@ -50,6 +50,11 @@ pub struct DraftSummary {
     pub reply_context: Option<super::ReplyContext>,
     /// Whose message a forward passes on.
     pub forwarded: Option<super::reply::ForwardSummary>,
+    /// The Message-ID a reply answers, shown when the original is gone.
+    pub in_reply_to: Option<String>,
+    /// Names the mailbox already has for the draft's recipients, from mail
+    /// they sent, by lowercase address. A name is never made up.
+    pub known_names: std::collections::BTreeMap<String, String>,
 }
 
 /// Agent hunks waiting for review, and the serialized draft their byte
@@ -463,13 +468,15 @@ impl Store {
                     maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
                     reply_context: None,
                     forwarded: None,
+                    in_reply_to: None,
+                    known_names: Default::default(),
                 },
             ))
         })?;
         let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         // The drafts list is short; each reply reads its original as the
         // compose window does, so the two say the same thing.
-        Ok(rows
+        let mut drafts: Vec<DraftSummary> = rows
             .into_iter()
             .map(|(in_reply_to, quote_text, mut draft)| {
                 if !in_reply_to.trim().is_empty() {
@@ -477,11 +484,32 @@ impl Store {
                         .message_summary(account_id, &crate::MessageId::new(in_reply_to.trim()))
                         .ok()
                         .flatten();
+                    draft.in_reply_to = Some(in_reply_to.trim().to_string());
                 }
                 draft.forwarded = super::reply::forward_summary(&quote_text);
                 draft
             })
-            .collect())
+            .collect();
+        let emails: Vec<String> = drafts
+            .iter()
+            .flat_map(|draft| draft.to.iter().chain(&draft.cc).chain(&draft.bcc))
+            .filter_map(|raw| super::email_of(raw))
+            .collect();
+        let names = self.sender_names(account_id, &emails).unwrap_or_default();
+        for draft in &mut drafts {
+            draft.known_names = draft
+                .to
+                .iter()
+                .chain(&draft.cc)
+                .chain(&draft.bcc)
+                .filter_map(|raw| super::email_of(raw))
+                .filter_map(|email| {
+                    let email = email.to_lowercase();
+                    names.get(&email).map(|name| (email, name.clone()))
+                })
+                .collect();
+        }
+        Ok(drafts)
     }
 
     pub fn compose_owner(&self, id: &str) -> Result<Option<String>> {
@@ -981,8 +1009,16 @@ mod tests {
             (summary.sender.as_str(), summary.subject.as_str()),
             ("Ada Lovelace", "Q3")
         );
-        // The original is no longer in the mailbox: nothing to name.
+        // The original is no longer in the mailbox: nothing to name, but
+        // its id still says it is a reply.
         assert_eq!(find("gone").reply_context, None);
+        assert_eq!(find("gone").in_reply_to.as_deref(), Some("missing@x"));
+        assert_eq!(find("forward").in_reply_to, None);
+        // Jon sent mail with his name, so the drafts list knows it.
+        assert_eq!(
+            reply.known_names.get("jon@x").map(String::as_str),
+            Some("Jon")
+        );
     }
     use crate::{Account, BackendKind};
 

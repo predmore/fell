@@ -453,7 +453,7 @@ mod tests {
         assert!(!end.sent);
         let notices = hub.take_notices();
         let (line, warn) = &notices[0];
-        assert!(line.starts_with("may have been sent"), "{notices:?}");
+        assert!(line.starts_with("May have been sent"), "{notices:?}");
         assert!(line.contains("check Sent before sending again"), "{line}");
         assert!(line.contains("Lunch"), "{line}");
         assert!(*warn, "the inbox shows it in the error colour");

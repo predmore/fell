@@ -41,6 +41,15 @@ type Listener = Box<dyn Fn() -> bool + Send>;
 /// and preview are.
 pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
 
+/// `text` with its first letter upper case.
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
     listeners: Mutex<Vec<Listener>>,
@@ -329,6 +338,8 @@ impl DraftHub {
                 *last = None;
             }
         }
+        // Inbox notices start with a capital, as "Sent “Lunch”" does.
+        let line = sentence_case(&line);
         self.closed.lock().expect("closed").push((line, warn));
         self.emit();
     }
@@ -1220,7 +1231,7 @@ mod tests {
         hub.note_hidden("d1");
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("not sent"), "{lines:?}");
+        assert!(lines[0].starts_with("Not sent"), "{lines:?}");
         assert!(hub.take_closed().is_empty());
     }
 
@@ -1281,7 +1292,7 @@ mod tests {
         hub.note_shown("d1");
         hub.note_hidden("d1");
         let lines = hub.take_closed();
-        assert!(lines[0].starts_with("draft saved"), "{lines:?}");
+        assert!(lines[0].starts_with("Draft saved"), "{lines:?}");
         assert!(lines[0].ends_with("gd drafts"), "{lines:?}");
     }
 
@@ -1308,13 +1319,13 @@ mod tests {
     }
 
     #[test]
-    fn a_late_send_that_may_have_gone_out_is_a_lowercase_warning() {
+    fn a_late_send_that_may_have_gone_out_is_a_warning() {
         let hub = hub_with_d1("late");
         hub.report_send("d1", Some(MAYBE_SENT_NOTICE));
         let notices = hub.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         let (line, warn) = &notices[0];
-        assert!(line.starts_with("may have been sent"), "{line}");
+        assert!(line.starts_with("May have been sent"), "{line}");
         assert!(line.contains("\u{201c}Hi\u{201d}"), "{line}");
         assert!(*warn, "a possible double send is shown as a warning");
         // A draft simply left unsent is news, not a warning.
@@ -1322,7 +1333,7 @@ mod tests {
         let notices = hub.take_notices();
         assert_eq!(
             notices[0].0,
-            "not sent  ·  \u{201c}Hi\u{201d}  ·  gd drafts"
+            "Not sent  ·  \u{201c}Hi\u{201d}  ·  gd drafts"
         );
         assert!(!notices[0].1);
     }
