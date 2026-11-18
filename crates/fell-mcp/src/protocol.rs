@@ -935,6 +935,14 @@ mod tests {
 
     #[test]
     fn request_send_and_draft_edits_never_transmit() {
+        // The draft tools fall back to the default mailbox path, so on a
+        // machine with real mail this test would open it.
+        if fell_core::test_support::skip_unless_available(
+            "request_send_and_draft_edits_never_transmit",
+            fell_core::test_support::real_mailbox_present(),
+        ) {
+            return;
+        }
         let (mut session, _) = session_with(AgentGrant::enabled(true, true, true), "bot");
         init(&mut session);
         let created = tool_json(&call(

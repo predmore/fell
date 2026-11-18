@@ -19,6 +19,8 @@ pub mod send;
 mod smtp;
 pub mod store;
 pub mod sync;
+#[doc(hidden)]
+pub mod test_support;
 pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};

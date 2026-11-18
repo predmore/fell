@@ -1100,6 +1100,9 @@ fn canonical_wal_has_frames(canonical: &Path) -> bool {
 
 fn open_mailbox_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Wait for other writers from the first statement on, including the
+    // journal mode below, not only after `from_connection` sets it.
+    conn.busy_timeout(Duration::from_secs(5))?;
     // The UI and `fell-mcp` share this file. WAL lets a reader run beside a writer.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
@@ -1972,7 +1975,7 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             }
             drop(stmt);
         }
-        let tx = conn.unchecked_transaction()?;
+        let tx = begin_immediate(conn)?;
         for message in &batch {
             let fingerprint = message_fingerprint(message);
             let Some((stored, via_alias)) =
@@ -2582,7 +2585,7 @@ fn backfill_fingerprints(conn: &Connection) -> Result<()> {
         if batch.is_empty() {
             break;
         }
-        let tx = conn.unchecked_transaction()?;
+        let tx = begin_immediate(conn)?;
         for (rowid, body) in &batch {
             after = *rowid;
             let fingerprint = fingerprint_of(body.as_deref());
@@ -2849,6 +2852,18 @@ pub(crate) fn ensure_triggers(
 
 /// Write lock from the first statement, so an embedding commit cannot
 /// invalidate a snapshot this transaction already read.
+/// A plain transaction that takes the write lock up front.
+///
+/// A deferred transaction that reads and then writes cannot wait for
+/// another writer: in WAL mode SQLite answers the upgrade with "database is
+/// locked" at once, ignoring the busy timeout. Opening the mailbox while the
+/// indexer, sync, or `fell-mcp` was writing failed that way. Starting with
+/// `BEGIN IMMEDIATE` lets the busy timeout apply. Use it for writes that run
+/// before the summary tables exist; later writes use [`immediate_transaction`].
+pub(crate) fn begin_immediate(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
 pub(crate) fn immediate_transaction(conn: &Connection) -> Result<WriteTx<'_>> {
     rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map(WriteTx)
@@ -2882,7 +2897,7 @@ fn ensure_fts(conn: &Connection) -> Result<()> {
     // Drop, create, and copy commit together. A killed process rolls the
     // upgrade back, so the next open tries again instead of keeping an empty
     // index whose columns merely look current.
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_immediate(conn)?;
     let have = column_names(&tx, "messages_fts")?;
     let needed = [
         "subject",
@@ -6555,5 +6570,48 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod open_while_writing {
+    /// Opens of one mailbox from several threads, beside a held store whose
+    /// indexer writes, all succeed. Each open runs schema checks that write;
+    /// a deferred transaction there failed at once with "database is locked"
+    /// instead of waiting, about one open in five.
+    #[test]
+    fn concurrent_opens_wait_instead_of_failing() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-open-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mail.db");
+        let _held = super::Store::open(&db).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    (0..15)
+                        .filter_map(|_| super::Store::open(&db).err().map(|err| err.to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let failures: Vec<String> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
