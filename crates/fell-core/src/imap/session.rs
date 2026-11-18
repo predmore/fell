@@ -1,5 +1,6 @@
 //! Blocking IMAP session. Read-only commands only: CAPABILITY, STARTTLS,
 //! LOGIN, LIST, EXAMINE, FETCH, UID FETCH, UID SEARCH, ENABLE, IDLE, LOGOUT.
+//! The write-back outbox moves mail on a separate [`writes::WriteSession`].
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -18,6 +19,9 @@ use crate::Error;
 use super::ImapConfig;
 use super::ImapSecurity;
 use super::utf7::decode_modified_utf7;
+
+mod writes;
+pub(super) use writes::{Placed, WriteError, WriteSession};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 

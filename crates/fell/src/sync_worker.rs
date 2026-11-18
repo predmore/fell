@@ -7,14 +7,20 @@
 //! server without IDLE falls back to the timer. The window never waits on
 //! it: status arrives on an async channel, and the window rereads the store
 //! on its own store thread.
+//!
+//! With `write_back = true` in `account.toml`, each pass first sends the
+//! archive and move rows the window queued, on a separate `SELECT` session
+//! ([`AccountConfig::replay_outbox`]). The window asks for that right after
+//! an archive, move, or undo. A move the server will never get is reported
+//! once, for the status bar.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, InboxWait, Store, SyncFailureKind, classify_sync_error,
-    fetch_missing_bodies, sync_with_progress,
+    Account, AccountConfig, BackendKind, DropReason, InboxWait, ReplayReport, Store,
+    SyncFailureKind, classify_sync_error, fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
@@ -42,18 +48,70 @@ const OPEN_RETRIES_BEFORE_ERROR: usize = 3;
 /// after a pass. A request for a pass is checked between batches.
 const BODY_BATCHES_AFTER_PASS: usize = 5;
 
-/// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean the
-/// store has new rows.
-pub type SyncEvent = SyncKind;
+/// What the sync thread tells the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncEvent {
+    /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean
+    /// the store has new rows.
+    Status(SyncKind),
+    /// Moves the server will never get. The change stays in Fell.
+    NotSent(NotSent),
+}
+
+/// The first reason in a replay's dropped moves, and how many rows it
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotSent {
+    pub reason: DropReason,
+    /// The folder the messages were to leave on the server.
+    pub folder: String,
+    pub count: usize,
+}
+
+impl NotSent {
+    fn from_report(report: &ReplayReport) -> Option<Self> {
+        let first = report.dropped.first()?;
+        let count = report
+            .dropped
+            .iter()
+            .filter(|dropped| dropped.reason == first.reason)
+            .count();
+        Some(Self {
+            reason: first.reason,
+            folder: first.source_folder.clone(),
+            count,
+        })
+    }
+}
+
+/// Why the window woke the sync thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// `space s`: a pass now, shown as connecting.
+    Sync,
+    /// Archive, move, or undo was queued for the server: send it now,
+    /// quietly.
+    WriteBack,
+}
 
 pub struct SyncHandle {
-    wake: Sender<()>,
+    wake: Sender<Ask>,
+    /// `write_back` in the account file.
+    write_back: bool,
 }
 
 impl SyncHandle {
     /// Start the next pass now. A pass already running finishes first.
     pub fn sync_now(&self) {
-        let _ = self.wake.send(());
+        let _ = self.wake.send(Ask::Sync);
+    }
+
+    /// Send queued archive and move rows now, then run a pass, without
+    /// showing "connecting". Nothing is queued while write-back is off.
+    pub fn write_back_now(&self) {
+        if self.write_back {
+            let _ = self.wake.send(Ask::WriteBack);
+        }
     }
 }
 
@@ -63,21 +121,22 @@ pub fn start(
 ) -> (SyncHandle, UnboundedReceiver<SyncEvent>) {
     let (events_tx, events) = unbounded();
     let (wake, wake_rx) = mpsc::channel();
+    let write_back = config.write_back;
     std::thread::Builder::new()
         .name("fell-sync".into())
         .spawn(move || run(config, store_path, events_tx, wake_rx))
         .expect("spawn sync thread");
-    (SyncHandle { wake }, events)
+    (SyncHandle { wake, write_back }, events)
 }
 
 fn run(
     config: AccountConfig,
     store_path: PathBuf,
     events: UnboundedSender<SyncEvent>,
-    wake: Receiver<()>,
+    wake: Receiver<Ask>,
 ) {
     let bridge = config.backend == BackendKind::Bridge;
-    let send = |kind: SyncKind| events.unbounded_send(kind).is_ok();
+    let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
     let failed = |kind: SyncFailureKind, detail: String| {
         SyncKind::Failed(SyncFailure {
             kind,
@@ -109,7 +168,7 @@ fn run(
                     return;
                 }
                 match wake.recv_timeout(delay) {
-                    Ok(()) | Err(RecvTimeoutError::Timeout) => continue,
+                    Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -120,6 +179,14 @@ fn run(
     // Cleared for good once the server says it has no IDLE.
     let mut idle = true;
     loop {
+        // Moves go first, so the pass that follows sees where they landed.
+        // A failure here is a connection problem the pass reports.
+        if let Ok(report) = config.replay_outbox(&store)
+            && let Some(not_sent) = NotSent::from_report(&report)
+            && events.unbounded_send(SyncEvent::NotSent(not_sent)).is_err()
+        {
+            return;
+        }
         let mut alive = true;
         let mut last_progress: Option<Instant> = None;
         let mut batches = 0usize;
@@ -171,9 +238,12 @@ fn run(
             _ => wait_on_timer(&wake, delay),
         };
         match woke {
-            Woke::Asked => {
-                while wake.try_recv().is_ok() {}
-                if !send(SyncKind::Connecting) {
+            Woke::Asked(ask) => {
+                let mut shown = ask == Ask::Sync;
+                while let Ok(more) = wake.try_recv() {
+                    shown |= more == Ask::Sync;
+                }
+                if shown && !send(SyncKind::Connecting) {
                     return;
                 }
             }
@@ -190,14 +260,14 @@ fn fill_old_bodies(
     config: &AccountConfig,
     store: &Store,
     account: &Account,
-    wake: &Receiver<()>,
+    wake: &Receiver<Ask>,
 ) -> Option<Woke> {
     let Ok(backend) = config.backend() else {
         return None;
     };
     for _ in 0..BODY_BATCHES_AFTER_PASS {
         match wake.try_recv() {
-            Ok(()) => return Some(Woke::Asked),
+            Ok(ask) => return Some(Woke::Asked(ask)),
             Err(TryRecvError::Disconnected) => return Some(Woke::Closed),
             Err(TryRecvError::Empty) => {}
         }
@@ -213,7 +283,7 @@ fn fill_old_bodies(
 #[derive(Debug, PartialEq, Eq)]
 enum Woke {
     /// The window asked for a pass now.
-    Asked,
+    Asked(Ask),
     /// IDLE saw INBOX change.
     Mail,
     Timer,
@@ -221,9 +291,9 @@ enum Woke {
     Closed,
 }
 
-fn wait_on_timer(wake: &Receiver<()>, delay: Duration) -> Woke {
+fn wait_on_timer(wake: &Receiver<Ask>, delay: Duration) -> Woke {
     match wake.recv_timeout(delay) {
-        Ok(()) => Woke::Asked,
+        Ok(ask) => Woke::Asked(ask),
         Err(RecvTimeoutError::Timeout) => Woke::Timer,
         Err(RecvTimeoutError::Disconnected) => Woke::Closed,
     }
@@ -237,17 +307,17 @@ fn wait_on_inbox(
     store: &Store,
     account: &Account,
     delay: Duration,
-    wake: &Receiver<()>,
+    wake: &Receiver<Ask>,
     idle: &mut bool,
 ) -> Woke {
     let started = Instant::now();
     let cursor = store.sync_cursor(&account.id).ok().flatten();
-    let mut asked = false;
+    let mut asked = None;
     let mut closed = false;
     let outcome = config.backend().and_then(|backend| {
         backend.wait_for_change(cursor.as_ref(), delay, &mut || match wake.try_recv() {
-            Ok(()) => {
-                asked = true;
+            Ok(ask) => {
+                asked = Some(ask);
                 true
             }
             Err(TryRecvError::Disconnected) => {
@@ -260,8 +330,8 @@ fn wait_on_inbox(
     if closed {
         return Woke::Closed;
     }
-    if asked {
-        return Woke::Asked;
+    if let Some(ask) = asked {
+        return Woke::Asked(ask);
     }
     match outcome {
         Ok(InboxWait::Changed) => Woke::Mail,

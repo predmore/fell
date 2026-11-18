@@ -1,4 +1,5 @@
-//! In-process IMAP server for tests. Speaks the read-only subset the client uses.
+//! In-process IMAP server for tests. Speaks the read-only subset the client
+//! uses, plus the write-back verbs in [`writes`] when a test turns them on.
 //!
 //! Tests change the mailboxes between syncs to stand in for the server: a
 //! message dropped from `messages` was expunged, one pushed with a new UID
@@ -11,6 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+mod writes;
+pub(super) use writes::WriteFixture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum BodyForm {
@@ -98,6 +102,8 @@ pub(super) struct TestServer {
     pub state: Arc<Mutex<TestState>>,
     /// Bytes the server has written to clients, greetings and replies alike.
     pub sent: Arc<AtomicUsize>,
+    /// Write verbs, for the outbox tests. Off by default.
+    pub writes: Arc<Mutex<WriteFixture>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -109,16 +115,25 @@ impl TestServer {
         let state = Arc::new(Mutex::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(Mutex::new(WriteFixture::default()));
         let thread_state = Arc::clone(&state);
+        let thread_writes = Arc::clone(&writes);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_sent = Arc::clone(&sent);
         let thread = thread::spawn(move || {
-            accept_loop(listener, thread_state, thread_shutdown, thread_sent)
+            accept_loop(
+                listener,
+                thread_state,
+                thread_writes,
+                thread_shutdown,
+                thread_sent,
+            )
         });
         Self {
             addr,
             state,
             sent,
+            writes,
             shutdown,
             thread: Some(thread),
         }
@@ -138,6 +153,7 @@ impl Drop for TestServer {
 fn accept_loop(
     listener: TcpListener,
     state: Arc<Mutex<TestState>>,
+    writes: Arc<Mutex<WriteFixture>>,
     shutdown: Arc<AtomicBool>,
     sent: Arc<AtomicUsize>,
 ) {
@@ -154,7 +170,7 @@ fn accept_loop(
                 // As long as the client's own timeout: a large fetch on a
                 // loaded machine can still be persisting when the reply ends.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-                handle(stream, &state, &sent);
+                handle(stream, &state, &writes, &sent);
             }
             Err(_) => break,
         }
@@ -179,7 +195,12 @@ impl Write for Counted {
     }
 }
 
-fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsize>) {
+fn handle(
+    stream: TcpStream,
+    state: &Arc<Mutex<TestState>>,
+    writes: &Arc<Mutex<WriteFixture>>,
+    sent: &Arc<AtomicUsize>,
+) {
     let mut write = Counted {
         stream: stream.try_clone().expect("clone"),
         sent: Arc::clone(sent),
@@ -214,9 +235,12 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
             }
         }
         let verb_upper = verb.to_ascii_uppercase();
+        if authed && writes::handle(&tag, &verb_upper, &rest, state, writes, &mut write) {
+            continue;
+        }
         match verb_upper.as_str() {
             "CAPABILITY" => {
-                let caps = capability_text(&state.lock().expect("state"));
+                let caps = capability_text(&state.lock().expect("state")) + &writes::caps(writes);
                 let _ = write.write_all(
                     format!("* CAPABILITY {caps}\r\n{tag} OK CAPABILITY\r\n").as_bytes(),
                 );
@@ -288,7 +312,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
                     );
                 } else if user == guard.username && pass == guard.password {
                     authed = true;
-                    let caps = capability_text(&guard);
+                    let caps = capability_text(&guard) + &writes::caps(writes);
                     let _ = write
                         .write_all(format!("{tag} OK [CAPABILITY {caps}] LOGIN\r\n").as_bytes());
                 } else {
@@ -851,13 +875,19 @@ fn parse_uid_fetch(rest: &str, state: &TestState) -> Option<(String, Option<u64>
     Some((range.to_string(), changed, mailbox))
 }
 
+/// The mailbox the last EXAMINE or SELECT opened.
 fn last_examined(commands: &[String]) -> Option<String> {
     for command in commands.iter().rev() {
         let upper = command.to_ascii_uppercase();
-        let Some(index) = upper.find(" EXAMINE ") else {
+        let Some(index) = upper.find(" EXAMINE ").or_else(|| upper.find(" SELECT ")) else {
             continue;
         };
-        return Some(mailbox_name(command[index + " EXAMINE ".len()..].trim()));
+        let verb_len = if upper[index..].starts_with(" EXAMINE ") {
+            " EXAMINE ".len()
+        } else {
+            " SELECT ".len()
+        };
+        return Some(mailbox_name(command[index + verb_len..].trim()));
     }
     None
 }

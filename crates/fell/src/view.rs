@@ -5,7 +5,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fell_core::{AccountConfig, AccountId, FolderRole, FolderRoles, FolderSpan, ListKey, ThreadId};
+use fell_core::{
+    AccountConfig, AccountId, DropReason, FolderRole, FolderRoles, FolderSpan, ListKey, ThreadId,
+};
 use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
@@ -125,6 +127,25 @@ type ThreadsResult = Result<ListRead, String>;
 
 /// What the inbox says while a reply or forward's window comes up:
 /// "reply all · Jon".
+/// One line for moves the server will never get. The change stays in Fell,
+/// and no key would fix it, so none is shown.
+fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String {
+    let folder = session.folder_text(&not_sent.folder);
+    let messages = if not_sent.count == 1 {
+        "1 message".to_string()
+    } else {
+        format!("{} messages", not_sent.count)
+    };
+    match not_sent.reason {
+        DropReason::FolderReset => {
+            format!("{folder} was reset on the server; {messages} moved only in Fell")
+        }
+        DropReason::Refused => format!("The server refused to move {messages}"),
+        DropReason::NotFound => format!("{messages} not found in {folder} on the server"),
+        DropReason::NoMove => "This server can't move mail; moves stay in Fell".to_string(),
+    }
+}
+
 fn reply_notice(kind: ReplyKind, sender: &str) -> String {
     format!("{}{sender}", reply_notice_prefix(kind))
 }
@@ -333,9 +354,18 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            while let Some(kind) = events.next().await {
+            while let Some(event) = events.next().await {
                 let alive = this
                     .update(cx, |inbox, cx| {
+                        let kind = match event {
+                            sync_worker::SyncEvent::Status(kind) => kind,
+                            sync_worker::SyncEvent::NotSent(not_sent) => {
+                                let text = not_sent_notice(&inbox.session, &not_sent);
+                                inbox.session.show_toast(text, true);
+                                cx.notify();
+                                return;
+                            }
+                        };
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
                             || matches!(kind, SyncKind::Synced { stored, .. } if stored > 0);
                         inbox.session.sync = kind;
@@ -1253,6 +1283,7 @@ impl Inbox {
                     inbox.pending_removals.remove(&id);
                     inbox.moved_thread = key;
                     inbox.session.show_toast("Archived · u", false);
+                    inbox.send_to_server();
                     Some(ReadIntent {
                         changed: true,
                         ..ReadIntent::default()
@@ -1299,6 +1330,7 @@ impl Inbox {
                     inbox.moved_thread = key;
                     let label = inbox.session.folder_text(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
+                    inbox.send_to_server();
                     Some(ReadIntent {
                         changed: true,
                         ..ReadIntent::default()
@@ -1316,6 +1348,14 @@ impl Inbox {
             },
             cx,
         );
+    }
+
+    /// Archive, move, and undo may have queued a server move: send it now
+    /// rather than at the next pass.
+    fn send_to_server(&self) {
+        if let Some(sync) = &self.sync {
+            sync.write_back_now();
+        }
     }
 
     /// Remove `id` from the rows on screen before its write lands and open
@@ -1350,6 +1390,7 @@ impl Inbox {
             |inbox, result| match result {
                 Ok(()) => {
                     inbox.session.show_toast("Undone", false);
+                    inbox.send_to_server();
                     Some(ReadIntent {
                         changed: true,
                         select: inbox.moved_thread.take(),
@@ -4254,7 +4295,9 @@ impl<T: Styled> FontOpt for T {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIST_BORDER_PX, ctrl_letter, key_from, should_follow_visible, unread_bar_dx};
+    use super::{
+        LIST_BORDER_PX, ctrl_letter, key_from, not_sent_notice, should_follow_visible, unread_bar_dx,
+    };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
     use crate::motion;
@@ -4401,6 +4444,47 @@ mod tests {
                 Pane::List,
                 KeyId::Char(key)
             ));
+        }
+    }
+
+    #[test]
+    fn moves_the_server_will_not_get_say_so_in_one_line() {
+        use crate::keymap::Keymap;
+        use crate::model::{Session, SyncKind};
+        use crate::sync_worker::NotSent;
+        use fell_core::DropReason;
+
+        let session = Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        let notice = |reason, count| {
+            not_sent_notice(
+                &session,
+                &NotSent {
+                    reason,
+                    folder: "INBOX".into(),
+                    count,
+                },
+            )
+        };
+        assert_eq!(
+            notice(DropReason::FolderReset, 1),
+            "Inbox was reset on the server; 1 message moved only in Fell"
+        );
+        assert_eq!(
+            notice(DropReason::Refused, 3),
+            "The server refused to move 3 messages"
+        );
+        assert_eq!(
+            notice(DropReason::NotFound, 1),
+            "1 message not found in Inbox on the server"
+        );
+        for reason in [
+            DropReason::FolderReset,
+            DropReason::Refused,
+            DropReason::NotFound,
+            DropReason::NoMove,
+        ] {
+            let text = notice(reason, 2);
+            assert!(!text.contains('\n') && text.chars().count() <= 64, "{text}");
         }
     }
 }
