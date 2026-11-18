@@ -1516,7 +1516,9 @@ fn message_block(
 ) -> gpui::AnyElement {
     let cursor = session.message_cursor == index && session.pane == Pane::Conversation;
     if message.expanded {
-        expanded_message(theme, session, message, index, cursor, cx)
+        expanded_message(
+            theme, session, message, index, cursor, conv_width, window, cx,
+        )
     } else {
         collapsed_message(theme, message, index, cursor, conv_width, window, cx)
     }
@@ -1606,12 +1608,15 @@ fn collapsed_message(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expanded_message(
     theme: &Theme,
     session: &Session,
     message: &ConvMessage,
     index: usize,
     cursor: bool,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let quotes = session.is_open(index);
@@ -1672,7 +1677,8 @@ fn expanded_message(
                 ),
         )
         .children(message.recipients.as_ref().map(|line| {
-            recipient_lines(theme, line, session.recipients_are_open(index), index, cx)
+            let open = session.recipients_are_open(index);
+            recipient_lines(theme, line, open, index, conv_width, window, cx)
         }))
         .children({
             // `q` opens every collapsed block in the message at once, so
@@ -1698,11 +1704,14 @@ fn expanded_message(
 /// Who else got the message, under its sender. Closed: one line of names
 /// that never wraps, then "+N more" and the key. Open (`q`, or a click): a
 /// row per group with every address.
+#[allow(clippy::too_many_arguments)]
 fn recipient_lines(
     theme: &Theme,
     line: &present::RecipientLine,
     open: bool,
     index: usize,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let toggle = cx.listener(move |inbox, _, window, cx| {
@@ -1732,7 +1741,12 @@ fn recipient_lines(
                     )
                     .child({
                         // One run of text, so a long list wraps like prose.
-                        let mut text = group.people.join(", ");
+                        let mut text = group
+                            .people
+                            .iter()
+                            .map(|person| person.replace(' ', "\u{a0}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let mut marks = Vec::new();
                         if group.only_you {
                             text.push_str("   ");
@@ -1756,6 +1770,7 @@ fn recipient_lines(
                             )
                     })
             }))
+            .child(div().text_color(rgb(theme.dimmed)).child("q to hide"))
     } else {
         // Only the names give way to an ellipsis; the count and the key
         // always show. The text takes the box's colour, so hover reaches it.
@@ -1764,13 +1779,17 @@ fn recipient_lines(
         } else {
             " · q for addresses".to_string()
         };
+        // Measured, like the thread list: the names get a real ellipsis and
+        // the count and key always fit after them.
+        let room = (conv_width - 48.0).min(680.0) - line_px(window, &tail, FontWeight::NORMAL);
+        let names = clip_line(window, &line.short, room.max(48.0), FontWeight::NORMAL);
         div()
             .flex()
             .min_w(px(0.))
             .text_color(rgb(theme.dimmed))
             .hover(|style| style.text_color(rgb(theme.foreground)))
-            .child(div().min_w(px(0.)).truncate().child(line.short.clone()))
-            .child(div().flex_shrink_0().child(tail))
+            .child(div().whitespace_nowrap().child(names))
+            .child(div().flex_shrink_0().whitespace_nowrap().child(tail))
     };
     div()
         .id(gpui::ElementId::named_usize("recipients", index))
