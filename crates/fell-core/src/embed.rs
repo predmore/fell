@@ -1,14 +1,26 @@
 //! Local embedding index for message bodies.
 //!
 //! Each message stores one vector in `message_embeddings`, in the same SQLite
-//! file as the mailbox and keyed by account. The active embedder is
-//! [`LocalHashV1`]. That is a placeholder: a lexical feature hash, not a
-//! semantic model. There is no weight file and no network call.
+//! file as the mailbox and keyed by account.
 //!
-//! Vectors store the embedder's model id and version. [`spawn_indexer`]
-//! replaces rows whose id or version differs, recent mail first, on a
-//! background thread. Opening the store, listing threads, and
-//! [`crate::Store::search`] do not compute vectors. This is not semantic search.
+//! Which embedder fills it depends on what is on disk:
+//!
+//! - By default it is [`LocalHashV1`], a lexical feature hash. No weight file
+//!   and no network call.
+//! - After `fell embeddings install` has downloaded and checked the pinned
+//!   [`MINILM_L6_V2_INT8`] files, the indexer loads them with tract and stores
+//!   `all-MiniLM-L6-v2` sentence vectors instead ([`OnnxEmbedder`]).
+//!
+//! Nothing in this module downloads. The indexer only looks for files that
+//! are already installed, and falls back to the placeholder when they are
+//! missing or fail their SHA-256 check.
+//!
+//! Vectors store the embedder's model id and version. The background indexer
+//! replaces rows whose id, version, or length differs, recent mail first, in
+//! small batches on a background thread. Switching models therefore rewrites
+//! the whole index there. Opening the store, listing threads, and
+//! [`crate::Store::search`] do not compute vectors, and search stays keyword
+//! search: nothing reads these vectors to rank results yet.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -22,9 +34,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Error, Result};
 
+mod model_files;
+mod onnx;
+mod wordpiece;
+
+pub use model_files::{
+    Fetch, LocalModel, MINILM_L6_V2_INT8, ModelError, ModelFile, default_models_dir, install_model,
+    installed_model_dir, model_dir, remove_model, verify_installed,
+};
+pub use onnx::OnnxEmbedder;
+
 /// Placeholder model id. This is a lexical feature hash, not a semantic model.
 ///
-/// A real local model replaces this id. The indexer then rewrites stored rows.
+/// It stays the active id until the local model is installed (see
+/// [`MINILM_L6_V2_INT8`]). The indexer rewrites stored rows when that changes.
 pub const EMBEDDING_MODEL: &str = "local-hash-v1";
 
 /// Placeholder version stored beside [`EMBEDDING_MODEL`].
@@ -47,7 +70,8 @@ pub struct EmbedderId {
 /// Turns one message body into a vector.
 ///
 /// The index stores [`BodyEmbedder::id`] with the bytes. A new id or version
-/// makes the background indexer replace those rows.
+/// makes the background indexer replace those rows. `embed` returns exactly
+/// [`BodyEmbedder::dims`] values.
 pub trait BodyEmbedder {
     fn id(&self) -> EmbedderId;
     fn dims(&self) -> usize;
@@ -91,8 +115,61 @@ impl BodyEmbedder for LocalHashV1 {
     }
 }
 
-fn active_embedder() -> LocalHashV1 {
-    LocalHashV1
+/// The embedder the background indexer uses for one mailbox.
+///
+/// `models_root` is resolved on the thread that opens the store. Loading, and
+/// the SHA-256 check that comes with it, happen on the indexer thread.
+#[derive(Debug, Clone)]
+pub(crate) struct EmbedderSource {
+    models_root: Option<std::path::PathBuf>,
+    model: &'static LocalModel,
+}
+
+impl EmbedderSource {
+    fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(source) = TEST_SOURCE.with(|cell| cell.borrow().clone()) {
+            return source;
+        }
+        Self {
+            models_root: default_models_dir(),
+            model: &MINILM_L6_V2_INT8,
+        }
+    }
+
+    /// The installed model, else the placeholder. Never fetches.
+    fn load(&self) -> Box<dyn BodyEmbedder> {
+        let Some(root) = self.models_root.as_deref() else {
+            return Box::new(LocalHashV1);
+        };
+        let Some(dir) = installed_model_dir(self.model, root) else {
+            return Box::new(LocalHashV1);
+        };
+        match OnnxEmbedder::load(self.model, &dir) {
+            Ok(embedder) => Box::new(embedder),
+            // A file that fails its checksum or does not load keeps the
+            // placeholder. `fell embeddings status` reports why.
+            Err(_) => Box::new(LocalHashV1),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SOURCE: std::cell::RefCell<Option<EmbedderSource>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point the next indexers spawned from this thread at `root` and `model`.
+/// `None` goes back to the default, which in tests is "no model".
+#[cfg(test)]
+pub(crate) fn testing_model_source(source: Option<(std::path::PathBuf, &'static LocalModel)>) {
+    TEST_SOURCE.with(|cell| {
+        *cell.borrow_mut() = source.map(|(root, model)| EmbedderSource {
+            models_root: Some(root),
+            model,
+        });
+    });
 }
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -130,11 +207,12 @@ CREATE TABLE IF NOT EXISTS embedding_queue (
 
 /// Placeholder vector for `body`.
 ///
-/// This is [`LocalHashV1`]: a lexical feature hash, not semantic search.
-/// Tokens are lowercase runs of letters and digits. An empty body is the zero
-/// vector. This does not read the network or a model file.
+/// This is always [`LocalHashV1`]: a lexical feature hash, not semantic
+/// search, whatever model the indexer has loaded. Tokens are lowercase runs of
+/// letters and digits. An empty body is the zero vector. This does not read
+/// the network or a model file.
 pub fn embed_body(body: &str) -> Embedding {
-    let embedder = active_embedder();
+    let embedder = LocalHashV1;
     let id = embedder.id();
     Embedding {
         model: id.model.to_string(),
@@ -204,6 +282,7 @@ impl Indexer {
         let active_thread = Arc::clone(&active);
         let path = path.to_path_buf();
         let abort = abort_this_indexer();
+        let source = EmbedderSource::from_env();
         let thread = thread::Builder::new()
             .name("fell-embeddings".into())
             .spawn(move || {
@@ -222,7 +301,7 @@ impl Indexer {
                     match try_embed_lock(&path) {
                         Ok(Some(lock)) => {
                             active_thread.store(true, Ordering::Relaxed);
-                            index_loop(&path, &stop_thread, &pause_thread);
+                            index_loop(&path, &stop_thread, &pause_thread, &source);
                             active_thread.store(false, Ordering::Relaxed);
                             drop(lock);
                             return;
@@ -384,7 +463,7 @@ fn restrict_lock_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool) {
+fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool, source: &EmbedderSource) {
     let conn = loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -394,6 +473,9 @@ fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool) {
             Err(_) => sleep_unless_stopped(BUSY_RETRY, stop),
         }
     };
+    // Hashing and building the model take a few hundred milliseconds. This
+    // runs here, on the indexer thread, after the lock is ours.
+    let embedder = source.load();
     let mut scan = Scan::default();
     let mut idle = IDLE_MIN;
     while !stop.load(Ordering::Relaxed) {
@@ -401,7 +483,7 @@ fn index_loop(path: &Path, stop: &Arc<AtomicBool>, pause: &AtomicBool) {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
-        let kind = match scan.step(&conn, INDEX_BATCH, Some(stop.as_ref())) {
+        let kind = match scan.step(&conn, INDEX_BATCH, Some(stop.as_ref()), embedder.as_ref()) {
             Ok(IndexStep::Wrote(_)) => AfterBatch::Progress,
             Ok(IndexStep::Idle) => AfterBatch::Idle,
             // Busy and snapshot errors are not an empty index. Retry soon.
@@ -457,8 +539,18 @@ fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
 /// block the UI use [`Indexer`] instead of this function.
 #[cfg(test)]
 pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize> {
+    index_embeddings_with(conn, limit, &LocalHashV1)
+}
+
+/// [`index_embeddings`] with a given embedder.
+#[cfg(test)]
+pub(crate) fn index_embeddings_with(
+    conn: &Connection,
+    limit: usize,
+    embedder: &dyn BodyEmbedder,
+) -> Result<usize> {
     delete_orphans(conn)?;
-    match Scan::default().step(conn, limit, None)? {
+    match Scan::default().step(conn, limit, None, embedder)? {
         IndexStep::Wrote(n) => Ok(n),
         IndexStep::Idle => Ok(0),
     }
@@ -468,44 +560,28 @@ pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize>
 ///
 /// A missing vector is queued too. A date change can move that mail into the
 /// part of the catch-up the walker has already passed. This does not compute
-/// a vector.
+/// a vector, and it does not know which model the indexer has loaded: a row
+/// from another model but the same body is left for the indexer's stale scan.
 pub(crate) fn invalidate_message_embedding(
     conn: &Connection,
     account_id: &str,
     message_id: &str,
     body: &str,
 ) -> Result<()> {
-    let embedder = active_embedder();
-    let id = embedder.id();
     let hash = body_hash(body);
-    let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
-    let expected_bytes = dims.saturating_mul(4);
-    let existing: Option<(String, String, i64, String, i64)> = conn
+    let existing: Option<(i64, String, i64)> = conn
         .query_row(
-            "SELECT model, model_version, dims, body_hash, length(vector)
+            "SELECT dims, body_hash, length(vector)
              FROM message_embeddings
              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((model, version, stored_dims, stored_hash, nbytes)) = existing else {
+    let Some((stored_dims, stored_hash, nbytes)) = existing else {
         return enqueue_message(conn, account_id, message_id);
     };
-    if model == id.model
-        && version == id.version
-        && stored_dims == dims
-        && stored_hash == hash
-        && nbytes == expected_bytes
-    {
+    if stored_hash == hash && nbytes == stored_dims.saturating_mul(4) {
         return Ok(());
     }
     remove_message_embedding(conn, account_id, message_id)?;
@@ -647,13 +723,14 @@ impl Scan {
         conn: &Connection,
         limit: usize,
         stop: Option<&AtomicBool>,
+        embedder: &dyn BodyEmbedder,
     ) -> Result<IndexStep> {
         if limit == 0 {
             return Ok(IndexStep::Idle);
         }
         let queued = select_queued(conn, limit)?;
         if !queued.is_empty() {
-            let wrote = write_batch(conn, &queued, stop)?;
+            let wrote = write_batch(conn, &queued, stop, embedder)?;
             return Ok(IndexStep::Wrote(wrote));
         }
         if let Some(high) = self.high {
@@ -664,9 +741,9 @@ impl Scan {
                 },
                 None => Bound::Newer(high),
             };
-            let newer = select_stale(conn, limit, bound)?;
+            let newer = select_stale(conn, limit, bound, embedder)?;
             if !newer.is_empty() {
-                let wrote = write_batch(conn, &newer, stop)?;
+                let wrote = write_batch(conn, &newer, stop, embedder)?;
                 if newer.len() == limit {
                     self.newer_before = newer.last().map(|row| row.key);
                 } else {
@@ -680,9 +757,9 @@ impl Scan {
             Some(key) => Bound::Older(key),
             None => Bound::Any,
         };
-        let older = select_stale(conn, limit, bound)?;
+        let older = select_stale(conn, limit, bound, embedder)?;
         if !older.is_empty() {
-            let wrote = write_batch(conn, &older, stop)?;
+            let wrote = write_batch(conn, &older, stop, embedder)?;
             if self.high.is_none() {
                 self.high = older.first().map(|row| row.key);
             }
@@ -693,11 +770,11 @@ impl Scan {
             self.before = None;
             self.high = None;
             self.newer_before = None;
-            let top = select_stale(conn, limit, Bound::Any)?;
+            let top = select_stale(conn, limit, Bound::Any, embedder)?;
             if top.is_empty() {
                 return Ok(IndexStep::Idle);
             }
-            let wrote = write_batch(conn, &top, stop)?;
+            let wrote = write_batch(conn, &top, stop, embedder)?;
             self.high = top.first().map(|row| row.key);
             self.before = top.last().map(|row| row.key);
             return Ok(IndexStep::Wrote(wrote));
@@ -706,8 +783,12 @@ impl Scan {
     }
 }
 
-fn select_stale(conn: &Connection, limit: usize, bound: Bound) -> Result<Vec<StaleRow>> {
-    let embedder = active_embedder();
+fn select_stale(
+    conn: &Connection,
+    limit: usize,
+    bound: Bound,
+    embedder: &dyn BodyEmbedder,
+) -> Result<Vec<StaleRow>> {
     let id = embedder.id();
     let dims = i64::try_from(embedder.dims()).unwrap_or(i64::MAX);
     let bytes = dims.saturating_mul(4);
@@ -818,9 +899,15 @@ struct Prepared {
     values: Vec<f32>,
 }
 
-fn write_batch(conn: &Connection, rows: &[StaleRow], stop: Option<&AtomicBool>) -> Result<usize> {
-    // Hash outside the write lock. A multi-megabyte batch must not hold it
-    // for the whole hash, or sync and triage outlive the 5s busy timeout.
+fn write_batch(
+    conn: &Connection,
+    rows: &[StaleRow],
+    stop: Option<&AtomicBool>,
+    embedder: &dyn BodyEmbedder,
+) -> Result<usize> {
+    // Embed outside the write lock. A model run takes tens of milliseconds
+    // per message, so a batch must not hold the lock for it, or sync and
+    // triage outlive the 5s busy timeout. The stop flag is read per message.
     let mut prepared = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -829,7 +916,7 @@ fn write_batch(conn: &Connection, rows: &[StaleRow], stop: Option<&AtomicBool>) 
         interrupt_rebuild(index)?;
         let body = message_body(conn, &row.account_id, &row.message_id)?;
         let values = match &body {
-            Some(body) => active_embedder().embed(body),
+            Some(body) => embedder.embed(body),
             None => Vec::new(),
         };
         prepared.push(Prepared {
@@ -843,7 +930,7 @@ fn write_batch(conn: &Connection, rows: &[StaleRow], stop: Option<&AtomicBool>) 
         conn.execute_batch("ROLLBACK")?;
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let wrote = store_prepared(conn, &prepared);
+    let wrote = store_prepared(conn, &prepared, embedder.id());
     match wrote {
         Ok(n) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(n),
@@ -859,7 +946,7 @@ fn write_batch(conn: &Connection, rows: &[StaleRow], stop: Option<&AtomicBool>) 
     }
 }
 
-fn store_prepared(conn: &Connection, rows: &[Prepared]) -> Result<usize> {
+fn store_prepared(conn: &Connection, rows: &[Prepared], id: EmbedderId) -> Result<usize> {
     let mut wrote = 0;
     for row in rows {
         let Some(hashed) = row.body.as_deref() else {
@@ -876,7 +963,14 @@ fn store_prepared(conn: &Connection, rows: &[Prepared]) -> Result<usize> {
             enqueue_message(conn, &row.account_id, &row.message_id)?;
             continue;
         }
-        store_embedding(conn, &row.account_id, &row.message_id, hashed, &row.values)?;
+        store_embedding(
+            conn,
+            &row.account_id,
+            &row.message_id,
+            hashed,
+            &row.values,
+            id,
+        )?;
         dequeue_message(conn, &row.account_id, &row.message_id)?;
         wrote += 1;
     }
@@ -901,8 +995,8 @@ fn store_embedding(
     message_id: &str,
     body: &str,
     values: &[f32],
+    id: EmbedderId,
 ) -> Result<()> {
-    let id = active_embedder().id();
     let hash = body_hash(body);
     let dims = i64::try_from(values.len()).unwrap_or(i64::MAX);
     conn.execute(
@@ -2123,7 +2217,7 @@ mod tests {
         }
         let mut scan = Scan::default();
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert!(stored(&store, "a1", "new@x").model == EMBEDDING_MODEL);
@@ -2137,7 +2231,7 @@ mod tests {
         arrived.headers.date_unix = 40;
         store.upsert_message(&arrived).unwrap();
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "later@x"), embed_body("later mail"));
@@ -2148,7 +2242,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "mid@x").version, EMBEDDING_VERSION);
@@ -2179,18 +2273,18 @@ mod tests {
             .unwrap();
         let mut scan = Scan::default();
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         let mut moved = message("a1", "moved@x", "moved@x");
         moved.headers.date_unix = 45;
         store.upsert_message(&moved).unwrap();
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "moved@x").version, EMBEDDING_VERSION);
@@ -2210,7 +2304,7 @@ mod tests {
         store.upsert_message(&floor).unwrap();
         let mut scan = Scan::default();
         assert!(matches!(
-            scan.step(&store.conn, 1, None).unwrap(),
+            scan.step(&store.conn, 1, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         for (id, date) in [("a@x", 10_i64), ("b@x", 20), ("c@x", 30)] {
@@ -2224,7 +2318,7 @@ mod tests {
             .execute("DELETE FROM embedding_queue", [])
             .unwrap();
         assert!(matches!(
-            scan.step(&store.conn, 2, None).unwrap(),
+            scan.step(&store.conn, 2, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(2)
         ));
         assert_eq!(stored(&store, "a1", "c@x").version, EMBEDDING_VERSION);
@@ -2236,7 +2330,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            scan.step(&store.conn, 2, None).unwrap(),
+            scan.step(&store.conn, 2, None, &LocalHashV1).unwrap(),
             IndexStep::Wrote(1)
         ));
         assert_eq!(stored(&store, "a1", "a@x").version, EMBEDDING_VERSION);
@@ -2291,5 +2385,294 @@ mod tests {
             embed_body("please pay the invoice")
         );
         assert_eq!(stored(&store, "a1", "b@x"), embed_body("team calendar"));
+    }
+
+    /// Counts calls and returns a fixed-width vector. Never reads a file.
+    struct Double {
+        calls: Cell<usize>,
+    }
+
+    impl BodyEmbedder for Double {
+        fn id(&self) -> EmbedderId {
+            EmbedderId {
+                model: "test-double",
+                version: "7",
+            }
+        }
+
+        fn dims(&self) -> usize {
+            3
+        }
+
+        fn embed(&self, body: &str) -> Vec<f32> {
+            self.calls.set(self.calls.get() + 1);
+            vec![body.len() as f32, 1.0, 0.0]
+        }
+    }
+
+    fn model_counts(store: &Store) -> Vec<(String, String, i64, i64)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT model, model_version, dims, COUNT(*) FROM message_embeddings
+                 GROUP BY model, model_version, dims ORDER BY model",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn upsert_many(store: &Store, count: usize) {
+        for index in 0..count {
+            let mut mail = message(
+                "a1",
+                &format!("m{index}@x"),
+                &format!("pay invoice {index}"),
+            );
+            mail.headers.date_unix = 1_700_000_000 + index as i64;
+            store.upsert_message(&mail).unwrap();
+        }
+    }
+
+    struct SourceReset;
+    impl Drop for SourceReset {
+        fn drop(&mut self) {
+            testing_model_source(None);
+        }
+    }
+
+    const TINY_ID: EmbedderId = EmbedderId {
+        model: "tiny-onnx",
+        version: "1",
+    };
+
+    /// Install the in-memory tiny ONNX graph under `root` through the same
+    /// path `fell embeddings install` uses, with a fetcher that serves bytes
+    /// from memory.
+    fn install_tiny(root: &Path) -> (&'static LocalModel, std::path::PathBuf) {
+        let onnx = super::onnx::testing::tiny_onnx();
+        let vocab = super::onnx::testing::TINY_VOCAB.as_bytes().to_vec();
+        let model = super::model_files::testing::model_for(TINY_ID, &onnx, &vocab, 256);
+        let calls = Cell::new(0);
+        let mut fetch = super::model_files::testing::serve(
+            vec![(model.onnx.url, onnx), (model.vocab.url, vocab)],
+            &calls,
+        );
+        let dir = install_model(model, root, &mut fetch).unwrap();
+        assert_eq!(calls.get(), 2);
+        (model, dir)
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-embed-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn any_body_embedder_fills_the_index_with_its_own_id() {
+        let store = open(&["a1"]);
+        upsert_many(&store, 3);
+        let double = Double {
+            calls: Cell::new(0),
+        };
+        assert_eq!(index_embeddings_with(&store.conn, 64, &double).unwrap(), 3);
+        assert_eq!(double.calls.get(), 3);
+        assert_eq!(
+            model_counts(&store),
+            vec![("test-double".into(), "7".into(), 3, 3)]
+        );
+        let row = stored(&store, "a1", "m0@x");
+        assert_eq!(row.values, vec!["pay invoice 0".len() as f32, 1.0, 0.0]);
+        // Nothing is stale for the same embedder.
+        assert_eq!(index_embeddings_with(&store.conn, 64, &double).unwrap(), 0);
+        assert_eq!(double.calls.get(), 3);
+        // Going back to the placeholder rewrites every row.
+        index_all(&store);
+        assert_eq!(
+            model_counts(&store),
+            vec![(EMBEDDING_MODEL.into(), EMBEDDING_VERSION.into(), 64, 3)]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_body_keeps_another_models_row_for_the_indexer() {
+        let store = open(&["a1"]);
+        let mail = message("a1", "m@x", "pay the invoice");
+        store.upsert_message(&mail).unwrap();
+        let double = Double {
+            calls: Cell::new(0),
+        };
+        index_embeddings_with(&store.conn, 64, &double).unwrap();
+        // A resync with the same body does not drop the row, whatever model
+        // wrote it. The indexer's stale scan decides that.
+        store.upsert_message(&mail).unwrap();
+        assert_eq!(stored(&store, "a1", "m@x").model, "test-double");
+        let mut changed = mail.clone();
+        changed.body_text = Some("a new body".into());
+        store.upsert_message(&changed).unwrap();
+        assert_eq!(embedding_count(&store), 0);
+    }
+
+    #[test]
+    fn a_model_switch_rewrites_one_batch_at_a_time() {
+        let dir = temp_dir("switch-batch");
+        let (model, model_dir) = install_tiny(&dir.join("models"));
+        let tiny = OnnxEmbedder::load(model, &model_dir).unwrap();
+        let store = open(&["a1"]);
+        upsert_many(&store, INDEX_BATCH * 2 + 6);
+        index_all(&store);
+        let mut scan = Scan::default();
+        assert!(matches!(
+            scan.step(&store.conn, INDEX_BATCH, None, &tiny).unwrap(),
+            IndexStep::Wrote(n) if n == INDEX_BATCH
+        ));
+        assert_eq!(
+            model_counts(&store),
+            vec![
+                (
+                    EMBEDDING_MODEL.into(),
+                    EMBEDDING_VERSION.into(),
+                    64,
+                    INDEX_BATCH as i64 + 6
+                ),
+                ("tiny-onnx".into(), "1".into(), 4, INDEX_BATCH as i64),
+            ]
+        );
+        // Newest mail moves first.
+        let newest = format!("m{}@x", INDEX_BATCH * 2 + 5);
+        assert_eq!(stored(&store, "a1", &newest).model, "tiny-onnx");
+        assert_eq!(stored(&store, "a1", "m0@x").model, EMBEDDING_MODEL);
+        while matches!(
+            scan.step(&store.conn, INDEX_BATCH, None, &tiny).unwrap(),
+            IndexStep::Wrote(_)
+        ) {}
+        assert_eq!(
+            model_counts(&store),
+            vec![(
+                "tiny-onnx".into(),
+                "1".into(),
+                4,
+                INDEX_BATCH as i64 * 2 + 6
+            )]
+        );
+        assert_eq!(
+            stored(&store, "a1", "m0@x").values,
+            tiny.embed("pay invoice 0")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_installed_model_rewrites_the_index_on_the_indexer_thread() {
+        let _source = SourceReset;
+        let _pause = PauseReset;
+        let dir = temp_dir("switch-thread");
+        let path = dir.join("mail.sqlite");
+        let count = INDEX_BATCH * 2 + 3;
+        {
+            // Placeholder rows first, as an older Fell would have left them.
+            testing_start_indexer_paused(true);
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account("a1")).unwrap();
+            upsert_many(&store, count);
+            index_all(&store);
+        }
+        let (model, model_dir) = install_tiny(&dir.join("models"));
+        testing_model_source(Some((dir.join("models"), model)));
+        testing_start_indexer_paused(true);
+        let store = Store::open(&path).unwrap();
+        // Open returned with every row as it was. No vector was computed here.
+        assert_eq!(
+            model_counts(&store),
+            vec![(
+                EMBEDDING_MODEL.into(),
+                EMBEDDING_VERSION.into(),
+                64,
+                count as i64
+            )]
+        );
+        store.testing_pause_indexer(false);
+        let start = std::time::Instant::now();
+        while model_counts(&store) != vec![("tiny-onnx".into(), "1".into(), 4, count as i64)] {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "indexer did not switch models: {:?}",
+                model_counts(&store)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tiny = OnnxEmbedder::load(model, &model_dir).unwrap();
+        assert_eq!(
+            stored(&store, "a1", "m3@x").values,
+            tiny.embed("pay invoice 3")
+        );
+        drop(store);
+        // Removing the model goes back to the placeholder on the next open.
+        assert!(remove_model(model, &dir.join("models")).unwrap());
+        testing_start_indexer_paused(false);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            wait_indexed(&store, "a1", "m0@x"),
+            embed_body("pay invoice 0")
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_model_on_disk_keeps_the_placeholder_and_creates_nothing() {
+        let dir = temp_dir("no-model");
+        let root = dir.join("models");
+        let source = EmbedderSource {
+            models_root: Some(root.clone()),
+            model: &MINILM_L6_V2_INT8,
+        };
+        assert_eq!(source.load().id(), LocalHashV1.id());
+        assert!(
+            !root.exists(),
+            "looking for a model must not create its directory"
+        );
+        let none = EmbedderSource {
+            models_root: None,
+            model: &MINILM_L6_V2_INT8,
+        };
+        assert_eq!(none.load().id(), LocalHashV1.id());
+        // Inside these tests the default never points at a real model.
+        assert_eq!(EmbedderSource::from_env().models_root, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tampered_model_file_keeps_the_placeholder() {
+        let dir = temp_dir("tampered");
+        let root = dir.join("models");
+        let (model, model_dir) = install_tiny(&root);
+        let source = EmbedderSource {
+            models_root: Some(root.clone()),
+            model,
+        };
+        assert_eq!(source.load().id(), TINY_ID);
+        let mut bytes = std::fs::read(model_dir.join("model.onnx")).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(model_dir.join("model.onnx"), &bytes).unwrap();
+        assert!(matches!(
+            OnnxEmbedder::load(model, &model_dir).unwrap_err(),
+            ModelError::Checksum { .. }
+        ));
+        assert_eq!(source.load().id(), LocalHashV1.id());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
