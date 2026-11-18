@@ -1919,6 +1919,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-native-certs",
+ "sha2 0.10.9",
  "smallvec",
  "ureq",
  "webkit2gtk",

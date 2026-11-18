@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -77,7 +78,11 @@ pub const MINILM_L6_V2_INT8: LocalModel = LocalModel {
     },
     dir_name: "all-MiniLM-L6-v2-qint8",
     title: "all-MiniLM-L6-v2 sentence embeddings (int8 ONNX, 384 dimensions)",
-    card_url: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+    card_url: concat!(
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/",
+        "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+        "/README.md"
+    ),
     license: "Apache-2.0",
     onnx: ModelFile {
         name: "model.onnx",
@@ -140,6 +145,8 @@ pub enum ModelError {
     Missing,
     #[error("cannot load the model: {0}")]
     Load(String),
+    #[error("the model failed on this message: {0}")]
+    Inference(String),
 }
 
 /// Root that holds downloaded models: `$FELL_MODEL_DIR`, else
@@ -199,15 +206,49 @@ pub fn installed_model_dir(model: &LocalModel, root: &Path) -> Option<PathBuf> {
 }
 
 /// Read one installed file and check it against its pin.
+///
+/// The file is opened without following a symlink and without blocking on a
+/// FIFO, and it must be a regular file. Its size, hash, and bytes all come
+/// from that one descriptor, so a path swapped after the check is not what
+/// gets loaded. A path that is gone, is a symlink, or is not a regular file is
+/// [`ModelError::Missing`]: there is no install there.
 pub(crate) fn read_verified(dir: &Path, file: &ModelFile) -> Result<Vec<u8>, ModelError> {
     let path = dir.join(file.name);
-    let handle = fs::File::open(&path)?;
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+        .open(&path)
+        .map_err(|err| {
+            if not_there(&err) {
+                ModelError::Missing
+            } else {
+                err.into()
+            }
+        })?;
+    let meta = handle.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(ModelError::Missing);
+    }
+    if meta.len() != file.bytes {
+        return Err(ModelError::Size {
+            file: file.name,
+            expected: file.bytes,
+            actual: meta.len().min(file.bytes.saturating_add(1)),
+        });
+    }
     let mut bytes = Vec::with_capacity(usize::try_from(file.bytes).unwrap_or(0));
     handle
         .take(file.bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     check(file, bytes.len() as u64, &Sha256::digest(&bytes))?;
     Ok(bytes)
+}
+
+/// The open failed because nothing usable is at the path: it is absent, a
+/// symlink (`O_NOFOLLOW`), or a parent is not a directory.
+fn not_there(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound
+        || matches!(err.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::ENOTDIR)
 }
 
 /// Hash every installed file. `Err(Missing)` when one is absent.
@@ -262,19 +303,12 @@ pub fn install_model(
     root: &Path,
     fetch: &mut Fetch<'_>,
 ) -> Result<PathBuf, ModelError> {
+    sweep_partials(model, root);
     if let Ok(dir) = verify_installed(model, root) {
         return Ok(dir);
     }
     create_private_dirs(root)?;
-    let staging = root.join(format!(
-        ".{}.partial-{}-{}",
-        model.dir_name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|time| time.as_nanos())
-            .unwrap_or(0)
-    ));
+    let staging = scratch_path(model, root, "new");
     create_private_dir(&staging)?;
     let staged = (|| {
         for file in model.files() {
@@ -287,21 +321,76 @@ pub fn install_model(
         return Err(err);
     }
     let dir = model_dir(model, root);
-    if fs::symlink_metadata(&dir).is_ok() {
-        // A partial or stale install that failed verification above.
-        if let Err(err) = remove_path(&dir) {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(err.into());
+    // A partial or stale install that failed verification above is moved
+    // aside, not deleted, until the new one is in place. If the new one
+    // cannot be renamed in, the old one goes back.
+    let backup = match fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            let backup = scratch_path(model, root, "old");
+            if let Err(err) = fs::rename(&dir, &backup) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(err.into());
+            }
+            Some(backup)
         }
-    }
-    if let Err(err) = fs::rename(&staging, &dir) {
+        Err(_) => None,
+    };
+    if let Err(err) = publish(&staging, &dir) {
         let _ = fs::remove_dir_all(&staging);
+        if let Some(backup) = &backup {
+            let _ = fs::rename(backup, &dir);
+        }
         return Err(err.into());
     }
     if let Ok(handle) = fs::File::open(root) {
         let _ = handle.sync_all();
     }
+    if let Some(backup) = &backup {
+        let _ = remove_path(backup);
+    }
     Ok(dir)
+}
+
+/// A fresh name beside the model directory for a staging or backup copy.
+/// Every such name starts with `.{dir_name}.partial-`, which is what
+/// [`sweep_partials`] removes.
+fn scratch_path(model: &LocalModel, root: &Path, kind: &str) -> PathBuf {
+    root.join(format!(
+        ".{}.partial-{kind}-{}-{}",
+        model.dir_name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+/// Remove staging and backup copies an interrupted install left behind.
+/// Symlinks are removed, not followed.
+fn sweep_partials(model: &LocalModel, root: &Path) {
+    let prefix = format!(".{}.partial-", model.dir_name);
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = remove_path(&entry.path());
+        }
+    }
+}
+
+fn publish(staging: &Path, dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_PUBLISH.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected rename failure"));
+    }
+    fs::rename(staging, dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn download_one(file: &ModelFile, staging: &Path, fetch: &mut Fetch<'_>) -> Result<(), ModelError> {
@@ -359,7 +448,8 @@ fn remove_path(path: &Path) -> io::Result<()> {
 }
 
 /// Create `dir` and any missing parents, each owner-only. Existing parents keep
-/// their mode. `dir` itself is set to 0700 either way.
+/// their mode. `dir` itself must be a real directory owned by this user, and
+/// is set to 0700 either way.
 fn create_private_dirs(dir: &Path) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut current = dir;
@@ -373,39 +463,68 @@ fn create_private_dirs(dir: &Path) -> io::Result<()> {
     for path in missing.iter().rev() {
         create_private_dir(path)?;
     }
-    restrict(dir, 0o700)
+    create_private_dir(dir)
 }
 
+/// `mkdir` with mode 0700, then `fchmod` through a descriptor opened with
+/// `O_DIRECTORY | O_NOFOLLOW`. When the path already exists it must be a
+/// directory, not a symlink to one, and owned by this user.
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => restrict(path, 0o700),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err),
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
     }
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| {
+            if not_there(&err) {
+                refused(path, "is not a directory (a symlink is not followed)")
+            } else {
+                err
+            }
+        })?;
+    let meta = handle.metadata()?;
+    if !meta.is_dir() {
+        return Err(refused(path, "is not a directory"));
+    }
+    if meta.uid() != user_id() {
+        return Err(refused(path, "is owned by another user"));
+    }
+    handle.set_permissions(fs::Permissions::from_mode(0o700))
+}
+
+fn refused(path: &Path, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} {why}", path.display()),
+    )
 }
 
 fn create_private_file(path: &Path) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
 }
 
-fn restrict(path: &Path, mode: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
-    }
+// Flag values differ by architecture (aarch64 and x86_64 disagree on
+// `O_DIRECTORY`), so they come from libc, as in `compose::workspace`.
+const O_DIRECTORY: i32 = libc::O_DIRECTORY;
+const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+const O_NONBLOCK: i32 = libc::O_NONBLOCK;
+const O_NOCTTY: i32 = libc::O_NOCTTY;
+
+/// This process's user id, read from `/proc/self` as `compose::workspace`
+/// does (the crate forbids the `unsafe` a `geteuid` call needs).
+fn user_id() -> u32 {
+    fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -504,6 +623,12 @@ mod tests {
             );
         }
         assert_eq!(model.license, "Apache-2.0");
+        assert!(
+            model.card_url.starts_with("https://huggingface.co/")
+                && model.card_url.contains(MINILM_REVISION),
+            "the model card is read at the pinned commit: {}",
+            model.card_url
+        );
         assert_ne!(model.id.model, super::super::EMBEDDING_MODEL);
     }
 
@@ -703,6 +828,142 @@ mod tests {
             std::os::unix::fs::symlink(root.join("elsewhere"), dir.join("model.onnx")).unwrap();
             assert!(installed_model_dir(model, &root).is_none());
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn fixed_fetch<'a>(
+        model: &LocalModel,
+        calls: &'a Cell<usize>,
+    ) -> impl FnMut(&str) -> io::Result<Box<dyn Read>> + 'a {
+        serve(
+            vec![
+                (model.onnx.url, b"onnx".to_vec()),
+                (model.vocab.url, b"vocab".to_vec()),
+            ],
+            calls,
+        )
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_symlinked_models_root_is_refused_and_not_chmodded() {
+        let base = temp_root("root-link");
+        let target = base.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = base.join("models");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let model = model_for(ID, b"onnx", b"vocab", 8);
+        let calls = Cell::new(0);
+        let err = install_model(model, &root, &mut fixed_fetch(model, &calls)).unwrap_err();
+        assert!(
+            matches!(&err, ModelError::Io(io) if io.kind() == io::ErrorKind::PermissionDenied),
+            "{err}"
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(mode(&target), 0o755, "the symlink target keeps its mode");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_where_the_models_root_goes_is_refused() {
+        let base = temp_root("root-file");
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join("models");
+        fs::write(&root, b"not a directory").unwrap();
+        let model = model_for(ID, b"onnx", b"vocab", 8);
+        let calls = Cell::new(0);
+        assert!(install_model(model, &root, &mut fixed_fetch(model, &calls)).is_err());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(fs::read(&root).unwrap(), b"not a directory");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_swapped_symlink_or_a_fifo_is_not_read() {
+        let root = temp_root("swap");
+        let model = model_for(ID, b"onnx", b"vocab", 8);
+        let calls = Cell::new(0);
+        let dir = install_model(model, &root, &mut fixed_fetch(model, &calls)).unwrap();
+        // The path passed the stat check, then became a symlink to bytes that
+        // match the pin. The open must not follow it.
+        fs::write(root.join("decoy"), b"onnx").unwrap();
+        fs::remove_file(dir.join("model.onnx")).unwrap();
+        std::os::unix::fs::symlink(root.join("decoy"), dir.join("model.onnx")).unwrap();
+        assert!(matches!(
+            read_verified(&dir, &model.onnx).unwrap_err(),
+            ModelError::Missing
+        ));
+        // A FIFO would block a plain open until a writer appears.
+        fs::remove_file(dir.join("model.onnx")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("model.onnx"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (done, wait) = std::sync::mpsc::channel();
+        let fifo_dir = dir.clone();
+        let onnx = model.onnx;
+        std::thread::spawn(move || {
+            let _ = done.send(read_verified(&fifo_dir, &onnx).map(|_| ()));
+        });
+        let got = wait
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO must not block");
+        assert!(matches!(got.unwrap_err(), ModelError::Missing));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_rename_puts_the_previous_install_back() {
+        let root = temp_root("restore");
+        let model = model_for(ID, b"onnx", b"vocab", 8);
+        let calls = Cell::new(0);
+        let mut fetch = fixed_fetch(model, &calls);
+        let dir = install_model(model, &root, &mut fetch).unwrap();
+        // Make the install fail verification so the next call replaces it.
+        fs::write(dir.join("vocab.txt"), b"VOCAB").unwrap();
+        FAIL_PUBLISH.with(|fail| fail.set(true));
+        let err = install_model(model, &root, &mut fetch).unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert_eq!(fs::read(dir.join("model.onnx")).unwrap(), b"onnx");
+        assert_eq!(fs::read(dir.join("vocab.txt")).unwrap(), b"VOCAB");
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("test-model")]);
+        // Without the failure the replacement goes in and the backup is gone.
+        install_model(model, &root, &mut fetch).unwrap();
+        verify_installed(model, &root).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_sweeps_partial_directories_left_behind() {
+        let root = temp_root("sweep");
+        let model = model_for(ID, b"onnx", b"vocab", 8);
+        let calls = Cell::new(0);
+        let mut fetch = fixed_fetch(model, &calls);
+        install_model(model, &root, &mut fetch).unwrap();
+        let stale = root.join(".test-model.partial-new-1-2");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("model.onnx"), b"half").unwrap();
+        let backup = root.join(".test-model.partial-old-1-3");
+        fs::create_dir_all(&backup).unwrap();
+        let keep = root.join(".other-model.partial-new-1-2");
+        fs::create_dir_all(&keep).unwrap();
+        // Even when the install already verifies and nothing is fetched.
+        install_model(model, &root, &mut fetch).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(!stale.exists());
+        assert!(!backup.exists());
+        assert!(keep.exists(), "another model's staging is not touched");
         let _ = fs::remove_dir_all(&root);
     }
 }

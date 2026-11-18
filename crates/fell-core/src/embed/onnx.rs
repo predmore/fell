@@ -160,21 +160,26 @@ impl BodyEmbedder for OnnxEmbedder {
         self.dims
     }
 
-    /// A body with no word pieces is the zero vector, like the placeholder. A
-    /// graph error is also the zero vector: the row is still written, so one
-    /// bad message cannot make the indexer retry it forever.
-    fn embed(&self, body: &str) -> Vec<f32> {
+    /// A body with no word pieces is the zero vector, like the placeholder.
+    /// A graph error is an error, not a vector: the indexer stores nothing
+    /// for it and retries the message a bounded number of times.
+    fn embed(&self, body: &str) -> Result<Vec<f32>, ModelError> {
         let ids = self.tokenizer.encode(body, self.max_tokens);
         if ids.len() <= 2 {
-            return vec![0.0; self.dims];
+            return Ok(vec![0.0; self.dims]);
         }
-        match self.run(&ids) {
-            Ok(mut values) if values.len() == self.dims => {
-                super::normalize(&mut values);
-                values
-            }
-            _ => vec![0.0; self.dims],
+        let mut values = self
+            .run(&ids)
+            .map_err(|err| ModelError::Inference(format!("{err:#}")))?;
+        if values.len() != self.dims {
+            return Err(ModelError::Inference(format!(
+                "expected {} dimensions, got {}",
+                self.dims,
+                values.len()
+            )));
         }
+        super::normalize(&mut values);
+        Ok(values)
     }
 }
 
@@ -231,31 +236,76 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn tiny_onnx() -> Vec<u8> {
+        tiny_graph(None)
+    }
+
+    /// The tiny graph, but it returns states for the first two tokens only.
+    /// It loads (the probe is two tokens), and any longer body fails at run
+    /// time with a shape error, as a real graph error would.
+    pub(crate) fn tiny_onnx_clipped() -> Vec<u8> {
+        tiny_graph(Some(2))
+    }
+
+    fn ints(name: &str, values: &[i64]) -> TensorProto {
+        TensorProto {
+            name: name.into(),
+            dims: vec![values.len() as i64],
+            data_type: DataType::Int64 as i32,
+            int64_data: values.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn tiny_graph(clip_tokens: Option<i64>) -> Vec<u8> {
         let vocab_len = TINY_VOCAB.lines().count();
         let table: Vec<f32> = (0..vocab_len).flat_map(tiny_row).collect();
         let ids = ["batch_size", "sequence_length"];
+        let gathered = if clip_tokens.is_some() {
+            "states"
+        } else {
+            "last_hidden_state"
+        };
+        let mut node = vec![NodeProto {
+            name: "lookup".into(),
+            op_type: "Gather".into(),
+            input: vec!["table".into(), "input_ids".into()],
+            output: vec![gathered.into()],
+            attribute: vec![AttributeProto {
+                name: "axis".into(),
+                r#type: AttributeType::Int as i32,
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let mut initializer = vec![TensorProto {
+            name: "table".into(),
+            dims: vec![vocab_len as i64, TINY_DIMS as i64],
+            data_type: DataType::Float as i32,
+            float_data: table,
+            ..Default::default()
+        }];
+        if let Some(tokens) = clip_tokens {
+            node.push(NodeProto {
+                name: "clip".into(),
+                op_type: "Slice".into(),
+                input: vec![
+                    "states".into(),
+                    "starts".into(),
+                    "ends".into(),
+                    "axes".into(),
+                ],
+                output: vec!["last_hidden_state".into()],
+                ..Default::default()
+            });
+            initializer.push(ints("starts", &[0]));
+            initializer.push(ints("ends", &[tokens]));
+            initializer.push(ints("axes", &[1]));
+        }
         let graph = GraphProto {
             name: "tiny".into(),
-            node: vec![NodeProto {
-                name: "lookup".into(),
-                op_type: "Gather".into(),
-                input: vec!["table".into(), "input_ids".into()],
-                output: vec!["last_hidden_state".into()],
-                attribute: vec![AttributeProto {
-                    name: "axis".into(),
-                    r#type: AttributeType::Int as i32,
-                    i: 0,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            initializer: vec![TensorProto {
-                name: "table".into(),
-                dims: vec![vocab_len as i64, TINY_DIMS as i64],
-                data_type: DataType::Float as i32,
-                float_data: table,
-                ..Default::default()
-            }],
+            node,
+            initializer,
             input: vec![
                 value_info("input_ids", DataType::Int64, &ids),
                 value_info("attention_mask", DataType::Int64, &ids),
@@ -264,7 +314,15 @@ pub(crate) mod testing {
             output: vec![value_info(
                 "last_hidden_state",
                 DataType::Float,
-                &["batch_size", "sequence_length", "4"],
+                &[
+                    "batch_size",
+                    if clip_tokens.is_some() {
+                        "clipped_length"
+                    } else {
+                        "sequence_length"
+                    },
+                    "4",
+                ],
             )],
             ..Default::default()
         };
@@ -321,7 +379,7 @@ mod tests {
         assert_eq!(embedder.id(), ID);
         assert_eq!(embedder.dims(), TINY_DIMS);
         // [CLS] pay march invoice . [SEP]
-        let got = embedder.embed("Pay MARCH invoice.");
+        let got = embedder.embed("Pay MARCH invoice.").unwrap();
         assert!(close(&got, &expected(&[2, 5, 6, 4, 10, 3])), "{got:?}");
         let norm: f32 = got.iter().map(|v| v * v).sum();
         assert!((norm.sqrt() - 1.0).abs() < 1e-5);
@@ -331,15 +389,24 @@ mod tests {
     fn truncates_at_max_tokens() {
         let embedder = tiny(4);
         // [CLS] team offsite [SEP]; "calendar" is past the limit.
-        let got = embedder.embed("team offsite calendar");
+        let got = embedder.embed("team offsite calendar").unwrap();
         assert!(close(&got, &expected(&[2, 9, 8, 3])), "{got:?}");
     }
 
     #[test]
     fn an_empty_body_is_the_zero_vector() {
         let embedder = tiny(256);
-        assert_eq!(embedder.embed(" \n\t"), vec![0.0; TINY_DIMS]);
-        assert_eq!(embedder.embed(""), vec![0.0; TINY_DIMS]);
+        assert_eq!(embedder.embed(" \n\t").unwrap(), vec![0.0; TINY_DIMS]);
+        assert_eq!(embedder.embed("").unwrap(), vec![0.0; TINY_DIMS]);
+    }
+
+    #[test]
+    fn a_graph_error_is_an_error_not_a_zero_vector() {
+        let embedder = OnnxEmbedder::from_bytes(ID, &tiny_onnx_clipped(), TINY_VOCAB, 256).unwrap();
+        let err = embedder.embed("pay the invoice").unwrap_err();
+        assert!(matches!(err, ModelError::Inference(_)), "{err}");
+        // An empty body is still the zero vector, without running the graph.
+        assert_eq!(embedder.embed("").unwrap(), vec![0.0; TINY_DIMS]);
     }
 
     #[test]
@@ -366,9 +433,15 @@ mod tests {
         eprintln!("load and verify: {:?}", start.elapsed());
         assert_eq!(embedder.dims(), 384);
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let invoice = embedder.embed("Please pay the March invoice by Friday.");
-        let due = embedder.embed("The invoice for March is due at the end of the week.");
-        let offsite = embedder.embed("Team offsite: calendar invite for next Tuesday.");
+        let invoice = embedder
+            .embed("Please pay the March invoice by Friday.")
+            .unwrap();
+        let due = embedder
+            .embed("The invoice for March is due at the end of the week.")
+            .unwrap();
+        let offsite = embedder
+            .embed("Team offsite: calendar invite for next Tuesday.")
+            .unwrap();
         assert!(cos(&invoice, &due) > 0.6, "{}", cos(&invoice, &due));
         assert!(cos(&invoice, &due) > cos(&invoice, &offsite) + 0.3);
         let bodies = [
@@ -381,7 +454,7 @@ mod tests {
             let runs = 20;
             let start = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(embedder.embed(body));
+                std::hint::black_box(embedder.embed(body).unwrap());
             }
             eprintln!(
                 "{tokens:>3} tokens: {:?} per message",

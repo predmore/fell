@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fell_core::embed::{
-    EMBEDDING_MODEL, EMBEDDING_VERSION, LocalModel, MINILM_L6_V2_INT8, ModelError,
-    default_models_dir, install_model, model_dir, remove_model, verify_installed,
+    EMBEDDING_MODEL, EMBEDDING_VERSION, LocalEmbedder, LocalModel, MINILM_L6_V2_INT8, ModelError,
+    default_models_dir, install_model, load_local_embedder, model_dir, remove_model,
+    verify_installed,
 };
 
 const USAGE: &str = "\
@@ -39,6 +40,7 @@ pub fn embeddings_command(args: &[String]) -> i32 {
     let mut fetch = HttpsFetch::default();
     let result = run(
         args,
+        &MINILM_L6_V2_INT8,
         default_models_dir(),
         &mut Console {
             out: &mut out,
@@ -66,11 +68,11 @@ type Fetch<'a> = dyn FnMut(&str) -> io::Result<Box<dyn Read>> + 'a;
 
 fn run(
     args: &[String],
+    model: &LocalModel,
     root: Option<PathBuf>,
     console: &mut Console<'_>,
     fetch: &mut Fetch<'_>,
 ) -> Result<(), String> {
-    let model = &MINILM_L6_V2_INT8;
     let command = args.first().map(String::as_str);
     if matches!(command, Some("--help" | "-h" | "help") | None) {
         return say(console, USAGE);
@@ -101,23 +103,29 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
+/// Reports what the indexer will do, by loading the model the same way it
+/// does. A model is only reported as active when it actually loads.
 fn status(model: &LocalModel, root: &Path, console: &mut Console<'_>) -> Result<(), String> {
     let dir = model_dir(model, root);
-    let text = match verify_installed(model, root) {
-        Ok(dir) => format!(
-            "Indexing with {} version {} ({}).\nFiles: {} (checksums match).\nSearch is keyword search; the vectors are not used for ranking yet.",
+    let text = match load_local_embedder(model, Some(root)) {
+        LocalEmbedder::Model(_) => format!(
+            "Indexing with {} version {} ({}).\nFiles: {} (checksums match, the model loads).\nSearch is keyword search; the vectors are not used for ranking yet.",
             model.id.model,
             model.id.version,
             model.title,
             dir.display()
         ),
-        Err(ModelError::Missing) => format!(
+        LocalEmbedder::Unavailable(err) => format!(
+            "Not indexing: the model files at {} are installed but do not load: {err}\nThe index is left as it is, and Fell tries the model again later and each time it opens the mailbox.\nRun `fell embeddings remove` to index with {EMBEDDING_MODEL} instead.",
+            dir.display()
+        ),
+        LocalEmbedder::Placeholder(ModelError::Missing) => format!(
             "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model).\nNo model is installed at {}.\nRun `fell embeddings install` to download {} ({}).",
             dir.display(),
             model.title,
             megabytes(model.download_bytes())
         ),
-        Err(err) => format!(
+        LocalEmbedder::Placeholder(err) => format!(
             "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model).\nThe files at {} do not pass their check: {err}\nRun `fell embeddings install` to replace them, or `fell embeddings remove`.",
             dir.display()
         ),
@@ -240,6 +248,10 @@ impl HttpsFetch {
     }
 }
 
+/// No single download may take longer than this, however slowly the bytes
+/// keep arriving. 23 MB in five minutes is about 80 KB/s.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(5 * 60);
+
 fn https_agent() -> io::Result<ureq::Agent> {
     use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
     let roots: Vec<Certificate<'static>> = rustls_native_certs::load_native_certs()
@@ -264,6 +276,8 @@ fn https_agent() -> io::Result<ureq::Agent> {
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_per_read(Some(Duration::from_secs(60)))
+        .timeout_recv_body(Some(DOWNLOAD_DEADLINE))
+        .timeout_global(Some(DOWNLOAD_DEADLINE))
         .user_agent(concat!("fell/", env!("CARGO_PKG_VERSION")))
         .tls_config(tls)
         .build()
@@ -299,11 +313,23 @@ mod tests {
         answer: &str,
         serve: impl Fn(&str) -> Vec<u8>,
     ) -> (Result<(), String>, String, usize) {
+        invoke_model(list, &MINILM_L6_V2_INT8, root, tty, answer, serve)
+    }
+
+    fn invoke_model(
+        list: &[&str],
+        model: &LocalModel,
+        root: &Path,
+        tty: bool,
+        answer: &str,
+        serve: impl Fn(&str) -> Vec<u8>,
+    ) -> (Result<(), String>, String, usize) {
         let calls = Cell::new(0);
         let mut out = Vec::new();
         let mut input = io::Cursor::new(answer.as_bytes().to_vec());
         let result = run(
             &args(list),
+            model,
             Some(root.to_path_buf()),
             &mut Console {
                 out: &mut out,
@@ -418,5 +444,61 @@ mod tests {
         let (help, text, _) = invoke(&[], &root, true, "", never);
         help.unwrap();
         assert!(text.contains("fell embeddings install"));
+    }
+
+    /// A model pinned to `onnx` and `vocab`, so those bytes pass the check.
+    fn pinned_to(onnx: &'static [u8], vocab: &'static [u8]) -> &'static LocalModel {
+        use sha2::{Digest, Sha256};
+        let hex = |bytes: &[u8]| -> &'static str {
+            let text: String = Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            Box::leak(text.into_boxed_str())
+        };
+        let mut model = MINILM_L6_V2_INT8;
+        model.dir_name = "test-model";
+        model.onnx.url = "https://example.invalid/model.onnx";
+        model.onnx.sha256 = hex(onnx);
+        model.onnx.bytes = onnx.len() as u64;
+        model.vocab.url = "https://example.invalid/vocab.txt";
+        model.vocab.sha256 = hex(vocab);
+        model.vocab.bytes = vocab.len() as u64;
+        Box::leak(Box::new(model))
+    }
+
+    #[test]
+    fn status_does_not_report_a_model_that_will_not_load() {
+        let root = temp_root("unloadable");
+        let onnx: &[u8] = b"verified bytes, but not an ONNX graph";
+        let vocab: &[u8] = b"[PAD]\n[UNK]\n[CLS]\n[SEP]\n";
+        let model = pinned_to(onnx, vocab);
+        let (result, _, calls) =
+            invoke_model(&["install", "--yes"], model, &root, false, "", |url| {
+                if url == model.onnx.url {
+                    onnx.to_vec()
+                } else {
+                    vocab.to_vec()
+                }
+            });
+        result.unwrap();
+        assert_eq!(calls, 2);
+        verify_installed(model, &root).unwrap();
+        let (result, out, calls) = invoke_model(&["status"], model, &root, true, "", never);
+        result.unwrap();
+        assert_eq!(calls, 0);
+        assert!(!out.contains("Indexing with"), "{out}");
+        assert!(out.contains("do not load"), "{out}");
+        assert!(out.contains("left as it is"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_download_has_a_total_deadline() {
+        let agent = https_agent().unwrap();
+        let timeouts = agent.config().timeouts();
+        assert_eq!(timeouts.global, Some(DOWNLOAD_DEADLINE));
+        assert_eq!(timeouts.recv_body, Some(DOWNLOAD_DEADLINE));
+        assert!(DOWNLOAD_DEADLINE <= Duration::from_secs(10 * 60));
     }
 }
