@@ -67,7 +67,7 @@ impl Action {
             Self::ToggleSelect => "Toggle select",
             Self::Visual => "Visual select",
             Self::FullWidth => "Full-width conversation",
-            Self::ToggleQuotes => "Quoted text",
+            Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
         }

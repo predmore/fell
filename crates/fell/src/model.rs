@@ -174,7 +174,12 @@ pub struct Session {
     pub full_width: bool,
     pub messages: Vec<ConvMessage>,
     pub message_cursor: usize,
-    pub quotes_open: HashSet<usize>,
+    /// Messages whose collapsed parts (quotes, signature, every recipient)
+    /// are open, by Message-ID, so a reread that shifts rows keeps them.
+    pub quotes_open: HashSet<String>,
+    /// Messages whose full recipient list is open, by Message-ID. A click
+    /// on the recipient line opens only this; `q` opens everything.
+    pub recipients_open: HashSet<String>,
     pub overlay: Overlay,
     pub chord: Vec<KeyId>,
     pub chord_gen: u64,
@@ -222,6 +227,7 @@ impl Session {
             messages: Vec::new(),
             message_cursor: 0,
             quotes_open: HashSet::new(),
+            recipients_open: HashSet::new(),
             overlay: Overlay::None,
             chord: Vec::new(),
             chord_gen: 0,
@@ -461,9 +467,56 @@ impl Session {
             .all(|thread| old_ids.contains(&thread.id))
     }
 
+    /// `q`: open or close every collapsed part of the message at `index`,
+    /// quoted text and recipients together.
+    pub fn toggle_open(&mut self, index: usize) {
+        let Some(id) = self.messages.get(index).map(|message| message.id.clone()) else {
+            return;
+        };
+        let open = !(self.quotes_open.contains(&id) || self.recipients_open.contains(&id));
+        for set in [&mut self.quotes_open, &mut self.recipients_open] {
+            if open {
+                set.insert(id.clone());
+            } else {
+                set.remove(&id);
+            }
+        }
+    }
+
+    /// A click on a quote or signature block.
+    pub fn toggle_quotes(&mut self, index: usize) {
+        if let Some(id) = self.messages.get(index).map(|message| message.id.clone())
+            && !self.quotes_open.remove(&id)
+        {
+            self.quotes_open.insert(id);
+        }
+    }
+
+    /// A click on the recipient line.
+    pub fn toggle_recipients(&mut self, index: usize) {
+        if let Some(id) = self.messages.get(index).map(|message| message.id.clone())
+            && !self.recipients_open.remove(&id)
+        {
+            self.recipients_open.insert(id);
+        }
+    }
+
+    pub fn is_open(&self, index: usize) -> bool {
+        self.messages
+            .get(index)
+            .is_some_and(|message| self.quotes_open.contains(&message.id))
+    }
+
+    pub fn recipients_are_open(&self, index: usize) -> bool {
+        self.messages
+            .get(index)
+            .is_some_and(|message| self.recipients_open.contains(&message.id))
+    }
+
     pub fn set_messages(&mut self, messages: Vec<ConvMessage>) {
         self.messages = messages;
         self.quotes_open.clear();
+        self.recipients_open.clear();
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
@@ -485,13 +538,17 @@ impl Session {
             self.set_messages(messages);
             return true;
         }
-        for (new, old) in messages.iter_mut().zip(&self.messages) {
-            new.expanded = old.expanded;
+        for new in &mut messages {
+            if let Some(old) = self.messages.iter().find(|old| old.id == new.id) {
+                new.expanded = old.expanded;
+            }
         }
         let cursor = self.message_cursor;
         let len = messages.len();
+        for set in [&mut self.quotes_open, &mut self.recipients_open] {
+            set.retain(|id| messages.iter().any(|message| &message.id == id));
+        }
         self.messages = messages;
-        self.quotes_open.retain(|index| *index < len);
         self.message_cursor = cursor.min(len.saturating_sub(1));
         false
     }
@@ -875,9 +932,7 @@ impl Session {
             }
             Action::ToggleQuotes => {
                 self.count.clear();
-                if !self.quotes_open.remove(&self.message_cursor) {
-                    self.quotes_open.insert(self.message_cursor);
-                }
+                self.toggle_open(self.message_cursor);
             }
             Action::Palette => {
                 self.count.clear();
@@ -1447,8 +1502,51 @@ mod tests {
         assert_eq!(session.folder, "Sent");
     }
 
+    #[test]
+    fn open_parts_stay_with_their_message_when_a_reread_shifts_rows() {
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        let first = empty_message(true);
+        let second = empty_message(true);
+        session.set_messages(vec![first.clone(), second.clone()]);
+        session.message_cursor = 0;
+        session.toggle_open(0);
+        assert!(session.is_open(0));
+        // Sync puts a new message before the one that was opened.
+        let newcomer = empty_message(true);
+        session.refresh_messages(vec![newcomer, first.clone(), second], false);
+        assert!(!session.is_open(0));
+        assert!(session.is_open(1));
+        // The opened message leaves the thread: nothing else opens in its place.
+        session.refresh_messages(vec![empty_message(true)], false);
+        assert!(!session.is_open(0));
+    }
+
+    #[test]
+    fn a_click_on_recipients_opens_only_them_and_q_opens_everything() {
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        session.set_messages(vec![empty_message(true)]);
+        session.toggle_recipients(0);
+        assert!(session.recipients_are_open(0));
+        assert!(!session.is_open(0), "quoted text stays closed");
+        session.toggle_recipients(0);
+        session.toggle_open(0);
+        assert!(session.recipients_are_open(0) && session.is_open(0));
+        session.toggle_open(0);
+        assert!(!session.recipients_are_open(0) && !session.is_open(0));
+    }
+
     fn empty_message(expanded: bool) -> ConvMessage {
         ConvMessage {
+            id: {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                format!(
+                    "m{}",
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            },
             sender: "Jon".into(),
             email: "jon@x".into(),
             folders: "Inbox".into(),
@@ -1456,6 +1554,7 @@ mod tests {
             snippet: "snip".into(),
             body: crate::text_render::render_stored_body(Some("body"), "snip"),
             expanded,
+            recipients: None,
         }
     }
 }

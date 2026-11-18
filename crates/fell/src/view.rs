@@ -1516,7 +1516,9 @@ fn message_block(
 ) -> gpui::AnyElement {
     let cursor = session.message_cursor == index && session.pane == Pane::Conversation;
     if message.expanded {
-        expanded_message(theme, session, message, index, cursor, cx)
+        expanded_message(
+            theme, session, message, index, cursor, conv_width, window, cx,
+        )
     } else {
         collapsed_message(theme, message, index, cursor, conv_width, window, cx)
     }
@@ -1606,15 +1608,18 @@ fn collapsed_message(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expanded_message(
     theme: &Theme,
     session: &Session,
     message: &ConvMessage,
     index: usize,
     cursor: bool,
+    conv_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let quotes = session.quotes_open.contains(&index);
+    let quotes = session.is_open(index);
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -1643,7 +1648,8 @@ fn expanded_message(
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
-                .pb(px(8.))
+                // The recipient line belongs to this header, so it sits close.
+                .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -1670,14 +1676,20 @@ fn expanded_message(
                         .child(present::relative_date(now_unix(), message.date_unix)),
                 ),
         )
+        .children(message.recipients.as_ref().map(|line| {
+            let open = session.recipients_are_open(index);
+            recipient_lines(theme, line, open, index, conv_width, window, cx)
+        }))
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
+            // The recipient line comes first and names the key itself.
             let first_hidden = message
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)));
+                .position(|block| !matches!(block, BodyBlock::Text(_)))
+                .filter(|_| message.recipients.is_none());
             message
                 .body
                 .blocks
@@ -1688,6 +1700,130 @@ fn expanded_message(
                 })
                 .collect::<Vec<_>>()
         })
+        .into_any_element()
+}
+
+/// Who else got the message, under its sender. Closed: one line of names
+/// that never wraps, then "+N more" and the key. Open (`q`, or a click): a
+/// row per group with every address.
+#[allow(clippy::too_many_arguments)]
+fn recipient_lines(
+    theme: &Theme,
+    line: &present::RecipientLine,
+    open: bool,
+    index: usize,
+    conv_width: f32,
+    window: &Window,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let toggle = cx.listener(move |inbox, _, window, cx| {
+        window.focus(&inbox.focus);
+        inbox.session.cancel_pending_keys();
+        inbox.session.pane = Pane::Conversation;
+        inbox.session.message_cursor = index;
+        inbox.session.toggle_recipients(index);
+        cx.notify();
+    });
+    let size = px(theme.ui_px - 1.0);
+    let body = if open {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(line.groups.iter().enumerate().map(|(row, group)| {
+                let last_row = row + 1 == line.groups.len();
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(28.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(group.label),
+                    )
+                    .child({
+                        // Each person is one piece that never breaks, with
+                        // its comma attached, so a line never starts with an
+                        // address or a comma. The row wraps between pieces.
+                        let last = group.people.len().saturating_sub(1);
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap_x(px(6.))
+                            .text_color(rgb(theme.foreground))
+                            .children(group.people.iter().enumerate().map(|(at, person)| {
+                                // The name leads; the address is quieter.
+                                let (name, address) = match person.find(" <") {
+                                    Some(split) => (&person[..split], &person[split..]),
+                                    None => (person.as_str(), ""),
+                                };
+                                let comma = if at < last { "," } else { "" };
+                                div()
+                                    .flex()
+                                    .min_w(px(0.))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(name.to_string())
+                                    .child(
+                                        div()
+                                            .text_color(rgb(theme.dimmed))
+                                            .child(format!("{address}{comma}")),
+                                    )
+                            }))
+                            // One dim note ends the row, so its separators
+                            // space evenly: "only you · q to hide".
+                            .children({
+                                let note = match (group.only_you, last_row) {
+                                    (true, true) => Some("only you · q to hide"),
+                                    (true, false) => Some("only you"),
+                                    (false, true) => Some("· q to hide"),
+                                    (false, false) => None,
+                                };
+                                note.map(|note| {
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(theme.dimmed))
+                                        .child(note)
+                                })
+                            })
+                    })
+            }))
+    } else {
+        // Whole people only, measured like the thread list, so the count
+        // always matches the names on screen; the Bcc and key always show.
+        // Only a single name too long for the pane is cut, with an ellipsis.
+        // The text takes the box's colour, so hover reaches it.
+        let room = (conv_width - 48.0).min(680.0);
+        let (names, tail, _) = present::fit_recipients(line, |names, tail| {
+            line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
+                <= room
+        });
+        let names = clip_line(
+            window,
+            &names,
+            (room - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
+            FontWeight::NORMAL,
+        );
+        div()
+            .flex()
+            .min_w(px(0.))
+            .text_color(rgb(theme.dimmed))
+            .hover(|style| style.text_color(rgb(theme.foreground)))
+            .child(div().whitespace_nowrap().child(names))
+            .child(div().flex_shrink_0().whitespace_nowrap().child(tail))
+    };
+    div()
+        .id(gpui::ElementId::named_usize("recipients", index))
+        .max_w(px(680.))
+        .pb(px(10.))
+        .text_size(size)
+        .child(
+            body.cursor_pointer()
+                .on_mouse_down(MouseButton::Left, toggle),
+        )
         .into_any_element()
 }
 
@@ -1742,9 +1878,7 @@ fn body_block(
                             inbox.session.cancel_pending_keys();
                             inbox.session.pane = Pane::Conversation;
                             inbox.session.message_cursor = index;
-                            if !inbox.session.quotes_open.remove(&index) {
-                                inbox.session.quotes_open.insert(index);
-                            }
+                            inbox.session.toggle_quotes(index);
                             cx.notify();
                         }),
                     )
