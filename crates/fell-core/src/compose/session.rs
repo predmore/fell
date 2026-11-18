@@ -102,6 +102,8 @@ pub struct Snapshot {
     pub focused: bool,
     pub send_block: Option<String>,
     pub text: String,
+    /// The agent whose `request_send` opened this draft, if one did.
+    pub send_requested_by: Option<String>,
 }
 
 /// Why the editor will not send a draft (again).
@@ -158,6 +160,8 @@ pub struct DraftSession {
     settled: String,
     /// Mailbox database that should receive this draft on flush.
     store_path: Option<PathBuf>,
+    /// The agent that last asked the person to review and send this draft.
+    send_requested_by: Option<String>,
     /// When the latest unflushed editor change was armed. `None` when the file is current.
     outbound_since: Option<u64>,
     /// Synchronous saves: the attachment stamp last copied into the mailbox.
@@ -227,6 +231,7 @@ impl DraftSession {
             last_written: String::new(),
             settled: String::new(),
             store_path: None,
+            send_requested_by: None,
             outbound_since: None,
             save_cache: SaveCache::default(),
             writer: None,
@@ -493,6 +498,11 @@ impl DraftSession {
         self.open = true;
         self.focused = true;
         false
+    }
+
+    /// Remember which agent asked for the editor, so it can say so.
+    pub fn note_send_request(&mut self, agent: &str) {
+        self.send_requested_by = Some(agent.to_string());
     }
 
     pub fn try_agent_delete(&self) -> Result<(), String> {
@@ -960,6 +970,7 @@ impl DraftSession {
             focused: self.focused,
             send_block,
             text,
+            send_requested_by: self.send_requested_by.clone(),
         }
     }
 

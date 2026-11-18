@@ -8,8 +8,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const TEXT_CONTRAST: f64 = 4.5;
-const MARK_CONTRAST: f64 = 3.0;
+pub(crate) const TEXT_CONTRAST: f64 = 4.5;
+pub(crate) const MARK_CONTRAST: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -177,6 +177,30 @@ fn map_palette(
         mono_family: fonts.mono_family.clone(),
         mono_px: fonts.mono_px,
     }
+}
+
+/// Every stock Omarchy theme in `stock-themes/`, plus the two built-in
+/// themes, for contrast tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn every_test_theme() -> Vec<Theme> {
+    let fonts = Fonts {
+        ui_family: None,
+        ui_px: 15.0,
+        mono_family: None,
+        mono_px: 13.0,
+    };
+    let mut themes = vec![builtin(true, fonts.clone()), builtin(false, fonts.clone())];
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stock-themes");
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        themes.push(theme_from_palette(&text, &fonts, name).unwrap());
+    }
+    themes
 }
 
 pub fn contrast_ok(theme: &Theme) -> bool {
@@ -562,7 +586,7 @@ pub fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-fn mix(a: u32, b: u32, t: f64) -> u32 {
+pub(crate) fn mix(a: u32, b: u32, t: f64) -> u32 {
     fn mix_channel(a: u32, b: u32, shift: u32, t: f64) -> u32 {
         let av = (a >> shift) & 255;
         let bv = (b >> shift) & 255;
@@ -624,7 +648,7 @@ fn push_toward(fg: u32, bg: u32, min: f64, toward: u32) -> Option<(u32, f64)> {
     }
 }
 
-fn ensure_all(fg: u32, backgrounds: &[u32], min: f64) -> u32 {
+pub(crate) fn ensure_all(fg: u32, backgrounds: &[u32], min: f64) -> u32 {
     let mut color = fg;
     for _ in 0..3 {
         let mut next = color;

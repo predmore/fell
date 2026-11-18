@@ -3,17 +3,11 @@
 //! This crate renders. It does not speak IMAP or Proton. Compose edits plain
 //! markdown and sends only from this window.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-
 use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
-use fell_core::compose::DraftHub;
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
-use notify::{Event, RecursiveMode, Watcher};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -71,8 +65,9 @@ fn main() {
     let root = std::env::temp_dir().join(format!("fell-compose-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (hub, draft_id, folder) = open_demo(root, theme).expect("open demo draft");
-    serve_socket(hub.clone());
-    let _watcher = watch_folder(hub.clone(), draft_id.clone(), folder.clone());
+    fell::draft_host::serve_socket(hub.clone());
+    let _watcher =
+        fell::draft_host::watch_folder(hub.clone(), Some((draft_id.clone(), folder.clone())));
     let draft_id_for_window = draft_id.clone();
     let folder_for_window = folder.clone();
     Application::new().run(move |cx: &mut App| {
@@ -167,78 +162,4 @@ fn preview() {
         .expect("open Fell window");
         cx.activate(true);
     });
-}
-
-fn serve_socket(hub: Arc<DraftHub>) {
-    let path = fell_core::compose::draft_socket_path();
-    let listener = match DraftHub::bind(&path) {
-        Ok(listener) => listener,
-        Err(_) => return,
-    };
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            hub.serve_one(stream);
-        }
-    });
-}
-
-fn watch_folder(
-    hub: Arc<DraftHub>,
-    draft_id: String,
-    folder: PathBuf,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Event, notify::Error>>();
-        let Ok(mut watcher) = notify::recommended_watcher(move |event| {
-            let _ = tx.send(event);
-        }) else {
-            return;
-        };
-        let mut current_id = draft_id;
-        let mut current_folder = folder;
-        if watcher
-            .watch(&current_folder, RecursiveMode::NonRecursive)
-            .is_err()
-        {
-            return;
-        }
-        loop {
-            if let Some(id) = hub.focused_id()
-                && id != current_id
-                && let Some(next) = hub.with_session(&id, |session| session.folder().to_path_buf())
-                && watcher.unwatch(&current_folder).is_ok()
-                && watcher.watch(&next, RecursiveMode::NonRecursive).is_ok()
-            {
-                current_id = id;
-                current_folder = next;
-            }
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(_) => {
-                    let start = std::time::Instant::now();
-                    while start.elapsed() < Duration::from_millis(150) {
-                        let remaining = Duration::from_millis(150).saturating_sub(start.elapsed());
-                        if rx.recv_timeout(remaining).is_err() {
-                            break;
-                        }
-                    }
-                    let id = current_id.clone();
-                    if fell_core::compose::draft_file_is_symlink(&current_folder) {
-                        continue;
-                    }
-                    // Sample before reading: the read happens outside the
-                    // lock, and a save can land in between.
-                    let since = hub
-                        .with_session(&id, |session| session.disk_generation())
-                        .unwrap_or(0);
-                    let content = std::fs::read_to_string(current_folder.join("draft.md")).ok();
-                    hub.with_session(&id, |session| {
-                        session.push_disk_seen(content, since, 0);
-                        session.poll_disk(150);
-                    });
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    })
 }

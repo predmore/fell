@@ -78,6 +78,37 @@ fn palette(kind: ThemeKind) -> Palette {
     }
 }
 
+/// Compose colors from the Omarchy theme the inbox is using, so the editor
+/// matches it. Tinted rows keep AA text on them.
+fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
+    use crate::theme::{MARK_CONTRAST, TEXT_CONTRAST, ensure_all, mix};
+    let bg = theme.background;
+    let panel = theme.surface;
+    let code = mix(bg, theme.foreground, 0.10);
+    let hunk = mix(bg, theme.accent, 0.16);
+    let fresh = mix(panel, theme.star, 0.14);
+    let fg = ensure_all(
+        theme.foreground,
+        &[bg, panel, code, hunk, fresh],
+        TEXT_CONTRAST,
+    );
+    Palette {
+        bg,
+        fg,
+        dim: ensure_all(theme.dimmed, &[bg, panel, code, hunk, fresh], TEXT_CONTRAST),
+        marker: ensure_all(mix(theme.dimmed, bg, 0.2), &[bg, code, hunk], MARK_CONTRAST),
+        accent: ensure_all(theme.accent, &[bg, panel, hunk, fresh], TEXT_CONTRAST),
+        caret: fg,
+        code,
+        selection: theme.selection,
+        error: ensure_all(theme.error, &[bg, panel], TEXT_CONTRAST),
+        fresh,
+        panel,
+        rule: theme.border,
+        hunk,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -185,6 +216,9 @@ pub struct ComposeView {
     subject_line: String,
     field_col: usize,
     theme: ThemeKind,
+    /// The Omarchy theme this window follows, live. `None` uses the
+    /// built-in palette for `theme`.
+    look: Option<crate::theme::Theme>,
     raw: bool,
     preview: bool,
     quote_open: bool,
@@ -200,6 +234,8 @@ pub struct ComposeView {
     watching: bool,
     flush_pending: bool,
     flush_gen: u64,
+    /// `:q` asked to close this window. The next frame removes it.
+    closing: bool,
 }
 
 impl ComposeView {
@@ -214,6 +250,9 @@ impl ComposeView {
             .with_session(&draft_id, |session| session.snapshot())
             .unwrap_or_else(|| empty_snapshot(&draft_id));
         let editor = Editor::from_body(&snap.body);
+        // A closed window no longer counts as showing its draft.
+        cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
+            .detach();
         Self {
             hub,
             draft_id: draft_id.into(),
@@ -227,6 +266,7 @@ impl ComposeView {
             subject_line: snap.subject,
             field_col: 0,
             theme: ThemeKind::Dark,
+            look: None,
             raw: false,
             preview: false,
             quote_open: false,
@@ -241,6 +281,7 @@ impl ComposeView {
             watching: false,
             flush_pending: false,
             flush_gen: 0,
+            closing: false,
         }
     }
 
@@ -323,6 +364,54 @@ impl ComposeView {
 
     pub fn set_theme(&mut self, theme: ThemeKind) {
         self.theme = theme;
+    }
+
+    /// Paint with the active Omarchy theme, as the inbox does, and repaint
+    /// when it changes. `:theme` switches back to the built-in palettes.
+    pub(crate) fn follow_omarchy_theme(&mut self, cx: &mut Context<Self>) {
+        let theme = crate::theme::load();
+        self.theme = if theme.is_light() {
+            ThemeKind::Light
+        } else {
+            ThemeKind::Dark
+        };
+        self.look = Some(theme);
+        let (changed, mut changes) = futures::channel::mpsc::unbounded();
+        let watching = crate::theme::watch(changed);
+        cx.spawn(async move |this, cx| {
+            loop {
+                if watching {
+                    if futures::StreamExt::next(&mut changes).await.is_none() {
+                        break;
+                    }
+                } else {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                }
+                let next = cx
+                    .background_executor()
+                    .spawn(async { crate::theme::load() })
+                    .await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.look.is_some() && this.look.as_ref() != Some(&next) {
+                            this.look = Some(next);
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn colors(&self) -> Palette {
+        match &self.look {
+            Some(theme) => palette_from_theme(theme),
+            None => palette(self.theme),
+        }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -763,6 +852,7 @@ impl ComposeView {
             }
             "quote" => self.toggle_quote(),
             "theme" => {
+                self.look = None;
                 self.theme = match self.theme {
                     ThemeKind::Dark => ThemeKind::Light,
                     ThemeKind::Light => ThemeKind::Dark,
@@ -771,6 +861,12 @@ impl ComposeView {
             "keep" => self.keep_or_reject(true),
             "reject" => self.keep_or_reject(false),
             "undo" => self.undo(),
+            "close" => {
+                // The draft is already saved; closing only hides it.
+                self.flush_now();
+                self.closing = true;
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -1066,6 +1162,9 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.closing {
+            window.remove_window();
+        }
         self.sync_from_hub();
         if self.leader && !self.which_visible {
             let ready = self
@@ -1096,7 +1195,12 @@ impl Render for ComposeView {
             .hub
             .with_session(self.draft_id.as_ref(), |session| session.snapshot())
             .unwrap_or_else(|| empty_snapshot(self.draft_id.as_ref()));
-        let colors = palette(self.theme);
+        let colors = self.colors();
+        let ui_family = self
+            .look
+            .as_ref()
+            .and_then(|theme| theme.ui_family.clone())
+            .unwrap_or_else(|| "Liberation Sans".into());
         let mode = match self.editor.mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
@@ -1128,7 +1232,7 @@ impl Render for ComposeView {
             .text_color(rgb(colors.fg))
             .text_size(px(16.))
             .font_weight(FontWeight(400.))
-            .font_family("Liberation Sans")
+            .font_family(ui_family)
             .child(header(&snap, colors).flex_shrink_0())
             .child(self.fields_view(&snap, colors).flex_shrink_0())
             .child(self.body_view(&snap, colors))
@@ -1466,21 +1570,42 @@ impl PreparedSend {
 }
 
 fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
-    div()
+    let top = div()
         .flex()
         .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight(620.))
+                .child("Compose"),
+        )
+        .child(
+            div()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_size(px(16.))
+                .text_color(rgb(colors.dim))
+                .child(format!("{}   {}", snap.from, snap.id)),
+        );
+    // Its own line, so it never pushes the sender out of a narrow window.
+    let asked = snap.send_requested_by.as_ref().map(|agent| {
+        div().text_color(rgb(colors.accent)).child(format!(
+            "{} asked you to review and send",
+            agent.strip_prefix("agent:").unwrap_or(agent)
+        ))
+    });
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
         .px_4()
         .py_2()
         .bg(rgb(colors.panel))
         .border_b_1()
         .border_color(rgb(colors.selection))
-        .child(div().font_weight(FontWeight(620.)).child("Compose"))
-        .child(
-            div()
-                .text_size(px(16.))
-                .text_color(rgb(colors.dim))
-                .child(format!("{}   {}", snap.from, snap.id)),
-        )
+        .child(top)
+        .children(asked)
 }
 
 fn field_row(
@@ -1505,17 +1630,19 @@ fn field_row(
             .child(
                 div()
                     .w(px(88.))
+                    .flex_shrink_0()
                     .text_size(px(16.))
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
-            .child(div().flex_1().child(if value.is_empty() {
+            .child(div().flex_1().min_w(px(0.)).child(if value.is_empty() {
                 SharedString::from(" ")
             } else {
                 SharedString::from(value.to_string())
             }))
             .children(fresh.then(|| {
                 div()
+                    .flex_shrink_0()
                     .text_size(px(16.))
                     .text_color(rgb(colors.accent))
                     .child("new")
@@ -1534,12 +1661,15 @@ fn subject_row(subject: &str, active: bool, colors: Palette) -> gpui::Div {
         .child(
             div()
                 .w(px(88.))
+                .flex_shrink_0()
                 .text_size(px(16.))
                 .text_color(rgb(colors.fg))
                 .child("Subject"),
         )
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.))
                 .font_weight(FontWeight(560.))
                 .child(subject.to_string()),
         )
@@ -1861,7 +1991,7 @@ fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
             .text_size(px(18.))
             .font_weight(FontWeight(700.))
             .text_color(rgb(colors.accent))
-            .child(format!("{indent}● "));
+            .child(format!("{indent}• "));
     }
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 && trimmed.as_bytes().get(digits) == Some(&b'.') {
@@ -1959,7 +2089,7 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
                 let marker = if *ordered {
                     format!("{}.", index + 1)
                 } else {
-                    "●".into()
+                    "•".into()
                 };
                 list = list.child(
                     div()
@@ -2445,6 +2575,7 @@ fn empty_snapshot(id: &str) -> Snapshot {
         focused: false,
         send_block: None,
         text: String::new(),
+        send_requested_by: None,
     }
 }
 
@@ -2508,9 +2639,13 @@ fn palette_action(query: &str) -> Option<&'static str> {
     if query.is_empty() {
         return None;
     }
+    // Vim's `:q`. `quote` still runs from `:qu`.
+    if query == "q" || query == "quit" {
+        return Some("close");
+    }
     let mut found = None;
     for name in [
-        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo",
+        "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close",
     ] {
         if name.starts_with(&query) {
             if found.is_some() {
@@ -2602,6 +2737,54 @@ pub fn open_demo(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compose_text_meets_aa_on_every_stock_theme() {
+        use crate::theme::{MARK_CONTRAST, TEXT_CONTRAST, contrast, every_test_theme};
+        let themes = every_test_theme();
+        assert!(themes.len() > 10);
+        for theme in themes {
+            let colors = super::palette_from_theme(&theme);
+            let name = &theme.name;
+            for bg in [
+                colors.bg,
+                colors.panel,
+                colors.code,
+                colors.hunk,
+                colors.fresh,
+            ] {
+                assert!(
+                    contrast(colors.fg, bg) >= TEXT_CONTRAST,
+                    "{name} fg on {bg:06x}"
+                );
+            }
+            for bg in [colors.bg, colors.panel, colors.fresh] {
+                assert!(
+                    contrast(colors.dim, bg) >= TEXT_CONTRAST,
+                    "{name} dim on {bg:06x}"
+                );
+            }
+            for bg in [colors.bg, colors.panel, colors.hunk, colors.fresh] {
+                assert!(
+                    contrast(colors.accent, bg) >= TEXT_CONTRAST,
+                    "{name} accent on {bg:06x}"
+                );
+            }
+            assert!(
+                contrast(colors.error, colors.bg) >= TEXT_CONTRAST,
+                "{name} error"
+            );
+            assert!(
+                contrast(colors.marker, colors.bg) >= MARK_CONTRAST,
+                "{name} marker"
+            );
+            // Markers stay quieter than the prose they mark.
+            assert!(
+                contrast(colors.marker, colors.bg) < contrast(colors.fg, colors.bg),
+                "{name}"
+            );
+        }
+    }
     use super::{Editor, cursor_line_covered};
     use fell_core::compose::markdown_to_doc;
 
@@ -2758,6 +2941,10 @@ mod tests {
         assert_eq!(super::palette_action("r"), None);
         assert_eq!(super::palette_action("re"), Some("reject"));
         assert_eq!(super::palette_action("raw"), Some("raw"));
+        assert_eq!(super::palette_action("q"), Some("close"));
+        assert_eq!(super::palette_action("quit"), Some("close"));
+        assert_eq!(super::palette_action("qu"), Some("quote"));
+        assert_eq!(super::palette_action("cl"), Some("close"));
     }
 
     #[test]

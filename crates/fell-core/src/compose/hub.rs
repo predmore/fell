@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -26,6 +27,9 @@ pub struct DraftHub {
     focused: Mutex<Option<String>>,
     shown: Mutex<Option<String>>,
     shown_cv: Condvar,
+    /// Bumped by every `request_send`, so a host can bring the editor up
+    /// again for a draft that is already focused.
+    reveals: AtomicU64,
 }
 
 impl Default for DraftHub {
@@ -42,6 +46,7 @@ impl DraftHub {
             focused: Mutex::new(None),
             shown: Mutex::new(None),
             shown_cv: Condvar::new(),
+            reveals: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +114,15 @@ impl DraftHub {
         self.shown_cv.notify_all();
     }
 
+    /// The compose window showing `id` closed. A later `request_send` waits
+    /// for a window to show it again before it reports the draft opened.
+    pub fn note_hidden(&self, id: &str) {
+        let mut shown = self.shown.lock().expect("shown");
+        if shown.as_deref() == Some(id) {
+            *shown = None;
+        }
+    }
+
     fn wait_shown(&self, id: &str) -> bool {
         {
             let shown = self.shown.lock().expect("shown");
@@ -137,6 +151,12 @@ impl DraftHub {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// How many `request_send` calls have asked for the editor. A host opens
+    /// or raises the compose window when this changes.
+    pub fn reveal_count(&self) -> u64 {
+        self.reveals.load(Ordering::SeqCst)
     }
 
     pub fn focused_id(&self) -> Option<String> {
@@ -284,7 +304,9 @@ impl DraftHub {
             "request_send" => {
                 let changes = session.take_user_changes(&agent);
                 let transmitted = session.request_send();
+                session.note_send_request(&agent);
                 *self.focused.lock().expect("focused") = Some(draft_id.clone());
+                self.reveals.fetch_add(1, Ordering::SeqCst);
                 reveal = Some(draft_id.clone());
                 let snap = session.snapshot();
                 json!({
@@ -776,6 +798,79 @@ mod tests {
         let requested: Value = serde_json::from_str(&requested).unwrap();
         assert_eq!(requested["opened"], true);
         assert_eq!(requested["transmitted"], false);
+    }
+
+    fn hub_with_d1(name: &str) -> Arc<DraftHub> {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fields = DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            subject: "Hi".into(),
+            ..DraftFields::default()
+        };
+        let folder =
+            workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
+                .unwrap();
+        let mut session =
+            DraftSession::create(folder, "d1", AccountId("a".into()), fields, "alpha\n").unwrap();
+        session.set_owner("bot");
+        let hub = Arc::new(DraftHub::new());
+        hub.insert(session);
+        hub
+    }
+
+    fn request_send_d1(hub: &DraftHub) -> Value {
+        let reply = hub.handle_line(
+            &json!({ "id": 1, "op": "request_send", "draft_id": "d1", "agent": "bot" }).to_string(),
+        );
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    #[test]
+    fn each_request_send_asks_the_host_to_show_the_editor_again() {
+        let hub = hub_with_d1("reveal");
+        assert_eq!(hub.reveal_count(), 0);
+        request_send_d1(&hub);
+        assert_eq!(hub.reveal_count(), 1);
+        // Same draft, already focused: still a new request to bring it up.
+        request_send_d1(&hub);
+        assert_eq!(hub.reveal_count(), 2);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        let snap = hub
+            .with_session("d1", |session| session.snapshot())
+            .unwrap();
+        assert_eq!(snap.send_requested_by.as_deref(), Some("bot"));
+        // Reading or editing a draft never asks for the editor.
+        hub.handle_line(
+            &json!({ "id": 2, "op": "get_draft", "draft_id": "d1", "agent": "bot" }).to_string(),
+        );
+        assert_eq!(hub.reveal_count(), 2);
+    }
+
+    #[test]
+    fn a_closed_window_does_not_count_as_showing_the_draft() {
+        let hub = hub_with_d1("hidden");
+        let _host = hub.subscribe();
+        hub.note_shown("d1");
+        assert_eq!(request_send_d1(&hub)["opened"], true);
+        hub.note_hidden("d1");
+        let started = std::time::Instant::now();
+        let reply = request_send_d1(&hub);
+        assert_eq!(reply["opened"], false);
+        assert_eq!(reply["transmitted"], false);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+        // Hiding another draft leaves this one shown.
+        hub.note_shown("d1");
+        hub.note_hidden("other");
+        assert_eq!(request_send_d1(&hub)["opened"], true);
     }
 
     #[test]
