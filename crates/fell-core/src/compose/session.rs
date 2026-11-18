@@ -493,6 +493,12 @@ impl DraftSession {
         self.focused = true;
     }
 
+    /// The window showing this draft closed. Agents may delete it again.
+    pub fn close_editor(&mut self) {
+        self.open = false;
+        self.focused = false;
+    }
+
     /// Focus the editor. Does not transmit.
     pub fn request_send(&mut self) -> bool {
         self.open = true;

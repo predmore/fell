@@ -27,12 +27,7 @@ use crate::theme::{self, Theme};
 pub fn run() {
     Application::new().run(|cx: &mut App| {
         // Agents' drafts open in a compose window from here; see draft_host.
-        let compose_theme = if theme::load().is_light() {
-            crate::compose_ui::ThemeKind::Light
-        } else {
-            crate::compose_ui::ThemeKind::Dark
-        };
-        let _hub = crate::draft_host::host_agent_drafts(cx, compose_theme);
+        let _hub = crate::draft_host::host_agent_drafts(cx);
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let view = cx.open_window(

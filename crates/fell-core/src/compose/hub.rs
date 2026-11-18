@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -21,9 +21,25 @@ use super::workspace::{self, draft_socket_path};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubEvent;
 
+/// The draft socket and the lock that makes this process its only server.
+pub struct HubListener {
+    listener: UnixListener,
+    _lock: std::fs::File,
+}
+
+impl HubListener {
+    pub fn incoming(&self) -> std::os::unix::net::Incoming<'_> {
+        self.listener.incoming()
+    }
+}
+
+/// Called on every hub change. Returns `false` once its subscriber is gone,
+/// and is then dropped.
+type Listener = Box<dyn Fn() -> bool + Send>;
+
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
-    listeners: Mutex<Vec<Sender<()>>>,
+    listeners: Mutex<Vec<Listener>>,
     focused: Mutex<Option<String>>,
     shown: Mutex<Option<String>>,
     shown_cv: Condvar,
@@ -51,9 +67,19 @@ impl DraftHub {
     }
 
     pub fn subscribe(&self) -> Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        self.listeners.lock().expect("listeners").push(tx);
+        let (tx, rx) = mpsc::channel::<()>();
+        self.subscribe_with(move || tx.send(()).is_ok());
         rx
+    }
+
+    /// Run `notify` after every change, from whichever thread made it. Keep
+    /// it cheap and non-blocking, such as a send on an async channel; return
+    /// `false` when nobody listens any more.
+    pub fn subscribe_with(&self, notify: impl Fn() -> bool + Send + 'static) {
+        self.listeners
+            .lock()
+            .expect("listeners")
+            .push(Box::new(notify));
     }
 
     /// Add a live draft. Its saves run on a writer thread from now on, so
@@ -117,10 +143,14 @@ impl DraftHub {
     /// The compose window showing `id` closed. A later `request_send` waits
     /// for a window to show it again before it reports the draft opened.
     pub fn note_hidden(&self, id: &str) {
-        let mut shown = self.shown.lock().expect("shown");
-        if shown.as_deref() == Some(id) {
-            *shown = None;
+        {
+            let mut shown = self.shown.lock().expect("shown");
+            if shown.as_deref() == Some(id) {
+                *shown = None;
+            }
         }
+        // No window has it open for editing any more.
+        self.with_session(id, DraftSession::close_editor);
     }
 
     fn wait_shown(&self, id: &str) -> bool {
@@ -363,17 +393,39 @@ impl DraftHub {
         reply.to_string()
     }
 
-    pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    /// Serve agent drafts at `path`. One Fell process owns the socket: a
+    /// lock beside it is held for as long as the returned listener lives, and
+    /// a second process gets an error instead of taking the path over. A
+    /// socket file left by a process that exited is replaced.
+    pub fn bind(path: &Path) -> std::io::Result<HubListener> {
+        use fs4::fs_std::FileExt;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+        if !lock.try_lock_exclusive()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another Fell is serving agent drafts",
+            ));
         }
         if path.exists() {
             std::fs::remove_file(path)?;
         }
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(listener)
+        Ok(HubListener {
+            listener,
+            _lock: lock,
+        })
     }
 
     pub fn serve_one(self: &Arc<Self>, stream: UnixStream) {
@@ -392,7 +444,7 @@ impl DraftHub {
 
     fn emit(&self) {
         let mut listeners = self.listeners.lock().expect("listeners");
-        listeners.retain(|listener| listener.send(()).is_ok());
+        listeners.retain(|listener| listener());
     }
 }
 
@@ -871,6 +923,60 @@ mod tests {
         hub.note_shown("d1");
         hub.note_hidden("other");
         assert_eq!(request_send_d1(&hub)["opened"], true);
+    }
+
+    #[test]
+    fn a_second_process_cannot_take_over_the_draft_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "fell-hub-bind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("live.sock");
+        let first = DraftHub::bind(&path).unwrap();
+        let second = DraftHub::bind(&path);
+        assert_eq!(
+            second.err().map(|err| err.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+        // The first server still owns the path it bound.
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(first);
+        // A socket file left behind is replaced once nobody holds the lock.
+        let _again = DraftHub::bind(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_listener_that_is_gone_is_dropped() {
+        let hub = hub_with_d1("listeners");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        hub.subscribe_with(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+        request_send_d1(&hub);
+        request_send_d1(&hub);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hiding_the_window_closes_the_draft_for_editing() {
+        let hub = hub_with_d1("closed");
+        request_send_d1(&hub);
+        assert!(
+            hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
+        hub.note_hidden("d1");
+        assert!(
+            !hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
     }
 
     #[test]

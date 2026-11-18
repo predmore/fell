@@ -4,8 +4,10 @@
 //! The inbox and the compose demo both run this. Nothing here transmits:
 //! mail goes out only from the compose window's own send action.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fell_core::compose::DraftHub;
@@ -15,7 +17,7 @@ use gpui::{
 };
 use notify::{Event, RecursiveMode, Watcher};
 
-use crate::compose_ui::{ComposeView, ThemeKind};
+use crate::compose_ui::ComposeView;
 
 /// Answer `fell-mcp` draft calls on the user's private socket. Another Fell
 /// already serving it keeps it; this one then serves no agents.
@@ -23,7 +25,10 @@ pub fn serve_socket(hub: Arc<DraftHub>) {
     let path = fell_core::compose::draft_socket_path();
     let listener = match DraftHub::bind(&path) {
         Ok(listener) => listener,
-        Err(_) => return,
+        Err(err) => {
+            eprintln!("fell: agent drafts are not served here: {err}");
+            return;
+        }
     };
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -65,6 +70,9 @@ pub fn watch_folder(
                     None => true,
                 };
                 if released && watcher.watch(&next, RecursiveMode::NonRecursive).is_ok() {
+                    // A write that landed before the watch began sent no
+                    // event; merge whatever the file holds now.
+                    merge_from_disk(&hub, &id, &next);
                     current = Some((id, next));
                 }
             }
@@ -80,19 +88,7 @@ pub fn watch_folder(
                     let Some((id, folder)) = current.clone() else {
                         continue;
                     };
-                    if fell_core::compose::draft_file_is_symlink(&folder) {
-                        continue;
-                    }
-                    // Sample before reading: the read happens outside the
-                    // lock, and a save can land in between.
-                    let since = hub
-                        .with_session(&id, |session| session.disk_generation())
-                        .unwrap_or(0);
-                    let content = std::fs::read_to_string(folder.join("draft.md")).ok();
-                    hub.with_session(&id, |session| {
-                        session.push_disk_seen(content, since, 0);
-                        session.poll_disk(150);
-                    });
+                    merge_from_disk(&hub, &id, &folder);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -101,11 +97,33 @@ pub fn watch_folder(
     })
 }
 
+/// Merge `draft.md` in `folder` into live draft `id`, as an outside edit.
+fn merge_from_disk(hub: &DraftHub, id: &str, folder: &std::path::Path) {
+    if fell_core::compose::draft_file_is_symlink(folder) {
+        return;
+    }
+    // Sample before reading: the read happens outside the lock, and a save
+    // can land in between.
+    let since = hub
+        .with_session(id, |session| session.disk_generation())
+        .unwrap_or(0);
+    let content = std::fs::read_to_string(folder.join("draft.md")).ok();
+    hub.with_session(id, |session| {
+        session.push_disk_seen(content, since, 0);
+        session.poll_disk(150);
+    });
+}
+
 /// Serve agent drafts from the inbox: the socket, the folder watcher, and a
 /// compose window that opens, or comes to the front, whenever an agent calls
 /// `request_send`. Saves still queued when Fell quits are waited for.
-pub fn host_agent_drafts(cx: &mut App, theme: ThemeKind) -> Arc<DraftHub> {
+pub fn host_agent_drafts(cx: &mut App) -> Arc<DraftHub> {
     let hub = Arc::new(DraftHub::new());
+    // Subscribe before the socket accepts anything, and count reveals from
+    // zero, so a request_send that lands while the inbox is still opening
+    // is not lost.
+    let (tx, mut events) = futures::channel::mpsc::unbounded::<()>();
+    hub.subscribe_with(move || tx.unbounded_send(()).is_ok());
     serve_socket(hub.clone());
     // The watcher thread lives as long as the app.
     let _ = watch_folder(hub.clone(), None);
@@ -115,41 +133,78 @@ pub fn host_agent_drafts(cx: &mut App, theme: ThemeKind) -> Arc<DraftHub> {
         async move { hub.settle_all() }
     })
     .detach();
-    let events = Arc::new(Mutex::new(hub.subscribe()));
+    let windows: Rc<RefCell<Option<WindowHandle<ComposeView>>>> = Rc::default();
+    follow_theme(cx, windows.clone());
     let host = hub.clone();
     cx.spawn(async move |cx| {
-        let mut seen = host.reveal_count();
-        let mut window: Option<WindowHandle<ComposeView>> = None;
+        let mut seen = 0;
         loop {
-            let events = events.clone();
-            let alive = cx
-                .background_executor()
-                .spawn(async move { events.lock().ok().is_some_and(|rx| rx.recv().is_ok()) })
-                .await;
-            if !alive {
+            let reveals = host.reveal_count();
+            if reveals > seen {
+                seen = reveals;
+                if let Some(id) = host.focused_id() {
+                    reveal(cx, &host, &id, &windows);
+                }
+            }
+            if futures::StreamExt::next(&mut events).await.is_none() {
                 break;
             }
-            let reveals = host.reveal_count();
-            if reveals == seen {
-                continue;
-            }
-            seen = reveals;
-            let Some(id) = host.focused_id() else {
-                continue;
-            };
-            // An open compose window follows the hub's focus by itself.
-            let raised = window.is_some_and(|handle| {
-                handle
-                    .update(cx, |_, window, _| window.activate_window())
-                    .is_ok()
-            });
-            if !raised {
-                window = open_compose_window(cx, host.clone(), &id, theme);
-            }
+            while events.try_recv().is_ok() {}
         }
     })
     .detach();
     hub
+}
+
+/// Bring the compose window to the front on draft `id`, opening one if
+/// there is none. An open window follows the hub's focus by itself.
+fn reveal(
+    cx: &mut AsyncApp,
+    hub: &Arc<DraftHub>,
+    id: &str,
+    window: &Rc<RefCell<Option<WindowHandle<ComposeView>>>>,
+) {
+    let open = *window.borrow();
+    let raised = open.is_some_and(|handle| {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    });
+    if !raised {
+        *window.borrow_mut() = open_compose_window(cx, hub.clone(), id);
+    }
+}
+
+/// One Omarchy theme watcher for the compose window, as the inbox has its
+/// own. A theme change repaints the window if it still follows the theme.
+fn follow_theme(cx: &mut App, window: Rc<RefCell<Option<WindowHandle<ComposeView>>>>) {
+    let (changed, mut changes) = futures::channel::mpsc::unbounded();
+    let watching = crate::theme::watch(changed);
+    cx.spawn(async move |cx| {
+        loop {
+            if watching {
+                if futures::StreamExt::next(&mut changes).await.is_none() {
+                    break;
+                }
+            } else {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+            }
+            let Some(handle) = *window.borrow() else {
+                continue;
+            };
+            let next = cx
+                .background_executor()
+                .spawn(async { crate::theme::load() })
+                .await;
+            let _ = handle.update(cx, |view, _, cx| {
+                if view.follows_look() {
+                    view.set_look(next);
+                    cx.notify();
+                }
+            });
+        }
+    })
+    .detach();
 }
 
 /// A compose window on draft `id`, focused. `None` when the draft is not in
@@ -158,7 +213,6 @@ fn open_compose_window(
     cx: &mut AsyncApp,
     hub: Arc<DraftHub>,
     id: &str,
-    theme: ThemeKind,
 ) -> Option<WindowHandle<ComposeView>> {
     let folder = hub.with_session(id, |session| {
         session.open_for_edit();
@@ -166,7 +220,8 @@ fn open_compose_window(
     })?;
     let id = id.to_string();
     cx.update(|cx| {
-        let bounds = Bounds::centered(None, size(px(900.), px(760.)), cx);
+        let (width, height) = compose_window_size();
+        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let handle = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -182,8 +237,7 @@ fn open_compose_window(
             move |_window, cx| {
                 cx.new(|cx| {
                     let mut compose = ComposeView::new(hub, id, folder, cx);
-                    compose.set_theme(theme);
-                    compose.follow_omarchy_theme(cx);
+                    compose.set_look(crate::theme::load());
                     compose.watch_live(cx);
                     compose
                 })
@@ -194,4 +248,16 @@ fn open_compose_window(
     })
     .ok()
     .flatten()
+}
+
+/// The compose window's first size. `FELL_COMPOSE_WINDOW=WxH` overrides it,
+/// as `FELL_WINDOW` does for the inbox.
+fn compose_window_size() -> (f32, f32) {
+    std::env::var("FELL_COMPOSE_WINDOW")
+        .ok()
+        .and_then(|raw| {
+            let (width, height) = raw.split_once('x')?;
+            Some((width.parse().ok()?, height.parse().ok()?))
+        })
+        .unwrap_or((900.0, 760.0))
 }

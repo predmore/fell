@@ -37,7 +37,6 @@ struct Palette {
     code: u32,
     selection: u32,
     error: u32,
-    fresh: u32,
     panel: u32,
     rule: u32,
     hunk: u32,
@@ -55,7 +54,6 @@ fn palette(kind: ThemeKind) -> Palette {
             code: 0x3a3834,
             selection: 0x2a3344,
             error: 0xf7768e,
-            fresh: 0x2c2926,
             panel: 0x242320,
             rule: 0x6e675f,
             hunk: 0x243044,
@@ -70,7 +68,6 @@ fn palette(kind: ThemeKind) -> Palette {
             code: 0xe4ddd4,
             selection: 0xd9e2f2,
             error: 0x9f1239,
-            fresh: 0xf6eee4,
             panel: 0xfffdfb,
             rule: 0x8f877e,
             hunk: 0xe7eef8,
@@ -86,23 +83,17 @@ fn palette_from_theme(theme: &crate::theme::Theme) -> Palette {
     let panel = theme.surface;
     let code = mix(bg, theme.foreground, 0.10);
     let hunk = mix(bg, theme.accent, 0.16);
-    let fresh = mix(panel, theme.star, 0.14);
-    let fg = ensure_all(
-        theme.foreground,
-        &[bg, panel, code, hunk, fresh],
-        TEXT_CONTRAST,
-    );
+    let fg = ensure_all(theme.foreground, &[bg, panel, code, hunk], TEXT_CONTRAST);
     Palette {
         bg,
         fg,
-        dim: ensure_all(theme.dimmed, &[bg, panel, code, hunk, fresh], TEXT_CONTRAST),
+        dim: ensure_all(theme.dimmed, &[bg, panel, code, hunk], TEXT_CONTRAST),
         marker: ensure_all(mix(theme.dimmed, bg, 0.2), &[bg, code, hunk], MARK_CONTRAST),
-        accent: ensure_all(theme.accent, &[bg, panel, hunk, fresh], TEXT_CONTRAST),
+        accent: ensure_all(theme.accent, &[bg, panel, hunk], TEXT_CONTRAST),
         caret: fg,
         code,
         selection: theme.selection,
         error: ensure_all(theme.error, &[bg, panel], TEXT_CONTRAST),
-        fresh,
         panel,
         rule: theme.border,
         hunk,
@@ -286,17 +277,15 @@ impl ComposeView {
     }
 
     pub fn watch_live(&self, cx: &mut Context<Self>) {
-        let rx = Arc::new(std::sync::Mutex::new(self.hub.subscribe()));
+        // An async channel: waiting for the hub holds no thread, and once
+        // the window is gone the next change drops this subscription.
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        self.hub
+            .subscribe_with(move || tx.unbounded_send(()).is_ok());
         cx.spawn(async move |this, cx| {
-            loop {
-                let rx = rx.clone();
-                let ok = cx
-                    .background_executor()
-                    .spawn(async move { rx.lock().ok().is_some_and(|inbox| inbox.recv().is_ok()) })
-                    .await;
-                if !ok {
-                    break;
-                }
+            while futures::StreamExt::next(&mut rx).await.is_some() {
+                // Several changes may have queued; one repaint covers them.
+                while rx.try_recv().is_ok() {}
                 if this
                     .update(cx, |this, cx| {
                         this.sync_from_hub();
@@ -366,45 +355,20 @@ impl ComposeView {
         self.theme = theme;
     }
 
-    /// Paint with the active Omarchy theme, as the inbox does, and repaint
-    /// when it changes. `:theme` switches back to the built-in palettes.
-    pub(crate) fn follow_omarchy_theme(&mut self, cx: &mut Context<Self>) {
-        let theme = crate::theme::load();
+    /// Paint with this Omarchy theme, as the inbox does. The host calls it
+    /// again when the theme changes. `:theme` switches to the built-ins.
+    pub(crate) fn set_look(&mut self, theme: crate::theme::Theme) {
         self.theme = if theme.is_light() {
             ThemeKind::Light
         } else {
             ThemeKind::Dark
         };
         self.look = Some(theme);
-        let (changed, mut changes) = futures::channel::mpsc::unbounded();
-        let watching = crate::theme::watch(changed);
-        cx.spawn(async move |this, cx| {
-            loop {
-                if watching {
-                    if futures::StreamExt::next(&mut changes).await.is_none() {
-                        break;
-                    }
-                } else {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                }
-                let next = cx
-                    .background_executor()
-                    .spawn(async { crate::theme::load() })
-                    .await;
-                let alive = this
-                    .update(cx, |this, cx| {
-                        if this.look.is_some() && this.look.as_ref() != Some(&next) {
-                            this.look = Some(next);
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
+    }
+
+    /// Whether this window still follows the Omarchy theme.
+    pub(crate) fn follows_look(&self) -> bool {
+        self.look.is_some()
     }
 
     fn colors(&self) -> Palette {
@@ -419,6 +383,9 @@ impl ComposeView {
     }
 
     fn sync_from_hub(&mut self) {
+        if self.closing {
+            return;
+        }
         self.follow_focus();
         if !self.pull_unpainted() {
             self.mark_painted();
@@ -865,6 +832,8 @@ impl ComposeView {
                 // The draft is already saved; closing only hides it.
                 self.flush_now();
                 self.closing = true;
+                // From now on a request_send must wait for a new window.
+                self.hub.note_hidden(self.draft_id.as_ref());
                 cx.notify();
             }
             _ => {}
@@ -1202,24 +1171,20 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let mode = match self.editor.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
-            Mode::Visual => "VISUAL",
+            Mode::Normal => "normal",
+            Mode::Insert => "insert",
+            Mode::Visual => "visual",
         };
         let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
             (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
             (Mode::Normal, "esc normal") => "i insert".into(),
             _ => self.status.clone(),
         };
-        let unreviewed = snap.unreviewed;
         let wide = window.viewport_size().width > px(640.);
-        let send_label = if let Some(reason) = &snap.send_block {
-            format!("send blocked · {reason}")
-        } else if unreviewed == 0 {
-            "send space m s".to_string()
-        } else {
-            format!("send space m s · {unreviewed} unreviewed")
-        };
+        let mono = self
+            .look
+            .as_ref()
+            .and_then(|theme| theme.mono_family.clone());
         div()
             .id("compose")
             .track_focus(&self.focus)
@@ -1241,7 +1206,7 @@ impl Render for ComposeView {
                     .map(|quote| quote.flex_shrink_0()),
             )
             .child(attachment_row(&snap, colors).flex_shrink_0())
-            .child(status_bar(mode, &send_label, &hint, &snap, colors, wide).flex_shrink_0())
+            .child(status_bar(mode, &hint, &snap, colors, wide, mono).flex_shrink_0())
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
@@ -1263,33 +1228,48 @@ impl ComposeView {
             &snap.to,
             colors,
         );
-        column = field_row(
-            column,
-            "Cc",
-            &self.cc_line,
-            self.field == Field::Cc,
-            &snap.cc,
-            colors,
-        );
-        column = field_row(
-            column,
-            "Bcc",
-            &self.bcc_line,
-            self.field == Field::Bcc,
-            &snap.bcc,
-            colors,
-        );
+        let copies_empty = snap.cc.is_empty() && snap.bcc.is_empty();
+        let copies_active = matches!(self.field, Field::Cc | Field::Bcc);
+        if copies_empty && !copies_active {
+            // Two empty rows would push the message down; tab still reaches each.
+            column = column.child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .px_1()
+                    .py_1()
+                    .border_l(px(2.))
+                    .border_color(rgb(colors.panel))
+                    .text_size(px(16.))
+                    .child(div().w(px(88.)).flex_shrink_0().child("Cc, Bcc"))
+                    .child(div().text_color(rgb(colors.dim)).child("none")),
+            );
+        } else {
+            column = field_row(
+                column,
+                "Cc",
+                &self.cc_line,
+                self.field == Field::Cc,
+                &snap.cc,
+                colors,
+            );
+            column = field_row(
+                column,
+                "Bcc",
+                &self.bcc_line,
+                self.field == Field::Bcc,
+                &snap.bcc,
+                colors,
+            );
+        }
         column
             .child(subject_row(
                 &self.subject_line,
                 self.field == Field::Subject,
                 colors,
             ))
-            .child(if snap.hunks.is_empty() {
-                reply_row(snap, colors)
-            } else {
-                hunk_banner(snap, colors)
-            })
+            .child(reply_row(snap, colors))
+            .children((!snap.hunks.is_empty()).then(|| hunk_banner(snap, colors)))
     }
 
     fn body_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1570,6 +1550,11 @@ impl PreparedSend {
 }
 
 fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
+    let title = if snap.send_requested_by.is_some() {
+        "Review and send"
+    } else {
+        "Compose"
+    };
     let top = div()
         .flex()
         .justify_between()
@@ -1578,7 +1563,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
             div()
                 .flex_shrink_0()
                 .font_weight(FontWeight(620.))
-                .child("Compose"),
+                .child(title),
         )
         .child(
             div()
@@ -1586,13 +1571,13 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
                 .overflow_hidden()
                 .text_size(px(16.))
                 .text_color(rgb(colors.dim))
-                .child(format!("{}   {}", snap.from, snap.id)),
+                .child(format!("from {}", snap.from)),
         );
     // Its own line, so it never pushes the sender out of a narrow window.
     let asked = snap.send_requested_by.as_ref().map(|agent| {
         div().text_color(rgb(colors.accent)).child(format!(
             "{} asked you to review and send",
-            agent.strip_prefix("agent:").unwrap_or(agent)
+            agent_label(agent)
         ))
     });
     div()
@@ -1608,6 +1593,27 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .children(asked)
 }
 
+/// An agent id as the header shows it: without the `agent:` prefix, and
+/// without format characters (bidi overrides, zero-width marks) that could
+/// make the sentence around it read differently.
+fn agent_label(agent: &str) -> String {
+    agent
+        .strip_prefix("agent:")
+        .unwrap_or(agent)
+        .chars()
+        .filter(|ch| {
+            !ch.is_control()
+                && !matches!(
+                    *ch,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2060}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect()
+}
+
 fn field_row(
     parent: gpui::Div,
     label: &str,
@@ -1616,17 +1622,48 @@ fn field_row(
     addresses: &[fell_core::compose::AddressView],
     colors: Palette,
 ) -> gpui::Div {
-    let fresh = addresses.iter().any(|address| address.fresh);
-    let bg = if fresh { colors.fresh } else { colors.panel };
+    // While a field is being edited it shows the raw line. Otherwise each
+    // address stands alone, and one the account never mailed says "new".
+    let shown = if active || addresses.is_empty() {
+        div().child(if value.is_empty() {
+            SharedString::from(" ")
+        } else {
+            SharedString::from(value.to_string())
+        })
+    } else {
+        // One run of text, so a long list wraps like prose and each "new"
+        // stays beside its address.
+        let mut text = String::new();
+        let mut marks = Vec::new();
+        for (index, address) in addresses.iter().enumerate() {
+            if index > 0 {
+                text.push_str(",  ");
+            }
+            text.push_str(&address.raw);
+            if address.fresh {
+                text.push(' ');
+                let start = text.len();
+                text.push_str("new");
+                marks.push((
+                    start..text.len(),
+                    gpui::HighlightStyle {
+                        color: Some(rgb(colors.accent).into()),
+                        font_weight: Some(FontWeight(600.)),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+        div().child(gpui::StyledText::new(SharedString::from(text)).with_highlights(marks))
+    };
     parent.child(
         div()
             .flex()
             .gap_3()
             .px_1()
             .py_1()
-            .bg(rgb(bg))
             .border_l(px(2.))
-            .border_color(rgb(if active || fresh { colors.accent } else { bg }))
+            .border_color(rgb(if active { colors.accent } else { colors.panel }))
             .child(
                 div()
                     .w(px(88.))
@@ -1635,18 +1672,7 @@ fn field_row(
                     .text_color(rgb(colors.fg))
                     .child(label.to_string()),
             )
-            .child(div().flex_1().min_w(px(0.)).child(if value.is_empty() {
-                SharedString::from(" ")
-            } else {
-                SharedString::from(value.to_string())
-            }))
-            .children(fresh.then(|| {
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(16.))
-                    .text_color(rgb(colors.accent))
-                    .child("new")
-            })),
+            .child(shown.flex_1().min_w(px(0.))),
     )
 }
 
@@ -1690,33 +1716,51 @@ fn reply_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .border_color(rgb(colors.panel))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
-        .child(div().w(px(88.)).child("Reply to"))
+        .child(div().w(px(88.)).flex_shrink_0().child("In reply to"))
         .child(reply.to_string())
 }
 
 fn hunk_banner(snap: &Snapshot, colors: Palette) -> gpui::Div {
-    let label = snap
-        .hunks
-        .first()
+    let first = snap.hunks.first();
+    let what = first
         .map(|hunk| match hunk.kind {
-            HunkKind::Recipients => "agent changed recipients",
-            HunkKind::Subject => "agent changed the subject",
-            HunkKind::Attachments => "agent changed attachments",
-            HunkKind::Body => "agent edit",
+            HunkKind::Recipients => "agent changed recipients".to_string(),
+            HunkKind::Subject => "agent changed the subject".to_string(),
+            HunkKind::Attachments => "agent changed attachments".to_string(),
+            HunkKind::Body => match body_edit_line(snap, hunk) {
+                Some(line) => format!("agent edit at line {line}"),
+                None => "agent edit".to_string(),
+            },
         })
-        .unwrap_or("agent edit");
+        .unwrap_or_else(|| "agent edit".into());
+    let count = snap.hunks.len();
+    let label = if count > 1 {
+        format!("{what} (1 of {count})")
+    } else {
+        what
+    };
     div()
         .flex()
         .px_1()
         .py_1()
         .border_l(px(2.))
-        .border_color(rgb(colors.hunk))
+        .border_color(rgb(colors.accent))
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
         .text_color(rgb(colors.fg))
         .child(format!(
             "{label}  ·  u undo  ·  space a k keep  ·  space a x reject"
         ))
+}
+
+/// The body line (from 1) where a body hunk starts, as the editor counts it.
+fn body_edit_line(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<usize> {
+    let slice = snap.text.get(hunk.start..hunk.end)?.trim();
+    if slice.is_empty() {
+        return None;
+    }
+    let at = snap.body.find(slice)?;
+    Some(snap.body[..at].matches('\n').count() + 1)
 }
 
 fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize)> {
@@ -2436,13 +2480,15 @@ fn attachment_row(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .child(format!("Attachments  {names}"))
 }
 
+/// One line, in the inbox's style: mode and hints on the left, send on
+/// the right, `key action` pairs separated by ` · `, in the mono face.
 fn status_bar(
     mode: &str,
-    send: &str,
     status: &SharedString,
     snap: &Snapshot,
     colors: Palette,
     wide: bool,
+    mono: Option<String>,
 ) -> gpui::Div {
     let fresh = snap
         .to
@@ -2458,30 +2504,64 @@ fn status_bar(
         (count, true) => Some(format!("{count} new recipients")),
         (count, false) => Some(format!("{count} new")),
     };
-    div()
+    let dot = || div().text_color(rgb(colors.dim)).child("·");
+    let mut left = div()
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
+        .child(dot())
+        .child(div().text_color(rgb(colors.fg)).child(status.to_string()));
+    if let Some(label) = fresh_label {
+        left = left
+            .child(dot())
+            .child(div().text_color(rgb(colors.accent)).child(label));
+    }
+    let right = match &snap.send_block {
+        Some(reason) => div()
+            .flex()
+            .gap_2()
+            .child(div().text_color(rgb(colors.dim)).child("send blocked"))
+            .child(dot())
+            .child(div().text_color(rgb(colors.fg)).child(reason.clone())),
+        None => {
+            let mut right = div()
+                .flex()
+                .gap_2()
+                .child(div().text_color(rgb(colors.fg)).child("space m s send"));
+            if snap.unreviewed > 0 {
+                // Sending accepts these, so they stand out.
+                right = right.child(dot()).child(
+                    div()
+                        .text_color(rgb(colors.accent))
+                        .font_weight(FontWeight(600.))
+                        .child(format!("{} unreviewed", snap.unreviewed)),
+                );
+            }
+            right
+                .child(dot())
+                .child(div().text_color(rgb(colors.fg)).child(":q close"))
+        }
+    };
+    let bar = div()
         .flex()
         .flex_wrap()
         .items_center()
         .justify_between()
-        .gap_4()
+        .gap_x_4()
+        .gap_y_1()
         .px(px(16.))
-        .py_2()
+        .py(px(6.))
         .bg(rgb(colors.panel))
         .border_t_1()
         .border_color(rgb(colors.rule))
-        .text_size(px(16.))
-        .child(
-            div()
-                .flex()
-                .flex_shrink_0()
-                .gap_3()
-                .child(div().text_color(rgb(colors.accent)).child(mode.to_string()))
-                .child(div().text_color(rgb(colors.fg)).child(status.to_string()))
-                .children(
-                    fresh_label.map(|label| div().text_color(rgb(colors.accent)).child(label)),
-                ),
-        )
-        .child(div().flex_shrink_0().child(send.to_string()))
+        .text_size(px(14.))
+        .child(left)
+        .child(right);
+    match mono {
+        Some(family) => bar.font_family(family),
+        None => bar,
+    }
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
@@ -2739,6 +2819,15 @@ pub fn open_demo(
 mod tests {
 
     #[test]
+    fn agent_names_lose_format_characters() {
+        assert_eq!(super::agent_label("agent:claude-code"), "claude-code");
+        assert_eq!(
+            super::agent_label("agent:bot\u{202E}dneS\u{200B}"),
+            "botdneS"
+        );
+    }
+
+    #[test]
     fn compose_text_meets_aa_on_every_stock_theme() {
         use crate::theme::{MARK_CONTRAST, TEXT_CONTRAST, contrast, every_test_theme};
         let themes = every_test_theme();
@@ -2746,25 +2835,19 @@ mod tests {
         for theme in themes {
             let colors = super::palette_from_theme(&theme);
             let name = &theme.name;
-            for bg in [
-                colors.bg,
-                colors.panel,
-                colors.code,
-                colors.hunk,
-                colors.fresh,
-            ] {
+            for bg in [colors.bg, colors.panel, colors.code, colors.hunk] {
                 assert!(
                     contrast(colors.fg, bg) >= TEXT_CONTRAST,
                     "{name} fg on {bg:06x}"
                 );
             }
-            for bg in [colors.bg, colors.panel, colors.fresh] {
+            for bg in [colors.bg, colors.panel, colors.hunk] {
                 assert!(
                     contrast(colors.dim, bg) >= TEXT_CONTRAST,
                     "{name} dim on {bg:06x}"
                 );
             }
-            for bg in [colors.bg, colors.panel, colors.hunk, colors.fresh] {
+            for bg in [colors.bg, colors.panel, colors.hunk] {
                 assert!(
                     contrast(colors.accent, bg) >= TEXT_CONTRAST,
                     "{name} accent on {bg:06x}"
