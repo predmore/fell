@@ -562,8 +562,7 @@ pub(crate) mod tests {
         let account = me();
         let home = temp_home("agent-reply", &account);
         let store = fell_core::Store::open(&home.store).unwrap();
-        store.upsert_message(&parent_message(&account)).unwrap();
-        // An agent's reply names only its parent.
+        // An agent's reply names only its parent, which is not stored yet.
         store
             .save_compose(&fell_core::compose::StoredCompose {
                 id: "c1".into(),
@@ -582,6 +581,18 @@ pub(crate) mod tests {
                 reply: Default::default(),
             })
             .unwrap();
+        drop(store);
+        // Opened before the parent syncs: no chain is made up and kept.
+        let hub = DraftHub::new();
+        home.open(&hub, "c1", &account.id).unwrap();
+        let references = hub
+            .with_session("c1", |session| session.reply_parts().references.clone())
+            .unwrap();
+        assert!(references.is_empty(), "{references:?}");
+        drop(hub);
+        // Once the parent is in the mailbox, the next open builds it.
+        let store = fell_core::Store::open(&home.store).unwrap();
+        store.upsert_message(&parent_message(&account)).unwrap();
         drop(store);
         let hub = DraftHub::new();
         home.open(&hub, "c1", &account.id).unwrap();

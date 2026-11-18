@@ -75,24 +75,26 @@ pub fn start_reply_in_zone(
     match kind {
         ReplyKind::Reply | ReplyKind::ReplyAll => {
             let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll);
-            let mut references: Vec<String> = parent
+            let references: Vec<String> = parent
                 .headers
                 .references
                 .iter()
                 .map(|id| id.as_str().to_string())
                 .collect();
             // Mail synced before In-Reply-To was appended has it in front of
-            // the chain it was missing from. It is the newest id, not the
-            // root, so it moves to the end before the chain is capped.
-            if references.len() > 1
+            // the chain it was missing from, so the root may be second. The
+            // order stays as sent; a capped chain keeps both heads.
+            let head = if references.len() > 1
                 && parent
                     .headers
                     .in_reply_to
                     .as_ref()
                     .is_some_and(|id| id.as_str() == references[0])
             {
-                references.rotate_left(1);
-            }
+                2
+            } else {
+                1
+            };
             let (quote_text, quote_html) = reply_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
@@ -104,7 +106,7 @@ pub fn start_reply_in_zone(
                     ..DraftFields::default()
                 },
                 parts: ReplyParts {
-                    references: build_references(&references, parent_id),
+                    references: build_references_keeping(&references, parent_id, head),
                     quote_text,
                     quote_html,
                 },
@@ -237,6 +239,16 @@ pub fn reply_recipients(parent: &Message, own: &[String], all: bool) -> (Vec<Str
 /// dropped; a long chain keeps its root and its newest ids, at most
 /// [`MAX_REFERENCES`] in all. Ids are bare, without angle brackets.
 pub fn build_references(parent_references: &[String], parent_id: &str) -> Vec<String> {
+    build_references_keeping(parent_references, parent_id, 1)
+}
+
+/// [`build_references`], keeping the first `head` ids when the chain is
+/// capped, not just the root.
+fn build_references_keeping(
+    parent_references: &[String],
+    parent_id: &str,
+    head: usize,
+) -> Vec<String> {
     let clean = |raw: &str| {
         let id = MessageId::new(raw.trim()).as_str().to_string();
         (!id.is_empty()
@@ -255,8 +267,9 @@ pub fn build_references(parent_references: &[String], parent_id: &str) -> Vec<St
         .collect();
     out.extend(parent);
     if out.len() > MAX_REFERENCES {
-        let newest = out.split_off(out.len() - (MAX_REFERENCES - 1));
-        out.truncate(1);
+        let head = head.clamp(1, MAX_REFERENCES - 1);
+        let newest = out.split_off(out.len() - (MAX_REFERENCES - head));
+        out.truncate(head);
         out.extend(newest);
     }
     out
@@ -644,7 +657,8 @@ mod tests {
 
     #[test]
     fn a_chain_with_its_parent_in_front_keeps_its_root_when_capped() {
-        // Synced before In-Reply-To was appended: [mid, root, ...].
+        // Synced before In-Reply-To was appended: [mid, root, ...]. The order
+        // stays, and the cap keeps both heads.
         let mut message = parent();
         message.headers.in_reply_to = Some(MessageId::new("mid@x"));
         let mut chain = vec![MessageId::new("mid@x"), MessageId::new("root@x")];
@@ -653,8 +667,13 @@ mod tests {
         let start = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
         let refs = &start.parts.references;
         assert_eq!(refs.len(), MAX_REFERENCES);
-        assert_eq!(refs[0], "root@x");
-        assert_eq!(&refs[refs.len() - 2..], ["mid@x", "parent@x"]);
+        assert_eq!(&refs[..2], ["mid@x", "root@x"]);
+        assert_eq!(&refs[refs.len() - 2..], ["m19@x", "parent@x"]);
+        // A reply to the root that also cites later ids keeps its order.
+        message.headers.in_reply_to = Some(MessageId::new("root@x"));
+        message.headers.references = vec![MessageId::new("root@x"), MessageId::new("mid@x")];
+        let start = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
+        assert_eq!(start.parts.references, ["root@x", "mid@x", "parent@x"]);
     }
 
     #[test]

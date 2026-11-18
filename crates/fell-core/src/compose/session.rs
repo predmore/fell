@@ -419,21 +419,22 @@ impl DraftSession {
                 .filter(|id| !id.trim().is_empty())
         {
             // A reply started without its chain, such as an agent's: the
-            // parent's own References, when the mailbox has the parent.
-            let chain: Vec<String> = store
+            // parent's own References, when the mailbox has the parent. If
+            // it does not yet, the chain stays empty so a later open builds
+            // it; a send meanwhile cites the parent alone.
+            let found = store
                 .message(session.account_id(), &crate::MessageId::new(parent))
                 .ok()
-                .flatten()
-                .map(|message| {
-                    message
-                        .headers
-                        .references
-                        .iter()
-                        .map(|id| id.as_str().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            session.reply.references = super::reply::build_references(&chain, parent);
+                .flatten();
+            if let Some(message) = found {
+                let chain: Vec<String> = message
+                    .headers
+                    .references
+                    .iter()
+                    .map(|id| id.as_str().to_string())
+                    .collect();
+                session.reply.references = super::reply::build_references(&chain, parent);
+            }
         }
         session.issues = parsed.issues;
         if let Some(path) = store.db_path() {

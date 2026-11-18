@@ -62,7 +62,12 @@ pub fn build_outgoing(
         }
     }
     if !reply.quote_html.trim().is_empty() {
-        html.push_str(&reply.quote_html);
+        // Inside the document, before it closes: a quote after </html> is
+        // dropped by many readers.
+        match html.rfind("</body>") {
+            Some(at) => html.insert_str(at, &reply.quote_html),
+            None => html.push_str(&reply.quote_html),
+        }
     }
     let digest = attachment_digest(files);
     let message_id = fresh_message_id();
@@ -850,6 +855,11 @@ mod tests {
         );
         let html = message.body_html(0).unwrap().to_string();
         assert!(html.contains("<blockquote><p>the original</p></blockquote>"));
+        // The quote is inside the document, after the answer.
+        let quote_at = html.find("<blockquote><p>the original").unwrap();
+        assert!(html.find("My answer.").unwrap() < quote_at, "{html}");
+        assert!(quote_at < html.rfind("</body>").unwrap(), "{html}");
+        assert!(html.trim_end().ends_with("</html>"), "{html}");
         // The confirmation covers the quote: it is in the body the person sends.
         assert!(outgoing.draft.body.contains("> the original"));
         // A reply with no stored chain still names its parent.
