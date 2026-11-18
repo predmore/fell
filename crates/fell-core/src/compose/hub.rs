@@ -263,7 +263,8 @@ impl DraftHub {
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
             let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
-                Some(_) if sent => format!("sent{}  ·  gs sent", quoted_subject(&subject)),
+                // What happened, as docs/ux.md has it: "Sent" and the subject.
+                Some(_) if sent => format!("Sent{}", quoted_subject(&subject)),
                 // The key to what the warning asks: look in Sent.
                 Some(reason) if reason == SendLock::MaybeSent.reason() => format!(
                     "{MAYBE_SENT_NOTICE}{}  ·  gs sent",
@@ -306,7 +307,7 @@ impl DraftHub {
                 format!("{failure}{name}  ·  gs sent")
             }
             (_, Some(failure)) => format!("{failure}{name}  ·  gd drafts"),
-            (Some(_), None) if sent => format!("sent{name}  ·  gs sent"),
+            (Some(_), None) if sent => format!("Sent{name}"),
             (Some(reason), None) if reason == SendLock::MaybeSent.reason() => {
                 format!("{MAYBE_SENT_NOTICE}{name}  ·  gs sent")
             }
@@ -1360,7 +1361,8 @@ mod tests {
         // The sent close clears what the first close left for reopen.
         hub.note_hidden("d1");
         let lines = hub.take_closed();
-        assert!(lines.last().unwrap().starts_with("sent"), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("Sent"), "{lines:?}");
+        assert!(!lines.last().unwrap().contains("gs sent"), "{lines:?}");
         let before = hub.reveal_count();
         assert!(
             !hub.reopen_last(),
@@ -1398,7 +1400,7 @@ mod tests {
         hub.report_send("d1", None);
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].starts_with("Sent"), "{lines:?}");
         assert!(lines[0].contains("Hi"), "{lines:?}");
         assert!(!hub.reopen_last());
         // A send that did not go out says why, and the draft stays.

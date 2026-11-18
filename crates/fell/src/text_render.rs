@@ -23,6 +23,9 @@ pub enum BodyBlock {
     Quote(SharedString),
     /// A signature block. Collapsed until the reader expands it.
     Signature(SharedString),
+    /// A compose draft's markdown, painted with the compose window's
+    /// renderer, so the draft reads as the recipient will see it.
+    Markdown(std::sync::Arc<fell_core::compose::StyledDoc>),
 }
 
 fn shared(text: &str) -> SharedString {

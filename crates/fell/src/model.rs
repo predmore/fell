@@ -288,6 +288,8 @@ pub struct Session {
     pub folder_index: usize,
     pub folder_intent: FolderIntent,
     pub toast: Option<Toast>,
+    /// Counts notices shown; see [`Session::toast_generation`].
+    toast_generation: u64,
     /// Destination chosen by `m`, consumed when the view applies the move.
     pub pending_move: Option<String>,
     /// The folder on screen has not been read from the store yet.
@@ -343,12 +345,14 @@ impl Session {
             folder_index: 0,
             folder_intent: FolderIntent::Go,
             toast: None,
+            toast_generation: 0,
             pending_move: None,
             loading: false,
         }
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>, error: bool) {
+        self.toast_generation = self.toast_generation.wrapping_add(1);
         self.toast = Some(Toast {
             text: text.into(),
             error,
@@ -357,6 +361,22 @@ impl Session {
 
     pub fn clear_toast(&mut self) {
         self.toast = None;
+    }
+
+    /// Which notice is on screen: every `show_toast` makes a new one, even
+    /// with the same words.
+    pub fn toast_generation(&self) -> u64 {
+        self.toast_generation
+    }
+
+    /// Clear the notice only if it is still `generation`, so a timer for an
+    /// earlier notice never takes down a newer one.
+    pub fn clear_toast_if(&mut self, generation: u64) -> bool {
+        if self.toast.is_some() && self.toast_generation == generation {
+            self.toast = None;
+            return true;
+        }
+        false
     }
 
     pub fn folder_prompt(&self) -> &'static str {
@@ -2997,6 +3017,23 @@ mod tests {
         assert_eq!(session.unread_threads(), 17);
     }
 
+    #[test]
+    fn an_old_notice_timer_leaves_a_newer_notice_alone() {
+        // #99: two drafts opened within the settle delay; the first timer
+        // cleared the second "opening draft" notice, which had other words.
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        session.show_toast("opening draft \u{201c}A\u{201d}", false);
+        let first = session.toast_generation();
+        session.show_toast("opening draft \u{201c}A\u{201d}", false);
+        let second = session.toast_generation();
+        assert!(!session.clear_toast_if(first), "same words, newer notice");
+        assert!(session.toast.is_some());
+        assert!(session.clear_toast_if(second));
+        assert!(session.toast.is_none());
+        assert!(!session.clear_toast_if(second), "nothing left to clear");
+    }
+
     fn empty_message(expanded: bool) -> ConvMessage {
         ConvMessage {
             id: {
@@ -3015,6 +3052,7 @@ mod tests {
             body: crate::text_render::render_stored_body(Some("body"), "snip"),
             expanded,
             recipients: None,
+            context: None,
         }
     }
 }

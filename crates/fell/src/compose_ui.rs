@@ -19,6 +19,7 @@ use image::Frame;
 use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
+use crate::present::display_safe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -1842,7 +1843,7 @@ impl ComposeView {
             block = block.child(render_doc(
                 &html_to_doc(html),
                 &self.folder,
-                Links::Target,
+                Paint::compose(Links::Target),
                 colors,
             ));
         }
@@ -2208,23 +2209,6 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
 /// make the sentence around it read differently.
 fn agent_label(agent: &str) -> String {
     display_safe(agent.strip_prefix("agent:").unwrap_or(agent))
-}
-
-/// Text from outside (an agent name, a sender, a subject) without line
-/// breaks or the invisible marks that reorder or hide what is drawn.
-fn display_safe(text: &str) -> String {
-    text.chars()
-        .filter(|ch| {
-            !ch.is_control()
-                && !matches!(
-                    *ch,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2060}'..='\u{2069}'
-                        | '\u{FEFF}'
-                )
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2919,7 +2903,7 @@ fn styled_body(
                         block, &text, editor, &edits, focused, links, colors, was_lines,
                     )
                 } else {
-                    render_block(block, folder, links, colors)
+                    render_block(block, folder, Paint::compose(links), colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -3040,7 +3024,7 @@ fn raw_source_block(
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
-        return render_block(block, Path::new(""), links, colors);
+        return render_block(block, Path::new(""), Paint::compose(links), colors);
     };
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
@@ -3644,11 +3628,21 @@ fn caret(colors: Palette, mode: Mode) -> gpui::Div {
         .bg(rgb(colors.caret))
 }
 
-fn render_doc(doc: &StyledDoc, folder: &Path, links: Links, colors: Palette) -> gpui::Div {
+/// A compose draft in the inbox's reading pane: the compose window's
+/// rendering, at the inbox's text size, links by their label.
+pub(crate) fn render_draft_doc(doc: &StyledDoc, theme: &crate::theme::Theme) -> gpui::Div {
+    let paint = Paint {
+        links: Links::Label,
+        text_px: theme.ui_px,
+    };
+    render_doc(doc, Path::new(""), paint, palette_from_theme(theme))
+}
+
+fn render_doc(doc: &StyledDoc, folder: &Path, paint: Paint, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col();
     let mut previous = None;
     for block in &doc.blocks {
-        let mut painted = render_block(block, folder, links, colors);
+        let mut painted = render_block(block, folder, paint, colors);
         if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
             painted = painted.mt_2();
         }
@@ -3674,16 +3668,36 @@ enum Links {
 }
 
 /// Where a link goes, muted after its label.
+/// How styled blocks paint: how links show, and the body text size that
+/// headings and list markers scale from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Paint {
+    links: Links,
+    text_px: f32,
+}
+
+impl Paint {
+    /// The compose window, whose body text is 16 px.
+    fn compose(links: Links) -> Self {
+        Self {
+            links,
+            text_px: 16.,
+        }
+    }
+}
+
 fn render_block(
     block: &fell_core::compose::Block,
     folder: &Path,
-    links: Links,
+    paint: Paint,
     colors: Palette,
 ) -> gpui::Div {
+    let links = paint.links;
     match &block.body {
+        // 28 and 22 px over the compose window's 16.
         BlockBody::Heading { level, inlines } => div()
             .font_weight(FontWeight(680.))
-            .text_size(px(if *level <= 1 { 28. } else { 22. }))
+            .text_size(px(paint.text_px * if *level <= 1 { 1.75 } else { 1.375 }))
             .child(render_inlines(inlines, links, colors)),
         BlockBody::Paragraph { inlines } => match plain_lines(inlines) {
             // Plain text wraps at the window's edge, one line per break,
@@ -3709,7 +3723,7 @@ fn render_block(
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(18.))
+                                .text_size(px(paint.text_px * 1.125))
                                 .font_weight(FontWeight(700.))
                                 .text_color(rgb(colors.accent))
                                 .child(marker),
@@ -3726,7 +3740,7 @@ fn render_block(
                 .pl_3()
                 .text_color(rgb(colors.dim));
             for block in blocks {
-                quote = quote.child(render_block(block, folder, links, colors));
+                quote = quote.child(render_block(block, folder, paint, colors));
             }
             quote
         }
@@ -4464,7 +4478,12 @@ fn preview_panel(snap: &Snapshot, colors: Palette) -> impl IntoElement {
                     .text_color(rgb(colors.dim))
                     .child("HTML preview"),
             )
-            .child(render_doc(&doc, Path::new(""), Links::Target, colors)),
+            .child(render_doc(
+                &doc,
+                Path::new(""),
+                Paint::compose(Links::Target),
+                colors,
+            )),
     )
 }
 

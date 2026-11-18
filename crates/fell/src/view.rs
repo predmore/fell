@@ -404,7 +404,20 @@ impl Inbox {
                     .flatten(),
                 _ => None,
             };
+            let mut rows = present::thread_rows(&page.threads, &me);
+            let mut unread = page.unread;
             let drafts = if roles.is(FolderRole::Drafts, &reading) {
+                // Synced drafts name who they are to, and none is unread.
+                let ids: Vec<ThreadId> = page
+                    .threads
+                    .iter()
+                    .map(|thread| thread.thread_id.clone())
+                    .collect();
+                let recipients = store
+                    .folder_recipients(&account, &reading, &ids)
+                    .unwrap_or_default();
+                present::address_draft_rows(&mut rows, &recipients, &me);
+                unread = 0;
                 store
                     .unsent_compose_drafts(&account)
                     .map_err(|err| err.to_string())?
@@ -412,10 +425,10 @@ impl Inbox {
                 Vec::new()
             };
             Ok(ListRead {
-                rows: present::thread_rows(&page.threads, &me),
+                rows,
                 more_before: page.more_before,
                 more_after: page.more_after,
-                unread: page.unread,
+                unread,
                 names,
                 followed,
                 drafts,
@@ -1042,7 +1055,9 @@ impl Inbox {
                 .drafts
                 .iter()
                 .find(|item| item.id == draft)
-                .map(|item| present::draft_conversation(item, &self.session.account_email))
+                .map(|item| {
+                    present::draft_conversation(item, &self.session.account_email, now_unix())
+                })
                 .unwrap_or_default();
             let same = self.open_thread.as_deref() == Some(id.as_str());
             if same {
@@ -1394,10 +1409,11 @@ impl Inbox {
             self.session
                 .show_toast(format!("opening draft \u{201c}{subject}\u{201d}"), false);
         }
+        let notice = self.session.toast_generation();
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
-            self.settle_opening_notice(cx);
+            self.settle_opening_notice(notice, cx);
             return;
         }
         let Some(home) = self.draft_home.clone() else {
@@ -1429,7 +1445,7 @@ impl Inbox {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
                         if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(cx);
+                            inbox.settle_opening_notice(notice, cx);
                         }
                     }
                     Err(err) => {
@@ -1479,6 +1495,7 @@ impl Inbox {
             return;
         };
         self.session.show_toast(reply_notice(kind, &sender), false);
+        let notice = self.session.toast_generation();
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let roles = self.session.roles.clone();
@@ -1509,7 +1526,7 @@ impl Inbox {
                 match result {
                     Ok(id) => {
                         if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(cx);
+                            inbox.settle_opening_notice(notice, cx);
                         }
                     }
                     Err(err) => {
@@ -1530,23 +1547,15 @@ impl Inbox {
     }
 
     /// The window is on its way: once it has had time to show, the inbox's
-    /// "opening" notice has done its job and goes, unless something newer
-    /// replaced it.
-    fn settle_opening_notice(&mut self, cx: &mut Context<Self>) {
+    /// "opening" notice `notice` has done its job and goes, unless something
+    /// newer replaced it, such as the notice for a second draft opened since.
+    fn settle_opening_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(700))
                 .await;
             let _ = this.update(cx, |inbox, cx| {
-                let opening = inbox.session.toast.as_ref().is_some_and(|toast| {
-                    toast.text.starts_with("opening draft")
-                        || toast.text == "new draft"
-                        || [ReplyKind::Reply, ReplyKind::ReplyAll, ReplyKind::Forward]
-                            .into_iter()
-                            .any(|kind| toast.text.starts_with(reply_notice_prefix(kind)))
-                });
-                if opening {
-                    inbox.session.clear_toast();
+                if inbox.session.clear_toast_if(notice) {
                     cx.notify();
                 }
             });
@@ -1586,6 +1595,8 @@ impl Inbox {
                 draft.subject = snap.subject;
                 draft.body = snap.body;
                 draft.from = snap.from;
+                draft.reply_context = snap.reply_context;
+                draft.forwarded = snap.forwarded;
                 Some(draft)
             })
             .collect()
@@ -2360,20 +2371,23 @@ fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
                         .child(name)
                 })),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(if unread > 0 {
-                    theme.accent
-                } else {
-                    theme.dimmed
-                }))
-                .child(if unread == 1 {
-                    "1 unread".to_string()
-                } else {
-                    format!("{unread} unread")
-                }),
-        )
+        // Drafts are not mail to read: no count there.
+        .when(!session.in_drafts(), |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(if unread > 0 {
+                        theme.accent
+                    } else {
+                        theme.dimmed
+                    }))
+                    .child(if unread == 1 {
+                        "1 unread".to_string()
+                    } else {
+                        format!("{unread} unread")
+                    }),
+            )
+        })
 }
 
 fn thread_list(
@@ -3274,6 +3288,18 @@ fn expanded_message(
             let open = session.recipients_are_open(index);
             recipient_lines(theme, line, open, index, conv_width, live, window, cx)
         }))
+        // What a draft answers, under who it goes to, as in its window.
+        .children(message.context.as_ref().map(|line| {
+            div()
+                .max_w(px(680.))
+                // Close under the recipient line, as one header block.
+                .when(message.recipients.is_some(), |line| line.mt(px(-6.)))
+                .pb(px(10.))
+                .text_size(px(theme.ui_px - 1.0))
+                .text_color(rgb(dim))
+                .truncate()
+                .child(line.clone())
+        }))
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
@@ -3282,7 +3308,7 @@ fn expanded_message(
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)))
+                .position(|block| matches!(block, BodyBlock::Quote(_) | BodyBlock::Signature(_)))
                 .filter(|_| message.recipients.is_none());
             message
                 .body
@@ -3447,6 +3473,12 @@ fn body_block(
             .pb(px(8.))
             .line_height(px(theme.ui_px * 1.45))
             .child(text.clone())
+            .into_any_element(),
+        BodyBlock::Markdown(doc) => div()
+            .max_w(px(680.))
+            .pb(px(8.))
+            .line_height(px(theme.ui_px * 1.45))
+            .child(crate::compose_ui::render_draft_doc(doc, theme))
             .into_any_element(),
         BodyBlock::Quote(text) | BodyBlock::Signature(text) => {
             let label = if matches!(block, BodyBlock::Quote(_)) {

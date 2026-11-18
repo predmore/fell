@@ -46,6 +46,10 @@ pub struct DraftSummary {
     pub updated_unix: i64,
     /// A send that may have gone out. Sent drafts are not listed.
     pub maybe_sent: bool,
+    /// What a reply answers, when the mailbox still holds the original.
+    pub reply_context: Option<super::ReplyContext>,
+    /// Whose message a forward passes on.
+    pub forwarded: Option<super::reply::ForwardSummary>,
 }
 
 /// Agent hunks waiting for review, and the serialized draft their byte
@@ -427,7 +431,7 @@ impl Store {
     pub fn unsent_compose_drafts(&self, account_id: &AccountId) -> Result<Vec<DraftSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.from_addr, d.to_addrs, d.cc_addrs, d.subject, d.body, d.owner,
-                    d.updated_unix, s.state, d.bcc_addrs
+                    d.updated_unix, s.state, d.bcc_addrs, d.in_reply_to, d.quote_text
              FROM compose_drafts d
              LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
              WHERE d.account_id = ?1
@@ -440,21 +444,44 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![account_id.as_str(), SEND_CLEAR, SEND_SENT], |row| {
             let state: Option<String> = row.get(8)?;
-            Ok(DraftSummary {
-                id: row.get(0)?,
-                from: row.get(1)?,
-                to: split_list(&row.get::<_, String>(2)?),
-                cc: split_list(&row.get::<_, String>(3)?),
-                bcc: split_list(&row.get::<_, String>(9)?),
-                subject: row.get(4)?,
-                body: row.get(5)?,
-                owner: row.get(6)?,
-                updated_unix: row.get(7)?,
-                // Anything but a clean "clear" errs toward "may have been sent".
-                maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
-            })
+            let in_reply_to: Option<String> = row.get(10)?;
+            let quote_text: Option<String> = row.get(11)?;
+            Ok((
+                in_reply_to.unwrap_or_default(),
+                quote_text.unwrap_or_default(),
+                DraftSummary {
+                    id: row.get(0)?,
+                    from: row.get(1)?,
+                    to: split_list(&row.get::<_, String>(2)?),
+                    cc: split_list(&row.get::<_, String>(3)?),
+                    bcc: split_list(&row.get::<_, String>(9)?),
+                    subject: row.get(4)?,
+                    body: row.get(5)?,
+                    owner: row.get(6)?,
+                    updated_unix: row.get(7)?,
+                    // Anything but a clean "clear" errs toward "may have been sent".
+                    maybe_sent: state.is_some_and(|state| state != SEND_CLEAR),
+                    reply_context: None,
+                    forwarded: None,
+                },
+            ))
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        // The drafts list is short; each reply reads its original as the
+        // compose window does, so the two say the same thing.
+        Ok(rows
+            .into_iter()
+            .map(|(in_reply_to, quote_text, mut draft)| {
+                if !in_reply_to.trim().is_empty() {
+                    draft.reply_context = self
+                        .message_summary(account_id, &crate::MessageId::new(in_reply_to.trim()))
+                        .ok()
+                        .flatten();
+                }
+                draft.forwarded = super::reply::forward_summary(&quote_text);
+                draft
+            })
+            .collect())
     }
 
     pub fn compose_owner(&self, id: &str) -> Result<Option<String>> {
@@ -909,6 +936,53 @@ mod tests {
         );
         let missing = crate::MessageId::new("missing@x");
         assert_eq!(store.message_summary(&account.id, &missing).unwrap(), None);
+        // The drafts list says what a reply answers, as its window does.
+        let save = |id: &str, in_reply_to: Option<&str>, quote_text: &str| {
+            store
+                .save_compose(&StoredCompose {
+                    id: id.into(),
+                    account_id: account.id.clone(),
+                    fields: DraftFields {
+                        from: "me@x".into(),
+                        to: vec!["jon@x".into()],
+                        subject: "Re: Plans".into(),
+                        in_reply_to: in_reply_to.map(str::to_string),
+                        ..DraftFields::default()
+                    },
+                    body: "sounds good\n".into(),
+                    files: Vec::new(),
+                    identities: vec!["me@x".into()],
+                    owner: String::new(),
+                    reply: super::super::ReplyParts {
+                        quote_text: quote_text.into(),
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+        };
+        save("reply", Some("echo@list"), "> hi\n");
+        save(
+            "forward",
+            None,
+            "---------- Forwarded message ----------\nFrom: Ada Lovelace <ada@x>\n\
+             Subject: Q3\n\nhi\n",
+        );
+        save("gone", Some("missing@x"), "");
+        let listed = store.unsent_compose_drafts(&account.id).unwrap();
+        let find = |id: &str| listed.iter().find(|draft| draft.id == id).unwrap();
+        let reply = find("reply");
+        assert_eq!(reply.reply_context.as_ref().unwrap().subject, "Plans");
+        assert_eq!(reply.reply_context.as_ref().unwrap().sender, "Jon");
+        assert_eq!(reply.forwarded, None);
+        let forward = find("forward");
+        assert_eq!(forward.reply_context, None);
+        let summary = forward.forwarded.as_ref().unwrap();
+        assert_eq!(
+            (summary.sender.as_str(), summary.subject.as_str()),
+            ("Ada Lovelace", "Q3")
+        );
+        // The original is no longer in the mailbox: nothing to name.
+        assert_eq!(find("gone").reply_context, None);
     }
     use crate::{Account, BackendKind};
 
