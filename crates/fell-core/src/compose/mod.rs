@@ -33,7 +33,9 @@ pub use persist::{
     StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft, remember_compose_store,
     remembered_store_path, stored_compose_account, stored_compose_owner,
 };
-pub use session::{AddressView, AttachmentView, DraftSession, HunkView, SendLock, Snapshot};
+pub use session::{
+    AddressView, AttachmentView, DraftSession, HunkView, SendLock, SentBcc, Snapshot,
+};
 pub use workspace::{
     draft_file_is_symlink, draft_folder, draft_root, draft_socket_path, image_file, materialize_in,
     materialize_workspace, read_account, read_owner, require_owner, resolve_inside, write_owner,

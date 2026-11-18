@@ -34,6 +34,28 @@ struct Checkpoint {
     notices: Vec<String>,
 }
 
+/// Bcc recipients of one sent message, for the mailbox's local record.
+/// The server's Sent copy has no Bcc header; see [`crate::Store::record_sent_bcc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentBcc {
+    store: PathBuf,
+    account_id: AccountId,
+    message_id: crate::MessageId,
+    bcc: Vec<crate::Address>,
+}
+
+impl SentBcc {
+    /// Write the record. Opens the mailbox for this one write, like a draft
+    /// save, so no connection outlives the send.
+    pub fn save(&self) -> crate::Result<()> {
+        crate::Store::open(&self.store)?.record_sent_bcc(
+            &self.account_id,
+            &self.message_id,
+            &self.bcc,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressView {
     pub raw: String,
@@ -959,6 +981,31 @@ impl DraftSession {
             return files;
         }
         workspace::resolve_closure(&self.folder, &self.fields, &self.body).files
+    }
+
+    /// The Bcc to remember once `outgoing` has gone out, or may have.
+    /// `None` when it has no Bcc or this draft has no mailbox to record in.
+    pub fn sent_bcc(&self, outgoing: &Outgoing) -> Option<SentBcc> {
+        let bcc: Vec<crate::Address> = outgoing
+            .draft
+            .bcc
+            .iter()
+            .filter_map(|raw| super::frontmatter::mailbox_parts(raw))
+            .map(|(name, email)| crate::Address { name, email })
+            .collect();
+        if bcc.is_empty() {
+            return None;
+        }
+        let store = self
+            .store_path
+            .clone()
+            .or_else(|| persist::remembered_store_path(&self.id))?;
+        Some(SentBcc {
+            store,
+            account_id: outgoing.draft.account_id.clone(),
+            message_id: outgoing.message_id.clone(),
+            bcc,
+        })
     }
 
     pub fn send_lock(&self) -> Option<SendLock> {

@@ -167,6 +167,8 @@ mod tests {
     struct Counting {
         sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         answer: fn() -> fell_core::Result<()>,
+        /// The message bytes of the latest transmission.
+        mime: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
     impl Counting {
@@ -174,7 +176,19 @@ mod tests {
             Self {
                 sends: Default::default(),
                 answer,
+                mime: Default::default(),
             }
+        }
+
+        /// The `Message-ID` of the latest transmission.
+        fn message_id(&self) -> fell_core::MessageId {
+            let mime = self.mime.lock().unwrap();
+            let text = String::from_utf8_lossy(&mime);
+            let line = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Message-ID:"))
+                .expect("Message-ID header");
+            fell_core::MessageId::new(line)
         }
 
         fn count(&self) -> usize {
@@ -205,6 +219,7 @@ mod tests {
         ) -> fell_core::Result<fell_core::SentMessage> {
             fell_core::send::require_confirmation(&pending, &confirmation)?;
             self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.mime.lock().unwrap() = pending.mime.clone();
             (self.answer)()?;
             Ok(fell_core::SentMessage {
                 pending_id: pending.id,
@@ -324,5 +339,157 @@ mod tests {
             }
         }
         assert_eq!(backend.count(), 1);
+    }
+
+    /// A draft with a Bcc, bound to a mailbox file the test can read.
+    fn bcc_session(name: &str) -> (fell_core::compose::DraftSession, fell_core::Store) {
+        let root = std::env::temp_dir().join(format!(
+            "fell-editor-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mail.db");
+        let store = fell_core::Store::open(&db).unwrap();
+        store
+            .upsert_account(&fell_core::Account {
+                id: AccountId("mailbox".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: fell_core::BackendKind::Bridge,
+            })
+            .unwrap();
+        let fields = fell_core::compose::DraftFields {
+            from: "jon@example.com".into(),
+            to: vec!["ada@example.com".into()],
+            bcc: vec!["Hidden Person <hidden@example.com>".into()],
+            subject: "Hello".into(),
+            ..fell_core::compose::DraftFields::default()
+        };
+        let folder = fell_core::compose::materialize_in(
+            &root.join("drafts"),
+            name,
+            &fields,
+            "body\n",
+            &AccountId("mailbox".into()),
+        )
+        .unwrap();
+        let mut session = fell_core::compose::DraftSession::create(
+            folder,
+            name,
+            AccountId("mailbox".into()),
+            fields,
+            "body\n",
+        )
+        .unwrap();
+        session.bind_store(&db);
+        session.mark_seen();
+        (session, store)
+    }
+
+    /// The copy the server files in Sent for `id`: no Bcc header.
+    fn sent_copy(id: fell_core::MessageId) -> fell_core::Message {
+        fell_core::Message {
+            account_id: AccountId("mailbox".into()),
+            headers: fell_core::MessageHeaders {
+                message_id: id.clone(),
+                proton_conversation_id: None,
+                in_reply_to: None,
+                references: Vec::new(),
+                from: fell_core::Address {
+                    name: None,
+                    email: "jon@example.com".into(),
+                },
+                subject: "Hello".into(),
+                date_unix: 1,
+            },
+            remote_id: fell_core::RemoteId("sent-1".into()),
+            thread_id: fell_core::ThreadId::from_message_id(&id),
+            snippet: "body".into(),
+            body_text: Some("body".into()),
+            unread: false,
+            folders: vec!["Sent".into()],
+            labels: Vec::new(),
+            arrived_via: Vec::new(),
+            to: vec![fell_core::Address {
+                name: None,
+                email: "ada@example.com".into(),
+            }],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            starred: false,
+            has_attachment: false,
+            archived: false,
+            snooze_until: None,
+            list_id: None,
+        }
+    }
+
+    #[test]
+    fn a_sent_message_keeps_its_bcc_for_the_sent_copy() {
+        let (mut session, store) = bcc_session("bcc-sent");
+        let backend = Counting::new(|| Ok(()));
+        send_from_editor(&mut session, &backend).unwrap();
+        let mime = String::from_utf8(backend.mime.lock().unwrap().clone()).unwrap();
+        assert!(!mime.to_ascii_lowercase().contains("hidden@"), "{mime}");
+        let id = backend.message_id();
+        let thread = store.upsert_message(&sent_copy(id.clone())).unwrap();
+        let messages = shown_once_recorded(&store, &thread);
+        assert_eq!(messages[0].bcc[0].email, "hidden@example.com");
+        assert_eq!(messages[0].bcc[0].name.as_deref(), Some("Hidden Person"));
+    }
+
+    #[test]
+    fn a_message_that_may_have_been_sent_keeps_its_bcc() {
+        let (mut session, store) = bcc_session("bcc-uncertain");
+        let backend = Counting::new(|| {
+            Err(fell_core::Error::SendUncertain(
+                "smtp: read timed out".into(),
+            ))
+        });
+        send_from_editor(&mut session, &backend).unwrap_err();
+        let thread = store
+            .upsert_message(&sent_copy(backend.message_id()))
+            .unwrap();
+        let messages = shown_once_recorded(&store, &thread);
+        assert_eq!(messages[0].bcc.len(), 1);
+    }
+
+    #[test]
+    fn a_message_that_was_not_sent_leaves_no_bcc_record() {
+        let (mut session, store) = bcc_session("bcc-refused");
+        let backend =
+            Counting::new(|| Err(fell_core::Error::Backend("smtp: RCPT rejected".into())));
+        send_from_editor(&mut session, &backend).unwrap_err();
+        let thread = store
+            .upsert_message(&sent_copy(backend.message_id()))
+            .unwrap();
+        // The record is written off the send path; give a stray one time.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let messages = store
+            .thread_messages(&AccountId("mailbox".into()), &thread)
+            .unwrap();
+        assert!(messages[0].bcc.is_empty());
+    }
+
+    /// The thread once the background Bcc record has landed, or after 5 s.
+    fn shown_once_recorded(
+        store: &fell_core::Store,
+        thread: &fell_core::ThreadId,
+    ) -> Vec<fell_core::Message> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let messages = store
+                .thread_messages(&AccountId("mailbox".into()), thread)
+                .unwrap();
+            if !messages[0].bcc.is_empty() || std::time::Instant::now() > deadline {
+                return messages;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

@@ -1324,10 +1324,12 @@ pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, SendFailure> {
-    let prepared = prepare_from_editor(session)?;
+    let mut prepared = prepare_from_editor(session)?;
+    let sent_bcc = prepared.sent_bcc.take();
     // This call holds the session throughout, so the claim cannot be lost.
     let result = prepared.transmit_checked(backend, || true);
     session.end_send(lock_after(&result));
+    remember_bcc(sent_bcc, &result);
     result
 }
 
@@ -1337,6 +1339,8 @@ pub struct PreparedSend {
     account: fell_core::AccountId,
     outgoing: fell_core::compose::Outgoing,
     files: Vec<fell_core::SubmittedFile>,
+    /// Recorded after the server has, or may have, the message.
+    sent_bcc: Option<fell_core::compose::SentBcc>,
 }
 
 /// Run the editor's send checks, read the attachments, and claim the draft
@@ -1358,6 +1362,7 @@ pub fn prepare_from_editor(
             inline: file.inline,
         })
         .collect();
+    let sent_bcc = session.sent_bcc(&outgoing);
     if let Err(err) = session.begin_send() {
         // A lock only the mailbox knew of stays a lock; anything else (the
         // claim could not be recorded) sent nothing.
@@ -1370,6 +1375,7 @@ pub fn prepare_from_editor(
         account: session.account_id().clone(),
         outgoing,
         files,
+        sent_bcc,
     })
 }
 
@@ -1386,9 +1392,10 @@ fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, S
 pub(crate) fn transmit_from_hub(
     hub: &DraftHub,
     id: &str,
-    prepared: PreparedSend,
+    mut prepared: PreparedSend,
     backend: impl FnOnce(&AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure>,
 ) -> Result<fell_core::SentMessage, SendFailure> {
+    let sent_bcc = prepared.sent_bcc.take();
     // While the lock is held every edit path is refused, so the prepared
     // message is still the draft. Only a send that lost its lock stops.
     let result = backend(&prepared.account).and_then(|backend| {
@@ -1399,7 +1406,39 @@ pub(crate) fn transmit_from_hub(
         })
     });
     hub.with_session(id, |session| session.end_send(lock_after(&result)));
+    remember_bcc(sent_bcc, &result);
     result
+}
+
+/// Keep the Bcc of a message the server has, or may have, so the Sent copy
+/// shows it once it syncs. A message that was not sent leaves no record.
+/// The write runs on its own thread with a few retries: the mail already
+/// went out, so a busy mailbox must neither hold up the send nor lose this.
+fn remember_bcc(
+    sent_bcc: Option<fell_core::compose::SentBcc>,
+    result: &Result<fell_core::SentMessage, SendFailure>,
+) {
+    if !matches!(result, Ok(_) | Err(SendFailure::MaybeSent(_))) {
+        return;
+    }
+    let Some(record) = sent_bcc else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut last = None;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
+            }
+            match record.save() {
+                Ok(()) => return,
+                Err(err) => last = Some(err),
+            }
+        }
+        if let Some(err) = last {
+            eprintln!("fell: could not record the Bcc of a sent message: {err}");
+        }
+    });
 }
 
 impl PreparedSend {
