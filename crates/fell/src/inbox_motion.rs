@@ -25,6 +25,10 @@ pub struct StatusMotion {
     /// A notice leaving, fading where it was: a key cleared it, or another
     /// notice replaced it.
     pub leaving: Option<(Toast, f32)>,
+    /// How far below its place the notice is drawn, rising in.
+    pub notice_dy: f32,
+    /// How far above its place the leaving notice is drawn, rising out.
+    pub leaving_dy: f32,
     /// How much of the key hints shows. A notice takes their room, so they
     /// fade out as it comes and back in as it leaves.
     pub hints: f32,
@@ -80,6 +84,8 @@ pub struct PaneEntry {
 
 pub struct InboxMotion {
     pub motion: Motion,
+    /// The time every transition here runs on.
+    pub clock: motion::Clock,
     /// Rows moving after an archive, undo, sync or folder switch.
     pub list: Option<ListShift<ThreadRow>>,
     /// The list viewport gliding to the selection (`Ctrl-d`, `gg`, `G`).
@@ -109,6 +115,8 @@ pub struct InboxMotion {
     last_layer: Option<Layer>,
     /// The pane that came into view and the side it comes from.
     pane: Option<(Transition, Pane)>,
+    /// In a narrow window, the pane it replaced, fading out beneath it.
+    pane_out: Option<(Pane, Transition)>,
     last_panes: (bool, bool),
     last_layout: (Pane, bool),
     /// The conversation's focus edge changing colour.
@@ -118,6 +126,9 @@ pub struct InboxMotion {
     last_selected: Option<String>,
     /// Another thread's messages just arrived in the conversation.
     arrival: Option<Transition>,
+    /// They arrived since the last frame: the fade starts with the frame
+    /// that first draws them, so a late frame cannot eat it.
+    arrival_pending: bool,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -139,6 +150,7 @@ impl InboxMotion {
     pub fn new(motion: Motion) -> Self {
         Self {
             motion,
+            clock: motion::Clock::default(),
             list: None,
             list_glide: None,
             conv_glide: None,
@@ -157,12 +169,14 @@ impl InboxMotion {
             last_overlay: Overlay::None,
             last_layer: None,
             pane: None,
+            pane_out: None,
             last_panes: (true, true),
             last_layout: (Pane::List, false),
             focus: None,
             selection_out: None,
             last_selected: None,
             arrival: None,
+            arrival_pending: false,
             list_from: None,
             conv_from: None,
             card_to: None,
@@ -174,6 +188,9 @@ impl InboxMotion {
     /// `panes`: which panes this frame shows (list, conversation).
     pub fn observe(&mut self, session: &Session, panes: (bool, bool), now: Instant) {
         let start = |duration| self.motion.start(duration, now);
+        if std::mem::take(&mut self.arrival_pending) {
+            self.arrival = start(motion::QUICK);
+        }
         if session.toast != self.last_toast {
             match (&session.toast, self.last_toast.take()) {
                 (Some(toast), old) => {
@@ -279,6 +296,14 @@ impl InboxMotion {
                     _ => None,
                 };
                 self.pane = entering.and_then(|pane| start(motion::PANE).map(|t| (t, pane)));
+                // A narrow window swaps one pane for the other: the old one
+                // fades out under the new one, so no frame shows neither.
+                let leaving = match (self.last_panes, panes) {
+                    ((true, false), (false, true)) => Some(Pane::List),
+                    ((false, true), (true, false)) => Some(Pane::Conversation),
+                    _ => None,
+                };
+                self.pane_out = leaving.and_then(|pane| start(motion::FADE).map(|t| (pane, t)));
             }
             if layout.0 != self.last_layout.0 {
                 self.focus = start(motion::QUICK);
@@ -318,8 +343,9 @@ impl InboxMotion {
     }
 
     /// Another thread's messages replaced the conversation.
-    pub fn thread_arrived(&mut self, now: Instant) {
-        self.arrival = self.motion.start(motion::QUICK, now);
+    pub fn thread_arrived(&mut self) {
+        self.arrival = None;
+        self.arrival_pending = true;
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -344,6 +370,7 @@ impl InboxMotion {
         self.focus = None;
         self.selection_out = None;
         self.arrival = None;
+        self.arrival_pending = false;
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -411,6 +438,7 @@ impl InboxMotion {
             self.pane = None;
         }
         running |= self.pane.is_some();
+        running |= keep_with(&mut self.pane_out, now);
         if self
             .list
             .as_ref()
@@ -448,14 +476,19 @@ impl InboxMotion {
     }
 
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
-        let notice = session.toast.clone().map(|toast| {
-            let p = motion::progress(self.toast_in.as_ref(), now);
-            (toast, motion::lerp(self.toast_from, 1.0, p))
-        });
+        let rising = motion::progress(self.toast_in.as_ref(), now);
+        let notice = session
+            .toast
+            .clone()
+            .map(|toast| (toast, motion::lerp(self.toast_from, 1.0, rising)));
         let leaving = self
             .toast_out
             .as_ref()
             .map(|(toast, fade)| (toast.clone(), fade.remaining(now)));
+        let gone = self
+            .toast_out
+            .as_ref()
+            .map_or(0.0, |(_, fade)| motion::ease_out(fade.linear(now)));
         let hints = match (&notice, &leaving) {
             (Some(_), _) => {
                 self.hints_from * self.hints_out.map_or(0.0, |fade| fade.remaining(now))
@@ -466,6 +499,8 @@ impl InboxMotion {
         StatusMotion {
             notice,
             leaving,
+            notice_dy: motion::NOTICE_RISE_PX * (1.0 - rising),
+            leaving_dy: -motion::NOTICE_RISE_PX * gone,
             hints,
         }
     }
@@ -502,7 +537,9 @@ impl InboxMotion {
                 let p = transition.progress(now);
                 let side = if pane == Pane::List { -1.0 } else { 1.0 };
                 PaneEntry {
-                    opacity: p,
+                    // From ARRIVE_FROM, like any content that replaces other
+                    // content: never from empty.
+                    opacity: motion::lerp(motion::ARRIVE_FROM, 1.0, p),
                     dx: side * motion::PANE_SLIDE_PX * (1.0 - p),
                 }
             }
@@ -511,6 +548,22 @@ impl InboxMotion {
                 dx: 0.0,
             },
         }
+    }
+
+    /// The pane a narrow window just swapped out, still fading where it
+    /// was as it moves a little towards its own side (the list left, the
+    /// conversation right): the way the new one came in, continued.
+    pub fn pane_leaving(&self, now: Instant) -> Option<(Pane, PaneEntry)> {
+        let (pane, fade) = self.pane_out.as_ref()?;
+        let shows = fade.remaining(now);
+        let side = if *pane == Pane::List { -1.0 } else { 1.0 };
+        Some((
+            *pane,
+            PaneEntry {
+                opacity: shows,
+                dx: side * motion::PANE_SLIDE_PX * (1.0 - shows),
+            },
+        ))
     }
 
     /// How much of the selection highlight row `id` still shows, when the
@@ -655,9 +708,23 @@ mod tests {
             assert!((1.0..1.2).contains(&(old + new)), "{ms} ms: {old} + {new}");
         }
         assert!(motion.status(&session, later(swap, 17)).leaving.unwrap().1 > 0.7);
+        // A swap, not a smear: the new one rises in from just below its
+        // place as the old one rises out above it, over the same fade.
+        assert_eq!(
+            (status.notice_dy, status.leaving_dy),
+            (motion::NOTICE_RISE_PX, 0.0)
+        );
+        let mut last = (status.notice_dy, status.leaving_dy);
+        for ms in [17, 33, 50, 80] {
+            let mid = motion.status(&session, later(swap, ms));
+            assert!(mid.notice_dy < last.0 && mid.notice_dy > 0.0, "{ms} ms");
+            assert!(mid.leaving_dy < last.1 && mid.leaving_dy > -motion::NOTICE_RISE_PX);
+            last = (mid.notice_dy, mid.leaving_dy);
+        }
         let after = motion.status(&session, later(swap, 120));
         assert!(after.leaving.is_none_or(|(_, o)| o == 0.0), "out over FADE");
         assert_eq!(after.notice.unwrap().1, 1.0);
+        assert_eq!(after.notice_dy, 0.0, "in its place");
     }
 
     #[test]
@@ -826,9 +893,27 @@ mod tests {
         session.pane = Pane::Conversation;
         motion.observe(&session, (false, true), now);
         let entry = motion.pane_entry(Pane::Conversation, now);
-        assert_eq!(entry.opacity, 0.0);
+        assert_eq!(entry.opacity, motion::ARRIVE_FROM, "never from empty");
         assert!(entry.dx > 0.0, "from the right");
         assert_eq!(motion.pane_entry(Pane::List, now).opacity, 1.0);
+        // The list fades out under it, so a frame never shows neither.
+        for ms in [0, 16, 33, 50, 80, 119] {
+            let at = later(now, ms);
+            let (pane, out) = motion.pane_leaving(at).expect("the list is leaving");
+            assert_eq!(pane, Pane::List);
+            assert!(out.dx <= 0.0, "towards the left");
+            let coming = motion.pane_entry(Pane::Conversation, at).opacity;
+            assert!(
+                coming + out.opacity >= 0.95,
+                "{ms} ms: {coming} + {}",
+                out.opacity
+            );
+        }
+        assert!(
+            motion.tick(later(now, 130)),
+            "the conversation still slides"
+        );
+        assert!(motion.pane_leaving(later(now, 130)).is_none());
         session.pane = Pane::List;
         let back = later(now, 300);
         motion.observe(&session, (true, false), back);
@@ -836,6 +921,14 @@ mod tests {
             motion.pane_entry(Pane::List, back).dx < 0.0,
             "from the left"
         );
+        assert_eq!(
+            motion.pane_entry(Pane::List, back).opacity,
+            motion::ARRIVE_FROM
+        );
+        let (pane, _) = motion
+            .pane_leaving(back)
+            .expect("the conversation is leaving");
+        assert_eq!(pane, Pane::Conversation);
     }
 
     #[test]

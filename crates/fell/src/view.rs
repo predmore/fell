@@ -408,7 +408,10 @@ impl Inbox {
             };
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.read_gen == generation {
-                    inbox.read_landed(folder, result, intent, cx);
+                    let log = inbox.frames.clone();
+                    FrameLog::event(log.as_ref(), "rows", || {
+                        inbox.read_landed(folder, result, intent, cx)
+                    });
                 }
             });
         })
@@ -526,7 +529,8 @@ impl Inbox {
             }
         }
         let row_height = self.list_row_height();
-        let drawn = self.drawn_rows(Instant::now());
+        let now = self.motion.clock.now();
+        let drawn = self.drawn_rows(now);
         let before_id = self.session.cursor_id.clone();
         let before_index = before_id
             .as_ref()
@@ -700,7 +704,7 @@ impl Inbox {
     /// scroll with the list from there. `replace`: the list is another
     /// folder's; it fades in and nothing of the old one lingers.
     fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool) {
-        let now = Instant::now();
+        let now = self.motion.clock.now();
         // Ghosts keep their place in the list's content, as of the offset
         // the next frame draws at.
         let offset = self.list_offset();
@@ -771,7 +775,8 @@ impl Inbox {
 
     /// A key arrived: jump every transition to its end state first.
     fn settle_motion(&mut self) {
-        let settled = self.motion.settle(Instant::now());
+        let now = self.motion.clock.now();
+        let settled = self.motion.settle(now);
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }
@@ -839,7 +844,8 @@ impl Inbox {
                 {
                     return;
                 }
-                match result {
+                let log = inbox.frames.clone();
+                FrameLog::event(log.as_ref(), "messages", || match result {
                     Ok(view) => {
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
@@ -850,7 +856,7 @@ impl Inbox {
                             inbox.session.refresh_messages(view, bottom)
                         } else {
                             inbox.session.set_messages(view);
-                            inbox.motion.thread_arrived(Instant::now());
+                            inbox.motion.thread_arrived();
                             true
                         };
                         inbox.mark_open(id);
@@ -865,7 +871,7 @@ impl Inbox {
                         }
                         inbox.session.fail_query(QueryFault::Message, err);
                     }
-                }
+                });
                 cx.notify();
             });
         })
@@ -1078,7 +1084,8 @@ impl Inbox {
     /// the row that took its place.
     fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
         self.pending_removals.insert(id.to_string());
-        let drawn = self.drawn_rows(Instant::now());
+        let now = self.motion.clock.now();
+        let drawn = self.drawn_rows(now);
         self.session.remove_thread(id);
         self.scroll_list_to_cursor();
         self.start_list_shift(drawn, false);
@@ -1572,14 +1579,9 @@ impl Inbox {
         let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
         let x = self.conv_scroll.offset().x;
         self.conv_scroll.set_offset(point(x, px(to)));
-        self.motion.conv_glide = Glide::start(
-            &self.motion.motion,
-            from,
-            to,
-            reach,
-            motion::SLIDE,
-            Instant::now(),
-        );
+        let now = self.motion.clock.now();
+        self.motion.conv_glide =
+            Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now);
         if let Some(glide) = self.motion.conv_glide {
             self.conv_scroll.set_offset(point(x, px(glide.from)));
         }
@@ -1687,13 +1689,14 @@ impl Inbox {
         let rows = self.session.threads.len();
         let target = present::list_scroll_target(offset, index, moved, rows, ROW_PX, view);
         let from = self.motion.glide_from_list(drawn);
+        let now = self.motion.clock.now();
         self.motion.list_glide = Glide::start(
             &self.motion.motion,
             from,
             target,
             view * motion::GLIDE_MAX_VIEWPORTS,
             motion::SLIDE,
-            Instant::now(),
+            now,
         );
         self.set_list_offset(self.motion.list_glide.map_or(target, |glide| glide.from));
     }
@@ -1719,7 +1722,10 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = Instant::now();
+        let real = Instant::now();
+        // Motion time: a frame the compositor held back moves what is
+        // moving one step on, not to its end.
+        let now = self.motion.clock.frame(real);
         self.frame_now = now;
         let width = f32::from(window.viewport_size().width);
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
@@ -1731,9 +1737,11 @@ impl Render for Inbox {
         let animating = self.motion.tick(now);
         if animating {
             window.request_animation_frame();
+        } else {
+            self.motion.clock.idle();
         }
         if let Some(log) = &self.frames {
-            log.borrow_mut().render_started(now, animating);
+            log.borrow_mut().render_started(real, animating);
         }
         let frames = self.frames.clone();
         let theme = self.theme.clone();
@@ -1781,8 +1789,10 @@ impl Render for Inbox {
             now,
             Shown {
                 subject,
+                folder: self.list_folder.clone(),
                 leaving,
                 card,
+                frames: frames.clone(),
             },
             width,
             split,
@@ -1796,10 +1806,11 @@ impl Render for Inbox {
         )
         .when_some(frames, |root, frames| {
             frames.borrow_mut().built(Instant::now());
+            let last = frames.clone();
             // Painted last, so it marks the end of the frame's paint.
             root.child(
                 gpui::canvas(
-                    |_, _, _| {},
+                    move |_, _, _| last.borrow_mut().mark(1, Instant::now()),
                     move |_, _, _, _| frames.borrow_mut().painted(Instant::now()),
                 )
                 .absolute()
@@ -1827,6 +1838,10 @@ struct Shown {
     leaving: Vec<gpui::AnyElement>,
     /// The palette's or folder picker's height as drawn this frame.
     card: Option<f32>,
+    /// The folder the rows on screen come from. The header names it, so
+    /// after `gs` its name and count change in the frame the rows do.
+    folder: String,
+    frames: Option<SharedFrameLog>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1853,9 +1868,45 @@ fn shell(
     let status = motion.status(session, now);
     let Shown {
         subject,
+        folder,
         leaving,
         card,
+        frames,
     } = shown;
+    let mut subject = Some(subject);
+    // A narrow window's pane that a key just swapped out fades beneath the
+    // one coming in, where it was, full width.
+    let swapped_out = motion
+        .pane_leaving(now)
+        .filter(|(pane, _)| match pane {
+            Pane::List => !show_list,
+            Pane::Conversation => !show_conv,
+        })
+        .map(|(pane, entry)| {
+            let pane = match pane {
+                Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), cx),
+                Pane::Conversation => conversation(
+                    &theme,
+                    session,
+                    subject.take().unwrap_or_default(),
+                    motion,
+                    now,
+                    conv_scroll.clone(),
+                    width,
+                    window,
+                    cx,
+                ),
+            };
+            // A flex row, as the panes' own row is, so the pane fills it.
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_row()
+                .child(entering(pane, entry))
+        });
     div()
         .id("fell-root")
         .track_focus(&focus)
@@ -1895,14 +1946,29 @@ fn shell(
         .text_size(px(theme.ui_px))
         .font_family_opt(theme.ui_family.clone())
         .overflow_hidden()
-        .child(header(&theme, session))
+        .when_some(frames, |root, frames| {
+            let first = frames.clone();
+            // Prepainted and painted first: marks the end of layout and the
+            // start of paint.
+            root.child(
+                gpui::canvas(
+                    move |_, _, _| first.borrow_mut().mark(0, Instant::now()),
+                    move |_, _, _, _| frames.borrow_mut().mark(2, Instant::now()),
+                )
+                .absolute()
+                .size_0(),
+            )
+        })
+        .child(header(&theme, session, &folder))
         .child(
             div()
+                .relative()
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
                 .flex_row()
                 .overflow_hidden()
+                .children(swapped_out)
                 .when(show_list, |row| {
                     row.child(entering(
                         thread_list(
@@ -1929,7 +1995,7 @@ fn shell(
                         conversation(
                             &theme,
                             session,
-                            subject,
+                            subject.take().unwrap_or_default(),
                             motion,
                             now,
                             conv_scroll,
@@ -1971,7 +2037,7 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
         .opacity(entry.opacity)
 }
 
-fn header(theme: &Theme, session: &Session) -> gpui::Div {
+fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
     let unread = session.unread_threads();
     div()
         .h(px(44.))
@@ -2005,10 +2071,10 @@ fn header(theme: &Theme, session: &Session) -> gpui::Div {
                     div()
                         .flex_none()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(session.folder_title()),
+                        .child(session.roles.label(folder)),
                 )
                 // The folder's own name gives way first in a narrow window.
-                .children(session.folder_title_detail().map(|name| {
+                .children(session.folder_detail(folder).map(|name| {
                     div()
                         .min_w(px(0.))
                         .overflow_hidden()
@@ -2377,8 +2443,27 @@ fn thread_line_two(
     };
     let subject_w = line_px(window, &row.subject, weight).min(280.0);
     let snippet_w = (text_width - subject_w - 8.0).max(24.0);
-    let subject = clip_line(window, &row.subject, subject_w.min(text_width), weight);
-    let snippet = clip_line(window, &row.snippet, snippet_w, FontWeight::NORMAL);
+    // Shaped once here and drawn from that shaping: a row that comes into
+    // view shapes each of its two texts at most twice.
+    let subject_color = if selected {
+        theme.on_selection
+    } else {
+        theme.foreground
+    };
+    let subject = clip_shaped(
+        window,
+        &row.subject,
+        subject_w.min(text_width),
+        weight,
+        Some(subject_color),
+    );
+    let snippet = clip_shaped(
+        window,
+        &row.snippet,
+        snippet_w,
+        FontWeight::NORMAL,
+        Some(snippet_color),
+    );
     div()
         .w(px(text_width))
         .flex()
@@ -2386,38 +2471,45 @@ fn thread_line_two(
         .items_center()
         .gap(px(8.))
         .overflow_hidden()
-        .child(
+        .children(subject.map(|line| shaped_text(line, window)))
+        .children(snippet.map(|line| {
             div()
-                .font_weight(weight)
-                .flex_none()
+                .w(px(snippet_w))
                 .overflow_hidden()
-                .whitespace_nowrap()
-                .text_color(rgb(if selected {
-                    theme.on_selection
-                } else {
-                    theme.foreground
-                }))
-                .child(subject),
-        )
-        .when(!row.snippet.is_empty(), |line| {
-            line.child(
-                div()
-                    .w(px(snippet_w))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(rgb(snippet_color))
-                    .child(snippet),
-            )
-        })
+                .child(shaped_text(line, window))
+        }))
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
+    shape_ui_line(window, text, weight, None).map_or(0.0, |line| f32::from(line.width))
+}
+
+/// `text` shaped as one line in the UI font at `weight`, in `color` (the
+/// inherited one when `None`).
+fn shape_ui_line(
+    window: &Window,
+    text: &str,
+    weight: FontWeight,
+    color: Option<u32>,
+) -> Option<gpui::ShapedLine> {
     if text.is_empty() {
-        return 0.0;
+        return None;
     }
     let mut style = window.text_style();
     style.font_weight = weight;
+    if let Some(color) = color {
+        style.color = rgb(color).into();
+    }
     let font_px = style.font_size.to_pixels(window.rem_size());
+    let key = LineKey {
+        text: text.to_string(),
+        font: style.font(),
+        px: f32::from(font_px).to_bits(),
+        color: style.color,
+    };
+    if let Some(line) = SHAPED.with(|lines| lines.borrow_mut().get(&key)) {
+        return Some(line);
+    }
     let run = style.to_run(text.len());
     let line = window.text_system().shape_line(
         SharedString::from(text.to_string()),
@@ -2425,37 +2517,134 @@ fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
         &[run],
         None,
     );
-    f32::from(line.width)
+    SHAPED.with(|lines| lines.borrow_mut().insert(key, line.clone()));
+    Some(line)
+}
+
+/// What a line was shaped from: its text, font, size and colour.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LineKey {
+    text: String,
+    font: gpui::Font,
+    px: u32,
+    color: gpui::Hsla,
+}
+
+/// Lines the rows and the status bar shaped, kept across frames. GPUI keeps
+/// a line's shaping only while every frame draws it, so a folder the reader
+/// comes back to (`gs` then `gi`) or rows that scroll back into view would
+/// be shaped again on the frame they appear: 10–20 ms, more than a frame.
+/// Two generations: when the newer one fills up it becomes the older, and
+/// lines still drawn move back into the newer one as they are used.
+#[derive(Default)]
+struct ShapedLines {
+    recent: std::collections::HashMap<LineKey, gpui::ShapedLine>,
+    older: std::collections::HashMap<LineKey, gpui::ShapedLine>,
+}
+
+impl ShapedLines {
+    /// Lines kept in each generation.
+    const KEEP: usize = 4096;
+
+    fn get(&mut self, key: &LineKey) -> Option<gpui::ShapedLine> {
+        if let Some(line) = self.recent.get(key) {
+            return Some(line.clone());
+        }
+        let line = self.older.remove(key)?;
+        self.insert(key.clone(), line.clone());
+        Some(line)
+    }
+
+    fn insert(&mut self, key: LineKey, line: gpui::ShapedLine) {
+        if self.recent.len() >= Self::KEEP {
+            self.older = std::mem::take(&mut self.recent);
+        }
+        self.recent.insert(key, line);
+    }
+}
+
+thread_local! {
+    /// The UI thread's [`ShapedLines`]; only the UI thread draws.
+    static SHAPED: std::cell::RefCell<ShapedLines> = std::cell::RefCell::default();
 }
 
 /// Shorten one line to `max_px`, ending on an ellipsis that reaches that width.
 fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> String {
-    if line_px(window, text, weight) <= max_px {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut best = "…".to_string();
-    let mut lo = 0;
-    let mut hi = chars.len();
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let mut candidate: String = chars[..mid].iter().collect();
-        candidate = candidate.trim_end().to_string();
-        if !candidate.is_empty() {
-            candidate.push('…');
-        } else {
-            candidate = "…".to_string();
+    clip_shaped(window, text, max_px, weight, None)
+        .map_or_else(String::new, |line| line.text.to_string())
+}
+
+/// [`clip_line`], shaped and ready to paint ([`shaped_text`]), so the row
+/// does not shape the same text again to draw it.
+///
+/// It shapes at most twice: once to find the cut, once for the line that
+/// is drawn. Only as much of a long snippet as could ever fit is shaped.
+fn clip_shaped(
+    window: &Window,
+    text: &str,
+    max_px: f32,
+    weight: FontWeight,
+    color: Option<u32>,
+) -> Option<gpui::ShapedLine> {
+    // No glyph of a UI font is narrower than a fifth of an em, so more
+    // characters than this can never fit.
+    let font_px = f32::from(window.text_style().font_size.to_pixels(window.rem_size()));
+    let most = (max_px / (font_px * 0.2).max(1.0)).ceil() as usize + 2;
+    let probe = match text.char_indices().nth(most) {
+        Some((cut, _)) => &text[..cut],
+        None => text,
+    };
+    let mut line = shape_ui_line(window, probe, weight, color)?;
+    if f32::from(line.width) <= max_px {
+        if probe.len() == text.len() {
+            return Some(line);
         }
-        if line_px(window, &candidate, weight) <= max_px {
-            best = candidate;
-            lo = mid;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
+        // Narrower glyphs than any font has: measure the whole line.
+        line = shape_ui_line(window, text, weight, color)?;
+        if f32::from(line.width) <= max_px {
+            return Some(line);
         }
     }
-    best
+    // The shaped line says where each glyph starts, so the cut is found
+    // without shaping every candidate.
+    let shaped = line.text.clone();
+    let room = max_px - line_px(window, "…", weight);
+    let mut end = line
+        .index_for_x(px(room.max(0.0)))
+        .unwrap_or(shaped.len())
+        .min(shaped.len());
+    while !shaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let kept = shaped[..end].trim_end();
+        let candidate = format!("{kept}…");
+        let cut = shape_ui_line(window, &candidate, weight, color)?;
+        // Kerning can make the cut line a little wider than its prefix
+        // was inside the whole line: step back until it fits.
+        if kept.is_empty() || f32::from(cut.width) <= max_px {
+            return Some(cut);
+        }
+        end = shaped[..kept.len()]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+    }
+}
+
+/// A line [`clip_shaped`] already shaped, drawn as it is.
+fn shaped_text(line: gpui::ShapedLine, window: &Window) -> gpui::Canvas<()> {
+    let height = window.text_style().line_height_in_pixels(window.rem_size());
+    let width = line.width;
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, cx| {
+            let _ = line.paint(bounds.origin, height, window, cx);
+        },
+    )
+    .w(width)
+    .h(height)
+    .flex_none()
 }
 
 /// The width of `text` as the status bar draws it: its size and family.
@@ -3015,7 +3204,8 @@ fn status_bar(
     if session.detail_text().is_some() {
         used += 12.0 + bar_px(window, "· ? details", size, ui);
     }
-    let notice_text = |toast: &Toast, opacity: f32| {
+    let scale = window.scale_factor();
+    let notice_text = |toast: &Toast, opacity: f32, dy: f32| {
         let text = present::fit_notice(&toast.text, (width - used).max(80.0), |text| {
             bar_px(window, text, size, ui)
         });
@@ -3029,8 +3219,12 @@ fn status_bar(
                 theme.foreground
             }))
             .when(opacity < 1.0, |text| text.opacity(opacity))
+            .when(dy.abs() >= 0.01, |text| {
+                text.relative().top(px(motion::snap(dy, scale)))
+            })
             .child(text)
     };
+    let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
         div()
             .font_family_opt(theme.mono_family.clone())
@@ -3097,7 +3291,7 @@ fn status_bar(
                 .overflow_hidden()
                 .map(|cell| match (current, leaving) {
                     (Some((toast, opacity)), Some((old, gone))) => cell
-                        .child(notice_text(&toast, opacity))
+                        .child(notice_text(&toast, opacity, notice_dy))
                         // The notice it replaced fades out over it.
                         .child(
                             div()
@@ -3108,10 +3302,13 @@ fn status_bar(
                                 .right(px(0.))
                                 .flex()
                                 .items_center()
-                                .child(notice_text(&old, gone)),
+                                .child(notice_text(&old, gone, leaving_dy)),
                         ),
-                    (Some((toast, opacity)), None) | (None, Some((toast, opacity))) => {
-                        cell.child(notice_text(&toast, opacity))
+                    (Some((toast, opacity)), None) => {
+                        cell.child(notice_text(&toast, opacity, notice_dy))
+                    }
+                    (None, Some((toast, opacity))) => {
+                        cell.child(notice_text(&toast, opacity, leaving_dy))
                     }
                     (None, None) => cell,
                 }),

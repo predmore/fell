@@ -8,7 +8,13 @@
 //! that frame's paint), `cpu_ms` (CPU time the UI thread spent on the frame,
 //! which a busy machine's preemption does not inflate), the key, and
 //! whether a transition was running. GPU
-//! submission and presentation happen after paint and are not counted.
+//! submission and presentation happen after paint and are not counted in
+//! the frame; `gap_ms` and `between_cpu_ms` (wall and UI-thread CPU time
+//! from the last frame's paint to this frame's start) show them, and any
+//! other UI-thread work between frames.
+//!
+//! Work the UI thread does outside a frame (a store reply landing) is a
+//! line of its own: `event`, its `ms` and `cpu_ms`.
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -23,8 +29,13 @@ pub struct FrameLog {
     render_at: Option<Instant>,
     render_cpu: f64,
     built_at: Option<Instant>,
+    /// Phase marks: layout done (first prepaint), prepaint done, paint started.
+    marks: [Option<Instant>; 3],
     key: Option<(Instant, String)>,
     animating: bool,
+    /// When the last frame's paint ended, and the thread's CPU time then.
+    last_paint: Option<(Instant, f64)>,
+    gap: Option<(f64, f64)>,
 }
 
 pub type SharedFrameLog = Rc<RefCell<FrameLog>>;
@@ -60,8 +71,11 @@ impl FrameLog {
             render_at: None,
             render_cpu: 0.0,
             built_at: None,
+            marks: [None; 3],
             key: None,
             animating: false,
+            last_paint: None,
+            gap: None,
         })))
     }
 
@@ -76,11 +90,41 @@ impl FrameLog {
         self.render_at = Some(at);
         self.render_cpu = thread_cpu_ms();
         self.animating = animating;
+        self.gap = self
+            .last_paint
+            .map(|(painted, cpu)| (ms(painted, at), self.render_cpu - cpu));
+    }
+
+    /// Time a piece of UI-thread work outside a frame, as an `event` line.
+    pub fn event<T>(log: Option<&SharedFrameLog>, name: &str, work: impl FnOnce() -> T) -> T {
+        let Some(log) = log else {
+            return work();
+        };
+        let (start, cpu) = (Instant::now(), thread_cpu_ms());
+        let out = work();
+        let (end, cpu_ms) = (Instant::now(), thread_cpu_ms() - cpu);
+        let mut log = log.borrow_mut();
+        let t_ms = ms(log.opened, start);
+        let _ = writeln!(
+            log.out,
+            "{{\"t_ms\":{t_ms:.1},\"event\":{name:?},\"ms\":{:.3},\"cpu_ms\":{cpu_ms:.3}}}",
+            ms(start, end)
+        );
+        let _ = log.out.flush();
+        out
     }
 
     /// The view's element tree is built; layout and paint follow.
     pub fn built(&mut self, at: Instant) {
         self.built_at = Some(at);
+    }
+
+    /// The first element's prepaint (layout is done), the last element's
+    /// prepaint (prepaint is done), and the first element's paint.
+    pub fn mark(&mut self, phase: usize, at: Instant) {
+        if let Some(slot) = self.marks.get_mut(phase) {
+            *slot = Some(at);
+        }
     }
 
     pub fn painted(&mut self, at: Instant) {
@@ -89,17 +133,31 @@ impl FrameLog {
         };
         let frame_ms = ms(start, at);
         let cpu_ms = thread_cpu_ms() - self.render_cpu;
-        let build_ms = self.built_at.take().map_or(0.0, |built| ms(start, built));
+        let built = self.built_at.take();
+        let build_ms = built.map_or(0.0, |built| ms(start, built));
+        let [laid, prepainted, painting] = std::mem::take(&mut self.marks);
+        let span = |from: Option<Instant>, to: Option<Instant>| match (from, to) {
+            (Some(from), Some(to)) => format!("{:.3}", ms(from, to)),
+            _ => "null".to_string(),
+        };
+        let layout_ms = span(built, laid);
+        let prepaint_ms = span(laid, prepainted);
+        let paint_ms = span(painting, Some(at));
         let (key_ms, name) = match self.key.take() {
             Some((pressed, name)) => (format!("{:.3}", ms(pressed, at)), name),
             None => ("null".to_string(), String::new()),
         };
+        let (gap_ms, between_cpu_ms) = match self.gap.take() {
+            Some((gap, cpu)) => (format!("{gap:.3}"), format!("{cpu:.3}")),
+            None => ("null".to_string(), "null".to_string()),
+        };
         let _ = writeln!(
             self.out,
-            "{{\"t_ms\":{:.1},\"frame_ms\":{frame_ms:.3},\"build_ms\":{build_ms:.3},\"cpu_ms\":{cpu_ms:.3},\"key_ms\":{key_ms},\"key\":{name:?},\"anim\":{}}}",
+            "{{\"t_ms\":{:.1},\"frame_ms\":{frame_ms:.3},\"build_ms\":{build_ms:.3},\"layout_ms\":{layout_ms},\"prepaint_ms\":{prepaint_ms},\"paint_ms\":{paint_ms},\"cpu_ms\":{cpu_ms:.3},\"gap_ms\":{gap_ms},\"between_cpu_ms\":{between_cpu_ms},\"key_ms\":{key_ms},\"key\":{name:?},\"anim\":{}}}",
             ms(self.opened, start),
             self.animating
         );
+        self.last_paint = Some((at, thread_cpu_ms()));
         let _ = self.out.flush();
     }
 }

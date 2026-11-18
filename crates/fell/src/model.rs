@@ -403,13 +403,8 @@ impl Session {
         self.roles.label(&self.folder)
     }
 
-    /// The open folder's own name, shown dimmed beside its title only when
-    /// another folder would read the same (see [`Self::folder_detail`]).
-    pub fn folder_title_detail(&self) -> Option<String> {
-        self.folder_detail(&self.folder)
-    }
-
-    /// `folder`'s own name when its label alone would read like another of
+    /// `folder`'s own name, shown dimmed beside its title in the header,
+    /// when its label alone would read like another of
     /// the account's folders: Gmail's `[Gmail]/Sent Mail` beside a label
     /// called `Sent`. `None` for every folder in the usual case.
     pub fn folder_detail(&self, folder: &str) -> Option<String> {
@@ -2020,7 +2015,7 @@ mod tests {
         assert_eq!(session.folder, "[Gmail]/Sent Mail");
         assert_eq!(session.folder_title(), "Sent");
         assert_eq!(
-            session.folder_title_detail().as_deref(),
+            session.folder_detail(&session.folder).as_deref(),
             Some("[Gmail]/Sent Mail")
         );
         assert_eq!(

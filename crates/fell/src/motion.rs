@@ -43,6 +43,9 @@ pub const FADE: Duration = Duration::from_millis(120);
 
 /// How far an overlay rises while it fades in, in pixels.
 pub const RISE_PX: f32 = 6.0;
+/// How far a notice rises as it comes in, and again as it leaves, in
+/// pixels: a notice replacing another reads as a swap, not a smear.
+pub const NOTICE_RISE_PX: f32 = 2.0;
 /// How far a pane that comes into view slides in from its side, in pixels.
 pub const PANE_SLIDE_PX: f32 = 24.0;
 /// Another thread's messages, and another folder's rows, arrive at this
@@ -90,8 +93,58 @@ pub fn mix(from: u32, to: u32, t: f32) -> u32 {
     channel(16) | channel(8) | channel(0)
 }
 
-/// One running transition. Its progress is time-based, so a slow frame
-/// skips ahead instead of stretching the animation.
+/// The longest step one frame moves the motion [`Clock`]: two frames at 60 Hz.
+pub const MAX_STEP: Duration = Duration::from_millis(34);
+
+/// The time transitions run on. It follows the wall clock, except that one
+/// frame never moves it more than [`MAX_STEP`]: a frame that comes late
+/// (the compositor held it back, the machine is busy) shows the next step
+/// of what was moving instead of its end, so nothing jumps. A transition
+/// still finishes in its time on any steady frame rate down to 30 Hz.
+/// When nothing runs, it catches up with the wall clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Clock {
+    /// How far motion time is behind the wall clock.
+    lag: Duration,
+    /// When the last frame that drew motion started (wall clock).
+    last: Option<Instant>,
+}
+
+impl Clock {
+    /// Motion time at wall-clock `real`.
+    pub fn at(&self, real: Instant) -> Instant {
+        real.checked_sub(self.lag).unwrap_or(real)
+    }
+
+    /// Motion time now, for a transition a key or a store reply starts.
+    /// The next frame measures its step from here.
+    pub fn now(&mut self) -> Instant {
+        let real = Instant::now();
+        self.last.get_or_insert(real);
+        self.at(real)
+    }
+
+    /// A frame starts at wall-clock `real`: the motion time it draws at.
+    pub fn frame(&mut self, real: Instant) -> Instant {
+        if let Some(last) = self.last {
+            let step = real.saturating_duration_since(last);
+            if step > MAX_STEP {
+                self.lag += step - MAX_STEP;
+            }
+        }
+        self.last = Some(real);
+        self.at(real)
+    }
+
+    /// Nothing is moving: catch up with the wall clock.
+    pub fn idle(&mut self) {
+        *self = Clock::default();
+    }
+}
+
+/// One running transition. Its progress is time-based on the motion
+/// [`Clock`], so a slow frame skips ahead (up to [`MAX_STEP`]) instead of
+/// stretching the animation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transition {
     started: Instant,
@@ -301,7 +354,9 @@ impl<R> Ghost<R> {
 pub struct ListShift<R> {
     transition: Transition,
     /// Rows arriving in place, from [`ARRIVE_FROM`]: never from empty.
-    arrive: Transition,
+    /// Its clock starts on the first frame that draws them, so a late
+    /// first frame cannot eat the fade. `None` until then.
+    arrive: Option<Transition>,
     /// Row id → its top before the change, in viewport pixels.
     before: HashMap<String, f32>,
     /// Row id → how far it is drawn from its slot when the shift starts,
@@ -331,7 +386,6 @@ impl<R: Clone> ListShift<R> {
         now: Instant,
     ) -> Option<ListShift<R>> {
         let transition = motion.start(SLIDE, now)?;
-        let arrive = motion.start(QUICK, now)?;
         let replaced = replace || (!before.is_empty() && left.len() == before.len());
         let fade = motion.start(FADE, now)?;
         let mut ghosts: Vec<Ghost<R>> = Vec::new();
@@ -345,7 +399,7 @@ impl<R: Clone> ListShift<R> {
         }
         Some(ListShift {
             transition,
-            arrive,
+            arrive: None,
             before: before.into_iter().collect(),
             resolved: HashMap::new(),
             ghosts,
@@ -410,9 +464,12 @@ impl<R: Clone> ListShift<R> {
                     // Arriving in a slot nothing slides into (another
                     // folder, a `G` landing): softened, never blinked
                     // through empty.
+                    let arrive = *self
+                        .arrive
+                        .get_or_insert_with(|| Transition::new(now, QUICK));
                     RowMotion {
                         dy: 0.0,
-                        opacity: lerp(ARRIVE_FROM, 1.0, self.arrive.progress(now)),
+                        opacity: lerp(ARRIVE_FROM, 1.0, arrive.progress(now)),
                         reveal: 1.0,
                     }
                 }
@@ -458,7 +515,9 @@ impl<R: Clone> ListShift<R> {
     }
 
     pub fn running(&self, now: Instant) -> bool {
-        self.transition.running(now) || self.ghosts.iter().any(|ghost| ghost.running(now))
+        self.transition.running(now)
+            || self.arrive.is_some_and(|arrive| arrive.running(now))
+            || self.ghosts.iter().any(|ghost| ghost.running(now))
     }
 
     /// Every row drawn so far sits in its slot and nothing fades: the
@@ -709,6 +768,48 @@ mod tests {
             }
         }
         assert_eq!(last, [1.0; 3], "full after QUICK");
+    }
+
+    #[test]
+    fn a_stalled_frame_moves_motion_on_by_one_step_at_most() {
+        let start = Instant::now();
+        let mut clock = Clock::default();
+        assert_eq!(clock.frame(start), start);
+        let fade = Transition::new(at(start, 16), QUICK);
+        // Steady 60 Hz and 30 Hz frames keep wall-clock time.
+        let t = clock.frame(at(start, 16));
+        assert_eq!(t, at(start, 16));
+        let t = clock.frame(at(start, 49));
+        assert_eq!(t, at(start, 49));
+        // The compositor holds the next frame back 100 ms: the fade moves
+        // one step on, not to its end.
+        let t = clock.frame(at(start, 149));
+        assert_eq!(t, at(start, 49) + MAX_STEP);
+        assert!(fade.running(t), "{}", fade.progress(t));
+        // Frames after the stall come at the usual pace and finish it.
+        let t = clock.frame(at(start, 165));
+        assert_eq!(t, at(start, 49 + 34 + 16));
+        assert!(!fade.running(t));
+        // Once nothing runs, motion time is wall-clock time again.
+        clock.idle();
+        assert_eq!(clock.frame(at(start, 400)), at(start, 400));
+    }
+
+    #[test]
+    fn a_late_first_frame_does_not_eat_the_arrival() {
+        let start = Instant::now();
+        let mut switched = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], true, start);
+        // The rows landed at `start`, but the first frame that draws them
+        // comes 90 ms later, longer than the whole fade.
+        let first = at(start, 90);
+        assert_eq!(switched.row("x", 0.0, None, first).opacity, ARRIVE_FROM);
+        assert!(switched.running(first), "the fade has only begun");
+        let mid = switched.row("x", 0.0, None, at(start, 110)).opacity;
+        assert!(mid > ARRIVE_FROM && mid < 1.0, "{mid}");
+        // A row drawn later than the first one joins the same fade.
+        assert_eq!(switched.row("y", 68.0, None, at(start, 110)).opacity, mid);
+        assert_eq!(switched.row("x", 0.0, None, at(start, 170)).opacity, 1.0);
+        assert!(!switched.running(at(start, 170)));
     }
 
     #[test]
