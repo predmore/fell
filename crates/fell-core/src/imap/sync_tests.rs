@@ -3843,7 +3843,10 @@ fn a_server_that_ignores_the_window_sends_a_10_mb_part_whole() {
     let size = 10 * 1024 * 1024;
     let fixture = crate::imap::mime_fixtures::large_attachment("big@x", size);
     let (server, backend, request) = part_server(&fixture, true);
-    assert!(request.part.encoded_size > 8 * 1024 * 1024, "over the reply cap");
+    assert!(
+        request.part.encoded_size > 8 * 1024 * 1024,
+        "over the reply cap"
+    );
     let (root, cache) = temp_cache("whole");
     server.state.lock().expect("state").commands.clear();
     let mut heard = Vec::new();
@@ -3872,7 +3875,11 @@ fn a_part_exactly_one_window_long_is_fetched_once() {
             fixture.bytes[0].1,
             "ignores the window: {ignores_window}"
         );
-        assert_eq!(part_fetches(&server), 1, "ignores the window: {ignores_window}");
+        assert_eq!(
+            part_fetches(&server),
+            1,
+            "ignores the window: {ignores_window}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
     // Smaller windows still add up to the part when the server honours them.
@@ -3887,7 +3894,11 @@ fn a_part_exactly_one_window_long_is_fetched_once() {
         std::fs::read(&cached.unwrap().path).unwrap(),
         fixture.bytes[0].1
     );
-    assert!((2..=3).contains(&part_fetches(&server)), "{:?}", commands(&server));
+    assert!(
+        (2..=3).contains(&part_fetches(&server)),
+        "{:?}",
+        commands(&server)
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -4046,7 +4057,10 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     let count = |verb: &str| logged.iter().filter(|line| line.contains(verb)).count();
     assert_eq!(count("EXAMINE"), 1, "one session: {logged:?}");
     assert_eq!(count("LOGOUT"), 1, "the cancelled session is closed");
-    assert!(cache.lookup(&request).is_none(), "nothing half-fetched is kept");
+    assert!(
+        cache.lookup(&request).is_none(),
+        "nothing half-fetched is kept"
+    );
 
     // Dropping the fetcher cancels the running job and waits for its thread.
     parts_server.state.lock().expect("state").commands.clear();
@@ -4067,6 +4081,10 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     }
     let finished = finished.expect("Done arrived before drop returned");
     assert!(finished.unwrap_err().to_string().contains("cancelled"));
-    assert!(commands(&parts_server).iter().any(|line| line.contains("LOGOUT")));
+    assert!(
+        commands(&parts_server)
+            .iter()
+            .any(|line| line.contains("LOGOUT"))
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

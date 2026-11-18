@@ -14,9 +14,9 @@
 
 use std::fs;
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
