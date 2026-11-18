@@ -314,17 +314,21 @@ impl DraftSession {
             return lock;
         }
         let lock = read_legacy_send_state(&legacy);
-        match store.finish_compose_send(&self.account_id, &self.id, lock) {
-            Ok(()) => {
+        match store.migrate_compose_send(&self.account_id, &self.id, lock) {
+            Ok(recorded) => {
                 let _ = std::fs::remove_file(&legacy);
+                recorded
             }
-            Err(err) if lock.is_some() => self.notices.push(format!(
-                "could not move this draft's send record into the mailbox: {err}"
-            )),
-            // Nothing to keep; the file is read again on the next open.
-            Err(_) => {}
+            Err(err) => {
+                if lock.is_some() {
+                    self.notices.push(format!(
+                        "could not move this draft's send record into the mailbox: {err}"
+                    ));
+                }
+                // The file is read again on the next open.
+                lock
+            }
         }
-        lock
     }
 
     /// A draft saved before review state moved into the mailbox kept it in
@@ -1937,7 +1941,9 @@ mod tests {
             (SendLock::Sent, "was sent"),
             (SendLock::MaybeSent, "may already have been sent"),
         ] {
-            session.end_send(None);
+            // A recorded send is never cleared, so each case is a new draft.
+            let (_root, _store, mut session) = stored_session("body\n");
+            session.mark_seen();
             session.begin_send().unwrap();
             session.end_send(Some(lock));
             assert!(session.prepare_send().unwrap_err().contains(needle));
@@ -2672,6 +2678,52 @@ mod tests {
         let reopened =
             DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(reopened.send_lock(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_late_clear_never_unlocks_a_sent_draft() {
+        let (root, store, session) = stored_session("body\n");
+        let account = AccountId("local".into());
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::Sent))
+            .unwrap();
+        // A second session's "nothing went out" and a stray "may have been
+        // sent" both arrive after the send was recorded.
+        store.finish_compose_send(&account, "d1", None).unwrap();
+        store
+            .finish_compose_send(&account, "d1", Some(SendLock::MaybeSent))
+            .unwrap();
+        assert_eq!(
+            store.compose_send_record(&account, "d1").unwrap(),
+            Some(Some(SendLock::Sent))
+        );
+        let reopened = reopen(session, &store);
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_migration_racing_another_keeps_the_sent_record() {
+        let (root, store, session) = stored_session("body\n");
+        let account = AccountId("local".into());
+        let folder = session.folder().to_path_buf();
+        drop(session);
+        store.conn.execute("DELETE FROM compose_send", []).unwrap();
+        // The first open moved `sent` out of the file and deleted it.
+        assert_eq!(
+            store
+                .migrate_compose_send(&account, "d1", Some(SendLock::Sent))
+                .unwrap(),
+            Some(SendLock::Sent)
+        );
+        // A second open that raced it finds no file and would say "clear".
+        assert_eq!(
+            store.migrate_compose_send(&account, "d1", None).unwrap(),
+            Some(SendLock::Sent)
+        );
+        let reopened = DraftSession::open_with_store(&folder, account, &store).unwrap();
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
         let _ = fs::remove_dir_all(root);
     }
 

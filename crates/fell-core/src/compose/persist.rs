@@ -212,15 +212,59 @@ impl Store {
     }
 
     /// Record how a send ended: `None` when nothing was transmitted and the
-    /// draft may be sent again. Also writes the first record of a draft, so
-    /// a later open knows the old `send-state` file was already read.
+    /// draft may be sent again. Only a "may have been sent" claim can be
+    /// cleared; a recorded `sent` is never undone by a late or stray clear.
     pub(crate) fn finish_compose_send(
         &self,
         account_id: &AccountId,
         draft_id: &str,
         lock: Option<SendLock>,
     ) -> Result<()> {
-        let state = match lock {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        match lock {
+            None => {
+                self.conn.execute(
+                    "UPDATE compose_send SET state = ?3, updated_unix = ?4
+                     WHERE account_id = ?1 AND draft_id = ?2 AND state = ?5",
+                    params![
+                        account_id.as_str(),
+                        draft_id,
+                        SEND_CLEAR,
+                        now_unix(),
+                        SEND_MAYBE_SENT
+                    ],
+                )?;
+            }
+            Some(lock) => {
+                let state = match lock {
+                    SendLock::Sent => SEND_SENT,
+                    SendLock::MaybeSent | SendLock::InFlight => SEND_MAYBE_SENT,
+                };
+                // `sent` only moves up; "may have been sent" never replaces it.
+                self.conn.execute(
+                    "INSERT INTO compose_send (account_id, draft_id, state, updated_unix)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(account_id, draft_id) DO UPDATE SET
+                        state = excluded.state,
+                        updated_unix = excluded.updated_unix
+                     WHERE compose_send.state != ?5",
+                    params![account_id.as_str(), draft_id, state, now_unix(), SEND_SENT],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// First record of a draft's send state, from an old `send-state` file.
+    /// A record that is already there wins, whoever wrote it, and is returned:
+    /// two opens racing to migrate cannot replace `sent` with `clear`.
+    pub(crate) fn migrate_compose_send(
+        &self,
+        account_id: &AccountId,
+        draft_id: &str,
+        legacy: Option<SendLock>,
+    ) -> Result<Option<SendLock>> {
+        let state = match legacy {
             None => SEND_CLEAR,
             Some(SendLock::Sent) => SEND_SENT,
             Some(SendLock::MaybeSent | SendLock::InFlight) => SEND_MAYBE_SENT,
@@ -229,12 +273,12 @@ impl Store {
         self.conn.execute(
             "INSERT INTO compose_send (account_id, draft_id, state, updated_unix)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(account_id, draft_id) DO UPDATE SET
-                state = excluded.state,
-                updated_unix = excluded.updated_unix",
+             ON CONFLICT(account_id, draft_id) DO NOTHING",
             params![account_id.as_str(), draft_id, state, now_unix()],
         )?;
-        Ok(())
+        Ok(self
+            .compose_send_record(account_id, draft_id)?
+            .unwrap_or(Some(SendLock::MaybeSent)))
     }
 
     /// The send record of a draft: `Ok(None)` when it has none, and

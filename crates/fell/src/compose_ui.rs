@@ -577,7 +577,21 @@ impl ComposeView {
                 match outcome {
                     Ok(_) => {
                         this.sent = true;
-                        this.status = "Sent from the editor".into();
+                        let id = this.draft_id.to_string();
+                        let unrecorded = this
+                            .hub
+                            .with_session(&id, |session| {
+                                session.snapshot().notices.iter().any(|notice| {
+                                    notice.starts_with("could not record how this send ended")
+                                })
+                            })
+                            .unwrap_or(false);
+                        this.status = if unrecorded {
+                            "Sent; the mailbox did not record it, so this draft will read as possibly sent"
+                        } else {
+                            "Sent from the editor"
+                        }
+                        .into();
                     }
                     Err(err) => {
                         this.sent = matches!(err, SendFailure::MaybeSent(_));
