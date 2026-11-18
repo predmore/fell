@@ -1059,6 +1059,7 @@ impl Inbox {
         self.session.show_toast(reply_notice(kind, &sender), false);
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
+        let roles = self.session.roles.clone();
         let read = self.store.call({
             let account = account.clone();
             move |store| store.message(&account, &parent_id)
@@ -1069,10 +1070,10 @@ impl Inbox {
             };
             let result = match found {
                 Ok(Some(parent)) => {
-                    let own = fell_core::compose::own_addresses(&parent, &email);
+                    let own = fell_core::compose::own_addresses(&parent, &email, &roles);
                     let offset = crate::present::local_offset(parent.headers.date_unix);
                     let start = fell_core::compose::start_reply_in_zone(
-                        kind, &parent, &email, &own, offset,
+                        kind, &parent, &email, &own, offset, &roles,
                     );
                     let hub = hub.clone();
                     cx.background_executor()
