@@ -697,32 +697,67 @@ fn utc_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     (year, month, day, hour, minute, wday)
 }
 
-/// Fit a notice to `max_px`, as `measure` sizes text. A quoted name gives
-/// up whole words first, so the outcome before it and the key after it
-/// stay whole; only a first word too long alone is cut inside.
+/// Fit a notice to `max_px`, as `measure` sizes text. The quoted name
+/// gives up whole words first. If even one word does not fit, the clauses
+/// between the outcome and the closing key go next, last first, and the
+/// name is fitted again; so the outcome and the key always stay whole and
+/// no clause is cut in the middle. Only an outcome too long alone is cut.
 pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
     if measure(text) <= max_px {
         return text.to_string();
     }
-    let quoted = text.find('\u{201c}').and_then(|open| {
+    if let Some(fitted) = shorten_name(text, max_px, &measure) {
+        return fitted;
+    }
+    let mut parts: Vec<&str> = text.split(NOTICE_DOT).collect();
+    while let Some(drop) = (1..parts.len().saturating_sub(1))
+        .rev()
+        .find(|index| !parts[*index].contains('\u{201c}'))
+    {
+        parts.remove(drop);
+        let candidate = parts.join(NOTICE_DOT);
+        if measure(&candidate) <= max_px {
+            return candidate;
+        }
+        if let Some(fitted) = shorten_name(&candidate, max_px, &measure) {
+            return fitted;
+        }
+    }
+    let text = parts.join(NOTICE_DOT);
+    match quoted_span(&text) {
+        Some((open, close)) => {
+            let before = &text[..open + '\u{201c}'.len_utf8()];
+            let after = &text[close..];
+            let name = text[before.len()..close].trim_end_matches('…');
+            cut_to(name, before, after, max_px, &measure)
+        }
+        None => cut_to(&text, "", "", max_px, &measure),
+    }
+}
+
+/// How the inbox separates a notice's clauses.
+const NOTICE_DOT: &str = "  ·  ";
+
+fn quoted_span(text: &str) -> Option<(usize, usize)> {
+    text.find('\u{201c}').and_then(|open| {
         text[open..]
             .find('\u{201d}')
             .map(|close| (open, open + close))
-    });
-    let Some((open, close)) = quoted else {
-        return cut_to(text, "", "", max_px, &measure);
-    };
+    })
+}
+
+/// `text` with its quoted name cut to whole words that fit, keeping at
+/// least the first; `None` when no quoted name, or not even one word, fits.
+fn shorten_name(text: &str, max_px: f32, measure: &impl Fn(&str) -> f32) -> Option<String> {
+    let (open, close) = quoted_span(text)?;
     let before = &text[..open + '\u{201c}'.len_utf8()];
     let after = &text[close..];
     let name = text[before.len()..close].trim_end_matches('…');
     let words: Vec<&str> = name.split_whitespace().collect();
-    for count in (1..words.len()).rev() {
-        let candidate = format!("{before}{}…{after}", words[..count].join(" "));
-        if measure(&candidate) <= max_px {
-            return candidate;
-        }
-    }
-    cut_to(name, before, after, max_px, &measure)
+    (1..words.len())
+        .rev()
+        .map(|count| format!("{before}{}…{after}", words[..count].join(" ")))
+        .find(|candidate| measure(candidate) <= max_px)
 }
 
 /// The longest start of `middle` that fits between `before` and `after`,
@@ -765,6 +800,23 @@ mod tests {
             "Ada Lovelace"
         );
         assert_eq!(recipient_label("jon.smith@example.com"), "Jon.smith");
+    }
+
+    #[test]
+    fn a_narrow_warning_drops_its_middle_clause_before_its_key() {
+        let notice = "may have been sent  ·  check Sent before sending again  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent";
+        let width = |text: &str| text.chars().count() as f32;
+        let fitted = fit_notice(notice, 60.0, width);
+        assert_eq!(
+            fitted,
+            "may have been sent  ·  \u{201c}Budget numbers\u{201d}  ·  gs sent"
+        );
+        let fitted = fit_notice(notice, 48.0, width);
+        assert_eq!(
+            fitted,
+            "may have been sent  ·  \u{201c}Budget…\u{201d}  ·  gs sent"
+        );
+        assert!(width(&fitted) <= 48.0);
     }
 
     #[test]

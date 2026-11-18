@@ -1092,7 +1092,8 @@ impl ComposeView {
                     })
                     .unwrap_or_else(|| Err("this draft is not open".into()));
                 self.status = match released {
-                    Ok(()) => "unlocked · edit or space m s send".into(),
+                    // The bar's right side already offers send.
+                    Ok(()) => "unlocked".into(),
                     Err(err) => err.into(),
                 };
                 cx.notify();
