@@ -116,6 +116,7 @@ struct Snap {
     unread: i64,
     archived: i64,
     snooze_until: Option<i64>,
+    starred: i64,
 }
 
 /// Maximum review-draft body, in Unicode scalar values.
@@ -270,6 +271,125 @@ impl crate::Store {
                 message.unread = false;
             },
         )
+    }
+
+    /// Mark every message in the thread unread, so the thread shows unread in
+    /// every folder it is in.
+    pub fn mark_thread_unread(
+        &self,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        actor: &str,
+    ) -> Result<Option<RecordedAction>> {
+        let summary = "marked thread unread".to_string();
+        self.mutate_thread(
+            account_id,
+            thread_id,
+            actor,
+            "mark_unread",
+            summary,
+            |message| {
+                message.unread = true;
+            },
+        )
+    }
+
+    /// Star or unstar every message in the thread.
+    pub fn star_thread(
+        &self,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        starred: bool,
+        actor: &str,
+    ) -> Result<Option<RecordedAction>> {
+        let (kind, summary) = if starred {
+            ("star", "starred thread")
+        } else {
+            ("unstar", "unstarred thread")
+        };
+        self.mutate_thread(
+            account_id,
+            thread_id,
+            actor,
+            kind,
+            summary.to_string(),
+            |message| {
+                message.starred = starred;
+            },
+        )
+    }
+
+    /// Clear the snooze on every message in the thread.
+    pub fn unsnooze_thread(
+        &self,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        actor: &str,
+    ) -> Result<Option<RecordedAction>> {
+        let summary = "unsnoozed thread".to_string();
+        self.mutate_thread(
+            account_id,
+            thread_id,
+            actor,
+            "unsnooze",
+            summary,
+            |message| {
+                message.snooze_until = None;
+            },
+        )
+    }
+
+    /// Move the thread's messages that are in `from` to `to`. Other folders
+    /// on those messages stay, so a Sent copy stays in Sent. A message with
+    /// no folder that is not archived counts as Inbox. Moving into Inbox
+    /// clears the archive bit, moving into Archive sets it.
+    ///
+    /// Folder names match ignoring ASCII case and the aliases in
+    /// [`crate::folder_aliases`]. Fails when no message is in `from`.
+    pub fn agent_move_thread(
+        &self,
+        account_id: &AccountId,
+        thread_id: &ThreadId,
+        from: &str,
+        to: &str,
+        actor: &str,
+    ) -> Result<Option<RecordedAction>> {
+        let from = canonical_folder(from)?;
+        let to = canonical_folder(to)?;
+        if same_folder(&from, &to) {
+            return Err(Error::Invalid("move needs a different folder".into()));
+        }
+        let to_inbox = same_folder(&to, "INBOX");
+        let to_archive = same_folder(&to, "Archive");
+        let from_inbox = same_folder(&from, "INBOX");
+        let summary = format!("moved thread from {from} to {to}");
+        let mut found = false;
+        let action =
+            self.mutate_thread(account_id, thread_id, actor, "move", summary, |message| {
+                let implied_inbox = from_inbox && message.folders.is_empty() && !message.archived;
+                let before = message.folders.len();
+                message.folders.retain(|folder| !same_folder(folder, &from));
+                if message.folders.len() == before && !implied_inbox {
+                    return;
+                }
+                found = true;
+                if !message
+                    .folders
+                    .iter()
+                    .any(|folder| same_folder(folder, &to))
+                {
+                    message.folders.push(to.clone());
+                }
+                if to_inbox {
+                    message.archived = false;
+                } else if to_archive {
+                    message.archived = true;
+                }
+            })?;
+        if !found {
+            return Err(Error::Invalid(format!("no messages in {from}")));
+        }
+        Ok(action)
     }
 
     /// Snooze every message in the thread until `until_unix` (unix seconds).
@@ -487,8 +607,9 @@ impl crate::Store {
         for (old, new) in &writes {
             tx.execute(
                 "INSERT INTO agent_action_messages (
-                    action_id, message_id, labels, folders, unread, archived, snooze_until
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    action_id, message_id, labels, folders, unread, archived, snooze_until,
+                    starred
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     action.id,
                     old.message_id,
@@ -497,18 +618,21 @@ impl crate::Store {
                     old.unread,
                     old.archived,
                     old.snooze_until,
+                    old.starred,
                 ],
             )?;
             tx.execute(
                 "UPDATE messages
-                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5
-                 WHERE account_id = ?6 AND message_id = ?7",
+                 SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
+                     starred = ?6
+                 WHERE account_id = ?7 AND message_id = ?8",
                 params![
                     new.labels,
                     new.folders,
                     new.unread,
                     new.archived,
                     new.snooze_until,
+                    new.starred,
                     account_id.as_str(),
                     new.message_id,
                 ],
@@ -529,6 +653,7 @@ impl Snap {
             unread: i64::from(message.unread),
             archived: i64::from(message.archived),
             snooze_until: message.snooze_until,
+            starred: i64::from(message.starred),
         }
     }
 
@@ -538,6 +663,7 @@ impl Snap {
             || self.unread != other.unread
             || self.archived != other.archived
             || self.snooze_until != other.snooze_until
+            || self.starred != other.starred
     }
 }
 
@@ -565,6 +691,25 @@ fn require_token<'a>(value: &'a str, what: &str) -> Result<&'a str> {
         )));
     }
     Ok(value)
+}
+
+fn canonical_folder(folder: &str) -> Result<String> {
+    let folder = folder.trim();
+    if folder.is_empty() || folder.chars().any(|c| c.is_control() || c == '\u{1e}') {
+        return Err(Error::Invalid(
+            "folder is empty or contains a control character".into(),
+        ));
+    }
+    Ok(folder.to_string())
+}
+
+/// Same folder, ignoring ASCII case and folder aliases (Archive/Archived).
+fn same_folder(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let aliases = crate::folder_aliases(a);
+    !aliases.is_empty() && aliases.iter().any(|alias| alias.eq_ignore_ascii_case(b))
 }
 
 fn canonical_label(label: &str) -> Result<String> {
@@ -774,7 +919,7 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
 
 fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT message_id, labels, folders, unread, archived, snooze_until
+        "SELECT message_id, labels, folders, unread, archived, snooze_until, starred
          FROM agent_action_messages WHERE action_id = ?1 ORDER BY rowid ASC",
     )?;
     let rows = stmt.query_map(params![action_id], |row| {
@@ -785,6 +930,7 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> R
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
         ))
     })?;
     let mut saved = Vec::new();
@@ -792,17 +938,20 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> R
         saved.push(row?);
     }
     drop(stmt);
-    for (message_id, labels, folders, unread, archived, snooze_until) in saved {
+    for (message_id, labels, folders, unread, archived, snooze_until, starred) in saved {
+        // A row logged before stars were recorded has no star to restore.
         conn.execute(
             "UPDATE messages
-             SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5
-             WHERE account_id = ?6 AND message_id = ?7",
+             SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
+                 starred = COALESCE(?6, starred)
+             WHERE account_id = ?7 AND message_id = ?8",
             params![
                 labels,
                 folders,
                 unread,
                 archived,
                 snooze_until,
+                starred,
                 account_id.as_str(),
                 message_id,
             ],
@@ -1051,6 +1200,180 @@ mod tests {
             store.agent_undo(&account_id).unwrap_err(),
             Error::NothingToUndo
         ));
+    }
+
+    #[test]
+    fn star_unread_unsnooze_and_move_are_logged_and_undoable() {
+        let (store, account_id, thread_id) = seeded();
+        store
+            .snooze_thread(&account_id, &thread_id, 1_893_456_000, "user")
+            .unwrap();
+        let starred = store
+            .star_thread(&account_id, &thread_id, true, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (starred.kind.as_str(), starred.summary.as_str()),
+            ("star", "starred thread")
+        );
+        assert!(
+            store
+                .star_thread(&account_id, &thread_id, true, "user")
+                .unwrap()
+                .is_none(),
+            "starring a starred thread changes nothing"
+        );
+        let unread = store
+            .mark_thread_unread(&account_id, &thread_id, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unread.kind, "mark_unread");
+        let unsnoozed = store
+            .unsnooze_thread(&account_id, &thread_id, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unsnoozed.kind, "unsnooze");
+        let moved = store
+            .agent_move_thread(&account_id, &thread_id, "inbox", "Work", "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.kind, "move");
+        assert_eq!(moved.summary, "moved thread from inbox to Work");
+
+        let messages = only_message(&store, &account_id, &thread_id);
+        assert!(messages.iter().all(|message| message.starred
+            && message.unread
+            && message.snooze_until.is_none()
+            && message.folders == vec!["Work".to_string()]
+            && !message.archived));
+        let unstarred = store
+            .star_thread(&account_id, &thread_id, false, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unstarred.kind, "unstar");
+        assert!(
+            only_message(&store, &account_id, &thread_id)
+                .iter()
+                .all(|message| !message.starred)
+        );
+
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "unstar");
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "move");
+        let restored = only_message(&store, &account_id, &thread_id);
+        assert_eq!(
+            restored[0].folders,
+            vec!["INBOX".to_string(), "Work".to_string()]
+        );
+        assert_eq!(restored[1].folders, vec!["INBOX".to_string()]);
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "unsnooze");
+        assert!(
+            only_message(&store, &account_id, &thread_id)
+                .iter()
+                .all(|message| message.snooze_until == Some(1_893_456_000))
+        );
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "mark_unread");
+        let restored = only_message(&store, &account_id, &thread_id);
+        assert!(restored[0].unread && !restored[1].unread);
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "star");
+        assert!(
+            only_message(&store, &account_id, &thread_id)
+                .iter()
+                .all(|message| !message.starred)
+        );
+    }
+
+    #[test]
+    fn move_leaves_other_copies_and_follows_inbox_and_archive() {
+        let (store, account_id, thread_id) = seeded();
+        // Only the root is in Work. The reply stays where it is.
+        store
+            .agent_move_thread(&account_id, &thread_id, "work", "Archive", "user")
+            .unwrap()
+            .unwrap();
+        let messages = only_message(&store, &account_id, &thread_id);
+        assert_eq!(
+            messages[0].folders,
+            vec!["INBOX".to_string(), "Archive".to_string()]
+        );
+        assert!(messages[0].archived, "moving into Archive sets the bit");
+        assert_eq!(messages[1].folders, vec!["INBOX".to_string()]);
+        assert!(!messages[1].archived);
+        // Archived is an alias of Archive, and Inbox clears the bit again.
+        store
+            .agent_move_thread(&account_id, &thread_id, "Archived", "INBOX", "user")
+            .unwrap()
+            .unwrap();
+        let messages = only_message(&store, &account_id, &thread_id);
+        assert_eq!(messages[0].folders, vec!["INBOX".to_string()]);
+        assert!(!messages[0].archived);
+
+        let missing = store
+            .agent_move_thread(&account_id, &thread_id, "Work", "Later", "user")
+            .unwrap_err();
+        assert_eq!(missing.to_string(), "no messages in Work");
+        assert!(
+            store
+                .agent_move_thread(&account_id, &thread_id, "INBOX", "inbox", "user")
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_move_thread(&account_id, &thread_id, "INBOX", "bad\nname", "user")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_folder_moves_out_of_inbox() {
+        let (store, account_id, _) = seeded();
+        let thread = store
+            .upsert_message(&message(
+                "a1",
+                "bare@x",
+                None,
+                "Bare",
+                "body",
+                true,
+                &[],
+                &[],
+                30,
+            ))
+            .unwrap();
+        store
+            .agent_move_thread(&account_id, &thread, "INBOX", "Work", "user")
+            .unwrap()
+            .unwrap();
+        let messages = only_message(&store, &account_id, &thread);
+        assert_eq!(messages[0].folders, vec!["Work".to_string()]);
+        assert!(
+            store
+                .folder_threads(&account_id, "INBOX")
+                .unwrap()
+                .iter()
+                .all(|row| row.thread_id != thread)
+        );
+    }
+
+    #[test]
+    fn undo_logged_before_stars_were_recorded_keeps_the_star() {
+        let (store, account_id, thread_id) = seeded();
+        store
+            .mark_thread_read(&account_id, &thread_id, "user")
+            .unwrap()
+            .unwrap();
+        // What a row from before the starred column looks like.
+        store
+            .conn
+            .execute("UPDATE agent_action_messages SET starred = NULL", [])
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE messages SET starred = 1", [])
+            .unwrap();
+        assert_eq!(store.agent_undo(&account_id).unwrap().kind, "mark_read");
+        let messages = only_message(&store, &account_id, &thread_id);
+        assert!(messages.iter().all(|message| message.starred));
+        assert!(messages[0].unread);
     }
 
     #[test]
