@@ -1519,6 +1519,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_thread_gives_type_and_size_from_listed_parts_never_bytes() {
+        let (mut session, _) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        let part = |section: &str, role, mime: &str, name: &str, size| fell_core::MimePart {
+            section: section.into(),
+            role,
+            mime_type: mime.into(),
+            filename: Some(name.into()),
+            size,
+            encoded_size: size * 4 / 3,
+            encoding: fell_core::TransferEncoding::Base64,
+            content_id: None,
+            disposition: fell_core::Disposition::Attachment,
+            nested: false,
+        };
+        let mut signed = message("a1", "signed@x", "Report", "see attached", "");
+        signed.has_attachment = true;
+        signed.parts = Some(fell_core::MessageParts {
+            plain: Some("see attached".into()),
+            mime_parts: vec![
+                part(
+                    "2",
+                    fell_core::PartRole::Attachment,
+                    "application/pdf",
+                    "q3.pdf",
+                    48_213,
+                ),
+                part(
+                    "3",
+                    fell_core::PartRole::Signature,
+                    "application/pgp-signature",
+                    "signature.asc",
+                    833,
+                ),
+            ],
+            ..Default::default()
+        });
+        let thread = session.store.upsert_message(&signed).unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        let message = &read["messages"][0];
+        assert_eq!(
+            message["attachments"],
+            json!([{
+                "name": { "untrusted_email_content": { "text": "q3.pdf", "truncated": false } },
+                "type": { "untrusted_email_content": { "text": "application/pdf", "truncated": false } },
+                "size": 48_213,
+            }])
+        );
+        assert_eq!(message["attachments_omitted"], 0);
+    }
+
     /// Every tool, whatever it is passed, neither sends nor says it did.
     /// Mail leaves only from the editor's own send action.
     #[test]

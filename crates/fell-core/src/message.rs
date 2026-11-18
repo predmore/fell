@@ -100,6 +100,74 @@ pub struct MessageParts {
     /// Bulk-mail signals (`List-Unsubscribe`, `Precedence`, ESP markers) as
     /// `(name, value)`, unfolded, in header order.
     pub bulk_headers: Vec<(String, String)>,
+    /// Every MIME part that is not body text, in document order: files,
+    /// images the HTML shows by `cid:`, and signatures. Metadata only; the
+    /// bytes stay on the server until [`crate::parts::fetch_part`] asks.
+    pub mime_parts: Vec<MimePart>,
+}
+
+/// One MIME part of a received message other than its text and HTML body.
+///
+/// Everything here came from the message and is untrusted. `filename` in
+/// particular must go through [`crate::parts::sanitize_filename`] before it
+/// names a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimePart {
+    /// The IMAP part number (RFC 3501 section 6.4.5), such as `2` or `3.1`:
+    /// what `BODY.PEEK[<section>]` fetches from a server copy.
+    pub section: String,
+    pub role: PartRole,
+    /// `type/subtype`, lowercase. `application/octet-stream` when the part
+    /// gave none that reads.
+    pub mime_type: String,
+    /// The name the sender gave it (`filename`, else `name`), with RFC 2231
+    /// and encoded words decoded.
+    pub filename: Option<String>,
+    /// Bytes once the transfer encoding is undone.
+    pub size: u64,
+    /// Bytes on the server, still transfer-encoded: what a fetch downloads.
+    pub encoded_size: u64,
+    pub encoding: TransferEncoding,
+    /// `Content-ID` without angle brackets: what a `cid:` URL names.
+    pub content_id: Option<String>,
+    pub disposition: Disposition,
+    /// The part sits inside an attached `message/rfc822` (the attached
+    /// message itself is not nested).
+    pub nested: bool,
+}
+
+/// What a [`MimePart`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PartRole {
+    /// A file offered to the reader. Sets `has_attachment`.
+    Attachment,
+    /// An image shown inside the HTML body, which loads its `Content-ID` by
+    /// a `cid:` URL (`src`, `background`, `poster`, CSS `url()`), and not
+    /// sent as `Content-Disposition: attachment`. Not an attachment.
+    Inline,
+    /// A detached signature: `application/pgp-signature`, an S/MIME
+    /// signature type, or a part named `*.p7s` or `signature.asc`. Not an
+    /// attachment.
+    Signature,
+}
+
+/// The `Content-Transfer-Encoding` a part's bytes are stored in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransferEncoding {
+    /// `7bit`, `8bit`, `binary`, none given, or one not known.
+    #[default]
+    Identity,
+    QuotedPrintable,
+    Base64,
+}
+
+/// The `Content-Disposition` type, when the part gave one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Disposition {
+    #[default]
+    Unspecified,
+    Inline,
+    Attachment,
 }
 
 pub(crate) fn encode_addresses(addrs: &[Address]) -> String {

@@ -744,8 +744,46 @@ fn mutation_json(action: Option<fell_core::RecordedAction>) -> Value {
     }
 }
 
+/// The files a message offers, by name, type and size: never their bytes.
+/// Signatures and images the HTML shows are not files. Mail synced before
+/// part lists were kept has names only.
+fn attachments_json(session: &Session, message: &Message) -> (Vec<Value>, usize) {
+    let listed = session
+        .store
+        .message_attachments(&session.account_id, &message.headers.message_id)
+        .ok()
+        .flatten();
+    let files: Vec<Value> = match listed {
+        Some(parts) => parts
+            .iter()
+            .filter(|part| part.role == fell_core::PartRole::Attachment && !part.nested)
+            .map(|part| {
+                json!({
+                    "name": untrusted::envelope(
+                        part.filename.as_deref().unwrap_or("attachment"),
+                        SNIPPET_CHARS,
+                    ),
+                    "type": untrusted::envelope(&part.mime_type, SNIPPET_CHARS),
+                    "size": part.size,
+                })
+            })
+            .collect(),
+        None => message
+            .attachment_names
+            .iter()
+            .map(|name| json!({ "name": untrusted::envelope(name, SNIPPET_CHARS) }))
+            .collect(),
+    };
+    let omitted = files.len().saturating_sub(MAX_ATTACHMENT_NAMES);
+    (
+        files.into_iter().take(MAX_ATTACHMENT_NAMES).collect(),
+        omitted,
+    )
+}
+
 fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -> Value {
     let body = message.body_text.as_deref().unwrap_or("");
+    let (attachments, attachments_omitted) = attachments_json(session, message);
     json!({
         "message_id": session.show_id(message.headers.message_id.as_str()),
         "sender_address": session.show_id(&message.headers.from.email),
@@ -757,13 +795,8 @@ fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -
         "unread": message.unread,
         "starred": message.starred,
         "has_attachment": message.has_attachment,
-        "attachments": message
-            .attachment_names
-            .iter()
-            .take(MAX_ATTACHMENT_NAMES)
-            .map(|name| json!({ "name": untrusted::envelope(name, SNIPPET_CHARS) }))
-            .collect::<Vec<_>>(),
-        "attachments_omitted": message.attachment_names.len().saturating_sub(MAX_ATTACHMENT_NAMES),
+        "attachments": attachments,
+        "attachments_omitted": attachments_omitted,
         "folders": message.folders,
         "labels": message.labels,
         "archived": message.archived,
@@ -1049,7 +1082,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "read_thread",
-            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name only, never their contents, at most 20 per message; attachments_omitted counts the rest. has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
+            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name, MIME type (both untrusted_email_content) and decoded size in bytes, never their contents, at most 20 per message; attachments_omitted counts the rest. Signatures and images shown inside the HTML are not attachments. Mail synced before parts were listed has names only, and has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
             scope: ToolScope::Read,
             schema: object_schema(
                 Map::from_iter([

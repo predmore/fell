@@ -85,6 +85,12 @@ pub(super) struct TestState {
     pub special_use: bool,
     /// Advertise SPECIAL-USE but answer `RETURN (SPECIAL-USE)` with BAD.
     pub reject_list_return: bool,
+    /// Sleep this long after each 64 KiB of a `BODY[<section>]` reply, so a
+    /// part fetch is slow.
+    pub part_write_delay: Option<Duration>,
+    /// Ignore `<offset.len>` and send the whole part, with no `<origin>`,
+    /// as some servers do.
+    pub part_ignores_window: bool,
 }
 
 pub(super) struct TestServer {
@@ -505,6 +511,18 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
+                    if let Some((section, window)) = part_request(&upper_cmd) {
+                        write_part(
+                            &mut write,
+                            seq,
+                            message,
+                            &section,
+                            window,
+                            guard.part_write_delay,
+                            guard.part_ignores_window,
+                        );
+                        continue;
+                    }
                     if !upper_cmd.contains("BODY") {
                         if upper_cmd.contains("FLAGS") {
                             let flags = message.flags.join(" ");
@@ -637,6 +655,178 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<TestState>>, sent: &Arc<AtomicUsi
         }
         let _ = write.flush();
     }
+}
+
+/// `BODY.PEEK[<section>]<offset.len>` in a UID FETCH, for a numeric section.
+fn part_request(upper: &str) -> Option<(String, Option<(usize, usize)>)> {
+    let start = upper.find("BODY.PEEK[")? + "BODY.PEEK[".len();
+    let end = start + upper[start..].find(']')?;
+    let section = &upper[start..end];
+    if section.is_empty() || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let after = &upper[end + 1..];
+    let window = after.strip_prefix('<').and_then(|tail| {
+        let (offset, rest) = tail.split_once('.')?;
+        let (len, _) = rest.split_once('>')?;
+        Some((offset.parse().ok()?, len.parse().ok()?))
+    });
+    Some((section.to_string(), window))
+}
+
+fn write_part(
+    write: &mut impl Write,
+    seq: usize,
+    message: &FixtureMessage,
+    section: &str,
+    window: Option<(usize, usize)>,
+    delay: Option<Duration>,
+    ignore_window: bool,
+) {
+    let Some(bytes) = section_body(&message.raw, section) else {
+        let _ = write.write_all(
+            format!(
+                "* {seq} FETCH (UID {} BODY[{section}] NIL)\r\n",
+                message.uid
+            )
+            .as_bytes(),
+        );
+        return;
+    };
+    let (origin, slice) = match window.filter(|_| !ignore_window) {
+        Some((offset, len)) => {
+            let start = offset.min(bytes.len());
+            let end = start.saturating_add(len).min(bytes.len());
+            (format!("<{offset}>"), &bytes[start..end])
+        }
+        None => (String::new(), &bytes[..]),
+    };
+    let _ = write.write_all(
+        format!(
+            "* {seq} FETCH (UID {} BODY[{section}]{origin} {{{}}}\r\n",
+            message.uid,
+            slice.len()
+        )
+        .as_bytes(),
+    );
+    for chunk in slice.chunks(64 * 1024) {
+        let _ = write.write_all(chunk);
+        if let Some(delay) = delay {
+            let _ = write.flush();
+            thread::sleep(delay);
+        }
+    }
+    let _ = write.write_all(b")\r\n");
+}
+
+/// The body of IMAP part `section` of `raw`, found with a small MIME walk of
+/// its own (not the client's parser), so tests check the client's numbering.
+pub(super) fn section_body(raw: &[u8], section: &str) -> Option<Vec<u8>> {
+    let mut entity = raw;
+    let mut top = true;
+    for number in section.split('.') {
+        let number: usize = number.parse().ok()?;
+        entity = *children(entity, top).get(number.checked_sub(1)?)?;
+        top = false;
+    }
+    Some(split_entity(entity).1.to_vec())
+}
+
+/// What IMAP numbers `.1`, `.2`, … under `entity`. A whole message that is
+/// not multipart has one part, itself; an attached message numbers as the
+/// message inside it.
+fn children(entity: &[u8], top: bool) -> Vec<&[u8]> {
+    let (headers, body) = split_entity(entity);
+    let content_type = header_value(headers, "content-type").unwrap_or_default();
+    let lower = content_type.to_ascii_lowercase();
+    if lower.starts_with("multipart/") {
+        param(&content_type, "boundary")
+            .map(|boundary| multipart_children(body, &boundary))
+            .unwrap_or_default()
+    } else if top {
+        vec![entity]
+    } else if lower.starts_with("message/rfc822") {
+        children(body, true)
+    } else {
+        Vec::new()
+    }
+}
+
+fn split_entity(entity: &[u8]) -> (&[u8], &[u8]) {
+    for (at, window) in entity.windows(4).enumerate() {
+        if window == b"\r\n\r\n" {
+            return (&entity[..at + 2], &entity[at + 4..]);
+        }
+    }
+    if entity.starts_with(b"\r\n") {
+        return (&[], &entity[2..]);
+    }
+    (entity, &[])
+}
+
+fn header_value(headers: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(headers);
+    let mut value: Option<String> = None;
+    let mut collecting = false;
+    for line in text.split("\r\n") {
+        if collecting && (line.starts_with(' ') || line.starts_with('\t')) {
+            if let Some(value) = value.as_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        collecting = false;
+        if let Some((key, rest)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case(name)
+        {
+            value = Some(rest.trim().to_string());
+            collecting = true;
+        }
+    }
+    value
+}
+
+fn param(value: &str, name: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|item| {
+        let (key, raw) = item.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| raw.trim().trim_matches('"').to_string())
+    })
+}
+
+/// The children of a multipart body, each without the CRLF before the next
+/// delimiter, as IMAP returns them.
+fn multipart_children<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+    let delimiter = format!("--{boundary}");
+    let delimiter = delimiter.as_bytes();
+    let mut starts = Vec::new();
+    let mut at = 0;
+    while at + delimiter.len() <= body.len() {
+        let line_start = at == 0 || body[..at].ends_with(b"\r\n");
+        if line_start && body[at..].starts_with(delimiter) {
+            starts.push(at);
+            at += delimiter.len();
+            continue;
+        }
+        at += 1;
+    }
+    let mut out = Vec::new();
+    for pair in starts.windows(2) {
+        let (open, next) = (pair[0], pair[1]);
+        let after = &body[open + delimiter.len()..];
+        if after.starts_with(b"--") {
+            break;
+        }
+        let Some(eol) = after.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let content_start = open + delimiter.len() + eol + 2;
+        let content_end = next.saturating_sub(2).max(content_start);
+        out.push(&body[content_start..content_end]);
+    }
+    out
 }
 
 fn parse_uid_fetch(rest: &str, state: &TestState) -> Option<(String, Option<u64>, String)> {

@@ -450,7 +450,7 @@ fn remove_path(path: &Path) -> io::Result<()> {
 /// Create `dir` and any missing parents, each owner-only. Existing parents keep
 /// their mode. `dir` itself must be a real directory owned by this user, and
 /// is set to 0700 either way.
-fn create_private_dirs(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dirs(dir: &Path) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut current = dir;
     while fs::symlink_metadata(current).is_err() {
@@ -469,7 +469,7 @@ fn create_private_dirs(dir: &Path) -> io::Result<()> {
 /// `mkdir` with mode 0700, then `fchmod` through a descriptor opened with
 /// `O_DIRECTORY | O_NOFOLLOW`. When the path already exists it must be a
 /// directory, not a symlink to one, and owned by this user.
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
@@ -503,7 +503,7 @@ fn refused(path: &Path, why: &str) -> io::Error {
     )
 }
 
-fn create_private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -515,13 +515,13 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
 // Flag values differ by architecture (aarch64 and x86_64 disagree on
 // `O_DIRECTORY`), so they come from libc, as in `compose::workspace`.
 const O_DIRECTORY: i32 = libc::O_DIRECTORY;
-const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+pub(crate) const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 const O_NONBLOCK: i32 = libc::O_NONBLOCK;
 const O_NOCTTY: i32 = libc::O_NOCTTY;
 
 /// This process's user id, read from `/proc/self` as `compose::workspace`
 /// does (the crate forbids the `unsafe` a `geteuid` call needs).
-fn user_id() -> u32 {
+pub(crate) fn user_id() -> u32 {
     fs::metadata("/proc/self")
         .map(|meta| meta.uid())
         .unwrap_or(0)

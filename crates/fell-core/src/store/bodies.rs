@@ -8,8 +8,13 @@
 //!
 //! Rows are keyed like `messages`, by account and canonical Message-ID, and
 //! go when the message row goes. A merge first moves the parts the kept row
-//! lacks onto it; an expunge saves them for undo (`local_action_bodies`). Attachment parts belong in a sibling
-//! `message_parts` table keyed the same way, with a part id.
+//! lacks onto it; an expunge saves them for undo (`local_action_bodies`).
+//!
+//! The other MIME parts (files, `cid:` images, signatures) are listed in
+//! `message_parts`, keyed the same way plus the IMAP section, metadata only.
+//! `message_bodies.parts_listed` says whether that list was taken: a row
+//! written before it existed has an unknown list, not an empty one. A list
+//! moves, merges and is saved for undo (`local_action_parts`) with the body.
 //!
 //! Mail stored before this table existed is queued in `body_backfill` once,
 //! by the schema version 4 upgrade; sync fetches those messages again from a
@@ -20,7 +25,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
-use crate::message::{MessageId, MessageParts, RemoteId};
+use crate::message::{
+    Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
+};
 use crate::{Error, Result};
 
 const BODIES_SCHEMA: &str = "
@@ -33,8 +40,33 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     plain BLOB,
     -- Bulk-mail headers: name US value, records joined by RS.
     bulk_headers TEXT NOT NULL DEFAULT '',
+    -- 1 once message_parts holds this message's part list (maybe none).
+    parts_listed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
 );
+
+-- The non-body MIME parts of a message: metadata, never bytes.
+CREATE TABLE IF NOT EXISTS message_parts (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    -- IMAP part number, as BODY.PEEK[section] takes it.
+    section TEXT NOT NULL,
+    -- Document order.
+    position INTEGER NOT NULL,
+    -- 0 attachment, 1 inline (cid:), 2 signature.
+    role INTEGER NOT NULL,
+    mime_type TEXT NOT NULL,
+    filename TEXT,
+    size INTEGER NOT NULL,
+    encoded_size INTEGER NOT NULL,
+    -- 0 identity, 1 quoted-printable, 2 base64.
+    encoding INTEGER NOT NULL,
+    content_id TEXT,
+    -- 0 none given, 1 inline, 2 attachment.
+    disposition INTEGER NOT NULL,
+    nested INTEGER NOT NULL,
+    PRIMARY KEY (account_id, message_id, section)
+) WITHOUT ROWID;
 
 -- Messages stored before message_bodies, still to fetch again.
 CREATE TABLE IF NOT EXISTS body_backfill (
@@ -49,13 +81,60 @@ CREATE TRIGGER IF NOT EXISTS message_bodies_ad AFTER DELETE ON messages BEGIN
     DELETE FROM body_backfill
     WHERE account_id = old.account_id AND message_id = old.message_id;
 END;
+
+CREATE TRIGGER IF NOT EXISTS message_parts_ad AFTER DELETE ON messages BEGIN
+    DELETE FROM message_parts
+    WHERE account_id = old.account_id AND message_id = old.message_id;
+END;
 ";
 
 /// Create the tables and the trigger that drops parts with their message.
 /// Queueing mail stored before them is [`queue_stored_mail`], which runs
 /// after the version 3 merge so it sees only the rows that survive it.
 pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
-    conn.execute_batch(BODIES_SCHEMA).map_err(Into::into)
+    conn.execute_batch(BODIES_SCHEMA)?;
+    if !has_column(conn, "message_bodies", "parts_listed")? {
+        conn.execute_batch(
+            "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// Schema version 5: queue every stored message with a server copy whose
+/// part list was never taken, so the backfill fetches it once more and
+/// lists its attachments. Stamped in the same transaction, as version 4.
+pub(super) fn queue_unlisted_mail(conn: &Connection) -> Result<()> {
+    let tx = super::begin_immediate(conn)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO body_backfill (account_id, message_id)
+         SELECT m.account_id, m.message_id FROM messages m
+         WHERE EXISTS (
+             SELECT 1 FROM message_copies c
+             WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM message_bodies b
+             WHERE b.account_id = m.account_id AND b.message_id = m.message_id
+               AND b.parts_listed = 1
+         )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '5')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Schema version 4: queue every stored message that has a server copy and no
@@ -120,6 +199,9 @@ pub(crate) struct StoredParts {
     html: Option<Vec<u8>>,
     plain: Option<Vec<u8>>,
     bulk_headers: String,
+    /// `None` when no source was parsed (nothing could be fetched), so the
+    /// stored list, if any, stays.
+    mime_parts: Option<Vec<MimePart>>,
 }
 
 impl StoredParts {
@@ -128,6 +210,7 @@ impl StoredParts {
             html: parts.html.as_deref().map(compress),
             plain: parts.plain.as_deref().map(compress),
             bulk_headers: encode_headers(&parts.bulk_headers),
+            mime_parts: Some(parts.mime_parts.clone()),
         }
     }
 
@@ -135,27 +218,41 @@ impl StoredParts {
         self.html.is_some() || self.plain.is_some()
     }
 
+    /// The part list this source gave, when one was parsed.
+    pub(crate) fn mime_parts(&self) -> Option<&[MimePart]> {
+        self.mime_parts.as_deref()
+    }
+
     /// Replace the parts saved for undo on every open action that removed
-    /// `message_id`, as a later copy of it replaces the saved body text.
+    /// `message_id`, as a later copy of it replaces the saved body text. A
+    /// copy with no text body (only files) replaces the part list and
+    /// leaves any saved body alone.
     pub(crate) fn save_for_undo(
         &self,
         conn: &Connection,
         account_id: &AccountId,
         message_id: &str,
     ) -> Result<()> {
-        conn.execute(
-            "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers)
-             SELECT m.action_id, m.message_id, ?3, ?4, ?5, ?6
-             FROM local_action_messages m
-             JOIN local_actions a ON a.id = m.action_id
-             WHERE m.message_id = ?2 AND m.removed = 1
-               AND a.account_id = ?1 AND a.undone = 0
-             ON CONFLICT(action_id, message_id) DO UPDATE SET
+        let on_conflict = if self.has_body() {
+            "ON CONFLICT(action_id, message_id) DO UPDATE SET
                 codec = excluded.codec,
                 html = excluded.html,
                 plain = excluded.plain,
-                bulk_headers = excluded.bulk_headers",
+                bulk_headers = excluded.bulk_headers"
+        } else {
+            "ON CONFLICT(action_id, message_id) DO NOTHING"
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO local_action_bodies
+                    (action_id, message_id, codec, html, plain, bulk_headers)
+                 SELECT m.action_id, m.message_id, ?3, ?4, ?5, ?6
+                 FROM local_action_messages m
+                 JOIN local_actions a ON a.id = m.action_id
+                 WHERE m.message_id = ?2 AND m.removed = 1
+                   AND a.account_id = ?1 AND a.undone = 0
+                 {on_conflict}"
+            ),
             params![
                 account_id.as_str(),
                 message_id,
@@ -165,20 +262,211 @@ impl StoredParts {
                 self.bulk_headers,
             ],
         )?;
+        let Some(list) = &self.mime_parts else {
+            return Ok(());
+        };
+        let actions = {
+            let mut stmt = conn.prepare(
+                "SELECT m.action_id FROM local_action_messages m
+                 JOIN local_actions a ON a.id = m.action_id
+                 WHERE m.message_id = ?2 AND m.removed = 1
+                   AND a.account_id = ?1 AND a.undone = 0",
+            )?;
+            stmt.query_map(params![account_id.as_str(), message_id], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for action_id in actions {
+            conn.execute(
+                "UPDATE local_action_bodies SET parts_listed = 1
+                 WHERE action_id = ?1 AND message_id = ?2",
+                params![action_id, message_id],
+            )?;
+            conn.execute(
+                "DELETE FROM local_action_parts WHERE action_id = ?1 AND message_id = ?2",
+                params![action_id, message_id],
+            )?;
+            for (position, part) in list.iter().enumerate() {
+                insert_part(
+                    conn,
+                    "INSERT INTO local_action_parts (action_id, message_id, section, position,
+                        role, mime_type, filename, size, encoded_size, encoding, content_id,
+                        disposition, nested)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::types::Value::Integer(action_id),
+                    message_id,
+                    position,
+                    part,
+                )?;
+            }
+        }
         Ok(())
     }
+}
+
+/// Columns of `message_parts` after the key, as `local_action_parts` copies them.
+pub(crate) const PART_COLUMNS: &str = "section, position, role, mime_type, filename, size,
+    encoded_size, encoding, content_id, disposition, nested";
+
+fn insert_part(
+    conn: &Connection,
+    sql: &str,
+    owner: rusqlite::types::Value,
+    message_id: &str,
+    position: usize,
+    part: &MimePart,
+) -> Result<()> {
+    conn.prepare_cached(sql)?.execute(params![
+        owner,
+        message_id,
+        part.section,
+        position as i64,
+        role_code(part.role),
+        part.mime_type,
+        part.filename,
+        part.size as i64,
+        part.encoded_size as i64,
+        encoding_code(part.encoding),
+        part.content_id,
+        disposition_code(part.disposition),
+        i64::from(part.nested),
+    ])?;
+    Ok(())
+}
+
+fn role_code(role: PartRole) -> i64 {
+    match role {
+        PartRole::Attachment => 0,
+        PartRole::Inline => 1,
+        PartRole::Signature => 2,
+    }
+}
+
+fn encoding_code(encoding: TransferEncoding) -> i64 {
+    match encoding {
+        TransferEncoding::Identity => 0,
+        TransferEncoding::QuotedPrintable => 1,
+        TransferEncoding::Base64 => 2,
+    }
+}
+
+fn disposition_code(disposition: Disposition) -> i64 {
+    match disposition {
+        Disposition::Unspecified => 0,
+        Disposition::Inline => 1,
+        Disposition::Attachment => 2,
+    }
+}
+
+fn part_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MimePart> {
+    Ok(MimePart {
+        section: row.get(0)?,
+        role: match row.get::<_, i64>(2)? {
+            1 => PartRole::Inline,
+            2 => PartRole::Signature,
+            _ => PartRole::Attachment,
+        },
+        mime_type: row.get(3)?,
+        filename: row.get(4)?,
+        size: row.get::<_, i64>(5)?.max(0) as u64,
+        encoded_size: row.get::<_, i64>(6)?.max(0) as u64,
+        encoding: match row.get::<_, i64>(7)? {
+            1 => TransferEncoding::QuotedPrintable,
+            2 => TransferEncoding::Base64,
+            _ => TransferEncoding::Identity,
+        },
+        content_id: row.get(8)?,
+        disposition: match row.get::<_, i64>(9)? {
+            1 => Disposition::Inline,
+            2 => Disposition::Attachment,
+            _ => Disposition::Unspecified,
+        },
+        nested: row.get::<_, i64>(10)? != 0,
+    })
+}
+
+/// Whether `message_id` has its part list recorded.
+pub(crate) fn parts_listed(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<bool> {
+    let listed: Option<i64> = conn
+        .prepare_cached(
+            "SELECT parts_listed FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
+        .optional()?;
+    Ok(listed == Some(1))
+}
+
+/// Replace the part list of a message whose `message_bodies` row exists.
+fn replace_list(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    list: &[MimePart],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM message_parts WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    for (position, part) in list.iter().enumerate() {
+        insert_part(
+            conn,
+            "INSERT INTO message_parts (account_id, message_id, section, position, role,
+                mime_type, filename, size, encoded_size, encoding, content_id, disposition,
+                nested)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::types::Value::Text(account_id.as_str().to_string()),
+            message_id,
+            position,
+            part,
+        )?;
+    }
+    conn.execute(
+        "UPDATE message_bodies SET parts_listed = 1 WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    Ok(())
+}
+
+/// The recorded part list of a canonical message id, in document order.
+/// `None` when it was never taken.
+pub(super) fn list(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Option<Vec<MimePart>>> {
+    if !parts_listed(conn, account_id, message_id)? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {PART_COLUMNS} FROM message_parts
+         WHERE account_id = ?1 AND message_id = ?2
+         ORDER BY position"
+    ))?;
+    let parts = stmt
+        .query_map(params![account_id.as_str(), message_id], part_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(parts))
 }
 
 /// Store `parts` for `message_id` and take it off the backfill queue. An
 /// empty `parts` (no HTML, no plain) still writes a row when there is none,
 /// recording that it was looked at, but never replaces parts with a body.
+///
+/// The part list follows the body: `Replace` with a body replaces it, and
+/// otherwise a list is written only where none was taken yet. Returns
+/// whether this write set the list.
 pub(super) fn write(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
     parts: &StoredParts,
     mode: Write,
-) -> Result<()> {
+) -> Result<bool> {
     conn.execute(
         "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
         params![account_id.as_str(), message_id],
@@ -212,7 +500,15 @@ pub(super) fn write(
             parts.bulk_headers,
         ],
     )?;
-    Ok(())
+    let Some(list) = &parts.mime_parts else {
+        return Ok(false);
+    };
+    let replace = (mode == Write::Replace && parts.has_body())
+        || !parts_listed(conn, account_id, message_id)?;
+    if replace {
+        replace_list(conn, account_id, message_id, list)?;
+    }
+    Ok(replace)
 }
 
 /// Insert a row, or fill each empty column of the stored one. Rows of
@@ -229,13 +525,13 @@ const FILL_GAP_SQL: &str = "INSERT INTO message_bodies
 
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
 /// parts it lacks from `from`, as stored. `to` leaves the backfill queue
-/// when it gains a body.
+/// when it gains a body. Returns the part list when `to` took `from`'s.
 pub(super) fn move_into(
     conn: &Connection,
     account_id: &AccountId,
     from: &str,
     to: &str,
-) -> Result<()> {
+) -> Result<Option<Vec<MimePart>>> {
     let moved = conn.execute(
         "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
          SELECT account_id, ?3, codec, html, plain, bulk_headers FROM message_bodies
@@ -255,7 +551,19 @@ pub(super) fn move_into(
             params![account_id.as_str(), to],
         )?;
     }
-    Ok(())
+    // The part list goes with it when the kept row has none.
+    if !parts_listed(conn, account_id, to)?
+        && let Some(list) = list(conn, account_id, from)?
+    {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_bodies (account_id, message_id, codec)
+             VALUES (?1, ?2, ?3)",
+            params![account_id.as_str(), to, CODEC_DEFLATE],
+        )?;
+        replace_list(conn, account_id, to, &list)?;
+        return Ok(Some(list));
+    }
+    Ok(None)
 }
 
 /// Stored parts for a canonical message id, or `None` when there is no row.
@@ -291,6 +599,7 @@ pub(super) fn read(
         html: html.as_deref().map(decompress).transpose()?,
         plain: plain.as_deref().map(decompress).transpose()?,
         bulk_headers: decode_headers(&headers),
+        mime_parts: list(conn, account_id, message_id)?.unwrap_or_default(),
     }))
 }
 
@@ -702,6 +1011,7 @@ mod tests {
 
         // A fetch for the gap fills the same way and keeps what is stored.
         let fetched = MessageParts {
+            mime_parts: Vec::new(),
             html: Some("<p>other</p>".into()),
             plain: Some("other".into()),
             bulk_headers: Vec::new(),
@@ -710,6 +1020,238 @@ mod tests {
             .store_fetched_parts(&account().id, &[(MessageId::new("post@x"), Some(fetched))])
             .unwrap();
         assert_eq!(body(&store, "post@x").unwrap(), kept);
+    }
+
+    fn with_attachments(id: &str, mailbox: &str, uid: u32) -> Message {
+        let fixture = crate::imap::mime_fixtures::mixed_two_attachments(id);
+        crate::imap::to_message(&account().id, mailbox, mailbox, 7, uid, &[], &fixture.raw)
+    }
+
+    fn attachments(store: &Store, id: &str) -> Option<Vec<crate::MimePart>> {
+        store
+            .message_attachments(&account().id, &MessageId::new(id))
+            .unwrap()
+    }
+
+    fn part_rows(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM message_parts", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn part_lists_are_kept_read_back_and_deleted_with_the_message() {
+        let message = with_attachments("pdf@x", "INBOX", 1);
+        let list = message.parts.clone().unwrap().mime_parts;
+        assert_eq!(list.len(), 2);
+        let store = store_with(vec![message.clone()]);
+        assert_eq!(attachments(&store, "pdf@x"), Some(list.clone()));
+        assert_eq!(body(&store, "pdf@x").unwrap().mime_parts, list);
+        let stored = store
+            .message(&account().id, &MessageId::new("pdf@x"))
+            .unwrap()
+            .unwrap();
+        assert!(stored.has_attachment);
+        assert_eq!(stored.attachment_names, vec!["report.pdf", "totals.csv"]);
+        // A part request carries the part and the copies to fetch it from.
+        let request = store
+            .part_request(&account().id, &MessageId::new("pdf@x"), "3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.part, list[1]);
+        assert_eq!(request.copies, vec![RemoteId("imap:7:1:INBOX".into())]);
+        assert!(
+            store
+                .part_request(&account().id, &MessageId::new("pdf@x"), "9")
+                .unwrap()
+                .is_none()
+        );
+        // Plain mail has an empty list, not an unknown one.
+        let plain = newsletter("plain@x", "INBOX", 2, "<p>x</p>");
+        store.upsert_message(&plain).unwrap();
+        assert_eq!(attachments(&store, "plain@x"), Some(Vec::new()));
+
+        assert!(
+            store
+                .delete_message(&account().id, &MessageId::new("pdf@x"))
+                .unwrap()
+        );
+        assert_eq!(part_rows(&store), 0);
+        assert_eq!(attachments(&store, "pdf@x"), None);
+    }
+
+    #[test]
+    fn a_resync_replaces_the_list_but_a_copy_without_a_body_keeps_it() {
+        let store = store_with(vec![with_attachments("pdf@x", "INBOX", 1)]);
+        let mut signed = {
+            let fixture = crate::imap::mime_fixtures::pgp_signed("pdf@x");
+            crate::imap::to_message(&account().id, "INBOX", "INBOX", 7, 1, &[], &fixture.raw)
+        };
+        let mut bodiless = signed.clone();
+        bodiless.parts = Some(MessageParts::default());
+        store.upsert_message(&bodiless).unwrap();
+        assert_eq!(attachments(&store, "pdf@x").unwrap().len(), 2);
+        signed.has_attachment = false;
+        store.upsert_message(&signed).unwrap();
+        let list = attachments(&store, "pdf@x").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].role, crate::PartRole::Signature);
+        // The marker and names follow the list that replaced the old one.
+        let kept = store
+            .message(&account().id, &MessageId::new("pdf@x"))
+            .unwrap()
+            .unwrap();
+        assert!(!kept.has_attachment);
+        assert!(kept.attachment_names.is_empty());
+        assert!(
+            store
+                .search(&account().id, "has:attachment")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_collapsed_copy_whose_list_is_not_kept_adds_no_names() {
+        let mut sent = with_attachments("post@x", "Sent", 1);
+        sent.folders = vec!["Sent".into()];
+        // The list echo of it, with a footer file the Sent copy never had.
+        let mut echo = with_attachments("echo@lists.x", "INBOX", 2);
+        echo.list_id = Some("list.x".into());
+        echo.headers.subject = format!("[list] {}", sent.headers.subject);
+        let mut footer = echo.parts.as_ref().unwrap().mime_parts[1].clone();
+        footer.section = "4".into();
+        footer.filename = Some("footer.txt".into());
+        echo.parts.as_mut().unwrap().mime_parts.push(footer);
+        echo.attachment_names.push("footer.txt".into());
+        let store = store_with(vec![sent]);
+        store.upsert_message(&echo).unwrap();
+        let kept = store
+            .message(&account().id, &MessageId::new("echo@lists.x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.headers.message_id.as_str(), "post@x", "collapsed");
+        assert_eq!(attachments(&store, "post@x").unwrap().len(), 2);
+        assert_eq!(kept.attachment_names, vec!["report.pdf", "totals.csv"]);
+        assert!(kept.has_attachment);
+    }
+
+    #[test]
+    fn the_first_list_replaces_a_marker_an_older_classifier_set() {
+        // Issue #148 on mail stored before part lists: a signed message got
+        // has_attachment and the name signature.asc.
+        let fixture = crate::imap::mime_fixtures::pgp_signed("sig@x");
+        let mut old =
+            crate::imap::to_message(&account().id, "INBOX", "INBOX", 7, 1, &[], &fixture.raw);
+        let parsed = old.parts.take().unwrap();
+        old.has_attachment = true;
+        old.attachment_names = vec!["signature.asc".into()];
+        let other = {
+            let mut other = old.clone();
+            other.headers.message_id = MessageId::new("sig2@x");
+            other.remote_id = RemoteId("imap:7:2:INBOX".into());
+            other.thread_id = crate::ThreadId::from_message_id(&other.headers.message_id);
+            other
+        };
+        let store = store_with(vec![old.clone(), other.clone()]);
+        let marker = |id: &str| {
+            let stored = store
+                .message(&account().id, &MessageId::new(id))
+                .unwrap()
+                .unwrap();
+            (stored.has_attachment, stored.attachment_names)
+        };
+        assert_eq!(marker("sig@x"), (true, vec!["signature.asc".to_string()]));
+        assert_eq!(attachments(&store, "sig@x"), None);
+
+        // The backfill lists it.
+        store
+            .store_fetched_parts(&account().id, &[(MessageId::new("sig@x"), Some(parsed))])
+            .unwrap();
+        assert_eq!(marker("sig@x"), (false, Vec::new()));
+        let threads = store.folder_threads(&account().id, "INBOX").unwrap();
+        let row = threads
+            .iter()
+            .find(|thread| thread.thread_id == old.thread_id)
+            .unwrap();
+        assert!(!row.has_attachment, "the folder list follows");
+        assert!(
+            store
+                .search(&account().id, "has:attachment")
+                .unwrap()
+                .hits
+                .len()
+                == 1
+        );
+
+        // A sync of the other one does the same.
+        let resynced = crate::imap::to_message(&account().id, "INBOX", "INBOX", 7, 2, &[], &{
+            crate::imap::mime_fixtures::pgp_signed("sig2@x").raw
+        });
+        store.upsert_message(&resynced).unwrap();
+        assert_eq!(marker("sig2@x"), (false, Vec::new()));
+        assert!(
+            store
+                .search(&account().id, "has:attachment")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mail_stored_before_part_lists_is_queued_once_by_version_5() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-parts-migrate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let old = with_attachments("pdf@x", "INBOX", 1);
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account()).unwrap();
+            store.upsert_message(&old).unwrap();
+            // A version 4 mailbox: bodies without part lists.
+            store
+                .conn
+                .execute_batch(
+                    "DROP TRIGGER message_parts_ad;
+                     DROP TABLE message_parts;
+                     ALTER TABLE message_bodies DROP COLUMN parts_listed;
+                     UPDATE meta SET value = '4' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(attachments(&store, "pdf@x"), None);
+        let queued = store.missing_bodies(&account().id, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        // Opening it asks too, though its body is stored.
+        assert!(
+            store
+                .body_request(&account().id, &MessageId::new("pdf@x"))
+                .unwrap()
+                .is_some()
+        );
+        let parts = old.parts.clone();
+        store
+            .store_fetched_parts(&account().id, &[(MessageId::new("pdf@x"), parts.clone())])
+            .unwrap();
+        assert_eq!(
+            attachments(&store, "pdf@x"),
+            Some(parts.unwrap().mime_parts)
+        );
+        assert!(store.missing_bodies(&account().id, 10).unwrap().is_empty());
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.missing_bodies(&account().id, 10).unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn plan(store: &Store, sql: &str) -> String {

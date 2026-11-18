@@ -15,6 +15,7 @@ pub mod embed;
 pub mod folders;
 pub mod imap;
 pub mod message;
+pub mod parts;
 pub mod search;
 pub mod send;
 mod smtp;
@@ -39,7 +40,11 @@ pub use embed::{
 };
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
 pub use imap::{ImapConfig, ImapSecurity, InboxWait};
-pub use message::{Address, Message, MessageHeaders, MessageId, MessageParts, RemoteId};
+pub use message::{
+    Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
+    RemoteId, TransferEncoding,
+};
+pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
 pub use search::{SearchHit, SearchResults};
 pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,

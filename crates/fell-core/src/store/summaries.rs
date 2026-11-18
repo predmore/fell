@@ -2504,6 +2504,7 @@ mod tests {
             std::sync::atomic::Ordering::Relaxed,
         );
         crate::MessageParts {
+            mime_parts: Vec::new(),
             html: Some(html),
             plain: Some(plain),
             bulk_headers: vec![(

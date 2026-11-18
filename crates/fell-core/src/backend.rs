@@ -147,6 +147,23 @@ pub trait MailBackend {
         Ok(Vec::new())
     }
 
+    /// Fetch one MIME part of a stored copy by its IMAP section, still
+    /// transfer-encoded. `encoded_size` is its listed size on the wire
+    /// ([`crate::MimePart::encoded_size`]), so a fetch knows when it has it
+    /// all. Read-only: nothing is marked read. `Ok(None)` when the server
+    /// no longer has the copy. `progress` hears the bytes read so far; when
+    /// it answers `Break`, the fetch closes its session and fails. Backends
+    /// with nothing to fetch return `None`.
+    fn fetch_part(
+        &self,
+        _copy: &crate::RemoteId,
+        _section: &str,
+        _encoded_size: u64,
+        _progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// Accept a draft for later send. Must not transmit.
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend>;
 
@@ -223,6 +240,16 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_bodies(&self.imap, copies)
     }
 
+    fn fetch_part(
+        &self,
+        copy: &crate::RemoteId,
+        section: &str,
+        encoded_size: u64,
+        progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::imap::fetch_part(&self.imap, copy, section, encoded_size, progress)
+    }
+
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {
         Ok(PendingSend::new("bridge", draft))
     }
@@ -282,6 +309,16 @@ impl MailBackend for ImapBackend {
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         crate::imap::fetch_bodies(&self.config, copies)
+    }
+
+    fn fetch_part(
+        &self,
+        copy: &crate::RemoteId,
+        section: &str,
+        encoded_size: u64,
+        progress: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::imap::fetch_part(&self.config, copy, section, encoded_size, progress)
     }
 
     fn submit_draft(&self, draft: Draft) -> Result<PendingSend> {

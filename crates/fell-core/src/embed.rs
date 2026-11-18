@@ -36,7 +36,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Error, Result};
 
-mod model_files;
+pub(crate) mod model_files;
 mod onnx;
 mod wordpiece;
 
