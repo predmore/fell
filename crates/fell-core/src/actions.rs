@@ -1382,6 +1382,28 @@ fn tombstoned_folders(
 }
 
 fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
+    // The parts this copy gives the snapshot: a copy with a body, or with
+    // files and no text. One with neither (fetched without its body) leaves
+    // the saved list, and the marker and names that describe it.
+    let parts = message
+        .parts
+        .as_ref()
+        .map(crate::store::bodies::StoredParts::new);
+    let saved_parts = parts.filter(|parts| {
+        parts.has_body() || parts.mime_parts().is_some_and(|list| !list.is_empty())
+    });
+    let names = |names: &[String]| crate::store::union_tokens("", names, false);
+    let (has_attachment, attachment_names) = match (&message.parts, &saved_parts) {
+        (None, _) => (
+            Some(message.has_attachment),
+            Some(names(&message.attachment_names)),
+        ),
+        (Some(parts), Some(_)) => (
+            Some(crate::imap::has_attachment(&parts.mime_parts)),
+            Some(names(&crate::imap::attachment_names(&parts.mime_parts))),
+        ),
+        (Some(_), None) => (None, None),
+    };
     let via = join_tokens(
         &message
             .arrived_via
@@ -1403,7 +1425,8 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
             to_line = ?9,
             cc_line = ?10,
             bcc_line = ?11,
-            has_attachment = ?12
+            has_attachment = COALESCE(?12, has_attachment),
+            attachment_names = COALESCE(?15, attachment_names)
          WHERE message_id = ?13
            AND action_id IN (
                SELECT id FROM local_actions
@@ -1421,23 +1444,21 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
             encode_addresses(&message.to),
             encode_addresses(&message.cc),
             encode_addresses(&message.bcc),
-            i64::from(message.has_attachment),
+            has_attachment.map(i64::from),
             message.headers.message_id.as_str(),
             message.account_id.as_str(),
+            attachment_names,
         ],
     )?;
     // The body above came from this copy, so its parts replace the saved ones.
-    if let Some(parts) = &message.parts {
-        let parts = crate::store::bodies::StoredParts::new(parts);
-        if parts.has_body() {
-            // An action recorded before Fell kept parts has no table yet.
-            ensure_action_schema(conn)?;
-            parts.save_for_undo(
-                conn,
-                &message.account_id,
-                message.headers.message_id.as_str(),
-            )?;
-        }
+    if let Some(parts) = saved_parts {
+        // An action recorded before Fell kept parts has no table yet.
+        ensure_action_schema(conn)?;
+        parts.save_for_undo(
+            conn,
+            &message.account_id,
+            message.headers.message_id.as_str(),
+        )?;
     }
     Ok(())
 }
@@ -2701,6 +2722,70 @@ mod tests {
         assert!(messages(&store, "a1", &thread).is_empty());
         store.undo(&account("a1")).unwrap();
         assert_eq!(files_of(&store, "note@x"), Some(vec!["server.pdf".into()]));
+    }
+
+    #[test]
+    fn an_attachment_only_copy_in_the_expunged_folder_replaces_the_saved_list_and_names() {
+        let store = open(&[("a1", "a@x")]);
+        let mut note = sample("a1", "note@x", "Note", "first body");
+        note.parts = Some(with_file("first", "first.pdf"));
+        let thread = store.upsert_message(&note).unwrap();
+        let names = |store: &Store| {
+            let row = store
+                .message(&account("a1"), &MessageId::new("note@x"))
+                .unwrap()
+                .unwrap();
+            (row.has_attachment, row.attachment_names)
+        };
+        assert_eq!(names(&store), (true, vec!["first.pdf".to_string()]));
+
+        expunge(&store, &thread);
+        // The server's copy is only a file: no text body at all.
+        let mut gone = sample("a1", "note@x", "Note", "");
+        gone.folders = vec![FOLDER_TRASH.into()];
+        let mut only_file = with_file("unused", "scan.pdf");
+        only_file.html = None;
+        only_file.plain = None;
+        only_file.bulk_headers.clear();
+        gone.parts = Some(only_file);
+        gone.has_attachment = true;
+        gone.attachment_names = vec!["scan.pdf".into()];
+        store
+            .apply_delta(
+                &account("a1"),
+                &MailboxDelta {
+                    messages: vec![gone],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert!(messages(&store, "a1", &thread).is_empty());
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["scan.pdf".into()]));
+        assert_eq!(names(&store), (true, vec!["scan.pdf".to_string()]));
+        // The saved body stays: that copy had none to replace it with.
+        assert_eq!(
+            body_of(&store, "note@x").unwrap().html,
+            with_file("first", "first.pdf").html
+        );
+
+        // A copy fetched without its body leaves the saved list and names.
+        expunge(&store, &thread);
+        let mut bodiless = sample("a1", "note@x", "Note", "");
+        bodiless.folders = vec![FOLDER_TRASH.into()];
+        bodiless.parts = Some(crate::MessageParts::default());
+        store
+            .apply_delta(
+                &account("a1"),
+                &MailboxDelta {
+                    messages: vec![bodiless],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(files_of(&store, "note@x"), Some(vec!["scan.pdf".into()]));
+        assert_eq!(names(&store), (true, vec!["scan.pdf".to_string()]));
     }
 
     #[test]

@@ -224,26 +224,35 @@ impl StoredParts {
     }
 
     /// Replace the parts saved for undo on every open action that removed
-    /// `message_id`, as a later copy of it replaces the saved body text.
+    /// `message_id`, as a later copy of it replaces the saved body text. A
+    /// copy with no text body (only files) replaces the part list and
+    /// leaves any saved body alone.
     pub(crate) fn save_for_undo(
         &self,
         conn: &Connection,
         account_id: &AccountId,
         message_id: &str,
     ) -> Result<()> {
-        conn.execute(
-            "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers)
-             SELECT m.action_id, m.message_id, ?3, ?4, ?5, ?6
-             FROM local_action_messages m
-             JOIN local_actions a ON a.id = m.action_id
-             WHERE m.message_id = ?2 AND m.removed = 1
-               AND a.account_id = ?1 AND a.undone = 0
-             ON CONFLICT(action_id, message_id) DO UPDATE SET
+        let on_conflict = if self.has_body() {
+            "ON CONFLICT(action_id, message_id) DO UPDATE SET
                 codec = excluded.codec,
                 html = excluded.html,
                 plain = excluded.plain,
-                bulk_headers = excluded.bulk_headers",
+                bulk_headers = excluded.bulk_headers"
+        } else {
+            "ON CONFLICT(action_id, message_id) DO NOTHING"
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO local_action_bodies
+                    (action_id, message_id, codec, html, plain, bulk_headers)
+                 SELECT m.action_id, m.message_id, ?3, ?4, ?5, ?6
+                 FROM local_action_messages m
+                 JOIN local_actions a ON a.id = m.action_id
+                 WHERE m.message_id = ?2 AND m.removed = 1
+                   AND a.account_id = ?1 AND a.undone = 0
+                 {on_conflict}"
+            ),
             params![
                 account_id.as_str(),
                 message_id,
