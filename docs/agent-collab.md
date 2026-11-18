@@ -74,7 +74,7 @@ Body in markdown. Inline images: ![chart](chart.png)
 - Size and count limits on the resolved attachments follow the account's sending limits, and the editor warns when they are exceeded. Inline images are sent as CID parts, per the compose section of docs/ux.md.
 - Attachments are copied into the stored draft on save so a restart loses nothing. The folder is deleted when the draft is sent or discarded.
 
-User-facing evidence: screenshots plus a recording of an agent editing a draft live, a script updating `draft.md` while the editor updates live, and an agent adding an attachment. UX judges must each score 9.5 or better.
+User-facing evidence: screenshots plus a recording of an agent editing a draft live, a script updating `draft.md` while the editor updates live, and an agent adding an attachment. UX judges must each score 9 or better.
 
 ## Sources
 

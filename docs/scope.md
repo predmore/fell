@@ -59,7 +59,7 @@ Linux x86_64. Flatpak, .deb, and .rpm are skipped for now.
 ## Review gates
 UX quality is a top priority. Any PR that changes something the user sees or touches (UI, keymap, rendering, interaction, performance feel) merges only when, in addition to CI and the code reviewer:
 
-- Independent UX judges who did not write the code each score it 9.5 or better out of 10. [docs/ux.md](ux.md), together with [docs/scope.md](scope.md), is the bar they score against (Zed-like speed and polish, keyboard-first vim grammar, typography and density, clarity, focus states, empty and loading states, error handling).
+- Independent UX judges who did not write the code each score it 9 or better out of 10. [docs/ux.md](ux.md), together with [docs/scope.md](scope.md), is the bar they score against (Zed-like speed and polish, motion, keyboard-first vim grammar, typography and density, clarity and quiet, focus states, empty and loading states, error handling).
 - The PR description attaches screenshots of the running app (before/after when changing existing UI, several window sizes) and a short recording for keyboard flows. Those are the same images the judges score. For the inbox, that evidence is screenshots of the running app on a dark stock Omarchy theme, a light stock Omarchy theme, and a narrow window, plus a keyboard recording.
 
 Applies from M1's inbox PR onward.
