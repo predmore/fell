@@ -887,6 +887,60 @@ pub(super) fn folder_page(
     })
 }
 
+/// Where `thread` sits in `folder`'s list now, or `None` when it is not in
+/// the folder. Reads the thread's own rows, not the list.
+pub(super) fn folder_key_of(
+    conn: &Connection,
+    account_id: &AccountId,
+    folder: &str,
+    thread: &ThreadId,
+) -> Result<Option<ListKey>> {
+    in_one_snapshot(conn, || {
+        let account = account_id.as_str();
+        let keys: Vec<String> = folder_query_names(folder)
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let queued = conn
+            .prepare_cached(
+                "SELECT 1 FROM thread_summary_dirty WHERE account_id = ?1 AND thread_id = ?2",
+            )?
+            .query_row(params![account, thread.0], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if queued {
+            // Its stored rows are out of date, as in [`ListReader::new`].
+            let Some(summary) = compute(conn, account, &thread.0)? else {
+                return Ok(None);
+            };
+            let listed = summary
+                .folders
+                .iter()
+                .any(|membership| keys.contains(&membership.key));
+            return Ok(listed.then(|| ListKey {
+                date_unix: summary.last_date,
+                thread_id: thread.clone(),
+            }));
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT last_date FROM thread_folders
+             WHERE account_id = ?1 AND thread_id = ?2 AND folder_key = ?3",
+        )?;
+        for key in &keys {
+            let date: Option<i64> = stmt
+                .query_row(params![account, thread.0, key], |row| row.get(0))
+                .optional()?;
+            if let Some(date_unix) = date {
+                return Ok(Some(ListKey {
+                    date_unix,
+                    thread_id: thread.clone(),
+                }));
+            }
+        }
+        Ok(None)
+    })
+}
+
 /// Run `read` inside one read transaction. The summary rows and the queue
 /// of threads to compute live must come from the same moment: otherwise a
 /// write that skipped the refresh can commit between the two reads and a
@@ -1717,6 +1771,47 @@ mod tests {
         assert_lists_match(&store, "after the version 1 upgrade", true);
         drop(store);
         remove_mailbox(&path);
+    }
+
+    #[test]
+    fn a_threads_folder_key_matches_its_list_row() {
+        let store = Store::open_in_memory().unwrap();
+        fill(&store, 23, 40);
+        let account = account().id;
+        let threads: Vec<String> = store
+            .conn
+            .prepare("SELECT thread_id FROM thread_summary")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        // One thread waits in the refresh queue with a stale stored date.
+        store
+            .conn
+            .execute_batch(&format!(
+                "UPDATE thread_folders SET last_date = 1 WHERE thread_id = '{0}';
+                 INSERT INTO thread_summary_dirty (account_id, thread_id)
+                     VALUES ('{1}', '{0}');",
+                threads[0], account.0
+            ))
+            .unwrap();
+        for folder in QUERIES {
+            let listed = store.folder_threads(&account, folder).unwrap();
+            for thread in &threads {
+                let thread = ThreadId(thread.clone());
+                let expected = listed
+                    .iter()
+                    .find(|row| row.thread_id == thread)
+                    .map(ListKey::of);
+                assert_eq!(
+                    store.folder_key_of(&account, folder, &thread).unwrap(),
+                    expected,
+                    "{folder} {}",
+                    thread.0
+                );
+            }
+        }
     }
 
     #[test]

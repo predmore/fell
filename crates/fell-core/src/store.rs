@@ -809,6 +809,18 @@ impl Store {
     ) -> Result<FolderPage> {
         summaries::folder_page(&self.conn, account_id, folder, span)
     }
+
+    /// Where `thread` sits in `folder`'s list, or `None` when it is not in
+    /// the folder. The list uses it to follow a selected thread that new
+    /// mail moved outside the loaded rows.
+    pub fn folder_key_of(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+        thread: &ThreadId,
+    ) -> Result<Option<ListKey>> {
+        summaries::folder_key_of(&self.conn, account_id, folder, thread)
+    }
 }
 
 #[cfg(test)]

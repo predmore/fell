@@ -103,6 +103,9 @@ struct ListRead {
     more_after: bool,
     unread: usize,
     names: Vec<String>,
+    /// Where the selected thread sits now, when it is still in the folder
+    /// but not among `rows`: new mail moved it outside the window.
+    followed: Option<ListKey>,
 }
 
 type ThreadsResult = Result<ListRead, String>;
@@ -301,17 +304,31 @@ impl Inbox {
             self.session
                 .span(intent.fetch, intent.select.as_ref(), self.visible_rows())
         };
+        // The selected thread, unless the reader took it out of the list.
+        let follow = self
+            .session
+            .cursor_id
+            .clone()
+            .filter(|id| folder == self.list_folder && !self.pending_removals.contains(id));
         let read = move |store: &fell_core::Store| -> ThreadsResult {
             let page = store
                 .folder_page(&account, &reading, &span)
                 .map_err(|err| err.to_string())?;
             let names = store.folder_names(&account).unwrap_or_default();
+            let followed = match follow {
+                Some(id) if !page.threads.iter().any(|thread| thread.thread_id.0 == id) => store
+                    .folder_key_of(&account, &reading, &ThreadId(id))
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
             Ok(ListRead {
                 rows: present::thread_rows(&page.threads, &me),
                 more_before: page.more_before,
                 more_after: page.more_after,
                 unread: page.unread,
                 names,
+                followed,
             })
         };
         // Only sync asked: nobody is waiting, so keep the interactive lane
@@ -377,8 +394,9 @@ impl Inbox {
             mut rows,
             more_before,
             more_after,
-            unread,
+            mut unread,
             names,
+            followed,
         } = match result {
             Ok(found) => found,
             Err(err) => {
@@ -396,7 +414,29 @@ impl Inbox {
         }
         let switched = folder != self.list_folder;
         if !switched {
+            // A read from before the write still counts the rows taken out.
+            let hidden_unread = rows
+                .iter()
+                .filter(|row| row.unread && self.pending_removals.contains(&row.id))
+                .count();
+            unread = unread.saturating_sub(hidden_unread);
             rows.retain(|row| !self.pending_removals.contains(&row.id));
+        }
+        // New mail moved the selected thread outside the rows read (they do
+        // not reach the top of the folder). Read the rows around it, as undo
+        // does, instead of selecting whichever row took its place.
+        if !switched
+            && intent.select.is_none()
+            && let Some(key) = self.session.moved_selection(&rows, followed)
+        {
+            self.request_threads(
+                ReadIntent {
+                    select: Some(key),
+                    ..intent
+                },
+                cx,
+            );
+            return;
         }
         self.list_folder = folder;
         if switched {
@@ -456,7 +496,9 @@ impl Inbox {
         let Some(fetch) = self.session.take_fetch() else {
             return;
         };
-        if self.read_in_flight && !self.refresh_in_flight {
+        // A jump the reader cancelled must reach the read in flight, or its
+        // rows would replace the ones the reader moved in.
+        if self.read_in_flight && !self.refresh_in_flight && !fetch.drop_jump {
             return;
         }
         self.request_threads(
@@ -1017,13 +1059,22 @@ impl Inbox {
         ((height / row).floor() as usize).max(1)
     }
 
+    /// Nothing selected (the row after an archived one is loading): stay.
     fn scroll_list_to_cursor(&self) {
-        self.list_scroll
-            .scroll_to_item(self.session.cursor_index(), ScrollStrategy::Top);
+        if let Some(index) = self.session.selected_index() {
+            self.list_scroll.scroll_to_item(index, ScrollStrategy::Top);
+        }
+    }
+
+    /// [`Session::cancel_pending_keys`], and the read that drops a jump it
+    /// cancelled.
+    fn cancel_pending_keys(&mut self, cx: &mut Context<Self>) {
+        self.session.cancel_pending_keys();
+        self.issue_fetch(cx);
     }
 
     fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
-        self.session.cancel_pending_keys();
+        self.cancel_pending_keys(cx);
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
@@ -1726,7 +1777,7 @@ fn collapsed_message(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 window.focus(&inbox.focus);
-                inbox.session.cancel_pending_keys();
+                inbox.cancel_pending_keys(cx);
                 inbox.session.pane = Pane::Conversation;
                 inbox.session.message_cursor = index;
                 if let Some(message) = inbox.session.messages.get_mut(index) {
@@ -1798,7 +1849,7 @@ fn expanded_message(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 window.focus(&inbox.focus);
-                inbox.session.cancel_pending_keys();
+                inbox.cancel_pending_keys(cx);
                 inbox.session.pane = Pane::Conversation;
                 inbox.session.message_cursor = index;
                 cx.notify();
@@ -1880,7 +1931,7 @@ fn recipient_lines(
 ) -> gpui::AnyElement {
     let toggle = cx.listener(move |inbox, _, window, cx| {
         window.focus(&inbox.focus);
-        inbox.session.cancel_pending_keys();
+        inbox.cancel_pending_keys(cx);
         inbox.session.pane = Pane::Conversation;
         inbox.session.message_cursor = index;
         inbox.session.toggle_recipients(index);
@@ -2037,7 +2088,7 @@ fn body_block(
                         MouseButton::Left,
                         cx.listener(move |inbox, _, window, cx| {
                             window.focus(&inbox.focus);
-                            inbox.session.cancel_pending_keys();
+                            inbox.cancel_pending_keys(cx);
                             inbox.session.pane = Pane::Conversation;
                             inbox.session.message_cursor = index;
                             inbox.session.toggle_quotes(index);
