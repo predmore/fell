@@ -393,12 +393,56 @@ fn quote_level(line: &str) -> (usize, &str) {
     (level, rest)
 }
 
+/// The first line of a forward's header block.
+const FORWARD_MARK: &str = "---------- Forwarded message ----------";
+/// How the header block names attachments Fell could not carry.
+const NOT_FORWARDED: &str = "Attachments (not forwarded): ";
+
+/// A forward, as its compose window names it: whose message, which one,
+/// and the attachments that do not go with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardSummary {
+    pub sender: String,
+    pub subject: String,
+    /// The original's attachment names, or `None` when it had none.
+    pub not_forwarded: Option<String>,
+}
+
+/// Read back the header block [`forward_quote`] wrote. `None` for a reply or
+/// a draft that forwards nothing. The block is Fell's own, kept in the
+/// mailbox, so a draft edit cannot change it.
+pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
+    let mut lines = quote_text.lines();
+    if lines.next()? != FORWARD_MARK {
+        return None;
+    }
+    let mut summary = ForwardSummary {
+        sender: String::new(),
+        subject: String::new(),
+        not_forwarded: None,
+    };
+    for line in lines.take_while(|line| !line.is_empty()) {
+        if let Some(from) = line.strip_prefix("From: ") {
+            // "Maya <maya@x>" reads as "Maya"; a bare address stays.
+            summary.sender = match from.rsplit_once(" <") {
+                Some((name, _)) if !name.trim().is_empty() => name.trim().to_string(),
+                _ => from.trim().to_string(),
+            };
+        } else if let Some(subject) = line.strip_prefix("Subject: ") {
+            summary.subject = subject.to_string();
+        } else if let Some(names) = line.strip_prefix(NOT_FORWARDED) {
+            summary.not_forwarded = Some(names.to_string());
+        }
+    }
+    Some(summary)
+}
+
 /// The forwarded header block and the original, unquoted. Attachments are
 /// named in the block: Fell does not keep their bytes, so they do not go
 /// with the forward.
 fn forward_quote(parent: &Message) -> (String, String) {
     let mut header = vec![
-        "---------- Forwarded message ----------".to_string(),
+        FORWARD_MARK.to_string(),
         format!("From: {}", display_address(&parent.headers.from)),
         format!("Date: {}", rfc5322_date(parent.headers.date_unix)),
         format!("Subject: {}", one_line(&parent.headers.subject)),
@@ -435,9 +479,9 @@ pub fn attachment_line(parent: &Message) -> Option<String> {
         .filter(|name| !name.is_empty())
         .collect();
     if !names.is_empty() {
-        Some(format!("Attachments (not forwarded): {}", names.join(", ")))
+        Some(format!("{NOT_FORWARDED}{}", names.join(", ")))
     } else if parent.has_attachment {
-        Some("Attachments (not forwarded): the original had attachments".to_string())
+        Some(format!("{NOT_FORWARDED}the original had attachments"))
     } else {
         None
     }
@@ -746,6 +790,16 @@ mod tests {
             "{text}"
         );
         assert!(start.parts.quote_html.contains("report.pdf, chart.png"));
+        assert_eq!(
+            forward_summary(text),
+            Some(ForwardSummary {
+                sender: "Ada Lovelace".into(),
+                subject: "Re: Plans".into(),
+                not_forwarded: Some("report.pdf, chart.png".into()),
+            })
+        );
+        let reply = start_reply(ReplyKind::Reply, &message, "jon@example.com", &me());
+        assert_eq!(forward_summary(&reply.parts.quote_text), None);
     }
 
     fn stored(

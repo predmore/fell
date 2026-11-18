@@ -112,12 +112,19 @@ pub struct Snapshot {
     /// The message this draft replies to, as "sender · subject · date",
     /// when the mailbox has it.
     pub reply_context: Option<ReplyContext>,
+    /// What a forward carries, read from its header block.
+    pub forwarded: Option<super::reply::ForwardSummary>,
 }
 
 /// The parent message of a reply, read from the mailbox when the draft opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyContext {
     pub sender: String,
+    /// The sender's address, shown when the reply goes somewhere else.
+    pub sender_email: String,
+    /// Where the original asked replies to go, lowercased. A To address in
+    /// here that is not the sender is marked, so a redirect is seen.
+    pub reply_to: Vec<String>,
     pub subject: String,
     pub date_unix: i64,
 }
@@ -1144,6 +1151,7 @@ impl DraftSession {
             text,
             send_requested_by: self.send_requested_by.clone(),
             reply_context: self.reply_context.clone(),
+            forwarded: super::reply::forward_summary(&self.reply.quote_text),
         }
     }
 

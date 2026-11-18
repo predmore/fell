@@ -118,12 +118,17 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
-/// What the inbox says while a reply or forward's window comes up.
-fn reply_notice(kind: ReplyKind) -> &'static str {
+/// What the inbox says while a reply or forward's window comes up:
+/// "reply all · Jon".
+fn reply_notice(kind: ReplyKind, sender: &str) -> String {
+    format!("{}{sender}", reply_notice_prefix(kind))
+}
+
+fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
     match kind {
-        ReplyKind::Reply => "new reply",
-        ReplyKind::ReplyAll => "new reply all",
-        ReplyKind::Forward => "new forward",
+        ReplyKind::Reply => "reply · ",
+        ReplyKind::ReplyAll => "reply all · ",
+        ReplyKind::Forward => "forward · ",
     }
 }
 
@@ -1032,6 +1037,7 @@ impl Inbox {
             return;
         };
         let parent_id = fell_core::MessageId::new(&target.id);
+        let sender = target.sender.clone();
         let Some(hub) = cx
             .try_global::<crate::draft_host::AgentDrafts>()
             .map(|drafts| drafts.0.clone())
@@ -1047,7 +1053,7 @@ impl Inbox {
             );
             return;
         };
-        self.session.show_toast(reply_notice(kind), false);
+        self.session.show_toast(reply_notice(kind, &sender), false);
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let read = self.store.call({
@@ -1108,7 +1114,7 @@ impl Inbox {
                         || toast.text == "new draft"
                         || [ReplyKind::Reply, ReplyKind::ReplyAll, ReplyKind::Forward]
                             .into_iter()
-                            .any(|kind| toast.text == reply_notice(kind))
+                            .any(|kind| toast.text.starts_with(reply_notice_prefix(kind)))
                 });
                 if opening {
                     inbox.session.clear_toast();

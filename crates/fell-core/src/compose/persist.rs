@@ -471,7 +471,8 @@ impl Store {
     ) -> Result<Option<super::ReplyContext>> {
         self.conn
             .query_row(
-                "SELECT m.from_name, m.from_email, m.subject, m.date_unix FROM messages m
+                "SELECT m.from_name, m.from_email, m.subject, m.date_unix, m.reply_to_line
+                 FROM messages m
                  WHERE m.account_id = ?1 AND (
                      m.message_id = ?2 OR m.message_id IN (
                          SELECT canonical_message_id FROM message_aliases
@@ -483,8 +484,17 @@ impl Store {
                 |row| {
                     let name: Option<String> = row.get(0)?;
                     let email: String = row.get(1)?;
+                    let reply_to: String = row.get(4)?;
                     Ok(super::ReplyContext {
-                        sender: name.filter(|name| !name.trim().is_empty()).unwrap_or(email),
+                        sender: name
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or_else(|| email.clone()),
+                        sender_email: email,
+                        reply_to: crate::message::decode_addresses(&reply_to)
+                            .into_iter()
+                            .map(|address| address.email.trim().to_lowercase())
+                            .filter(|email| !email.is_empty())
+                            .collect(),
                         subject: row.get(2)?,
                         date_unix: row.get(3)?,
                     })

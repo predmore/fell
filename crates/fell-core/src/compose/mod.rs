@@ -35,8 +35,8 @@ pub use persist::{
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
 pub use reply::{
-    MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references, forward_subject,
-    own_addresses, reply_recipients, reply_subject, start_reply,
+    ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
+    forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
 };
 pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
