@@ -1614,7 +1614,7 @@ fn expanded_message(
     cursor: bool,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let quotes = session.quotes_open.contains(&index);
+    let quotes = session.is_open(index);
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -1643,7 +1643,8 @@ fn expanded_message(
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
-                .pb(px(8.))
+                // The recipient line belongs to this header, so it sits close.
+                .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -1670,48 +1671,20 @@ fn expanded_message(
                         .child(present::relative_date(now_unix(), message.date_unix)),
                 ),
         )
-        .children(message.recipients.as_ref().map(|line| {
-            // Cut short until `q` (or a click) opens the message's collapsed
-            // parts; then every name with its address.
-            // A cut list is the first collapsed part, so it names the key.
-            let text = if quotes {
-                line.full.clone()
-            } else if line.truncated {
-                format!("{}  ·  q", line.short)
-            } else {
-                line.short.clone()
-            };
-            div()
-                .id(gpui::ElementId::named_usize("recipients", index))
-                .max_w(px(680.))
-                .mt(px(-4.))
-                .pb(px(8.))
-                .text_color(rgb(dim))
-                .text_size(px(theme.ui_px - 1.0))
-                .child(text)
-                .when(line.truncated || line.full != line.short, |row| {
-                    row.cursor_pointer()
-                        .on_click(cx.listener(move |inbox, _, _, cx| {
-                            if !inbox.session.quotes_open.remove(&index) {
-                                inbox.session.quotes_open.insert(index);
-                            }
-                            cx.notify();
-                        }))
-                })
-        }))
+        .children(
+            message
+                .recipients
+                .as_ref()
+                .map(|line| recipient_lines(theme, line, quotes, index, cx)),
+        )
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
-            let recipients_named_it = message
-                .recipients
-                .as_ref()
-                .is_some_and(|line| line.truncated);
             let first_hidden = message
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)))
-                .filter(|_| !recipients_named_it);
+                .position(|block| !matches!(block, BodyBlock::Text(_)));
             message
                 .body
                 .blocks
@@ -1722,6 +1695,81 @@ fn expanded_message(
                 })
                 .collect::<Vec<_>>()
         })
+        .into_any_element()
+}
+
+/// Who else got the message, under its sender. Closed: one line of names
+/// that never wraps, then "+N more" and the key. Open (`q`, or a click): a
+/// row per group with every address.
+fn recipient_lines(
+    theme: &Theme,
+    line: &present::RecipientLine,
+    open: bool,
+    index: usize,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let toggle = cx.listener(move |inbox, _, window, cx| {
+        window.focus(&inbox.focus);
+        inbox.session.cancel_pending_keys();
+        inbox.session.pane = Pane::Conversation;
+        inbox.session.message_cursor = index;
+        inbox.session.toggle_open(index);
+        cx.notify();
+    });
+    let size = px(theme.ui_px - 1.0);
+    let body = if open {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(line.groups.iter().map(|group| {
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .min_w(px(28.))
+                            .text_color(rgb(theme.dimmed))
+                            .child(group.label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_color(rgb(theme.foreground))
+                            .child(group.people.join(", ")),
+                    )
+            }))
+    } else {
+        let more = (line.hidden > 0).then(|| format!(" +{} more", line.hidden));
+        div()
+            .flex()
+            .min_w(px(0.))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(rgb(theme.dimmed))
+                    .child(format!("{}{}", line.short, more.unwrap_or_default())),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(theme.dimmed))
+                    .child(" · q for all"),
+            )
+    };
+    div()
+        .id(gpui::ElementId::named_usize("recipients", index))
+        .max_w(px(680.))
+        .pb(px(10.))
+        .text_size(size)
+        .child(
+            body.cursor_pointer()
+                .hover(|style| style.text_color(rgb(theme.foreground)))
+                .on_mouse_down(MouseButton::Left, toggle),
+        )
         .into_any_element()
 }
 
@@ -1776,9 +1824,7 @@ fn body_block(
                             inbox.session.cancel_pending_keys();
                             inbox.session.pane = Pane::Conversation;
                             inbox.session.message_cursor = index;
-                            if !inbox.session.quotes_open.remove(&index) {
-                                inbox.session.quotes_open.insert(index);
-                            }
+                            inbox.session.toggle_open(index);
                             cx.notify();
                         }),
                     )

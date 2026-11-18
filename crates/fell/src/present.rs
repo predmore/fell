@@ -35,6 +35,8 @@ pub struct ThreadRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvMessage {
+    /// The message's Message-ID, which open state is kept by.
+    pub id: String,
     pub sender: String,
     pub email: String,
     pub folders: String,
@@ -46,19 +48,26 @@ pub struct ConvMessage {
     pub recipients: Option<RecipientLine>,
 }
 
-/// The dimmed line under an expanded message's sender.
+/// Who else got a message, for the lines under an expanded message's sender.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientLine {
-    /// Names only, the first few, then "+N more".
+    /// One line of names: "to me · cc Ada, Maya, Sam".
     pub short: String,
-    /// Every recipient with their address. Shown once the message's
-    /// collapsed parts are opened (`q`, or a click on the line).
-    pub full: String,
-    /// `short` leaves someone out.
-    pub truncated: bool,
+    /// Names left off `short`; the line ends "+N more".
+    pub hidden: usize,
+    /// Every recipient with an address, a row per group, once opened.
+    pub groups: Vec<RecipientGroup>,
 }
 
-/// Names on the short line before "+N more".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientGroup {
+    /// "to", "cc", or "bcc (only you)".
+    pub label: &'static str,
+    pub people: Vec<String>,
+}
+
+/// Names on the short line. One more than this shows the last name instead
+/// of "+1 more".
 const SHOWN_RECIPIENTS: usize = 4;
 
 /// To and Cc for anyone's message. Bcc only on the person's own sent mail:
@@ -66,57 +75,74 @@ const SHOWN_RECIPIENTS: usize = 4;
 /// describes someone else's message.
 pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
     let from_me = message.headers.from.email.eq_ignore_ascii_case(me);
-    let groups: [(&str, &[fell_core::Address]); 3] = [
-        ("to", &message.to),
-        ("cc", &message.cc),
-        ("bcc", if from_me { &message.bcc } else { &[] }),
+    let groups: [(&str, &'static str, &[fell_core::Address]); 3] = [
+        ("to", "to", &message.to),
+        ("cc", "cc", &message.cc),
+        (
+            "bcc",
+            "bcc (only you)",
+            if from_me { &message.bcc } else { &[] },
+        ),
     ];
-    let total: usize = groups.iter().map(|(_, people)| people.len()).sum();
+    let total: usize = groups.iter().map(|(_, _, people)| people.len()).sum();
     if total == 0 {
         return None;
     }
+    let budget = if total == SHOWN_RECIPIENTS + 1 {
+        total
+    } else {
+        SHOWN_RECIPIENTS
+    };
     let mut short = Vec::new();
     let mut full = Vec::new();
     let mut shown = 0;
-    for (label, people) in groups {
+    for (label, full_label, people) in groups {
         if people.is_empty() {
             continue;
         }
         let names: Vec<String> = people
             .iter()
-            .map(|person| display_name(&person.name, &person.email, me))
+            .map(|person| recipient_name(person, me))
             .collect();
-        let room = SHOWN_RECIPIENTS.saturating_sub(shown);
+        let room = budget.saturating_sub(shown).min(names.len());
         if room > 0 {
-            short.push(format!(
-                "{label} {}",
-                names[..names.len().min(room)].join(", ")
-            ));
-            shown += names.len().min(room);
+            short.push(format!("{label} {}", names[..room].join(", ")));
+            shown += room;
         }
-        let addressed: Vec<String> = people
-            .iter()
-            .zip(&names)
-            .map(|(person, name)| {
-                if name == "me" || name.eq_ignore_ascii_case(&person.email) {
-                    name.clone()
-                } else {
-                    format!("{name} <{}>", person.email)
-                }
-            })
-            .collect();
-        full.push(format!("{label} {}", addressed.join(", ")));
-    }
-    let hidden = total - shown;
-    let mut short = short.join("  ·  ");
-    if hidden > 0 {
-        short.push_str(&format!("  +{hidden} more"));
+        full.push(RecipientGroup {
+            label: full_label,
+            people: people
+                .iter()
+                .zip(&names)
+                .map(|(person, name)| {
+                    if name.eq_ignore_ascii_case(&person.email) {
+                        name.clone()
+                    } else {
+                        format!("{name} <{}>", person.email)
+                    }
+                })
+                .collect(),
+        });
     }
     Some(RecipientLine {
-        short,
-        full: full.join("  ·  "),
-        truncated: hidden > 0,
+        short: short.join(" · "),
+        hidden: total - shown,
+        groups: full,
     })
+}
+
+/// "me" only for the person's own address. Someone else whose name or
+/// mailbox reads "me" is shown by address, so the two never look alike.
+fn recipient_name(person: &fell_core::Address, me: &str) -> String {
+    if person.email.eq_ignore_ascii_case(me) {
+        return "me".into();
+    }
+    let name = display_name(&person.name, &person.email, me);
+    if name.eq_ignore_ascii_case("me") {
+        person.email.clone()
+    } else {
+        name
+    }
 }
 
 pub fn visible_panes(width: f32, pane: Pane, full_width: bool) -> (bool, bool) {
@@ -156,6 +182,7 @@ pub fn conversation(messages: &[Message], me: &str) -> Vec<ConvMessage> {
         .map(|(index, message)| {
             let email = message.headers.from.email.clone();
             ConvMessage {
+                id: message.headers.message_id.as_str().to_string(),
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
                 folders: message
@@ -687,6 +714,13 @@ mod tests {
         }
     }
 
+    fn people(line: &RecipientLine) -> Vec<(&'static str, String)> {
+        line.groups
+            .iter()
+            .map(|group| (group.label, group.people.join(", ")))
+            .collect()
+    }
+
     #[test]
     fn recipients_show_me_and_both_groups() {
         let message = addressed(
@@ -696,9 +730,15 @@ mod tests {
             &[],
         );
         let line = recipient_line(&message, "me@x").unwrap();
-        assert_eq!(line.short, "to me, Bob Stone  ·  cc carol");
-        assert_eq!(line.full, "to me, Bob Stone <bob@x>  ·  cc carol <carol@x>");
-        assert!(!line.truncated);
+        assert_eq!(line.short, "to me, Bob Stone · cc carol");
+        assert_eq!(line.hidden, 0);
+        assert_eq!(
+            people(&line),
+            [
+                ("to", "me <me@x>, Bob Stone <bob@x>".to_string()),
+                ("cc", "carol <carol@x>".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -712,10 +752,31 @@ mod tests {
         ];
         let message = addressed("ada@x", &to, &[("F", "f@x")], &[]);
         let line = recipient_line(&message, "me@x").unwrap();
-        assert_eq!(line.short, "to A, B, C, D  +2 more");
-        assert!(line.truncated);
-        assert!(line.full.contains("E <e@x>"));
-        assert!(line.full.ends_with("cc F <f@x>"));
+        assert_eq!(line.short, "to A, B, C, D");
+        assert_eq!(line.hidden, 2);
+        assert!(people(&line)[0].1.contains("E <e@x>"));
+        assert_eq!(people(&line)[1], ("cc", "F <f@x>".to_string()));
+    }
+
+    #[test]
+    fn one_name_past_the_cut_is_shown_instead_of_one_more() {
+        let to = [("A", "a@x"), ("B", "b@x"), ("C", "c@x"), ("D", "d@x")];
+        let message = addressed("ada@x", &to, &[("E", "e@x")], &[]);
+        let line = recipient_line(&message, "me@x").unwrap();
+        assert_eq!(line.short, "to A, B, C, D · cc E");
+        assert_eq!(line.hidden, 0);
+    }
+
+    #[test]
+    fn someone_called_me_is_not_shown_as_the_person() {
+        let message = addressed(
+            "ada@x",
+            &[("me", "other@x"), ("", "me@elsewhere"), ("Caleb", "ME@x")],
+            &[],
+            &[],
+        );
+        let line = recipient_line(&message, "me@x").unwrap();
+        assert_eq!(line.short, "to other@x, me@elsewhere, me");
     }
 
     #[test]
@@ -723,12 +784,16 @@ mod tests {
         let bcc = [("Hidden", "hidden@x")];
         let mine = addressed("ME@x", &[("Ada", "ada@x")], &[], &bcc);
         let line = recipient_line(&mine, "me@x").unwrap();
-        assert_eq!(line.short, "to Ada  ·  bcc Hidden");
+        assert_eq!(line.short, "to Ada · bcc Hidden");
+        assert_eq!(
+            people(&line)[1],
+            ("bcc (only you)", "Hidden <hidden@x>".to_string())
+        );
         // Someone else's message never shows a Bcc, even if one was stored.
         let theirs = addressed("ada@x", &[("Caleb", "me@x")], &[], &bcc);
         let line = recipient_line(&theirs, "me@x").unwrap();
         assert_eq!(line.short, "to me");
-        assert!(!line.full.contains("hidden"));
+        assert_eq!(line.groups.len(), 1);
     }
 
     #[test]
