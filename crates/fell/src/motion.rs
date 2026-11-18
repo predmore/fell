@@ -36,6 +36,7 @@ pub const SLIDE: Duration = Duration::from_millis(120);
 /// narrow window, or the list coming back. The longest move, so the longest.
 pub const PANE: Duration = Duration::from_millis(160);
 /// An overlay (palette, folder picker, which-key) or a notice fading in.
+/// Overlays and notices leave faster, over [`QUICK`].
 pub const FADE: Duration = Duration::from_millis(120);
 /// A notice fading out after the next key cleared it.
 pub const FADE_OUT: Duration = Duration::from_millis(160);
@@ -44,8 +45,6 @@ pub const FADE_OUT: Duration = Duration::from_millis(160);
 pub const RISE_PX: f32 = 6.0;
 /// How far a pane that comes into view slides in from its side, in pixels.
 pub const PANE_SLIDE_PX: f32 = 24.0;
-/// An overlay opens at this fraction of its width and grows to full size.
-pub const OPEN_SCALE: f32 = 0.96;
 /// Another thread's messages arrive at this opacity and settle to full,
 /// so switching threads softens instead of blinking through empty.
 pub const ARRIVE_FROM: f32 = 0.4;
@@ -239,12 +238,17 @@ pub struct RowMotion {
     /// Draw the row this far below its slot (negative: above).
     pub dy: f32,
     pub opacity: f32,
+    /// How much of the row's height shows, from its top: a row put back
+    /// between two others opens with the gap the rows below leave, so they
+    /// never slide over it.
+    pub reveal: f32,
 }
 
 impl RowMotion {
     pub const STILL: RowMotion = RowMotion {
         dy: 0.0,
         opacity: 1.0,
+        reveal: 1.0,
     };
 }
 
@@ -253,7 +257,8 @@ impl RowMotion {
 #[derive(Clone, Debug)]
 pub struct Ghost<R> {
     pub row: R,
-    /// Its top before it left, in viewport pixels.
+    /// Its top in list content (0 at the first row), so it scrolls with
+    /// the rows around it.
     pub top: f32,
     transition: Transition,
 }
@@ -275,8 +280,8 @@ impl<R> Ghost<R> {
 /// used to be, and the offset eases to zero: rows below an archived row
 /// slide up into its place, rows below an undone row slide down to make
 /// room, and a row that was not on screen fades in. Rows that left are
-/// [`Ghost`]s. When no row on screen survives the change (another folder,
-/// a jump to the far end), the new rows fade in and nothing slides.
+/// [`Ghost`]s. When no row on screen survives the change, or the list is
+/// another folder's, the new rows fade in and nothing slides.
 #[derive(Clone, Debug)]
 pub struct ListShift<R> {
     transition: Transition,
@@ -294,25 +299,26 @@ pub struct ListShift<R> {
 impl<R: Clone> ListShift<R> {
     /// `before`: id and viewport top of each row drawn before the change
     /// (and a few beyond the edges, so rows sliding in from just outside
-    /// slide instead of fading). `left`: rows among them that are gone.
-    /// `carried`: ghosts of an earlier shift still fading, kept so a quick
-    /// second change does not cut them off.
+    /// slide instead of fading). `left`: rows among them that are gone,
+    /// with their top in list content as of now. `carried`: ghosts of an
+    /// earlier shift still fading, kept so a quick second change does not
+    /// cut them off. `replace`: the list is another one (a folder switch):
+    /// every row fades in, and nothing of the old list lingers.
     pub fn start(
         motion: &Motion,
         before: Vec<(String, f32)>,
         left: Vec<(R, f32)>,
         carried: Vec<Ghost<R>>,
         reach: f32,
+        replace: bool,
         now: Instant,
     ) -> Option<ListShift<R>> {
         let transition = motion.start(SLIDE, now)?;
-        let replaced = !before.is_empty() && left.len() == before.len();
+        let replaced = replace || (!before.is_empty() && left.len() == before.len());
         let fade = motion.start(COLLAPSE, now)?;
-        let mut ghosts: Vec<Ghost<R>> = carried
-            .into_iter()
-            .filter(|ghost| ghost.running(now))
-            .collect();
+        let mut ghosts: Vec<Ghost<R>> = Vec::new();
         if !replaced {
+            ghosts.extend(carried.into_iter().filter(|ghost| ghost.running(now)));
             ghosts.extend(left.into_iter().map(|(row, top)| Ghost {
                 row,
                 top,
@@ -329,52 +335,91 @@ impl<R: Clone> ListShift<R> {
         })
     }
 
-    /// How to draw row `id`, whose slot now starts at `top` (viewport pixels).
-    pub fn row(&mut self, id: &str, top: f32, now: Instant) -> RowMotion {
+    /// How far row `id`, whose slot starts at viewport `top`, starts from
+    /// its slot: `None` when it fades in instead.
+    fn start_for(&self, id: &str, top: f32) -> Option<f32> {
+        if self.replaced {
+            return None;
+        }
+        match self.before.get(id) {
+            Some(old) if (old - top).abs() <= self.reach => Some(old - top),
+            _ => None,
+        }
+    }
+
+    /// Fix row `id`'s start the first time it is asked for.
+    fn resolve(&mut self, id: &str, top: f32) -> Option<f32> {
+        if let Some(start) = self.resolved.get(id) {
+            return *start;
+        }
+        let start = self.start_for(id, top);
+        self.resolved.insert(id.to_string(), start);
+        start
+    }
+
+    /// How to draw row `id`, whose slot now starts at `top` (viewport
+    /// pixels). `below`: the next row's id and slot top, so a row put back
+    /// between two others opens with the gap instead of being covered.
+    pub fn row(
+        &mut self,
+        id: &str,
+        top: f32,
+        below: Option<(&str, f32)>,
+        now: Instant,
+    ) -> RowMotion {
         let p = self.transition.progress(now);
-        let replaced = self.replaced;
-        let reach = self.reach;
-        let before = &self.before;
-        let start = *self.resolved.entry(id.to_string()).or_insert_with(|| {
-            if replaced {
-                return None;
-            }
-            match before.get(id) {
-                Some(old) if (old - top).abs() <= reach => Some(old - top),
-                _ => None,
-            }
-        });
-        match start {
+        match self.resolve(id, top) {
             Some(dy) => RowMotion {
                 dy: dy * (1.0 - p),
                 opacity: 1.0,
+                reveal: 1.0,
             },
-            None => RowMotion {
-                dy: 0.0,
-                opacity: p,
-            },
+            None => {
+                // The row below came down from above: this row was put in
+                // between, and the gap it sits in is still opening.
+                let opening = below
+                    .and_then(|(next, next_top)| self.resolve(next, next_top))
+                    .is_some_and(|dy| dy < -0.5);
+                RowMotion {
+                    dy: 0.0,
+                    opacity: p,
+                    reveal: if opening { p } else { 1.0 },
+                }
+            }
         }
     }
 
-    /// How far row `id` is drawn from its slot right now: an interrupted
-    /// shift hands this to the next one, so a row in flight keeps its place.
-    pub fn offset_of(&self, id: &str, now: Instant) -> f32 {
+    /// How far row `id`, whose slot starts at viewport `top`, is drawn
+    /// from it right now: an interrupted shift hands this to the next one,
+    /// so a row in flight keeps its place. A row not drawn yet (two changes
+    /// before one frame) is where it would have been drawn.
+    pub fn offset_of(&self, id: &str, top: f32, now: Instant) -> f32 {
         let p = self.transition.progress(now);
-        match self.resolved.get(id) {
-            Some(Some(dy)) => dy * (1.0 - p),
-            _ => 0.0,
-        }
+        let start = match self.resolved.get(id) {
+            Some(start) => *start,
+            None => self.start_for(id, top),
+        };
+        start.map_or(0.0, |dy| dy * (1.0 - p))
     }
 
-    /// Ghosts whose old top falls in the slot `[top, top + height)`, with
-    /// their top relative to that slot. The view draws each beneath the
-    /// row in that slot, so the row slides over it as it fades.
+    /// Ghosts whose old top falls in the slot `[top, top + height)` (list
+    /// content pixels), with their top relative to that slot. The view
+    /// draws each beneath the row in that slot, so the row slides over it
+    /// as it fades.
     pub fn ghosts_in(&self, top: f32, height: f32, now: Instant) -> Vec<(R, f32, f32)> {
         self.ghosts
             .iter()
             .filter(|ghost| ghost.running(now) && ghost.top >= top && ghost.top < top + height)
             .map(|ghost| (ghost.row.clone(), ghost.top - top, ghost.opacity(now)))
             .collect()
+    }
+
+    /// Rows were put above the ghosts' rows (`dy` pixels of them): the
+    /// ghosts move down with the rows they were between.
+    pub fn move_ghosts(&mut self, dy: f32) {
+        for ghost in &mut self.ghosts {
+            ghost.top += dy;
+        }
     }
 
     pub fn take_ghosts(&mut self) -> Vec<Ghost<R>> {
@@ -439,8 +484,15 @@ mod tests {
         let now = Instant::now();
         assert!(off.start(SLIDE, now).is_none());
         assert!(Glide::start(&off, 0.0, -400.0, 0.0, SLIDE, now).is_none());
-        let shift: Option<ListShift<u8>> =
-            ListShift::start(&off, vec![("a".into(), 0.0)], vec![], vec![], 600.0, now);
+        let shift: Option<ListShift<u8>> = ListShift::start(
+            &off,
+            vec![("a".into(), 0.0)],
+            vec![],
+            vec![],
+            600.0,
+            false,
+            now,
+        );
         assert!(shift.is_none());
         assert_eq!(progress(None, now), 1.0);
     }
@@ -477,21 +529,47 @@ mod tests {
         assert!(Glide::start(&motion, -10.0, -10.2, 600.0, SLIDE, start).is_none());
     }
 
+    fn shift<'a>(
+        before: &[(&str, f32)],
+        left: &[(&'a str, f32)],
+        carried: Vec<Ghost<&'a str>>,
+        replace: bool,
+        now: Instant,
+    ) -> ListShift<&'a str> {
+        ListShift::start(
+            &Motion::new(true),
+            before
+                .iter()
+                .map(|(id, top)| (id.to_string(), *top))
+                .collect(),
+            left.to_vec(),
+            carried,
+            600.0,
+            replace,
+            now,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn rows_below_an_archived_row_slide_up_over_its_ghost() {
-        let motion = Motion::new(true);
         let start = Instant::now();
         // Rows a, b, c at 0, 68, 136. b is archived: c now sits at 68.
-        let before = vec![("a".into(), 0.0), ("b".into(), 68.0), ("c".into(), 136.0)];
-        let mut shift =
-            ListShift::start(&motion, before, vec![("b", 68.0)], vec![], 600.0, start).unwrap();
-        assert_eq!(shift.row("a", 0.0, start), RowMotion::STILL);
-        let c = shift.row("c", 68.0, start);
+        let mut shift = shift(
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0)],
+            &[("b", 68.0)],
+            vec![],
+            false,
+            start,
+        );
+        assert_eq!(shift.row("a", 0.0, None, start), RowMotion::STILL);
+        let c = shift.row("c", 68.0, None, start);
         assert_eq!(
             c,
             RowMotion {
                 dy: 68.0,
-                opacity: 1.0
+                opacity: 1.0,
+                reveal: 1.0,
             },
             "c starts where it was"
         );
@@ -500,76 +578,170 @@ mod tests {
         assert_eq!(ghosts[0].0, "b");
         assert_eq!(ghosts[0].1, 0.0);
         assert!(shift.running(at(start, 60)));
-        let mid = shift.row("c", 68.0, at(start, 60));
+        let mid = shift.row("c", 68.0, None, at(start, 60));
         assert!(mid.dy > 0.0 && mid.dy < 68.0);
-        assert_eq!(shift.row("c", 68.0, at(start, 120)), RowMotion::STILL);
+        assert_eq!(shift.row("c", 68.0, None, at(start, 120)), RowMotion::STILL);
         assert!(shift.ghosts_in(68.0, 68.0, at(start, 120)).is_empty());
         assert!(!shift.running(at(start, 120)));
     }
 
     #[test]
     fn a_new_row_fades_in_and_a_far_row_does_not_fly() {
-        let motion = Motion::new(true);
         let start = Instant::now();
-        let before = vec![("a".into(), 0.0), ("far".into(), 0.0)];
-        let mut shift: ListShift<&str> =
-            ListShift::start(&motion, before, vec![], vec![], 300.0, start).unwrap();
-        assert_eq!(shift.row("new", 0.0, start).opacity, 0.0);
+        let mut shift = ListShift::<&str>::start(
+            &Motion::new(true),
+            vec![("a".into(), 0.0), ("far".into(), 0.0)],
+            vec![],
+            vec![],
+            300.0,
+            false,
+            start,
+        )
+        .unwrap();
+        assert_eq!(shift.row("new", 0.0, None, start).opacity, 0.0);
         assert_eq!(
-            shift.row("far", 900.0, start),
+            shift.row("far", 900.0, None, start),
             RowMotion {
                 dy: 0.0,
-                opacity: 0.0
+                opacity: 0.0,
+                reveal: 1.0,
             }
         );
-        assert_eq!(shift.row("new", 0.0, at(start, 120)).opacity, 1.0);
+        assert_eq!(shift.row("new", 0.0, None, at(start, 120)).opacity, 1.0);
+    }
+
+    #[test]
+    fn a_row_put_back_opens_with_its_gap() {
+        let start = Instant::now();
+        // Undo puts b back between a and c: c was at 68 and now sits at 136.
+        let mut shift = shift(&[("a", 0.0), ("c", 68.0)], &[], vec![], false, start);
+        let b = shift.row("b", 68.0, Some(("c", 136.0)), start);
+        assert_eq!(b.reveal, 0.0, "closed while c still covers its slot");
+        let mid = at(start, 40);
+        let b = shift.row("b", 68.0, Some(("c", 136.0)), mid);
+        let c = shift.row("c", 136.0, None, mid);
+        // The part of b that shows ends where c is drawn.
+        assert!((68.0 + 68.0 * b.reveal - (136.0 + c.dy)).abs() < 0.01);
+        assert_eq!(
+            shift
+                .row("b", 68.0, Some(("c", 136.0)), at(start, 120))
+                .reveal,
+            1.0
+        );
+        // A row added at the end has nothing to make room for.
+        assert_eq!(shift.row("d", 204.0, None, start).reveal, 1.0);
     }
 
     #[test]
     fn a_replaced_list_fades_in_without_ghosts() {
-        let motion = Motion::new(true);
         let start = Instant::now();
-        let before = vec![("a".into(), 0.0)];
-        let mut shift =
-            ListShift::start(&motion, before, vec![("a", 0.0)], vec![], 600.0, start).unwrap();
-        assert!(shift.ghosts_in(0.0, 68.0, start).is_empty());
-        assert_eq!(shift.row("x", 0.0, start).opacity, 0.0);
+        let mut replaced = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], false, start);
+        assert!(replaced.ghosts_in(0.0, 68.0, start).is_empty());
+        assert_eq!(replaced.row("x", 0.0, None, start).opacity, 0.0);
+    }
+
+    #[test]
+    fn another_folder_drops_ghosts_even_when_a_row_is_shared() {
+        let start = Instant::now();
+        let first = shift(
+            &[("a", 0.0), ("b", 68.0)],
+            &[("a", 0.0)],
+            vec![],
+            false,
+            start,
+        );
+        let carried = first.ghosts.clone();
+        // `e` then `gs`: Sent shares b with the inbox, and a is still fading.
+        let mut switched = shift(
+            &[("b", 0.0), ("c", 68.0)],
+            &[("c", 68.0)],
+            carried,
+            true,
+            at(start, 20),
+        );
+        assert!(switched.ghosts_in(0.0, 1000.0, at(start, 20)).is_empty());
+        let b = switched.row("b", 0.0, None, at(start, 20));
+        assert_eq!(b.dy, 0.0, "a shared row fades in with the rest");
+        assert!(b.opacity < 1.0);
     }
 
     #[test]
     fn a_change_that_moves_nothing_is_still() {
-        let motion = Motion::new(true);
         let start = Instant::now();
         // New mail above the viewport: the list scrolled by the same amount.
-        let before = vec![("a".into(), 0.0), ("b".into(), 68.0)];
-        let mut shift: ListShift<&str> =
-            ListShift::start(&motion, before, vec![], vec![], 600.0, start).unwrap();
-        shift.row("a", 0.0, start);
-        shift.row("b", 68.0, start);
+        let mut shift = shift(&[("a", 0.0), ("b", 68.0)], &[], vec![], false, start);
+        shift.row("a", 0.0, None, start);
+        shift.row("b", 68.0, None, start);
         assert!(shift.is_still());
     }
 
     #[test]
     fn an_interrupted_shift_hands_over_offsets_and_ghosts() {
-        let motion = Motion::new(true);
         let start = Instant::now();
-        let before = vec![("b".into(), 0.0), ("c".into(), 68.0)];
-        let mut first =
-            ListShift::start(&motion, before, vec![("b", 0.0)], vec![], 600.0, start).unwrap();
-        first.row("c", 0.0, start);
+        let mut first = shift(
+            &[("b", 0.0), ("c", 68.0)],
+            &[("b", 0.0)],
+            vec![],
+            false,
+            start,
+        );
+        first.row("c", 0.0, None, start);
         let mid = at(start, 30);
-        let offset = first.offset_of("c", mid);
+        let offset = first.offset_of("c", 0.0, mid);
         assert!(offset > 0.0 && offset < 68.0);
         let carried = first.take_ghosts();
-        let second = ListShift::start(
-            &motion,
-            vec![("c".into(), offset)],
-            vec![],
-            carried,
-            600.0,
-            mid,
-        )
-        .unwrap();
+        let second = shift(&[("c", offset)], &[], carried, false, mid);
         assert_eq!(second.ghosts_in(0.0, 68.0, mid).len(), 1, "b keeps fading");
+    }
+
+    #[test]
+    fn two_changes_before_a_frame_hand_over_unpainted_offsets() {
+        let start = Instant::now();
+        // a, b, c, d at 0, 68, 136, 204. `e` on a, then `e` on b before
+        // any frame drew the first shift: nothing called `row` yet.
+        let first = shift(
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0), ("d", 204.0)],
+            &[("a", 0.0)],
+            vec![],
+            false,
+            start,
+        );
+        // After the first archive c's slot is at 68, and it is drawn at 136.
+        assert_eq!(first.offset_of("c", 68.0, start), 68.0);
+        let later = at(start, 30);
+        let c = first.offset_of("c", 68.0, later);
+        assert!(c > 0.0 && c < 68.0, "lerped by progress: {c}");
+        // The second shift starts from those pixels, not from the slots.
+        let mut second = shift(
+            &[
+                ("b", 0.0 + first.offset_of("b", 0.0, later)),
+                ("c", 68.0 + c),
+            ],
+            &[("b", 0.0)],
+            vec![],
+            false,
+            later,
+        );
+        let drawn = second.row("c", 0.0, None, later);
+        assert!((drawn.dy - (68.0 + c)).abs() < 0.01, "no snap: {drawn:?}");
+    }
+
+    #[test]
+    fn ghosts_live_in_content_and_move_with_rows_put_above() {
+        let start = Instant::now();
+        // b left from content y 136 (row 2).
+        let mut shift = shift(
+            &[("a", 68.0), ("b", 136.0)],
+            &[("b", 136.0)],
+            vec![],
+            false,
+            start,
+        );
+        // Scrolling never moves it: slots are asked for in content pixels.
+        assert_eq!(shift.ghosts_in(136.0, 68.0, start).len(), 1);
+        // Two rows arrived above: it is now in row 4's slot.
+        shift.move_ghosts(136.0);
+        assert!(shift.ghosts_in(136.0, 68.0, start).is_empty());
+        assert_eq!(shift.ghosts_in(272.0, 68.0, start).len(), 1);
     }
 }

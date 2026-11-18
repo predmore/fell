@@ -243,6 +243,26 @@ pub fn visible_panes(width: f32, pane: Pane, full_width: bool) -> (bool, bool) {
     (true, true)
 }
 
+/// How the list follows the selection when a folder read lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// Keep the selected row where it is on screen.
+    Hold,
+    /// A cursor move that waited for rows (`G`, `gg`, a page past the
+    /// loaded rows) moved the selection: glide to it.
+    Glide,
+    /// Another folder, or a change the reader made: show the selection now.
+    Jump,
+}
+
+pub fn landing(switched: bool, holds_viewport: bool, same_thread: bool) -> Landing {
+    match (switched, holds_viewport, same_thread) {
+        (false, true, true) => Landing::Hold,
+        (false, true, false) => Landing::Glide,
+        _ => Landing::Jump,
+    }
+}
+
 /// The list scroll offset (0 at the top, negative further down) that shows
 /// row `index` of `rows` rows of height `row` in a viewport `view` tall,
 /// starting from `offset`. A row already in full view stays put. `moved`:

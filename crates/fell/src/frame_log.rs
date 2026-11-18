@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -46,9 +47,11 @@ fn thread_cpu_ms() -> f64 {
 impl FrameLog {
     pub fn from_env() -> Option<SharedFrameLog> {
         let path = std::env::var_os("FELL_FRAME_LOG")?;
+        // Key names and timings are the reader's: only they may read them.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .ok()?;
         Some(Rc::new(RefCell::new(FrameLog {
