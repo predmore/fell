@@ -1,0 +1,26 @@
+--- stdout
+{
+  "mcp": {
+    "fell": {
+      "type": "local",
+      "command": [
+        "/opt/fell/fell-mcp",
+        "serve",
+        "--store",
+        "$TMP/mail.db",
+        "--account",
+        "demo",
+        "--agent",
+        "opencode"
+      ],
+      "enabled": true
+    }
+  }
+}
+--- stderr
+Granted opencode read, draft on demo (demo@example.com). It cannot send mail.
+
+For ~/.config/opencode/opencode.json:
+
+
+Revoke any time with `fell-mcp revoke opencode`.

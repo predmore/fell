@@ -7,11 +7,12 @@ x86_64 CI build from `main`. This is not a GitHub Release.
 `fell-x86_64-linux.tar.gz` contains:
 
 - `fell` — the binary
+- `fell-mcp` — the MCP server for agents; `fell mcp …` runs it
 - `dev.predmore.fell.desktop`
 - `dev.predmore.fell.compose.desktop`: hidden; it gives the compose window (app id `dev.predmore.fell.compose`) the Fell icon
 - `dev.predmore.fell.png`
 
-Run `./fell`. For a launcher, copy the binary onto `PATH`, both desktop files to `~/.local/share/applications/`, and the icon to `~/.local/share/icons/hicolor/256x256/apps/`.
+Run `./fell`. For a launcher, copy both binaries onto `PATH` (keep them in the same folder), both desktop files to `~/.local/share/applications/`, and the icon to `~/.local/share/icons/hicolor/256x256/apps/`.
 
 ## Hyprland
 
@@ -29,7 +30,7 @@ hl.window_rule({
 
 ## AppImage
 
-`fell-x86_64.AppImage` is the other CI artifact. `chmod +x` it after download; Actions stores artifacts in a zip and does not keep the executable bit. It embeds the static type 2 runtime, so it does not need `libfuse2`.
+`fell-x86_64.AppImage` is the other CI artifact. `chmod +x` it after download; Actions stores artifacts in a zip and does not keep the executable bit. It embeds the static type 2 runtime, so it does not need `libfuse2`. It carries `fell-mcp` too: `./fell-x86_64.AppImage mcp add codex` connects an agent, and the entry it writes starts the AppImage with `mcp serve …`.
 
 ## WebKitGTK
 

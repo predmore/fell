@@ -13,5 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 fell-core.workspace = true
-serde_json.workspace = true
+libc = "0.2.191"
+# `add` edits Goose's YAML config; the same parser fell-core uses for drafts.
+saphyr = { version = "0.3.4", default-features = false }
+# Merged JSON configs keep the key order people wrote.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
+# `add` merges into Codex's config.toml and keeps its comments and layout.
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }

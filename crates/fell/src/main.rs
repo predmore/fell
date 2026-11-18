@@ -5,6 +5,8 @@
 
 use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
+use std::ffi::OsString;
+
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
@@ -16,6 +18,7 @@ Usage:
                                connect and test a mail account
   fell embeddings status|install|remove
                                the local search model
+  fell mcp add|list|revoke     connect an agent (runs fell-mcp)
   fell --help                  print this help
 
 `fell account --help` and `fell embeddings --help` list their options.
@@ -33,6 +36,7 @@ enum Command {
     Help,
     Account(Vec<String>),
     Embeddings(Vec<String>),
+    Mcp(Vec<OsString>),
     Fixture { name: String, light: bool },
     Compose(ComposePreview),
 }
@@ -49,6 +53,9 @@ struct ComposePreview {
 /// stderr; the caller adds the usage text and exits 2.
 fn parse_args(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("mcp") => {
+            return Ok(Command::Mcp(args[1..].iter().map(OsString::from).collect()));
+        }
         Some("account") => return Ok(Command::Account(args[1..].to_vec())),
         Some("embeddings") => return Ok(Command::Embeddings(args[1..].to_vec())),
         _ => {}
@@ -122,6 +129,11 @@ fn size_value(name: &str, raw: &str) -> Result<f32, String> {
 }
 
 fn main() {
+    // `fell mcp` passes its arguments through untouched, even non-UTF-8 paths.
+    let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if raw.first().is_some_and(|arg| arg == "mcp") {
+        mcp(&raw[1..]);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
         Ok(command) => command,
@@ -134,10 +146,33 @@ fn main() {
         Command::Help => println!("{USAGE}"),
         Command::Account(args) => std::process::exit(fell::account_command(&args)),
         Command::Embeddings(args) => std::process::exit(fell::embeddings_command(&args)),
+        Command::Mcp(args) => mcp(&args),
         Command::Inbox => fell::run(),
         Command::Fixture { name, light } => preview(name, light),
         Command::Compose(preview) => compose_preview(preview),
     }
+}
+
+/// `fell mcp …` runs the `fell-mcp` program installed next to this one. The
+/// MCP server stays its own process: it never links the UI's send
+/// confirmation. In the AppImage both live in `usr/bin`.
+fn mcp(args: &[OsString]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("fell-mcp")))
+        .filter(|path| path.is_file());
+    let Some(program) = sibling else {
+        eprintln!("fell: fell-mcp is not installed next to fell");
+        std::process::exit(2);
+    };
+    // Must match `fell_mcp::FELL_MCP_ARG0`; fell does not link fell-mcp.
+    let err = std::process::Command::new(&program)
+        .arg0("fell mcp")
+        .args(args)
+        .exec();
+    eprintln!("fell: could not start {}: {err}", program.display());
+    std::process::exit(2);
 }
 
 fn compose_preview(preview: ComposePreview) {
@@ -290,6 +325,14 @@ mod tests {
         assert_eq!(
             parse(&["embeddings", "--help"]),
             Ok(Command::Embeddings(vec!["--help".into()]))
+        );
+        assert_eq!(
+            parse(&["mcp", "add", "codex", "--help"]),
+            Ok(Command::Mcp(vec![
+                "add".into(),
+                "codex".into(),
+                "--help".into()
+            ]))
         );
         assert_eq!(
             parse(&["--fixture", "native-personal-reply", "--theme", "light"]),

@@ -1,13 +1,15 @@
-//! `fell-mcp` command line. Grant writes scopes into the local store.
-//! Serve speaks MCP. Neither command can send mail.
+//! `fell-mcp` command line. `add` connects a harness, `grant`, `list` and
+//! `revoke` manage scopes in the local store, and `serve` speaks MCP. None of
+//! them can send mail.
 
 use std::ffi::OsString;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
-use fell_core::{AccountId, AgentGrant, Store};
+use fell_core::{Account, AccountId, AgentGrant, Store};
 
 use crate::protocol::Session;
+use crate::setup::{self, Env, Harness, ServerSpec, Written};
 
 const HELP: &str = "\
 fell-mcp — local MCP server for Fell
@@ -15,15 +17,28 @@ fell-mcp — local MCP server for Fell
 There is no send tool. Agents are off until granted a scope.
 
 Usage:
-  fell-mcp serve  --store PATH --account ID --agent ID
-  fell-mcp grant  --store PATH --account ID --agent ID --read [--triage] [--draft]
-  fell-mcp revoke --store PATH --account ID --agent ID
+  fell-mcp add HARNESS [--read] [--triage] [--draft] [--write | --print]
+  fell-mcp list
+  fell-mcp revoke AGENT [--account ID]
+  fell-mcp grant  AGENT --read [--triage] [--draft] [--account ID]
+  fell-mcp serve  --account ID --agent ID [--store PATH]
+
+Harnesses: claude-code, codex, gemini, opencode, goose.
+
+`add` grants the scopes you pick (read and draft unless you ask for triage)
+and prints the harness's MCP entry. It asks before adding the entry to the
+harness's config file; --write adds it without asking, --print never does.
 
 Scopes:
   --read     search, read_thread, list_folders, list_threads, list_labels
   --triage   label, move, archive, star, mark_read, mark_unread, snooze,
              unsnooze, and undo of those
   --draft    create_draft, list_drafts, and undo of those
+
+Every command uses Fell's mailbox ($FELL_STORE, else
+$XDG_DATA_HOME/fell/mail.db) unless --store is given, and the only account
+in it unless --account is given. --agent names the agent (default: the
+harness name).
 ";
 
 #[derive(Debug)]
@@ -47,22 +62,39 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-enum Command {
-    Help,
-    Serve,
-    Grant,
-    Revoke,
+impl From<io::Error> for CliError {
+    fn from(err: io::Error) -> Self {
+        Self::new(err.to_string())
+    }
 }
 
-struct Parsed {
-    command: Command,
-    store: PathBuf,
-    account: String,
-    agent: String,
-    read: bool,
-    triage: bool,
-    draft: bool,
+fn store_err(err: fell_core::Error) -> CliError {
+    CliError::new(err.to_string())
 }
+
+/// What the commands read and write besides the store. Tests swap in buffers.
+pub(crate) struct Io<'a> {
+    pub input: &'a mut dyn BufRead,
+    /// Snippets and `list` output.
+    pub out: &'a mut dyn Write,
+    /// Questions and progress.
+    pub err: &'a mut dyn Write,
+    pub tty: bool,
+    pub env: Env,
+    /// Fell's own mailbox, when the environment names one.
+    pub default_store: Option<PathBuf>,
+    /// This program, as a harness should start it.
+    pub exe: Option<PathBuf>,
+    /// The AppImage file when this runs inside one: harnesses start
+    /// `APPIMAGE mcp serve …`, since the mounted path changes every run.
+    pub appimage: Option<PathBuf>,
+    /// How the person ran this program: `fell-mcp` or `fell mcp`.
+    pub name: &'static str,
+    pub now_unix: i64,
+}
+
+/// argv[0] when `fell mcp` runs this program.
+pub const FELL_MCP_ARG0: &str = "fell mcp";
 
 /// `args` is a full argv, including the program name.
 pub fn cli_main<I, S>(args: I) -> Result<(), CliError>
@@ -70,81 +102,223 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let args: Vec<OsString> = args.into_iter().map(Into::into).skip(1).collect();
-    let parsed = parse(&args)?;
-    match parsed.command {
-        Command::Help => {
-            println!("{HELP}");
-            Ok(())
-        }
-        Command::Grant => apply_grant(&parsed, true),
-        Command::Revoke => apply_grant(&parsed, false),
-        Command::Serve => serve(&parsed),
+    let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    // `fell mcp …` starts this program with that argv[0], so hints match
+    // what the person typed.
+    let name = if args.first().is_some_and(|arg0| arg0 == FELL_MCP_ARG0) {
+        FELL_MCP_ARG0
+    } else {
+        "fell-mcp"
+    };
+    if !args.is_empty() {
+        args.remove(0);
+    }
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut out = io::stdout();
+    let mut err = io::stderr();
+    let tty = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let exe = std::env::current_exe().ok();
+    let appimage = inside_appimage(
+        exe.as_deref(),
+        std::env::var_os("APPIMAGE").map(PathBuf::from),
+        std::env::var_os("APPDIR").map(PathBuf::from),
+    );
+    let mut io = Io {
+        input: &mut input,
+        out: &mut out,
+        err: &mut err,
+        tty,
+        env: Env::from_process(),
+        default_store: fell_core::compose::mailbox_db_path(),
+        exe,
+        appimage,
+        name,
+        now_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64),
+    };
+    run(&args, &mut io)
+}
+
+fn inside_appimage(
+    exe: Option<&Path>,
+    appimage: Option<PathBuf>,
+    appdir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let (exe, appimage, appdir) = (exe?, appimage?, appdir?);
+    (appimage.is_absolute() && appdir.is_absolute() && exe.starts_with(&appdir)).then_some(appimage)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Help,
+    Add,
+    List,
+    Grant,
+    Revoke,
+    Serve,
+}
+
+#[derive(Debug, Default)]
+struct Opts {
+    positional: Vec<String>,
+    store: Option<PathBuf>,
+    account: Option<String>,
+    agent: Option<String>,
+    read: bool,
+    triage: bool,
+    draft: bool,
+    write: bool,
+    print: bool,
+}
+
+impl Opts {
+    fn any_scope(&self) -> bool {
+        self.read || self.triage || self.draft
     }
 }
 
-fn parse(args: &[OsString]) -> Result<Parsed, CliError> {
-    if args.is_empty() {
-        return Err(CliError::new(
-            "missing command (serve, grant, revoke, or --help)",
-        ));
+pub(crate) fn run(args: &[OsString], io: &mut Io<'_>) -> Result<(), CliError> {
+    let (command, opts) = parse(args)?;
+    match command {
+        Command::Help => {
+            writeln!(io.out, "{HELP}")?;
+            Ok(())
+        }
+        Command::Add => add(&opts, io),
+        Command::List => list(&opts, io),
+        Command::Grant => grant(&opts, io),
+        Command::Revoke => revoke(&opts, io),
+        Command::Serve => serve(&opts, io),
     }
-    let command_name = arg_str(&args[0])?;
-    if command_name == "--help" || command_name == "-h" || command_name == "help" {
-        return Ok(empty(Command::Help));
-    }
-    let command = match command_name {
-        "serve" => Command::Serve,
+}
+
+const COMMANDS: &str = "add, list, revoke, grant, serve, or --help";
+
+fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
+    let Some(first) = args.first() else {
+        return Err(CliError::new(format!("missing command ({COMMANDS})")));
+    };
+    let command = match arg_str(first)? {
+        "--help" | "-h" | "help" => return Ok((Command::Help, Opts::default())),
+        "add" => Command::Add,
+        "list" => Command::List,
         "grant" => Command::Grant,
         "revoke" => Command::Revoke,
+        "serve" => Command::Serve,
         other => {
             return Err(CliError::new(format!(
-                "unknown command {other} (serve, grant, revoke, or --help)"
+                "unknown command {other} ({COMMANDS})"
             )));
         }
     };
-    let mut store = None;
-    let mut account = None;
-    let mut agent = None;
-    let mut read = false;
-    let mut triage = false;
-    let mut draft = false;
+    let mut opts = Opts::default();
     let mut index = 1;
     while index < args.len() {
         let flag = arg_str(&args[index])?;
+        let mut value = |name: &str| -> Result<OsString, CliError> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| CliError::new(format!("missing value for {name}")))
+        };
         match flag {
-            "--help" | "-h" => return Ok(empty(Command::Help)),
-            "--read" => read = true,
-            "--triage" => triage = true,
-            "--draft" => draft = true,
-            "--store" => {
-                index += 1;
-                store = Some(PathBuf::from(require_value(args, index, "--store")?));
-            }
-            "--account" => {
-                index += 1;
-                account = Some(arg_str(&require_value(args, index, "--account")?)?.to_string());
-            }
-            "--agent" => {
-                index += 1;
-                agent = Some(arg_str(&require_value(args, index, "--agent")?)?.to_string());
-            }
+            "--help" | "-h" => return Ok((Command::Help, Opts::default())),
+            "--read" => opts.read = true,
+            "--triage" => opts.triage = true,
+            "--draft" => opts.draft = true,
+            "--write" => opts.write = true,
+            "--print" => opts.print = true,
+            "--store" => opts.store = Some(PathBuf::from(value("--store")?)),
+            "--account" => opts.account = Some(arg_str(&value("--account")?)?.to_string()),
+            "--agent" => opts.agent = Some(arg_str(&value("--agent")?)?.to_string()),
             other if other.starts_with('-') => {
                 return Err(CliError::new(format!("unknown flag {other}")));
             }
-            other => return Err(CliError::new(format!("unexpected argument {other}"))),
+            other => opts.positional.push(other.to_string()),
         }
         index += 1;
     }
-    if matches!(command, Command::Help) {
-        return Ok(empty(Command::Help));
-    }
-    let store = store.ok_or_else(|| CliError::new("missing --store"))?;
-    let account = account.ok_or_else(|| CliError::new("missing --account"))?;
-    let agent = agent.ok_or_else(|| CliError::new("missing --agent"))?;
-    if account.is_empty() || account != account.trim() {
+    if let Some(account) = &opts.account
+        && (account.is_empty() || account != account.trim())
+    {
         return Err(CliError::new("account id is empty"));
     }
+    if (opts.write || opts.print) && command != Command::Add {
+        return Err(CliError::new("--write and --print are for add"));
+    }
+    match command {
+        Command::Add => {
+            if opts.positional.len() != 1 {
+                return Err(CliError::new(format!(
+                    "add needs one harness: {}",
+                    harness_names()
+                )));
+            }
+            if opts.write && opts.print {
+                return Err(CliError::new("pick one of --write and --print"));
+            }
+        }
+        Command::List => {
+            if !opts.positional.is_empty()
+                || opts.any_scope()
+                || opts.account.is_some()
+                || opts.agent.is_some()
+            {
+                return Err(CliError::new("list takes only --store"));
+            }
+        }
+        Command::Grant | Command::Revoke => {
+            take_agent(&mut opts)?;
+            if command == Command::Grant && !opts.any_scope() {
+                return Err(CliError::new(
+                    "grant needs at least one of --read, --triage, --draft",
+                ));
+            }
+            if command == Command::Revoke && opts.any_scope() {
+                return Err(CliError::new("revoke clears every scope; omit scope flags"));
+            }
+        }
+        Command::Serve => {
+            if !opts.positional.is_empty() {
+                return Err(CliError::new(format!(
+                    "unexpected argument {}",
+                    opts.positional[0]
+                )));
+            }
+            if opts.any_scope() {
+                return Err(CliError::new("serve does not take scope flags; use grant"));
+            }
+            if opts.account.is_none() {
+                return Err(CliError::new("missing --account"));
+            }
+            if opts.agent.is_none() {
+                return Err(CliError::new("missing --agent"));
+            }
+        }
+        Command::Help => {}
+    }
+    if let Some(agent) = &opts.agent {
+        check_agent_id(agent)?;
+    }
+    Ok((command, opts))
+}
+
+/// `grant AGENT` and `revoke AGENT`, or the older `--agent AGENT`.
+fn take_agent(opts: &mut Opts) -> Result<(), CliError> {
+    match (opts.positional.len(), &opts.agent) {
+        (0, Some(_)) => Ok(()),
+        (1, None) => {
+            opts.agent = opts.positional.pop();
+            Ok(())
+        }
+        (0, None) => Err(CliError::new("missing agent (fell-mcp list shows them)")),
+        _ => Err(CliError::new("name one agent")),
+    }
+}
+
+fn check_agent_id(agent: &str) -> Result<(), CliError> {
     if agent.is_empty()
         || agent != agent.trim()
         || agent.chars().any(|c| c.is_control() || c == '\u{1e}')
@@ -153,47 +327,15 @@ fn parse(args: &[OsString]) -> Result<Parsed, CliError> {
             "agent id is empty or contains a control character",
         ));
     }
-    match command {
-        Command::Grant if !read && !triage && !draft => {
-            return Err(CliError::new(
-                "grant needs at least one of --read, --triage, --draft",
-            ));
-        }
-        Command::Serve if read || triage || draft => {
-            return Err(CliError::new("serve does not take scope flags; use grant"));
-        }
-        Command::Revoke if read || triage || draft => {
-            return Err(CliError::new("revoke clears every scope; omit scope flags"));
-        }
-        _ => {}
-    }
-    Ok(Parsed {
-        command,
-        store,
-        account,
-        agent,
-        read,
-        triage,
-        draft,
-    })
+    Ok(())
 }
 
-fn empty(command: Command) -> Parsed {
-    Parsed {
-        command,
-        store: PathBuf::new(),
-        account: String::new(),
-        agent: String::new(),
-        read: false,
-        triage: false,
-        draft: false,
-    }
-}
-
-fn require_value(args: &[OsString], index: usize, flag: &str) -> Result<OsString, CliError> {
-    args.get(index)
-        .cloned()
-        .ok_or_else(|| CliError::new(format!("missing value for {flag}")))
+fn harness_names() -> String {
+    Harness::ALL
+        .iter()
+        .map(|harness| harness.id())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn arg_str(value: &OsString) -> Result<&str, CliError> {
@@ -202,43 +344,430 @@ fn arg_str(value: &OsString) -> Result<&str, CliError> {
         .ok_or_else(|| CliError::new("argument is not utf-8"))
 }
 
-fn apply_grant(parsed: &Parsed, enable: bool) -> Result<(), CliError> {
-    let store = Store::open(&parsed.store).map_err(|err| CliError::new(err.to_string()))?;
-    let account = AccountId(parsed.account.clone());
-    let grant = if enable {
-        AgentGrant::enabled(parsed.read, parsed.triage, parsed.draft)
+/// The store path and the open store. The mailbox must already exist:
+/// opening it here must not create an empty one.
+fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
+    let path = match (&opts.store, &io.default_store) {
+        (Some(path), _) | (None, Some(path)) => path.clone(),
+        (None, None) => {
+            return Err(CliError::new(
+                "no mailbox path; set HOME, XDG_DATA_HOME, or FELL_STORE, or pass --store",
+            ));
+        }
+    };
+    if !path.is_file() {
+        return Err(CliError::new(format!(
+            "no Fell mailbox at {}. Connect mail first with `fell account setup`",
+            io.env.display(&path)
+        )));
+    }
+    let path = std::path::absolute(&path)?;
+    let store = Store::open(&path).map_err(store_err)?;
+    Ok((path, store))
+}
+
+fn ask(io: &mut Io<'_>, question: &str, default: bool) -> Result<bool, CliError> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        write!(io.err, "{question} {hint} ")?;
+        io.err.flush()?;
+        let mut line = String::new();
+        if io.input.read_line(&mut line)? == 0 {
+            writeln!(io.err)?;
+            return Ok(default);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => writeln!(io.err, "Answer y or n.")?,
+        }
+    }
+}
+
+fn account_label(account: &Account) -> String {
+    if account.email.is_empty() || account.email == account.id.as_str() {
+        account.id.as_str().to_string()
     } else {
-        AgentGrant::DISABLED
+        format!("{} ({})", account.id.as_str(), account.email)
+    }
+}
+
+/// The named account, else the only one, else (at a terminal) the one picked.
+fn resolve_account(
+    store: &Store,
+    given: Option<&str>,
+    io: &mut Io<'_>,
+) -> Result<Account, CliError> {
+    let accounts = store.list_accounts().map_err(store_err)?;
+    let ids = || {
+        accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(given) = given {
+        return accounts
+            .iter()
+            .find(|account| account.id.as_str() == given)
+            .cloned()
+            .ok_or_else(|| {
+                CliError::new(if accounts.is_empty() {
+                    format!("unknown account {given}")
+                } else {
+                    format!("unknown account {given} (this mailbox has {})", ids())
+                })
+            });
+    }
+    match accounts.as_slice() {
+        [] => Err(CliError::new(
+            "this mailbox has no account yet. Connect mail first with `fell account setup`",
+        )),
+        [only] => Ok(only.clone()),
+        many if io.tty => {
+            writeln!(io.err, "Which account?")?;
+            for (n, account) in many.iter().enumerate() {
+                writeln!(io.err, "  {}  {}", n + 1, account_label(account))?;
+            }
+            loop {
+                write!(io.err, "Number: ")?;
+                io.err.flush()?;
+                let mut line = String::new();
+                if io.input.read_line(&mut line)? == 0 {
+                    return Err(CliError::new("no account picked"));
+                }
+                if let Ok(n) = line.trim().parse::<usize>()
+                    && (1..=many.len()).contains(&n)
+                {
+                    return Ok(many[n - 1].clone());
+                }
+            }
+        }
+        _ => Err(CliError::new(format!(
+            "this mailbox has {} accounts ({}); pick one with --account",
+            accounts.len(),
+            ids()
+        ))),
+    }
+}
+
+fn scope_names(grant: AgentGrant) -> String {
+    if !grant.enabled {
+        return "revoked".into();
+    }
+    let names: Vec<&str> = [
+        (grant.read, "read"),
+        (grant.triage, "triage"),
+        (grant.draft, "draft"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// How the person runs this program again, for hints.
+fn self_command(io: &Io<'_>) -> String {
+    match &io.appimage {
+        Some(appimage) => {
+            let shown = io.env.display(appimage);
+            match shown.strip_prefix("~/") {
+                Some(rest) => format!("~/{} mcp", setup::shell_word(rest)),
+                None => format!("{} mcp", setup::shell_word(&shown)),
+            }
+        }
+        None => io.name.into(),
+    }
+}
+
+fn path_text(path: &Path) -> Result<String, CliError> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| CliError::new(format!("{} is not a UTF-8 path", path.display())))
+}
+
+fn server_spec(
+    io: &Io<'_>,
+    store: &Path,
+    account: &AccountId,
+    agent: &str,
+) -> Result<ServerSpec, CliError> {
+    let mut args = Vec::new();
+    let program = match (&io.appimage, &io.exe) {
+        (Some(appimage), _) => {
+            args.extend(["mcp".to_string(), "serve".into()]);
+            path_text(appimage)?
+        }
+        (None, Some(exe)) => {
+            args.push("serve".into());
+            path_text(exe)?
+        }
+        (None, None) => return Err(CliError::new("cannot find the fell-mcp program")),
+    };
+    args.extend([
+        "--store".into(),
+        path_text(store)?,
+        "--account".into(),
+        account.as_str().to_string(),
+        "--agent".into(),
+        agent.to_string(),
+    ]);
+    Ok(ServerSpec { program, args })
+}
+
+fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
+    let name = &opts.positional[0];
+    let Some(harness) = Harness::parse(name) else {
+        return Err(CliError::new(format!(
+            "unknown harness {name} ({})",
+            harness_names()
+        )));
+    };
+    let agent = opts
+        .agent
+        .clone()
+        .unwrap_or_else(|| harness.id().to_string());
+    let (store_path, store) = open_store(opts, io)?;
+    let account = resolve_account(&store, opts.account.as_deref(), io)?;
+    let grant = if opts.any_scope() {
+        AgentGrant::enabled(opts.read, opts.triage, opts.draft)
+    } else if io.tty {
+        let read = ask(io, &format!("Let {agent} search and read your mail?"), true)?;
+        let draft = ask(
+            io,
+            &format!("Let {agent} save drafts for you to review?"),
+            true,
+        )?;
+        let triage = ask(
+            io,
+            &format!("Let {agent} triage (label, move, archive, star, snooze)?"),
+            false,
+        )?;
+        if !read && !triage && !draft {
+            return Err(CliError::new("nothing granted; nothing changed"));
+        }
+        AgentGrant::enabled(read, triage, draft)
+    } else {
+        AgentGrant::enabled(true, false, true)
     };
     store
-        .set_agent_grant(&account, &parsed.agent, grant)
-        .map_err(|err| CliError::new(err.to_string()))?;
-    if enable {
-        eprintln!(
-            "fell-mcp: enabled agent {} on account {}",
-            parsed.agent, parsed.account
-        );
+        .set_agent_grant(&account.id, &agent, grant)
+        .map_err(store_err)?;
+    writeln!(
+        io.err,
+        "Granted {agent} {} on {}. It cannot send mail.",
+        scope_names(grant),
+        account_label(&account)
+    )?;
+    let spec = server_spec(io, &store_path, &account.id, &agent)?;
+    let snippet = setup::snippet(harness, &spec);
+    let revoke_hint = format!(
+        "Revoke any time with `{} revoke {agent}`.",
+        self_command(io)
+    );
+
+    let Some(config) = harness.config_path(&io.env) else {
+        writeln!(io.err, "\nRun this to add Fell to {}:\n", harness.title())?;
+        write!(io.out, "{snippet}")?;
+        if opts.write {
+            writeln!(
+                io.err,
+                "\nFell does not edit {}'s config: it rewrites that file while it runs.",
+                harness.title()
+            )?;
+        }
+        writeln!(io.err, "\n{revoke_hint}")?;
+        return Ok(());
+    };
+    let shown = io.env.display(&config);
+    writeln!(io.err, "\nFor {shown}:\n")?;
+    write!(io.out, "{snippet}")?;
+    io.out.flush()?;
+    writeln!(io.err)?;
+    let write = if opts.print {
+        false
+    } else if opts.write {
+        true
+    } else if io.tty {
+        ask(io, &format!("Add this to {shown}?"), false)?
     } else {
-        eprintln!(
-            "fell-mcp: disabled agent {} on account {}",
-            parsed.agent, parsed.account
-        );
+        writeln!(io.err, "Run again with --write to add it to {shown}.")?;
+        false
+    };
+    if !write {
+        writeln!(io.err, "{revoke_hint}")?;
+        return Ok(());
+    }
+    match setup::write_config(harness, &config, &spec, &io.env, io.now_unix) {
+        Ok(Written::Unchanged) => writeln!(io.err, "{shown} already has this entry.")?,
+        Ok(Written::Wrote {
+            backup,
+            replaced,
+            created,
+        }) => {
+            let verb = if created {
+                "Created"
+            } else if replaced {
+                "Replaced the fell entry in"
+            } else {
+                "Added fell to"
+            };
+            match backup {
+                Some(backup) => writeln!(
+                    io.err,
+                    "{verb} {shown}. The old file is {}.",
+                    io.env.display(&backup)
+                )?,
+                None => writeln!(io.err, "{verb} {shown}.")?,
+            }
+            writeln!(io.err, "Restart {} to load it.", harness.title())?;
+        }
+        Err(reason) => {
+            writeln!(
+                io.err,
+                "Did not write: {reason}. Paste the entry above into it yourself."
+            )?;
+        }
+    }
+    writeln!(io.err, "{revoke_hint}")?;
+    Ok(())
+}
+
+fn ago(now: i64, then: i64) -> String {
+    let secs = (now - then).max(0);
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..172_800 => "yesterday".into(),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+fn list(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
+    let (_, store) = open_store(opts, io)?;
+    let rows = store.list_agent_grants().map_err(store_err)?;
+    if rows.is_empty() {
+        writeln!(
+            io.out,
+            "No agents yet. Connect one with `{} add HARNESS`.",
+            self_command(io)
+        )?;
+        return Ok(());
+    }
+    let table: Vec<[String; 4]> = rows
+        .iter()
+        .map(|row| {
+            [
+                row.agent_id.clone(),
+                row.account_id.as_str().to_string(),
+                scope_names(row.grant),
+                row.last_action_unix
+                    .map_or_else(|| "never".into(), |at| ago(io.now_unix, at)),
+            ]
+        })
+        .collect();
+    let header = ["AGENT", "ACCOUNT", "SCOPES", "LAST ACTION"].map(str::to_string);
+    let mut widths = [0usize; 3];
+    for row in std::iter::once(&header).chain(&table) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    for row in std::iter::once(&header).chain(&table) {
+        writeln!(
+            io.out,
+            "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+        )?;
     }
     Ok(())
 }
 
-fn serve(parsed: &Parsed) -> Result<(), CliError> {
-    let store = Store::open(&parsed.store).map_err(|err| CliError::new(err.to_string()))?;
-    let mut session = Session::new(
-        store,
-        AccountId(parsed.account.clone()),
-        parsed.agent.clone(),
-    )
-    .map_err(CliError::new)?;
-    eprintln!(
-        "fell-mcp: serving account {} for agent {} (no send tool)",
-        parsed.account, parsed.agent
-    );
+fn grant(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
+    let agent = opts.agent.as_deref().unwrap_or_default();
+    let (_, store) = open_store(opts, io)?;
+    let account = match &opts.account {
+        // The store reports an unknown account itself.
+        Some(id) => AccountId(id.clone()),
+        None => resolve_account(&store, None, io)?.id,
+    };
+    let grant = AgentGrant::enabled(opts.read, opts.triage, opts.draft);
+    store
+        .set_agent_grant(&account, agent, grant)
+        .map_err(store_err)?;
+    writeln!(
+        io.err,
+        "Granted {agent} {} on {}.",
+        scope_names(grant),
+        account.as_str()
+    )?;
+    Ok(())
+}
+
+fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
+    let agent = opts.agent.as_deref().unwrap_or_default();
+    let (_, store) = open_store(opts, io)?;
+    let accounts: Vec<AccountId> = match &opts.account {
+        Some(id) => vec![AccountId(id.clone())],
+        None => {
+            let rows: Vec<_> = store
+                .list_agent_grants()
+                .map_err(store_err)?
+                .into_iter()
+                .filter(|row| row.agent_id == agent)
+                .collect();
+            if rows.is_empty() {
+                return Err(CliError::new(format!(
+                    "no agent named {agent} (`{} list` shows them)",
+                    self_command(io)
+                )));
+            }
+            if rows.iter().all(|row| !row.grant.enabled) {
+                writeln!(io.err, "{agent} is already revoked.")?;
+                return Ok(());
+            }
+            rows.into_iter()
+                .filter(|row| row.grant.enabled)
+                .map(|row| row.account_id)
+                .collect()
+        }
+    };
+    for account in &accounts {
+        store
+            .set_agent_grant(account, agent, AgentGrant::DISABLED)
+            .map_err(store_err)?;
+    }
+    let names: Vec<&str> = accounts.iter().map(AccountId::as_str).collect();
+    writeln!(
+        io.err,
+        "Revoked {agent} on {}. Running sessions get no tools from their next call.",
+        names.join(", ")
+    )?;
+    Ok(())
+}
+
+fn serve(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
+    let (_, store) = open_store(opts, io)?;
+    let account = opts.account.clone().unwrap_or_default();
+    let agent = opts.agent.clone().unwrap_or_default();
+    let mut session =
+        Session::new(store, AccountId(account.clone()), agent.clone()).map_err(CliError::new)?;
+    writeln!(
+        io.err,
+        "fell-mcp: serving account {account} for agent {agent} (no send tool)"
+    )?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     session
@@ -248,141 +777,4 @@ fn serve(parsed: &Parsed) -> Result<(), CliError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use fell_core::{Account, AccountId, BackendKind};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static N: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "fell-mcp-{}-{}-{}",
-                std::process::id(),
-                nanos,
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn grant_and_revoke_round_trip() {
-        let dir = TempDir::new();
-        let path = dir.path().join("mail.sqlite");
-        {
-            let store = Store::open(&path).unwrap();
-            store
-                .upsert_account(&Account {
-                    id: AccountId("a1".into()),
-                    display_name: "Caleb".into(),
-                    email: "c@x".into(),
-                    backend_kind: BackendKind::Bridge,
-                })
-                .unwrap();
-        }
-        let path_str = path.to_str().unwrap();
-        cli_main([
-            "fell-mcp",
-            "grant",
-            "--store",
-            path_str,
-            "--account",
-            "a1",
-            "--agent",
-            "bot",
-            "--read",
-        ])
-        .unwrap();
-        {
-            let store = Store::open(&path).unwrap();
-            let grant = store.agent_grant(&AccountId("a1".into()), "bot").unwrap();
-            assert!(grant.enabled && grant.read && !grant.triage && !grant.draft);
-        }
-        cli_main([
-            "fell-mcp",
-            "revoke",
-            "--store",
-            path_str,
-            "--account",
-            "a1",
-            "--agent",
-            "bot",
-        ])
-        .unwrap();
-        let store = Store::open(&path).unwrap();
-        assert_eq!(
-            store.agent_grant(&AccountId("a1".into()), "bot").unwrap(),
-            AgentGrant::DISABLED
-        );
-    }
-
-    #[test]
-    fn grant_requires_a_scope_and_a_known_account() {
-        let err = cli_main([
-            "fell-mcp",
-            "grant",
-            "--store",
-            "x",
-            "--account",
-            "a",
-            "--agent",
-            "bot",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("at least one"));
-        let dir = TempDir::new();
-        let path = dir.path().join("mail.sqlite");
-        Store::open(&path).unwrap();
-        let err = cli_main([
-            "fell-mcp",
-            "grant",
-            "--store",
-            path.to_str().unwrap(),
-            "--account",
-            "missing",
-            "--agent",
-            "bot",
-            "--draft",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown account"));
-        let err = cli_main([
-            "fell-mcp",
-            "serve",
-            "--store",
-            "x",
-            "--account",
-            "a",
-            "--agent",
-            "bot",
-            "--read",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("does not take scope flags"));
-    }
-
-    #[test]
-    fn help_mentions_that_there_is_no_send_tool() {
-        assert!(HELP.contains("no send tool"));
-        assert!(!HELP.lines().any(|line| line.starts_with("fell-mcp send")));
-    }
-}
+mod tests;
