@@ -1725,6 +1725,12 @@ impl ComposeView {
             .unwrap_or(false);
         if quoted {
             self.quote_open = !self.quote_open;
+            self.status = if self.quote_open {
+                "quote shown"
+            } else {
+                "quote hidden"
+            }
+            .into();
         } else {
             self.quote_open = false;
             self.status = "nothing quoted".into();
@@ -2137,33 +2143,40 @@ fn field_row(
                 div().child(gpui::StyledText::new(SharedString::from(text)).with_highlights(marks))
             }))
     } else {
-        // One run of text, so a long list wraps like prose and each "new"
+        // A wrapping row with each address whole, so a long list breaks
+        // between addresses, never inside one, and each "(first time)"
         // stays beside its address.
-        let mut text = String::new();
-        let mut marks = Vec::new();
-        for (index, address) in addresses.iter().enumerate() {
-            if index > 0 {
-                text.push_str(",  ");
-            }
-            text.push_str(&address.raw);
-            if address.fresh {
-                // Never mailed from this account. Not an agent change, so it
-                // does not wear the agent accent.
-                // Non-breaking, so the note never wraps away from its address.
-                text.push('\u{a0}');
-                let start = text.len();
-                text.push_str("(first\u{a0}time)");
-                marks.push((
-                    start..text.len(),
-                    gpui::HighlightStyle {
-                        color: Some(rgb(colors.dim).into()),
-                        font_style: Some(gpui::FontStyle::Italic),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-        div().child(gpui::StyledText::new(SharedString::from(text)).with_highlights(marks))
+        let last = addresses.len().saturating_sub(1);
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_x_2()
+            .children(addresses.iter().enumerate().map(|(index, address)| {
+                let mut text = address.raw.clone();
+                let mut marks = Vec::new();
+                if address.fresh {
+                    // Never mailed from this account. Not an agent change, so
+                    // it does not wear the agent accent.
+                    text.push(' ');
+                    let start = text.len();
+                    text.push_str("(first time)");
+                    marks.push((
+                        start..text.len(),
+                        gpui::HighlightStyle {
+                            color: Some(rgb(colors.dim).into()),
+                            font_style: Some(gpui::FontStyle::Italic),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                if index < last {
+                    text.push(',');
+                }
+                div()
+                    .whitespace_nowrap()
+                    .child(gpui::StyledText::new(SharedString::from(text)).with_highlights(marks))
+            }))
     };
     parent.child(
         div()
@@ -2924,7 +2937,16 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
             .font_weight(FontWeight(680.))
             .text_size(px(if *level <= 1 { 28. } else { 22. }))
             .child(render_inlines(inlines, colors)),
-        BlockBody::Paragraph { inlines } => div().child(render_inlines(inlines, colors)),
+        BlockBody::Paragraph { inlines } => match plain_lines(inlines) {
+            // Plain text wraps at the window's edge, one line per break,
+            // so a long quoted line in a narrow window is not cut off.
+            Some(lines) => lines
+                .into_iter()
+                .fold(div().flex().flex_col(), |column, line| {
+                    column.child(div().w_full().child(line))
+                }),
+            None => div().child(render_inlines(inlines, colors)),
+        },
         BlockBody::List { ordered, items } => {
             let mut list = div().flex().flex_col();
             for (index, item) in items.iter().enumerate() {
@@ -2967,6 +2989,19 @@ fn render_block(block: &fell_core::compose::Block, folder: &Path, colors: Palett
             .child(text.clone()),
         BlockBody::Image { alt, src } => image_block(alt, src, folder, colors),
     }
+}
+
+/// A paragraph that is only text, split at its line breaks. `None` when it
+/// has links, emphasis, code or images, which keep their inline layout.
+fn plain_lines(inlines: &[fell_core::compose::Inline]) -> Option<Vec<String>> {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            fell_core::compose::Inline::Text(part) => text.push_str(part),
+            _ => return None,
+        }
+    }
+    Some(text.split('\n').map(str::to_string).collect())
 }
 
 fn render_inlines(inlines: &[fell_core::compose::Inline], colors: Palette) -> gpui::Div {

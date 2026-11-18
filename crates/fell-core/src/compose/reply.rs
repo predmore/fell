@@ -273,9 +273,74 @@ fn reply_quote(parent: &Message) -> (String, String) {
     let html = format!(
         "<p>{}</p><blockquote>{}</blockquote>",
         escape(&intro),
-        paragraphs(&body)
+        quoted_paragraphs(&body)
     );
     (text, html)
+}
+
+/// Plain text as HTML paragraphs, with the `>` lines the original quoted
+/// turned into quotes inside the quote, so a reply to a reply reads in
+/// order with each level marked rather than showing `> >`.
+fn quoted_paragraphs(text: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0;
+    let mut open = false;
+    for line in text.lines() {
+        let (level, rest) = quote_level(line);
+        if open && (level != depth || rest.trim().is_empty()) {
+            out.push_str("</p>");
+            open = false;
+        }
+        while depth < level {
+            out.push_str("<blockquote>");
+            depth += 1;
+        }
+        while depth > level {
+            out.push_str("</blockquote>");
+            depth -= 1;
+        }
+        let rest = rest.trim_end();
+        if rest.trim().is_empty() {
+            continue;
+        }
+        if open {
+            out.push_str("<br>");
+        } else {
+            out.push_str("<p>");
+            open = true;
+        }
+        out.push_str(&escape(rest));
+    }
+    if open {
+        out.push_str("</p>");
+    }
+    for _ in 0..depth {
+        out.push_str("</blockquote>");
+    }
+    out
+}
+
+/// How many `>` markers start the line (`>>` and `> >` both count two),
+/// and the text after them.
+fn quote_level(line: &str) -> (usize, &str) {
+    let mut level = 0;
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start_matches(' ');
+        match trimmed.strip_prefix('>') {
+            Some(after) => {
+                level += 1;
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    let rest = if level > 0 {
+        rest.strip_prefix(' ').unwrap_or(rest)
+    } else {
+        rest
+    };
+    (level, rest)
 }
 
 /// The forwarded header block and the original, unquoted. Attachments are
@@ -306,7 +371,7 @@ fn forward_quote(parent: &Message) -> (String, String) {
             .map(|line| escape(line))
             .collect::<Vec<_>>()
             .join("<br>"),
-        paragraphs(&body)
+        quoted_paragraphs(&body)
     );
     (text, html)
 }
@@ -326,22 +391,6 @@ pub fn attachment_line(parent: &Message) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Plain text as HTML paragraphs: a blank line starts a new one, and lines
-/// inside one are kept with `<br>`.
-fn paragraphs(text: &str) -> String {
-    let mut out = String::new();
-    for block in text.split("\n\n") {
-        let lines: Vec<String> = block.lines().map(|line| escape(line.trim_end())).collect();
-        if lines.iter().all(|line| line.trim().is_empty()) {
-            continue;
-        }
-        out.push_str("<p>");
-        out.push_str(&lines.join("<br>"));
-        out.push_str("</p>");
-    }
-    out
 }
 
 fn one_line(text: &str) -> String {
@@ -515,6 +564,21 @@ mod tests {
     }
 
     #[test]
+    fn quoted_lines_nest_in_the_html_in_order() {
+        let body =
+            "Yes.\n\n-- \nJon\n\n> Can we?\n> Why not.\n>> One folder.\n> > Still here.\n<b>&";
+        assert_eq!(
+            quoted_paragraphs(body),
+            "<p>Yes.</p><p>--<br>Jon</p>\
+             <blockquote><p>Can we?<br>Why not.</p>\
+             <blockquote><p>One folder.<br>Still here.</p></blockquote></blockquote>\
+             <p>&lt;b&gt;&amp;</p>"
+        );
+        assert_eq!(quote_level("  > >x"), (2, "x"));
+        assert_eq!(quote_level("a > b"), (0, "a > b"));
+    }
+
+    #[test]
     fn a_reply_starts_with_its_parent_and_the_quote() {
         let start = start_reply(ReplyKind::Reply, &parent(), "jon@example.com", &me());
         assert_eq!(start.fields.from, "jon@example.com");
@@ -546,7 +610,15 @@ mod tests {
                 .quote_html
                 .contains("<blockquote><p>See you at noon.</p>")
         );
-        assert!(start.parts.quote_html.contains("&gt; earlier"));
+        // The original's own quote nests inside the reply's.
+        assert!(
+            start
+                .parts
+                .quote_html
+                .contains("<blockquote><p>earlier</p></blockquote>"),
+            "{}",
+            start.parts.quote_html
+        );
     }
 
     #[test]
