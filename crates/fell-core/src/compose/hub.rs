@@ -162,16 +162,29 @@ impl DraftHub {
                 snap.send_lock_reason(),
                 snap.unreviewed,
                 snap.send_requested_by.is_some(),
+                snap.subject.clone(),
             )
         });
-        if was_shown && let Some((locked, unreviewed, asked)) = summary {
+        if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
+            // Name the draft, so the line says which review closed.
+            let what = if subject.trim().is_empty() {
+                "Review".to_string()
+            } else {
+                let short: String = subject.chars().take(40).collect();
+                let more = if subject.chars().count() > 40 {
+                    "…"
+                } else {
+                    ""
+                };
+                format!("Review of \u{201c}{short}{more}\u{201d}")
+            };
             let line = match locked {
-                Some(reason) => format!("Review closed · {reason}"),
+                Some(reason) => format!("{what} closed · {reason}"),
                 None if asked && unreviewed > 0 => format!(
-                    "Review closed · not sent · {unreviewed} edit{} unreviewed",
+                    "{what} closed · not sent · {unreviewed} edit{} unreviewed",
                     if unreviewed == 1 { "" } else { "s" }
                 ),
-                None => "Review closed · draft kept, not sent".to_string(),
+                None => format!("{what} closed · draft kept, not sent"),
             };
             self.closed.lock().expect("closed").push(line);
             self.emit();

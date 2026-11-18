@@ -409,7 +409,13 @@ impl ComposeView {
         self.focused_hunk = Some(*hunk);
         if let Some(line) = line {
             self.editor.row = line - 1;
-            self.editor.col = 0;
+            // Past a list or quote marker, so the cursor sits on a letter.
+            self.editor.col = self
+                .editor
+                .lines
+                .get(line - 1)
+                .map(|text| content_column(text))
+                .unwrap_or(0);
             self.editor.clamp();
         }
         self.status = format!("edit {} of {}", index + 1, order.len()).into();
@@ -718,10 +724,35 @@ impl ComposeView {
 
     fn undo(&mut self) {
         let id = self.draft_id.to_string();
+        let before: Vec<u64> = self
+            .hub
+            .with_session(&id, |session| {
+                session
+                    .snapshot()
+                    .hunks
+                    .iter()
+                    .map(|hunk| hunk.id)
+                    .collect()
+            })
+            .unwrap_or_default();
         if self.hub.with_session(&id, |session| session.undo()) == Some(true) {
             self.applied_revision = 0;
             self.sync_from_hub();
-            self.status = "undone".into();
+            // An edit that came back (a keep or reject undone) takes focus.
+            let snap = self.hub.with_session(&id, |session| session.snapshot());
+            let returned = snap.as_ref().and_then(|snap| {
+                let order = ordered_hunks(snap);
+                let at = order.iter().position(|(hunk, _)| !before.contains(hunk))?;
+                let name = edit_name(snap, order_hunk(snap, &order, at)?);
+                Some((order, at, name))
+            });
+            match returned {
+                Some((order, at, name)) => {
+                    self.focus_hunk_at(&order, at);
+                    self.status = format!("undid · {name} back").into();
+                }
+                None => self.status = "undone".into(),
+            }
         }
     }
 
@@ -738,6 +769,9 @@ impl ComposeView {
         let Some((hunk_id, _)) = order.get(at).copied() else {
             return;
         };
+        let name = order_hunk(&snap, &order, at)
+            .map(|hunk| edit_name(&snap, hunk))
+            .unwrap_or_else(|| "the edit".into());
         self.hub.with_session(&id, |session| {
             if keep {
                 session.keep_hunk(hunk_id);
@@ -753,16 +787,13 @@ impl ComposeView {
             .hub
             .with_session(&id, |session| ordered_hunks(&session.snapshot()))
             .unwrap_or_default();
+        let done = if keep { "kept" } else { "rejected" };
         if after.is_empty() {
             self.focused_hunk = None;
-            self.status = if keep {
-                "kept; no edits left"
-            } else {
-                "rejected; no edits left"
-            }
-            .into();
+            self.status = format!("{done} {name} · u undo · all reviewed").into();
         } else {
             self.focus_hunk_at(&after, at.min(after.len() - 1));
+            self.status = format!("{done} {name} · u undo").into();
         }
     }
 
@@ -1293,7 +1324,7 @@ impl Render for ComposeView {
             .font_weight(FontWeight(400.))
             .font_family(ui_family)
             .child(header(&snap, colors).flex_shrink_0())
-            .child(self.fields_view(&snap, colors).flex_shrink_0())
+            .child(self.fields_view(&snap, colors, wide).flex_shrink_0())
             .child(self.body_view(&snap, colors))
             .children(
                 self.quote_view(&snap, colors)
@@ -1312,7 +1343,7 @@ impl Render for ComposeView {
 }
 
 impl ComposeView {
-    fn fields_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
+    fn fields_view(&self, snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         column = field_row(
             column,
@@ -1321,6 +1352,7 @@ impl ComposeView {
             self.field == Field::To,
             &snap.to,
             colors,
+            wide,
         );
         let copies_empty = snap.cc.is_empty() && snap.bcc.is_empty();
         let copies_active = matches!(self.field, Field::Cc | Field::Bcc);
@@ -1346,6 +1378,7 @@ impl ComposeView {
                 self.field == Field::Cc,
                 &snap.cc,
                 colors,
+                wide,
             );
             column = field_row(
                 column,
@@ -1354,6 +1387,7 @@ impl ComposeView {
                 self.field == Field::Bcc,
                 &snap.bcc,
                 colors,
+                wide,
             );
         }
         column
@@ -1379,7 +1413,13 @@ impl ComposeView {
             .child(if self.raw {
                 raw_body(&self.editor, colors)
             } else {
-                styled_body(&self.editor, &self.folder, &body_edit_ranges(snap), colors)
+                styled_body(
+                    &self.editor,
+                    &self.folder,
+                    &body_edit_ranges(snap),
+                    self.focused_hunk,
+                    colors,
+                )
             });
         let mut column = div()
             .flex()
@@ -1711,6 +1751,7 @@ fn field_row(
     active: bool,
     addresses: &[fell_core::compose::AddressView],
     colors: Palette,
+    wide: bool,
 ) -> gpui::Div {
     // While a field is being edited it shows the raw line. Otherwise each
     // address stands alone, and one the account never mailed says "new".
@@ -1720,6 +1761,29 @@ fn field_row(
         } else {
             SharedString::from(value.to_string())
         })
+    } else if !wide {
+        // Narrow: one address per line, its note always beside it.
+        div()
+            .flex()
+            .flex_col()
+            .children(addresses.iter().map(|address| {
+                let mut text = address.raw.clone();
+                let mut marks = Vec::new();
+                if address.fresh {
+                    text.push('\u{a0}');
+                    let start = text.len();
+                    text.push_str("(first\u{a0}time)");
+                    marks.push((
+                        start..text.len(),
+                        gpui::HighlightStyle {
+                            color: Some(rgb(colors.dim).into()),
+                            font_style: Some(gpui::FontStyle::Italic),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                div().child(gpui::StyledText::new(SharedString::from(text)).with_highlights(marks))
+            }))
     } else {
         // One run of text, so a long list wraps like prose and each "new"
         // stays beside its address.
@@ -1906,7 +1970,7 @@ fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<
         .lines()
         .map(|line| line.trim().trim_start_matches(['-', '*', '#', '>', ' ']))
         .find(|line| !line.is_empty())?;
-    let mut words: Vec<&str> = line.split_whitespace().take(5).collect();
+    let mut words: Vec<&str> = line.split_whitespace().take(4).collect();
     let more = line.split_whitespace().count() > words.len();
     if words.is_empty() {
         return None;
@@ -1917,8 +1981,45 @@ fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<
     Some(words.join(" "))
 }
 
+fn order_hunk<'a>(
+    snap: &'a Snapshot,
+    order: &[(u64, Option<usize>)],
+    at: usize,
+) -> Option<&'a fell_core::compose::HunkView> {
+    let (id, _) = order.get(at)?;
+    snap.hunks.iter().find(|hunk| hunk.id == *id)
+}
+
+/// How the status line names an edit: its first words, or what it changed.
+fn edit_name(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> String {
+    match hunk.kind {
+        HunkKind::Recipients => "the recipient change".into(),
+        HunkKind::Subject => "the subject change".into(),
+        HunkKind::Attachments => "the attachment change".into(),
+        HunkKind::Body => edit_preview(snap, hunk)
+            .map(|words| format!("\u{201c}{words}\u{201d}"))
+            .unwrap_or_else(|| "the edit".into()),
+    }
+}
+
+/// The first column after a line's markdown marker ("- ", "> ", "1. ").
+fn content_column(line: &str) -> usize {
+    let trimmed = line.trim_start();
+    let indent = line.chars().count() - trimmed.chars().count();
+    let marker = ["- ", "* ", "+ ", "> ", "# ", "## ", "### "]
+        .iter()
+        .find(|marker| trimmed.starts_with(**marker))
+        .map(|marker| marker.chars().count())
+        .or_else(|| {
+            let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+            (digits > 0 && trimmed[digits..].starts_with(". ")).then_some(digits + 2)
+        })
+        .unwrap_or(0);
+    indent + marker
+}
+
 /// Each body edit: its byte range in the body and the text it replaced.
-fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String)> {
+fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String, u64)> {
     snap.hunks
         .iter()
         .filter(|hunk| hunk.kind == HunkKind::Body)
@@ -1928,7 +2029,12 @@ fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String)> {
                 return None;
             }
             let at = snap.body.find(slice)?;
-            Some((at, at + slice.len(), hunk.previous.trim().to_string()))
+            Some((
+                at,
+                at + slice.len(),
+                hunk.previous.trim().to_string(),
+                hunk.id,
+            ))
         })
         .collect()
 }
@@ -1936,7 +2042,8 @@ fn body_edit_ranges(snap: &Snapshot) -> Vec<(usize, usize, String)> {
 fn styled_body(
     editor: &Editor,
     folder: &Path,
-    hunks: &[(usize, usize, String)],
+    hunks: &[(usize, usize, String, u64)],
+    focused: Option<u64>,
     colors: Palette,
 ) -> gpui::Div {
     let text = editor.text();
@@ -1951,19 +2058,19 @@ fn styled_body(
             BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
-                let edits: Vec<&(usize, usize, String)> = block
+                let edits: Vec<&(usize, usize, String, u64)> = block
                     .source
                     .map(|(start, end)| {
                         hunks
                             .iter()
-                            .filter(|(hunk_start, hunk_end, _)| {
+                            .filter(|(hunk_start, hunk_end, _, _)| {
                                 start < *hunk_end && end > *hunk_start
                             })
                             .collect()
                     })
                     .unwrap_or_default();
                 let painted = if raw || !edits.is_empty() {
-                    raw_source_block(block, &text, editor, &edits, colors)
+                    raw_source_block(block, &text, editor, &edits, focused, colors)
                 } else {
                     render_block(block, folder, colors)
                 };
@@ -2068,7 +2175,8 @@ fn raw_source_block(
     block: &fell_core::compose::Block,
     text: &str,
     editor: &Editor,
-    edits: &[&(usize, usize, String)],
+    edits: &[&(usize, usize, String, u64)],
+    focused: Option<u64>,
     colors: Palette,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
@@ -2089,7 +2197,9 @@ fn raw_source_block(
         let touching: Vec<usize> = edits
             .iter()
             .enumerate()
-            .filter(|(_, (from, to, _))| *from < line_end.max(line_start + 1) && *to > line_start)
+            .filter(|(_, (from, to, _, _))| {
+                *from < line_end.max(line_start + 1) && *to > line_start
+            })
             .map(|(index, _)| index)
             .collect();
         if !touching.is_empty() {
@@ -2099,19 +2209,40 @@ fn raw_source_block(
                 }
                 announced.push(*index);
                 let previous = &edits[*index].2;
+                let is_focused = Some(edits[*index].3) == focused;
                 if !previous.is_empty() {
                     column = column.child(
                         div()
                             .flex()
                             .gap_2()
                             .bg(rgb(colors.hunk))
+                            .border_l(px(3.))
+                            .border_color(rgb(if is_focused {
+                                colors.accent
+                            } else {
+                                colors.hunk
+                            }))
                             .text_color(rgb(colors.dim))
                             .child(div().flex_shrink_0().child("was"))
                             .child(div().line_through().child(previous.clone())),
                     );
                 }
             }
-            painted = div().w_full().bg(rgb(colors.hunk)).child(painted);
+            // The focused edit carries an accent bar, so the body shows
+            // which one the bar, keep and reject are about.
+            let is_focused = touching
+                .iter()
+                .any(|index| Some(edits[*index].3) == focused);
+            painted = div()
+                .w_full()
+                .bg(rgb(colors.hunk))
+                .border_l(px(3.))
+                .border_color(rgb(if is_focused {
+                    colors.accent
+                } else {
+                    colors.hunk
+                }))
+                .child(painted);
         }
         column = column.child(painted);
         line_start = line_end + 1;
@@ -2682,16 +2813,15 @@ fn status_bar(
         .chain(&snap.bcc)
         .filter(|item| item.fresh)
         .count();
-    let fresh_label = match (fresh, wide) {
-        (0, _) => None,
-        (1, true) => Some("1 first-time recipient".to_string()),
-        (count, true) => Some(format!("{count} first-time recipients")),
-        (count, false) => Some(format!("{count} first-time rcpt")),
+    let fresh_label = match fresh {
+        0 => None,
+        1 => Some("1 first-time recipient".to_string()),
+        count => Some(format!("{count} first-time recipients")),
     };
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     // A narrow window keeps one line: the mode, first-time count, send and
     // the unreviewed count stay; the insert and close hints go first.
-    let mut left = div().flex().gap_2().min_w(px(0.));
+    let mut left = div().flex().flex_1().gap_2().min_w(px(0.));
     let idle = matches!(
         status.as_ref(),
         "i insert" | "esc normal" | "normal" | "insert"
@@ -2700,23 +2830,47 @@ fn status_bar(
         left = left
             .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
             .child(dot())
-            .child(div().text_color(rgb(colors.fg)).child(status.to_string()));
-        if let Some(label) = fresh_label {
-            left = left
-                .child(dot())
-                .child(div().text_color(rgb(colors.fg)).child(label));
+            // The message gives way first, so it never runs under send.
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(rgb(colors.fg))
+                    .child(status.to_string()),
+            );
+        // The header tags each first-time address; the count only fills
+        // an idle bar, so it never crowds out a message.
+        if let Some(label) = fresh_label.filter(|_| idle) {
+            left = left.child(dot()).child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(colors.fg))
+                    .child(label),
+            );
         }
-    } else if !idle {
-        // Narrow: a message (an edit position, an error) beats the hints.
-        left = left.child(
-            div()
-                .min_w(px(0.))
-                .truncate()
-                .text_color(rgb(colors.fg))
-                .child(status.to_string()),
-        );
-    } else if let Some(label) = fresh_label {
-        left = left.child(div().text_color(rgb(colors.fg)).child(label));
+    } else {
+        // Narrow: a message (an edit position, an error) beats the hints and
+        // gives way first; the first-time count stays, short.
+        if !idle {
+            left = left.child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(rgb(colors.fg))
+                    .child(status.to_string()),
+            );
+        }
+        if fresh > 0 {
+            if !idle {
+                left = left.child(dot());
+            }
+            left = left.child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(colors.fg))
+                    .child(format!("{fresh} new")),
+            );
+        }
     }
     let right = match &snap.send_block {
         Some(reason) => div()
@@ -2728,6 +2882,7 @@ fn status_bar(
         None => {
             let mut right = div()
                 .flex()
+                .flex_shrink_0()
                 .gap_2()
                 .child(div().text_color(rgb(colors.fg)).child("space m s send"));
             if snap.unreviewed > 0 {
@@ -2739,26 +2894,26 @@ fn status_bar(
                         .child(format!("{} unreviewed", snap.unreviewed)),
                 );
             }
-            if wide {
-                right = right
-                    .child(dot())
-                    .child(div().text_color(rgb(colors.fg)).child(":q close"));
-            }
             right
+                .child(dot())
+                .child(
+                    div()
+                        .text_color(rgb(colors.fg))
+                        .child(if wide { ":q close" } else { ":q" }),
+                )
         }
     };
     let bar = div()
         .flex()
         .items_center()
         .justify_between()
-        .gap_x_4()
-        .gap_y_1()
+        .gap_x(px(if wide { 16. } else { 10. }))
         .px(px(16.))
         .py(px(6.))
         .bg(rgb(colors.panel))
         .border_t_1()
         .border_color(rgb(colors.rule))
-        .text_size(px(14.))
+        .text_size(px(if wide { 14. } else { 13. }))
         .child(left)
         .child(right);
     match mono {

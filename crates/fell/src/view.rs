@@ -1974,6 +1974,8 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
             div()
                 .flex_1()
                 .min_w(px(0.))
+                // Air before the key hints, so a long message never runs into them.
+                .pr(px(16.))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
