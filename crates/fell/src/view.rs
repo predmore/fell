@@ -1683,11 +1683,13 @@ fn expanded_message(
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
+            // The recipient line comes first and names the key itself.
             let first_hidden = message
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)));
+                .position(|block| !matches!(block, BodyBlock::Text(_)))
+                .filter(|_| message.recipients.is_none());
             message
                 .body
                 .blocks
@@ -1728,7 +1730,8 @@ fn recipient_lines(
             .flex()
             .flex_col()
             .gap(px(2.))
-            .children(line.groups.iter().map(|group| {
+            .children(line.groups.iter().enumerate().map(|(row, group)| {
+                let last_row = row + 1 == line.groups.len();
                 div()
                     .flex()
                     .gap(px(10.))
@@ -1752,17 +1755,23 @@ fn recipient_lines(
                             .gap_x(px(6.))
                             .text_color(rgb(theme.foreground))
                             .children(group.people.iter().enumerate().map(|(at, person)| {
-                                let piece = if at < last {
-                                    format!("{person},")
-                                } else {
-                                    person.clone()
+                                // The name leads; the address is quieter.
+                                let (name, address) = match person.find(" <") {
+                                    Some(split) => (&person[..split], &person[split..]),
+                                    None => (person.as_str(), ""),
                                 };
+                                let comma = if at < last { "," } else { "" };
                                 div()
+                                    .flex()
                                     .min_w(px(0.))
                                     .whitespace_nowrap()
-                                    .text_ellipsis()
                                     .overflow_hidden()
-                                    .child(piece)
+                                    .child(name.to_string())
+                                    .child(
+                                        div()
+                                            .text_color(rgb(theme.dimmed))
+                                            .child(format!("{address}{comma}")),
+                                    )
                             }))
                             .children(group.only_you.then(|| {
                                 div()
@@ -1770,16 +1779,27 @@ fn recipient_lines(
                                     .text_color(rgb(theme.dimmed))
                                     .child("only you")
                             }))
+                            .children(last_row.then(|| {
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(theme.dimmed))
+                                    .child("· q to hide")
+                            }))
                     })
             }))
-            .child(div().text_color(rgb(theme.dimmed)).child("q to hide"))
     } else {
         // Only the names give way to an ellipsis; the count and the key
         // always show. The text takes the box's colour, so hover reaches it.
+        // The Bcc on the person's own mail always shows, after the count.
+        let bcc = line
+            .bcc
+            .as_ref()
+            .map(|bcc| format!(" · {bcc}"))
+            .unwrap_or_default();
         let tail = if line.hidden > 0 {
-            format!(" +{} more · q", line.hidden)
+            format!(" +{} more{bcc} · q", line.hidden)
         } else {
-            " · q".to_string()
+            format!("{bcc} · q")
         };
         // Measured, like the thread list: the names get a real ellipsis and
         // the count and key always fit after them.

@@ -53,8 +53,11 @@ pub struct ConvMessage {
 pub struct RecipientLine {
     /// One line of names: "to me · cc Ada, Maya, Sam".
     pub short: String,
-    /// Names left off `short`; the line ends "+N more".
+    /// To and Cc names left off `short`; the line says "+N more".
     pub hidden: usize,
+    /// "bcc Riya" on the person's own sent mail. Never folded into the
+    /// count, so a Bcc always shows on the closed line.
+    pub bcc: Option<String>,
     /// Every recipient with an address, a row per group, once opened.
     pub groups: Vec<RecipientGroup>,
 }
@@ -86,13 +89,15 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
     if total == 0 {
         return None;
     }
-    let budget = if total == SHOWN_RECIPIENTS + 1 {
-        total
+    let visible: usize = groups[..2].iter().map(|(_, _, people)| people.len()).sum();
+    let budget = if visible == SHOWN_RECIPIENTS + 1 {
+        visible
     } else {
         SHOWN_RECIPIENTS
     };
     let mut short = Vec::new();
     let mut full = Vec::new();
+    let mut bcc = None;
     let mut shown = 0;
     for (label, full_label, people) in groups {
         if people.is_empty() {
@@ -102,10 +107,17 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
             .iter()
             .map(|person| recipient_name(person, me))
             .collect();
-        let room = budget.saturating_sub(shown).min(names.len());
-        if room > 0 {
-            short.push(format!("{label} {}", names[..room].join(", ")));
-            shown += room;
+        if label == "bcc" {
+            bcc = Some(match names.len() {
+                1 => format!("bcc {}", names[0]),
+                more => format!("bcc {} +{}", names[0], more - 1),
+            });
+        } else {
+            let room = budget.saturating_sub(shown).min(names.len());
+            if room > 0 {
+                short.push(format!("{label} {}", names[..room].join(", ")));
+                shown += room;
+            }
         }
         full.push(RecipientGroup {
             label: full_label,
@@ -125,7 +137,8 @@ pub fn recipient_line(message: &Message, me: &str) -> Option<RecipientLine> {
     }
     Some(RecipientLine {
         short: short.join(" · "),
-        hidden: total - shown,
+        hidden: visible - shown,
+        bcc,
         groups: full,
     })
 }
@@ -783,13 +796,33 @@ mod tests {
         let bcc = [("Hidden", "hidden@x")];
         let mine = addressed("ME@x", &[("Ada", "ada@x")], &[], &bcc);
         let line = recipient_line(&mine, "me@x").unwrap();
-        assert_eq!(line.short, "to Ada · bcc Hidden");
+        assert_eq!(line.short, "to Ada");
+        assert_eq!(line.bcc.as_deref(), Some("bcc Hidden"));
         assert_eq!(people(&line)[1], ("bcc", "Hidden <hidden@x>".to_string()));
         // Someone else's message never shows a Bcc, even if one was stored.
         let theirs = addressed("ada@x", &[("Caleb", "me@x")], &[], &bcc);
         let line = recipient_line(&theirs, "me@x").unwrap();
         assert_eq!(line.short, "to me");
+        assert_eq!(line.bcc, None);
         assert_eq!(line.groups.len(), 1);
+    }
+
+    #[test]
+    fn a_bcc_is_never_folded_into_the_count() {
+        let cc = [
+            ("Maya", "maya@x"),
+            ("Sam", "sam@x"),
+            ("Priya", "priya@x"),
+            ("Jon", "jon@x"),
+            ("Bob", "bob@x"),
+            ("Lena", "lena@x"),
+        ];
+        let bcc = [("Riya", "riya@x"), ("Finance", "fin@x")];
+        let mine = addressed("me@x", &[("Ada", "ada@x")], &cc, &bcc);
+        let line = recipient_line(&mine, "me@x").unwrap();
+        assert_eq!(line.short, "to Ada · cc Maya, Sam, Priya");
+        assert_eq!(line.hidden, 3);
+        assert_eq!(line.bcc.as_deref(), Some("bcc Riya +1"));
     }
 
     #[test]
