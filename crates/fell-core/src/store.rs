@@ -170,6 +170,17 @@ CREATE TABLE IF NOT EXISTS compose_attachments (
     PRIMARY KEY (draft_id, path),
     FOREIGN KEY(draft_id) REFERENCES compose_drafts(id) ON DELETE CASCADE
 );
+
+-- How the last send of a draft ended: 'maybe-sent' from the claim on,
+-- then 'sent', or 'clear' when nothing went out. See compose::persist.
+CREATE TABLE IF NOT EXISTS compose_send (
+    account_id TEXT NOT NULL,
+    draft_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    message_id TEXT,
+    updated_unix INTEGER NOT NULL,
+    PRIMARY KEY (account_id, draft_id)
+);
 "#;
 
 const FTS_TABLE: &str = r#"
