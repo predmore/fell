@@ -817,10 +817,10 @@ fn serve(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
         io.err,
         "fell-mcp: serving account {account} for agent {agent} (no send tool)"
     )?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    // `cli_main` already holds the stdin lock in `io.input`; std's stdin
+    // lock is not reentrant, so serve over the same handles.
     session
-        .serve(stdin.lock(), stdout.lock())
+        .serve(&mut *io.input, &mut *io.out)
         .map_err(|err| CliError::new(err.to_string()))?;
     Ok(())
 }

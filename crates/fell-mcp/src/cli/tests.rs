@@ -894,3 +894,35 @@ fn help_mentions_that_there_is_no_send_tool() {
             .any(|line| line.trim_start().starts_with("fell-mcp send"))
     );
 }
+
+#[test]
+fn serve_speaks_mcp_over_the_handles_it_was_given() {
+    // `cli_main` holds the stdin lock for the whole run; serve must read
+    // through that same handle instead of locking stdin again (which would
+    // block forever before the first request).
+    let ctx = Ctx::new();
+    let store = ctx.store();
+    let request = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n"
+    );
+    let ran = ctx.run(
+        &[
+            "fell-mcp",
+            "serve",
+            "--store",
+            store.to_str().unwrap(),
+            "--account",
+            "demo",
+            "--agent",
+            "bot",
+        ],
+        request,
+        false,
+    );
+    assert!(ran.result.is_ok(), "{:?} {}", ran.result, ran.err);
+    assert!(ran.out.contains(r#""id":1"#), "{}", ran.out);
+    assert!(ran.out.contains(r#""id":2"#), "{}", ran.out);
+}
