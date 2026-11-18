@@ -25,6 +25,8 @@ pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
 
+pub use summaries::{FolderPage, FolderSpan, ListKey};
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
@@ -375,6 +377,10 @@ impl Store {
 
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Sync writes and a folder read, whose window bounds come in several
+        // shapes, together use more than rusqlite's default of 16 cached
+        // statements. Past that, each read prepares its SQL again.
+        conn.set_prepared_statement_cache_capacity(64);
         // A first sync can push gigabytes through the log. SQLite reuses the
         // file after a checkpoint but never shrinks it; this trims it back.
         conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
@@ -789,6 +795,31 @@ impl Store {
         folder: &str,
     ) -> Result<Vec<FolderThread>> {
         summaries::folder_threads(&self.conn, account_id, folder)
+    }
+
+    /// One window of the list [`Store::folder_threads`] returns, whether the
+    /// folder has rows beyond it on either side, and the folder's unread
+    /// count. A window is found by list position (see [`ListKey`]), so its
+    /// cost follows the rows it returns, not the size of the folder.
+    pub fn folder_page(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+        span: &FolderSpan,
+    ) -> Result<FolderPage> {
+        summaries::folder_page(&self.conn, account_id, folder, span)
+    }
+
+    /// Where `thread` sits in `folder`'s list, or `None` when it is not in
+    /// the folder. The list uses it to follow a selected thread that new
+    /// mail moved outside the loaded rows.
+    pub fn folder_key_of(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+        thread: &ThreadId,
+    ) -> Result<Option<ListKey>> {
+        summaries::folder_key_of(&self.conn, account_id, folder, thread)
     }
 }
 

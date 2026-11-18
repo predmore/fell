@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fell_core::SyncFailureKind;
+use std::ops::Range;
+
+use fell_core::{FolderSpan, ListKey, SyncFailureKind, ThreadId};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
 use crate::present::{ConvMessage, Pane, ThreadRow, folder_label, merge_folders};
@@ -109,6 +111,65 @@ pub struct Toast {
     pub error: bool,
 }
 
+/// Rows the list wants from the store beyond the ones it holds. The view
+/// turns this into the next folder read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fetch {
+    /// Rows to add above the first loaded row.
+    pub before: usize,
+    /// Rows to add below the last loaded row.
+    pub after: usize,
+    /// Replace the loaded rows with the top or the bottom of the folder.
+    pub jump: Option<Jump>,
+    /// A cursor motion since a jump was asked for: drop that jump, so `G`
+    /// then `j` before the bottom rows land does not still go to the end.
+    pub drop_jump: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jump {
+    /// The first this many rows.
+    Top(usize),
+    /// The last this many rows.
+    Bottom(usize),
+}
+
+impl Fetch {
+    pub fn is_empty(&self) -> bool {
+        self.before == 0 && self.after == 0 && self.jump.is_none() && !self.drop_jump
+    }
+
+    pub fn merge(self, later: Fetch) -> Fetch {
+        Fetch {
+            before: self.before.max(later.before),
+            after: self.after.max(later.after),
+            jump: if later.drop_jump {
+                later.jump
+            } else {
+                later.jump.or(self.jump)
+            },
+            drop_jump: self.drop_jump || later.drop_jump,
+        }
+    }
+}
+
+/// Where the cursor goes once rows that are still loading arrive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Pending {
+    /// A motion ran past the last loaded row. Move this many more.
+    Down(usize),
+    /// A motion ran past the first loaded row.
+    Up(usize),
+    /// `G`: the last row of the folder.
+    Last,
+    /// `gg` or a count: this row, counted from the top of the folder.
+    Row(usize),
+    /// The selected row was archived as the last loaded one. Nothing is
+    /// selected until the row that comes after `key` loads. Then select it
+    /// and move `down` rows more, for motions made while it loaded.
+    After { key: ListKey, down: usize },
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Motion {
     Forward(usize),
@@ -167,7 +228,24 @@ pub struct Session {
     pub account_email: String,
     pub folder: String,
     pub folders: Vec<String>,
+    /// The loaded part of the folder list: a run of rows in list order.
     pub threads: Vec<ThreadRow>,
+    /// The folder has rows above `threads` that are not loaded.
+    pub more_before: bool,
+    /// The folder has rows below `threads` that are not loaded.
+    pub more_after: bool,
+    /// Unread threads in the whole folder, counted by the store.
+    pub unread_count: usize,
+    /// Rows to read first and to add at a time.
+    pub load_rows: usize,
+    /// Load more once fewer than this many rows are left past the cursor or
+    /// the viewport.
+    pub margin: usize,
+    /// Rows a read keeps loaded beyond the cursor, the visual anchor, and
+    /// the viewport. Rows further away are dropped.
+    pub keep_rows: usize,
+    fetch: Option<Fetch>,
+    pending: Option<Pending>,
     pub cursor_id: Option<String>,
     pub anchor_id: Option<String>,
     pub picked: HashSet<String>,
@@ -220,6 +298,14 @@ impl Session {
             folder: "INBOX".into(),
             folders: Vec::new(),
             threads: Vec::new(),
+            more_before: false,
+            more_after: false,
+            unread_count: 0,
+            load_rows: 100,
+            margin: 40,
+            keep_rows: 200,
+            fetch: None,
+            pending: None,
             cursor_id: None,
             anchor_id: None,
             picked: HashSet::new(),
@@ -307,15 +393,48 @@ impl Session {
         folder_label(&self.folder)
     }
 
+    /// Unread threads in the folder, including rows that are not loaded.
     pub fn unread_threads(&self) -> usize {
-        self.threads.iter().filter(|thread| thread.unread).count()
+        self.unread_count
     }
 
     pub fn cursor_index(&self) -> usize {
+        self.selected_index().unwrap_or(0)
+    }
+
+    /// The selected row among the loaded ones, if any is selected.
+    pub fn selected_index(&self) -> Option<usize> {
         self.threads
             .iter()
             .position(|thread| Some(&thread.id) == self.cursor_id.as_ref())
-            .unwrap_or(0)
+    }
+
+    /// Where the cursor stands while nothing is selected because the
+    /// selected row was archived as the last loaded one: the first loaded
+    /// row after it, or one past the end. Also the rows still to move once
+    /// that row loads.
+    fn gap(&self) -> Option<(usize, usize)> {
+        if self.cursor_id.is_some() {
+            return None;
+        }
+        let Some(Pending::After { key, down }) = &self.pending else {
+            return None;
+        };
+        let place = self.threads.partition_point(|row| row_key(row) <= *key);
+        Some((place, *down))
+    }
+
+    /// Take the cursor move waiting for rows. Dropping a `G` or `gg` that
+    /// asked for a jump also drops the jump.
+    fn take_pending(&mut self) -> Option<Pending> {
+        let pending = self.pending.take();
+        if matches!(pending, Some(Pending::Last | Pending::Row(_))) {
+            self.want(Fetch {
+                drop_jump: true,
+                ..Fetch::default()
+            });
+        }
+        pending
     }
 
     pub fn mode_label(&self) -> &'static str {
@@ -421,7 +540,9 @@ impl Session {
                     .min(self.threads.len().saturating_sub(1));
                 self.cursor_id = self.threads.get(index).map(|thread| thread.id.clone());
             }
-        } else {
+        } else if !matches!(self.pending, Some(Pending::After { .. })) {
+            // Unless the row after an archived one is still to load: it is
+            // selected when it does (see [`Session::settle`]).
             self.cursor_id = self.threads.first().map(|thread| thread.id.clone());
         }
         self.picked
@@ -485,6 +606,228 @@ impl Session {
         }
     }
 
+    /// Take the rows a folder read returned, and whether the folder goes on
+    /// past them. The same thread stays selected (see [`Session::set_threads`]).
+    /// A cursor move that was waiting for these rows then finishes, or asks
+    /// for more.
+    pub fn set_page(
+        &mut self,
+        rows: Vec<ThreadRow>,
+        more_before: bool,
+        more_after: bool,
+        unread: usize,
+    ) {
+        self.more_before = more_before;
+        self.more_after = more_after;
+        self.unread_count = unread;
+        self.set_threads(rows);
+        self.settle();
+    }
+
+    /// Where to follow the selected thread before taking `rows`: its key
+    /// now (`found`, looked up by id) when the rows read leave it out though
+    /// it is still in the folder. New mail moved it above rows that do not
+    /// reach the top of the folder. Without this the row that took its
+    /// place would be selected, and opened.
+    pub fn moved_selection(&self, rows: &[ThreadRow], found: Option<ListKey>) -> Option<ListKey> {
+        let key = found?;
+        let id = self.cursor_id.as_deref()?;
+        (key.thread_id.0 == id && !rows.iter().any(|row| row.id == id)).then_some(key)
+    }
+
+    /// Rows to read next, if the list asked for any.
+    pub fn take_fetch(&mut self) -> Option<Fetch> {
+        self.fetch.take()
+    }
+
+    pub fn has_fetch(&self) -> bool {
+        self.fetch.is_some()
+    }
+
+    fn want(&mut self, fetch: Fetch) {
+        self.fetch = Some(match self.fetch {
+            Some(earlier) => earlier.merge(fetch),
+            None => fetch,
+        });
+    }
+
+    /// Forget rows and cursor moves that belong to the folder on screen.
+    /// A folder switch calls this.
+    pub fn forget_window(&mut self) {
+        self.more_before = false;
+        self.more_after = false;
+        self.fetch = None;
+        self.pending = None;
+    }
+
+    /// Ask for more rows when the cursor or the rows on screen are within
+    /// `margin` of an end of the loaded rows and the folder goes on.
+    pub fn need_rows(&mut self, visible: Option<Range<usize>>) {
+        let Some((lo, hi)) = self.focus(visible) else {
+            return;
+        };
+        let len = self.threads.len();
+        let mut fetch = Fetch::default();
+        if self.more_after && len - 1 - hi < self.margin {
+            fetch.after = self.load_rows;
+        }
+        if self.more_before && lo < self.margin {
+            fetch.before = self.load_rows;
+        }
+        if !fetch.is_empty() {
+            self.want(fetch);
+        }
+    }
+
+    /// The loaded rows the reader is at: the cursor (or the place of a row
+    /// just removed), the visual anchor, and the rows on screen.
+    fn focus(&self, visible: Option<Range<usize>>) -> Option<(usize, usize)> {
+        let len = self.threads.len();
+        if len == 0 {
+            return None;
+        }
+        let cursor = match self.gap() {
+            Some((place, _)) => place.min(len - 1),
+            None => self.cursor_index(),
+        };
+        let (mut lo, mut hi) = (cursor, cursor);
+        if let Some(range) = visible.filter(|range| !range.is_empty()) {
+            lo = lo.min(range.start);
+            hi = hi.max(range.end - 1);
+        }
+        if self.visual
+            && let Some(anchor) = self
+                .threads
+                .iter()
+                .position(|thread| Some(&thread.id) == self.anchor_id.as_ref())
+        {
+            lo = lo.min(anchor);
+            hi = hi.max(anchor);
+        }
+        let hi = hi.min(len - 1);
+        Some((lo.min(hi), hi))
+    }
+
+    /// What the next read of this folder asks the store for: the loaded rows
+    /// again (so rows sync added or changed among them show up) plus `fetch`.
+    /// Rows more than `keep_rows` past the reader are dropped, unless the
+    /// fetch is growing that end. `select` is a thread the read must include,
+    /// such as the one undo brings back.
+    pub fn span(
+        &self,
+        fetch: Fetch,
+        select: Option<&ListKey>,
+        visible: Option<Range<usize>>,
+    ) -> FolderSpan {
+        match fetch.jump {
+            Some(Jump::Top(rows)) => return FolderSpan::Top { rows },
+            Some(Jump::Bottom(rows)) => return FolderSpan::Bottom { rows },
+            None => {}
+        }
+        let (Some(top), Some(bottom), Some((lo, hi))) = (
+            self.threads.first(),
+            self.threads.last(),
+            self.focus(visible),
+        ) else {
+            return FolderSpan::Top {
+                rows: self.load_rows.max(fetch.after),
+            };
+        };
+        if let Some(key) = select {
+            let above = self.more_before && *key < row_key(top);
+            let below = self.more_after && *key > row_key(bottom);
+            if above || below {
+                return FolderSpan::Window {
+                    first: Some(key.clone()),
+                    last: key.clone(),
+                    before: self.margin,
+                    after: self.load_rows,
+                };
+            }
+        }
+        let len = self.threads.len();
+        let mut start = if fetch.before > 0 {
+            0
+        } else {
+            lo.saturating_sub(self.keep_rows)
+        };
+        let mut end = if fetch.after > 0 {
+            len - 1
+        } else {
+            hi.saturating_add(self.keep_rows).min(len - 1)
+        };
+        // A thread to select within the loaded bounds is read even when it
+        // moved among rows that would be dropped.
+        if let Some(key) = select {
+            let at = self
+                .threads
+                .partition_point(|row| row_key(row) < *key)
+                .min(len - 1);
+            start = start.min(at);
+            end = end.max(at);
+        }
+        // From the top when the top is loaded, so rows sync adds above the
+        // first one are read too.
+        let first = (start > 0 || self.more_before).then(|| row_key(&self.threads[start]));
+        let after = if end + 1 < len {
+            0
+        } else if self.more_after {
+            fetch.after
+        } else {
+            // The whole end is loaded: also read rows sync adds below it.
+            fetch.after.max(self.margin)
+        };
+        FolderSpan::Window {
+            first,
+            last: row_key(&self.threads[end]),
+            before: if start == 0 { fetch.before } else { 0 },
+            after,
+        }
+    }
+
+    /// Finish a cursor move that was waiting for rows, now that a read
+    /// landed. Asks for more when they are still not loaded.
+    fn settle(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        match pending {
+            Pending::Down(steps) => {
+                self.move_list(Motion::Forward(steps));
+            }
+            Pending::Up(steps) => {
+                self.move_list(Motion::Backward(steps));
+            }
+            Pending::Last => {
+                self.list_last();
+            }
+            Pending::Row(index) => {
+                self.list_row(index);
+            }
+            // Something got selected meanwhile (a click, undo): keep it.
+            Pending::After { .. } if self.cursor_id.is_some() => {}
+            Pending::After { key, down } => {
+                let next = self.threads.iter().find(|row| row_key(row) > key);
+                match next {
+                    Some(row) => {
+                        self.cursor_id = Some(row.id.clone());
+                        if down > 0 {
+                            self.move_list(Motion::Forward(down));
+                        }
+                    }
+                    None if self.more_after => {
+                        self.pending = Some(Pending::After { key, down });
+                        self.want(Fetch {
+                            after: down.saturating_add(self.load_rows),
+                            ..Fetch::default()
+                        });
+                    }
+                    None => self.cursor_id = self.threads.last().map(|row| row.id.clone()),
+                }
+            }
+        }
+    }
+
     /// A click on a quote or signature block.
     pub fn toggle_quotes(&mut self, index: usize) {
         if let Some(id) = self.messages.get(index).map(|message| message.id.clone())
@@ -513,6 +856,151 @@ impl Session {
         self.messages
             .get(index)
             .is_some_and(|message| self.recipients_open.contains(&message.id))
+    }
+
+    fn select_index(&mut self, index: usize) -> bool {
+        let Some(row) = self.threads.get(index) else {
+            return false;
+        };
+        let changed = self.cursor_id.as_deref() != Some(row.id.as_str());
+        self.cursor_id = Some(row.id.clone());
+        changed
+    }
+
+    /// Move the list cursor. A move past the loaded rows goes as far as it
+    /// can now and finishes when the rest loads.
+    fn move_list(&mut self, motion: Motion) -> bool {
+        let len = self.threads.len();
+        if len == 0 {
+            return false;
+        }
+        if let Some((place, down)) = self.gap() {
+            return self.move_from_gap(place, down, motion);
+        }
+        // Keys pressed while the rows were loading add up.
+        let owed = match (&self.pending, motion) {
+            (Some(Pending::Down(steps)), Motion::Forward(_))
+            | (Some(Pending::Up(steps)), Motion::Backward(_)) => *steps,
+            _ => 0,
+        };
+        self.take_pending();
+        let cursor = self.cursor_index();
+        let (next, short) = match motion {
+            Motion::Forward(steps) => {
+                let target = cursor.saturating_add(steps).saturating_add(owed);
+                (target.min(len - 1), target.saturating_sub(len - 1))
+            }
+            Motion::Backward(steps) => {
+                let steps = steps.saturating_add(owed);
+                (cursor.saturating_sub(steps), steps.saturating_sub(cursor))
+            }
+        };
+        let changed = self.select_index(next);
+        if short > 0 {
+            match motion {
+                Motion::Forward(_) if self.more_after => {
+                    self.pending = Some(Pending::Down(short));
+                    self.want(Fetch {
+                        after: short.saturating_add(self.margin),
+                        ..Fetch::default()
+                    });
+                }
+                Motion::Backward(_) if self.more_before => {
+                    self.pending = Some(Pending::Up(short));
+                    self.want(Fetch {
+                        before: short.saturating_add(self.margin),
+                        ..Fetch::default()
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.need_rows(None);
+        changed
+    }
+
+    /// A motion while nothing is selected after an archive. The cursor
+    /// stands at `place`, `down` rows short of where earlier motions took
+    /// it. It selects a row only once the target is loaded, so the next key
+    /// cannot act on the row above the archived one, or on the top row.
+    fn move_from_gap(&mut self, place: usize, down: usize, motion: Motion) -> bool {
+        let len = self.threads.len();
+        let at = place.saturating_add(down);
+        let target = match motion {
+            Motion::Forward(steps) => at.saturating_add(steps),
+            Motion::Backward(steps) => at.saturating_sub(steps),
+        };
+        if target < len {
+            self.pending = None;
+            let changed = self.select_index(target);
+            self.need_rows(None);
+            return changed;
+        }
+        if !self.more_after {
+            self.pending = None;
+            return self.select_index(len - 1);
+        }
+        if let Some(Pending::After { down, .. }) = &mut self.pending {
+            *down = target - place;
+        }
+        self.want(Fetch {
+            after: (target - len + 1).saturating_add(self.margin),
+            ..Fetch::default()
+        });
+        false
+    }
+
+    /// `G`: the last row of the folder.
+    fn list_last(&mut self) -> bool {
+        self.take_pending();
+        if !self.more_after {
+            return self.select_index(self.threads.len().saturating_sub(1));
+        }
+        self.pending = Some(Pending::Last);
+        self.want(if self.visual {
+            // Keep the anchor: load every row down to the end.
+            Fetch {
+                after: usize::MAX,
+                ..Fetch::default()
+            }
+        } else {
+            Fetch {
+                jump: Some(Jump::Bottom(self.load_rows)),
+                ..Fetch::default()
+            }
+        });
+        false
+    }
+
+    /// `gg` or a count: row `index` from the top of the folder.
+    fn list_row(&mut self, index: usize) -> bool {
+        self.take_pending();
+        let len = self.threads.len();
+        if !self.more_before && (index < len || !self.more_after) {
+            let changed = self.select_index(index.min(len.saturating_sub(1)));
+            self.need_rows(None);
+            return changed;
+        }
+        self.pending = Some(Pending::Row(index));
+        self.want(if !self.more_before {
+            Fetch {
+                after: (index + 1 - len).saturating_add(self.margin),
+                ..Fetch::default()
+            }
+        } else if self.visual {
+            Fetch {
+                before: usize::MAX,
+                ..Fetch::default()
+            }
+        } else {
+            Fetch {
+                jump: Some(Jump::Top(
+                    index.saturating_add(1 + self.margin).max(self.load_rows),
+                )),
+                ..Fetch::default()
+            }
+        });
+        false
     }
 
     pub fn set_messages(&mut self, messages: Vec<ConvMessage>) {
@@ -570,11 +1058,29 @@ impl Session {
             self.visual = false;
             self.anchor_id = None;
         }
-        self.threads.remove(index);
+        let removed = self.threads.remove(index);
+        if removed.unread {
+            self.unread_count = self.unread_count.saturating_sub(1);
+        }
         self.picked.remove(id);
         if self.cursor_id.as_deref() == Some(id) {
-            let next = index.min(self.threads.len().saturating_sub(1));
-            self.cursor_id = self.threads.get(next).map(|thread| thread.id.clone());
+            if index == self.threads.len() && self.more_after {
+                // The row that takes its place is not loaded yet. Select
+                // nothing until it is, so the next key cannot act on the row
+                // above by mistake.
+                self.cursor_id = None;
+                self.pending = Some(Pending::After {
+                    key: row_key(&removed),
+                    down: 0,
+                });
+                self.want(Fetch {
+                    after: self.load_rows,
+                    ..Fetch::default()
+                });
+            } else {
+                let next = index.min(self.threads.len().saturating_sub(1));
+                self.cursor_id = self.threads.get(next).map(|thread| thread.id.clone());
+            }
         }
         if self.anchor_id.as_deref() == Some(id) {
             self.visual = false;
@@ -792,6 +1298,7 @@ impl Session {
             FolderIntent::Go => {
                 if self.folder != chosen {
                     self.folder = chosen;
+                    self.forget_window();
                     Step {
                         reload_threads: true,
                         ..Step::default()
@@ -960,6 +1467,7 @@ impl Session {
             return false;
         }
         self.folder = folder.to_string();
+        self.forget_window();
         true
     }
 
@@ -974,11 +1482,10 @@ impl Session {
 
     fn jump_last(&mut self) -> bool {
         if self.count.is_empty() {
-            let end = match self.pane {
-                Pane::List => self.threads.len().saturating_sub(1),
-                Pane::Conversation => self.messages.len().saturating_sub(1),
-            };
-            self.jump_index(end)
+            if self.pane == Pane::List {
+                return self.list_last();
+            }
+            self.jump_index(self.messages.len().saturating_sub(1))
         } else {
             let count = self.take_count();
             self.jump_index(count.saturating_sub(1))
@@ -991,11 +1498,7 @@ impl Session {
                 if self.threads.is_empty() {
                     return false;
                 }
-                let index = index.min(self.threads.len() - 1);
-                let id = self.threads[index].id.clone();
-                let changed = self.cursor_id.as_deref() != Some(id.as_str());
-                self.cursor_id = Some(id);
-                changed
+                self.list_row(index)
             }
             Pane::Conversation => {
                 if self.messages.is_empty() {
@@ -1010,17 +1513,7 @@ impl Session {
 
     fn move_cursor(&mut self, motion: Motion) -> bool {
         match self.pane {
-            Pane::List => {
-                let len = self.threads.len();
-                if len == 0 {
-                    return false;
-                }
-                let next = step_index(self.cursor_index(), len, motion);
-                let id = self.threads[next].id.clone();
-                let changed = self.cursor_id.as_deref() != Some(id.as_str());
-                self.cursor_id = Some(id);
-                changed
-            }
+            Pane::List => self.move_list(motion),
             Pane::Conversation => {
                 let len = self.messages.len();
                 if len == 0 {
@@ -1043,9 +1536,20 @@ impl Session {
         n
     }
 
-    /// Drop a typed count and an unfinished chord. Mouse selection calls this
-    /// so the next key does not finish the prefix.
+    /// Drop a typed count, an unfinished chord, and a cursor move waiting
+    /// for rows. Mouse selection calls this so the next key does not finish
+    /// the prefix, and a late page does not move the row just clicked.
+    ///
+    /// The place of a row just archived is kept while nothing is selected:
+    /// it is where the cursor stands, not a key. Selecting a row ends it.
     pub fn cancel_pending_keys(&mut self) {
+        if self.gap().is_some() {
+            if let Some(Pending::After { down, .. }) = &mut self.pending {
+                *down = 0;
+            }
+        } else {
+            self.take_pending();
+        }
         self.count.clear();
         self.chord.clear();
         self.note_chord();
@@ -1134,6 +1638,14 @@ impl Session {
                 hint: "gi inbox · gf folders".into(),
             },
         })
+    }
+}
+
+/// Where `row` sits in its folder list.
+pub fn row_key(row: &ThreadRow) -> ListKey {
+    ListKey {
+        date_unix: row.date_unix,
+        thread_id: ThreadId(row.id.clone()),
     }
 }
 
@@ -1554,6 +2066,483 @@ mod tests {
         // `space s` reaches the view too.
         session.on_key(KeyId::Space, 4);
         assert!(session.on_key(KeyId::Char('s'), 4).sync_now);
+    }
+
+    /// A folder the way the store holds it: every row, in list order.
+    struct Folder(Vec<ThreadRow>);
+
+    fn dated(id: &str, date_unix: i64) -> ThreadRow {
+        ThreadRow {
+            date_unix,
+            ..row(id)
+        }
+    }
+
+    impl Folder {
+        /// Rows `t00`, `t01`, … from newest to oldest, a minute apart.
+        fn new(rows: usize) -> Self {
+            Self(
+                (0..rows)
+                    .map(|index| dated(&format!("t{index:02}"), 1_000_000 - index as i64 * 60))
+                    .collect(),
+            )
+        }
+
+        fn insert(&mut self, row: ThreadRow) {
+            self.0.push(row);
+            self.0.sort_by_key(row_key);
+        }
+
+        fn remove(&mut self, id: &str) {
+            self.0.retain(|row| row.id != id);
+        }
+
+        /// What `Store::folder_page` returns for `span`.
+        fn read(&self, span: &FolderSpan) -> (Vec<ThreadRow>, bool, bool) {
+            let keys: Vec<ListKey> = self.0.iter().map(row_key).collect();
+            let len = keys.len();
+            let (start, end) = match span {
+                FolderSpan::Top { rows } => (0, (*rows).min(len)),
+                FolderSpan::Bottom { rows } => (len.saturating_sub(*rows), len),
+                FolderSpan::Window {
+                    first,
+                    last,
+                    before,
+                    after,
+                } => {
+                    let low = first
+                        .as_ref()
+                        .map_or(0, |first| keys.iter().filter(|key| *key < first).count());
+                    let high = keys.iter().filter(|key| *key <= last).count();
+                    (
+                        low.saturating_sub(*before),
+                        high.saturating_add(*after).min(len).max(low),
+                    )
+                }
+            };
+            (self.0[start..end].to_vec(), start > 0, end < len)
+        }
+    }
+
+    fn paged(rows: usize, load: usize, margin: usize) -> (Session, Folder) {
+        let folder = Folder::new(rows);
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        session.load_rows = load;
+        session.margin = margin;
+        session.keep_rows = 1_000;
+        let (rows, before, after) = folder.read(&FolderSpan::Top { rows: load });
+        session.set_page(rows, before, after, 0);
+        (session, folder)
+    }
+
+    /// Answer the reads the list asks for, the way the view does, until it
+    /// asks for no more. Returns how many reads ran.
+    fn land(session: &mut Session, folder: &Folder) -> usize {
+        let mut reads = 0;
+        while let Some(fetch) = session.take_fetch() {
+            reads += 1;
+            assert!(reads < 20, "the list keeps asking for rows");
+            refresh_with(session, folder, fetch, None);
+        }
+        reads
+    }
+
+    fn refresh_with(
+        session: &mut Session,
+        folder: &Folder,
+        fetch: Fetch,
+        select: Option<&ListKey>,
+    ) {
+        let span = session.span(fetch, select, None);
+        let (rows, before, after) = folder.read(&span);
+        session.set_page(rows, before, after, 0);
+    }
+
+    fn ids(session: &Session) -> Vec<String> {
+        session.threads.iter().map(|row| row.id.clone()).collect()
+    }
+
+    #[test]
+    fn j_past_the_last_loaded_row_moves_on_once_the_next_page_lands() {
+        // No margin, so nothing loads early and the edge is reached.
+        let (mut session, folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t09"));
+        assert!(!session.has_fetch());
+        // One more row down: it is not loaded, so the cursor waits.
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t09"));
+        // A second j while the page loads still counts.
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(land(&mut session, &folder), 1);
+        assert_eq!(session.cursor_id.as_deref(), Some("t11"));
+        assert!(session.more_after);
+        // A count that runs past several pages.
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('5'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t26"));
+        // And off the end of the folder: stops at the last row.
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t29"));
+        assert!(!session.more_after);
+    }
+
+    #[test]
+    fn moving_near_the_end_of_the_loaded_rows_loads_more_first() {
+        let (mut session, folder) = paged(30, 10, 3);
+        for _ in 0..6 {
+            session.on_key(KeyId::Char('j'), 4);
+            assert!(!session.has_fetch());
+        }
+        // Three rows left below t06: load before the reader gets there.
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t07"));
+        assert_eq!(land(&mut session, &folder), 1);
+        assert_eq!(session.threads.len(), 20);
+        assert_eq!(session.cursor_id.as_deref(), Some("t07"));
+    }
+
+    #[test]
+    fn g_and_gg_reach_the_ends_of_rows_that_are_not_loaded() {
+        let (mut session, folder) = paged(30, 10, 2);
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t29"));
+        assert!(session.more_before);
+        assert!(!session.more_after);
+        assert!(
+            session.threads.len() <= 10,
+            "G loads the end, not the folder"
+        );
+        // k past the first loaded row loads the rows above.
+        session.on_key(KeyId::Char('1'), 4);
+        session.on_key(KeyId::Char('2'), 4);
+        session.on_key(KeyId::Char('k'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t17"));
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('g'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t00"));
+        assert!(!session.more_before);
+        // A count counts from the top of the folder, loaded or not.
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        session.on_key(KeyId::Char('5'), 4);
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t04"));
+        session.on_key(KeyId::Char('2'), 4);
+        session.on_key(KeyId::Char('5'), 4);
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t24"));
+    }
+
+    #[test]
+    fn a_visual_range_keeps_its_anchor_across_loaded_pages() {
+        let (mut session, folder) = paged(30, 10, 2);
+        session.on_key(KeyId::Char('j'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        land(&mut session, &folder);
+        session.on_key(KeyId::Char('V'), 4);
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        assert!(session.visual);
+        assert_eq!(session.cursor_id.as_deref(), Some("t29"));
+        let highlighted = session.highlighted();
+        assert_eq!(highlighted.len(), 28);
+        assert!(highlighted.contains("t02") && highlighted.contains("t15"));
+        // Back up over the anchor and to the top.
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('g'), 4);
+        land(&mut session, &folder);
+        assert!(session.visual);
+        assert_eq!(session.highlighted().len(), 3);
+    }
+
+    #[test]
+    fn rows_sync_adds_above_the_selection_keep_it_selected() {
+        let (mut session, mut folder) = paged(30, 10, 2);
+        for _ in 0..5 {
+            session.on_key(KeyId::Char('j'), 4);
+        }
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t05"));
+        let loaded = session.threads.len();
+        for (index, id) in ["n0", "n1", "n2"].iter().enumerate() {
+            folder.insert(dated(id, 2_000_000 - index as i64));
+        }
+        // Between two rows that are loaded, too.
+        folder.insert(dated("mid", 1_000_000 - 2 * 60 - 1));
+        refresh_with(&mut session, &folder, Fetch::default(), None);
+        assert_eq!(session.cursor_id.as_deref(), Some("t05"));
+        assert_eq!(session.cursor_index(), 9);
+        assert_eq!(&ids(&session)[..4], ["n0", "n1", "n2", "t00"]);
+        assert_eq!(session.threads.len(), loaded + 4);
+
+        // Further down, with the top not loaded: rows added above the
+        // loaded ones stay out, and the selection does not move.
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        session.on_key(KeyId::Char('k'), 4);
+        let before = ids(&session);
+        assert!(session.more_before);
+        folder.insert(dated("n3", 3_000_000));
+        refresh_with(&mut session, &folder, Fetch::default(), None);
+        assert_eq!(ids(&session), before);
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+    }
+
+    #[test]
+    fn archiving_the_last_loaded_row_selects_the_next_one_once_it_loads() {
+        let (mut session, mut folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t09"));
+        session.remove_thread("t09");
+        folder.remove("t09");
+        // Nothing is selected while the row in its place loads, so a second
+        // `e` cannot archive t08.
+        assert_eq!(session.cursor_id, None);
+        assert_eq!(land(&mut session, &folder), 1);
+        assert_eq!(session.cursor_id.as_deref(), Some("t10"));
+        // At the true end of the folder the row above takes its place.
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        session.remove_thread("t29");
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+        assert!(!session.has_fetch());
+    }
+
+    #[test]
+    fn archiving_the_last_loaded_row_then_moving_never_acts_on_the_top_row() {
+        let (mut session, mut folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.remove_thread("t09");
+        folder.remove("t09");
+        assert_eq!(session.cursor_id, None);
+        assert_eq!(session.selected_index(), None, "the list does not scroll");
+        // `j` while the next page loads: still nothing selected, and not
+        // the top row. The motion is kept.
+        let step = session.on_key(KeyId::Char('j'), 4);
+        assert!(!step.archive);
+        assert_eq!(session.cursor_id, None);
+        // A sync refresh that brings no rows past the gap keeps it.
+        refresh_with(&mut session, &folder, Fetch::default(), None);
+        assert_eq!(session.threads.len(), 9);
+        assert_eq!(
+            session.cursor_id, None,
+            "set_threads must not pick the top row"
+        );
+        land(&mut session, &folder);
+        // t10 took t09's place; `j` moved one past it.
+        assert_eq!(session.cursor_id.as_deref(), Some("t11"));
+        // So the next `e` archives t11, not t00.
+        assert!(session.on_key(KeyId::Char('e'), 4).archive);
+
+        // A count and Ctrl-d add up the same way.
+        let (mut session, mut folder) = paged(60, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.remove_thread("t09");
+        folder.remove("t09");
+        session.on_key(KeyId::Char('3'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.on_key(KeyId::Ctrl('d'), 4);
+        assert_eq!(session.cursor_id, None);
+        land(&mut session, &folder);
+        // t10, then 3 rows, then a page of 4.
+        assert_eq!(session.cursor_id.as_deref(), Some("t17"));
+
+        // `k` from the gap goes to the row above the archived one.
+        let (mut session, mut folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.remove_thread("t09");
+        folder.remove("t09");
+        session.on_key(KeyId::Char('k'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t08"));
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t08"));
+    }
+
+    #[test]
+    fn a_click_or_cancel_after_archiving_the_last_loaded_row_keeps_its_place() {
+        // cancel_pending_keys (a click in the conversation) keeps the place.
+        let (mut session, mut folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.remove_thread("t09");
+        folder.remove("t09");
+        session.on_key(KeyId::Char('j'), 4);
+        session.cancel_pending_keys();
+        assert_eq!(session.cursor_id, None);
+        session.on_key(KeyId::Char('j'), 4);
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t11"));
+        assert!(session.on_key(KeyId::Char('e'), 4).archive);
+
+        // A click on a row selects it, and the late page does not move it.
+        let (mut session, mut folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('9'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.remove_thread("t09");
+        folder.remove("t09");
+        session.cancel_pending_keys();
+        session.cursor_id = Some("t04".into());
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t04"));
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t05"));
+    }
+
+    #[test]
+    fn a_motion_after_g_cancels_the_jump() {
+        let (mut session, folder) = paged(30, 10, 0);
+        session.on_key(KeyId::Char('G'), 4);
+        let jump = session.take_fetch().unwrap();
+        assert_eq!(jump.jump, Some(Jump::Bottom(10)));
+        // `j` before the bottom rows land.
+        session.on_key(KeyId::Char('j'), 4);
+        let cancel = session.take_fetch().unwrap();
+        assert!(cancel.drop_jump);
+        // The view merges the two reads into one: no jump left.
+        let merged = jump.merge(cancel);
+        assert_eq!(merged.jump, None);
+        refresh_with(&mut session, &folder, merged, None);
+        assert_eq!(session.cursor_id.as_deref(), Some("t01"));
+        assert!(!session.more_before);
+
+        // The same for `gg` from the bottom, and a jump not yet taken.
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        assert!(session.more_before);
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('g'), 4);
+        session.on_key(KeyId::Char('k'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+        land(&mut session, &folder);
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+        assert!(session.more_before);
+
+        // A later jump after a motion still jumps.
+        let merged = Fetch {
+            drop_jump: true,
+            ..Fetch::default()
+        }
+        .merge(Fetch {
+            jump: Some(Jump::Top(5)),
+            ..Fetch::default()
+        });
+        assert_eq!(merged.jump, Some(Jump::Top(5)));
+    }
+
+    #[test]
+    fn new_mail_on_the_selected_thread_outside_the_loaded_rows_keeps_it_open() {
+        let (mut session, mut folder) = paged(30, 10, 2);
+        session.on_key(KeyId::Char('G'), 4);
+        land(&mut session, &folder);
+        session.on_key(KeyId::Char('k'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+        assert!(session.more_before);
+        // New mail on t28 moves it to the top of the folder, above the
+        // loaded rows.
+        folder.remove("t28");
+        folder.insert(dated("t28", 5_000_000));
+        let span = session.span(Fetch::default(), None, None);
+        let (rows, before, after) = folder.read(&span);
+        assert!(!rows.iter().any(|row| row.id == "t28"));
+        // The view looks the thread up by id and reads the rows around it.
+        let found = Some(row_key(&folder.0[0]));
+        let key = session.moved_selection(&rows, found.clone()).unwrap();
+        refresh_with(&mut session, &folder, Fetch::default(), Some(&key));
+        assert!(session.select_if_present("t28"));
+        assert_eq!(session.cursor_id.as_deref(), Some("t28"));
+        // Rows that include it, or another selected thread, need nothing.
+        assert_eq!(
+            session.moved_selection(&ids_rows(&session), found.clone()),
+            None
+        );
+        session.cursor_id = Some("t01".into());
+        assert_eq!(session.moved_selection(&rows, found), None);
+        // Without the follow the list would have taken the old place.
+        let mut plain = session.clone();
+        plain.cursor_id = Some("t28".into());
+        plain.set_page(rows, before, after, 0);
+        assert_ne!(plain.cursor_id.as_deref(), Some("t28"));
+    }
+
+    fn ids_rows(session: &Session) -> Vec<ThreadRow> {
+        session.threads.clone()
+    }
+
+    #[test]
+    fn an_optimistic_archive_lowers_the_unread_count() {
+        let (mut session, _folder) = paged(30, 10, 2);
+        session.threads[3].unread = true;
+        session.unread_count = 5;
+        session.remove_thread("t03");
+        assert_eq!(session.unread_threads(), 4);
+        session.remove_thread("t04");
+        assert_eq!(session.unread_threads(), 4, "a read row leaves it alone");
+    }
+
+    #[test]
+    fn undo_loads_the_rows_around_a_thread_outside_the_loaded_ones() {
+        let (mut session, folder) = paged(40, 10, 2);
+        let back = row_key(&folder.0[20]);
+        let span = session.span(Fetch::default(), Some(&back), None);
+        assert!(matches!(span, FolderSpan::Window { first: Some(_), .. }));
+        refresh_with(&mut session, &folder, Fetch::default(), Some(&back));
+        assert!(session.select_if_present("t20"));
+        assert!(session.more_before && session.more_after);
+        // Inside the loaded rows, undo just rereads them.
+        let near = row_key(&folder.0[22]);
+        assert!(matches!(
+            session.span(Fetch::default(), Some(&near), None),
+            FolderSpan::Window { before: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_long_walk_down_keeps_only_rows_near_the_reader() {
+        let (mut session, folder) = paged(400, 20, 5);
+        session.keep_rows = 30;
+        for _ in 0..300 {
+            session.on_key(KeyId::Char('j'), 4);
+            land(&mut session, &folder);
+        }
+        assert_eq!(
+            session.cursor_id.as_deref(),
+            Some(folder.0[300].id.as_str())
+        );
+        refresh_with(&mut session, &folder, Fetch::default(), None);
+        assert!(
+            session.threads.len() <= 2 * 30 + 1,
+            "{}",
+            session.threads.len()
+        );
+        assert!(session.more_before && session.more_after);
+        assert_eq!(
+            session.cursor_id.as_deref(),
+            Some(folder.0[300].id.as_str())
+        );
+    }
+
+    #[test]
+    fn the_unread_count_covers_rows_that_are_not_loaded() {
+        let (mut session, folder) = paged(30, 10, 2);
+        let (rows, before, after) = folder.read(&FolderSpan::Top { rows: 10 });
+        session.set_page(rows, before, after, 17);
+        assert_eq!(session.unread_threads(), 17);
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {
