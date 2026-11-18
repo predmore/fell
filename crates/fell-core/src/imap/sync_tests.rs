@@ -387,13 +387,24 @@ fn condstore_updates_unread_without_a_second_copy() {
         let message = &mut guard.mailboxes[0].messages[0];
         message.flags.clear();
         message.modseq = 4;
+        guard.commands.clear();
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 1);
+    // A flag change on stored mail is a flag update, not a new message.
+    assert_eq!(report.upserted, 0);
     assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
     assert!(store.list_threads(&acct.id).unwrap()[0].unread);
     let logged = commands(&server);
-    assert!(logged.iter().any(|line| line.contains("CHANGEDSINCE")));
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.contains("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 1)")),
+        "{logged:?}"
+    );
+    assert!(
+        !logged.iter().any(|line| line.contains("BODY.PEEK")),
+        "{logged:?}"
+    );
     let login_at = logged
         .iter()
         .position(|line| line.starts_with("LOGIN"))
@@ -408,6 +419,180 @@ fn condstore_updates_unread_without_a_second_copy() {
             .iter()
             .any(|line| line.contains("EXAMINE") && line.contains("CONDSTORE"))
     );
+}
+
+/// Commands that download a message body (`BODY.PEEK[]`, not headers).
+fn body_fetches(server: &TestServer) -> Vec<String> {
+    commands(server)
+        .into_iter()
+        .filter(|line| line.contains("BODY.PEEK[]"))
+        .collect()
+}
+
+/// INBOX holding `count` unread messages of about 2 KB each, UIDs from 1.
+fn large_inbox(count: u32, qresync: bool) -> TestState {
+    let paragraph = "A line of a message body long enough to count for something.\r\n";
+    let mut state = sample_state();
+    state.condstore = true;
+    state.qresync = qresync;
+    state.mailboxes = vec![FixtureMailbox {
+        uidnext: Some(count + 1),
+        messages: (1..=count)
+            .map(|uid| FixtureMessage {
+                uid,
+                flags: Vec::new(),
+                modseq: 1,
+                body_form: BodyForm::Literal,
+                raw: raw_message(
+                    &format!("m{uid}@x"),
+                    None,
+                    &format!("Message {uid}"),
+                    "Ann <ann@x>",
+                    &paragraph.repeat(32),
+                    "",
+                ),
+            })
+            .collect(),
+        ..empty_mailbox("INBOX", 7)
+    }];
+    state
+}
+
+#[test]
+fn a_seen_change_on_stored_mail_fetches_flags_not_bodies() {
+    for qresync in [false, true] {
+        let server = TestServer::spawn(large_inbox(500, qresync));
+        let acct = account("a1", BackendKind::Imap);
+        let backend = ImapBackend {
+            account_id: acct.id.clone(),
+            config: config(server.addr.port()),
+        };
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 500);
+        let threads = store.list_threads(&acct.id).unwrap();
+        assert_eq!(threads.len(), 500);
+        assert!(threads.iter().all(|thread| thread.unread));
+        let body_bytes: usize = {
+            let mut state = server.state.lock().expect("state");
+            let inbox = mailbox(&mut state, "INBOX");
+            for message in &mut inbox.messages {
+                message.flags = vec!["\\Seen".into()];
+                message.modseq = 2;
+            }
+            let bytes = inbox.messages.iter().map(|message| message.raw.len()).sum();
+            state.commands.clear();
+            bytes
+        };
+        server.sent.store(0, std::sync::atomic::Ordering::Relaxed);
+        let report = sync_once(&acct, &backend, &store).unwrap();
+        let sent = server.sent.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(report.upserted, 0, "qresync {qresync}");
+        let logged = commands(&server);
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.contains("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 1")),
+            "{logged:?}"
+        );
+        assert!(
+            !logged.iter().any(|line| line.contains("BODY.PEEK")),
+            "a flag change must not download a body: {logged:?}"
+        );
+        let threads = store.list_threads(&acct.id).unwrap();
+        assert_eq!(threads.len(), 500);
+        assert!(
+            threads.iter().all(|thread| !thread.unread),
+            "every message is read now (qresync {qresync})"
+        );
+        assert!(
+            sent * 20 <= body_bytes,
+            "the pass sent {sent} bytes for {body_bytes} bytes of bodies (qresync {qresync})"
+        );
+    }
+}
+
+#[test]
+fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state.mailboxes.retain(|mailbox| mailbox.name == "INBOX");
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(stored(&store, &acct, "gone@x").is_none());
+    {
+        let mut state = server.state.lock().expect("state");
+        let inbox = mailbox(&mut state, "INBOX");
+        for message in &mut inbox.messages {
+            if message.uid == 3 || message.uid == 2 {
+                message.flags = vec!["\\Seen".into()];
+                message.modseq = 5;
+            }
+        }
+        state.commands.clear();
+    }
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 1);
+    assert!(stored(&store, &acct, "gone@x").is_some());
+    assert!(!stored(&store, &acct, "reply@x").unwrap().unread);
+    let bodies = body_fetches(&server);
+    assert!(
+        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        "only the copy the store does not hold is downloaded: {bodies:?}"
+    );
+}
+
+#[test]
+fn without_uidnext_only_new_uids_are_downloaded() {
+    let mut state = sample_state();
+    state.mailboxes = vec![FixtureMailbox {
+        omit_uidnext: true,
+        messages: (1..=2)
+            .map(|uid| FixtureMessage {
+                uid,
+                flags: vec!["\\Seen".into()],
+                modseq: 1,
+                body_form: BodyForm::Literal,
+                raw: raw_message(&format!("d{uid}@x"), None, "Old", "Ann <ann@x>", "old", ""),
+            })
+            .collect(),
+        ..empty_mailbox("INBOX", 6)
+    }];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    {
+        let mut state = server.state.lock().expect("state");
+        mailbox(&mut state, "INBOX").messages.push(FixtureMessage {
+            uid: 3,
+            flags: Vec::new(),
+            modseq: 2,
+            body_form: BodyForm::Literal,
+            raw: raw_message("d3@x", None, "New", "Ann <ann@x>", "new", ""),
+        });
+        state.commands.clear();
+    }
+    assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 1);
+    assert!(stored(&store, &acct, "d3@x").is_some());
+    let bodies = body_fetches(&server);
+    assert!(
+        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        "{bodies:?}"
+    );
+    server.state.lock().expect("state").commands.clear();
+    // `4:*` still names UID 3, the highest; it is stored, so nothing is fetched.
+    assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 0);
+    assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
 }
 
 #[test]
@@ -1580,6 +1765,7 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
         state.mailboxes[0].messages[0].body_form = BodyForm::Literal;
         state.mailboxes[0].messages[0].raw =
             raw_message("one@x", None, "First", "Ann <ann@x>", "one", "");
+        state.mailboxes[0].messages[1].flags.clear();
         state.commands.clear();
     }
     sync_once(&acct, &backend, &store).unwrap();
@@ -1587,6 +1773,19 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
     assert!(threads.iter().any(|thread| thread.subject == "First"));
     let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
     assert!(cursor.contains("INBOX\t5\t2\t"), "{cursor}");
+    // The low checkpoint must not download UID 2 again: its flags come
+    // from a flags-only fetch.
+    let bodies = body_fetches(&server);
+    assert!(
+        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 1 (UID FLAGS BODY.PEEK[])"),
+        "{bodies:?}"
+    );
+    assert!(
+        commands(&server)
+            .iter()
+            .any(|line| line.ends_with("UID FETCH 1:* (UID FLAGS)"))
+    );
+    assert!(stored(&store, &acct, "two@x").unwrap().unread);
 }
 
 #[test]

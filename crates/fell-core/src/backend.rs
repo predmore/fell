@@ -79,6 +79,17 @@ pub struct FetchedBody {
     pub raw: Option<Vec<u8>>,
 }
 
+/// Which server copies the store holds already, so sync never downloads a
+/// body it has. Called with a mailbox as remote ids spell it
+/// (`imap:{uidvalidity}:{uid}:{mailbox}`), a UIDVALIDITY, and an inclusive
+/// UID range; answers the stored UIDs in that range, ascending.
+pub type KnownCopies<'a> = dyn Fn(&str, u32, (u32, u32)) -> Result<Vec<u32>> + 'a;
+
+/// For a one-shot fetch with no store: every copy found gets its body fetched.
+fn no_known_copies(_mailbox: &str, _uidvalidity: u32, _range: (u32, u32)) -> Result<Vec<u32>> {
+    Ok(Vec::new())
+}
+
 /// Messages, flag updates, and vanished copies to apply to the local store.
 ///
 /// Removals drop server copies only. The folders they backed come off the
@@ -115,9 +126,13 @@ pub trait MailBackend {
     }
 
     /// Persist each bounded delta as it is produced. The default fetches once.
+    ///
+    /// `known` names the copies the store holds; their bodies are not fetched
+    /// again, only their flags.
     fn sync_changes(
         &self,
         cursor: Option<&SyncCursor>,
+        _known: &KnownCopies<'_>,
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
         persist(self.fetch_changes(cursor)?)
@@ -198,9 +213,10 @@ impl MailBackend for BridgeBackend {
     fn sync_changes(
         &self,
         cursor: Option<&SyncCursor>,
+        known: &KnownCopies<'_>,
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
-        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, persist)
+        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, known, persist)
     }
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
@@ -258,9 +274,10 @@ impl MailBackend for ImapBackend {
     fn sync_changes(
         &self,
         cursor: Option<&SyncCursor>,
+        known: &KnownCopies<'_>,
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
-        crate::imap::fetch_imap(&self.account_id, &self.config, cursor, persist)
+        crate::imap::fetch_imap(&self.account_id, &self.config, cursor, known, persist)
     }
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
@@ -344,7 +361,7 @@ fn collect_imap(
     cursor: Option<&SyncCursor>,
 ) -> Result<MailboxDelta> {
     let mut combined = MailboxDelta::default();
-    crate::imap::fetch_imap(account_id, config, cursor, |mut delta| {
+    crate::imap::fetch_imap(account_id, config, cursor, &no_known_copies, |mut delta| {
         combined.messages.append(&mut delta.messages);
         combined.flags.append(&mut delta.flags);
         combined.removals.append(&mut delta.removals);

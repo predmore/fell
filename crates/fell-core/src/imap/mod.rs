@@ -32,7 +32,9 @@ use std::fmt;
 
 use crate::Error;
 use crate::account::AccountId;
-use crate::backend::{FlagUpdate, FolderRemoval, MailboxDelta, RemovalKind, Settle, SyncCursor};
+use crate::backend::{
+    FlagUpdate, FolderRemoval, KnownCopies, MailboxDelta, RemovalKind, Settle, SyncCursor,
+};
 use crate::folders::{FolderRole, FolderRoles, ListedMailbox};
 use crate::message::{Message, RemoteId};
 
@@ -40,6 +42,10 @@ use crate::message::{Message, RemoteId};
 /// written in several deltas so the cursor can move before the FETCH ends.
 const BATCH_MESSAGES: usize = 32;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Flag updates held before they are persisted.
+const BATCH_FLAGS: usize = 5_000;
+/// UIDs named in one `UID FETCH` of bodies, so the command line stays short.
+const UIDS_PER_FETCH: usize = 250;
 
 /// Messages per `UID SEARCH` page of a removal listing.
 const LIST_PAGE: u32 = 5_000;
@@ -172,6 +178,7 @@ pub(crate) fn fetch_imap(
     account_id: &AccountId,
     config: &ImapConfig,
     cursor: Option<&SyncCursor>,
+    known: &KnownCopies<'_>,
     mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if config.username.is_empty() {
@@ -241,17 +248,24 @@ pub(crate) fn fetch_imap(
         let uidnext = examined.uidnext;
         let highest_modseq = examined.highest_modseq;
         let exists = examined.exists;
+        let escaped = escape_mailbox(&mailbox.raw);
         let mut batch = Vec::new();
         let mut batch_bytes = 0usize;
+        // Flags of copies already stored, whose bodies were not fetched.
+        let mut pending_flags = Vec::new();
         let mut highest: Option<u32> = None;
+        // Stored copies count toward the checkpoint only once the fetch is
+        // done: a body still to come may have a lower UID.
+        let mut stored_highest: Option<u32> = None;
         let mut min_unparsed: Option<u32> = None;
         let flush_batch = |batch: &mut Vec<Message>,
                            batch_bytes: &mut usize,
+                           flags: &mut Vec<FlagUpdate>,
                            highest: Option<u32>,
                            persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
                            done: &HashMap<String, MailboxCheckpoint>|
          -> Result<(), Error> {
-            if batch.is_empty() {
+            if batch.is_empty() && flags.is_empty() {
                 return Ok(());
             }
             let uid = checkpoint_uid(previous_owned.as_ref(), same_validity, highest);
@@ -278,13 +292,38 @@ pub(crate) fn fetch_imap(
                 },
                 Some((&mailbox.raw, &current)),
                 std::mem::take(batch),
-                Vec::new(),
+                std::mem::take(flags),
                 Vec::new(),
             )?;
             *batch_bytes = 0;
             Ok(())
         };
-        let stop = stream_bodies(&mut session, &plan, |item| {
+        let copies = Copies {
+            mailbox: &escaped,
+            uidvalidity,
+            known,
+        };
+        let stop = stream_bodies(&mut session, &plan, &copies, |streamed| {
+            let item = match streamed {
+                Streamed::Stored { uid, flags } => {
+                    if seen_through.is_none_or(|floor| uid > floor) {
+                        stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
+                    }
+                    pending_flags.push(flag_update(uidvalidity, uid, &escaped, &flags));
+                    if pending_flags.len() >= BATCH_FLAGS {
+                        flush_batch(
+                            &mut batch,
+                            &mut batch_bytes,
+                            &mut pending_flags,
+                            capped_highest(highest, min_unparsed),
+                            &mut persist,
+                            &done,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                Streamed::Fetched(item) => item,
+            };
             let counts = seen_through.is_none_or(|floor| item.uid > floor);
             if counts && item.body_missing {
                 min_unparsed = Some(min_unparsed.map_or(item.uid, |uid| uid.min(item.uid)));
@@ -309,6 +348,7 @@ pub(crate) fn fetch_imap(
                 flush_batch(
                     &mut batch,
                     &mut batch_bytes,
+                    &mut pending_flags,
                     capped_highest(highest, min_unparsed),
                     &mut persist,
                     &done,
@@ -317,10 +357,15 @@ pub(crate) fn fetch_imap(
             Ok(())
         })?;
         let (finished, min_skipped) = match stop {
-            session::FetchStop::Done => (true, None),
+            session::FetchStop::Done => {
+                if let Some(top) = stored_highest {
+                    highest = Some(highest.map_or(top, |current| current.max(top)));
+                }
+                (true, None)
+            }
             session::FetchStop::Refused => {
                 complete = false;
-                if batch.is_empty() && highest.is_none() {
+                if batch.is_empty() && highest.is_none() && pending_flags.is_empty() {
                     if let Some(prev) = previous_owned.clone() {
                         done.insert(mailbox.raw.clone(), prev);
                         emit_progress(
@@ -343,7 +388,7 @@ pub(crate) fn fetch_imap(
             }
             session::FetchStop::Truncated { min_skipped_uid } => (false, min_skipped_uid),
         };
-        let mut flags = Vec::new();
+        let mut flags = std::mem::take(&mut pending_flags);
         let mut flags_complete = true;
         let needs_baseline = finished
             && same_validity
@@ -356,16 +401,7 @@ pub(crate) fn fetch_imap(
             match session.uid_flags("1:*") {
                 Ok(rows) => {
                     for (uid, flag_names) in rows {
-                        let unread = !flag_names
-                            .iter()
-                            .any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
-                        flags.push(FlagUpdate {
-                            remote_id: RemoteId(format!(
-                                "imap:{uidvalidity}:{uid}:{}",
-                                escape_mailbox(&mailbox.raw)
-                            )),
-                            unread,
-                        });
+                        flags.push(flag_update(uidvalidity, uid, &escaped, &flag_names));
                     }
                 }
                 Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
@@ -665,37 +701,175 @@ fn capped_highest(highest: Option<u32>, min_unparsed: Option<u32>) -> Option<u32
     }
 }
 
+/// The copies of one mailbox the store already holds.
+struct Copies<'a> {
+    /// Escaped, as remote ids spell it.
+    mailbox: &'a str,
+    uidvalidity: u32,
+    known: &'a KnownCopies<'a>,
+}
+
+impl Copies<'_> {
+    fn stored(&self, low: u32, high: u32) -> Result<Vec<u32>, Error> {
+        (self.known)(self.mailbox, self.uidvalidity, (low, high))
+    }
+}
+
+/// One message a sync fetch reports.
+enum Streamed {
+    /// Not stored yet: fetched with its body.
+    Fetched(session::Fetched),
+    /// Stored already: only its flags were fetched.
+    Stored { uid: u32, flags: Vec<String> },
+}
+
+/// Report every message `plan` covers, fetching a body only for a UID the
+/// store has no copy of.
+///
+/// A CONDSTORE pass asks for flags alone (`UID FLAGS`, `CHANGEDSINCE`), then
+/// for the bodies of the UIDs it named that are not stored: new mail, or a
+/// copy skipped before (flagged `\Deleted` then). A high-water or full pass
+/// streams bodies in one command when nothing at or above its start is
+/// stored, as on a first sync; otherwise it goes the same way, so a
+/// checkpoint left low by an unreadable body never downloads known mail
+/// again. A pass without UIDNEXT always does.
 fn stream_bodies(
     session: &mut session::Session,
     plan: &FetchPlan,
-    mut on_fetched: impl FnMut(session::Fetched) -> Result<(), Error>,
+    copies: &Copies<'_>,
+    mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
 ) -> Result<session::FetchStop, Error> {
-    match plan {
-        FetchPlan::Idle => Ok(session::FetchStop::Done),
-        FetchPlan::ChangedSince(modseq) => session.uid_fetch_each("1:*", Some(*modseq), on_fetched),
-        FetchPlan::HighWater { start } => {
-            session.uid_fetch_each(&format!("{start}:*"), None, on_fetched)
+    let start = match plan {
+        FetchPlan::Idle => return Ok(session::FetchStop::Done),
+        FetchPlan::ChangedSince(modseq) => {
+            return flags_then_bodies(session, 1, Some(*modseq), copies, on_fetched);
         }
-        FetchPlan::Full => session.uid_fetch_each("1:*", None, on_fetched),
         FetchPlan::Discover { start } => {
-            let found = match session.uid_find(&format!("{start}:*")) {
-                Ok(uids) => uids,
-                Err(err) if untagged_overflow(&err) => {
-                    return Ok(session::FetchStop::Truncated {
-                        min_skipped_uid: None,
-                    });
-                }
-                Err(err) if uid_fetch_refused(&err) => return Ok(session::FetchStop::Refused),
-                Err(err) => return Err(err),
-            };
-            for uid in found.into_iter().filter(|uid| *uid >= *start) {
-                match session.uid_fetch_each(&uid.to_string(), None, &mut on_fetched)? {
-                    session::FetchStop::Done => {}
-                    other => return Ok(other),
-                }
-            }
-            Ok(session::FetchStop::Done)
+            return flags_then_bodies(session, *start, None, copies, on_fetched);
         }
+        FetchPlan::Full => 1,
+        FetchPlan::HighWater { start } => *start,
+    };
+    if !copies.stored(start, u32::MAX)?.is_empty() {
+        return flags_then_bodies(session, start, None, copies, on_fetched);
+    }
+    session.uid_fetch_each(
+        &format!("{start}:*"),
+        None,
+        session::FetchItems::Bodies,
+        |item| on_fetched(Streamed::Fetched(item)),
+    )
+}
+
+/// `UID FETCH start:* (UID FLAGS)`, then `BODY.PEEK[]` by UID for what the
+/// store does not hold. Stored copies are reported before any body.
+///
+/// A body fetch that stops early ends as `Truncated` at the lowest UID it
+/// did not deliver, so the checkpoint stays below it.
+fn flags_then_bodies(
+    session: &mut session::Session,
+    start: u32,
+    changed_since: Option<u64>,
+    copies: &Copies<'_>,
+    mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
+) -> Result<session::FetchStop, Error> {
+    let mut rows: Vec<(u32, Vec<String>)> = Vec::new();
+    let listed = session.uid_fetch_each(
+        &format!("{start}:*"),
+        changed_since,
+        session::FetchItems::Flags,
+        |item| {
+            // `n:*` names the highest UID even when it is below `n`.
+            if item.uid >= start {
+                rows.push((item.uid, item.flags));
+            }
+            Ok(())
+        },
+    )?;
+    let cut = match listed {
+        session::FetchStop::Done => None,
+        session::FetchStop::Refused => return Ok(session::FetchStop::Refused),
+        session::FetchStop::Truncated { min_skipped_uid } => Some(min_skipped_uid),
+    };
+    rows.sort_by_key(|(uid, _)| *uid);
+    rows.dedup_by_key(|(uid, _)| *uid);
+    let stored = match (rows.first(), rows.last()) {
+        (Some((low, _)), Some((high, _))) => copies.stored(*low, *high)?,
+        _ => Vec::new(),
+    };
+    let mut wanted = Vec::new();
+    for (uid, flags) in rows {
+        if stored.binary_search(&uid).is_ok() {
+            on_fetched(Streamed::Stored { uid, flags })?;
+        } else if rfc822::is_deleted(&flags) {
+            // Not stored either way, so its body is not worth the bytes.
+            on_fetched(Streamed::Fetched(session::Fetched {
+                uid,
+                flags,
+                body: Vec::new(),
+                skipped: false,
+                body_missing: false,
+            }))?;
+        } else {
+            wanted.push(uid);
+        }
+    }
+    for (index, chunk) in wanted.chunks(UIDS_PER_FETCH).enumerate() {
+        let mut delivered = Vec::with_capacity(chunk.len());
+        let stop =
+            session.uid_fetch_each(&uid_set(chunk), None, session::FetchItems::Bodies, |item| {
+                delivered.push(item.uid);
+                on_fetched(Streamed::Fetched(item))
+            })?;
+        if !matches!(stop, session::FetchStop::Done) {
+            let first_left = chunk
+                .iter()
+                .find(|uid| !delivered.contains(uid))
+                .or_else(|| wanted.get((index + 1) * UIDS_PER_FETCH))
+                .copied();
+            let listed_from = cut.flatten();
+            let min_skipped_uid = match (first_left, listed_from) {
+                (Some(left), Some(listed)) => Some(left.min(listed)),
+                (left, listed) => left.or(listed),
+            };
+            return Ok(session::FetchStop::Truncated { min_skipped_uid });
+        }
+    }
+    Ok(match cut {
+        None => session::FetchStop::Done,
+        Some(min_skipped_uid) => session::FetchStop::Truncated { min_skipped_uid },
+    })
+}
+
+/// Ascending UIDs as an IMAP set, runs written `low:high`.
+fn uid_set(uids: &[u32]) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < uids.len() {
+        let low = uids[index];
+        let mut high = low;
+        while uids.get(index + 1) == Some(&high.saturating_add(1)) {
+            index += 1;
+            high = uids[index];
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if low == high {
+            out.push_str(&low.to_string());
+        } else {
+            out.push_str(&format!("{low}:{high}"));
+        }
+        index += 1;
+    }
+    out
+}
+
+/// The unread state of one stored copy, from its flags.
+fn flag_update(uidvalidity: u32, uid: u32, escaped: &str, flags: &[String]) -> FlagUpdate {
+    FlagUpdate {
+        remote_id: RemoteId(format!("imap:{uidvalidity}:{uid}:{escaped}")),
+        unread: !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
     }
 }
 
@@ -1128,6 +1302,17 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].1.uid, 40);
         assert_eq!(decoded[0].1.uidnext, None);
+    }
+
+    #[test]
+    fn uid_sets_join_runs() {
+        assert_eq!(uid_set(&[3]), "3");
+        assert_eq!(uid_set(&[1, 2, 3, 7, 9, 10]), "1:3,7,9:10");
+        assert_eq!(
+            uid_set(&[u32::MAX - 1, u32::MAX]),
+            format!("{}:{}", u32::MAX - 1, u32::MAX)
+        );
+        assert_eq!(uid_set(&[]), "");
     }
 
     #[test]

@@ -583,6 +583,19 @@ impl Store {
         Ok(())
     }
 
+    /// UIDs from `low` to `high` with a stored copy in one mailbox (named as
+    /// remote ids spell it) under `uidvalidity`, ascending. Sync asks so it
+    /// never downloads a body the store has.
+    pub fn stored_uids(
+        &self,
+        account_id: &AccountId,
+        mailbox: &str,
+        uidvalidity: u32,
+        range: (u32, u32),
+    ) -> Result<Vec<u32>> {
+        copies::stored_uids(&self.conn, account_id, mailbox, uidvalidity, range)
+    }
+
     /// Re-resolve the threads this transaction's writes touched.
     fn rethread_written(&self, conn: &Connection, account_id: &AccountId) -> Result<()> {
         #[cfg(test)]

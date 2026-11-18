@@ -127,6 +127,30 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
     Ok(())
 }
 
+/// UIDs from `low` to `high` that have a stored copy in `mailbox` (escaped
+/// as remote ids spell it) under `uidvalidity`, ascending.
+pub(super) fn stored_uids(
+    conn: &Connection,
+    account_id: &AccountId,
+    mailbox: &str,
+    uidvalidity: u32,
+    (low, high): (u32, u32),
+) -> Result<Vec<u32>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT uid FROM message_copies
+         WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3
+           AND uid BETWEEN ?4 AND ?5
+         ORDER BY uid",
+    )?;
+    let uids = stmt
+        .query_map(
+            params![account_id.as_str(), mailbox, uidvalidity, low, high],
+            |row| row.get::<_, u32>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(uids)
+}
+
 /// A merge folded `from` into `to`: its copies now back `to`.
 pub(super) fn repoint(
     conn: &Connection,
