@@ -370,7 +370,7 @@ fn walk_message(
     if root.is_multipart() {
         walk_children(root, prefix, cids, depth, out);
     } else {
-        leaf(root, section(prefix, 1), false, cids, depth, out);
+        leaf(root, section(prefix, 1), cids, depth, out);
     }
 }
 
@@ -381,7 +381,6 @@ fn walk_children(
     depth: usize,
     out: &mut Vec<MimePart>,
 ) {
-    let signed = container.is_content_type("multipart", "signed");
     for (index, child) in container.children().enumerate() {
         if out.len() >= MAX_MIME_PARTS {
             return;
@@ -390,7 +389,7 @@ fn walk_children(
         if child.is_multipart() {
             walk_children(child, &number, cids, depth, out);
         } else {
-            leaf(child, number, signed && index == 1, cids, depth, out);
+            leaf(child, number, cids, depth, out);
         }
     }
 }
@@ -406,7 +405,6 @@ fn section(prefix: &str, number: usize) -> String {
 fn leaf(
     part: mail_parser::MessagePart<'_>,
     section: String,
-    signature_slot: bool,
     cids: &HashSet<String>,
     depth: usize,
     out: &mut Vec<MimePart>,
@@ -436,21 +434,18 @@ fn leaf(
         })
         .filter(|id| !id.is_empty() && id.len() <= MAX_PART_NAME)
         .map(str::to_string);
-    let role = if signature_slot || SIGNATURE_TYPES.contains(&mime_type.as_str()) {
-        PartRole::Signature
-    } else if content_id
-        .as_deref()
-        .is_some_and(|id| cids.contains(&id.to_ascii_lowercase()))
-    {
-        PartRole::Inline
-    } else {
-        PartRole::Attachment
-    };
     let disposition = match part.content_disposition() {
         Some(value) if value.ctype().eq_ignore_ascii_case("inline") => Disposition::Inline,
         Some(value) if value.ctype().eq_ignore_ascii_case("attachment") => Disposition::Attachment,
         _ => Disposition::Unspecified,
     };
+    let role = part_role(
+        &mime_type,
+        filename.as_deref(),
+        content_id.as_deref(),
+        disposition,
+        cids,
+    );
     let encoding = match part.encoding() {
         mail_parser::Encoding::Base64 => TransferEncoding::Base64,
         mail_parser::Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
@@ -475,6 +470,35 @@ fn leaf(
         let cids = html.as_deref().map(cid_references).unwrap_or_default();
         walk_message(inner, &section, &cids, depth + 1, out);
     }
+}
+
+/// What a part is to the reader. Anything that is not clearly a signature
+/// or an image the HTML shows stays a file the reader can open: a part is
+/// never hidden on the word of its position or of text in the body alone.
+fn part_role(
+    mime_type: &str,
+    filename: Option<&str>,
+    content_id: Option<&str>,
+    disposition: Disposition,
+    cids: &HashSet<String>,
+) -> PartRole {
+    if SIGNATURE_TYPES.contains(&mime_type) || filename.is_some_and(is_signature_name) {
+        return PartRole::Signature;
+    }
+    let shown = mime_type.starts_with("image/")
+        && disposition != Disposition::Attachment
+        && content_id.is_some_and(|id| cids.contains(&id.to_ascii_lowercase()));
+    if shown {
+        PartRole::Inline
+    } else {
+        PartRole::Attachment
+    }
+}
+
+/// `smime.p7s` and the like, or PGP's `signature.asc`.
+fn is_signature_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".p7s") || lower == "signature.asc"
 }
 
 fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
@@ -516,19 +540,22 @@ pub(crate) fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// The Content-IDs an HTML body names in `cid:` URLs, lowercase and
-/// percent-decoded (RFC 2392).
+/// The Content-IDs an HTML body loads by `cid:` URL (RFC 2392), lowercase
+/// and percent-decoded: as a `src`, `background` or `poster` attribute, or a
+/// CSS `url(...)`. A `cid:` that is only text, or a link the reader would
+/// have to follow, does not count.
 fn cid_references(html: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     let lower = html.to_ascii_lowercase();
     let mut from = 0;
     while let Some(found) = lower[from..].find("cid:") {
-        let start = from + found + 4;
+        let at = from + found;
+        let start = at + 4;
         let end = lower[start..]
             .find(|ch: char| ch.is_whitespace() || "\"'()<>".contains(ch))
             .map_or(lower.len(), |len| start + len);
         let id = percent_decode(&lower[start..end]);
-        if !id.is_empty() && id.len() <= MAX_PART_NAME {
+        if !id.is_empty() && id.len() <= MAX_PART_NAME && loads_url(&lower[..at]) {
             out.insert(id);
         }
         from = end.max(start);
@@ -537,6 +564,30 @@ fn cid_references(html: &str) -> HashSet<String> {
         }
     }
     out
+}
+
+/// Whether the lowercase HTML just before a URL makes that URL something the
+/// page loads: `src=`, `background=`, `poster=` (quoted or not), or `url(`.
+fn loads_url(before: &str) -> bool {
+    let before = before.trim_end_matches(|ch: char| ch.is_ascii_whitespace());
+    let before = before
+        .strip_suffix(['"', '\''])
+        .unwrap_or(before)
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace());
+    if before.ends_with("url(") {
+        return true;
+    }
+    let Some(name) = before.strip_suffix('=') else {
+        return false;
+    };
+    let name = name.trim_end_matches(|ch: char| ch.is_ascii_whitespace());
+    ["src", "background", "poster"].iter().any(|attr| {
+        name.strip_suffix(attr).is_some_and(|rest| {
+            rest.chars()
+                .next_back()
+                .is_none_or(|ch| ch.is_ascii_whitespace() || ch == '"' || ch == '\'' || ch == '/')
+        })
+    })
 }
 
 fn percent_decode(text: &str) -> String {
@@ -1064,7 +1115,7 @@ mod tests {
         assert!(!message.has_attachment, "issue #148");
         assert!(message.attachment_names.is_empty());
 
-        // S/MIME: the second part of multipart/signed, whatever its type.
+        // S/MIME sent as octet-stream: known by its `.p7s` name.
         let smime = String::from_utf8(fixture.raw)
             .unwrap()
             .replace(
@@ -1078,6 +1129,97 @@ mod tests {
         });
         assert_eq!(parts[0].role, PartRole::Signature);
         assert!(!message.has_attachment);
+    }
+
+    /// A related message: HTML `html`, then one part with `part_headers`.
+    fn related_with(html: &str, part_headers: &str) -> (Message, Vec<MimePart>) {
+        let raw = format!(
+            "From: a@x\r\nMessage-ID: <rel2@x>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/related; boundary=\"rel\"\r\n\r\n\
+             --rel\r\nContent-Type: text/html\r\n\r\n{html}\r\n\
+             --rel\r\n{part_headers}\r\nContent-ID: <part@x>\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n{}\r\n--rel--\r\n",
+            mime_fixtures::base64(b"%PDF or PNG")
+        );
+        listed(&MimeFixture {
+            raw: raw.into_bytes(),
+            bytes: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn only_an_image_the_html_loads_is_inline() {
+        let png = "Content-Type: image/png; name=\"logo.png\"";
+        let shown = [
+            "<img src=\"cid:part@x\">",
+            "<img SRC = 'cid:part@x'>",
+            "<td background=cid:part@x>",
+            "<div style=\"background: url(cid:part@x)\">",
+            "<div style=\"background: url( 'cid:part@x' )\">",
+        ];
+        for html in shown {
+            let (message, parts) = related_with(html, png);
+            assert_eq!(parts[0].role, PartRole::Inline, "{html}");
+            assert!(!message.has_attachment, "{html}");
+        }
+        // A cid: the page does not load leaves the image a file to open.
+        let not_shown = [
+            "<p>see cid:part@x</p>",
+            "<a href=\"cid:part@x\">logo</a>",
+            "<img data-src=\"cid:part@x\">",
+            "<img alt=\"cid:part@x\">",
+        ];
+        for html in not_shown {
+            let (message, parts) = related_with(html, png);
+            assert_eq!(parts[0].role, PartRole::Attachment, "{html}");
+            assert_eq!(message.attachment_names, vec!["logo.png"], "{html}");
+        }
+        // An image sent as an attachment stays one, even when the HTML shows it.
+        let (message, parts) = related_with(
+            "<img src=\"cid:part@x\">",
+            "Content-Type: image/png\r\nContent-Disposition: attachment; filename=\"photo.png\"",
+        );
+        assert_eq!(parts[0].role, PartRole::Attachment);
+        assert!(message.has_attachment);
+        // Something other than an image is never hidden as inline.
+        let (message, parts) = related_with(
+            "<img src=\"cid:part@x\">",
+            "Content-Type: application/pdf; name=\"invoice.pdf\"",
+        );
+        assert_eq!(parts[0].role, PartRole::Attachment);
+        assert_eq!(message.attachment_names, vec!["invoice.pdf"]);
+    }
+
+    #[test]
+    fn the_second_part_of_signed_mail_is_a_signature_only_when_it_is_one() {
+        let signed = |headers: &str| {
+            let raw = format!(
+                "From: a@x\r\nMessage-ID: <s2@x>\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: multipart/signed; boundary=\"sig\"; protocol=\"x\"\r\n\r\n\
+                 --sig\r\nContent-Type: text/plain\r\n\r\nsigned text\r\n\
+                 --sig\r\n{headers}\r\n\r\nMIIB\r\n--sig--\r\n"
+            );
+            listed(&MimeFixture {
+                raw: raw.into_bytes(),
+                bytes: Vec::new(),
+            })
+        };
+        let (message, parts) = signed(
+            "Content-Type: application/octet-stream; name=\"invoice.exe\"\r\n\
+             Content-Disposition: attachment; filename=\"invoice.exe\"",
+        );
+        assert_eq!(parts[0].role, PartRole::Attachment);
+        assert_eq!(message.attachment_names, vec!["invoice.exe"]);
+        for headers in [
+            "Content-Type: application/pkcs7-signature",
+            "Content-Type: application/x-pkcs7-signature",
+            "Content-Type: application/octet-stream; name=\"SMIME.P7S\"",
+            "Content-Type: text/plain; name=\"signature.asc\"",
+        ] {
+            let (message, parts) = signed(headers);
+            assert_eq!(parts[0].role, PartRole::Signature, "{headers}");
+            assert!(!message.has_attachment, "{headers}");
+        }
     }
 
     #[test]
