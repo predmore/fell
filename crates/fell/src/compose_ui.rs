@@ -233,6 +233,8 @@ pub struct ComposeView {
     focused_hunk: Option<u64>,
     /// How many agent edits the window has already announced.
     seen_edits: usize,
+    /// The person moved between edits; arrivals then leave focus alone.
+    focus_by_user: bool,
 }
 
 impl ComposeView {
@@ -282,6 +284,7 @@ impl ComposeView {
             bracket: None,
             focused_hunk: None,
             seen_edits: 0,
+            focus_by_user: false,
         }
     }
 
@@ -383,6 +386,7 @@ impl ComposeView {
     /// Move to the next (or previous) agent edit, wrapping around, and put
     /// the cursor on it when it is in the body.
     fn goto_hunk(&mut self, forward: bool) {
+        self.focus_by_user = true;
         let id = self.draft_id.to_string();
         let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
             return;
@@ -433,21 +437,24 @@ impl ComposeView {
             return;
         };
         let order = ordered_hunks(&snap);
+        let arrived = order.len().saturating_sub(self.seen_edits);
+        self.seen_edits = order.len();
+        if order.is_empty() {
+            self.focused_hunk = None;
+            return;
+        }
         let still_there = self
             .focused_hunk
             .is_some_and(|focused| order.iter().any(|(hunk, _)| *hunk == focused));
-        let arrived = order.len() > self.seen_edits;
-        self.seen_edits = order.len();
-        if order.is_empty() || (still_there && !arrived) {
-            if order.is_empty() {
-                self.focused_hunk = None;
-            }
+        if arrived == 0 && still_there {
             return;
         }
-        if !still_there {
+        // Until the person moves between edits, focus is the first edit in
+        // reading order, as opening on edits does. Their cursor stays put.
+        if !still_there || !self.focus_by_user {
             self.focused_hunk = order.first().map(|(hunk, _)| *hunk);
         }
-        if arrived {
+        if arrived > 0 {
             let who = snap
                 .send_requested_by
                 .as_deref()
@@ -457,8 +464,13 @@ impl ComposeView {
                 .focused_hunk
                 .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
                 .unwrap_or(0);
+            let what = if arrived == 1 {
+                "made an edit".to_string()
+            } else {
+                format!("made {arrived} edits")
+            };
             self.status = format!(
-                "{who} edited the draft · edit {} of {} · ]h",
+                "{who} {what} · on edit {} of {} · ]h [h move",
                 at + 1,
                 order.len()
             )
@@ -805,6 +817,7 @@ impl ComposeView {
     }
 
     fn keep_or_reject(&mut self, keep: bool) {
+        self.focus_by_user = true;
         let id = self.draft_id.to_string();
         let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
             return;
@@ -2932,7 +2945,6 @@ fn status_bar(
                     .child(format!("{fresh} first-time")),
             );
         }
-        left = left.child(dot());
     }
     let right = match &snap.send_block {
         Some(reason) => div()

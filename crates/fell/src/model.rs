@@ -144,6 +144,8 @@ pub struct Step {
     pub archive: bool,
     /// Start a sync pass now instead of waiting for the next one.
     pub sync_now: bool,
+    /// Bring back the agent review window that closed last.
+    pub reopen_review: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -630,15 +632,12 @@ impl Session {
         match keymap::match_seq(&self.keymap, &seq) {
             SeqMatch::Action(action) => {
                 self.clear_chord();
-                step.arm_which = true;
-                let ran = self.run(action, page_rows);
-                step.reload_threads |= ran.reload_threads;
-                step.reload_messages |= ran.reload_messages;
-                step.scroll_pages = ran.scroll_pages;
-                step.scroll_lines = ran.scroll_lines;
-                step.apply_move |= ran.apply_move;
-                step.undo |= ran.undo;
-                step.archive |= ran.archive;
+                // Everything the action asked for, so a new Step field cannot
+                // be dropped here (sync_now was, so `space s` did nothing).
+                step = Step {
+                    arm_which: true,
+                    ..self.run(action, page_rows)
+                };
             }
             SeqMatch::Prefix => {
                 self.chord = seq;
@@ -943,6 +942,13 @@ impl Session {
             Action::Help => {
                 self.count.clear();
                 self.overlay = Overlay::Help;
+            }
+            Action::ReopenReview => {
+                self.count.clear();
+                return Step {
+                    reopen_review: true,
+                    ..Step::default()
+                };
             }
         }
         step
@@ -1535,6 +1541,19 @@ mod tests {
         assert!(session.recipients_are_open(0) && session.is_open(0));
         session.toggle_open(0);
         assert!(!session.recipients_are_open(0) && !session.is_open(0));
+    }
+
+    #[test]
+    fn space_a_r_asks_to_reopen_the_agent_review() {
+        let mut session =
+            Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
+        session.on_key(KeyId::Space, 4);
+        session.on_key(KeyId::Char('a'), 4);
+        let step = session.on_key(KeyId::Char('r'), 4);
+        assert!(step.reopen_review);
+        // `space s` reaches the view too.
+        session.on_key(KeyId::Space, 4);
+        assert!(session.on_key(KeyId::Char('s'), 4).sync_now);
     }
 
     fn empty_message(expanded: bool) -> ConvMessage {

@@ -48,6 +48,8 @@ pub struct DraftHub {
     reveals: AtomicU64,
     /// One line per review window that closed, for the inbox to show.
     closed: Mutex<Vec<String>>,
+    /// The draft whose review window closed last, for the inbox to reopen.
+    last_closed: Mutex<Option<String>>,
 }
 
 impl Default for DraftHub {
@@ -66,6 +68,7 @@ impl DraftHub {
             shown_cv: Condvar::new(),
             reveals: AtomicU64::new(0),
             closed: Mutex::new(Vec::new()),
+            last_closed: Mutex::new(None),
         }
     }
 
@@ -166,30 +169,45 @@ impl DraftHub {
             )
         });
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
-            // The outcome comes first, so a narrow status bar cuts the
-            // draft's name, never "not sent".
+            // The outcome comes first and the reopen key next, so a narrow
+            // status bar cuts only the draft's name.
             let name = if subject.trim().is_empty() {
                 String::new()
             } else {
-                let short: String = subject.chars().take(24).collect();
-                let more = if subject.chars().count() > 24 {
+                let short: String = subject.chars().take(18).collect();
+                let more = if subject.chars().count() > 18 {
                     "…"
                 } else {
                     ""
                 };
-                format!(" · review of \u{201c}{short}{more}\u{201d} closed")
+                format!(" · \u{201c}{short}{more}\u{201d}")
             };
             let line = match locked {
                 Some(reason) => format!("{reason}{name}"),
-                None if asked && unreviewed > 0 => format!(
-                    "Not sent · {unreviewed} edit{} unreviewed{name}",
-                    if unreviewed == 1 { "" } else { "s" }
-                ),
-                None => format!("Not sent · draft kept{name}"),
+                None if asked && unreviewed > 0 => {
+                    format!("Not sent · space a r reopen · {unreviewed} unreviewed{name}")
+                }
+                None => format!("Not sent · space a r reopen{name}"),
             };
+            *self.last_closed.lock().expect("last closed") = Some(id.to_string());
             self.closed.lock().expect("closed").push(line);
             self.emit();
         }
+    }
+
+    /// Show the review window that closed last again, as a `request_send`
+    /// would. `false` when there is none, or its draft is gone.
+    pub fn reopen_last(&self) -> bool {
+        let Some(id) = self.last_closed.lock().expect("last closed").clone() else {
+            return false;
+        };
+        if self.with_session(&id, DraftSession::request_send).is_none() {
+            return false;
+        }
+        *self.focused.lock().expect("focused") = Some(id);
+        self.reveals.fetch_add(1, Ordering::SeqCst);
+        self.emit();
+        true
     }
 
     /// Lines about review windows that closed since the last call.
@@ -1036,6 +1054,25 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("Not sent"), "{lines:?}");
         assert!(hub.take_closed().is_empty());
+    }
+
+    #[test]
+    fn the_inbox_can_reopen_the_review_that_closed() {
+        let hub = hub_with_d1("reopen");
+        let _host = hub.subscribe();
+        assert!(!hub.reopen_last(), "nothing has closed yet");
+        request_send_d1(&hub);
+        hub.note_shown("d1");
+        hub.note_hidden("d1");
+        let before = hub.reveal_count();
+        assert!(hub.take_closed()[0].contains("space a r reopen"));
+        assert!(hub.reopen_last());
+        assert_eq!(hub.reveal_count(), before + 1);
+        assert_eq!(hub.focused_id().as_deref(), Some("d1"));
+        assert!(
+            hub.with_session("d1", |session| session.snapshot().open)
+                .unwrap()
+        );
     }
 
     #[test]

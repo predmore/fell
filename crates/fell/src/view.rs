@@ -774,6 +774,14 @@ impl Inbox {
         if step.archive {
             self.archive_current(cx);
         }
+        if step.reopen_review {
+            let reopened = cx
+                .try_global::<crate::draft_host::AgentDrafts>()
+                .is_some_and(|drafts| drafts.0.reopen_last());
+            if !reopened {
+                self.session.show_toast("No agent review to reopen", true);
+            }
+        }
         if step.sync_now {
             match &self.sync {
                 Some(handle) => {
@@ -1926,6 +1934,10 @@ fn body_block(
 fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
     let hint = if !session.chord.is_empty() {
         session.prefix_text()
+    } else if session.toast.is_some() {
+        // A notice takes the hints' room until the next key clears it, so
+        // it is never cut short.
+        String::new()
     } else if session.pane == Pane::Conversation {
         "j k  ·  esc  ·  ctrl-d  ·  space  ·  :".to_string()
     } else {
@@ -1970,6 +1982,9 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
+        .when(session.toast.is_some(), |bar| {
+            bar.child(div().text_color(rgb(theme.dimmed)).child("·"))
+        })
         .child(
             div()
                 .flex_1()
@@ -1988,7 +2003,7 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
                     session
                         .toast
                         .as_ref()
-                        .map(|toast| format!("· {}", toast.text))
+                        .map(|toast| toast.text.clone())
                         .unwrap_or_default(),
                 ),
         )
