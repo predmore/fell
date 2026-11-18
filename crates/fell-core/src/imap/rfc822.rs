@@ -26,6 +26,36 @@ pub(super) fn is_deleted(flags: &[String]) -> bool {
         .any(|flag| flag.eq_ignore_ascii_case("\\Deleted"))
 }
 
+/// The id [`to_message`] would store for this copy, from its headers alone.
+pub(super) fn copy_message_id(
+    mailbox_raw: &str,
+    uidvalidity: u32,
+    uid: u32,
+    headers: &[u8],
+) -> MessageId {
+    let parsed = MessageParser::new().parse_headers(headers);
+    message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid)
+}
+
+/// The Message-ID header, or one made from the UID when there is none.
+fn message_id_or_uid(
+    parsed: Option<&mail_parser::Message<'_>>,
+    mailbox_raw: &str,
+    uidvalidity: u32,
+    uid: u32,
+) -> MessageId {
+    parsed
+        .and_then(|message| message.message_id())
+        .filter(|id| !id.is_empty())
+        .map(MessageId::new)
+        .unwrap_or_else(|| {
+            MessageId::new(format!(
+                "uid.{uidvalidity}.{uid}.{}@imap.fell",
+                escape_mailbox(mailbox_raw)
+            ))
+        })
+}
+
 pub(super) fn to_message(
     account_id: &AccountId,
     mailbox_raw: &str,
@@ -36,17 +66,7 @@ pub(super) fn to_message(
     raw: &[u8],
 ) -> Message {
     let parsed = MessageParser::new().parse(raw);
-    let message_id = parsed
-        .as_ref()
-        .and_then(|message| message.message_id())
-        .filter(|id| !id.is_empty())
-        .map(MessageId::new)
-        .unwrap_or_else(|| {
-            MessageId::new(format!(
-                "uid.{uidvalidity}.{uid}.{}@imap.fell",
-                escape_mailbox(mailbox_raw)
-            ))
-        });
+    let message_id = message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid);
     let in_reply_to = parsed.as_ref().and_then(|message| {
         message
             .in_reply_to()

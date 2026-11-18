@@ -2,8 +2,11 @@
 //!
 //! The session lists mailboxes, examines them, and fetches with `BODY.PEEK`
 //! so the server is not asked to mark mail read. There is no SMTP, no OAuth,
-//! and no send command. INBOX IDLE is read-only too. Removal of vanished
-//! messages is later work.
+//! and no send command. INBOX IDLE is read-only too.
+//!
+//! Each pass also reports server copies that left a mailbox: `VANISHED`
+//! when QRESYNC is on, otherwise a paged `UID SEARCH` of the mailbox that
+//! the store compares with the copies it recorded.
 
 mod rfc822;
 mod session;
@@ -21,13 +24,18 @@ use std::fmt;
 
 use crate::Error;
 use crate::account::AccountId;
-use crate::backend::{FlagUpdate, MailboxDelta, SyncCursor};
+use crate::backend::{FlagUpdate, FolderRemoval, MailboxDelta, RemovalKind, Settle, SyncCursor};
 use crate::message::{Message, RemoteId};
 
 /// Messages held in memory before they are persisted. A larger mailbox is
 /// written in several deltas so the cursor can move before the FETCH ends.
 const BATCH_MESSAGES: usize = 32;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Messages per `UID SEARCH` page of a removal listing.
+const LIST_PAGE: u32 = 5_000;
+/// Messages per header page when a listing also learns Message-IDs.
+const FOUND_PAGE: u32 = 500;
 
 fn batch_message_limit() -> usize {
     #[cfg(test)]
@@ -170,9 +178,13 @@ pub(crate) fn fetch_imap(
     });
     let prior: HashMap<String, MailboxCheckpoint> = decode_cursor(cursor).into_iter().collect();
     let mut done: HashMap<String, MailboxCheckpoint> = HashMap::new();
+    // Every mailbox was read to the end, so a copy moved on the server has
+    // arrived wherever it went.
+    let mut complete = true;
     for mailbox in &mailboxes {
         let previous = prior.get(&mailbox.raw);
         let Some(examined) = session.examine(&mailbox.raw)? else {
+            complete = false;
             if let Some(prev) = previous {
                 done.insert(mailbox.raw.clone(), prev.clone());
                 emit_progress(
@@ -186,6 +198,7 @@ pub(crate) fn fetch_imap(
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 )?;
             }
             continue;
@@ -197,6 +210,10 @@ pub(crate) fn fetch_imap(
             .is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
         // High-water body fetches ignore UIDs already at the checkpoint.
         // CHANGEDSINCE results are kept so an older flag update is applied.
+        let carried_pruned = previous_owned
+            .as_ref()
+            .filter(|_| same_validity)
+            .and_then(|prev| prev.pruned);
         let seen_through = match (previous_owned.as_ref(), &plan) {
             (Some(prev), FetchPlan::HighWater { .. } | FetchPlan::Discover { .. })
                 if same_validity =>
@@ -234,6 +251,7 @@ pub(crate) fn fetch_imap(
                 modseq,
                 // Mid-pass: the mailbox is not caught up yet.
                 uidnext: None,
+                pruned: carried_pruned,
             };
             emit_progress(
                 persist,
@@ -245,6 +263,7 @@ pub(crate) fn fetch_imap(
                 },
                 Some((&mailbox.raw, &current)),
                 std::mem::take(batch),
+                Vec::new(),
                 Vec::new(),
             )?;
             *batch_bytes = 0;
@@ -285,6 +304,7 @@ pub(crate) fn fetch_imap(
         let (finished, min_skipped) = match stop {
             session::FetchStop::Done => (true, None),
             session::FetchStop::Refused => {
+                complete = false;
                 if batch.is_empty() && highest.is_none() {
                     if let Some(prev) = previous_owned.clone() {
                         done.insert(mailbox.raw.clone(), prev);
@@ -297,6 +317,7 @@ pub(crate) fn fetch_imap(
                                 done: &done,
                             },
                             None,
+                            Vec::new(),
                             Vec::new(),
                             Vec::new(),
                         )?;
@@ -376,12 +397,33 @@ pub(crate) fn fetch_imap(
         } else {
             None
         };
+        let clean = finished && min_unparsed.is_none();
+        complete &= clean;
+        let tracked = if clean {
+            track_removals(
+                &mut session,
+                mailbox,
+                Seen {
+                    uidvalidity,
+                    uidnext,
+                    exists,
+                },
+                previous_owned.as_ref().filter(|_| same_validity),
+                &plan,
+            )?
+        } else {
+            Tracked {
+                removals: Vec::new(),
+                pruned: carried_pruned,
+            }
+        };
         let current = MailboxCheckpoint {
             uidvalidity,
             uid,
             modseq,
             // What a finished pass saw, so IDLE can tell later mail apart.
             uidnext: if finished { uidnext } else { None },
+            pruned: tracked.pruned,
         };
         emit_progress(
             &mut persist,
@@ -394,11 +436,166 @@ pub(crate) fn fetch_imap(
             Some((&mailbox.raw, &current)),
             std::mem::take(&mut batch),
             flags,
+            tracked.removals,
         )?;
         done.insert(mailbox.raw.clone(), current);
     }
+    // Folders whose last copy vanished come off rows only now, after every
+    // mailbox had its chance to add the copy a server move made.
+    persist(MailboxDelta {
+        settle: if complete {
+            Settle::All
+        } else {
+            Settle::KeepRows
+        },
+        ..MailboxDelta::default()
+    })?;
     session.logout();
     Ok(())
+}
+
+/// What EXAMINE reported for the mailbox being synced.
+#[derive(Clone, Copy)]
+struct Seen {
+    uidvalidity: u32,
+    uidnext: Option<u32>,
+    exists: u32,
+}
+
+struct Tracked {
+    removals: Vec<FolderRemoval>,
+    /// For the checkpoint: `(EXISTS, UIDNEXT)` when removals were last fully
+    /// reported, or the previous pair when this pass could not.
+    pruned: Option<(u32, u32)>,
+}
+
+/// Report the copies that left this mailbox since the last pass.
+///
+/// With QRESYNC on, the CHANGEDSINCE fetch already carried `VANISHED
+/// (EARLIER)`. Otherwise the mailbox is listed by sequence number in pages.
+/// A listing counts only when no expunge arrived while it ran and it holds
+/// one ascending UID per message EXAMINE counted; anything else waits for
+/// the next pass. When EXISTS and UIDNEXT match the last full listing,
+/// nothing was added or removed, so no listing is sent. The first listing of
+/// a mailbox also fetches Message-ID headers (`BODY.PEEK`), so copies of
+/// mail synced before copies were recorded are known before anything is
+/// judged gone.
+fn track_removals(
+    session: &mut session::Session,
+    mailbox: &session::Listed,
+    seen: Seen,
+    previous: Option<&MailboxCheckpoint>,
+    plan: &FetchPlan,
+) -> Result<Tracked, Error> {
+    let escaped = escape_mailbox(&mailbox.raw);
+    let removal = |kind| FolderRemoval {
+        mailbox: escaped.clone(),
+        folder: mailbox.decoded.clone(),
+        kind,
+    };
+    let mut removals = Vec::new();
+    let vanished = session.take_vanished();
+    if !vanished.is_empty() {
+        removals.push(removal(RemovalKind::Vanished {
+            uidvalidity: seen.uidvalidity,
+            ranges: vanished,
+        }));
+    }
+    let carried = previous.and_then(|prev| prev.pruned);
+    let snapshot = (seen.exists, seen.uidnext.unwrap_or(0));
+    if carried.is_some() && session.qresync() && matches!(plan, FetchPlan::ChangedSince(_)) {
+        return Ok(Tracked {
+            removals,
+            pruned: Some(snapshot),
+        });
+    }
+    if session.saw_expunge() || (seen.uidnext.is_some() && carried == Some(snapshot)) {
+        return Ok(Tracked {
+            removals,
+            pruned: carried,
+        });
+    }
+    let discover = carried.is_none() && !matches!(plan, FetchPlan::Full);
+    let Some((present, found)) = list_mailbox(session, mailbox, seen, discover)? else {
+        return Ok(Tracked {
+            removals,
+            pruned: carried,
+        });
+    };
+    // Every UID below UIDNEXT was assigned before EXAMINE, so a stored copy
+    // at or below it that is not listed was expunged. Mail that arrived
+    // later is not judged.
+    let through = match seen.uidnext {
+        Some(next) => next.saturating_sub(1),
+        None => present
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .max(previous.map_or(0, |prev| prev.uid)),
+    };
+    removals.push(removal(RemovalKind::Listing {
+        uidvalidity: seen.uidvalidity,
+        present,
+        through,
+        found,
+        sweep: carried.is_none(),
+    }));
+    Ok(Tracked {
+        removals,
+        pruned: Some(snapshot),
+    })
+}
+
+type Listing = (Vec<u32>, Vec<(u32, crate::MessageId)>);
+
+/// Every UID in the mailbox, and with `discover` each copy's Message-ID.
+/// `None` when the server refused, or the listing cannot be trusted.
+fn list_mailbox(
+    session: &mut session::Session,
+    mailbox: &session::Listed,
+    seen: Seen,
+    discover: bool,
+) -> Result<Option<Listing>, Error> {
+    let page = if discover { FOUND_PAGE } else { LIST_PAGE };
+    let mut present = Vec::new();
+    let mut found = Vec::new();
+    let mut first = 1u32;
+    while first <= seen.exists {
+        let last = first.saturating_add(page - 1).min(seen.exists);
+        let listed = if discover {
+            session.fetch_message_ids(first, last).map(|rows| {
+                rows.map(|rows| {
+                    let mut uids = Vec::with_capacity(rows.len());
+                    for (uid, headers) in rows {
+                        let id =
+                            rfc822::copy_message_id(&mailbox.raw, seen.uidvalidity, uid, &headers);
+                        found.push((uid, id));
+                        uids.push(uid);
+                    }
+                    uids
+                })
+            })
+        } else {
+            session.uid_search_seq(first, last)
+        };
+        match listed {
+            Ok(Some(mut uids)) => present.append(&mut uids),
+            Ok(None) => return Ok(None),
+            Err(err) if untagged_overflow(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        if last == seen.exists {
+            break;
+        }
+        first = last + 1;
+    }
+    // Sequence numbers shift under an expunge, so a page could skip a UID
+    // that is still there.
+    let ordered = present.windows(2).all(|pair| pair[0] < pair[1]);
+    if session.saw_expunge() || present.len() != seen.exists as usize || !ordered {
+        return Ok(None);
+    }
+    Ok(Some((present, found)))
 }
 
 fn capped_highest(highest: Option<u32>, min_unparsed: Option<u32>) -> Option<u32> {
@@ -459,6 +656,7 @@ fn emit_progress(
     current: Option<(&str, &MailboxCheckpoint)>,
     messages: Vec<Message>,
     flags: Vec<FlagUpdate>,
+    removals: Vec<FolderRemoval>,
 ) -> Result<(), Error> {
     let mut pairs = Vec::new();
     for mailbox in snapshot.listed {
@@ -482,6 +680,8 @@ fn emit_progress(
         messages,
         flags,
         cursor: Some(encode_cursor(snapshot.account_id.as_str(), &pairs)),
+        removals,
+        settle: Settle::Later,
     })
 }
 
@@ -624,6 +824,10 @@ pub struct MailboxCheckpoint {
     /// so `uid + 1` is not a stand-in. `None` for cursors from before this
     /// field and for passes that stopped early.
     pub uidnext: Option<u32>,
+    /// `(EXISTS, UIDNEXT)` when a pass last reported every copy that left
+    /// this mailbox. `None` until the first such pass. UIDNEXT is 0 when the
+    /// server omitted it.
+    pub pruned: Option<(u32, u32)>,
 }
 
 /// Decode a sync cursor written by [`encode_cursor`].
@@ -669,6 +873,16 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 None => return Vec::new(),
             },
         };
+        let pruned = match parts.next() {
+            None | Some("-") => None,
+            Some(raw) => match raw
+                .split_once('/')
+                .and_then(|(exists, next)| Some((exists.parse().ok()?, next.parse().ok()?)))
+            {
+                Some(pair) => Some(pair),
+                None => return Vec::new(),
+            },
+        };
         if parts.next().is_some() {
             return Vec::new();
         }
@@ -679,6 +893,7 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 uid,
                 modseq,
                 uidnext,
+                pruned,
             },
         ));
     }
@@ -707,11 +922,45 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
         );
+        token.push('\t');
+        token.push_str(
+            &checkpoint
+                .pruned
+                .map(|(exists, next)| format!("{exists}/{next}"))
+                .unwrap_or_else(|| "-".into()),
+        );
     }
     SyncCursor {
         account_key: account_key.to_string(),
         token,
     }
+}
+
+/// One server copy, as an IMAP remote id names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteCopy {
+    /// Escaped like the remote id, so it compares with [`FolderRemoval::mailbox`].
+    ///
+    /// [`FolderRemoval::mailbox`]: crate::backend::FolderRemoval::mailbox
+    pub mailbox: String,
+    pub uidvalidity: u32,
+    pub uid: u32,
+    /// The folder name this copy adds to a row.
+    pub folder: String,
+}
+
+/// Parse `imap:{uidvalidity}:{uid}:{mailbox}`. Any other id is not a copy.
+pub(crate) fn parse_remote_id(raw: &str) -> Option<RemoteCopy> {
+    let rest = raw.strip_prefix("imap:")?;
+    let (uidvalidity, rest) = rest.split_once(':')?;
+    let (uid, mailbox) = rest.split_once(':')?;
+    let name = unescape_mailbox(mailbox)?;
+    Some(RemoteCopy {
+        mailbox: mailbox.to_string(),
+        uidvalidity: uidvalidity.parse().ok()?,
+        uid: uid.parse().ok()?,
+        folder: utf7::decode_modified_utf7(&name),
+    })
 }
 
 pub(super) fn escape_mailbox(name: &str) -> String {
@@ -763,6 +1012,7 @@ mod tests {
                     uid: 40,
                     modseq: Some(12),
                     uidnext: None,
+                    pruned: None,
                 },
             ),
             (
@@ -772,6 +1022,7 @@ mod tests {
                     uid: 0,
                     modseq: None,
                     uidnext: None,
+                    pruned: None,
                 },
             ),
         ];
@@ -789,6 +1040,7 @@ mod tests {
                 uid: 40,
                 modseq: None,
                 uidnext: Some(77),
+                pruned: Some((12, 77)),
             },
         )];
         let cursor = encode_cursor("acct", &mailboxes);

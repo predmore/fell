@@ -20,6 +20,7 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
+mod copies;
 pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
@@ -381,6 +382,7 @@ impl Store {
         ensure_message_columns(&conn)?;
         ensure_compose_columns(&conn)?;
         ensure_alias_columns(&conn)?;
+        copies::ensure_copies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
                 ON messages(account_id, body_fingerprint);
@@ -541,7 +543,9 @@ impl Store {
                 ],
             )?;
         }
-        if !delta.messages.is_empty() {
+        copies::apply_removals(&tx, account_id, &delta.removals)?;
+        let settled = copies::settle(&tx, account_id, delta.settle)?;
+        if !delta.messages.is_empty() || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -584,42 +588,12 @@ impl Store {
     /// transaction that deletes the row. `false` means the message was not stored.
     pub fn delete_message(&self, account_id: &AccountId, message_id: &MessageId) -> Result<bool> {
         let tx = immediate_transaction(&self.conn)?;
-        let Some((stored, _)) = find_stored(&tx, account_id, message_id)? else {
+        let Some(removed) = delete_stored(&tx, account_id, message_id)? else {
             tx.rollback()?;
             return Ok(false);
         };
-        let old_terms = terms_for_indexed(IndexedText {
-            subject: &stored.subject,
-            from_name: stored.from_name.as_deref(),
-            from_email: &stored.from_email,
-            body: &stored.body,
-            to_line: &stored.to_line,
-            cc_line: &stored.cc_line,
-            bcc_line: &stored.bcc_line,
-            folders: &stored.folders,
-            labels: &stored.labels,
-        });
-        sync_terms(&tx, account_id.as_str(), &old_terms, &HashSet::new())?;
-        remove_message_embedding(&tx, account_id.as_str(), message_id.as_str())?;
-        dequeue_message(&tx, account_id.as_str(), message_id.as_str())?;
-        let removed = tx.execute(
-            "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id.as_str(), stored.canonical_id],
-        )?;
-        tx.execute(
-            "DELETE FROM message_aliases
-             WHERE account_id = ?1
-               AND (message_id = ?2 OR canonical_message_id = ?2 OR message_id = ?3)",
-            params![
-                account_id.as_str(),
-                stored.canonical_id,
-                message_id.as_str()
-            ],
-        )?;
-        sent_bcc::forget_if_gone(&tx, account_id, &stored.canonical_id)?;
-        sent_bcc::forget_if_gone(&tx, account_id, message_id.as_str())?;
         tx.commit()?;
-        Ok(removed > 0)
+        Ok(removed)
     }
 
     /// Vector stored for this message body, if the indexer has written one.
@@ -1463,6 +1437,12 @@ fn thread_id_for_message_id(
 }
 
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
+    let thread = insert_arrival(conn, message)?;
+    copies::record(conn, message)?;
+    Ok(thread)
+}
+
+fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -1836,6 +1816,53 @@ fn map_arrival(row: &rusqlite::Row<'_>) -> rusqlite::Result<Arrival> {
     })
 }
 
+/// Delete a stored message with its search postings, body vector, queue
+/// entry, aliases, and server copies. `message_id` may be an alias of the row.
+/// `None` means nothing was stored under it.
+fn delete_stored(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &MessageId,
+) -> Result<Option<bool>> {
+    let Some((stored, _)) = find_stored(conn, account_id, message_id)? else {
+        return Ok(None);
+    };
+    let old_terms = terms_for_indexed(IndexedText {
+        subject: &stored.subject,
+        from_name: stored.from_name.as_deref(),
+        from_email: &stored.from_email,
+        body: &stored.body,
+        to_line: &stored.to_line,
+        cc_line: &stored.cc_line,
+        bcc_line: &stored.bcc_line,
+        folders: &stored.folders,
+        labels: &stored.labels,
+    });
+    sync_terms(conn, account_id.as_str(), &old_terms, &HashSet::new())?;
+    for id in [stored.canonical_id.as_str(), message_id.as_str()] {
+        remove_message_embedding(conn, account_id.as_str(), id)?;
+        dequeue_message(conn, account_id.as_str(), id)?;
+    }
+    let removed = conn.execute(
+        "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), stored.canonical_id],
+    )?;
+    conn.execute(
+        "DELETE FROM message_aliases
+         WHERE account_id = ?1
+           AND (message_id = ?2 OR canonical_message_id = ?2 OR message_id = ?3)",
+        params![
+            account_id.as_str(),
+            stored.canonical_id,
+            message_id.as_str()
+        ],
+    )?;
+    copies::forget(conn, account_id, &stored.canonical_id)?;
+    sent_bcc::forget_if_gone(conn, account_id, &stored.canonical_id)?;
+    sent_bcc::forget_if_gone(conn, account_id, message_id.as_str())?;
+    Ok(Some(removed > 0))
+}
+
 fn find_stored(
     conn: &Connection,
     account_id: &AccountId,
@@ -1962,6 +1989,12 @@ fn absorb_duplicate(
             message.account_id.as_str(),
             doomed.canonical_id,
         ],
+    )?;
+    copies::repoint(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
     )?;
     Ok(thread)
 }
@@ -3321,6 +3354,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3331,6 +3365,7 @@ mod tests {
                     messages: vec![msg("root@x", Some("conv-9"), None, "Root", "root")],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3354,6 +3389,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3377,6 +3413,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3412,6 +3449,7 @@ mod tests {
                         token: "cursor-only".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3443,6 +3481,7 @@ mod tests {
                         token: "should-not-stick".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap_err();
@@ -3479,6 +3518,7 @@ mod tests {
                         token: "must-not-advance".into(),
                     }),
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap_err();
@@ -3630,6 +3670,7 @@ mod tests {
                     ],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -3698,6 +3739,7 @@ mod tests {
                     messages: vec![sent, alias_a, alias_b],
                     cursor: None,
                     flags: Vec::new(),
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
@@ -6000,6 +6042,7 @@ mod tests {
                         unread: false,
                     }],
                     cursor: None,
+                    ..MailboxDelta::default()
                 },
             )
             .unwrap();
