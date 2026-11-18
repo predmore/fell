@@ -577,7 +577,21 @@ impl ComposeView {
                 match outcome {
                     Ok(_) => {
                         this.sent = true;
-                        this.status = "Sent from the editor".into();
+                        let id = this.draft_id.to_string();
+                        let unrecorded = this
+                            .hub
+                            .with_session(&id, |session| {
+                                session.snapshot().notices.iter().any(|notice| {
+                                    notice.starts_with("could not record how this send ended")
+                                })
+                            })
+                            .unwrap_or(false);
+                        this.status = if unrecorded {
+                            "Sent; the mailbox did not record it, so this draft will read as possibly sent"
+                        } else {
+                            "Sent from the editor"
+                        }
+                        .into();
                     }
                     Err(err) => {
                         this.sent = matches!(err, SendFailure::MaybeSent(_));
@@ -1349,7 +1363,14 @@ pub fn prepare_from_editor(
         })
         .collect();
     let sent_bcc = session.sent_bcc(&outgoing);
-    session.begin_send().map_err(SendFailure::NotSent)?;
+    if let Err(err) = session.begin_send() {
+        // A lock only the mailbox knew of stays a lock; anything else (the
+        // claim could not be recorded) sent nothing.
+        return Err(match session.send_lock() {
+            Some(lock) => SendFailure::Locked(lock),
+            None => SendFailure::NotSent(err),
+        });
+    }
     Ok(PreparedSend {
         account: session.account_id().clone(),
         outgoing,
@@ -2555,6 +2576,21 @@ pub fn open_demo(
         fields,
         demo_body(),
     )?;
+    // A send is recorded in the mailbox before it starts, so the demo draft
+    // gets a mailbox of its own beside it.
+    let db = root.join("mail.db");
+    let store = fell_core::Store::open(&db).map_err(|err| err.to_string())?;
+    store
+        .upsert_account(&fell_core::Account {
+            id: AccountId("local".into()),
+            display_name: "Jon".into(),
+            email: "jon@example.com".into(),
+            backend_kind: fell_core::BackendKind::Bridge,
+        })
+        .map_err(|err| err.to_string())?;
+    drop(store);
+    session.bind_store(&db);
+    session.flush()?;
     session.open_for_edit();
     session.set_known_recipients(["jon@example.com".into()].into_iter().collect());
     session.set_quote(Some(demo_quote().into()));

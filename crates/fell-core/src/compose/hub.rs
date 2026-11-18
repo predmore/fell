@@ -660,15 +660,27 @@ mod tests {
         let folder =
             workspace::materialize_in(&root, "d1", &fields, "alpha\n", &AccountId("a".into()))
                 .unwrap();
+        let db = root.join("mail.db");
+        crate::Store::open(&db)
+            .unwrap()
+            .upsert_account(&crate::Account {
+                id: AccountId("a".into()),
+                display_name: "Jon".into(),
+                email: "jon@example.com".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
         let open = || {
-            DraftSession::create(
+            let mut session = DraftSession::create(
                 folder.clone(),
                 "d1",
                 AccountId("a".into()),
                 fields.clone(),
                 "alpha\n",
             )
-            .unwrap()
+            .unwrap();
+            session.bind_store(&db);
+            session
         };
         let hub = DraftHub::new();
         hub.insert(open());
