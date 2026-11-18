@@ -20,7 +20,7 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
-mod sent_bcc;
+pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
 
@@ -605,6 +605,8 @@ impl Store {
                 message_id.as_str()
             ],
         )?;
+        sent_bcc::forget_if_gone(&tx, account_id, &stored.canonical_id)?;
+        sent_bcc::forget_if_gone(&tx, account_id, message_id.as_str())?;
         tx.commit()?;
         Ok(removed > 0)
     }
@@ -670,6 +672,8 @@ impl Store {
         for row in rows {
             out.push(row?);
         }
+        drop(stmt);
+        sent_bcc::add_recorded_bcc(&self.conn, &mut out)?;
         Ok(out)
     }
 
@@ -1444,13 +1448,6 @@ fn thread_id_for_message_id(
 }
 
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
-    match sent_bcc::with_recorded_bcc(conn, message)? {
-        Some(merged) => insert_arrival(conn, &merged),
-        None => insert_arrival(conn, message),
-    }
-}
-
-fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?

@@ -265,6 +265,10 @@ impl Store {
                 }
             }
         }
+        // Bcc of mail sent from Fell, which the Sent copy does not carry.
+        for address in crate::store::sent_bcc::recorded_bcc_addresses(&self.conn, account_id)? {
+            known.insert(address.email.to_ascii_lowercase());
+        }
         Ok(known)
     }
 

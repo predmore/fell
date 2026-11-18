@@ -399,9 +399,7 @@ mod tests {
         assert!(!mime.to_ascii_lowercase().contains("hidden@"), "{mime}");
         let id = backend.message_id();
         let thread = store.upsert_message(&sent_copy(id.clone())).unwrap();
-        let messages = store
-            .thread_messages(&AccountId("mailbox".into()), &thread)
-            .unwrap();
+        let messages = shown_once_recorded(&store, &thread);
         assert_eq!(messages[0].bcc[0].email, "hidden@example.com");
         assert_eq!(messages[0].bcc[0].name.as_deref(), Some("Hidden Person"));
     }
@@ -418,9 +416,7 @@ mod tests {
         let thread = store
             .upsert_message(&sent_copy(backend.message_id()))
             .unwrap();
-        let messages = store
-            .thread_messages(&AccountId("mailbox".into()), &thread)
-            .unwrap();
+        let messages = shown_once_recorded(&store, &thread);
         assert_eq!(messages[0].bcc.len(), 1);
     }
 
@@ -433,9 +429,28 @@ mod tests {
         let thread = store
             .upsert_message(&sent_copy(backend.message_id()))
             .unwrap();
+        // The record is written off the send path; give a stray one time.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let messages = store
             .thread_messages(&AccountId("mailbox".into()), &thread)
             .unwrap();
         assert!(messages[0].bcc.is_empty());
+    }
+
+    /// The thread once the background Bcc record has landed, or after 5 s.
+    fn shown_once_recorded(
+        store: &fell_core::Store,
+        thread: &fell_core::ThreadId,
+    ) -> Vec<fell_core::Message> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let messages = store
+                .thread_messages(&AccountId("mailbox".into()), thread)
+                .unwrap();
+            if !messages[0].bcc.is_empty() || std::time::Instant::now() > deadline {
+                return messages;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

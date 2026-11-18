@@ -2,17 +2,18 @@
 //!
 //! A message's Bcc is on the SMTP envelope, not in its header, so the copy
 //! the server files in Sent has none. After a send, the editor records the
-//! Bcc here by Message-ID. When that Sent copy syncs, or if it synced first,
-//! the recorded addresses join the row's `bcc_line`, so search and the
-//! "already mailed" check see them. The record never leaves the machine.
+//! Bcc here by Message-ID. It is joined in only for the person's own reads:
+//! the conversation view and the "already mailed" check. It is never copied
+//! into the message row or the search index, so a fell-mcp agent that was
+//! not shown a draft's Bcc cannot find it by searching. The record never
+//! leaves the machine, and goes with the last stored copy of its message.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Store, find_stored, immediate_transaction, union_addresses};
+use super::{Store, immediate_transaction, union_addresses};
 use crate::Result;
 use crate::account::AccountId;
 use crate::message::{Address, Message, MessageId, decode_addresses};
-use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
 pub(super) const SENT_BCC_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS sent_bcc (
@@ -24,8 +25,7 @@ CREATE TABLE IF NOT EXISTS sent_bcc (
 "#;
 
 impl Store {
-    /// Remember `bcc` for the message Fell sent as `message_id`, and add it
-    /// to that message's row if the Sent copy is already stored. Recording
+    /// Remember `bcc` for the message Fell sent as `message_id`. Recording
     /// the same addresses again changes nothing.
     pub fn record_sent_bcc(
         &self,
@@ -55,75 +55,77 @@ impl Store {
              ON CONFLICT(account_id, message_id) DO UPDATE SET bcc_addrs = excluded.bcc_addrs",
             params![account_id.as_str(), message_id.as_str(), recorded],
         )?;
-        add_to_stored_row(&tx, account_id, message_id, &bcc)?;
         tx.commit()
     }
 }
 
-/// `message` with any Bcc recorded for it, or `None` when there is none.
-pub(super) fn with_recorded_bcc(conn: &Connection, message: &Message) -> Result<Option<Message>> {
-    let recorded: Option<String> = conn
-        .query_row(
-            "SELECT bcc_addrs FROM sent_bcc WHERE account_id = ?1 AND message_id = ?2",
+/// Add each message's recorded Bcc, found by its own id or any id that
+/// collapsed into it, to `messages`. For the person's own view only.
+pub(super) fn add_recorded_bcc(conn: &Connection, messages: &mut [Message]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT bcc_addrs FROM sent_bcc
+         WHERE account_id = ?1 AND (
+             message_id = ?2
+             OR message_id IN (
+                 SELECT message_id FROM message_aliases
+                 WHERE account_id = ?1 AND canonical_message_id = ?2
+             )
+         )",
+    )?;
+    for message in messages {
+        let rows = stmt.query_map(
             params![
                 message.account_id.as_str(),
                 message.headers.message_id.as_str()
             ],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(recorded) = recorded else {
-        return Ok(None);
-    };
-    let mut merged = message.clone();
-    for addr in decode_addresses(&recorded) {
-        if !merged
-            .bcc
-            .iter()
-            .any(|have| have.email.eq_ignore_ascii_case(&addr.email))
-        {
-            merged.bcc.push(addr);
+            |row| row.get::<_, String>(0),
+        )?;
+        for recorded in rows {
+            for addr in decode_addresses(&recorded?) {
+                if !message
+                    .bcc
+                    .iter()
+                    .any(|have| have.email.eq_ignore_ascii_case(&addr.email))
+                {
+                    message.bcc.push(addr);
+                }
+            }
         }
     }
-    Ok(Some(merged))
+    Ok(())
 }
 
-/// Union `bcc` into the stored row for `message_id`, with its search terms.
-fn add_to_stored_row(
+/// Every address the person Bcc'd from Fell on this account.
+pub(crate) fn recorded_bcc_addresses(
     conn: &Connection,
     account_id: &AccountId,
-    message_id: &MessageId,
-    bcc: &[Address],
-) -> Result<()> {
-    let Some((stored, _)) = find_stored(conn, account_id, message_id)? else {
-        return Ok(());
-    };
-    let bcc_line = union_addresses(&stored.bcc_line, bcc);
-    if bcc_line == stored.bcc_line {
-        return Ok(());
+) -> Result<Vec<Address>> {
+    let mut stmt = conn.prepare("SELECT bcc_addrs FROM sent_bcc WHERE account_id = ?1")?;
+    let rows = stmt.query_map(params![account_id.as_str()], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for recorded in rows {
+        out.extend(decode_addresses(&recorded?));
     }
-    let indexed = |bcc_line: &str| {
-        terms_for_indexed(IndexedText {
-            subject: &stored.subject,
-            from_name: stored.from_name.as_deref(),
-            from_email: &stored.from_email,
-            body: &stored.body,
-            to_line: &stored.to_line,
-            cc_line: &stored.cc_line,
-            bcc_line,
-            folders: &stored.folders,
-            labels: &stored.labels,
-        })
-    };
-    sync_terms(
-        conn,
-        account_id.as_str(),
-        &indexed(&stored.bcc_line),
-        &indexed(&bcc_line),
-    )?;
+    Ok(out)
+}
+
+/// Drop the record once no stored copy of `message_id` is left: neither a
+/// row with that id nor an alias of one.
+pub(super) fn forget_if_gone(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<()> {
     conn.execute(
-        "UPDATE messages SET bcc_line = ?1 WHERE account_id = ?2 AND message_id = ?3",
-        params![bcc_line, account_id.as_str(), stored.canonical_id],
+        "DELETE FROM sent_bcc
+         WHERE account_id = ?1 AND message_id = ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM messages WHERE account_id = ?1 AND message_id = ?2
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM message_aliases WHERE account_id = ?1 AND message_id = ?2
+           )",
+        params![account_id.as_str(), message_id],
     )?;
     Ok(())
 }
@@ -197,16 +199,34 @@ mod tests {
         }
     }
 
-    fn stored_bcc(store: &Store, id: &str) -> Vec<String> {
-        let line: String = store
+    fn row_bcc_line(store: &Store, id: &str) -> String {
+        store
             .conn
             .query_row(
                 "SELECT bcc_line FROM messages WHERE account_id = 'a1' AND message_id = ?1",
                 [id],
                 |row| row.get(0),
             )
+            .unwrap()
+    }
+
+    /// Bcc as the person's conversation view reads it.
+    fn shown_bcc(store: &Store, id: &str) -> Vec<String> {
+        let thread: String = store
+            .conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE account_id = 'a1' AND message_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
             .unwrap();
-        decode_addresses(&line)
+        store
+            .thread_messages(&account(), &ThreadId(thread))
+            .unwrap()
+            .into_iter()
+            .find(|message| message.headers.message_id.as_str() == id)
+            .unwrap()
+            .bcc
             .into_iter()
             .map(|addr| addr.email)
             .collect()
@@ -223,67 +243,42 @@ mod tests {
     }
 
     #[test]
-    fn a_sent_copy_that_syncs_later_gets_the_recorded_bcc() {
+    fn a_sent_copy_that_syncs_later_shows_the_recorded_bcc() {
         let store = store();
         store
             .record_sent_bcc(&account(), &MessageId::new("<m1@compose.fell>"), &hidden())
             .unwrap();
         store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
-        assert_eq!(
-            stored_bcc(&store, "m1@compose.fell"),
-            ["hidden@example.com"]
-        );
-        let thread = store
-            .thread_messages(
-                &account(),
-                &ThreadId::from_message_id(&MessageId::new("m1@compose.fell")),
-            )
-            .unwrap();
+        assert_eq!(shown_bcc(&store, "m1@compose.fell"), ["hidden@example.com"]);
+        let id = MessageId::new("m1@compose.fell");
+        let thread = ThreadId::from_message_id(&id);
+        let thread = store.thread_messages(&account(), &thread).unwrap();
         assert_eq!(thread[0].bcc, hidden());
-        assert_eq!(found_by(&store, "hidden"), ["m1@compose.fell"]);
     }
 
     #[test]
-    fn a_sent_copy_that_synced_first_is_updated_and_searchable() {
+    fn a_recorded_bcc_never_reaches_the_row_or_search() {
         let store = store();
         store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
-        assert!(found_by(&store, "hidden").is_empty());
         store
             .record_sent_bcc(&account(), &MessageId::new("m1@compose.fell"), &hidden())
             .unwrap();
-        assert_eq!(
-            stored_bcc(&store, "m1@compose.fell"),
-            ["hidden@example.com"]
-        );
-        assert_eq!(found_by(&store, "hidden"), ["m1@compose.fell"]);
-        // A resync of the same Sent copy keeps the Bcc.
         store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
-        assert_eq!(
-            stored_bcc(&store, "m1@compose.fell"),
-            ["hidden@example.com"]
-        );
+        assert_eq!(shown_bcc(&store, "m1@compose.fell"), ["hidden@example.com"]);
+        // An agent that was not shown the draft's Bcc cannot find it.
+        assert_eq!(row_bcc_line(&store, "m1@compose.fell"), "");
+        assert!(found_by(&store, "hidden").is_empty());
+        assert!(found_by(&store, "to:hidden@example.com").is_empty());
     }
 
     #[test]
-    fn recording_twice_keeps_one_address_and_one_search_posting() {
+    fn recording_twice_keeps_one_address() {
         let store = store();
         store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
         let id = MessageId::new("m1@compose.fell");
         store.record_sent_bcc(&account(), &id, &hidden()).unwrap();
         store.record_sent_bcc(&account(), &id, &hidden()).unwrap();
-        assert_eq!(
-            stored_bcc(&store, "m1@compose.fell"),
-            ["hidden@example.com"]
-        );
-        let df: i64 = store
-            .conn
-            .query_row(
-                "SELECT df FROM search_terms WHERE account_id = 'a1' AND term = 'hidden'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(df, 1);
+        assert_eq!(shown_bcc(&store, "m1@compose.fell"), ["hidden@example.com"]);
     }
 
     #[test]
@@ -298,13 +293,60 @@ mod tests {
         store
             .record_sent_bcc(&account(), &MessageId::new("m1@compose.fell"), &hidden())
             .unwrap();
-        store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
         assert!(
             store
                 .mailed_addresses(&account())
                 .unwrap()
                 .contains("hidden@example.com")
         );
+    }
+
+    #[test]
+    fn a_sent_copy_that_collapsed_into_its_list_echo_still_shows_its_bcc() {
+        let store = store();
+        let body = "Here is the long version of the plan for Friday, with the details.";
+        let mut list = sent_copy("list-1@lists.example");
+        list.headers.subject = "[team] Plans".into();
+        list.list_id = Some("team.lists.example".into());
+        list.folders = vec!["INBOX".into()];
+        list.body_text = Some(body.into());
+        list.snippet = body.into();
+        list.headers.date_unix = 20;
+        store.upsert_message(&list).unwrap();
+        let mut sent = sent_copy("m1@compose.fell");
+        sent.body_text = Some(body.into());
+        sent.snippet = body.into();
+        store.upsert_message(&sent).unwrap();
+        // The Sent copy is now an alias of the list row.
+        let canonical: String = store
+            .conn
+            .query_row(
+                "SELECT canonical_message_id FROM message_aliases WHERE message_id = 'm1@compose.fell'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, "list-1@lists.example");
+        store
+            .record_sent_bcc(&account(), &MessageId::new("m1@compose.fell"), &hidden())
+            .unwrap();
+        assert_eq!(
+            shown_bcc(&store, "list-1@lists.example"),
+            ["hidden@example.com"]
+        );
+        assert!(found_by(&store, "hidden").is_empty());
+    }
+
+    #[test]
+    fn the_record_goes_with_the_last_copy() {
+        let store = store();
+        store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
+        let id = MessageId::new("m1@compose.fell");
+        store.record_sent_bcc(&account(), &id, &hidden()).unwrap();
+        assert!(store.delete_message(&account(), &id).unwrap());
+        // A later message reusing that id does not inherit the Bcc.
+        store.upsert_message(&sent_copy("m1@compose.fell")).unwrap();
+        assert!(shown_bcc(&store, "m1@compose.fell").is_empty());
     }
 
     #[test]
@@ -321,8 +363,7 @@ mod tests {
         store
             .record_sent_bcc(&account(), &MessageId::new("m1@compose.fell"), &hidden())
             .unwrap();
-        assert!(stored_bcc(&store, "other@x").is_empty());
-        assert!(found_by(&store, "hidden").is_empty());
+        assert!(shown_bcc(&store, "other@x").is_empty());
     }
 
     #[test]

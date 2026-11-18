@@ -1391,20 +1391,33 @@ pub(crate) fn transmit_from_hub(
 
 /// Keep the Bcc of a message the server has, or may have, so the Sent copy
 /// shows it once it syncs. A message that was not sent leaves no record.
+/// The write runs on its own thread with a few retries: the mail already
+/// went out, so a busy mailbox must neither hold up the send nor lose this.
 fn remember_bcc(
     sent_bcc: Option<fell_core::compose::SentBcc>,
     result: &Result<fell_core::SentMessage, SendFailure>,
 ) {
-    if lock_after(result).is_none() {
+    if !matches!(result, Ok(_) | Err(SendFailure::MaybeSent(_))) {
         return;
     }
-    if let Some(record) = sent_bcc
-        && let Err(err) = record.save()
-    {
-        // The mail went out; a missing local Bcc record must not report
-        // the send as failed.
-        eprintln!("fell: could not record the Bcc of a sent message: {err}");
-    }
+    let Some(record) = sent_bcc else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut last = None;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
+            }
+            match record.save() {
+                Ok(()) => return,
+                Err(err) => last = Some(err),
+            }
+        }
+        if let Some(err) = last {
+            eprintln!("fell: could not record the Bcc of a sent message: {err}");
+        }
+    });
 }
 
 impl PreparedSend {
