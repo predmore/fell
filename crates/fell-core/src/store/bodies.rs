@@ -7,11 +7,12 @@
 //! folder list and the FTS index never read this table.
 //!
 //! Rows are keyed like `messages`, by account and canonical Message-ID, and
-//! go when the message row goes. Attachment parts belong in a sibling
+//! go when the message row goes. A merge first moves the parts the kept row
+//! lacks onto it; an expunge saves them for undo (`local_action_bodies`). Attachment parts belong in a sibling
 //! `message_parts` table keyed the same way, with a part id.
 //!
 //! Mail stored before this table existed is queued in `body_backfill` once,
-//! when the table is created; sync fetches those messages again from a
+//! by the schema version 4 upgrade; sync fetches those messages again from a
 //! server copy ([`crate::sync::fetch_missing_bodies`]) and any write of
 //! parts takes a message off the queue. New mail never joins the queue, so a
 //! mailbox that is caught up pays nothing per pass.
@@ -50,41 +51,39 @@ CREATE TRIGGER IF NOT EXISTS message_bodies_ad AFTER DELETE ON messages BEGIN
 END;
 ";
 
-/// Create the tables. The first time, queue every stored message that has a
-/// server copy: its parts were never kept.
+/// Create the tables and the trigger that drops parts with their message.
+/// Queueing mail stored before them is [`queue_stored_mail`], which runs
+/// after the version 3 merge so it sees only the rows that survive it.
 pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
-    if table_exists(conn, "message_bodies")? {
-        return conn.execute_batch(BODIES_SCHEMA).map_err(Into::into);
-    }
-    // One transaction, so a second opener or a crash cannot leave the table
-    // without its queue.
-    let tx = super::begin_immediate(conn)?;
-    let existed = table_exists(&tx, "message_bodies")?;
-    tx.execute_batch(BODIES_SCHEMA)?;
-    if !existed {
-        tx.execute(
-            "INSERT OR IGNORE INTO body_backfill (account_id, message_id)
-             SELECT m.account_id, m.message_id FROM messages m
-             WHERE EXISTS (
-                 SELECT 1 FROM message_copies c
-                 WHERE c.account_id = m.account_id AND c.message_id = m.message_id
-             )",
-            [],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
+    conn.execute_batch(BODIES_SCHEMA).map_err(Into::into)
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
+/// Schema version 4: queue every stored message that has a server copy and no
+/// parts, and stamp the version in the same transaction, so a crash before the
+/// stamp queues again on the next open. `INSERT OR IGNORE` keeps that retry,
+/// and an open after a downgrade, from doing harm.
+pub(super) fn queue_stored_mail(conn: &Connection) -> Result<()> {
+    let tx = super::begin_immediate(conn)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO body_backfill (account_id, message_id)
+         SELECT m.account_id, m.message_id FROM messages m
+         WHERE EXISTS (
+             SELECT 1 FROM message_copies c
+             WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM message_bodies b
+             WHERE b.account_id = m.account_id AND b.message_id = m.message_id
+         )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '4')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 const CODEC_DEFLATE: i64 = 1;
@@ -108,8 +107,66 @@ pub struct BodyRequest {
 pub(super) enum Write {
     /// A same-id resync: parts with a body replace what is stored.
     Replace,
-    /// A collapsed copy: parts are written only where none with a body are.
+    /// A collapsed copy or a fetch for a gap: HTML, plain and the bulk
+    /// headers are each written only where the stored row has none, so a
+    /// plain-only Sent copy still gains the HTML of its list echo.
     FillGap,
+}
+
+/// Parts compressed and encoded as `message_bodies` keeps them. Built before
+/// a write transaction, so deflate does not run under the write lock.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StoredParts {
+    html: Option<Vec<u8>>,
+    plain: Option<Vec<u8>>,
+    bulk_headers: String,
+}
+
+impl StoredParts {
+    pub(crate) fn new(parts: &MessageParts) -> Self {
+        Self {
+            html: parts.html.as_deref().map(compress),
+            plain: parts.plain.as_deref().map(compress),
+            bulk_headers: encode_headers(&parts.bulk_headers),
+        }
+    }
+
+    pub(crate) fn has_body(&self) -> bool {
+        self.html.is_some() || self.plain.is_some()
+    }
+
+    /// Replace the parts saved for undo on every open action that removed
+    /// `message_id`, as a later copy of it replaces the saved body text.
+    pub(crate) fn save_for_undo(
+        &self,
+        conn: &Connection,
+        account_id: &AccountId,
+        message_id: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO local_action_bodies
+                (action_id, message_id, codec, html, plain, bulk_headers)
+             SELECT m.action_id, m.message_id, ?3, ?4, ?5, ?6
+             FROM local_action_messages m
+             JOIN local_actions a ON a.id = m.action_id
+             WHERE m.message_id = ?2 AND m.removed = 1
+               AND a.account_id = ?1 AND a.undone = 0
+             ON CONFLICT(action_id, message_id) DO UPDATE SET
+                codec = excluded.codec,
+                html = excluded.html,
+                plain = excluded.plain,
+                bulk_headers = excluded.bulk_headers",
+            params![
+                account_id.as_str(),
+                message_id,
+                CODEC_DEFLATE,
+                self.html,
+                self.plain,
+                self.bulk_headers,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 /// Store `parts` for `message_id` and take it off the backfill queue. An
@@ -119,46 +176,85 @@ pub(super) fn write(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
-    parts: &MessageParts,
+    parts: &StoredParts,
     mode: Write,
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
         params![account_id.as_str(), message_id],
     )?;
-    let incoming_has_body = has_body(parts);
-    let stored_has_body: Option<bool> = conn
-        .query_row(
-            "SELECT html IS NOT NULL OR plain IS NOT NULL FROM message_bodies
-             WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id.as_str(), message_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let write = match stored_has_body {
-        None => true,
-        Some(stored) => incoming_has_body && (mode == Write::Replace || !stored),
+    let sql = match mode {
+        Write::Replace if parts.has_body() => {
+            "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, message_id) DO UPDATE SET
+                codec = excluded.codec,
+                html = excluded.html,
+                plain = excluded.plain,
+                bulk_headers = excluded.bulk_headers"
+        }
+        // Nothing to replace with: only record a row when there is none.
+        Write::Replace => {
+            "INSERT OR IGNORE INTO message_bodies
+                (account_id, message_id, codec, html, plain, bulk_headers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        }
+        Write::FillGap => FILL_GAP_SQL,
     };
-    if !write {
-        return Ok(());
-    }
     conn.execute(
-        "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(account_id, message_id) DO UPDATE SET
-            codec = excluded.codec,
-            html = excluded.html,
-            plain = excluded.plain,
-            bulk_headers = excluded.bulk_headers",
+        sql,
         params![
             account_id.as_str(),
             message_id,
             CODEC_DEFLATE,
-            parts.html.as_deref().map(compress),
-            parts.plain.as_deref().map(compress),
-            encode_headers(&parts.bulk_headers),
+            parts.html,
+            parts.plain,
+            parts.bulk_headers,
         ],
     )?;
+    Ok(())
+}
+
+/// Insert a row, or fill each empty column of the stored one. Rows of
+/// another codec are left alone rather than mixed.
+const FILL_GAP_SQL: &str = "INSERT INTO message_bodies
+        (account_id, message_id, codec, html, plain, bulk_headers)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(account_id, message_id) DO UPDATE SET
+        html = COALESCE(message_bodies.html, excluded.html),
+        plain = COALESCE(message_bodies.plain, excluded.plain),
+        bulk_headers = CASE WHEN message_bodies.bulk_headers = ''
+            THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END
+     WHERE message_bodies.codec = excluded.codec";
+
+/// A merge is about to delete row `from` in favour of `to`: give `to` the
+/// parts it lacks from `from`, as stored. `to` leaves the backfill queue
+/// when it gains a body.
+pub(super) fn move_into(
+    conn: &Connection,
+    account_id: &AccountId,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let moved = conn.execute(
+        "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
+         SELECT account_id, ?3, codec, html, plain, bulk_headers FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2
+           AND (html IS NOT NULL OR plain IS NOT NULL)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+            html = COALESCE(message_bodies.html, excluded.html),
+            plain = COALESCE(message_bodies.plain, excluded.plain),
+            bulk_headers = CASE WHEN message_bodies.bulk_headers = ''
+                THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END
+         WHERE message_bodies.codec = excluded.codec",
+        params![account_id.as_str(), from, to],
+    )?;
+    if moved > 0 {
+        conn.execute(
+            "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), to],
+        )?;
+    }
     Ok(())
 }
 
@@ -260,10 +356,6 @@ pub(super) fn copies_of(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
-}
-
-fn has_body(parts: &MessageParts) -> bool {
-    parts.html.is_some() || parts.plain.is_some()
 }
 
 fn compress(text: &str) -> Vec<u8> {
@@ -522,7 +614,8 @@ mod tests {
                 .execute_batch(
                     "DROP TRIGGER message_bodies_ad;
                      DROP TABLE message_bodies;
-                     DROP TABLE body_backfill;",
+                     DROP TABLE body_backfill;
+                     UPDATE meta SET value = '3' WHERE key = 'schema_version';",
                 )
                 .unwrap();
         }
@@ -585,6 +678,38 @@ mod tests {
                 .map(str::trim),
             Some("<p>sent</p>")
         );
+    }
+
+    #[test]
+    fn a_list_echo_adds_html_to_a_plain_only_sent_copy() {
+        // The Sent copy went out as plain text; the list added an HTML part.
+        let mut sent = newsletter("post@x", "Sent", 1, "<p>unused</p>");
+        sent.folders = vec!["Sent".into()];
+        let sent_parts = sent.parts.as_mut().unwrap();
+        sent_parts.html = None;
+        sent_parts.bulk_headers.clear();
+        let plain = sent_parts.plain.clone();
+        let mut echo = newsletter("echo@lists.x", "INBOX", 2, "<p>with footer</p>");
+        echo.list_id = Some("list.x".into());
+        echo.headers.subject = "[list] Sale".into();
+        let echo_parts = echo.parts.clone().unwrap();
+        let store = store_with(vec![sent]);
+        store.upsert_message(&echo).unwrap();
+        let kept = body(&store, "post@x").unwrap();
+        assert_eq!(kept.plain, plain, "the stored plain part stays");
+        assert_eq!(kept.html, echo_parts.html, "the echo fills the HTML");
+        assert_eq!(kept.bulk_headers, echo_parts.bulk_headers);
+
+        // A fetch for the gap fills the same way and keeps what is stored.
+        let fetched = MessageParts {
+            html: Some("<p>other</p>".into()),
+            plain: Some("other".into()),
+            bulk_headers: Vec::new(),
+        };
+        store
+            .store_fetched_parts(&account().id, &[(MessageId::new("post@x"), Some(fetched))])
+            .unwrap();
+        assert_eq!(body(&store, "post@x").unwrap(), kept);
     }
 
     fn plan(store: &Store, sql: &str) -> String {

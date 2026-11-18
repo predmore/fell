@@ -21,7 +21,7 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
-mod bodies;
+pub(crate) mod bodies;
 mod copies;
 mod roles;
 pub(crate) mod sent_bcc;
@@ -402,8 +402,6 @@ impl Store {
         ensure_alias_columns(&conn)?;
         ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
-        // In place of a version bump: the first open queues mail stored
-        // before parts were kept, for sync to fetch again.
         bodies::ensure_bodies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
@@ -429,7 +427,10 @@ impl Store {
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
-        if schema_version(&conn)?.as_deref() != Some("3") {
+        let version = schema_version(&conn)?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if version < 3 {
             backfill_fingerprints(&conn)?;
             merge_backfilled_duplicates(&conn)?;
             // Replies to a copy deleted by the merge stay on its old thread
@@ -445,12 +446,12 @@ impl Store {
         // Reply-to and subject indexes for incremental threading. The first
         // open fills them and re-resolves every account once.
         threads::ensure_thread_index(&conn)?;
-        // 3 adds message_embeddings, the local body-vector index.
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '3')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [],
-        )?;
+        // 4 queues mail stored before message_bodies for sync to fetch
+        // again. It runs after the version 3 merge, so the queue names the
+        // rows that survived it, and stamps 4 in the same transaction.
+        if version < 4 {
+            bodies::queue_stored_mail(&conn)?;
+        }
         Ok(Self {
             indexer: None,
             conn,
@@ -776,17 +777,27 @@ impl Store {
         account_id: &AccountId,
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
+        // Deflate before the write lock: archive and mark-read wait on it.
+        let compressed: Vec<(&MessageId, bodies::StoredParts)> = fetched
+            .iter()
+            .map(|(message_id, parts)| {
+                let stored = parts
+                    .as_ref()
+                    .map(bodies::StoredParts::new)
+                    .unwrap_or_default();
+                (message_id, stored)
+            })
+            .collect();
         let tx = immediate_transaction(&self.conn)?;
         let mut filled = 0;
-        for (message_id, parts) in fetched {
+        for (message_id, parts) in &compressed {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
-            let parts = parts.clone().unwrap_or_default();
-            if parts.html.is_some() || parts.plain.is_some() {
+            if parts.has_body() {
                 filled += 1;
             }
-            bodies::write(&tx, account_id, &canonical, &parts, bodies::Write::FillGap)?;
+            bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
         }
         tx.commit()?;
         Ok(filled)
@@ -1730,7 +1741,7 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             conn,
             account_id,
             message.headers.message_id.as_str(),
-            parts,
+            &bodies::StoredParts::new(parts),
             bodies::Write::Replace,
         )?;
     }
@@ -1967,7 +1978,14 @@ fn write_kept(
         } else {
             bodies::Write::Replace
         };
-        bodies::write(conn, &message.account_id, &stored.canonical_id, parts, mode)?;
+        let parts = bodies::StoredParts::new(parts);
+        bodies::write(
+            conn,
+            &message.account_id,
+            &stored.canonical_id,
+            &parts,
+            mode,
+        )?;
     }
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
     // The vector belongs to the row that stays, not to the id this copy
@@ -2193,6 +2211,14 @@ fn absorb_duplicate(
     let extra_labels = split_field(&doomed.labels);
     let keeper = fold_doomed_local_state(keeper, doomed);
     let thread = write_kept(conn, message, &keeper, true, &extra_folders, &extra_labels)?;
+    // The stored parts of the doomed row fill what the keeper lacks; the
+    // delete below drops the rest with the row.
+    bodies::move_into(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
+    )?;
     let old_terms = terms_for_indexed(IndexedText {
         subject: &doomed.subject,
         from_name: doomed.from_name.as_deref(),
@@ -4586,7 +4612,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
@@ -6573,7 +6599,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let fingerprint: String = store
             .conn
             .query_row(
@@ -6710,7 +6736,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let filled: i64 = store
             .conn
             .query_row(
@@ -6784,6 +6810,82 @@ mod tests {
         assert!(kept.folders.iter().any(|folder| folder == "Sent"));
         assert!(kept.folders.iter().any(|folder| folder == "Archive"));
         assert!(!kept.folders.iter().any(|folder| folder == "INBOX"));
+    }
+
+    #[test]
+    fn absorb_moves_the_deleted_rows_parts_onto_the_kept_row() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        for (id, remote, subject, folders, list) in [
+            ("sent@x", "imap:sent", "Hello", "Sent", None),
+            (
+                "list@x",
+                "imap:inbox",
+                "[list] Hello",
+                "INBOX",
+                Some("list.example"),
+            ),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint, list_id
+                     ) VALUES (
+                        'a1', ?1, ?2, ?1, '', 'from@x', ?3, 1700000000, 'hello body',
+                        'hello body', 1, ?4, ?5, ?6
+                     )",
+                    params![id, remote, subject, folders, fingerprint, list],
+                )
+                .unwrap();
+        }
+        // The Sent copy has the plain part, the list copy only HTML.
+        let write = |id: &str, parts: crate::MessageParts| {
+            bodies::write(
+                &store.conn,
+                &account().id,
+                id,
+                &bodies::StoredParts::new(&parts),
+                bodies::Write::Replace,
+            )
+            .unwrap();
+        };
+        write(
+            "sent@x",
+            crate::MessageParts {
+                plain: Some("hello body".into()),
+                ..Default::default()
+            },
+        );
+        write(
+            "list@x",
+            crate::MessageParts {
+                html: Some("<p>hello body</p>".into()),
+                bulk_headers: vec![("List-Id".into(), "<list.example>".into())],
+                ..Default::default()
+            },
+        );
+        let mut again = msg("sent@x", None, None, "Hello", "hello body");
+        again.headers.date_unix = 1_700_000_000;
+        again.folders = vec!["Sent".into()];
+        again.remote_id = RemoteId("imap:sent".into());
+        store.upsert_message(&again).unwrap();
+        assert_eq!(listed(&store).len(), 1);
+        let kept = store
+            .message_body(&account().id, &MessageId::new("sent@x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept,
+            crate::MessageParts {
+                html: Some("<p>hello body</p>".into()),
+                plain: Some("hello body".into()),
+                bulk_headers: vec![("List-Id".into(), "<list.example>".into())],
+            }
+        );
     }
 
     #[test]
@@ -6998,7 +7100,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let rows = listed(&store);
         assert_eq!(rows.len(), 2);
         let kept = rows
@@ -7095,6 +7197,108 @@ mod tests {
         assert!(rows[0].list_id.is_none());
         assert!(rows[0].folders.iter().any(|folder| folder == "Sent"));
         assert!(rows[0].folders.iter().any(|folder| folder == "INBOX"));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_from_v2_queues_the_merged_row_for_its_parts() {
+        let path = std::env::temp_dir().join(format!(
+            "fell-schema-v2-{}-bodies.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = crate::message::body_fingerprint("hello body");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+                 CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    backend_kind TEXT NOT NULL
+                 );
+                 INSERT INTO accounts (id, display_name, email, backend_kind)
+                    VALUES ('a1', 'Caleb', 'c@x', 'bridge');
+                 CREATE TABLE messages (
+                    rowid INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    remote_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    proton_conversation_id TEXT,
+                    in_reply_to TEXT,
+                    references_header TEXT NOT NULL,
+                    from_name TEXT,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    date_unix INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    body_text TEXT,
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    folders TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '',
+                    arrived_via TEXT NOT NULL DEFAULT '',
+                    to_line TEXT NOT NULL DEFAULT '',
+                    cc_line TEXT NOT NULL DEFAULT '',
+                    bcc_line TEXT NOT NULL DEFAULT '',
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    has_attachment INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    snooze_until INTEGER,
+                    body_fingerprint TEXT NOT NULL DEFAULT '',
+                    UNIQUE (account_id, message_id)
+                 );",
+            )
+            .unwrap();
+            // Only the copy the merge deletes names a server copy.
+            for (id, remote, subject, folder) in [
+                ("sent@x", "imap:7:1:Sent", "Hello", "Sent"),
+                ("list@x", "local-list", "[list] Hello", "INBOX"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (
+                        account_id, message_id, remote_id, thread_id, references_header,
+                        from_email, subject, date_unix, snippet, body_text, unread, folders,
+                        body_fingerprint
+                     ) VALUES (
+                        'a1', ?1, ?2, ?1, '', 'from@x', ?3, 1700000000, 'hello body',
+                        'hello body', 1, ?4, ?5
+                     )",
+                    params![id, remote, subject, folder, fingerprint],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(listed(&store).len(), 1, "the v3 upgrade merged the pair");
+        let wanted = store.missing_bodies(&account().id, 10).unwrap();
+        assert_eq!(wanted.len(), 1, "{wanted:?}");
+        assert_eq!(wanted[0].copies, vec![RemoteId("imap:7:1:Sent".into())]);
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "4");
+
+        // A crash after the tables exist but before version 4 is stamped:
+        // the next open queues again.
+        store
+            .conn
+            .execute_batch(
+                "DELETE FROM body_backfill;
+                 UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.missing_bodies(&account().id, 10).unwrap(), wanted);
         drop(store);
         let _ = std::fs::remove_file(&path);
     }

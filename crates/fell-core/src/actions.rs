@@ -106,6 +106,19 @@ CREATE TABLE IF NOT EXISTS local_folder_tombstones (
 
 CREATE INDEX IF NOT EXISTS idx_local_folder_tombstones
     ON local_folder_tombstones(account_id, message_id);
+
+-- The message_bodies row of a message an action removed, as stored. No row
+-- here means it had none, and undo queues it to be fetched again.
+CREATE TABLE IF NOT EXISTS local_action_bodies (
+    action_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    codec INTEGER NOT NULL,
+    html BLOB,
+    plain BLOB,
+    bulk_headers TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (action_id, message_id),
+    FOREIGN KEY(action_id) REFERENCES local_actions(id)
+);
 "#;
 
 /// One recorded local edit. [`Store::undo`] returns the entry it restored.
@@ -338,6 +351,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM local_action_aliases WHERE action_id = ?1",
+            params![action.id],
+        )?;
+        tx.execute(
+            "DELETE FROM local_action_bodies WHERE action_id = ?1",
             params![action.id],
         )?;
         let changed = tx.execute(
@@ -580,6 +597,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             let saved = &saved;
             replace_message_row(conn, account_id, &current, saved)?;
             restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
+            restore_bodies(conn, account_id, snapshot.action_id, &saved.message_id)?;
             return Ok(());
         }
         let folders = join_tokens(&invert_tokens(
@@ -643,8 +661,41 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
     }
     insert_message_row(conn, account_id, saved)?;
     restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
+    if snapshot.removed {
+        restore_bodies(conn, account_id, snapshot.action_id, &saved.message_id)?;
+    }
     let terms = terms_of(saved);
     sync_terms(conn, account_id.as_str(), &HashSet::new(), &terms)?;
+    Ok(())
+}
+
+/// Put back the parts a removed row had, replacing any a later sync wrote
+/// for the same id, as the row itself is. A row that had none is queued
+/// to be fetched again.
+fn restore_bodies(
+    conn: &Connection,
+    account_id: &AccountId,
+    action_id: i64,
+    message_id: &str,
+) -> Result<()> {
+    for sql in [
+        "DELETE FROM message_bodies WHERE account_id = ?1 AND message_id = ?2",
+        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+    ] {
+        conn.execute(sql, params![account_id.as_str(), message_id])?;
+    }
+    let restored = conn.execute(
+        "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
+         SELECT ?1, message_id, codec, html, plain, bulk_headers FROM local_action_bodies
+         WHERE action_id = ?3 AND message_id = ?2",
+        params![account_id.as_str(), message_id, action_id],
+    )?;
+    if restored == 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO body_backfill (account_id, message_id) VALUES (?1, ?2)",
+            params![account_id.as_str(), message_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -958,6 +1009,7 @@ fn load_one(
 }
 
 struct Snapshot {
+    action_id: i64,
     removed: bool,
     row: SavedRow,
     after_folders: String,
@@ -980,6 +1032,7 @@ fn load_snapshots(conn: &Connection, action_id: i64) -> Result<Vec<Snapshot>> {
     drop(stmt);
     let mut aliases = load_saved_aliases(conn, action_id)?;
     for snapshot in &mut out {
+        snapshot.action_id = action_id;
         if let Some(found) = aliases.remove(&snapshot.row.message_id) {
             snapshot.aliases = found;
         }
@@ -1017,6 +1070,7 @@ fn load_saved_aliases(
 
 fn read_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     Ok(Snapshot {
+        action_id: 0,
         removed: row.get::<_, i64>(0)? != 0,
         row: read_saved_from(row, 1)?,
         after_folders: row.get(24)?,
@@ -1085,6 +1139,17 @@ fn insert_snapshot(
          )",
         params_from_iter(values),
     )?;
+    if plan.remove_row {
+        // The delete below takes the parts with the row (a trigger), so keep
+        // them for undo as stored.
+        conn.execute(
+            "INSERT INTO local_action_bodies
+                (action_id, message_id, codec, html, plain, bulk_headers)
+             SELECT ?1, message_id, codec, html, plain, bulk_headers FROM message_bodies
+             WHERE account_id = ?2 AND message_id = ?3",
+            params![action_id, account_id.as_str(), plan.before.message_id],
+        )?;
+    }
     let aliases = {
         let mut stmt = conn.prepare(
             "SELECT message_id, remote_id, folder FROM message_aliases
@@ -1309,6 +1374,19 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
             message.account_id.as_str(),
         ],
     )?;
+    // The body above came from this copy, so its parts replace the saved ones.
+    if let Some(parts) = &message.parts {
+        let parts = crate::store::bodies::StoredParts::new(parts);
+        if parts.has_body() {
+            // An action recorded before Fell kept parts has no table yet.
+            ensure_action_schema(conn)?;
+            parts.save_for_undo(
+                conn,
+                &message.account_id,
+                message.headers.message_id.as_str(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2071,6 +2149,7 @@ mod tests {
             store.connection(),
             &account("a1"),
             &Snapshot {
+                action_id: 0,
                 removed: true,
                 row: SavedRow {
                     message_id: "orig@x".into(),
@@ -2377,6 +2456,118 @@ mod tests {
         assert_eq!(messages(&store, "a1", &thread), baseline);
         assert_eq!(saved_copies(&store, "original secret body"), 0);
         assert_eq!(saved_copies(&store, "secret@x"), 0);
+    }
+
+    fn html(text: &str) -> crate::MessageParts {
+        crate::MessageParts {
+            html: Some(format!("<p>{text}</p>")),
+            plain: Some(text.into()),
+            bulk_headers: vec![("List-Id".into(), "<news.x>".into())],
+        }
+    }
+
+    fn body_of(store: &Store, id: &str) -> Option<crate::MessageParts> {
+        store
+            .message_body(&account("a1"), &MessageId::new(id))
+            .unwrap()
+    }
+
+    fn queued(store: &Store, id: &str) -> bool {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM body_backfill WHERE message_id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    }
+
+    /// Delete the thread from Inbox if it is there, then expunge it from Trash.
+    fn expunge(store: &Store, thread: &ThreadId) -> LocalAction {
+        let _ = store.delete_thread(&account("a1"), thread, FOLDER_INBOX);
+        store
+            .delete_thread(&account("a1"), thread, FOLDER_TRASH)
+            .unwrap()
+    }
+
+    #[test]
+    fn undo_of_expunge_puts_back_the_parts_it_removed() {
+        let store = open(&[("a1", "a@x")]);
+        let mut note = sample("a1", "note@x", "Note", "first body");
+        note.parts = Some(html("first"));
+        let thread = store.upsert_message(&note).unwrap();
+
+        // Expunge, then undo with nothing in between.
+        expunge(&store, &thread);
+        assert_eq!(body_of(&store, "note@x"), None);
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(body_of(&store, "note@x"), Some(html("first")));
+
+        // Expunge, then a sync writes the same id with other parts, then undo:
+        // the restored row shows its own parts, not the later copy's.
+        expunge(&store, &thread);
+        let mut later = sample("a1", "note@x", "Later", "later body");
+        later.parts = Some(html("later"));
+        store.upsert_message(&later).unwrap();
+        assert_eq!(body_of(&store, "note@x"), Some(html("later")));
+        store.undo(&account("a1")).unwrap();
+        let restored = &messages(&store, "a1", &thread)[0];
+        assert_eq!(restored.body_text.as_deref(), Some("first body"));
+        assert_eq!(body_of(&store, "note@x"), Some(html("first")));
+        assert!(!queued(&store, "note@x"));
+        let saved: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM local_action_bodies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(saved, 0, "undo drops the saved parts");
+
+        // A copy arriving only in the expunged folder keeps the row deleted
+        // but replaces the saved body, so its parts come back with it.
+        expunge(&store, &thread);
+        let mut gone = sample("a1", "note@x", "Note", "server body");
+        gone.folders = vec![FOLDER_TRASH.into()];
+        gone.parts = Some(html("server"));
+        store
+            .apply_delta(
+                &account("a1"),
+                &MailboxDelta {
+                    messages: vec![gone],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert!(messages(&store, "a1", &thread).is_empty());
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(
+            messages(&store, "a1", &thread)[0].body_text.as_deref(),
+            Some("server body")
+        );
+        assert_eq!(body_of(&store, "note@x"), Some(html("server")));
+    }
+
+    #[test]
+    fn undo_of_expunge_requeues_a_row_that_had_no_parts() {
+        let store = open(&[("a1", "a@x")]);
+        let thread = store
+            .upsert_message(&sample("a1", "old@x", "Old", "old body"))
+            .unwrap();
+        // Mail stored before parts were kept, waiting for the backfill.
+        store
+            .connection()
+            .execute("INSERT INTO body_backfill VALUES ('a1', 'old@x')", [])
+            .unwrap();
+        expunge(&store, &thread);
+        assert!(!queued(&store, "old@x"));
+        let mut later = sample("a1", "old@x", "Old", "old body");
+        later.parts = Some(html("later"));
+        store.upsert_message(&later).unwrap();
+        store.undo(&account("a1")).unwrap();
+        assert_eq!(body_of(&store, "old@x"), None, "later parts removed");
+        assert!(queued(&store, "old@x"), "queued to fetch again");
     }
 
     #[test]
