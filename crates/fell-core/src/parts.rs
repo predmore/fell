@@ -16,7 +16,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -334,6 +336,20 @@ pub fn fetch_part(
     request: &PartRequest,
     progress: &mut dyn FnMut(u64),
 ) -> Result<CachedPart> {
+    fetch_part_until(backend, cache, request, &mut |fetched| {
+        progress(fetched);
+        ControlFlow::Continue(())
+    })
+}
+
+/// [`fetch_part`], stopped (and its session closed) when `progress`
+/// answers `Break`.
+fn fetch_part_until(
+    backend: &dyn MailBackend,
+    cache: &PartCache,
+    request: &PartRequest,
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
+) -> Result<CachedPart> {
     if let Some(hit) = cache.lookup(request) {
         return Ok(hit);
     }
@@ -402,15 +418,39 @@ pub enum PartEvent {
     Done(Result<CachedPart>),
 }
 
-type Job = (PartRequest, Box<dyn FnMut(PartEvent) + Send>);
+type Events = Box<dyn FnMut(PartEvent) + Send>;
+type Job = (PartRequest, Arc<AtomicBool>, Events);
 
 /// A background thread that fetches parts one at a time, each over its own
 /// short-lived read-only IMAP session. [`PartFetcher::fetch`] returns at
 /// once, so it is safe to call from the UI; a sync pass on another
-/// connection carries on meanwhile. The thread ends when this is dropped,
-/// after the fetch it is running.
+/// connection carries on meanwhile.
+///
+/// Dropping it cancels every job and waits for the thread: queued jobs end
+/// at once, and the one running stops after the window it is reading, then
+/// closes its session.
 pub struct PartFetcher {
-    jobs: mpsc::Sender<Job>,
+    jobs: Option<mpsc::Sender<Job>>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One queued fetch. [`PartJob::cancel`] stops it: before it starts, it
+/// never connects; while it runs, it stops after the current window and
+/// closes its session. Either way `Done` reports an error.
+#[derive(Debug, Clone)]
+pub struct PartJob {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PartJob {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn cancelled() -> Error {
+    Error::Backend(crate::imap::PART_FETCH_CANCELLED.into())
 }
 
 impl PartFetcher {
@@ -421,30 +461,70 @@ impl PartFetcher {
         F: Fn() -> Result<Box<dyn MailBackend + Send>> + Send + 'static,
     {
         let (jobs, queue) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
+        let thread = std::thread::Builder::new()
             .name("fell-parts".into())
             .spawn(move || {
-                for (request, mut events) in queue {
+                for (request, job, mut events) in queue {
+                    let stopped = || job.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed);
+                    if stopped() {
+                        events(PartEvent::Done(Err(cancelled())));
+                        continue;
+                    }
                     let total = request.part.encoded_size;
                     let result = backend().and_then(|backend| {
-                        fetch_part(backend.as_ref(), &cache, &request, &mut |fetched| {
+                        fetch_part_until(backend.as_ref(), &cache, &request, &mut |fetched| {
                             events(PartEvent::Progress { fetched, total });
+                            if stopped() {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
                         })
                     });
                     events(PartEvent::Done(result));
                 }
             })
             .expect("spawn part fetch thread");
-        Self { jobs }
+        Self {
+            jobs: Some(jobs),
+            stopping,
+            thread: Some(thread),
+        }
     }
 
     /// Queue `request`. `events` runs on the fetch thread: progress after
     /// each window, then `Done` once.
-    pub fn fetch(&self, request: PartRequest, events: impl FnMut(PartEvent) + Send + 'static) {
-        if let Err(mpsc::SendError((_, mut events))) = self.jobs.send((request, Box::new(events))) {
+    pub fn fetch(
+        &self,
+        request: PartRequest,
+        events: impl FnMut(PartEvent) + Send + 'static,
+    ) -> PartJob {
+        let job = PartJob {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let sent = match &self.jobs {
+            Some(jobs) => jobs
+                .send((request, Arc::clone(&job.cancelled), Box::new(events)))
+                .map_err(|mpsc::SendError((_, _, events))| events),
+            None => Err(Box::new(events) as Events),
+        };
+        if let Err(mut events) = sent {
             events(PartEvent::Done(Err(Error::Backend(
                 "the part fetch thread stopped".into(),
             ))));
+        }
+        job
+    }
+}
+
+impl Drop for PartFetcher {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        drop(self.jobs.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -618,7 +698,7 @@ mod tests {
                 _copy: &RemoteId,
                 _section: &str,
                 _encoded_size: u64,
-                _progress: &mut dyn FnMut(u64),
+                _progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
             ) -> Result<Option<Vec<u8>>> {
                 Ok(Some(self.0.to_vec()))
             }

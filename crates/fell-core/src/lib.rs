@@ -44,7 +44,7 @@ pub use message::{
     Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
     RemoteId, TransferEncoding,
 };
-pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartRequest};
+pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
 pub use search::{SearchHit, SearchResults};
 pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,

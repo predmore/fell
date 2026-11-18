@@ -7,10 +7,15 @@
 //! (up to the 32 MB literal cap). The bytes come back still
 //! transfer-encoded; decoding is the caller's job.
 
+use std::ops::ControlFlow;
+
 use crate::Error;
 use crate::message::RemoteId;
 
 use super::{ImapConfig, parse_remote_id, session, unescape_mailbox};
+
+/// What a fetch stopped by its caller fails with.
+pub(crate) const CANCELLED: &str = "the part fetch was cancelled";
 
 /// Bytes asked for per `UID FETCH`.
 const WINDOW: usize = 2 * 1024 * 1024;
@@ -55,13 +60,14 @@ pub(crate) fn valid_section(section: &str) -> bool {
 /// The encoded bytes of part `section` of `copy`, listed as `encoded_size`
 /// bytes on the wire (0 when unknown). `Ok(None)` when the server no longer
 /// has that copy (expunged, a new UIDVALIDITY, a refused mailbox).
-/// `progress` hears the bytes read so far after each window.
+/// `progress` hears the bytes read so far after each window; `Break` stops
+/// the fetch, and the session is closed.
 pub(crate) fn fetch_part(
     config: &ImapConfig,
     copy: &RemoteId,
     section: &str,
     encoded_size: u64,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
 ) -> Result<Option<Vec<u8>>, Error> {
     if !valid_section(section) {
         return Err(Error::Backend(format!(
@@ -95,7 +101,7 @@ fn fetch_windows(
     uid: u32,
     section: &str,
     expected: usize,
-    progress: &mut dyn FnMut(u64),
+    progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
 ) -> Result<Option<Vec<u8>>, Error> {
     match session.examine(mailbox)? {
         Some(examined) if examined.uidvalidity == uidvalidity => {}
@@ -143,7 +149,9 @@ fn fetch_windows(
         if out.len() > MAX_ENCODED_PART {
             return Err(too_large());
         }
-        progress(out.len() as u64);
+        if progress(out.len() as u64).is_break() {
+            return Err(Error::Backend(CANCELLED.into()));
+        }
         // A part exactly one window long is whole once its listed size is
         // in: no second request for an empty window.
         if done || (expected > 0 && out.len() >= expected) {

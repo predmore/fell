@@ -3977,3 +3977,96 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
     assert_eq!(windows, 7, "2 MB windows of a 13.6 MB part");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
+    use std::time::{Duration, Instant};
+    let size = 10 * 1024 * 1024;
+    let fixture = crate::imap::mime_fixtures::large_attachment("big@x", size);
+    let syncing = TestServer::spawn(inbox_state(vec![(1, fixture.raw.clone())]));
+    let mut slow = inbox_state(vec![(1, fixture.raw.clone())]);
+    slow.part_write_delay = Some(Duration::from_millis(10));
+    let parts_server = TestServer::spawn(slow);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(syncing.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let request = store
+        .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
+        .unwrap()
+        .unwrap();
+    let (root, cache) = temp_cache("cancel");
+    let part_backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(parts_server.addr.port()),
+    };
+    let fetcher = crate::parts::PartFetcher::start(
+        move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
+        cache.clone(),
+    );
+    let channel = || std::sync::mpsc::channel::<crate::parts::PartEvent>();
+    let (running_events, running) = channel();
+    let (queued_events, queued) = channel();
+    let first = fetcher.fetch(request.clone(), move |event| {
+        let _ = running_events.send(event);
+    });
+    let second = fetcher.fetch(request.clone(), move |event| {
+        let _ = queued_events.send(event);
+    });
+    // The queued job, cancelled before it starts, never connects.
+    second.cancel();
+    assert!(matches!(
+        running.recv_timeout(Duration::from_secs(30)).unwrap(),
+        crate::parts::PartEvent::Progress { .. }
+    ));
+    let asked = Instant::now();
+    first.cancel();
+    let done = loop {
+        match running.recv_timeout(Duration::from_secs(30)).unwrap() {
+            crate::parts::PartEvent::Progress { .. } => {}
+            crate::parts::PartEvent::Done(result) => break result,
+        }
+    };
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "stopped after a window, not the whole part: {:?}",
+        asked.elapsed()
+    );
+    assert!(done.unwrap_err().to_string().contains("cancelled"));
+    match queued.recv_timeout(Duration::from_secs(30)).unwrap() {
+        crate::parts::PartEvent::Done(result) => {
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+        other @ crate::parts::PartEvent::Progress { .. } => panic!("{other:?}"),
+    }
+    let logged = commands(&parts_server);
+    let count = |verb: &str| logged.iter().filter(|line| line.contains(verb)).count();
+    assert_eq!(count("EXAMINE"), 1, "one session: {logged:?}");
+    assert_eq!(count("LOGOUT"), 1, "the cancelled session is closed");
+    assert!(cache.lookup(&request).is_none(), "nothing half-fetched is kept");
+
+    // Dropping the fetcher cancels the running job and waits for its thread.
+    parts_server.state.lock().expect("state").commands.clear();
+    let (events, heard) = channel();
+    fetcher.fetch(request.clone(), move |event| {
+        let _ = events.send(event);
+    });
+    assert!(matches!(
+        heard.recv_timeout(Duration::from_secs(30)).unwrap(),
+        crate::parts::PartEvent::Progress { .. }
+    ));
+    drop(fetcher);
+    let mut finished = None;
+    while let Ok(event) = heard.try_recv() {
+        if let crate::parts::PartEvent::Done(result) = event {
+            finished = Some(result);
+        }
+    }
+    let finished = finished.expect("Done arrived before drop returned");
+    assert!(finished.unwrap_err().to_string().contains("cancelled"));
+    assert!(commands(&parts_server).iter().any(|line| line.contains("LOGOUT")));
+    let _ = std::fs::remove_dir_all(&root);
+}

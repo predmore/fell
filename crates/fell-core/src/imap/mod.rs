@@ -17,7 +17,7 @@ mod utf7;
 pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_tcp_as_tls};
 
 pub(crate) use bodies::fetch_bodies;
-pub(crate) use part_fetch::fetch_part;
+pub(crate) use part_fetch::{CANCELLED as PART_FETCH_CANCELLED, fetch_part};
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
 #[cfg(test)]
