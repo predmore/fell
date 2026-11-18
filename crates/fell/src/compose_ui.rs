@@ -526,7 +526,7 @@ impl ComposeView {
         if snap.to.is_empty() && snap.cc.is_empty() && snap.bcc.is_empty() && snap.hunks.is_empty()
         {
             self.field = Field::To;
-            self.status = "to · tab next field".into();
+            self.status = "to · tab next".into();
         }
     }
 
@@ -977,16 +977,25 @@ impl ComposeView {
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
-        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
-            && key != "escape"
-        {
-            self.status = lock.reason().into();
-            return;
-        }
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
+        if let Some(Some(_)) = self.hub.with_session(&id, |session| session.send_lock())
+            && key != "escape"
+        {
+            // Still a window: `:` and its commands work, so `:q` closes
+            // it; `run_action` refuses the ones that would change the draft.
+            if self.palette.is_some() {
+                self.palette_key(key, typed, cx);
+            } else if key == ":" {
+                self.palette = Some(String::new());
+            } else {
+                // The bar's right side already gives the reason.
+                self.status = "read-only · :q close".into();
+            }
+            return;
+        }
         if self.palette.is_some() {
             self.palette_key(key, typed, cx);
             return;
@@ -1063,6 +1072,16 @@ impl ComposeView {
     }
 
     fn run_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        let locked = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
+            .flatten();
+        if let Some(lock) = locked
+            && matches!(action, "quote" | "keep" | "reject" | "undo")
+        {
+            self.status = lock.reason().into();
+            return;
+        }
         match action {
             "send" => self.send(cx),
             "preview" => {
@@ -1449,7 +1468,16 @@ impl Render for ComposeView {
             Mode::Insert => "insert",
             Mode::Visual => "visual",
         };
+        let locked = self
+            .hub
+            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
+            .flatten()
+            .is_some();
         let hint: SharedString = match (self.editor.mode, self.status.as_ref()) {
+            // Nothing to type into: the way out is the hint.
+            (_, "i insert" | "insert" | "esc normal" | "normal") if locked => {
+                "read-only · :q close".into()
+            }
             (Mode::Insert, "i insert" | "insert") => "esc normal".into(),
             (Mode::Normal, "esc normal" | "normal") => "i insert".into(),
             _ => self.status.clone(),
@@ -1814,9 +1842,14 @@ fn send_failure_line(
     outcome: &Result<fell_core::SentMessage, SendFailure>,
 ) -> Option<String> {
     match outcome {
-        Ok(_) if send_unrecorded(hub, id) => Some(SENT_UNRECORDED.into()),
+        // Worded as the inbox's other notices are: lowercase, outcome first.
+        Ok(_) if send_unrecorded(hub, id) => Some(
+            "sent  ·  the mailbox did not record it, so this draft reads as possibly sent".into(),
+        ),
         Ok(_) => None,
-        Err(err) => Some(err.to_string()),
+        Err(SendFailure::MaybeSent(_)) => Some(fell_core::compose::MAYBE_SENT_NOTICE.into()),
+        Err(SendFailure::NotSent(detail)) => Some(format!("not sent  ·  {detail}")),
+        Err(SendFailure::Locked(lock)) => Some(lock.reason().into()),
     }
 }
 
@@ -3253,7 +3286,13 @@ fn status_bar(
     let dot = || div().text_color(rgb(colors.dim)).child("·");
     // A narrow window keeps one line: the mode, first-time count, send and
     // the unreviewed count stay; the insert and close hints go first.
-    let mut left = div().flex().flex_1().gap_2().min_w(px(0.));
+    // Clipped, so a long message never draws under the send keys.
+    let mut left = div()
+        .flex()
+        .flex_1()
+        .gap_2()
+        .min_w(px(0.))
+        .overflow_hidden();
     let idle = matches!(
         status.as_ref(),
         "i insert" | "esc normal" | "normal" | "insert"
@@ -3281,10 +3320,16 @@ fn status_bar(
             );
         }
     } else {
-        // Narrow: a message (an edit position, an error) beats the hints and
-        // gives way first; the first-time count stays, short.
+        // Narrow: the mode always shows; a message (an edit position, an
+        // error) beats the hints and gives way first.
+        left = left.child(
+            div()
+                .flex_shrink_0()
+                .text_color(rgb(colors.dim))
+                .child(mode.to_string()),
+        );
         if !idle {
-            left = left.child(
+            left = left.child(dot()).child(
                 div()
                     .min_w(px(0.))
                     .truncate()
@@ -3295,13 +3340,17 @@ fn status_bar(
         // The header tags each first-time address; the count fills an idle
         // bar only, so it is never read as a count of edits.
         if fresh > 0 && idle {
-            left = left.child(div().flex_shrink_0().text_color(rgb(colors.fg)).child(
-                if fresh == 1 {
-                    "1 first-time recipient".to_string()
-                } else {
-                    format!("{fresh} first-time recipients")
-                },
-            ));
+            left = left.child(dot()).child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(colors.fg))
+                    // Short enough to sit beside the mode and send.
+                    .child(if fresh == 1 {
+                        "1 new recipient".to_string()
+                    } else {
+                        format!("{fresh} new recipients")
+                    }),
+            );
         }
     }
     let right = match &snap.send_block {
@@ -3320,6 +3369,15 @@ fn status_bar(
             .child(div().text_color(rgb(colors.fg)).child(":q close")),
         // Narrow: the reason alone says send is blocked, and leaves the
         // message on the left its room.
+        // May have gone out: the warning the inbox gives, in its colour.
+        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => div()
+            .flex_shrink_0()
+            .text_color(rgb(colors.error))
+            .child(if wide {
+                fell_core::compose::MAYBE_SENT_NOTICE
+            } else {
+                "may have been sent · check Sent"
+            }),
         Some(reason) => div()
             .flex()
             .flex_shrink_0()

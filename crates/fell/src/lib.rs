@@ -447,9 +447,12 @@ mod tests {
         let end = crate::compose_ui::finish_send(&hub, &sent, &other, true, &outcome);
         assert_eq!(end.status, None, "no error is painted on the other draft");
         assert!(!end.sent);
-        let lines = hub.take_closed();
-        assert!(lines[0].contains("Check Sent"), "{lines:?}");
-        assert!(lines[0].contains("Lunch"), "{lines:?}");
+        let notices = hub.take_notices();
+        let (line, warn) = &notices[0];
+        assert!(line.starts_with("may have been sent"), "{notices:?}");
+        assert!(line.contains("check Sent before sending again"), "{line}");
+        assert!(line.contains("Lunch"), "{line}");
+        assert!(*warn, "the inbox shows it in the error colour");
     }
 
     /// Send draft `id` as the window does, through `backend`, recording

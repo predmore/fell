@@ -39,7 +39,7 @@ type Listener = Box<dyn Fn() -> bool + Send>;
 
 /// The inbox notice for a draft that may have gone out, worded as its row
 /// and preview are.
-const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
+pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
 
 pub struct DraftHub {
     sessions: Mutex<HashMap<String, DraftSession>>,
@@ -51,7 +51,8 @@ pub struct DraftHub {
     /// again for a draft that is already focused.
     reveals: AtomicU64,
     /// One line per review window that closed, for the inbox to show.
-    closed: Mutex<Vec<String>>,
+    /// Closing notices for the inbox, each with whether it is a warning.
+    closed: Mutex<Vec<(String, bool)>>,
     /// The draft whose review window closed last, for the inbox to reopen.
     last_closed: Mutex<Option<String>>,
     /// Drafts being read from disk to go live, so two opens of one draft
@@ -262,7 +263,7 @@ impl DraftHub {
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
             let sent = locked == Some(SendLock::Sent.reason());
             let line = match locked {
-                Some(_) if sent => format!("sent{}", quoted_subject(&subject)),
+                Some(_) if sent => format!("sent{}  ·  gs sent", quoted_subject(&subject)),
                 Some(reason) if reason == SendLock::MaybeSent.reason() => format!(
                     "{MAYBE_SENT_NOTICE}{}  ·  gd drafts",
                     quoted_subject(&subject)
@@ -278,7 +279,8 @@ impl DraftHub {
                 // The person's own draft: kept, and in the drafts list.
                 None => format!("draft saved{}  ·  gd drafts", quoted_subject(&subject)),
             };
-            self.push_closed(id, line, sent);
+            let warn = locked == Some(SendLock::MaybeSent.reason());
+            self.push_closed(id, line, sent, warn);
         }
     }
 
@@ -287,6 +289,9 @@ impl DraftHub {
     /// window is left to say it. `failure` is what went wrong: a send that
     /// did not go out, may have, or went out but was not recorded.
     pub fn report_send(&self, id: &str, failure: Option<&str>) {
+        // Any failure is a warning: mail that did not go out, may have, or
+        // went out unrecorded.
+        let warn_failure = failure.is_some();
         let Some((locked, subject)) = self.with_session(id, |session| {
             let snap = session.snapshot();
             (snap.send_lock_reason(), snap.subject.clone())
@@ -297,19 +302,20 @@ impl DraftHub {
         let sent = locked == Some(SendLock::Sent.reason());
         let line = match (locked, failure) {
             (_, Some(failure)) => format!("{failure}{name}  ·  gd drafts"),
-            (Some(_), None) if sent => format!("sent{name}"),
+            (Some(_), None) if sent => format!("sent{name}  ·  gs sent"),
             (Some(reason), None) if reason == SendLock::MaybeSent.reason() => {
                 format!("{MAYBE_SENT_NOTICE}{name}  ·  gd drafts")
             }
             (Some(reason), None) => format!("{reason}{name}"),
             (None, None) => format!("not sent{name}  ·  gd drafts"),
         };
-        self.push_closed(id, line, sent);
+        let warn = warn_failure || locked == Some(SendLock::MaybeSent.reason());
+        self.push_closed(id, line, sent, warn);
     }
 
     /// Queue `line` for the inbox. Mail that went out is not offered again
     /// by reopen; anything else is the draft reopen brings back.
-    fn push_closed(&self, id: &str, line: String, sent: bool) {
+    fn push_closed(&self, id: &str, line: String, sent: bool, warn: bool) {
         {
             let mut last = self.last_closed.lock().expect("last closed");
             if !sent {
@@ -318,7 +324,7 @@ impl DraftHub {
                 *last = None;
             }
         }
-        self.closed.lock().expect("closed").push(line);
+        self.closed.lock().expect("closed").push((line, warn));
         self.emit();
     }
 
@@ -355,6 +361,15 @@ impl DraftHub {
 
     /// Lines about review windows that closed since the last call.
     pub fn take_closed(&self) -> Vec<String> {
+        self.take_notices()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// The closing notices since the last take, each with whether it is a
+    /// warning the inbox shows in its error colour.
+    pub fn take_notices(&self) -> Vec<(String, bool)> {
         std::mem::take(&mut *self.closed.lock().expect("closed"))
     }
 
@@ -1283,6 +1298,26 @@ mod tests {
     }
 
     #[test]
+    fn a_late_send_that_may_have_gone_out_is_a_lowercase_warning() {
+        let hub = hub_with_d1("late");
+        hub.report_send("d1", Some(MAYBE_SENT_NOTICE));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (line, warn) = &notices[0];
+        assert!(line.starts_with("may have been sent"), "{line}");
+        assert!(line.contains("\u{201c}Hi\u{201d}"), "{line}");
+        assert!(*warn, "a possible double send is shown as a warning");
+        // A draft simply left unsent is news, not a warning.
+        hub.report_send("d1", None);
+        let notices = hub.take_notices();
+        assert_eq!(
+            notices[0].0,
+            "not sent  ·  \u{201c}Hi\u{201d}  ·  gd drafts"
+        );
+        assert!(!notices[0].1);
+    }
+
+    #[test]
     fn the_inbox_can_reopen_the_review_that_closed() {
         let hub = hub_with_d1("reopen");
         let _host = hub.subscribe();
@@ -1316,7 +1351,7 @@ mod tests {
         // The sent close clears what the first close left for reopen.
         hub.note_hidden("d1");
         let lines = hub.take_closed();
-        assert!(lines.last().unwrap().starts_with("Sent"), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("sent"), "{lines:?}");
         let before = hub.reveal_count();
         assert!(
             !hub.reopen_last(),
@@ -1354,7 +1389,7 @@ mod tests {
         hub.report_send("d1", None);
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("Sent"), "{lines:?}");
+        assert!(lines[0].starts_with("sent"), "{lines:?}");
         assert!(lines[0].contains("Hi"), "{lines:?}");
         assert!(!hub.reopen_last());
         // A send that did not go out says why, and the draft stays.

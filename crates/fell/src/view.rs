@@ -716,7 +716,7 @@ impl Inbox {
         cx.spawn(async move |this, cx| {
             while events.next().await.is_some() {
                 while events.try_recv().is_ok() {}
-                let closed = hub.take_closed();
+                let closed = hub.take_notices();
                 let alive = this
                     .update(cx, |inbox, cx| {
                         // A draft changed, was sent, or is new: the drafts
@@ -724,10 +724,7 @@ impl Inbox {
                         if is_drafts(&inbox.session.folder) {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
-                        if let Some(line) = closed.last().cloned() {
-                            // A send that may have gone out is the one
-                            // notice to stop for.
-                            let warn = line.starts_with("may have been sent");
+                        if let Some((line, warn)) = closed.last().cloned() {
                             inbox.session.show_toast(line, warn);
                             cx.notify();
                         }
@@ -2075,9 +2072,11 @@ fn expanded_message(
                         .child(message.email.clone()),
                 )
                 .when(!message.folders.is_empty(), |row| {
+                    // A draft that may have gone out says so as its row does.
+                    let warn = message.folders.contains("may have been sent");
                     row.child(
                         div()
-                            .text_color(rgb(dim))
+                            .text_color(rgb(if warn { theme.error } else { dim }))
                             .text_size(px(theme.ui_px - 1.0))
                             .child(message.folders.clone()),
                     )

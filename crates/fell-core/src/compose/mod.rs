@@ -20,8 +20,8 @@ pub use frontmatter::{
     mailbox_parts, parse_address_line,
 };
 pub use hub::{
-    DraftHub, HubEvent, editor_is_running, file_fallback_edit, file_fallback_get,
-    file_fallback_replace_body, request_send_without_editor, rpc_call,
+    DraftHub, HubEvent, MAYBE_SENT_NOTICE, editor_is_running, file_fallback_edit,
+    file_fallback_get, file_fallback_replace_body, request_send_without_editor, rpc_call,
 };
 pub use markdown::{
     Block, BlockBody, Inline, StyleKind, StyleSpan, StyledDoc, doc_to_html, html_to_doc,
