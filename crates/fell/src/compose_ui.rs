@@ -231,6 +231,8 @@ pub struct ComposeView {
     bracket: Option<char>,
     /// The agent edit that the bar describes and keep, reject act on.
     focused_hunk: Option<u64>,
+    /// How many agent edits the window has already announced.
+    seen_edits: usize,
 }
 
 impl ComposeView {
@@ -279,6 +281,7 @@ impl ComposeView {
             closing: false,
             bracket: None,
             focused_hunk: None,
+            seen_edits: 0,
         }
     }
 
@@ -421,6 +424,48 @@ impl ComposeView {
         self.status = format!("edit {} of {}", index + 1, order.len()).into();
     }
 
+    /// An agent edit that arrives while the window is open gets the same
+    /// focus as one the window opened on, and says so; the person's cursor
+    /// stays where they were typing.
+    fn focus_new_edits(&mut self) {
+        let id = self.draft_id.to_string();
+        let Some(snap) = self.hub.with_session(&id, |session| session.snapshot()) else {
+            return;
+        };
+        let order = ordered_hunks(&snap);
+        let still_there = self
+            .focused_hunk
+            .is_some_and(|focused| order.iter().any(|(hunk, _)| *hunk == focused));
+        let arrived = order.len() > self.seen_edits;
+        self.seen_edits = order.len();
+        if order.is_empty() || (still_there && !arrived) {
+            if order.is_empty() {
+                self.focused_hunk = None;
+            }
+            return;
+        }
+        if !still_there {
+            self.focused_hunk = order.first().map(|(hunk, _)| *hunk);
+        }
+        if arrived {
+            let who = snap
+                .send_requested_by
+                .as_deref()
+                .map(agent_label)
+                .unwrap_or_else(|| "the agent".into());
+            let at = self
+                .focused_hunk
+                .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
+                .unwrap_or(0);
+            self.status = format!(
+                "{who} edited the draft · edit {} of {} · ]h",
+                at + 1,
+                order.len()
+            )
+            .into();
+        }
+    }
+
     /// An agent asked for review: start on its first edit, if any.
     pub(crate) fn start_on_first_edit(&mut self) {
         let id = self.draft_id.to_string();
@@ -428,6 +473,7 @@ impl ComposeView {
             return;
         };
         let order = ordered_hunks(&snap);
+        self.seen_edits = order.len();
         if !order.is_empty() {
             self.focus_hunk_at(&order, 0);
         }
@@ -452,6 +498,7 @@ impl ComposeView {
         if !self.pull_unpainted() {
             self.mark_painted();
         }
+        self.focus_new_edits();
         self.hub.note_shown(self.draft_id.as_ref());
     }
 
@@ -749,7 +796,8 @@ impl ComposeView {
             match returned {
                 Some((order, at, name)) => {
                     self.focus_hunk_at(&order, at);
-                    self.status = format!("undid · {name} back").into();
+                    let position = format!("edit {} of {}", at + 1, order.len());
+                    self.status = format!("{name} back for review · {position}").into();
                 }
                 None => self.status = "undone".into(),
             }
@@ -1397,9 +1445,24 @@ impl ComposeView {
                 colors,
             ))
             .child(reply_row(snap, colors))
-            .children(
-                (!snap.hunks.is_empty()).then(|| hunk_banner(snap, self.focused_hunk, colors)),
-            )
+            .children(if !snap.hunks.is_empty() {
+                Some(hunk_banner(snap, self.focused_hunk, colors))
+            } else if snap.send_requested_by.is_some() {
+                // The row stays, so an edit arriving later does not push the
+                // message down under the reader.
+                Some(
+                    div()
+                        .px_1()
+                        .py_1()
+                        .border_l(px(2.))
+                        .border_color(rgb(colors.panel))
+                        .text_size(px(16.))
+                        .text_color(rgb(colors.dim))
+                        .child("no agent edits to review"),
+                )
+            } else {
+                None
+            })
     }
 
     fn body_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
@@ -1693,8 +1756,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .min_w(px(0.))
         .child(div().flex_shrink_0().font_weight(FontWeight(620.)).child(
             if snap.send_requested_by.is_some() {
-                // The dot ends this part, so a wrapped line never starts with it.
-                "Review and send ·"
+                "Review and send"
             } else {
                 "Compose"
             },
@@ -1702,7 +1764,7 @@ fn header(snap: &Snapshot, colors: Palette) -> gpui::Div {
         .children(snap.send_requested_by.as_ref().map(|agent| {
             div()
                 .text_color(rgb(colors.accent))
-                .child(format!("asked by {}", agent_label(agent)))
+                .child(format!("— asked by {}", agent_label(agent)))
         }));
     div()
         .flex()
@@ -2860,17 +2922,17 @@ fn status_bar(
                     .child(status.to_string()),
             );
         }
-        if fresh > 0 {
-            if !idle {
-                left = left.child(dot());
-            }
+        // The header tags each first-time address; the count fills an idle
+        // bar only, so it is never read as a count of edits.
+        if fresh > 0 && idle {
             left = left.child(
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(colors.fg))
-                    .child(format!("{fresh} new")),
+                    .child(format!("{fresh} first-time")),
             );
         }
+        left = left.child(dot());
     }
     let right = match &snap.send_block {
         Some(reason) => div()

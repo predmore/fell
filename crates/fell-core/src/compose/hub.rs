@@ -166,25 +166,26 @@ impl DraftHub {
             )
         });
         if was_shown && let Some((locked, unreviewed, asked, subject)) = summary {
-            // Name the draft, so the line says which review closed.
-            let what = if subject.trim().is_empty() {
-                "Review".to_string()
+            // The outcome comes first, so a narrow status bar cuts the
+            // draft's name, never "not sent".
+            let name = if subject.trim().is_empty() {
+                String::new()
             } else {
-                let short: String = subject.chars().take(40).collect();
-                let more = if subject.chars().count() > 40 {
+                let short: String = subject.chars().take(24).collect();
+                let more = if subject.chars().count() > 24 {
                     "…"
                 } else {
                     ""
                 };
-                format!("Review of \u{201c}{short}{more}\u{201d}")
+                format!(" · review of \u{201c}{short}{more}\u{201d} closed")
             };
             let line = match locked {
-                Some(reason) => format!("{what} closed · {reason}"),
+                Some(reason) => format!("{reason}{name}"),
                 None if asked && unreviewed > 0 => format!(
-                    "{what} closed · not sent · {unreviewed} edit{} unreviewed",
+                    "Not sent · {unreviewed} edit{} unreviewed{name}",
                     if unreviewed == 1 { "" } else { "s" }
                 ),
-                None => format!("{what} closed · draft kept, not sent"),
+                None => format!("Not sent · draft kept{name}"),
             };
             self.closed.lock().expect("closed").push(line);
             self.emit();
@@ -1033,7 +1034,7 @@ mod tests {
         hub.note_hidden("d1");
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("not sent"), "{lines:?}");
+        assert!(lines[0].starts_with("Not sent"), "{lines:?}");
         assert!(hub.take_closed().is_empty());
     }
 

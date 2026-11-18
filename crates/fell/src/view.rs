@@ -1988,7 +1988,7 @@ fn status_bar(theme: &Theme, session: &Session) -> gpui::Div {
                     session
                         .toast
                         .as_ref()
-                        .map(|toast| toast.text.clone())
+                        .map(|toast| format!("· {}", toast.text))
                         .unwrap_or_default(),
                 ),
         )
