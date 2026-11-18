@@ -19,7 +19,9 @@ use crate::backend::{FolderRemoval, RemovalKind, Settle};
 use crate::message::{Message, MessageId};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
-use super::{delete_stored, find_stored, join_tokens, split_field, take_local_state};
+use super::{
+    canonical_id_on, delete_stored, find_stored, join_tokens, split_field, take_local_state,
+};
 
 const COPIES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS message_copies (
@@ -225,29 +227,9 @@ pub(super) fn forget(conn: &Connection, account_id: &AccountId, message_id: &str
     Ok(())
 }
 
-/// The present copies each listing found, for [`record_found`].
-pub(super) fn found_copies(
-    removals: &[FolderRemoval],
-) -> impl Iterator<Item = (&FolderRemoval, u32, u32, &MessageId)> {
-    removals.iter().flat_map(|removal| {
-        let found = match &removal.kind {
-            RemovalKind::Listing {
-                uidvalidity, found, ..
-            } => Some((*uidvalidity, found)),
-            RemovalKind::Vanished { .. } => None,
-        };
-        found.into_iter().flat_map(move |(uidvalidity, found)| {
-            found
-                .iter()
-                .map(move |(uid, message_id)| (removal, uidvalidity, *uid, message_id))
-        })
-    })
-}
-
 /// Drop the copies each removal names and queue the folders they backed.
 /// Folders and rows do not change until [`settle`]. Returns whether a row
-/// took over another's local state (see [`take_over_reset_row`]). Record
-/// [`found_copies`] first: a copy a listing found is not gone.
+/// took over another's local state (see [`take_over_reset_row`]).
 pub(super) fn apply_removals(
     conn: &Connection,
     account_id: &AccountId,
@@ -263,6 +245,9 @@ pub(super) fn apply_removals(
                 found,
                 sweep,
             } => {
+                for (uid, message_id) in found {
+                    record_found(conn, account_id, removal, *uidvalidity, *uid, message_id)?;
+                }
                 let listed = |uid: u32| uid > *through || present.binary_search(&uid).is_ok();
                 let stored = {
                     let mut stmt = conn.prepare(
@@ -400,7 +385,7 @@ fn fingerprint(conn: &Connection, account_id: &AccountId, message_id: &str) -> R
     )?)
 }
 
-pub(super) fn record_found(
+fn record_found(
     conn: &Connection,
     account_id: &AccountId,
     removal: &FolderRemoval,
@@ -410,22 +395,22 @@ pub(super) fn record_found(
 ) -> Result<()> {
     // A copy sync never stored (oversized, flagged deleted, removed here) has
     // no row to back.
-    let Some((stored, _)) = find_stored(conn, account_id, message_id)? else {
+    let Some(row) = canonical_id_on(conn, account_id, message_id)? else {
         return Ok(());
     };
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO message_copies
             (account_id, mailbox, uidvalidity, uid, message_id, folder)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            account_id.as_str(),
-            removal.mailbox,
-            uidvalidity,
-            uid,
-            stored.canonical_id,
-            removal.folder
-        ],
-    )?;
+    )?
+    .execute(params![
+        account_id.as_str(),
+        removal.mailbox,
+        uidvalidity,
+        uid,
+        row,
+        removal.folder
+    ])?;
     Ok(())
 }
 

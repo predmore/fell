@@ -359,14 +359,14 @@ mod tests {
         assert!(!sweep.contains("SCAN"), "{sweep}");
     }
 
-    /// More flags and found copies than one slice: the delta commits in
-    /// pieces and ends where one transaction would have.
+    /// Enough flags to split the delta in two: it ends where one
+    /// transaction would have.
     #[test]
-    fn a_delta_larger_than_a_slice_lands_whole() {
+    fn a_delta_split_in_two_lands_whole() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
         let account_id = AccountId("a1".into());
-        let total = u32::try_from(2 * super::super::SYNC_SLICE + 100).unwrap();
+        let total = u32::try_from(2 * super::super::SPLIT_DELTA_AT + 100).unwrap();
         store.apply_delta(&account_id, &delta(1, total)).unwrap();
         // The copies were recorded when the rows were stored. Forget them so
         // the listing's found copies are what puts them back.
@@ -444,6 +444,237 @@ mod tests {
             )
             .unwrap();
         assert_eq!(foldered, i64::from(total + 1));
+    }
+
+    /// The end of a pass over INBOX: each copy in `uids` with the unread
+    /// state the server reported when the pass fetched flags, and a listing
+    /// up to `through` that found every one of them.
+    fn end_of_inbox(
+        uids: std::ops::RangeInclusive<u32>,
+        through: u32,
+        unread: bool,
+        token: &str,
+    ) -> MailboxDelta {
+        let present: Vec<u32> = uids.collect();
+        MailboxDelta {
+            flags: present
+                .iter()
+                .map(|uid| crate::backend::FlagUpdate {
+                    remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
+                    unread,
+                })
+                .collect(),
+            removals: vec![crate::backend::FolderRemoval {
+                mailbox: "INBOX".into(),
+                folder: "INBOX".into(),
+                kind: crate::backend::RemovalKind::Listing {
+                    uidvalidity: 1,
+                    present: present.clone(),
+                    through,
+                    found: present
+                        .iter()
+                        .map(|uid| (*uid, MessageId::new(format!("m{uid}@example.test"))))
+                        .collect(),
+                    sweep: true,
+                },
+            }],
+            cursor: Some(crate::backend::SyncCursor {
+                account_key: "a1".into(),
+                token: token.into(),
+            }),
+            settle: crate::backend::Settle::All,
+            roles: None,
+            ..MailboxDelta::default()
+        }
+    }
+
+    /// A later pass that asked for flags changed since the stored modseq
+    /// and got none.
+    fn nothing_changed(token: &str) -> MailboxDelta {
+        MailboxDelta {
+            cursor: Some(crate::backend::SyncCursor {
+                account_key: "a1".into(),
+                token: token.into(),
+            }),
+            ..MailboxDelta::default()
+        }
+    }
+
+    fn unread_of(store: &Store, uid: u32) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT unread FROM messages WHERE message_id = ?1",
+                [format!("m{uid}@example.test")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn token(store: &Store) -> Option<String> {
+        store
+            .sync_cursor(&AccountId("a1".into()))
+            .unwrap()
+            .map(|cursor| cursor.token)
+    }
+
+    /// An agent marks a thread read while sync is part way through the
+    /// flags at the end of a mailbox. Those flags are what the server said
+    /// before the pass, and the pass stores the modseq, so the next pass
+    /// never sends that flag again: if a later part of the delta wrote the
+    /// old unread state over the agent's change, it would stay wrong.
+    #[test]
+    fn a_thread_marked_read_while_sync_commits_part_of_a_delta_stays_read() {
+        let dir = scratch("flag-gap");
+        let path = dir.join("mail.db");
+        let ui = Store::open(&path).unwrap();
+        ui.upsert_account(&account()).unwrap();
+        let account_id = AccountId("a1".into());
+        ui.apply_delta(&account_id, &delta(1, 2_100)).unwrap();
+
+        let sync = Store::open(&path).unwrap();
+        let marked = Arc::new(AtomicUsize::new(0));
+        let mut agent = Some(Store::open(&path).unwrap());
+        *sync.on_sync_commit.borrow_mut() = Some(Box::new({
+            let marked = Arc::clone(&marked);
+            move || {
+                // Once, at the first point sync lets another write in.
+                if let Some(agent) = agent.take() {
+                    let thread = inbox_message(2_050).thread_id;
+                    agent.mark_thread_read(&AccountId("a1".into()), &thread, "agent")?;
+                    marked.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }));
+        sync.apply_delta(
+            &account_id,
+            &end_of_inbox(1..=2_100, 2_100, true, "modseq-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            marked.load(Ordering::Relaxed),
+            1,
+            "sync let the agent in mid-delta"
+        );
+        assert!(!unread_of(&ui, 2_050), "the agent's read was overwritten");
+        assert!(unread_of(&ui, 2_049));
+        assert_eq!(token(&ui).as_deref(), Some("modseq-1"));
+
+        // The next pass asks for flags changed since modseq-1: none.
+        sync.apply_delta(&account_id, &nothing_changed("modseq-2"))
+            .unwrap();
+        assert!(!unread_of(&ui, 2_050));
+        assert_eq!(token(&ui).as_deref(), Some("modseq-2"));
+        drop((sync, ui));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whenever another write can get in during a delta, the copies table is
+    /// either as it was before the delta or as the whole listing left it: an
+    /// archive queued then sees every UID it must move and none the listing
+    /// is about to drop.
+    #[test]
+    fn a_write_during_a_delta_never_sees_half_a_listing() {
+        let dir = scratch("copies-gap");
+        let path = dir.join("mail.db");
+        let sync = Store::open(&path).unwrap();
+        sync.upsert_account(&account()).unwrap();
+        let account_id = AccountId("a1".into());
+        sync.apply_delta(&account_id, &delta(1, 2_100)).unwrap();
+        // UID 5000 is gone from the server: the listing below drops it.
+        sync.apply_delta(&account_id, &delta(5_000, 1)).unwrap();
+        // Copies recorded before Fell kept them: the listing records them.
+        sync.conn
+            .execute("DELETE FROM message_copies WHERE uid <= 2100", [])
+            .unwrap();
+        let copies = "SELECT COUNT(*) FROM message_copies";
+        let gone = "SELECT COUNT(*) FROM message_copies WHERE uid = 5000";
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = Store::open(&path).unwrap();
+        *sync.on_sync_commit.borrow_mut() = Some(Box::new({
+            let seen = Arc::clone(&seen);
+            move || {
+                seen.lock()
+                    .unwrap()
+                    .push((count(&reader, copies), count(&reader, gone)));
+                Ok(())
+            }
+        }));
+        sync.apply_delta(&account_id, &end_of_inbox(1..=2_100, 5_000, false, "done"))
+            .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "sync let other writes in mid-delta");
+        for state in &seen {
+            assert_eq!(*state, (1, 1), "a write saw part of the listing: {seen:?}");
+        }
+        assert_eq!(count(&sync, copies), 2_100);
+        assert_eq!(count(&sync, gone), 0);
+        drop(sync);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sync stops part way through a delta, and the next pass sends the
+    /// same delta again from the stored cursor. Nothing of the first try
+    /// that a later write could land between is left half done, and the
+    /// retry ends where one clean try would have.
+    #[test]
+    fn a_delta_cut_short_is_redone_whole() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let account_id = AccountId("a1".into());
+        store.apply_delta(&account_id, &delta(1, 2_100)).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM message_copies", [])
+            .unwrap();
+        let unread = "SELECT COUNT(*) FROM messages WHERE unread = 1";
+        let copies = "SELECT COUNT(*) FROM message_copies";
+        let end = end_of_inbox(1..=2_100, 2_100, false, "modseq-1");
+
+        // Stopped among the flags: none of them landed.
+        store.fail_after_flags.set(Some(1_500));
+        assert!(store.apply_delta(&account_id, &end).is_err());
+        store.fail_after_flags.set(None);
+        assert_eq!(count(&store, unread), 2_100, "some flags landed");
+        assert_eq!(count(&store, copies), 0);
+        assert_eq!(token(&store), None);
+
+        // Stopped where sync lets other writes in: every flag or none, and
+        // no copies or cursor yet.
+        let mut stop = true;
+        *store.on_sync_commit.borrow_mut() = Some(Box::new(move || {
+            if std::mem::take(&mut stop) {
+                return Err(crate::Error::Backend("sync stopped".into()));
+            }
+            Ok(())
+        }));
+        assert!(store.apply_delta(&account_id, &end).is_err());
+        let left = count(&store, unread);
+        assert!(left == 0 || left == 2_100, "{left} flags still unread");
+        assert_eq!(count(&store, copies), 0);
+        assert_eq!(token(&store), None);
+
+        // The retry.
+        store.apply_delta(&account_id, &end).unwrap();
+        assert_eq!(count(&store, unread), 0);
+        assert_eq!(count(&store, copies), 2_100);
+        assert_eq!(token(&store).as_deref(), Some("modseq-1"));
+
+        // A later change sticks through the next pass.
+        let thread = inbox_message(2_050).thread_id;
+        store
+            .mark_thread_unread(&account_id, &thread, "agent")
+            .unwrap();
+        store
+            .apply_delta(&account_id, &nothing_changed("modseq-2"))
+            .unwrap();
+        assert!(unread_of(&store, 2_050));
     }
 
     #[test]
@@ -583,10 +814,26 @@ mod tests {
             let done = Arc::clone(&done);
             move || {
                 let store = Store::open(&path).unwrap();
+                let split = Arc::new(std::sync::Mutex::new(None));
+                *store.on_sync_commit.borrow_mut() = Some(Box::new({
+                    let split = Arc::clone(&split);
+                    move || {
+                        *split.lock().unwrap() = Some(Instant::now());
+                        Ok(())
+                    }
+                }));
                 let started = Instant::now();
                 store.apply_delta(&AccountId("a1".into()), &end).unwrap();
+                let finished = Instant::now();
                 done.store(true, Ordering::Relaxed);
-                started.elapsed()
+                if let Some(at) = *split.lock().unwrap() {
+                    eprintln!(
+                        "  flags transaction {:?}, copies transaction {:?}",
+                        at - started,
+                        finished - at
+                    );
+                }
+                finished - started
             }
         });
         std::thread::sleep(Duration::from_millis(20));

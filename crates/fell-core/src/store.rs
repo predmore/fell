@@ -282,9 +282,9 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
         to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until, list_id,
         reply_to_line, attachment_names";
 
-/// Flags and found copies one sync transaction writes before it commits
-/// and lets a waiting write in. About 50 ms of work.
-const SYNC_SLICE: usize = 1_000;
+/// Flags in a delta, at or past which [`Store::apply_delta`] commits them
+/// before the delta's copy work and lets a waiting write in between.
+const SPLIT_DELTA_AT: usize = 1_000;
 
 /// The rows one server copy's flag lands on: the row it is, the row a
 /// merged copy joined, and the row its recorded copy backs. Each part seeks
@@ -322,7 +322,18 @@ pub struct Store {
     /// Tests compare incremental threading against the whole-account pass.
     #[cfg(test)]
     full_rethread: std::cell::Cell<bool>,
+    /// Tests: runs each time [`Store::apply_delta`] commits part of a delta
+    /// and before it begins the rest. An error stops the delta there, as a
+    /// crash would.
+    #[cfg(test)]
+    on_sync_commit: std::cell::RefCell<Option<SyncCommitHook>>,
+    /// Tests: [`Store::apply_delta`] fails after this many flags.
+    #[cfg(test)]
+    fail_after_flags: std::cell::Cell<Option<usize>>,
 }
+
+#[cfg(test)]
+type SyncCommitHook = Box<dyn FnMut() -> Result<()> + Send>;
 
 /// One page of FTS hits. `next_cursor` is passed back to [`Store::search_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +508,10 @@ impl Store {
             lock_wait,
             #[cfg(test)]
             full_rethread: std::cell::Cell::new(false),
+            #[cfg(test)]
+            on_sync_commit: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            fail_after_flags: std::cell::Cell::new(None),
             #[cfg(unix)]
             _mailbox_lock: None,
         })
@@ -576,12 +591,22 @@ impl Store {
     /// Write one sync delta.
     ///
     /// The end of a mailbox can carry a flag for every copy and, on its first
-    /// listing, every copy's Message-ID. That work commits every
-    /// [`SYNC_SLICE`] rows and begins again behind any write that is waiting,
-    /// so an archive or a draft save never waits for a whole mailbox. Each
-    /// slice is safe to repeat, and the cursor is written only in the last
-    /// one, so a pass cut short is done again by the next. A smaller delta is
-    /// one transaction.
+    /// listing, every copy's Message-ID. A delta with at least
+    /// [`SPLIT_DELTA_AT`] flags and work on copies is two transactions, and
+    /// the second begins behind any write that is waiting:
+    ///
+    /// 1. its new messages and every flag;
+    /// 2. its folder roles, every copy its listings found, the copies they
+    ///    no longer list, settling, and the cursor.
+    ///
+    /// Each part is whole, never cut inside. A write that gets in between
+    /// comes after every flag, so no flag the server sent before the pass
+    /// lands on top of it. The second part writes no read state. And the
+    /// copies stay as they were until one commit replaces them with what the
+    /// listing found, so an action reading them in between (an archive
+    /// queueing the UIDs to move) never sees half a listing. The cursor is
+    /// written only in the second part, so a pass cut short after the first
+    /// is done again by the next. Any other delta is one transaction.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
         let mut tx = self.begin_sync_write()?;
         for message in &delta.messages {
@@ -599,21 +624,38 @@ impl Store {
             insert_message(&tx, &message)?;
         }
         let inserted = !delta.messages.is_empty();
-        let mut rows = 0usize;
+        // Every flag in one transaction. Committing among them would let a
+        // read or unread change land between two of them and then be
+        // overwritten with what the server said before the pass, and the
+        // stored modseq means the server would not send that flag again.
+        // Once local flag intents (#161) keep the user's state apart from
+        // the server's, the flags could be committed in slices.
         for flag in &delta.flags {
+            #[cfg(test)]
+            self.stop_among_flags()?;
             apply_flag(&tx, account_id, flag)?;
-            tx = self.next_sync_slice(tx, &mut rows, account_id, inserted)?;
+        }
+        let copy_work = delta.roles.is_some()
+            || !delta.removals.is_empty()
+            || delta.settle != crate::backend::Settle::Later;
+        let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT;
+        if split {
+            if inserted {
+                self.rethread_written(&tx, account_id)?;
+            }
+            tx.commit()?;
+            #[cfg(test)]
+            if let Some(hook) = self.on_sync_commit.borrow_mut().as_mut() {
+                hook()?;
+            }
+            tx = self.begin_sync_write()?;
         }
         if let Some(found) = &delta.roles {
             roles::replace(&tx, account_id, found)?;
         }
-        for (removal, uidvalidity, uid, message_id) in copies::found_copies(&delta.removals) {
-            copies::record_found(&tx, account_id, removal, uidvalidity, uid, message_id)?;
-            tx = self.next_sync_slice(tx, &mut rows, account_id, inserted)?;
-        }
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if inserted || took_over || settled {
+        if (inserted && !split) || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -644,25 +686,17 @@ impl Store {
             .behind_waiting_writes(|| immediate_transaction(&self.conn))
     }
 
-    /// Count one row of a delta's flags and found copies, and every
-    /// [`SYNC_SLICE`] rows commit `tx` and begin the next slice. Threads the
-    /// delta's new messages joined are resolved before their first commit.
-    fn next_sync_slice<'a>(
-        &'a self,
-        tx: WriteTx<'a>,
-        rows: &mut usize,
-        account_id: &AccountId,
-        inserted: bool,
-    ) -> Result<WriteTx<'a>> {
-        *rows += 1;
-        if !rows.is_multiple_of(SYNC_SLICE) {
-            return Ok(tx);
+    /// Tests: count down `fail_after_flags` and fail when it runs out.
+    #[cfg(test)]
+    fn stop_among_flags(&self) -> Result<()> {
+        match self.fail_after_flags.get() {
+            Some(0) => Err(crate::Error::Backend("sync stopped mid-delta".into())),
+            Some(left) => {
+                self.fail_after_flags.set(Some(left - 1));
+                Ok(())
+            }
+            None => Ok(()),
         }
-        if inserted {
-            self.rethread_written(&tx, account_id)?;
-        }
-        tx.commit()?;
-        self.begin_sync_write()
     }
 
     /// Re-resolve the threads this transaction's writes touched.
@@ -1783,13 +1817,12 @@ fn canonical_id_on(
     account_id: &AccountId,
     message_id: &MessageId,
 ) -> Result<Option<String>> {
-    conn.query_row(
-        CANONICAL_ID_SQL,
-        params![account_id.as_str(), message_id.as_str()],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    conn.prepare_cached(CANONICAL_ID_SQL)?
+        .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(Into::into)
 }
 
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
@@ -2850,12 +2883,16 @@ fn apply_flag(
         }
         return Ok(());
     }
+    let mut update = conn.prepare_cached(
+        "UPDATE messages SET unread = ?1
+         WHERE account_id = ?2 AND message_id = ?3 AND unread != ?1",
+    )?;
     for message_id in targets {
-        conn.execute(
-            "UPDATE messages SET unread = ?1
-             WHERE account_id = ?2 AND message_id = ?3 AND unread != ?1",
-            params![i64::from(flag.unread), account_id.as_str(), message_id],
-        )?;
+        update.execute(params![
+            i64::from(flag.unread),
+            account_id.as_str(),
+            message_id
+        ])?;
     }
     Ok(())
 }
