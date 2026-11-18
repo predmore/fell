@@ -527,6 +527,7 @@ pub(crate) mod tests {
             &parent,
             &account.email,
             std::slice::from_ref(&account.email),
+            &fell_core::FolderRoles::default(),
         );
         let hub = DraftHub::new();
         let id = home.new_reply(&hub, &account.id, start).unwrap();

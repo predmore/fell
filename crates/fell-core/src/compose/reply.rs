@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use crate::{FolderRole, FolderRoles};
+
 use crate::message::{Address, Message, MessageId};
 
 use super::frontmatter::DraftFields;
@@ -57,8 +59,16 @@ const MAX_ID_LEN: usize = 250;
 
 /// Start a `kind` answer to `parent` from `from`, with the quote's dates in
 /// UTC. `own` holds the person's own addresses, which a reply never sends to.
-pub fn start_reply(kind: ReplyKind, parent: &Message, from: &str, own: &[String]) -> ReplyStart {
-    start_reply_in_zone(kind, parent, from, own, 0)
+/// `roles` are the account's folder roles, which say whether `parent` is a
+/// Sent copy.
+pub fn start_reply(
+    kind: ReplyKind,
+    parent: &Message,
+    from: &str,
+    own: &[String],
+    roles: &FolderRoles,
+) -> ReplyStart {
+    start_reply_in_zone(kind, parent, from, own, 0, roles)
 }
 
 /// [`start_reply`] with the quote's dates in the person's zone, `offset`
@@ -69,12 +79,13 @@ pub fn start_reply_in_zone(
     from: &str,
     own: &[String],
     offset: i64,
+    roles: &FolderRoles,
 ) -> ReplyStart {
     let subject = &parent.headers.subject;
     let parent_id = parent.headers.message_id.as_str();
     match kind {
         ReplyKind::Reply | ReplyKind::ReplyAll => {
-            let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll);
+            let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll, roles);
             let (quote_text, quote_html) = reply_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
@@ -135,7 +146,7 @@ fn prefixed(marker: &str, subject: &str) -> String {
 /// sender of a copy in Sent, which the person sent from some address of
 /// theirs. A mailing list the copy arrived through is not theirs, so a reply
 /// all still goes to it.
-pub fn own_addresses(parent: &Message, account_email: &str) -> Vec<String> {
+pub fn own_addresses(parent: &Message, account_email: &str, roles: &FolderRoles) -> Vec<String> {
     let list = parent.list_id.as_deref().map(|id| {
         id.trim()
             .trim_start_matches('<')
@@ -154,31 +165,39 @@ pub fn own_addresses(parent: &Message, account_email: &str) -> Vec<String> {
             .map(|email| email.trim().to_string())
             .filter(|email| email.contains('@') && !is_list(email)),
     );
-    if in_sent(parent) {
+    if in_sent(parent, roles) {
         own.push(parent.headers.from.email.trim().to_string());
     }
     own.retain(|email| !email.is_empty());
     own
 }
 
-/// Whether a copy of `message` is in the Sent folder.
-fn in_sent(message: &Message) -> bool {
-    message.folders.iter().any(|folder| {
-        folder.eq_ignore_ascii_case("sent") || folder.eq_ignore_ascii_case("sent mail")
-    })
+/// Whether a copy of `message` is in the account's Sent folder, whatever
+/// the server calls it (`Sent Items`, `[Gmail]/Sent Mail`).
+fn in_sent(message: &Message, roles: &FolderRoles) -> bool {
+    message
+        .folders
+        .iter()
+        .any(|folder| roles.is(FolderRole::Sent, folder))
 }
 
 /// To and Cc for a reply to `parent`. To is Reply-To when the message has
 /// one, else the sender. Reply all adds the other To recipients to To and
 /// keeps Cc as Cc. The person's own addresses (`own`) and repeats are left
-/// out. A reply to the person's own message goes to whoever it went to.
-pub fn reply_recipients(parent: &Message, own: &[String], all: bool) -> (Vec<String>, Vec<String>) {
+/// out. A reply to the person's own message (from one of `own`, or a copy
+/// in the Sent folder `roles` name) goes to whoever it went to.
+pub fn reply_recipients(
+    parent: &Message,
+    own: &[String],
+    all: bool,
+    roles: &FolderRoles,
+) -> (Vec<String>, Vec<String>) {
     let own: HashSet<String> = own
         .iter()
         .map(|email| email.trim().to_lowercase())
         .collect();
     let mine = |address: &Address| own.contains(&address.email.trim().to_lowercase());
-    let from_me = mine(&parent.headers.from) || in_sent(parent);
+    let from_me = mine(&parent.headers.from) || in_sent(parent, roles);
     let primary: Vec<&Address> = if from_me {
         parent.to.iter().collect()
     } else if !parent.reply_to.is_empty() {
@@ -598,7 +617,7 @@ mod tests {
 
     #[test]
     fn a_reply_goes_to_the_sender_and_never_to_me() {
-        let (to, cc) = reply_recipients(&parent(), &me(), false);
+        let (to, cc) = reply_recipients(&parent(), &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["Ada Lovelace <ada@x>"]);
         assert!(cc.is_empty());
     }
@@ -607,9 +626,9 @@ mod tests {
     fn reply_to_wins_over_the_sender() {
         let mut message = parent();
         message.reply_to = vec![address(Some("Plans list"), "plans@lists.x")];
-        let (to, _) = reply_recipients(&message, &me(), false);
+        let (to, _) = reply_recipients(&message, &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["Plans list <plans@lists.x>"]);
-        let (to, cc) = reply_recipients(&message, &me(), true);
+        let (to, cc) = reply_recipients(&message, &me(), true, &FolderRoles::default());
         assert_eq!(
             to,
             vec!["Plans list <plans@lists.x>", "Maya <maya@x>"],
@@ -620,7 +639,7 @@ mod tests {
 
     #[test]
     fn reply_all_adds_the_others_once_each_without_me() {
-        let (to, cc) = reply_recipients(&parent(), &me(), true);
+        let (to, cc) = reply_recipients(&parent(), &me(), true, &FolderRoles::default());
         assert_eq!(to, vec!["Ada Lovelace <ada@x>", "Maya <maya@x>"]);
         // Ada is in To already and Jon is me, in any case; Sam is listed twice.
         assert_eq!(cc, vec!["sam@x"]);
@@ -639,12 +658,37 @@ mod tests {
             address(None, "me+lists@pm.me"),
         ];
         message.arrived_via = vec!["me+lists@pm.me".into()];
-        let own = own_addresses(&message, "jon@example.com");
-        let (to, _) = reply_recipients(&message, &own, false);
+        let own = own_addresses(&message, "jon@example.com", &FolderRoles::default());
+        let (to, _) = reply_recipients(&message, &own, false, &FolderRoles::default());
         assert_eq!(to, vec!["Maya <maya@x>"]);
-        let (to, cc) = reply_recipients(&message, &own, true);
+        let (to, cc) = reply_recipients(&message, &own, true, &FolderRoles::default());
         assert_eq!(to, vec!["Maya <maya@x>"]);
         assert!(!cc.iter().chain(&to).any(|line| line.contains("pm.me")));
+    }
+
+    #[test]
+    fn a_sent_copy_is_found_by_its_role_not_its_name() {
+        // #140: on Fastmail the Sent folder is "Sent Items", on Gmail
+        // "[Gmail]/Sent Mail". A reply to a copy there went back to me.
+        for sent in ["Sent Items", "[Gmail]/Sent Mail"] {
+            let roles = FolderRoles::new(vec![crate::RoleFolder {
+                role: FolderRole::Sent,
+                name: sent.into(),
+                raw: sent.into(),
+                source: crate::RoleSource::Server,
+            }]);
+            let mut message = parent();
+            message.folders = vec![sent.into()];
+            message.headers.from = address(Some("Jon"), "me@pm.me");
+            message.to = vec![address(Some("Maya"), "maya@x")];
+            let own = own_addresses(&message, "jon@example.com", &roles);
+            assert!(own.contains(&"me@pm.me".to_string()), "{sent}: {own:?}");
+            let (to, _) = reply_recipients(&message, &[], false, &roles);
+            assert_eq!(to, vec!["Maya <maya@x>"], "{sent}");
+            // Without the role, the same folder is not taken for Sent.
+            let (to, _) = reply_recipients(&message, &[], false, &FolderRoles::default());
+            assert_eq!(to, vec!["Jon <me@pm.me>"], "{sent}");
+        }
     }
 
     #[test]
@@ -654,9 +698,9 @@ mod tests {
         message.arrived_via = vec!["team@lists.x".into(), "jon+team@example.com".into()];
         message.cc.push(address(None, "team@lists.x"));
         message.cc.push(address(None, "jon+team@example.com"));
-        let own = own_addresses(&message, "jon@example.com");
+        let own = own_addresses(&message, "jon@example.com", &FolderRoles::default());
         assert_eq!(own, vec!["jon@example.com", "jon+team@example.com"]);
-        let (_, cc) = reply_recipients(&message, &own, true);
+        let (_, cc) = reply_recipients(&message, &own, true, &FolderRoles::default());
         assert!(cc.contains(&"team@lists.x".to_string()), "{cc:?}");
         assert!(!cc.iter().any(|line| line.contains("jon+team")), "{cc:?}");
     }
@@ -670,7 +714,14 @@ mod tests {
         let mut chain = vec![MessageId::new("mid@x"), MessageId::new("root@x")];
         chain.extend((0..20).map(|n| MessageId::new(format!("m{n}@x"))));
         message.headers.references = chain;
-        let start = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
+        let start = start_reply_in_zone(
+            ReplyKind::Reply,
+            &message,
+            "jon@example.com",
+            &me(),
+            0,
+            &FolderRoles::default(),
+        );
         let refs = &start.parts.references;
         assert_eq!(refs.len(), MAX_REFERENCES);
         assert_eq!(&refs[..2], ["mid@x", "root@x"]);
@@ -678,7 +729,14 @@ mod tests {
         // A reply to the root that also cites later ids keeps its order.
         message.headers.in_reply_to = Some(MessageId::new("root@x"));
         message.headers.references = vec![MessageId::new("root@x"), MessageId::new("mid@x")];
-        let start = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
+        let start = start_reply_in_zone(
+            ReplyKind::Reply,
+            &message,
+            "jon@example.com",
+            &me(),
+            0,
+            &FolderRoles::default(),
+        );
         assert_eq!(start.parts.references, ["root@x", "mid@x", "parent@x"]);
     }
 
@@ -686,16 +744,16 @@ mod tests {
     fn a_reply_to_my_own_message_goes_to_its_recipients() {
         let mut message = parent();
         message.headers.from = address(Some("Jon"), "JON@example.com");
-        let (to, cc) = reply_recipients(&message, &me(), false);
+        let (to, cc) = reply_recipients(&message, &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["Maya <maya@x>"]);
         assert!(cc.is_empty());
-        let (to, cc) = reply_recipients(&message, &me(), true);
+        let (to, cc) = reply_recipients(&message, &me(), true, &FolderRoles::default());
         assert_eq!(to, vec!["Maya <maya@x>"]);
         assert_eq!(cc, vec!["sam@x", "Ada again <ADA@x>"]);
         // A note to myself alone is answered to me.
         message.to = vec![address(None, "jon@example.com")];
         message.cc.clear();
-        let (to, _) = reply_recipients(&message, &me(), true);
+        let (to, _) = reply_recipients(&message, &me(), true, &FolderRoles::default());
         assert_eq!(to, vec!["Jon <JON@example.com>"]);
     }
 
@@ -703,7 +761,7 @@ mod tests {
     fn names_with_commas_are_quoted_so_the_line_parses() {
         let mut message = parent();
         message.headers.from = address(Some("Lovelace, \"Ada\""), "ada@x");
-        let (to, _) = reply_recipients(&message, &me(), false);
+        let (to, _) = reply_recipients(&message, &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["\"Lovelace, Ada\" <ada@x>"]);
         assert_eq!(
             super::super::mailbox_parts(&to[0]),
@@ -777,7 +835,14 @@ mod tests {
 
     #[test]
     fn a_reply_starts_with_its_parent_and_the_quote() {
-        let start = start_reply_in_zone(ReplyKind::Reply, &parent(), "jon@example.com", &me(), 0);
+        let start = start_reply_in_zone(
+            ReplyKind::Reply,
+            &parent(),
+            "jon@example.com",
+            &me(),
+            0,
+            &FolderRoles::default(),
+        );
         assert_eq!(start.fields.from, "jon@example.com");
         assert_eq!(start.fields.subject, "Re: Plans");
         assert_eq!(start.fields.in_reply_to.as_deref(), Some("parent@x"));
@@ -823,7 +888,14 @@ mod tests {
         let mut message = parent();
         message.has_attachment = true;
         message.attachment_names = vec!["report.pdf".into(), "chart.png".into()];
-        let start = start_reply_in_zone(ReplyKind::Forward, &message, "jon@example.com", &me(), 0);
+        let start = start_reply_in_zone(
+            ReplyKind::Forward,
+            &message,
+            "jon@example.com",
+            &me(),
+            0,
+            &FolderRoles::default(),
+        );
         assert!(start.fields.to.is_empty() && start.fields.cc.is_empty());
         assert_eq!(start.fields.subject, "Fwd: Plans");
         assert_eq!(start.fields.in_reply_to, None);
@@ -852,7 +924,14 @@ mod tests {
                 not_forwarded: Some("report.pdf, chart.png".into()),
             })
         );
-        let reply = start_reply_in_zone(ReplyKind::Reply, &message, "jon@example.com", &me(), 0);
+        let reply = start_reply_in_zone(
+            ReplyKind::Reply,
+            &message,
+            "jon@example.com",
+            &me(),
+            0,
+            &FolderRoles::default(),
+        );
         assert_eq!(forward_summary(&reply.parts.quote_text), None);
     }
 
@@ -913,6 +992,7 @@ mod tests {
             &from_store,
             &account.email,
             std::slice::from_ref(&account.email),
+            &FolderRoles::default(),
         );
         let outgoing = super::super::mime::build_outgoing(
             account.id.clone(),

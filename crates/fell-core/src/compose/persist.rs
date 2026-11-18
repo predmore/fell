@@ -509,6 +509,8 @@ impl Store {
         if let Some(account) = self.get_account(account_id)? {
             known.insert(account.email.to_ascii_lowercase());
         }
+        // Sent by role: "Sent Items" or "[Gmail]/Sent Mail" count too.
+        let roles = self.folder_roles(account_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT folders, to_line, cc_line, bcc_line FROM messages WHERE account_id = ?1",
         )?;
@@ -522,9 +524,10 @@ impl Store {
         })?;
         for row in rows {
             let (folders, to, cc, bcc) = row?;
-            if !split_list(&folders).iter().any(|folder| {
-                folder.eq_ignore_ascii_case("sent") || folder.eq_ignore_ascii_case("sent mail")
-            }) {
+            if !split_list(&folders)
+                .iter()
+                .any(|folder| roles.is(crate::FolderRole::Sent, folder))
+            {
                 continue;
             }
             for line in [&to, &cc, &bcc] {
@@ -778,6 +781,66 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn people_mailed_from_any_sent_folder_are_known() {
+        // #140: only "Sent" and "Sent Mail" counted, so Fastmail's "Sent
+        // Items" left everyone mailed from it marked as first-time.
+        let store = Store::open_in_memory().unwrap();
+        let account = crate::Account {
+            id: AccountId("a".into()),
+            display_name: "Me".into(),
+            email: "me@x".into(),
+            backend_kind: crate::BackendKind::Bridge,
+        };
+        store.upsert_account(&account).unwrap();
+        let put = |id: &str, folder: &str, to: &str| {
+            let message_id = crate::MessageId::new(id);
+            store
+                .upsert_message(&crate::Message {
+                    account_id: account.id.clone(),
+                    headers: crate::MessageHeaders {
+                        message_id: message_id.clone(),
+                        proton_conversation_id: None,
+                        in_reply_to: None,
+                        references: Vec::new(),
+                        from: crate::Address {
+                            name: None,
+                            email: "me@x".into(),
+                        },
+                        subject: "Hi".into(),
+                        date_unix: 1,
+                    },
+                    remote_id: crate::RemoteId(id.into()),
+                    thread_id: crate::ThreadId::from_message_id(&message_id),
+                    snippet: "hi".into(),
+                    body_text: Some("hi".into()),
+                    unread: false,
+                    folders: vec![folder.into()],
+                    labels: Vec::new(),
+                    arrived_via: Vec::new(),
+                    to: vec![crate::Address {
+                        name: None,
+                        email: to.into(),
+                    }],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    starred: false,
+                    has_attachment: false,
+                    archived: false,
+                    snooze_until: None,
+                    list_id: None,
+                    reply_to: Vec::new(),
+                    attachment_names: Vec::new(),
+                })
+                .unwrap();
+        };
+        put("sent@x", "Sent Items", "maya@x");
+        put("inbox@x", "INBOX", "stranger@x");
+        let known = store.mailed_addresses(&account.id).unwrap();
+        assert!(known.contains("maya@x"), "{known:?}");
+        assert!(!known.contains("stranger@x"), "{known:?}");
+    }
 
     #[test]
     fn a_reply_names_its_parent_by_id_or_alias() {
