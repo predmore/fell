@@ -1390,6 +1390,38 @@ fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
     Ok(())
 }
 
+/// A server copy of a row deleted in Fell changed its read state: write it
+/// on the snapshot an undo would restore, as [`fold_deleted_snapshot`] does
+/// for a whole copy. A store with no actions yet has nothing to update.
+pub(crate) fn fold_flag_into_snapshots(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    unread: bool,
+) -> Result<()> {
+    let present: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'local_action_messages'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if present.is_none() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE local_action_messages SET unread = ?1
+         WHERE message_id = ?2
+           AND action_id IN (
+               SELECT id FROM local_actions
+               WHERE account_id = ?3 AND undone = 0
+           )",
+        params![i64::from(unread), message_id, account_id.as_str()],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn message_row_exists(
     conn: &Connection,
     account_id: &AccountId,

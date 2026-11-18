@@ -595,6 +595,106 @@ fn without_uidnext_only_new_uids_are_downloaded() {
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
 }
 
+fn literal(uid: u32, flags: &[&str], modseq: u64, raw: Vec<u8>) -> FixtureMessage {
+    FixtureMessage {
+        uid,
+        flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+        modseq,
+        body_form: BodyForm::Literal,
+        raw,
+    }
+}
+
+#[test]
+fn an_unread_change_on_the_other_copy_of_one_message_id_reaches_the_row() {
+    // INBOX and Sent (or All Mail) hold the same Message-ID. The row names
+    // the copy written last; the flag changes on the other one.
+    let raw = raw_message("both@x", None, "Both", "Ann <ann@x>", "kept twice", "");
+    let mut state = sample_state();
+    state.condstore = true;
+    state.mailboxes = vec![
+        FixtureMailbox {
+            messages: vec![literal(1, &["\\Seen"], 1, raw.clone())],
+            ..empty_mailbox("INBOX", 3)
+        },
+        FixtureMailbox {
+            messages: vec![literal(1, &["\\Seen"], 1, raw)],
+            ..empty_mailbox("Sent", 4)
+        },
+    ];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let row = stored(&store, &acct, "both@x").unwrap();
+    assert_eq!(row.remote_id.0, "imap:4:1:Sent");
+    assert!(!row.unread);
+    {
+        let mut state = server.state.lock().expect("state");
+        let message = &mut mailbox(&mut state, "INBOX").messages[0];
+        message.flags.clear();
+        message.modseq = 2;
+        state.commands.clear();
+    }
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 0);
+    assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
+    assert!(
+        stored(&store, &acct, "both@x").unwrap().unread,
+        "the INBOX copy is unread now"
+    );
+}
+
+#[test]
+fn a_flag_change_after_trash_is_emptied_comes_back_with_undo() {
+    let mut state = sample_state();
+    state.condstore = true;
+    state.mailboxes = vec![
+        empty_mailbox("INBOX", 3),
+        FixtureMailbox {
+            messages: vec![literal(
+                1,
+                &["\\Seen"],
+                1,
+                raw_message("binned@x", None, "Binned", "Ann <ann@x>", "old", ""),
+            )],
+            ..empty_mailbox("Trash", 5)
+        },
+    ];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let thread = thread_of(&store, &acct, "binned@x");
+    // Emptying Trash in Fell deletes the row; the server copy stays.
+    store.delete_thread(&acct.id, &thread, "Trash").unwrap();
+    assert!(stored(&store, &acct, "binned@x").is_none());
+    {
+        let mut state = server.state.lock().expect("state");
+        let message = &mut mailbox(&mut state, "Trash").messages[0];
+        message.flags.clear();
+        message.modseq = 2;
+        state.commands.clear();
+    }
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.upserted, 0);
+    assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
+    assert!(stored(&store, &acct, "binned@x").is_none());
+    store.undo(&acct.id).unwrap();
+    assert!(
+        stored(&store, &acct, "binned@x").unwrap().unread,
+        "undo restores the read state the server reported since"
+    );
+}
+
 #[test]
 fn bad_password_does_not_advance_the_cursor() {
     let server = TestServer::spawn(sample_state());
