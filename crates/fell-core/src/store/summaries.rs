@@ -1309,6 +1309,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 
@@ -2310,6 +2311,9 @@ mod tests {
                     message.folders = vec![folders[position].to_string()];
                     message.archived = false;
                     message.headers.date_unix = 1_600_000_000 + index as i64 * 60;
+                    // A server copy and stored parts, like mail IMAP sync wrote.
+                    message.remote_id = crate::RemoteId(format!("imap:1:{index}:INBOX"));
+                    message.parts = Some(measured_parts(&mut rng));
                     message
                 })
                 .collect();
@@ -2414,7 +2418,98 @@ mod tests {
                 .unwrap()
                 .unread
         });
+        let thread = full[middle].thread_id.clone();
+        time("open thread (thread_messages, 5 messages)", &|| {
+            store.thread_messages(&account, &thread).unwrap().len()
+        });
+        time("open thread, then message_body for each of the 5", &|| {
+            let messages = store.thread_messages(&account, &thread).unwrap();
+            for message in &messages {
+                store
+                    .message_body(&account, &message.headers.message_id)
+                    .unwrap()
+                    .expect("parts stored");
+            }
+            messages.len()
+        });
+        let one = full[middle].thread_id.clone();
+        let first_id = store.thread_messages(&account, &one).unwrap()[0]
+            .headers
+            .message_id
+            .clone();
+        time("one message by id (Store::message)", &|| {
+            usize::from(store.message(&account, &first_id).unwrap().is_some())
+        });
+        time(
+            "backfill check with nothing missing (missing_bodies)",
+            &|| store.missing_bodies(&account, 200).unwrap().len(),
+        );
+        let stored_bytes: i64 = store
+            .conn
+            .query_row(
+                "SELECT SUM(length(html)) + SUM(length(plain)) FROM message_bodies",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        println!(
+            "parts: {:.1} MB raw, {:.1} MB stored",
+            measured_raw_bytes() as f64 / 1e6,
+            stored_bytes as f64 / 1e6
+        );
         drop(store);
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        println!("mailbox file {:.1} MB", size as f64 / 1e6);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    static MEASURED_RAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn measured_raw_bytes() -> usize {
+        MEASURED_RAW.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A newsletter-sized HTML part (about 12 KB) and its plain alternative,
+    /// with varied words so compression is not flattered.
+    fn measured_parts(rng: &mut Rng) -> crate::MessageParts {
+        const WORDS: &[&str] = &[
+            "order", "shipping", "account", "update", "weekly", "digest", "meeting", "invoice",
+            "project", "review", "summer", "launch", "team", "notes", "draft", "travel", "receipt",
+            "offer", "member", "event", "report", "photos", "tickets", "garden",
+        ];
+        let sentence = |rng: &mut Rng, words: usize| {
+            (0..words)
+                .map(|_| WORDS[rng.below(WORDS.len())])
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut html = String::from(
+            "<html><head><style>td{font-family:Helvetica,Arial,sans-serif;color:#333}</style>\
+             </head><body><table width=\"600\" cellpadding=\"0\" cellspacing=\"0\">",
+        );
+        let mut plain = String::new();
+        while html.len() < 12_000 {
+            let text = sentence(rng, 18);
+            let link = rng.next();
+            html.push_str(&format!(
+                "<tr><td style=\"padding:12px 24px;font-size:15px;line-height:22px\">\
+                 <a href=\"https://news.example/c/{link:x}\">{text}</a></td></tr>"
+            ));
+            plain.push_str(&text);
+            plain.push('\n');
+        }
+        html.push_str("</table></body></html>");
+        MEASURED_RAW.fetch_add(
+            html.len() + plain.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        crate::MessageParts {
+            html: Some(html),
+            plain: Some(plain),
+            bulk_headers: vec![(
+                "List-Unsubscribe".to_string(),
+                "<https://news.example/u>".to_string(),
+            )],
+        }
     }
 }

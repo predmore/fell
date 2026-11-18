@@ -1,12 +1,13 @@
 //! RFC 822 bytes from IMAP FETCH, turned into a store message.
 //!
-//! HTML is reduced to plain text for the local body. Rendering HTML is later
-//! work and does not belong in sync.
+//! `body_text` is the plain text search and snippets use, with HTML reduced
+//! to text. The HTML and plain parts are kept as sent in [`MessageParts`] for
+//! the conversation view; sanitizing HTML belongs to rendering, not sync.
 
-use mail_parser::{HeaderForm, MessageParser};
+use mail_parser::{HeaderForm, MessageParser, PartKind};
 
 use crate::account::AccountId;
-use crate::message::{Address, Message, MessageHeaders, MessageId, RemoteId};
+use crate::message::{Address, Message, MessageHeaders, MessageId, MessageParts, RemoteId};
 use crate::threading::ThreadId;
 
 use super::escape_mailbox;
@@ -162,7 +163,143 @@ pub(crate) fn to_message(
         list_id,
         reply_to: address_list(parsed.as_ref().and_then(|message| message.reply_to())),
         attachment_names: parsed.as_ref().map(attachment_names).unwrap_or_default(),
+        parts: Some(parsed.as_ref().map(body_parts).unwrap_or_default()),
     }
+}
+
+/// Header names the renderer's bulk-mail check reads, matched exactly
+/// (ASCII case-insensitive).
+const BULK_HEADERS: &[&str] = &[
+    "List-Unsubscribe",
+    "List-Unsubscribe-Post",
+    "List-Id",
+    "Precedence",
+    "Auto-Submitted",
+    "X-Mailer",
+    "Feedback-ID",
+];
+
+/// Header name prefixes email service providers stamp on bulk sends. Keep
+/// this a superset of the ESP list in `fell-render`'s `choose.rs`.
+const ESP_HEADER_PREFIXES: &[&str] = &[
+    "x-mailchimp-",
+    "x-mc-",
+    "x-mailgun-",
+    "x-ses-",
+    "x-sendgrid-",
+    "x-klaviyo-",
+    "x-mailjet-",
+    "x-mandrill-",
+    "x-hs-",
+    "x-hubspot-",
+    "x-cmail-",
+    "x-campaign",
+    "x-sg-",
+    "x-pm-message-id",
+    "x-pm-tag",
+    "x-pm-rcpt",
+    "x-mailer-",
+    "x-marketo",
+    "x-csa-complaints",
+];
+
+/// A hostile message cannot make the kept headers large.
+const MAX_BULK_HEADERS: usize = 32;
+const MAX_BULK_HEADER_VALUE: usize = 2048;
+
+/// [`body_parts`] of raw RFC 822 bytes. Bytes that do not parse have none.
+pub(crate) fn parts_from_raw(raw: &[u8]) -> MessageParts {
+    MessageParser::new()
+        .parse(raw)
+        .as_ref()
+        .map(body_parts)
+        .unwrap_or_default()
+}
+
+/// The HTML and plain-text body parts as sent, and the bulk-mail headers.
+///
+/// `text_body` and `html_body` (RFC 8621) list stand-ins for a missing
+/// alternative: an HTML part in the text body of HTML-only mail, and the
+/// reverse. Only parts of the matching kind are kept, so HTML-only mail has
+/// no `plain` and plain-only mail has no `html`. Several parts of one kind
+/// (text around an inline image) are joined in reading order.
+fn body_parts(message: &mail_parser::Message<'_>) -> MessageParts {
+    let html = joined(message.html_body(), |kind| matches!(kind, PartKind::Html));
+    let plain = joined(message.text_body(), |kind| matches!(kind, PartKind::Text));
+    MessageParts {
+        html,
+        plain,
+        bulk_headers: bulk_headers(message),
+    }
+}
+
+fn joined<'m>(
+    parts: impl Iterator<Item = mail_parser::MessagePart<'m>>,
+    wanted: impl Fn(&PartKind<'m>) -> bool,
+) -> Option<String> {
+    let mut out: Option<String> = None;
+    for part in parts {
+        if !wanted(&part.kind()) {
+            continue;
+        }
+        let Some(text) = part.text() else {
+            continue;
+        };
+        match &mut out {
+            Some(joined) => {
+                if !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                joined.push_str(&text);
+            }
+            None => out = Some(text.into_owned()),
+        }
+    }
+    out.filter(|text| !text.trim().is_empty())
+}
+
+fn bulk_headers(message: &mail_parser::Message<'_>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for header in message.headers().iter() {
+        if out.len() >= MAX_BULK_HEADERS {
+            break;
+        }
+        let name = header.raw_name().trim();
+        if !is_bulk_header(name) {
+            continue;
+        }
+        let value = unfold(&String::from_utf8_lossy(header.raw_value()));
+        if value.is_empty() {
+            continue;
+        }
+        let mut end = value.len().min(MAX_BULK_HEADER_VALUE);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push((name.to_string(), value[..end].to_string()));
+    }
+    out
+}
+
+fn is_bulk_header(name: &str) -> bool {
+    if BULK_HEADERS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    ESP_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// One line: folded whitespace and control characters become single spaces.
+fn unfold(raw: &str) -> String {
+    raw.split(|ch: char| ch.is_whitespace() || ch.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// File names of the attachments, as a forward lists them. A part with no
@@ -294,6 +431,206 @@ mod tests {
         assert_eq!(message.list_id.as_deref(), Some("dev.example"));
         assert_eq!(message.headers.subject, "[list] 会議");
         assert_eq!(message.body_text.as_deref().map(str::trim), Some("hello"));
+    }
+
+    fn parts_of(raw: &str) -> (Message, MessageParts) {
+        let message = to_message(
+            &AccountId("a1".into()),
+            "INBOX",
+            "INBOX",
+            1,
+            9,
+            &[],
+            raw.as_bytes(),
+        );
+        let parts = message.parts.clone().expect("sync always parses parts");
+        (message, parts)
+    }
+
+    fn is_bulk(parts: &MessageParts) -> bool {
+        let mut headers = fell_render::MailHeaders::new();
+        for (name, value) in &parts.bulk_headers {
+            headers.add(name.as_str(), value.as_str());
+        }
+        headers.is_bulk()
+    }
+
+    #[test]
+    fn multipart_alternative_keeps_both_parts() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Subject: Plans\r\n\
+                   Message-ID: <alt@x>\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=\"b\"\r\n\
+                   \r\n\
+                   --b\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   Lunch at noon?\r\n\
+                   --b\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n\
+                   \r\n\
+                   <p style=3D\"color:red\">Lunch at <b>noon</b>?</p>\r\n\
+                   --b--\r\n";
+        let (message, parts) = parts_of(raw);
+        assert_eq!(
+            parts.plain.as_deref().map(str::trim),
+            Some("Lunch at noon?")
+        );
+        assert_eq!(
+            parts.html.as_deref().map(str::trim),
+            Some("<p style=\"color:red\">Lunch at <b>noon</b>?</p>")
+        );
+        assert!(parts.bulk_headers.is_empty());
+        assert!(!is_bulk(&parts));
+        assert_eq!(
+            message.body_text.as_deref().map(str::trim),
+            Some("Lunch at noon?")
+        );
+    }
+
+    #[test]
+    fn html_only_mail_has_no_plain_part_and_search_text_is_flattened() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Subject: Html\r\n\
+                   Message-ID: <h@x>\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <html><body><p>Hello <i>there</i></p><script>x()</script></body></html>\r\n";
+        let (message, parts) = parts_of(raw);
+        assert_eq!(parts.plain, None);
+        let html = parts.html.expect("html part");
+        // Stored as sent; sanitizing is the renderer's job.
+        assert!(html.contains("<script>x()</script>"));
+        let text = message.body_text.expect("flattened text");
+        assert!(text.contains("Hello there"));
+        assert!(!text.contains("<p>"));
+    }
+
+    #[test]
+    fn plain_only_mail_has_no_html_part() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Subject: Plain\r\n\
+                   Message-ID: <p@x>\r\n\
+                   \r\n\
+                   just text\r\n";
+        let (_, parts) = parts_of(raw);
+        assert_eq!(parts.html, None);
+        assert_eq!(parts.plain.as_deref().map(str::trim), Some("just text"));
+    }
+
+    #[test]
+    fn newsletter_keeps_bulk_headers_and_reads_as_bulk() {
+        let raw = "From: Shop <news@shop.example>\r\n\
+                   Subject: Sale\r\n\
+                   Message-ID: <n@shop.example>\r\n\
+                   List-Unsubscribe: <mailto:unsub@shop.example>,\r\n\
+                   \t<https://shop.example/u?id=1>\r\n\
+                   List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+                   Precedence: bulk\r\n\
+                   X-Mailer: Mailchimp Mailer\r\n\
+                   X-MC-User: 100\r\n\
+                   X-Spam-Score: 0\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=\"b\"\r\n\
+                   \r\n\
+                   --b\r\n\
+                   Content-Type: text/plain\r\n\
+                   \r\n\
+                   Sale today\r\n\
+                   --b\r\n\
+                   Content-Type: text/html\r\n\
+                   \r\n\
+                   <table><tr><td>Sale today</td></tr></table>\r\n\
+                   --b--\r\n";
+        let (_, parts) = parts_of(raw);
+        assert!(parts.html.is_some() && parts.plain.is_some());
+        assert_eq!(
+            parts.bulk_headers,
+            vec![
+                (
+                    "List-Unsubscribe".to_string(),
+                    "<mailto:unsub@shop.example>, <https://shop.example/u?id=1>".to_string()
+                ),
+                (
+                    "List-Unsubscribe-Post".to_string(),
+                    "List-Unsubscribe=One-Click".to_string()
+                ),
+                ("Precedence".to_string(), "bulk".to_string()),
+                ("X-Mailer".to_string(), "Mailchimp Mailer".to_string()),
+                ("X-MC-User".to_string(), "100".to_string()),
+            ]
+        );
+        assert!(is_bulk(&parts));
+        // Each signal alone is enough for the renderer.
+        for kept in &parts.bulk_headers[..] {
+            let one = MessageParts {
+                bulk_headers: vec![kept.clone()],
+                ..MessageParts::default()
+            };
+            if kept.0 != "List-Unsubscribe-Post" {
+                assert!(is_bulk(&one), "{} alone is bulk", kept.0);
+            }
+        }
+    }
+
+    #[test]
+    fn every_renderer_esp_header_is_kept() {
+        // The renderer's ESP names (fell-render choose.rs), one message each.
+        for name in [
+            "X-Mailchimp-Campaign",
+            "X-Mailgun-Sid",
+            "X-SES-Outgoing",
+            "X-SendGrid-Id",
+            "X-Klaviyo-Id",
+            "X-Mailjet-Campaign",
+            "X-Mandrill-User",
+            "X-HS-Id",
+            "X-HubSpot-Id",
+            "X-CMail-Id",
+            "X-Campaign-Id",
+            "X-SG-EID",
+            "X-SG-ID",
+            "X-PM-Message-Id",
+            "X-PM-Tag",
+            "X-PM-Rcpt",
+            "Feedback-ID",
+        ] {
+            let raw = format!("From: a@x\r\nMessage-ID: <e@x>\r\n{name}: v\r\n\r\nbody\r\n");
+            let (_, parts) = parts_of(&raw);
+            assert_eq!(parts.bulk_headers.len(), 1, "{name} kept");
+            assert!(is_bulk(&parts), "{name} reads as bulk");
+        }
+    }
+
+    #[test]
+    fn personal_mail_with_an_ordinary_mailer_is_not_bulk() {
+        let raw = "From: Ann <ann@x>\r\nMessage-ID: <t@x>\r\nX-Mailer: Thunderbird\r\n\r\nhi\r\n";
+        let (_, parts) = parts_of(raw);
+        assert_eq!(
+            parts.bulk_headers,
+            vec![("X-Mailer".to_string(), "Thunderbird".to_string())]
+        );
+        assert!(!is_bulk(&parts));
+    }
+
+    #[test]
+    fn hostile_header_floods_are_capped() {
+        let mut raw = String::from("From: a@x\r\nMessage-ID: <f@x>\r\n");
+        for index in 0..100 {
+            raw.push_str(&format!("X-MC-{index}: {}\r\n", "v".repeat(5000)));
+        }
+        raw.push_str("\r\nbody\r\n");
+        let (_, parts) = parts_of(&raw);
+        assert_eq!(parts.bulk_headers.len(), MAX_BULK_HEADERS);
+        assert!(
+            parts
+                .bulk_headers
+                .iter()
+                .all(|(_, value)| value.len() <= MAX_BULK_HEADER_VALUE)
+        );
     }
 
     #[test]

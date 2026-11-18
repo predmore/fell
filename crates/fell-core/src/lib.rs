@@ -29,8 +29,8 @@ pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classif
 pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{AgentGrant, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft};
 pub use backend::{
-    BridgeBackend, FixtureBackend, FolderRemoval, ImapBackend, MailBackend, MailboxDelta,
-    ProtonApiBackend, RemovalKind, Settle, SyncCursor, backend_for, is_demo_account,
+    BridgeBackend, FetchedBody, FixtureBackend, FolderRemoval, ImapBackend, MailBackend,
+    MailboxDelta, ProtonApiBackend, RemovalKind, Settle, SyncCursor, backend_for, is_demo_account,
 };
 pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
@@ -38,7 +38,7 @@ pub use embed::{
 };
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
 pub use imap::{ImapConfig, ImapSecurity, InboxWait};
-pub use message::{Address, Message, MessageHeaders, MessageId, RemoteId};
+pub use message::{Address, Message, MessageHeaders, MessageId, MessageParts, RemoteId};
 pub use search::{SearchHit, SearchResults};
 pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
@@ -49,7 +49,9 @@ pub use store::{
     FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, Participant, SearchPage,
     Store, ThreadList, ThreadSummary, folder_aliases,
 };
-pub use sync::{SyncReport, sync_once, sync_with_progress};
+pub use sync::{
+    SyncReport, fetch_message_body, fetch_missing_bodies, sync_once, sync_with_progress,
+};
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
 /// Crate-wide error. IMAP failures use [`Error::Backend`].

@@ -185,6 +185,7 @@ fn message(id: &str, name: &str, email: &str, body: &str, date_unix: i64) -> Mes
         list_id: None,
         reply_to: Vec::new(),
         attachment_names: Vec::new(),
+        parts: None,
     }
 }
 

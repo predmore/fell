@@ -21,12 +21,14 @@ use crate::search::{
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
+mod bodies;
 mod copies;
 mod roles;
 pub(crate) mod sent_bcc;
 mod summaries;
 mod threads;
 
+pub use bodies::BodyRequest;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -400,6 +402,9 @@ impl Store {
         ensure_alias_columns(&conn)?;
         ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
+        // In place of a version bump: the first open queues mail stored
+        // before parts were kept, for sync to fetch again.
+        bodies::ensure_bodies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
                 ON messages(account_id, body_fingerprint);
@@ -707,6 +712,92 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// The HTML and plain parts and bulk headers of one message, by its id
+    /// or an id that collapsed into it.
+    ///
+    /// One row is read and inflated, so call this off the UI thread when a
+    /// conversation opens, never for a folder list ([`Store::thread_messages`]
+    /// and the folder reads leave [`Message::parts`] empty). `None` means
+    /// sync has not stored parts for this message yet (mail synced before they
+    /// were kept, or a local write). Parts with neither `html` nor `plain`
+    /// mean no server copy had one to give. In both cases show `body_text`,
+    /// and ask the sync thread with [`crate::sync::fetch_message_body`].
+    pub fn message_body(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<crate::MessageParts>> {
+        let Some(canonical) = self.canonical_id(account_id, message_id)? else {
+            return Ok(None);
+        };
+        bodies::read(&self.conn, account_id, &canonical)
+    }
+
+    /// Up to `limit` messages stored before parts were kept, newest first,
+    /// with the server copies to fetch them from.
+    pub fn missing_bodies(&self, account_id: &AccountId, limit: usize) -> Result<Vec<BodyRequest>> {
+        bodies::missing(&self.conn, account_id, limit)
+    }
+
+    /// The server copies to fetch for one message with no stored body part,
+    /// including one an earlier backfill could not fetch. `None` when it has
+    /// a body part already, or no copy to fetch.
+    pub fn body_request(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<BodyRequest>> {
+        let Some(canonical) = self.canonical_id(account_id, message_id)? else {
+            return Ok(None);
+        };
+        if bodies::read(&self.conn, account_id, &canonical)?
+            .is_some_and(|parts| parts.html.is_some() || parts.plain.is_some())
+        {
+            return Ok(None);
+        }
+        let copies = bodies::copies_of(&self.conn, account_id, &canonical)?;
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(BodyRequest {
+            message_id: MessageId(canonical),
+            copies,
+        }))
+    }
+
+    /// Store parts fetched again for messages that had none. `None` parts
+    /// record that no copy could be fetched, so the backfill stops asking;
+    /// a later sync of the message still fills them. Parts already stored
+    /// are kept. Returns how many messages gained a body.
+    pub fn store_fetched_parts(
+        &self,
+        account_id: &AccountId,
+        fetched: &[(MessageId, Option<crate::MessageParts>)],
+    ) -> Result<usize> {
+        let tx = immediate_transaction(&self.conn)?;
+        let mut filled = 0;
+        for (message_id, parts) in fetched {
+            let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
+                continue;
+            };
+            let parts = parts.clone().unwrap_or_default();
+            if parts.html.is_some() || parts.plain.is_some() {
+                filled += 1;
+            }
+            bodies::write(&tx, account_id, &canonical, &parts, bodies::Write::FillGap)?;
+        }
+        tx.commit()?;
+        Ok(filled)
+    }
+
+    fn canonical_id(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<String>> {
+        canonical_id_on(&self.conn, account_id, message_id)
     }
 
     pub fn id_is_stored(&self, account_id: &AccountId, token: &str) -> Result<bool> {
@@ -1520,6 +1611,31 @@ fn thread_id_for_message_id(
     Ok(id.map(ThreadId))
 }
 
+/// Two indexed lookups. `message_id = ? OR message_id IN (…)` scans.
+const CANONICAL_ID_SQL: &str = "SELECT message_id FROM messages
+     WHERE account_id = ?1 AND message_id = ?2
+     UNION ALL
+     SELECT m.message_id FROM message_aliases a
+     JOIN messages m
+       ON m.account_id = a.account_id AND m.message_id = a.canonical_message_id
+     WHERE a.account_id = ?1 AND a.message_id = ?2
+     LIMIT 1";
+
+/// The stored row's Message-ID for `message_id` or an id collapsed into it.
+fn canonical_id_on(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &MessageId,
+) -> Result<Option<String>> {
+    conn.query_row(
+        CANONICAL_ID_SQL,
+        params![account_id.as_str(), message_id.as_str()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
     let thread = insert_arrival(conn, message)?;
     copies::record(conn, message)?;
@@ -1609,6 +1725,15 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             union_tokens("", &message.attachment_names, false),
         ],
     )?;
+    if let Some(parts) = &message.parts {
+        bodies::write(
+            conn,
+            account_id,
+            message.headers.message_id.as_str(),
+            parts,
+            bodies::Write::Replace,
+        )?;
+    }
     let body = message.body_text.as_deref().unwrap_or(&message.snippet);
     let terms = terms_for_indexed(IndexedText {
         subject: &message.headers.subject,
@@ -1835,6 +1960,15 @@ fn write_kept(
             stored.canonical_id,
         ],
     )?;
+    if let Some(parts) = &message.parts {
+        // Parts follow the body: a collapsed copy only fills a gap.
+        let mode = if like_alias {
+            bodies::Write::FillGap
+        } else {
+            bodies::Write::Replace
+        };
+        bodies::write(conn, &message.account_id, &stored.canonical_id, parts, mode)?;
+    }
     sync_terms(conn, message.account_id.as_str(), &old_terms, &new_terms)?;
     // The vector belongs to the row that stays, not to the id this copy
     // arrived under (which may be an alias).
@@ -3271,6 +3405,7 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
         list_id: row.get(24)?,
         reply_to: decode_addresses(&row.get::<_, String>(25)?),
         attachment_names: split_field(&row.get::<_, String>(26)?),
+        parts: None,
     })
 }
 
@@ -3338,6 +3473,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 

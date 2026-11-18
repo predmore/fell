@@ -420,6 +420,7 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
         list_id: None,
         reply_to: reply_address(row.id),
         attachment_names: attachment_names(&row),
+        parts: None,
     }
 }
 

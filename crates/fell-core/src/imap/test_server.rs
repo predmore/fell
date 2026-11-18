@@ -633,6 +633,12 @@ fn last_examined(commands: &[String]) -> Option<String> {
 /// RFC 3501: `n:*` includes the mailbox's highest UID even when `n` is greater
 /// than every assigned UID.
 fn uid_in_range(uid: u32, range: &str, highest: u32) -> bool {
+    range
+        .split(',')
+        .any(|part| uid_in_one_range(uid, part, highest))
+}
+
+fn uid_in_one_range(uid: u32, range: &str, highest: u32) -> bool {
     let (start, end) = range.split_once(':').unwrap_or((range, range));
     let start = if start == "*" {
         u32::MAX

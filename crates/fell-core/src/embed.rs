@@ -1385,6 +1385,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 

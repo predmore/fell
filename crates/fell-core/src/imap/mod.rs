@@ -8,12 +8,15 @@
 //! when QRESYNC is on, otherwise a paged `UID SEARCH` of the mailbox that
 //! the store compares with the copies it recorded.
 
+mod bodies;
 mod rfc822;
 mod session;
 mod utf7;
 
 pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_tcp_as_tls};
 
+pub(crate) use bodies::fetch_bodies;
+pub(crate) use rfc822::parts_from_raw;
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
 #[cfg(test)]

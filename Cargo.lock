@@ -1936,9 +1936,11 @@ name = "fell-core"
 version = "0.1.0"
 dependencies = [
  "fell-confirm",
+ "fell-render",
  "fs4",
  "libc",
  "mail-parser",
+ "miniz_oxide 0.8.9",
  "prost",
  "rcgen",
  "rusqlite",
