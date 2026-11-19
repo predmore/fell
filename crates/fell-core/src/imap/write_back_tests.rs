@@ -1951,7 +1951,7 @@ fn a_fetch_missing_flag_bits_records_its_revision_and_waits() {
     fx.server.state.lock().unwrap().mailboxes[0].messages[0].modseq = 15;
     fx.server.writes.lock().unwrap().omit_fetch_flags = true;
     let report = fx.replay();
-    assert_eq!((report.sent, report.waiting), (0, 3));
+    assert_eq!((report.sent, report.waiting), (2, 1));
     assert_eq!(fx.local_flags(&alpha), (true, true));
     let (revision, flagged): ([u8; 8], Option<bool>) = fx
         .store
@@ -1967,7 +1967,7 @@ fn a_fetch_missing_flag_bits_records_its_revision_and_waits() {
     fx.server.writes.lock().unwrap().omit_fetch_flags = false;
     fx.make_due();
     fx.clear_commands();
-    assert_eq!(fx.replay().sent, 3);
+    assert_eq!(fx.replay().sent, 1);
     assert_eq!(
         fx.stores()[0],
         "UID STORE 4 (UNCHANGEDSINCE 15) +FLAGS.SILENT (\\Flagged)"
@@ -1990,19 +1990,26 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     for attempt in 1..=max_attempts + 1 {
         fx.make_due();
         let report = fx.replay();
-        assert_eq!((report.sent, report.waiting), (0, 4));
+        assert_eq!(
+            (report.sent, report.waiting),
+            (if attempt == 1 { 2 } else { 0 }, 2)
+        );
         assert_eq!(report.flag_recovery_delayed, attempt == max_attempts);
         assert_eq!(
-            fx.stores().len(),
+            fx.stores()
+                .iter()
+                .filter(|command| command.starts_with("UID STORE 4 "))
+                .count(),
             1,
-            "the replacement waits for its baseline"
+            "the replacement on that copy waits for its baseline"
         );
+        assert_eq!(fx.stores().len(), 3);
         assert_eq!(fx.local_flags(&alpha), (true, false));
     }
     fx.server.writes.lock().unwrap().omit_fetch_flags = false;
     fx.make_due();
     let report = fx.replay();
-    assert_eq!(report.sent, 3);
+    assert_eq!(report.sent, 1);
     assert!(!report.flag_recovery_delayed);
     assert_eq!(fx.stores().len(), 4, "{:?}", fx.stores());
     assert!(
@@ -2013,6 +2020,94 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     assert_eq!(fx.local_flags(&alpha), (true, false));
     drop(fx);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_refused_store_leaves_other_copies_and_a_later_move_free() {
+    for move_already_queued in [false, true] {
+        let mut state = flag_state(true);
+        state
+            .mailboxes
+            .push(mailbox("Archive", "\\Archive", 30, &[]));
+        let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
+        let alpha = fx.thread("INBOX", "Alpha");
+        let archive = || {
+            fx.store
+                .archive_thread(&fx.account.id, &alpha, "INBOX")
+                .unwrap()
+        };
+        fx.flag(&alpha, FlagChange::Star);
+        fx.server.writes.lock().unwrap().refuse_store_uid = Some(4);
+        if move_already_queued {
+            archive();
+        }
+
+        let report = fx.replay();
+        assert_eq!(
+            (report.sent, report.waiting),
+            (2 + usize::from(move_already_queued), 1)
+        );
+        assert_eq!(fx.flags(ESCAPED_FOLDER, 9), ["\\Answered", "\\Flagged"]);
+        assert_eq!(fx.flags(ESCAPED_FOLDER, 12), ["\\Answered", "\\Flagged"]);
+        if !move_already_queued {
+            archive();
+            fx.clear_commands();
+            let report = fx.replay();
+            assert_eq!((report.sent, report.waiting), (1, 1));
+            assert!(fx.stores().is_empty());
+        }
+        assert_eq!(fx.on_server("Archive"), [(1, "Alpha".into())]);
+        assert_eq!(fx.flags("Archive", 1), ["\\Answered"]);
+        let rows = fx.store.outbox(&fx.account.id).unwrap();
+        let pending = rows
+            .iter()
+            .find(|row| row.state == OutboxState::Pending)
+            .unwrap();
+        assert_eq!(
+            (pending.source_mailbox.as_deref(), pending.uid, pending.sent),
+            (Some("Archive"), Some(1), false)
+        );
+
+        fx.make_due();
+        assert_eq!(fx.replay().sent, 1);
+        assert_eq!(fx.flags("Archive", 1), ["\\Answered", "\\Flagged"]);
+    }
+}
+
+#[test]
+fn an_unconfirmed_store_holds_its_move_but_allows_other_copies_to_write() {
+    let mut state = flag_state(true);
+    state
+        .mailboxes
+        .push(mailbox("Archive", "\\Archive", 30, &[]));
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Star);
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("STORE");
+    assert!(fx.replay().interrupted.is_some());
+    fx.store
+        .archive_thread(&fx.account.id, &alpha, "INBOX")
+        .unwrap();
+    fx.flag(&alpha, FlagChange::Unstar);
+
+    fx.server.writes.lock().unwrap().omit_fetch_flags = true;
+    let report = fx.replay();
+    assert_eq!((report.sent, report.waiting), (2, 3));
+    assert_eq!(fx.flags("INBOX", 4), ["\\Answered", "\\Flagged"]);
+    assert!(fx.on_server("Archive").is_empty());
+
+    fx.clear_commands();
+    let report = fx.replay();
+    assert_eq!((report.sent, report.waiting), (0, 3));
+    assert!(fx.stores().is_empty());
+    assert!(fx.on_server("Archive").is_empty());
+
+    fx.server.writes.lock().unwrap().omit_fetch_flags = false;
+    fx.make_due();
+    let report = fx.replay();
+    assert_eq!((report.sent, report.waiting), (2, 0));
+    assert_eq!(fx.flags("Archive", 1), ["\\Answered"]);
+    assert!(fx.on_server("INBOX").is_empty());
 }
 
 #[test]

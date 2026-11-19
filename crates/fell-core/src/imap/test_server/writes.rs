@@ -28,6 +28,7 @@ pub(in crate::imap) struct WriteFixture {
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
+    pub refuse_store_uid: Option<u32>,
     pub modified_no: bool,
     pub omit_store_modseq: bool,
     pub omit_fetch_flags: bool,
@@ -212,6 +213,9 @@ fn store_flag(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixtur
     let Ok(uid) = uid.parse::<u32>() else {
         return format!("{tag} BAD expected UID\r\n");
     };
+    if writes.refuse_store_uid == Some(uid) {
+        return format!("{tag} NO STORE refused\r\n");
+    }
     let conditional = state.condstore && !writes.nomodseq;
     let (expected, rest) = if let Some(modifier) = rest.strip_prefix("(UNCHANGEDSINCE ") {
         let Some((revision, rest)) = modifier.split_once(") ") else {

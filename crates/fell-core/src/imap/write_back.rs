@@ -18,8 +18,10 @@
 //!
 //! A refusal (NO or BAD) is retried with backoff and the row is dropped
 //! after [`MAX_ATTEMPTS`]. A dropped connection ends the pass and costs the
-//! rows nothing; the next pass tries again. Rows for one message go in the
-//! order they were queued: one that waits holds back the rest.
+//! rows nothing; the next pass tries again. Moves keep their queue order
+//! because a move can change a later write's UID. A refused STORE can
+//! retry on its own. A STORE with an unknown outcome holds its copy until
+//! replay can check what reached the server.
 //!
 //! Undo's reverse of a row that was sent but not settled waits behind it,
 //! then moves the copy that row placed. If that row never reached the
@@ -81,7 +83,8 @@ pub(super) fn replay_with(
         now,
         entries: &entries,
         settled: vec![false; entries.len()],
-        held: HashSet::new(),
+        held_moves: HashMap::new(),
+        unconfirmed_stores: HashMap::new(),
         listing: None,
         selected: None,
         bounds: HashMap::new(),
@@ -109,6 +112,13 @@ enum Stop {
     Stale,
 }
 
+enum MoveHold {
+    /// An earlier MOVE can change which copy a later write should use.
+    EarlierMove,
+    /// A MOVE needs the copy with an unconfirmed STORE. Other copies can write.
+    StoreRecovery,
+}
+
 impl From<Error> for Stop {
     fn from(err: Error) -> Self {
         Self::Store(err)
@@ -122,8 +132,9 @@ struct Pass<'a> {
     entries: &'a [OutboxEntry],
     /// Rows that reached Done or Dropped in this pass.
     settled: Vec<bool>,
-    /// Messages with a row that did not finish: their later rows wait.
-    held: HashSet<String>,
+    held_moves: HashMap<String, MoveHold>,
+    /// Mailbox, UIDVALIDITY, and UID of each STORE still being confirmed.
+    unconfirmed_stores: HashMap<String, HashSet<(u32, u32)>>,
     /// Folder name → raw mailbox name, from LIST when first needed.
     listing: Option<HashMap<String, String>>,
     /// The mailbox selected now and its UIDVALIDITY.
@@ -150,7 +161,7 @@ impl Pass<'_> {
                     visited[index] = true;
                 }
             }
-            self.held.clear();
+            self.held_moves.clear();
         }
         for index in 0..self.entries.len() {
             if visited[index] || (!has_move && self.entries[index].kind == OutboxKind::Move) {
@@ -158,12 +169,15 @@ impl Pass<'_> {
             }
             visited[index] = true;
             let entry = &self.entries[index];
-            if self.held.contains(&entry.message_id) || entry.retry_unix > self.now {
-                self.held.insert(entry.message_id.clone());
-                continue;
-            }
+            let held_move = self.held_moves.get(&entry.message_id);
             match entry.kind {
+                OutboxKind::Move if held_move.is_some() => {}
+                OutboxKind::Move if entry.retry_unix > self.now => {
+                    self.held_moves
+                        .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+                }
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
+                _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
             }
         }
@@ -196,6 +210,24 @@ impl Pass<'_> {
         Ok(entry)
     }
 
+    fn store_unconfirmed(&self, mailbox: &str, validity: u32, uid: u32) -> bool {
+        self.unconfirmed_stores
+            .get(mailbox)
+            .is_some_and(|copies| copies.contains(&(validity, uid)))
+    }
+
+    fn hold_unconfirmed_store(&mut self, entry: &OutboxEntry) {
+        if entry.sent
+            && let (Some(mailbox), Some(validity), Some(uid)) =
+                (&entry.source_mailbox, entry.uidvalidity, entry.uid)
+        {
+            self.unconfirmed_stores
+                .entry(mailbox.clone())
+                .or_default()
+                .insert((validity, uid));
+        }
+    }
+
     /// Send one conditional STORE attempt. Only a safe rebase asks for a
     /// second attempt; all other observations settle or use normal backoff.
     fn try_flag(
@@ -212,6 +244,13 @@ impl Pass<'_> {
         ) else {
             return Err(Error::Action("invalid flag write in outbox".into()).into());
         };
+        if self.store_unconfirmed(mailbox, validity, uid) {
+            return Ok(false);
+        }
+        if entry.retry_unix > self.now {
+            self.hold_unconfirmed_store(&entry);
+            return Ok(false);
+        }
         match self.select(session, mailbox)? {
             Ok(current) if current != validity => {
                 self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed")?;
@@ -343,7 +382,8 @@ impl Pass<'_> {
             None => None,
             Some(Reversed::Placed(uidvalidity, uid)) => Some((uidvalidity, uid)),
             Some(Reversed::Waiting) => {
-                self.held.insert(entry.message_id.clone());
+                self.held_moves
+                    .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 return Ok(());
             }
             Some(Reversed::Gone) => {
@@ -396,6 +436,13 @@ impl Pass<'_> {
                 }
             }
         };
+        if self.store_unconfirmed(&source, uidvalidity, uid) {
+            // Moving this copy would replace the UID and revision needed
+            // to confirm the earlier STORE.
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::StoreRecovery);
+            return Ok(());
+        }
 
         // Later rows that can go in the same command.
         let mut batch = vec![(index, uid)];
@@ -405,7 +452,7 @@ impl Pass<'_> {
                 continue;
             }
             let other = &entries[later];
-            let fits = !self.held.contains(&other.message_id)
+            let fits = !self.held_moves.contains_key(&other.message_id)
                 && !waiting.contains(other.message_id.as_str())
                 && !batch
                     .iter()
@@ -414,7 +461,9 @@ impl Pass<'_> {
                 && other.kind == entry.kind
                 && other.source_mailbox.as_deref() == Some(source.as_str())
                 && other.uidvalidity == Some(uidvalidity)
-                && other.uid.is_some()
+                && other
+                    .uid
+                    .is_some_and(|uid| !self.store_unconfirmed(&source, uidvalidity, uid))
                 && self.known_target(other).as_deref() == Some(target.as_str());
             if fits {
                 visited[later] = true;
@@ -700,7 +749,12 @@ impl Pass<'_> {
             }
             Settled::Recorded | Settled::Recovering => {}
         }
-        self.held.insert(entry.message_id.clone());
+        if entry.kind == OutboxKind::Move {
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+        } else if !refused && let Some(current) = self.pending_flag(index)? {
+            self.hold_unconfirmed_store(&current);
+        }
         Ok(())
     }
 
@@ -735,7 +789,8 @@ impl Pass<'_> {
         }
         self.settled[index] = true;
         if entry.kind == OutboxKind::Move {
-            self.held.insert(entry.message_id.clone());
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::EarlierMove);
         }
         Ok(settled)
     }
