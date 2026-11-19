@@ -742,7 +742,7 @@ fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
     assert!(
         body_fetches(&server)
             .iter()
-            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS BODY.PEEK[])")),
+            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ BODY.PEEK[])")),
         "{:?}",
         commands(&server)
     );
