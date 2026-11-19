@@ -1,0 +1,26 @@
+## open quoted
+p On 18/11/2026 10:02, Oskar Lind wrote:
+quote
+  p Can the scanner move to the reading room on Monday, or does it need the whole week?
+## open
+p Monday is fine. It only needs the afternoon once the cart is free.
+## open quoted
+quote
+  p And who has the key to the store room? I could not find it on the board.
+## open
+p Teo has it this week. I will ask him to leave it at the desk.
+## open quoted
+quote
+  p Last thing: is the old stand still needed?
+## open
+p No, it can go to recycling.
+p Thanks,
+  | Hanne
+## fold signature and quote
+p Hanne Berg
+  | Reading room and archives
+  | library.example.org
+quote
+  p -- 
+    | Oskar Lind
+    | Systems, example.com

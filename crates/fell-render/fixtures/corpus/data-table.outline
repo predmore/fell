@@ -1,0 +1,10 @@
+## open
+p Here are the station readings for October. The two blanks are days the gauge was frozen.
+table [start, end, end, end, end, end, start]
+  th p Station | p Elevation (m) | p Rain (mm) | p Snow (cm) | p Max °C | p Min °C | p Notes
+  td p Upper Meadow | p 1,240 | p 88.4 | p 12 | p 14.2 | p −3.1 | p Gauge replaced on the 9th after the old one cracked; readings before that may run low by a few millimetres.
+  td p Lakeshore | p 310 | p 142.0 | p 0 | p 19.8 | p 2.4 | p Fine.
+  td p Northfield Agricultural Research Station | p 560 | p 97.6 |  | p 17.1 | p 0.2 | p Snow sensor offline since the storm on the 22nd.
+  td p Pass | p 2,015 | p 61.3 | p 48 | p 8.9 | p −11.6 | 
+p Totals are on the [station page](https://weather.example.org/stations/2026-10). Let me know if your numbers differ.
+p Ola

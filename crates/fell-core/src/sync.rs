@@ -109,6 +109,44 @@ pub fn fetch_message_body(
     store.message_body(account_id, message_id)
 }
 
+/// [`fetch_message_body`] for several messages in one backend call, so a
+/// conversation of old mail costs one login, not one per message.
+///
+/// One answer per id, in order. `Some` parts are what is stored now; they
+/// are empty when no server copy had a body (or the message has no server
+/// copy). `None` means nothing is stored yet: the fetch stopped at its byte
+/// cap before this message, so ask again later.
+pub fn fetch_message_bodies(
+    account_id: &AccountId,
+    backend: &dyn MailBackend,
+    store: &Store,
+    message_ids: &[MessageId],
+) -> Result<Vec<Option<MessageParts>>> {
+    let mut wanted = Vec::new();
+    let mut asked = Vec::with_capacity(message_ids.len());
+    for id in message_ids {
+        let request = store.body_request(account_id, id)?;
+        asked.push(request.is_some());
+        wanted.extend(request);
+    }
+    if !wanted.is_empty() {
+        fetch_bodies(account_id, backend, store, &wanted)?;
+    }
+    message_ids
+        .iter()
+        .zip(asked)
+        .map(|(id, asked)| {
+            Ok(match store.message_body(account_id, id)? {
+                Some(parts) => Some(parts),
+                // Asked and still nothing stored: cut off, not answered.
+                None if asked => None,
+                // No server copy to ask: that is the answer.
+                None => Some(MessageParts::default()),
+            })
+        })
+        .collect()
+}
+
 /// Fetch `wanted` and record what the server answered. Returns how many
 /// were recorded.
 ///

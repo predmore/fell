@@ -46,10 +46,17 @@ pub struct ConvMessage {
     pub id: String,
     pub sender: String,
     pub email: String,
+    /// The message's own `From:` and `Subject:`, which the HTML body is
+    /// prepared with: a forward's subject keeps its history open, and a
+    /// logo named for the sender draws no `Image blocked` line.
+    pub mail_headers: Vec<(String, String)>,
     pub folders: String,
     pub date_unix: i64,
     pub snippet: String,
+    /// The stored text: what a message with no HTML part paints.
     pub body: RenderedBody,
+    /// The message's HTML, once read from the store and prepared.
+    pub rich: Rich,
     pub expanded: bool,
     /// Who else got the message. `None` when nothing is stored.
     pub recipients: Option<RecipientLine>,
@@ -81,11 +88,14 @@ pub fn awaiting_bodies(shown: &[ConvMessage]) -> bool {
         .any(|message| message.body_state == fell_core::BodyState::Pending)
 }
 
-/// A reread of the open thread that only filled in bodies: the same
-/// messages in the same order. Returns the ones whose body changed, for
-/// them to fade in, or `None` when messages came or went.
+pub fn same_messages(shown: &[ConvMessage], read: &[ConvMessage]) -> bool {
+    shown.len() == read.len() && shown.iter().zip(read).all(|(old, new)| old.id == new.id)
+}
+
+/// Body changes for the same messages in the same order. An empty list
+/// still allows a reread to update metadata without a body fade.
 pub fn bodies_filled(shown: &[ConvMessage], read: &[ConvMessage]) -> Option<Vec<usize>> {
-    if shown.len() != read.len() || shown.iter().zip(read).any(|(old, new)| old.id != new.id) {
+    if !same_messages(shown, read) {
         return None;
     }
     Some(
@@ -93,7 +103,11 @@ pub fn bodies_filled(shown: &[ConvMessage], read: &[ConvMessage]) -> Option<Vec<
             .iter()
             .zip(read)
             .enumerate()
-            .filter(|(_, (old, new))| old.body != new.body || old.body_state != new.body_state)
+            .filter(|(_, (old, new))| {
+                let replaced_html =
+                    matches!(new.rich, Rich::Html(_) | Rich::PlainPart(_)) && old.rich != new.rich;
+                old.body != new.body || old.body_state != new.body_state || replaced_html
+            })
             .map(|(index, _)| index)
             .collect(),
     )
@@ -125,6 +139,45 @@ pub fn offset_to_show_start(
     }
     let target = (view_top - item_top).clamp(-max, 0.0);
     ((target - offset).abs() > 0.5).then_some(target)
+}
+
+/// What an expanded message paints for its body.
+#[derive(Clone)]
+pub enum Rich {
+    /// No HTML part is stored: paint [`ConvMessage::body`].
+    Plain,
+    /// The stored plain part, used when the HTML has no native output.
+    PlainPart(std::sync::Arc<RenderedBody>),
+    /// No parts are stored at all yet (mail synced before they were kept).
+    /// Paints the stored text; opening the message asks sync for the parts.
+    Missing,
+    /// An HTML part is stored and is being read and prepared off the UI
+    /// thread. The body's space is reserved until it is ready.
+    Pending,
+    Html(std::sync::Arc<crate::mail_body::HtmlBody>),
+}
+
+impl PartialEq for Rich {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Html(a), Self::Html(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::PlainPart(a), Self::PlainPart(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for Rich {}
+
+impl std::fmt::Debug for Rich {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Plain | Self::PlainPart(_) => "Plain",
+            Self::Missing => "Missing",
+            Self::Pending => "Pending",
+            Self::Html(_) => "Html",
+        })
+    }
 }
 
 /// Who else got a message, for the lines under an expanded message's sender.
@@ -732,6 +785,10 @@ pub fn conversation(
             let email = message.headers.from.email.clone();
             ConvMessage {
                 id: message.headers.message_id.as_str().to_string(),
+                mail_headers: vec![
+                    ("Subject".into(), message.headers.subject.clone()),
+                    ("From".into(), from_header(&message.headers.from)),
+                ],
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
                 folders: message
@@ -752,7 +809,12 @@ pub fn conversation(
                     .join(" · "),
                 date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
-                body: render_stored_body(message.body_text.as_deref(), &message.snippet),
+                body: render_stored_body(
+                    message.body_text.as_deref(),
+                    &message.snippet,
+                    &message.headers.subject,
+                ),
+                rich: Rich::Plain,
                 expanded: message.unread || index == last,
                 recipients: recipient_line(message, me),
                 context: None,
@@ -1144,6 +1206,14 @@ fn cut_to(
     best
 }
 
+/// `Name <address>`, or the address alone, as a `From:` header writes it.
+fn from_header(from: &fell_core::Address) -> String {
+    match from.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => format!("{name} <{}>", from.email),
+        _ => from.email.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,10 +1225,12 @@ mod tests {
             id: id.into(),
             sender: "Ada".into(),
             email: "ada@x".into(),
+            mail_headers: Vec::new(),
             folders: "Inbox".into(),
             date_unix: 0,
             snippet: body.into(),
-            body: render_stored_body(Some(body).filter(|text| !text.is_empty()), body),
+            body: render_stored_body(Some(body).filter(|text| !text.is_empty()), body, ""),
+            rich: Rich::Plain,
             expanded: true,
             recipients: None,
             context: None,

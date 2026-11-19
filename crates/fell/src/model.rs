@@ -1241,17 +1241,16 @@ impl Session {
 
     /// Reread of the same messages in the same order. Folder and header
     /// changes land along with bodies. The reader's open state stays put.
-    pub fn fill_bodies(&mut self, mut messages: Vec<ConvMessage>) {
+    pub fn refresh_same_messages(&mut self, mut messages: Vec<ConvMessage>) {
         for (new, old) in messages.iter_mut().zip(&self.messages) {
             new.expanded = old.expanded;
         }
         self.messages = messages;
     }
 
-    /// Reread of the thread already open (sync added or dropped a message).
-    /// A reader on the last message follows to the new last one. A reader
-    /// further up keeps their message and opened quotes. Returns whether the
-    /// cursor moved to the end.
+    /// Reread of the thread already open. A reader at the end follows when
+    /// a new message arrives there. Returns whether the view should land
+    /// on that new message.
     ///
     /// `viewport_at_end` is whether the conversation is scrolled to its
     /// bottom: a reader who scrolled up with the wheel is not following.
@@ -1262,8 +1261,6 @@ impl Session {
         viewport_at_end: bool,
     ) -> bool {
         let at_end = viewport_at_end && self.message_cursor + 1 >= self.messages.len();
-        // Messages read since the thread opened stay open: what the reader
-        // has on screen does not fold up under them.
         for new in &mut messages {
             if let Some(old) = self.messages.iter().find(|old| old.id == new.id) {
                 new.expanded = old.expanded;
@@ -2318,11 +2315,11 @@ mod tests {
         // Sync fills in the older message's body (not the latest's).
         let mut read = vec![older.clone(), newest.clone()];
         read[0].body_state = fell_core::BodyState::Stored;
-        read[0].body = crate::text_render::render_stored_body(Some("it came"), "it came");
+        read[0].body = crate::text_render::render_stored_body(Some("it came"), "it came", "");
         read[1].expanded = true;
         let changed = crate::present::bodies_filled(&session.messages, &read);
         assert_eq!(changed, Some(vec![0]), "an in-place fill, of message 0");
-        session.fill_bodies(read);
+        session.refresh_same_messages(read);
         assert_eq!(session.message_cursor, 0, "the cursor stays");
         assert!(
             !session.messages[1].expanded,
@@ -2346,7 +2343,7 @@ mod tests {
             crate::present::bodies_filled(&session.messages, std::slice::from_ref(&read)),
             Some(vec![])
         );
-        session.fill_bodies(vec![read]);
+        session.refresh_same_messages(vec![read]);
         assert_eq!(session.messages[0].folders, "Inbox, Archive");
         assert_eq!(
             session.messages[0].body_state,
@@ -3369,6 +3366,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reread_at_the_bottom_lands_only_when_a_new_last_message_arrives() {
+        let mut session = session();
+        let first = empty_message(true);
+        let last = empty_message(true);
+        session.set_messages(vec![first.clone(), last.clone()]);
+        session.toggle_open(1);
+        session.messages[0].expanded = false;
+
+        // An account-wide sync reread must not drive a landing or reset
+        // disclosures while the reader is at the bottom of the same message.
+        assert!(!session.refresh_messages(vec![first.clone(), last.clone()], true));
+        assert_eq!(session.message_cursor, 1);
+        assert!(session.is_open(1));
+        assert!(session.recipients_are_open(1));
+        assert!(!session.messages[0].expanded);
+
+        let reply = empty_message(true);
+        assert!(session.refresh_messages(vec![first.clone(), last, reply.clone()], true));
+        assert_eq!(session.message_cursor, 2);
+        assert_eq!(session.messages[2].id, reply.id);
+        assert!(!session.refresh_messages(vec![first, reply.clone()], true));
+
+        // The previous message is visible at the bottom of the list but
+        // the reader scrolled up, so another reply does not drive a landing.
+        let newer = empty_message(true);
+        assert!(!session.refresh_messages(vec![reply, newer], false));
+    }
+
+    #[test]
     fn open_parts_stay_with_their_message_when_a_reread_shifts_rows() {
         let mut session =
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
@@ -4044,6 +4070,7 @@ mod tests {
 
     fn empty_message(expanded: bool) -> ConvMessage {
         ConvMessage {
+            mail_headers: Vec::new(),
             id: {
                 static NEXT: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -4057,7 +4084,8 @@ mod tests {
             folders: "Inbox".into(),
             date_unix: 0,
             snippet: "snip".into(),
-            body: crate::text_render::render_stored_body(Some("body"), "snip"),
+            body: crate::text_render::render_stored_body(Some("body"), "snip", ""),
+            rich: crate::present::Rich::Plain,
             expanded,
             recipients: None,
             context: None,

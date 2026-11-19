@@ -40,6 +40,13 @@ impl MailHeaders {
         headers
     }
 
+    /// Every field, in order.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -70,11 +77,26 @@ pub struct PreparedMail {
 }
 
 pub fn prepare(html: &str, headers: &MailHeaders) -> PreparedMail {
+    let mut document = crate::html_to_document(html);
+    if let Some(sender) = headers.get("From").map(display_name) {
+        crate::html::drop_named_images(&mut document, &sender);
+    }
     PreparedMail {
         suggested: choose_view(headers, html),
-        document: crate::html_to_document(html),
+        document,
         source_html: html.to_string(),
     }
+}
+
+/// The name part of a `From:` value: `Bayline Ferries` in
+/// `"Bayline Ferries" <bookings@bayline.example>`. Empty for a bare address.
+fn display_name(from: &str) -> String {
+    let name = match from.rfind('<') {
+        Some(at) => &from[..at],
+        None if from.contains('@') => "",
+        None => from,
+    };
+    name.trim().trim_matches('"').trim().to_string()
 }
 
 fn bulk_field(name: &str, value: &str) -> bool {

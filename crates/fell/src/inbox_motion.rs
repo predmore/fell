@@ -7,6 +7,7 @@
 //! scroll glides start where the view changes them, because they need the
 //! positions from before the change.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::keymap::KeyId;
@@ -149,11 +150,8 @@ pub struct InboxMotion {
     /// They arrived since the last frame: the fade starts with the frame
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: bool,
-    /// Bodies sync just filled in on the open thread, by message id, and
-    /// their fade. It starts with the frame that first draws them.
-    bodies: Vec<String>,
-    bodies_in: Option<Transition>,
-    bodies_pending: bool,
+    /// Bodies settling into the open thread, by message id.
+    bodies: HashMap<String, Transition>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -166,6 +164,62 @@ pub struct InboxMotion {
     last_unread: Option<(String, usize)>,
     /// The count it replaced in the same folder, fading out under the new one.
     unread_out: Option<(usize, Transition)>,
+    quotes: DisclosureMotion,
+    recipients: DisclosureMotion,
+}
+
+/// How open each moving disclosure is, from 0 to 1, by message id.
+#[derive(Default)]
+pub struct Disclosures {
+    pub quotes: HashMap<String, f32>,
+    pub recipients: HashMap<String, f32>,
+}
+
+#[derive(Default)]
+struct DisclosureMotion {
+    open: HashSet<String>,
+    transitions: HashMap<String, (Transition, bool)>,
+}
+
+impl DisclosureMotion {
+    fn sample(
+        &mut self,
+        open: &HashSet<String>,
+        motion: &Motion,
+        now: Instant,
+    ) -> HashMap<String, f32> {
+        if self.open != *open {
+            for (changed, opening) in [
+                (open.difference(&self.open), true),
+                (self.open.difference(open), false),
+            ] {
+                let duration = if opening { motion::SLIDE } else { motion::FADE };
+                if let Some(transition) = motion.start(duration, now) {
+                    for id in changed {
+                        self.transitions.insert(id.clone(), (transition, opening));
+                    }
+                }
+            }
+            self.open = open.clone();
+        }
+        self.transitions
+            .iter()
+            .map(|(id, (transition, opening))| {
+                let shown = if *opening {
+                    transition.progress(now)
+                } else {
+                    transition.remaining(now)
+                };
+                (id.clone(), shown)
+            })
+            .collect()
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        self.transitions
+            .retain(|_, (transition, _)| transition.running(now));
+        !self.transitions.is_empty()
+    }
 }
 
 /// Scroll offsets a settle jumped to, for the view to apply.
@@ -206,13 +260,13 @@ impl InboxMotion {
             last_selected: None,
             arrival: None,
             arrival_pending: false,
-            bodies: Vec::new(),
-            bodies_in: None,
-            bodies_pending: false,
             list_from: None,
             conv_from: None,
             card_to: None,
             card_glide: None,
+            bodies: HashMap::new(),
+            quotes: DisclosureMotion::default(),
+            recipients: DisclosureMotion::default(),
             last_unread: None,
             unread_out: None,
         }
@@ -224,9 +278,6 @@ impl InboxMotion {
         let start = |duration| self.motion.start(duration, now);
         if std::mem::take(&mut self.arrival_pending) {
             self.arrival = start(motion::QUICK);
-        }
-        if std::mem::take(&mut self.bodies_pending) {
-            self.bodies_in = start(motion::FADE);
         }
         if session.toast != self.last_toast {
             match (&session.toast, self.last_toast.take()) {
@@ -400,26 +451,6 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = true;
         self.bodies.clear();
-        self.bodies_in = None;
-        self.bodies_pending = false;
-    }
-
-    /// Sync filled in the bodies of `ids` in the open thread: they fade in
-    /// where their "not downloaded" line was, and nothing else moves.
-    pub fn bodies_filled(&mut self, ids: Vec<String>) {
-        self.bodies = ids;
-        self.bodies_in = None;
-        self.bodies_pending = true;
-    }
-
-    /// Opacity of one message's body: 0 to 1 while one sync just filled
-    /// in fades in, else 1.
-    pub fn body_opacity(&self, id: &str, now: Instant) -> f32 {
-        if self.bodies.iter().any(|filled| filled == id) {
-            motion::progress(self.bodies_in.as_ref(), now)
-        } else {
-            1.0
-        }
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -447,8 +478,9 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
-        self.bodies_in = None;
-        self.bodies_pending = false;
+        self.bodies.clear();
+        self.quotes.transitions.clear();
+        self.recipients.transitions.clear();
         self.unread_out = None;
         Settled {
             list: list.map(|glide| glide.to),
@@ -508,7 +540,10 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
-        running |= keep(&mut self.bodies_in, now);
+        self.bodies.retain(|_, fade| fade.running(now));
+        running |= self.quotes.tick(now);
+        running |= self.recipients.tick(now);
+        running |= !self.bodies.is_empty();
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -694,6 +729,36 @@ impl InboxMotion {
         )
     }
 
+    /// A message's HTML body replaced the room kept for it, or its stored
+    /// text, under a header already drawn: it settles in over [`motion::QUICK`].
+    pub fn body_arrived(&mut self, id: &str, now: Instant) {
+        if let Some(fade) = self.motion.start(motion::QUICK, now) {
+            self.bodies.insert(id.to_string(), fade);
+        }
+    }
+
+    /// Opacity of each body still settling in, by message id.
+    pub fn body_alphas(&self, now: Instant) -> HashMap<String, f32> {
+        self.bodies
+            .iter()
+            .map(|(id, fade)| {
+                let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
+                (id.clone(), alpha)
+            })
+            .collect()
+    }
+
+    /// History and recipients can open together with `q` or separately by
+    /// click. Both use the same timing and reduced-motion setting.
+    pub fn disclosures(&mut self, session: &Session, now: Instant) -> Disclosures {
+        Disclosures {
+            quotes: self.quotes.sample(&session.quotes_open, &self.motion, now),
+            recipients: self
+                .recipients
+                .sample(&session.recipients_open, &self.motion, now),
+        }
+    }
+
     /// How far the conversation is towards "focused": its edge and the
     /// message card under the cursor follow this.
     pub fn focus_edge(&self, pane: Pane, now: Instant) -> f32 {
@@ -726,29 +791,6 @@ mod tests {
             .status(session, now)
             .notice
             .map(|(_, opacity)| opacity)
-    }
-
-    #[test]
-    fn a_body_filled_in_fades_in_and_nothing_else_does() {
-        let mut motion = InboxMotion::new(Motion::new(true));
-        let session = session();
-        let now = Instant::now();
-        motion.observe(&session, (true, true), now);
-        motion.bodies_filled(vec!["b".into()]);
-        motion.observe(&session, (true, true), now);
-        assert_eq!(motion.body_opacity("b", now), 0.0);
-        assert_eq!(motion.body_opacity("a", now), 1.0, "other messages stay");
-        let mid = motion.body_opacity("b", later(now, 40));
-        assert!(mid > 0.0 && mid < 1.0, "{mid}");
-        assert!(motion.tick(later(now, 40)));
-        assert!(!motion.tick(later(now, 200)));
-        assert_eq!(motion.body_opacity("b", later(now, 200)), 1.0);
-
-        // Reduced motion: it shows at once.
-        let mut still = InboxMotion::new(Motion::new(false));
-        still.bodies_filled(vec!["b".into()]);
-        still.observe(&session, (true, true), now);
-        assert_eq!(still.body_opacity("b", now), 1.0);
     }
 
     #[test]
@@ -1252,6 +1294,57 @@ mod tests {
         motion.observe(&session, (false, true), now);
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
+        motion.body_arrived("a", now);
+        session.quotes_open.insert("a".into());
+        session.recipients_open.insert("a".into());
+        assert!(motion.body_alphas(now).is_empty());
+        let shown = motion.disclosures(&session, now);
+        assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
+    }
+
+    #[test]
+    fn history_and_recipients_move_together_and_a_key_settles_them() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        motion.body_arrived("a", now);
+        session.quotes_open.insert("b".into());
+        session.recipients_open.insert("b".into());
+        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
+        let opening = motion.disclosures(&session, now);
+        assert_eq!(opening.quotes["b"], 0.0);
+        assert_eq!(opening.recipients["b"], 0.0);
+
+        let mid = later(now, 40);
+        let alpha = motion.body_alphas(mid)["a"];
+        assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
+        assert!(motion.tick(mid));
+        let shown = motion.disclosures(&session, mid);
+        assert_eq!(shown.quotes, shown.recipients);
+        assert!((0.0..1.0).contains(&shown.quotes["b"]));
+
+        // The body is in after QUICK; both disclosures keep moving until SLIDE.
+        let after = later(now, 90);
+        assert!(motion.tick(after));
+        assert!(!motion.body_alphas(after).contains_key("a"));
+        assert!(motion.disclosures(&session, after).quotes["b"] > 0.9);
+
+        let close = later(now, 130);
+        assert!(!motion.tick(close));
+        session.quotes_open.clear();
+        session.recipients_open.clear();
+        let closing = motion.disclosures(&session, close);
+        assert_eq!(closing.quotes["b"], 1.0);
+        assert_eq!(closing.recipients["b"], 1.0);
+        let next = later(close, 20);
+        let shown = motion.disclosures(&session, next);
+        assert_eq!(shown.quotes, shown.recipients);
+        assert!((0.0..1.0).contains(&shown.quotes["b"]));
+
+        motion.settle(next);
+        let end = motion.disclosures(&session, next);
+        assert!(end.quotes.is_empty() && end.recipients.is_empty());
+        assert!(!motion.tick(next));
     }
 }

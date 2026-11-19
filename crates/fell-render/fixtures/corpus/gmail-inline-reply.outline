@@ -1,0 +1,18 @@
+## open
+p Answers inline.
+## open quoted
+p On Wed, Nov 18, 2026 at 8:40 AM Rafa Quint <[rafa@harbour.example.org](mailto:rafa@harbour.example.org)> wrote:
+quote
+  p Are the life jackets back from the cleaners?
+## open
+p Yes, all twelve, in the blue locker.
+## open quoted
+quote
+  p Did anyone check the fuel?
+## open
+p Not yet. I will do it on Friday with Teo.
+p Dee
+## fold quote
+quote
+  p Thanks,
+    | Rafa
