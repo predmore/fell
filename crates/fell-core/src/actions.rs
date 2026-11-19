@@ -10,6 +10,10 @@
 //! list, not folders. Archive and Trash are the account's folders for those
 //! roles ([`Store::folder_roles`]), not fixed names.
 //!
+//! With write-back on for the account (`write_back` in `account.toml`),
+//! archive and move also queue the server move in the same transaction, and
+//! undo takes it back (see [`crate::outbox`]). Labels and delete stay local.
+//!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
 //! the removed folder out. Undo puts the saved row back, then deletes that
@@ -248,7 +252,8 @@ impl Store {
                 roles.label(&archive)
             )));
         }
-        self.apply_thread(account_id, thread_id, ActionKind::Archive, |rows| {
+        let server = Some((from_folder.as_str(), archive.as_str(), &roles));
+        self.apply_thread(account_id, thread_id, ActionKind::Archive, server, |rows| {
             let plans = plan_relocate(rows, &from_folder, &archive);
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
@@ -274,7 +279,9 @@ impl Store {
         if from_folder.eq_ignore_ascii_case(&to_folder) {
             return Err(Error::Action("move needs a different folder".into()));
         }
-        self.apply_thread(account_id, thread_id, ActionKind::Move, |rows| {
+        let roles = self.folder_roles(account_id)?;
+        let server = Some((from_folder.as_str(), to_folder.as_str(), &roles));
+        self.apply_thread(account_id, thread_id, ActionKind::Move, server, |rows| {
             let plans = plan_relocate(rows, &from_folder, &to_folder);
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
@@ -299,7 +306,7 @@ impl Store {
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_thread(account_id, thread_id, ActionKind::Label, |rows| {
+        self.apply_thread(account_id, thread_id, ActionKind::Label, None, |rows| {
             let plans = plan_label(rows, adding, &label);
             if plans.is_empty() {
                 let message = if adding {
@@ -332,7 +339,7 @@ impl Store {
         let from_folder = canonical_folder(from_folder)?;
         let roles = self.folder_roles(account_id)?;
         let trash = roles.name(FolderRole::Trash).to_string();
-        self.apply_thread(account_id, thread_id, ActionKind::Delete, |rows| {
+        self.apply_thread(account_id, thread_id, ActionKind::Delete, None, |rows| {
             let plans = if from_folder.eq_ignore_ascii_case(&trash) {
                 plan_expunge(rows, &from_folder)
             } else {
@@ -361,6 +368,7 @@ impl Store {
         for row in &rows {
             restore_row(&tx, account_id, row)?;
         }
+        crate::outbox::undo_action(&tx, account_id, action.id)?;
         tx.execute(
             "DELETE FROM local_folder_tombstones WHERE action_id = ?1",
             params![action.id],
@@ -462,6 +470,7 @@ impl Store {
         account_id: &AccountId,
         thread_id: &ThreadId,
         kind: ActionKind,
+        server: Option<(&str, &str, &crate::folders::FolderRoles)>,
         plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
         self.require_account(account_id)?;
@@ -476,6 +485,13 @@ impl Store {
             return Err(Error::Action("nothing to change".into()));
         }
         let action = record_and_apply(&tx, account_id, kind, &summary, &plans)?;
+        if let Some((from, to, roles)) = server {
+            let moved: Vec<String> = plans
+                .iter()
+                .map(|plan| plan.before.message_id.clone())
+                .collect();
+            crate::outbox::queue_moves(&tx, account_id, action.id, &moved, from, to, roles)?;
+        }
         tx.commit()?;
         Ok(action)
     }

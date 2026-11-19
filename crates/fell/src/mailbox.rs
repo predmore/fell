@@ -187,6 +187,9 @@ fn prepare(
     if let Some(config) = config {
         let account = config.account();
         store.upsert_account(&account)?;
+        // Before the window can archive anything, so the first action is
+        // queued for the server or not as the file says.
+        store.set_write_back(&account.id, config.write_back)?;
         return Ok((account, SyncKind::Connecting));
     }
     let accounts = store.list_accounts()?;
