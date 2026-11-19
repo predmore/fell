@@ -7,7 +7,7 @@ use crate::Error;
 use crate::account::BackendKind;
 use crate::backend::{ImapBackend, MailBackend, MailboxDelta, SyncProgress};
 use crate::store::Store;
-use crate::sync::{sync_once, sync_with_progress};
+use crate::sync::{fetch_message_bodies, sync_once, sync_with_progress};
 
 use super::sync_tests::{
     account, body_fetches, commands, config, empty_mailbox, sample_state, stored,
@@ -268,7 +268,8 @@ fn a_restart_resumes_below_the_windows_already_read() {
 
     let acct = account("a1", BackendKind::Imap);
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 60, "only the 60 older messages are new");
+    assert!(report.changed);
+    assert_eq!(report.new_messages, None);
     let logged = commands(&server);
     let headers: Vec<&String> = logged
         .iter()
@@ -347,7 +348,7 @@ fn progress_reaches_the_report_while_a_first_sync_runs() {
         reports.push(report.clone());
     })
     .unwrap();
-    assert_eq!(report.upserted, 80);
+    assert_eq!(report.new_messages, None);
     let first = reports
         .iter()
         .find_map(|report| report.progress.clone())
@@ -360,15 +361,72 @@ fn progress_reaches_the_report_while_a_first_sync_runs() {
             total: 80,
         }
     );
-    // Rows from headers do not count as complete until their bodies come.
-    assert_eq!(reports[0].upserted, 0);
+    // Header rows are visible immediately. Folder progress advances with bodies.
+    assert!(reports[0].changed);
+    assert!(reports.iter().all(|report| report.new_messages.is_none()));
     assert!(reports.iter().any(|report| {
-        report.upserted == 10
-            && report
-                .progress
-                .as_ref()
-                .is_some_and(|progress| progress.done == 10)
+        report
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.done == 10)
     }));
+}
+
+#[test]
+fn on_demand_body_fetch_during_first_sync_does_not_report_new_mail() {
+    let _sizes = set_windows(SMALL);
+    let inbox = folder("INBOX", "", 3, "In", 2);
+    let copied = numbered("In", 1).pop().unwrap();
+    let server = TestServer::spawn(state_with(vec![inbox, empty_mailbox("All Mail", 4)]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let acct = account("a1", BackendKind::Imap);
+    let (_, stopped) = run_pass(&backend, &store, &mut |delta| {
+        delta.messages.iter().any(headers_only)
+    });
+    assert!(stopped.is_err());
+    assert!(stored(&store, &acct, "In1@x").unwrap().body_text.is_none());
+
+    let ids = [
+        crate::MessageId::new("In1@x"),
+        crate::MessageId::new("In2@x"),
+    ];
+    let fetched = fetch_message_bodies(&acct.id, &backend, &store, &ids).unwrap();
+    assert!(
+        fetched
+            .iter()
+            .all(|parts| parts.as_ref().is_some_and(|parts| parts.plain.is_some()))
+    );
+    let mut reports = Vec::new();
+    let resumed = sync_with_progress(&acct, &backend, &store, &mut |report| {
+        reports.push(report.clone());
+    })
+    .unwrap();
+    assert_eq!(resumed.new_messages, None);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.new_messages.unwrap_or(0) == 0)
+    );
+    assert!(
+        reports
+            .iter()
+            .filter_map(|report| report.progress.as_ref())
+            .any(|progress| {
+                progress.folder == "Inbox" && progress.done == 2 && progress.total == 2
+            })
+    );
+
+    server.state.lock().unwrap().mailboxes[1]
+        .messages
+        .push(copied);
+    let copy_pass = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(copy_pass.new_messages, Some(0));
+    assert_eq!(
+        stored(&store, &acct, "In1@x").unwrap().folders,
+        vec!["INBOX", "All Mail"]
+    );
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 2);
 }
 
 #[test]
@@ -383,7 +441,7 @@ fn a_second_pass_after_a_first_sync_fetches_no_body_again() {
     sync_once(&acct, &backend, &store).unwrap();
     server.state.lock().expect("state").commands.clear();
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 0);
+    assert_eq!(report.new_messages, Some(0));
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
     assert!(
         commands(&server)
@@ -465,7 +523,7 @@ fn a_body_too_large_to_keep_is_marked_and_not_asked_for_again() {
     // Later passes count it as read and never download it again.
     server.state.lock().expect("state").commands.clear();
     let again = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(again.upserted, 0);
+    assert_eq!(again.new_messages, Some(0));
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
     assert!(store.missing_bodies(&acct.id, 100).unwrap().is_empty());
 }

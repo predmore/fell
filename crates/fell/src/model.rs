@@ -24,16 +24,16 @@ pub enum SyncKind {
     StoreError,
     /// The account file is set up and the first attempt has not answered yet.
     Connecting,
-    /// Messages written so far in this pass.
+    /// A pass under way, with the count when the store can determine it.
     Syncing {
-        stored: usize,
+        new_messages: Option<usize>,
         /// The first sync of a folder under way, read newest first.
         progress: Option<fell_core::SyncProgress>,
     },
-    /// Unix time the last pass finished, and how many messages it wrote.
+    /// Unix time the last pass finished and whether to refresh its mail.
     Synced {
         at: i64,
-        stored: usize,
+        changed: bool,
     },
     Failed(SyncFailure),
 }
@@ -84,8 +84,11 @@ impl SyncKind {
                 grouped(progress.done),
                 grouped(progress.total)
             ),
-            Self::Syncing { stored: 0, .. } => "syncing…".into(),
-            Self::Syncing { stored, .. } => format!("syncing · {stored} new"),
+            Self::Syncing {
+                new_messages: Some(count),
+                ..
+            } if *count > 0 => format!("syncing · {count} new"),
+            Self::Syncing { .. } => "syncing…".into(),
             Self::Synced { at, .. } => {
                 let ago = now.saturating_sub(*at).max(0);
                 if ago < 60 {
@@ -2158,8 +2161,11 @@ impl Session {
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
                 title: format!("Syncing {}", self.folder_title()),
                 hint: match &self.sync {
-                    SyncKind::Syncing { stored, .. } if *stored > 0 => {
-                        format!("{stored} messages stored · conversations appear as they arrive")
+                    SyncKind::Syncing {
+                        new_messages: Some(count),
+                        ..
+                    } if *count > 0 => {
+                        format!("{count} messages stored · conversations appear as they arrive")
                     }
                     _ => "Conversations appear as they arrive".into(),
                 },
@@ -2234,7 +2240,7 @@ mod tests {
     #[test]
     fn a_first_sync_names_its_folder_and_how_far_it_is() {
         let syncing = SyncKind::Syncing {
-            stored: 12,
+            new_messages: None,
             progress: Some(fell_core::SyncProgress {
                 folder: "Inbox".into(),
                 done: 4_210,
@@ -2242,11 +2248,6 @@ mod tests {
             }),
         };
         assert_eq!(syncing.status_at(0), "syncing Inbox · 4,210 of 31,882");
-        let catching_up = SyncKind::Syncing {
-            stored: 3,
-            progress: None,
-        };
-        assert_eq!(catching_up.status_at(0), "syncing · 3 new");
         assert!(!syncing.is_error());
         for (count, text) in [
             (0, "0"),
@@ -2255,6 +2256,21 @@ mod tests {
             (1_234_567, "1,234,567"),
         ] {
             assert_eq!(grouped(count), text);
+        }
+    }
+
+    #[test]
+    fn catch_up_labels_only_confirmed_inserts_as_new() {
+        for (new_messages, expected) in [
+            (Some(3), "syncing · 3 new"),
+            (Some(0), "syncing…"),
+            (None, "syncing…"),
+        ] {
+            let status = SyncKind::Syncing {
+                new_messages,
+                progress: None,
+            };
+            assert_eq!(status.status_at(0), expected);
         }
     }
 

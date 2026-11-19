@@ -60,8 +60,8 @@ const BODIES_BETWEEN_PASSES: usize = 48;
 /// What the sync thread tells the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
-    /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean
-    /// the store has new rows.
+    /// The status to show. `Syncing`, and `Synced` with `changed`, can also
+    /// refresh mail that has just been written.
     Status(SyncKind),
     /// A conflict during replay changed a local flag.
     FlagsChanged,
@@ -303,7 +303,7 @@ fn run(
                 if last_progress.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
                     last_progress = Some(Instant::now());
                     alive &= send(SyncKind::Syncing {
-                        stored: report.upserted,
+                        new_messages: report.new_messages,
                         progress: report.progress.clone(),
                     });
                 }
@@ -320,7 +320,7 @@ fn run(
                 failures = 0;
                 if !send(SyncKind::Synced {
                     at: unix_now(),
-                    stored: report.upserted,
+                    changed: report.changed,
                 }) {
                     return;
                 }

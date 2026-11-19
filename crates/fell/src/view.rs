@@ -496,7 +496,7 @@ impl Inbox {
                             }
                         };
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
-                            || matches!(kind, SyncKind::Synced { stored, .. } if stored > 0);
+                            || matches!(kind, SyncKind::Synced { changed: true, .. });
                         if matches!(kind, SyncKind::Synced { .. }) {
                             // Sync is answering again: asks that failed
                             // while it was not can go now.
