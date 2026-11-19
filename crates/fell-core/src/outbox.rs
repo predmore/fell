@@ -265,6 +265,9 @@ pub struct ReplayReport {
     pub waiting: usize,
     /// Rows given up on. The local change stays; the server never got it.
     pub dropped: Vec<DroppedWrite>,
+    /// A previous flag write reached the retry limit without confirmation.
+    /// The newer edit still waits for that confirmation.
+    pub flag_recovery_delayed: bool,
     /// Replay applied a conflicting server value to the local store.
     pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
@@ -960,11 +963,9 @@ pub(crate) fn mark_sent(
     Ok(marked)
 }
 
-/// `report` as the status line should have it. The line names one reason,
-/// the first dropped move's. Two notices are said only once, and each is
-/// spent only by a report that leads with it:
+/// `report` as the status line should have it. Two notices are said only once:
 ///
-/// - "no MOVE": recorded as told when it leads, and left out after that;
+/// - "no MOVE": recorded as told when it appears, and left out after that;
 /// - a half-done copy from an earlier build ([`take_abandoned`]): taken only
 ///   by a report with nothing else to say, so it waits for the next pass.
 pub(crate) fn report_for_status(
@@ -972,16 +973,16 @@ pub(crate) fn report_for_status(
     account_id: &AccountId,
     mut report: ReplayReport,
 ) -> Result<ReplayReport> {
-    let leads_with_no_move = report
+    let no_move = report
         .dropped
-        .first()
-        .is_some_and(|dropped| dropped.reason == DropReason::NoMove);
-    if leads_with_no_move && note_move_missing(store, account_id, true)? {
+        .iter()
+        .any(|dropped| dropped.reason == DropReason::NoMove);
+    if no_move && note_move_missing(store, account_id, true)? {
         report
             .dropped
             .retain(|dropped| dropped.reason != DropReason::NoMove);
     }
-    if report.dropped.is_empty() {
+    if report.dropped.is_empty() && !report.flag_recovery_delayed {
         report.dropped = take_abandoned(store, account_id)?;
     }
     Ok(report)

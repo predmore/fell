@@ -695,6 +695,9 @@ impl Pass<'_> {
                 }
             }
             Settled::Recorded if last => return self.drop_row(index, reason, message),
+            Settled::Recovering if entry.attempts + 1 == MAX_ATTEMPTS => {
+                self.report.flag_recovery_delayed = true;
+            }
             Settled::Recorded | Settled::Recovering => {}
         }
         self.held.insert(entry.message_id.clone());

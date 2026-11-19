@@ -126,12 +126,12 @@ pub(crate) fn observe_flags(
     };
     let updated = conn
         .prepare_cached(
-            "UPDATE message_copies SET modseq = ?5,
-                 seen = COALESCE(?6, CASE WHEN modseq = ?5 OR modseq = ?8 THEN seen END),
-                 flagged = COALESCE(?7, CASE WHEN modseq = ?5 OR modseq = ?8 THEN flagged END),
+            "UPDATE message_copies SET modseq = COALESCE(?5, modseq),
+                 seen = COALESCE(?6, CASE WHEN ?5 IS NULL OR modseq = ?5 OR modseq = ?8 THEN seen END),
+                 flagged = COALESCE(?7, CASE WHEN ?5 IS NULL OR modseq = ?5 OR modseq = ?8 THEN flagged END),
                  seen_handled = CASE
                      WHEN ?9 THEN 1
-                     WHEN ?6 = seen OR (?6 IS NULL AND (modseq = ?5 OR modseq = ?8))
+                     WHEN ?6 = seen OR (?6 IS NULL AND (?5 IS NULL OR modseq = ?5 OR modseq = ?8))
                          THEN seen_handled
                      ELSE 0 END
              WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4

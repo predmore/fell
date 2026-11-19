@@ -1986,10 +1986,12 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     drop(fx.store);
     fx.store = Store::open(&path).unwrap();
     fx.server.writes.lock().unwrap().omit_fetch_flags = true;
-    for _ in 0..super::write_back::MAX_ATTEMPTS {
+    let max_attempts = super::write_back::MAX_ATTEMPTS;
+    for attempt in 1..=max_attempts + 1 {
         fx.make_due();
         let report = fx.replay();
         assert_eq!((report.sent, report.waiting), (0, 4));
+        assert_eq!(report.flag_recovery_delayed, attempt == max_attempts);
         assert_eq!(
             fx.stores().len(),
             1,
@@ -1999,7 +2001,9 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     }
     fx.server.writes.lock().unwrap().omit_fetch_flags = false;
     fx.make_due();
-    assert_eq!(fx.replay().sent, 3);
+    let report = fx.replay();
+    assert_eq!(report.sent, 3);
+    assert!(!report.flag_recovery_delayed);
     assert_eq!(fx.stores().len(), 4, "{:?}", fx.stores());
     assert!(
         fx.stores()
@@ -2111,11 +2115,25 @@ fn the_write_back_switch_gates_flags_and_nomodseq_uses_plain_store() {
     assert!(fx.stores().is_empty());
 
     fx.server.writes.lock().unwrap().nomodseq = true;
+    fx.flag(&alpha, FlagChange::Read);
     fx.flag(&alpha, FlagChange::Star);
-    assert_eq!(fx.replay_as_window().sent, 3);
+    assert_eq!(fx.replay_as_window().sent, 6);
     assert!(
         fx.stores()
             .iter()
             .all(|cmd| !cmd.contains("UNCHANGEDSINCE"))
+    );
+    let (modseq, seen, flagged, seen_handled): ([u8; 8], bool, bool, bool) = fx
+        .store
+        .connection()
+        .query_row(
+            "SELECT modseq, seen, flagged, seen_handled FROM message_copies WHERE uid = 4",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (u64::from_be_bytes(modseq), seen, flagged, seen_handled),
+        (4, true, true, true)
     );
 }

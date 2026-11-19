@@ -19,9 +19,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DropReason, InboxWait, MessageId, MessageParts,
-    OutboxKind, ReplayReport, Store, SyncFailureKind, classify_sync_error, fetch_message_bodies,
-    fetch_missing_bodies, sync_with_progress,
+    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts, Store,
+    SyncFailureKind, classify_sync_error, fetch_message_bodies, fetch_missing_bodies,
+    sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -65,42 +65,14 @@ pub enum SyncEvent {
     Status(SyncKind),
     /// A conflict during replay changed a local flag.
     FlagsChanged,
-    /// Actions the server will never get. The change stays in Fell.
-    NotSent(NotSent),
+    /// Write-back problems to show together in one notice.
+    WriteBackNotice {
+        dropped: Vec<DroppedWrite>,
+        flag_recovery_delayed: bool,
+    },
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
     BodiesStored,
-}
-
-/// The first reason in a replay's dropped writes, and how many rows it
-/// covers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotSent {
-    pub reason: DropReason,
-    pub kind: OutboxKind,
-    /// The folder the messages were to leave on the server.
-    pub folder: String,
-    pub count: usize,
-}
-
-impl NotSent {
-    fn from_report(report: &ReplayReport) -> Option<Self> {
-        let first = report.dropped.first()?;
-        let count = report
-            .dropped
-            .iter()
-            .filter(|dropped| {
-                dropped.reason == first.reason
-                    && (dropped.kind == OutboxKind::Move) == (first.kind == OutboxKind::Move)
-            })
-            .count();
-        Some(Self {
-            reason: first.reason,
-            kind: first.kind,
-            folder: first.source_folder.clone(),
-            count,
-        })
-    }
 }
 
 /// Why the window woke the sync thread for a pass.
@@ -308,8 +280,13 @@ fn run(
             if report.flags_changed && events.unbounded_send(SyncEvent::FlagsChanged).is_err() {
                 return;
             }
-            if let Some(not_sent) = NotSent::from_report(&report)
-                && events.unbounded_send(SyncEvent::NotSent(not_sent)).is_err()
+            if (!report.dropped.is_empty() || report.flag_recovery_delayed)
+                && events
+                    .unbounded_send(SyncEvent::WriteBackNotice {
+                        dropped: report.dropped,
+                        flag_recovery_delayed: report.flag_recovery_delayed,
+                    })
+                    .is_err()
             {
                 return;
             }
