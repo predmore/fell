@@ -12,6 +12,11 @@ rust-version.workspace = true
 # the only use of `fell-confirm`, so `fell-mcp` (which leaves it off) does
 # not link that crate at all.
 ui-confirm = ["dep:fell-confirm"]
+# `Store::testing_index_embeddings` and `Store::testing_search_embedder`, for
+# other crates' tests: they rewrite the vector index and swap the search
+# ranker. Enable it only from a `[dev-dependencies]` entry, so no release
+# build has it.
+test-utils = []
 
 [dependencies]
 fell-confirm = { workspace = true, optional = true }

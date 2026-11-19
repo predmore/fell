@@ -1360,3 +1360,38 @@ fn a_corrected_query_is_the_one_the_semantic_side_embeds() {
         "{filtered:?}"
     );
 }
+
+/// An embedder that says it has no dimensions.
+struct NoDims;
+
+impl BodyEmbedder for NoDims {
+    fn id(&self) -> EmbedderId {
+        EmbedderId {
+            model: "test-no-dims",
+            version: "1",
+        }
+    }
+
+    fn dims(&self) -> usize {
+        0
+    }
+
+    fn embed(&self, _body: &str) -> std::result::Result<Vec<f32>, ModelError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn an_embedder_with_no_dimensions_is_refused() {
+    let (store, _reset) = concept_store();
+    assert!(store.testing_search_embedder(Box::new(NoDims)).is_err());
+    let index = super::semantic::VectorIndex::load(&store.conn, NoDims.id(), 0);
+    assert!(index.is_err());
+
+    // Installed as the model, it never loads: search stays keyword search.
+    testing_embedder(Some(|| Box::new(NoDims)));
+    let store = Store::open_in_memory().unwrap();
+    fill(&store, &corpus_mail());
+    assert!(!store.semantic_search_active());
+    assert_eq!(hybrid(&store, "invoice"), keyword(&store, "invoice"));
+}

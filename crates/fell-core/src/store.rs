@@ -1085,7 +1085,9 @@ impl Store {
     }
 
     /// Tests in other crates: fill every missing or outdated body vector
-    /// with `embedder` on this thread. Returns the rows written.
+    /// with `embedder` on this thread. Returns the rows written. Only with
+    /// the `test-utils` feature, which no release build enables.
+    #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn testing_index_embeddings(&self, embedder: &dyn crate::BodyEmbedder) -> Result<usize> {
         let mut total = 0;
@@ -1099,7 +1101,9 @@ impl Store {
     }
 
     /// Tests in other crates: rank searches with `embedder`, as if it were
-    /// the installed model, over the vectors it stored.
+    /// the installed model, over the vectors it stored. An embedder with no
+    /// dimensions is an error. Only with the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn testing_search_embedder(
         &self,

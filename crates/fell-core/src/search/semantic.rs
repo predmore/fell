@@ -130,6 +130,7 @@ impl Semantic {
 
 impl Semantic {
     /// Search with `embedder` from now on, over the vectors it stored.
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn use_embedder(&mut self, embedder: SendEmbedder, conn: &Connection) -> Result<()> {
         let index = VectorIndex::load(conn, embedder.id(), embedder.dims())?;
         self.state = State::Ready(Box::new(Ready { embedder, index }));
@@ -222,8 +223,15 @@ pub(crate) struct VectorIndex {
 
 impl VectorIndex {
     /// Every row `id` stored with `dims` values, read in one snapshot: the
-    /// caller's transaction when it is in one, else its own.
+    /// caller's transaction when it is in one, else its own. An embedder
+    /// with no dimensions is an error.
     pub(crate) fn load(conn: &Connection, id: EmbedderId, dims: usize) -> Result<Self> {
+        if dims == 0 {
+            return Err(crate::Error::Invalid(format!(
+                "embedder {} has no dimensions",
+                id.model
+            )));
+        }
         let tx = Snapshot::begin(conn)?;
         let mut index = Self {
             id,
@@ -459,7 +467,8 @@ impl VectorIndex {
         allowed: Option<&[bool]>,
         limit: usize,
     ) -> Vec<(Arc<str>, f32)> {
-        let Some(slot) = self.account_slot(account) else {
+        // `load` refuses zero dimensions, and `chunks_exact(0)` would panic.
+        let (Some(slot), false) = (self.account_slot(account), self.dims == 0) else {
             return Vec::new();
         };
         let Some((query, query_scale)) = quantize(query.iter().copied(), self.dims) else {

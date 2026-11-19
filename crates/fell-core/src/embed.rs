@@ -716,6 +716,7 @@ pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize>
 }
 
 /// [`index_embeddings`] with a given embedder.
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn index_embeddings_with(
     conn: &Connection,
     limit: usize,
