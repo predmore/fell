@@ -15,6 +15,7 @@ pub mod embed;
 pub mod folders;
 pub mod imap;
 pub mod message;
+pub mod outbox;
 pub mod parts;
 pub mod search;
 pub mod send;
@@ -46,6 +47,7 @@ pub use message::{
     Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
     RemoteId, TransferEncoding,
 };
+pub use outbox::{DropReason, DroppedMove, OutboxEntry, OutboxKind, OutboxState, ReplayReport};
 pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
 pub use search::{SearchHit, SearchOptions, SearchResults};
 pub use send::{

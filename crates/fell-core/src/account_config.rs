@@ -17,6 +17,7 @@
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
+//! # write_back = true           # send archive and move to the server (off by default)
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -24,6 +25,10 @@
 //! `sent_folder`, `drafts_folder`, `trash_folder`, `junk_folder`,
 //! `archive_folder`, `all_mail_folder`, and `flagged_folder` name the folder
 //! for that role and win over both.
+//!
+//! Archive and move change only Fell's copy of the mailbox unless
+//! `write_back = true`: then they are queued and the sync thread moves the
+//! mail on the server too (see [`crate::outbox`]).
 //!
 //! Sending uses only this file's username and password, never anything in a
 //! draft folder. `smtp_security = "starttls"` (the default) refuses a server
@@ -73,6 +78,8 @@ pub struct AccountConfig {
     pub smtp_security: Option<ImapSecurity>,
     /// `sent_folder = "..."` and the like, in [`FolderRole::ALL`] order.
     pub folders: Vec<(FolderRole, String)>,
+    /// `write_back = true`: archive and move are sent to the server too.
+    pub write_back: bool,
 }
 
 impl AccountConfig {
@@ -97,6 +104,7 @@ impl AccountConfig {
             smtp_port: None,
             smtp_security: None,
             folders: Vec::new(),
+            write_back: false,
         }
     }
 
@@ -196,6 +204,10 @@ impl AccountConfig {
                 folders.push((role, name.trim().to_string()));
             }
         }
+        let write_back = get("write_back")
+            .map(|value| value.flag("write_back"))
+            .transpose()?
+            .unwrap_or(false);
         if let Some((key, _)) = fields.first() {
             return Err(invalid(format!("unknown key {key}")));
         }
@@ -214,6 +226,7 @@ impl AccountConfig {
             smtp_port,
             smtp_security,
             folders,
+            write_back,
         };
         config.validate()?;
         Ok(config)
@@ -298,6 +311,9 @@ impl AccountConfig {
                 push(&mut out, key, name);
             }
         }
+        if self.write_back {
+            out.push_str("write_back = true\n");
+        }
         out
     }
 
@@ -364,6 +380,20 @@ impl AccountConfig {
             imap: self.imap_config()?,
             smtp: self.smtp_config(),
         })
+    }
+
+    /// Send the archive and move rows queued for this account on a separate
+    /// `SELECT` session. Run it on the sync thread; it connects only when a
+    /// row is due. Sends nothing while `write_back` is off, but still
+    /// reports, once, a copy an earlier build of write-back left half done.
+    pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
+        let account_id = AccountId(self.id.clone());
+        let report = if !self.write_back || !crate::outbox::any_due(store, &account_id)? {
+            crate::ReplayReport::default()
+        } else {
+            crate::imap::replay_outbox(&self.imap_config()?, &account_id, store)?
+        };
+        crate::outbox::report_for_status(store, &account_id, report)
     }
 
     /// Log in and log out again without reading mail. Returns the number of
@@ -488,13 +518,23 @@ pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
 enum Value {
     Text(String),
     Number(u64),
+    Flag(bool),
 }
 
 impl Value {
     fn text(self, key: &str) -> Result<String> {
         match self {
             Self::Text(text) => Ok(text),
-            Self::Number(_) => Err(invalid(format!("{key} must be a quoted string"))),
+            Self::Number(_) | Self::Flag(_) => {
+                Err(invalid(format!("{key} must be a quoted string")))
+            }
+        }
+    }
+
+    fn flag(self, key: &str) -> Result<bool> {
+        match self {
+            Self::Flag(flag) => Ok(flag),
+            _ => Err(invalid(format!("{key} must be true or false"))),
         }
     }
 
@@ -515,7 +555,7 @@ impl Value {
                 .ok()
                 .filter(|port| *port != 0)
                 .ok_or_else(|| invalid(format!("port {number} is out of range"))),
-            Self::Text(_) => Err(invalid("port must be a number")),
+            Self::Text(_) | Self::Flag(_) => Err(invalid("port must be a number")),
         }
     }
 }
@@ -557,10 +597,15 @@ fn parse_value(raw: &str) -> std::result::Result<Value, String> {
         return Ok(Value::Text(rest[..end].to_string()));
     }
     let bare = raw.split('#').next().unwrap_or("").trim();
+    match bare {
+        "true" => return Ok(Value::Flag(true)),
+        "false" => return Ok(Value::Flag(false)),
+        _ => {}
+    }
     bare.parse::<u64>()
         .map(Value::Number)
         // Never repeat the value: it may be a password typed without quotes.
-        .map_err(|_| "the value must be a quoted string or a number".into())
+        .map_err(|_| "the value must be a quoted string, a number, or true or false".into())
 }
 
 /// A literal loopback address. A name such as `localhost` does not count.
@@ -634,6 +679,38 @@ mod tests {
             let err = AccountConfig::parse(&format!("{base}{line}")).unwrap_err();
             assert!(err.to_string().contains(message), "{line}: {err}");
         }
+    }
+
+    #[test]
+    fn write_back_is_off_unless_turned_on() {
+        let base = "email = \"me@proton.me\"\npassword = \"pw\"\n";
+        let off = AccountConfig::parse(base).unwrap();
+        assert!(!off.write_back);
+        assert!(!off.render().contains("write_back"));
+        let on = AccountConfig::parse(&format!("{base}write_back = true # sync triage\n")).unwrap();
+        assert!(on.write_back);
+        assert_eq!(AccountConfig::parse(&on.render()).unwrap(), on);
+        assert!(
+            !AccountConfig::parse(&format!("{base}write_back = false\n"))
+                .unwrap()
+                .write_back
+        );
+        for line in [
+            "write_back = \"true\"\n",
+            "write_back = 1\n",
+            "write_back = yes\n",
+        ] {
+            let err = AccountConfig::parse(&format!("{base}{line}")).unwrap_err();
+            assert!(
+                err.to_string().contains("write_back") || err.to_string().contains("true or false"),
+                "{line}: {err}"
+            );
+        }
+        let err = AccountConfig::parse("email = \"me@proton.me\"\npassword = true\n").unwrap_err();
+        assert!(
+            err.to_string().contains("password must be a quoted string"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod part_fetch;
 mod rfc822;
 mod session;
 mod utf7;
+mod write_back;
 
 pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_tcp_as_tls};
 
@@ -30,6 +31,8 @@ pub(crate) mod mime_fixtures;
 mod sync_tests;
 #[cfg(test)]
 mod test_server;
+#[cfg(test)]
+mod write_back_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -86,6 +89,16 @@ impl Drop for BatchLimitGuard {
     fn drop(&mut self) {
         TEST_BATCH_MESSAGES.with(|cell| cell.set(BATCH_MESSAGES));
     }
+}
+
+/// Send the account's queued archive and move rows ([`crate::outbox`]) on
+/// a separate `SELECT` session.
+pub(crate) fn replay_outbox(
+    config: &ImapConfig,
+    account_id: &AccountId,
+    store: &crate::store::Store,
+) -> Result<crate::outbox::ReplayReport, Error> {
+    write_back::replay(config, account_id, store)
 }
 
 /// Log in, count selectable mailboxes, and log out. Reads no mail.
@@ -1226,14 +1239,19 @@ pub(crate) fn parse_remote_id(raw: &str) -> Option<RemoteCopy> {
     })
 }
 
-pub(super) fn escape_mailbox(name: &str) -> String {
+/// The folder name a raw (modified UTF-7) mailbox name stands for.
+pub(crate) fn folder_name(raw: &str) -> String {
+    utf7::decode_modified_utf7(raw)
+}
+
+pub(crate) fn escape_mailbox(name: &str) -> String {
     name.replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
 }
 
-fn unescape_mailbox(raw: &str) -> Option<String> {
+pub(crate) fn unescape_mailbox(raw: &str) -> Option<String> {
     let mut out = String::new();
     let mut chars = raw.chars();
     while let Some(ch) = chars.next() {

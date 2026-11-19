@@ -8,6 +8,11 @@
 //! off a row only when no copy of that row is left in it, and a row is deleted
 //! only when it has no folder and no copy left. A server move adds the new
 //! copy during the same pass, so the row (and its local state) stays.
+//!
+//! A folder a write-back move not yet settled is bringing the row into
+//! stays too (see [`crate::outbox`]). Undo puts the row back in its folder
+//! at once and clears what kept sync off it, while the server still has
+//! the copy where the action moved it until the reverse move is sent.
 
 use std::collections::HashSet;
 
@@ -620,6 +625,10 @@ fn settle_one(
     if kept.len() == tokens.len() {
         return Ok(Outcome::Done);
     }
+    // Asked again at the next settle, once the move has placed its copy.
+    if moving_into(conn, account_id, &stored.canonical_id, folder)? {
+        return Ok(Outcome::Wait);
+    }
     if kept.is_empty() {
         let any_copy: Option<i64> = conn
             .query_row(
@@ -663,6 +672,29 @@ fn settle_one(
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
     *changed = true;
     Ok(Outcome::Done)
+}
+
+/// A write-back row not yet settled moves the message into `folder`.
+fn moving_into(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    folder: &str,
+) -> Result<bool> {
+    if !table_exists(conn, "server_outbox")? {
+        return Ok(false);
+    }
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM server_outbox
+             WHERE account_id = ?1 AND message_id = ?2 AND state = 'pending'
+               AND target_folder = ?3 COLLATE NOCASE
+             LIMIT 1",
+            params![account_id.as_str(), message_id, folder],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
