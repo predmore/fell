@@ -8,17 +8,22 @@
 //! from what the last frame drew, as [`crate::inbox_motion`] does, so
 //! open, `U`, `s`, undo, an agent and sync all move a row the same way, and
 //! every row a `V` range changes moves together:
-//! - the weight cross-fades, with the unread bar ([`motion::FADE`]);
+//! - the weight fades through: the old weight fades out over the first
+//!   [`WEIGHT_OUT`] of [`motion::FADE`], then the new one fades in, so the
+//!   two widths are never drawn over each other; the unread bar
+//!   cross-fades over the whole [`motion::FADE`];
 //! - a read row marked unread grows its subject box to fit the bold text,
 //!   and the snippet slides there ([`motion::SLIDE`]) instead of the
 //!   subject being cut short;
 //! - the star fades and scales in from [`STAR_FROM`] ([`STAR`]);
-//! - a box left wider than its text (a row opened, so now read) eases back
-//!   to its text once the row has rested for [`REST`] ([`RELAX`]).
+//! - a box left wider than its text (a row opened, so now read) stays
+//!   until the reader next moves in the list: the key that brings the list
+//!   back or moves its cursor ([`RowWidths::relax`]) eases it back to its
+//!   text ([`RELAX`]), in the frame that key's own transition starts in.
+//!   Nothing moves on a timer while the reader reads.
 //!
-//! With motion reduced every change shows on its first frame, and a box
-//! wider than its text stays that wide until the row leaves the screen, so
-//! nothing moves on its own after a delay.
+//! With motion reduced every change shows on its first frame, the relax
+//! too: on that key, at once.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -38,12 +43,17 @@ pub const STAR: Duration = Duration::from_millis(100);
 /// The scale a star grows from as it fades in, and shrinks to as it leaves.
 pub const STAR_FROM: f32 = 0.8;
 
-/// How long a row's weight stays unchanged before a box wider than its
-/// text eases back.
-pub const REST: Duration = Duration::from_millis(600);
-
-/// How long that ease takes: as long as a pane, since nothing asked for it.
+/// How long a box wider than its text takes to ease back: as long as the
+/// pane slide or list glide of the key that starts it.
 pub const RELAX: Duration = motion::PANE;
+
+/// The share of [`motion::FADE`] the old weight takes to fade out, before
+/// the new one fades in: 40 of 120 ms.
+pub const WEIGHT_OUT: f32 = 1.0 / 3.0;
+
+/// How wide the fade is that softens the snippet's right edge while a
+/// relaxing box carries it past the end of the line.
+pub const EDGE_FADE: f32 = 16.0;
 
 /// A row as one frame draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,9 +62,13 @@ pub struct RowFrame {
     pub subject_w: f32,
     /// The width the subject text is cut to: where the box is going.
     pub subject_room: f32,
-    /// How unread the row looks: 0 is read (regular, no bar), 1 is unread
-    /// (bold, bar). In between, the two weights cross-fade.
+    /// How much of the unread bar shows: 0 read, 1 unread.
     pub unread: f32,
+    /// The opacity of the regular-weight text, and of the bold text. At
+    /// rest one is 1 and the other 0; while the weight changes the old one
+    /// fades out before the new one fades in.
+    pub regular: f32,
+    pub bold: f32,
     /// How much of the star shows (its opacity; its scale follows).
     pub star: f32,
 }
@@ -63,12 +77,22 @@ impl RowFrame {
     /// A row drawn as it is, with nothing moving: `subject_w` wide.
     pub fn still(subject_w: f32, unread: bool, starred: bool) -> Self {
         let subject_w = subject_w.ceil();
+        let unread = f32::from(u8::from(unread));
         Self {
             subject_w,
             subject_room: subject_w,
-            unread: f32::from(u8::from(unread)),
+            unread,
+            regular: 1.0 - unread,
+            bold: unread,
             star: f32::from(u8::from(starred)),
         }
+    }
+
+    /// How strongly the snippet's right edge fades this frame: while a
+    /// relaxing box (wider than where it is going) carries the snippet,
+    /// cut for where it is going, past the end of the line. 0 at rest.
+    pub fn edge_fade(&self) -> f32 {
+        ((self.subject_w - self.subject_room) / (EDGE_FADE / 2.0)).clamp(0.0, 1.0)
     }
 
     /// The star's scale this frame.
@@ -93,8 +117,9 @@ struct Kept {
     weight: Option<Transition>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
-    /// When the weight last changed: the box relaxes [`REST`] after.
-    since: Instant,
+    /// The reader moved in the list: ease back to the text on the next
+    /// frame that draws the row.
+    relax: bool,
 }
 
 impl Kept {
@@ -107,10 +132,28 @@ impl Kept {
             let t = motion::progress(transition, now);
             if on { t } else { 1.0 - t }
         };
+        // Fade-through: the old weight leaves, then the new one comes.
+        let (leaving, coming) = match &self.weight {
+            Some(weight) => {
+                let t = weight.linear(now);
+                (
+                    motion::fade_out(t / WEIGHT_OUT),
+                    motion::ease_out((t - WEIGHT_OUT) / (1.0 - WEIGHT_OUT)),
+                )
+            }
+            None => (0.0, 1.0),
+        };
+        let (regular, bold) = if self.unread {
+            (leaving, coming)
+        } else {
+            (coming, leaving)
+        };
         RowFrame {
             subject_w,
             subject_room: self.width,
             unread: toward(self.unread, self.weight.as_ref()),
+            regular,
+            bold,
             star: toward(self.starred, self.star.as_ref()),
         }
     }
@@ -121,9 +164,9 @@ impl Kept {
             || self.star.is_some_and(|t| t.running(now))
     }
 
-    /// Wider than its text, with nothing moving: it relaxes after [`REST`].
-    fn waiting_to_relax(&self) -> bool {
-        self.slide.is_none() && self.width > self.natural + 0.5
+    /// Wider than its text: it eases back when the reader next moves.
+    fn wide(&self) -> bool {
+        self.width > self.natural + 0.5
     }
 }
 
@@ -191,7 +234,7 @@ impl RowWidths {
                         starred,
                         weight: None,
                         star: None,
-                        since: now,
+                        relax: false,
                     },
                 );
             }
@@ -213,7 +256,6 @@ impl RowWidths {
             let drawn = kept.frame(now).subject_w;
             kept.unread = unread;
             kept.weight = motion.start(motion::FADE, now);
-            kept.since = now;
             kept.natural = natural(unread).ceil();
             // Grow to fit rather than cut the text short (a read row marked
             // unread). A box that is wider stays for now, so a row that
@@ -227,19 +269,27 @@ impl RowWidths {
             kept.starred = starred;
             kept.star = motion.start(STAR, now);
         }
-        if kept.waiting_to_relax() && now.saturating_duration_since(kept.since) >= REST {
-            // With motion reduced this never starts: the box stays until
-            // the row leaves the screen rather than jumping on its own.
-            if let Some(relax) = motion.start(RELAX, now) {
-                kept.slide = Some((kept.width, relax));
-                kept.width = kept.natural;
-            }
+        if std::mem::take(&mut kept.relax) && kept.wide() {
+            // Eases from where it is drawn, or lands at once with motion
+            // reduced.
+            let drawn = kept.frame(now).subject_w;
+            kept.slide = motion.start(RELAX, now).map(|relax| (drawn, relax));
+            kept.width = kept.natural;
         }
         kept.frame(now)
     }
 
-    /// A key arrived: every row jumps to its end state. A box waiting to
-    /// relax keeps waiting.
+    /// The reader moved in the list (its cursor, or back to it): every box
+    /// left wider than its text eases back on the next frame, with what
+    /// that key moves.
+    pub fn relax(&mut self) {
+        for kept in self.rows.values_mut() {
+            kept.relax = kept.wide();
+        }
+    }
+
+    /// A key arrived: every row jumps to its end state. A box left wide
+    /// stays until [`RowWidths::relax`].
     pub fn settle(&mut self) {
         for kept in self.rows.values_mut() {
             kept.slide = None;
@@ -251,18 +301,6 @@ impl RowWidths {
     /// True while a row is moving and needs another frame.
     pub fn running(&self, now: Instant) -> bool {
         self.rows.values().any(|kept| kept.running(now))
-    }
-
-    /// How long until the next box is due to relax, if one is waiting.
-    pub fn next_relax(&self, now: Instant) -> Option<Duration> {
-        if !self.motion.enabled() {
-            return None;
-        }
-        self.rows
-            .values()
-            .filter(|kept| kept.waiting_to_relax())
-            .map(|kept| (kept.since + REST).saturating_duration_since(now))
-            .min()
     }
 }
 
@@ -300,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_unread_row_moves_nothing_and_cross_fades_the_weight() {
+    fn opening_an_unread_row_moves_nothing_and_fades_the_weight() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         let before = draw(&mut widths, "t1", true, t0);
@@ -377,7 +415,11 @@ mod tests {
         draw(&mut widths, "t1", false, at(t0, 32));
         let later = draw(&mut widths, "t1", false, at(t0, 5_000));
         assert_eq!(snippet_x(later), BOLD.ceil() + SUBJECT_GAP);
-        assert_eq!(widths.next_relax(at(t0, 5_000)), None);
+        // The reader moves: it lands on its text on that key's frame.
+        widths.relax();
+        let moved = draw(&mut widths, "t1", false, at(t0, 5_016));
+        assert_eq!(snippet_x(moved), REGULAR.ceil() + SUBJECT_GAP);
+        assert!(!widths.running(at(t0, 5_016)));
     }
 
     #[test]
@@ -400,42 +442,90 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_box_relaxes_after_the_row_rests() {
+    fn a_wide_box_waits_for_the_reader_to_move_then_eases_back() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         draw(&mut widths, "t1", true, t0);
-        // Opened at 16 ms: the box stays bold-wide while the row rests.
+        // Opened at 16 ms: the box stays bold-wide however long it rests.
         draw(&mut widths, "t1", false, at(t0, 16));
         let wide = BOLD.ceil() + SUBJECT_GAP;
         let narrow = REGULAR.ceil() + SUBJECT_GAP;
-        assert_eq!(snippet_x(draw(&mut widths, "t1", false, at(t0, 400))), wide);
+        for ms in [400, 700, 10_000] {
+            assert_eq!(snippet_x(draw(&mut widths, "t1", false, at(t0, ms))), wide);
+            assert!(!widths.running(at(t0, ms)), "{ms} ms");
+        }
+        // `j` (or Esc back to the list): eases from the frame that shows it.
+        widths.settle();
+        widths.relax();
+        let key = at(t0, 10_016);
+        let start = draw(&mut widths, "t1", false, key);
+        assert_eq!(snippet_x(start), wide);
+        assert!(widths.running(key));
+        // The snippet is cut for where it is going, so its right edge fades
+        // while it is carried past the end of the line.
+        assert_eq!(start.subject_room, REGULAR.ceil());
+        assert_eq!(start.edge_fade(), 1.0);
+        let mid = draw(&mut widths, "t1", false, at(key, 40));
+        assert!(snippet_x(mid) < wide && snippet_x(mid) > narrow);
+        // Ease-out: most of the way after a quarter of the time.
+        assert!(wide - snippet_x(mid) > (wide - narrow) * 0.5, "{mid:?}");
+        let done = draw(&mut widths, "t1", false, at(key, 160));
+        assert_eq!(snippet_x(done), narrow);
+        assert_eq!(done.edge_fade(), 0.0);
+        assert!(!widths.running(at(key, 160)));
+        // Once relaxed, another move changes nothing.
+        widths.relax();
         assert_eq!(
-            widths.next_relax(at(t0, 400)),
-            Some(Duration::from_millis(216))
-        );
-        // Due: eases over RELAX, never past its text.
-        let due = at(t0, 16 + 600);
-        assert_eq!(snippet_x(draw(&mut widths, "t1", false, due)), wide);
-        let mid = snippet_x(draw(&mut widths, "t1", false, at(due, 80)));
-        assert!(mid < wide && mid > narrow, "{mid}");
-        assert_eq!(
-            snippet_x(draw(&mut widths, "t1", false, at(due, 160))),
+            snippet_x(draw(&mut widths, "t1", false, at(key, 200))),
             narrow
         );
-        assert_eq!(widths.next_relax(at(due, 160)), None);
+        assert!(!widths.running(at(key, 200)));
     }
 
     #[test]
-    fn a_change_restarts_the_rest() {
+    fn a_move_leaves_rows_at_their_text_alone() {
+        let mut widths = RowWidths::default();
+        let t0 = Instant::now();
+        draw(&mut widths, "read", false, t0);
+        draw(&mut widths, "unread", true, t0);
+        widths.relax();
+        for id in ["read", "unread"] {
+            draw(&mut widths, id, id == "unread", at(t0, 16));
+        }
+        assert!(!widths.running(at(t0, 16)));
+    }
+
+    #[test]
+    fn the_weight_fades_through_without_drawing_both() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         draw(&mut widths, "t1", true, t0);
-        draw(&mut widths, "t1", false, at(t0, 16));
-        draw(&mut widths, "t1", true, at(t0, 500));
-        draw(&mut widths, "t1", false, at(t0, 550));
-        // The rest counts from the last change (550 ms): still wide at 700.
-        let frame = draw(&mut widths, "t1", false, at(t0, 700));
-        assert_eq!(snippet_x(frame), BOLD.ceil() + SUBJECT_GAP);
+        let key = at(t0, 16);
+        let first = draw(&mut widths, "t1", false, key);
+        assert_eq!((first.bold, first.regular), (1.0, 0.0));
+        // Never both weights at once, so their widths never smear: bold
+        // leaves over the first 40 ms, then regular comes.
+        let frames: Vec<(u64, RowFrame)> = (0..=120)
+            .step_by(4)
+            .map(|ms| (ms, draw(&mut widths, "t1", false, at(key, ms))))
+            .collect();
+        for (ms, frame) in &frames {
+            if *ms < 40 {
+                assert_eq!(frame.regular, 0.0, "{ms} ms: {frame:?}");
+            } else {
+                assert_eq!(frame.bold, 0.0, "{ms} ms: {frame:?}");
+            }
+        }
+        let at_ms = |wanted: u64| frames.iter().find(|(ms, _)| *ms == wanted).unwrap().1;
+        let mid_out = at_ms(20);
+        assert!(mid_out.bold > 0.0 && mid_out.bold < 1.0, "{mid_out:?}");
+        let mid_in = at_ms(80);
+        assert!(mid_in.regular > 0.0 && mid_in.regular < 1.0, "{mid_in:?}");
+        let done = at_ms(120);
+        assert_eq!((done.bold, done.regular), (0.0, 1.0));
+        // The bar cross-fades over the whole fade.
+        assert!(mid_in.unread > 0.0);
+        assert_eq!(done.unread, 0.0);
     }
 
     #[test]

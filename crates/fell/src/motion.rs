@@ -229,11 +229,6 @@ impl Motion {
         Self::new(!reduce)
     }
 
-    /// False when motion is reduced.
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// A transition starting now, or `None` when motion is reduced.
     pub fn start(&self, duration: Duration, now: Instant) -> Option<Transition> {
         self.enabled.then(|| Transition::new(now, duration))
