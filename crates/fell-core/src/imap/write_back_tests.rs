@@ -1974,6 +1974,20 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     fx.flag(&alpha, FlagChange::Unstar);
     drop(fx.store);
     fx.store = Store::open(&path).unwrap();
+    fx.server.writes.lock().unwrap().omit_fetch_flags = true;
+    for _ in 0..super::write_back::MAX_ATTEMPTS {
+        fx.make_due();
+        let report = fx.replay();
+        assert_eq!((report.sent, report.waiting), (0, 4));
+        assert_eq!(
+            fx.stores().len(),
+            1,
+            "the replacement waits for its baseline"
+        );
+        assert_eq!(fx.local_flags(&alpha), (true, false));
+    }
+    fx.server.writes.lock().unwrap().omit_fetch_flags = false;
+    fx.make_due();
     assert_eq!(fx.replay().sent, 3);
     assert_eq!(fx.stores().len(), 4, "{:?}", fx.stores());
     assert!(
@@ -1984,6 +1998,67 @@ fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
     assert_eq!(fx.local_flags(&alpha), (true, false));
     drop(fx);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_conflict_includes_flags_kept_by_an_earlier_move() {
+    let mut state = state_with(vec![
+        mailbox("INBOX", "", 7, &[(4, "Alpha")]),
+        mailbox("All Mail", "\\All", 21, &[(9, "Alpha")]),
+        mailbox("Archive", "\\Archive", 30, &[]),
+    ]);
+    state.condstore = true;
+    for copy in state
+        .mailboxes
+        .iter_mut()
+        .flat_map(|mailbox| &mut mailbox.messages)
+    {
+        copy.flags.push("\\Flagged".into());
+        copy.modseq = u64::from(copy.uid);
+    }
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.store
+        .archive_thread(&fx.account.id, &alpha, "INBOX")
+        .unwrap();
+    fx.store
+        .flag_threads(
+            &fx.account.id,
+            std::slice::from_ref(&alpha),
+            "Archive",
+            FlagChange::Star,
+        )
+        .unwrap()
+        .unwrap();
+    {
+        let mut server = fx.server.state.lock().unwrap();
+        let all_mail = &mut server.mailboxes[1].messages[0];
+        all_mail.flags.retain(|flag| flag != "\\Flagged");
+        all_mail.modseq = 15;
+    }
+
+    let report = fx.replay();
+    assert_eq!(
+        (report.sent, report.waiting, report.flags_changed),
+        (1, 0, false)
+    );
+    assert_eq!(
+        fx.stores(),
+        ["UID STORE 9 (UNCHANGEDSINCE 9) +FLAGS.SILENT (\\Flagged)"]
+    );
+    assert!(fx.on_server("INBOX").is_empty());
+    assert_eq!(fx.flags("Archive", 1), ["\\Seen", "\\Flagged"]);
+    assert_eq!(fx.local_flags(&alpha), (false, true));
+    let (seen, flagged, revision): (bool, bool, Option<Vec<u8>>) = fx
+        .store
+        .connection()
+        .query_row(
+            "SELECT seen, flagged, modseq FROM message_copies WHERE mailbox = 'Archive'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((seen, flagged, revision), (true, true, None));
 }
 
 #[test]

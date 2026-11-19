@@ -274,6 +274,7 @@ pub(crate) fn observe(
     advance(&tx, account, entry, flags, before_store, confirms_previous)?;
 
     let result = match progress {
+        Progress::Unconfirmed if live.is_some() => Progress::Unconfirmed,
         _ if !active => {
             complete(&tx, entry.id)?;
             Progress::Retired

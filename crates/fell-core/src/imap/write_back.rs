@@ -251,7 +251,7 @@ impl Pass<'_> {
                 self.settled[index] = true;
                 return Ok(false);
             }
-            Settled::Recorded => {}
+            Settled::Recorded | Settled::Recovering => {}
         }
         let reason = match session.uid_store_flag(uid, entry.kind, value, entry.flag_modseq) {
             Ok(FlagReply::Stored(None)) if session.conditional() => FetchReason::AfterStore,
@@ -581,7 +581,7 @@ impl Pass<'_> {
             outcome,
         )? {
             Settled::Stale => Err(Stop::Stale),
-            Settled::Recorded | Settled::Retired => Ok(()),
+            Settled::Recorded | Settled::Recovering | Settled::Retired => Ok(()),
         }
     }
 
@@ -661,9 +661,9 @@ impl Pass<'_> {
         let entries = self.entries;
         let entry = &entries[index];
         let last = entry.attempts + 1 >= MAX_ATTEMPTS;
-        // A refusal is recorded even on the last try: if undo reversed the
-        // row, it is retired there without a notice.
-        if last && !refused {
+        // A MOVE refusal can need to retire a queued undo. A flag retry can
+        // still be recovering an earlier STORE for a newer edit.
+        if last && !refused && entry.kind == OutboxKind::Move {
             return self.drop_row(index, reason, message);
         }
         let wait = BACKOFF_SECS[(entry.attempts as usize).min(BACKOFF_SECS.len() - 1)];
@@ -695,7 +695,7 @@ impl Pass<'_> {
                 }
             }
             Settled::Recorded if last => return self.drop_row(index, reason, message),
-            Settled::Recorded => {}
+            Settled::Recorded | Settled::Recovering => {}
         }
         self.held.insert(entry.message_id.clone());
         Ok(())

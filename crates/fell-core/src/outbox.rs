@@ -1065,6 +1065,9 @@ pub(crate) enum Outcome<'a> {
 pub(crate) enum Settled {
     /// Recorded as asked.
     Recorded,
+    /// A superseded flag STORE may already have landed. Its replacement
+    /// waits for a complete observation of that attempt.
+    Recovering,
     /// A superseded flag or a refused move that undo had already reversed.
     /// Neither needs another attempt or a notice.
     Retired,
@@ -1092,22 +1095,28 @@ pub(crate) fn settle(
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let now = now_unix();
-    let live: Option<(i64, bool)> = tx
+    let live: Option<(i64, bool, bool)> = tx
         .query_row(
-            "SELECT generation, flag_superseded FROM server_outbox
+            "SELECT generation, flag_superseded, sent FROM server_outbox
              WHERE id = ?1 AND (kind = 'move' OR state = 'pending')",
             params![entry.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     let current = enabled(&tx, account_id)?
         .then(|| generation(&tx, account_id))
         .transpose()?;
-    if Some(live.map_or(entry.generation, |(generation, _)| generation)) != current {
+    if Some(live.map_or(entry.generation, |(generation, _, _)| generation)) != current {
         tx.commit()?;
         return Ok(Settled::Stale);
     }
-    if entry.kind != OutboxKind::Move && live.is_none_or(|(_, superseded)| superseded) {
+    let recovering = entry.kind != OutboxKind::Move
+        && matches!(live, Some((_, true, true)))
+        && matches!(outcome, Outcome::Retry { refused: false, .. });
+    if entry.kind != OutboxKind::Move
+        && live.is_none_or(|(_, superseded, _)| superseded)
+        && !recovering
+    {
         tx.execute(
             "UPDATE server_outbox SET state = 'dropped', error = 'superseded', settled_unix = ?2
              WHERE id = ?1 AND state = 'pending'",
@@ -1138,7 +1147,11 @@ pub(crate) fn settle(
                 params![entry.id, i64::from(counts), retry_unix, error, refused],
             )?;
             tx.commit()?;
-            return Ok(Settled::Recorded);
+            return Ok(if recovering {
+                Settled::Recovering
+            } else {
+                Settled::Recorded
+            });
         }
         Outcome::Dropped { error } => {
             tx.execute(
@@ -1290,6 +1303,15 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
         uidvalidity,
         uid
     ];
+    let (seen, flagged): (Option<bool>, Option<bool>) = conn
+        .query_row(
+            "SELECT seen, flagged FROM message_copies
+             WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+            copy,
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or_default();
     conn.execute(
         "INSERT OR IGNORE INTO copy_orphans (account_id, message_id, folder)
          SELECT account_id, message_id, folder FROM message_copies
@@ -1320,9 +1342,10 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
     {
         return Ok(());
     }
+    // MOVE keeps the flags. The destination's MODSEQ comes from its mailbox.
     conn.execute(
-        "INSERT INTO message_copies (account_id, mailbox, uidvalidity, uid, message_id, folder)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO message_copies (account_id, mailbox, uidvalidity, uid, message_id, folder, seen, flagged)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(account_id, mailbox, uidvalidity, uid) DO NOTHING",
         params![
             account_id.as_str(),
@@ -1331,6 +1354,8 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             placed_uid,
             sent.message_id,
             crate::imap::folder_name(target),
+            seen,
+            flagged,
         ],
     )?;
     flags::follow_move(conn, account_id, sent)?;
