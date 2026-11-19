@@ -1,9 +1,9 @@
 //! Local archive, label, delete, and undo against the SQLite mailbox.
 //!
 //! These calls update rows the UI already reads. There is no socket, no IMAP
-//! session, and no send. A successful call stores the previous folders and
+//! session, and no send. Reversible calls store the previous folders and
 //! labels on that account's undo stack. [`Store::undo`] restores the latest
-//! entry and leaves every other account as it was.
+//! entry that still has messages to restore.
 //!
 //! Archive, delete, and spam change one folder on the messages in a thread
 //! (or in every thread of a selection). Any other folder on the same row,
@@ -42,7 +42,7 @@ use crate::{Error, Result};
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
 
-/// What [`Store::undo`] says when the latest action is a permanent delete.
+/// Legacy error text for permanent-delete undo.
 pub const UNDO_PURGE: &str = "a permanent delete can't be undone";
 
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
@@ -444,10 +444,8 @@ impl Store {
     /// stays in its Trash, and the tombstone this records keeps a later sync
     /// from bringing it back here.
     ///
-    /// This is never undone: [`Store::undo`] stops at it with
-    /// [`UNDO_PURGE`], and nothing recorded before it can be undone either.
-    /// The entry is recorded as a delete from Trash is, so a sync treats the
-    /// removed rows the same way.
+    /// Undo skips the purge and any earlier changes to the messages it
+    /// affected. Other messages in an earlier action can still be restored.
     pub fn purge_threads(
         &self,
         account_id: &AccountId,
@@ -471,7 +469,7 @@ impl Store {
         })
     }
 
-    /// Restore the latest archive, move, label, or delete on this account.
+    /// Restore the latest reversible action with messages on this account.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
@@ -479,13 +477,7 @@ impl Store {
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        if action.kind == ActionKind::Purge {
-            return Err(Error::Action(UNDO_PURGE.into()));
-        }
         let rows = load_snapshots(&tx, action.id)?;
-        if rows.is_empty() {
-            return Err(Error::Action("action has no messages".into()));
-        }
         for row in &rows {
             restore_row(&tx, account_id, row)?;
         }
@@ -706,8 +698,15 @@ fn record_and_apply(
     )?;
     let id = conn.last_insert_rowid();
     for plan in plans {
-        insert_snapshot(conn, id, account_id, plan)?;
+        if kind != ActionKind::Purge {
+            insert_snapshot(conn, id, account_id, plan)?;
+        }
         record_tombstones(conn, id, account_id, plan)?;
+    }
+    if kind == ActionKind::Purge {
+        finish_purge(conn, id, account_id)?;
+    }
+    for plan in plans {
         apply_plan(conn, account_id, plan)?;
     }
     Ok(LocalAction {
@@ -717,11 +716,98 @@ fn record_and_apply(
     })
 }
 
+/// Keep previous folder removals in force for each message and its aliases,
+/// even when an earlier mixed action is undone. Discard their older snapshots.
+fn finish_purge(conn: &Connection, id: i64, account_id: &AccountId) -> Result<()> {
+    conn.execute(
+        "WITH purged AS (
+             SELECT DISTINCT message_id FROM local_folder_tombstones WHERE action_id = ?1
+         ), identities(canonical_id, message_id) AS (
+             SELECT message_id, message_id FROM purged
+             UNION
+             SELECT p.message_id, a.message_id FROM purged p
+             JOIN message_aliases a ON a.canonical_message_id = p.message_id AND a.account_id = ?2
+             UNION
+             SELECT p.message_id, a.message_id FROM purged p
+             JOIN local_action_aliases a ON a.canonical_message_id = p.message_id AND a.action_id = ?1
+         )
+         INSERT OR IGNORE INTO local_folder_tombstones (action_id, account_id, message_id, folder)
+         SELECT ?1, ?2, target.message_id, t.folder
+         FROM identities target
+         JOIN identities source ON source.canonical_id = target.canonical_id
+         JOIN local_folder_tombstones t ON t.account_id = ?2 AND t.message_id = source.message_id
+         WHERE t.action_id <= ?1",
+        params![id, account_id.as_str()],
+    )?;
+    conn.execute(
+        "DELETE FROM local_folder_tombstones
+         WHERE action_id IN (
+             SELECT id FROM local_actions WHERE account_id = ?2 AND id < ?1 AND kind != 'purge'
+         ) AND message_id IN (
+             SELECT message_id FROM local_folder_tombstones WHERE action_id = ?1
+         )",
+        params![id, account_id.as_str()],
+    )?;
+    let purged_ids = "SELECT message_id FROM local_folder_tombstones WHERE action_id = ?1";
+    for table in [
+        "local_action_messages",
+        "local_action_bodies",
+        "local_action_parts",
+        "local_action_aliases",
+    ] {
+        let by_canonical = if table == "local_action_aliases" {
+            format!("OR canonical_message_id IN ({purged_ids})")
+        } else {
+            String::new()
+        };
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE action_id IN (SELECT id FROM local_actions WHERE account_id = ?2 AND id <= ?1)
+                   AND (message_id IN ({purged_ids}) {by_canonical})"
+            ),
+            params![id, account_id.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Earlier builds saved undo data even for permanent deletes. Clean it up
+/// on open and keep any aliases they dropped with the message tombstoned.
+pub(crate) fn migrate_purge_snapshots(conn: &Connection) -> Result<()> {
+    if !action_table_exists(conn, "local_action_messages")? {
+        return Ok(());
+    }
+    let legacy = {
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id FROM local_actions a
+             WHERE kind = 'purge'
+               AND EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
+             ORDER BY id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, AccountId(row.get(1)?)))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let tx = crate::store::begin_immediate(conn)?;
+    ensure_action_schema(&tx)?;
+    for (id, account_id) in legacy {
+        finish_purge(&tx, id, &account_id)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Option<LocalAction>> {
     let row: Option<(i64, String, String)> = conn
         .query_row(
-            "SELECT id, kind, summary FROM local_actions
-             WHERE account_id = ?1 AND undone = 0
+            "SELECT id, kind, summary FROM local_actions a
+             WHERE account_id = ?1 AND undone = 0 AND kind != 'purge'
+               AND EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1521,15 +1607,7 @@ fn tombstoned_folders(
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<Vec<String>> {
-    let present: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master
-             WHERE type = 'table' AND name = 'local_folder_tombstones'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if present.is_none() {
+    if !action_table_exists(conn, "local_folder_tombstones")? {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
@@ -1542,6 +1620,36 @@ fn tombstoned_folders(
         out.push(row?);
     }
     Ok(out)
+}
+
+/// A copy of a locally purged row can still be tracked by its server UID.
+pub(crate) fn folder_was_purged(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    folder: &str,
+) -> Result<bool> {
+    if !action_table_exists(conn, "local_folder_tombstones")? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM local_folder_tombstones t
+             JOIN local_actions a ON a.id = t.action_id
+             WHERE t.account_id = ?1 AND t.message_id = ?2
+               AND t.folder = ?3 COLLATE NOCASE AND a.kind = 'purge'
+         )",
+        params![account_id.as_str(), message_id, folder],
+        |row| row.get(0),
+    )?)
+}
+
+fn action_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
 }
 
 fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
@@ -2418,6 +2526,8 @@ mod tests {
             folders_of(&store, &first),
             vec![vec![FOLDER_SENT.to_string()]]
         );
+        assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
+        assert_eq!(folders_of(&store, &first), vec![vec![FOLDER_SENT]]);
     }
 
     #[test]
@@ -2425,7 +2535,13 @@ mod tests {
         let store = open(&[("a1", "a@x")]);
         let (first, second) = two_in_inbox(&store);
         let both = [first.clone(), second.clone()];
-        let trashed = store
+        let unrelated = store
+            .upsert_message(&sample("a1", "separate@x", "Separate", "separate body"))
+            .unwrap();
+        let older_archive = store
+            .archive_thread(&account("a1"), &unrelated, FOLDER_INBOX)
+            .unwrap();
+        store
             .delete_threads(&account("a1"), &both, FOLDER_INBOX)
             .unwrap();
         assert_eq!(
@@ -2450,31 +2566,119 @@ mod tests {
                 .is_empty()
         );
 
-        // Undo stops at it: neither it nor the delete before it comes back.
-        assert_eq!(text(store.undo(&account("a1"))), UNDO_PURGE);
-        assert!(messages(&store, "a1", &second).is_empty());
-        assert_ne!(trashed.id, purged.id);
-
-        // A later action still undoes, then undo stops at the purge again.
         let archived = store
             .archive_thread(&account("a1"), &first, FOLDER_SENT)
             .unwrap();
         assert_eq!(store.undo(&account("a1")).unwrap().id, archived.id);
-        assert_eq!(text(store.undo(&account("a1"))), UNDO_PURGE);
+        assert_eq!(store.undo(&account("a1")).unwrap().id, older_archive.id);
+        assert_eq!(folders_of(&store, &unrelated), vec![vec![FOLDER_INBOX]]);
+        assert!(messages(&store, "a1", &second).is_empty());
+        assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
     }
 
     #[test]
     fn a_sync_does_not_bring_back_a_permanently_deleted_message() {
         let store = open(&[("a1", "a@x")]);
         let mut gone = sample("a1", "gone@x", "Gone", "gone body");
-        gone.folders = vec![FOLDER_TRASH.into()];
+        gone.bcc = vec![Address {
+            name: None,
+            email: "hidden@x".into(),
+        }];
+        gone.parts = Some(html("gone html"));
         let thread = store.upsert_message(&gone).unwrap();
-        store
+        let label = store
+            .label_thread(&account("a1"), &thread, LabelChange::Add("work".into()))
+            .unwrap();
+        let deleted = store
+            .delete_thread(&account("a1"), &thread, FOLDER_INBOX)
+            .unwrap();
+        let purged = store
             .purge_threads(&account("a1"), std::slice::from_ref(&thread), FOLDER_TRASH)
             .unwrap();
-        // The server still has its copy in Trash: write-back never expunges.
+        // The server may still be in Inbox (write-back is off) or in Trash.
+        apply(&store, gone.clone());
+        gone.folders = vec![FOLDER_TRASH.into()];
         apply(&store, gone);
         assert!(messages(&store, "a1", &thread).is_empty());
+        assert_eq!(tombstones(&store, "gone@x"), 2);
+        for action in [label, deleted, purged] {
+            assert_eq!(saved_copies_for_action(&store, action.id), 0);
+        }
+        assert_eq!(saved_copies(&store, "gone body"), 0);
+        assert_eq!(saved_copies(&store, "hidden@x"), 0);
+        let saved_html: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_action_bodies WHERE message_id = 'gone@x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_html, 0);
+        assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
+    }
+
+    #[test]
+    fn reopening_cleans_up_legacy_purge_snapshots_and_suppresses_their_aliases() {
+        let folder = std::env::temp_dir().join(format!(
+            "fell-legacy-purge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("mailbox.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_account(&Account {
+                id: account("a1"),
+                display_name: "Test".into(),
+                email: "a@x".into(),
+                backend_kind: BackendKind::Bridge,
+            })
+            .unwrap();
+        let mut gone = sample("a1", "gone@x", "Gone", "legacy body");
+        gone.parts = Some(html("legacy html"));
+        let thread = store.upsert_message(&gone).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO message_aliases (account_id, message_id, canonical_message_id)
+             VALUES ('a1', 'alias@x', 'gone@x')",
+                [],
+            )
+            .unwrap();
+        // Legacy purge wrote the same data as a reversible expunge.
+        let purged = expunge(&store, &thread);
+        store
+            .connection()
+            .execute(
+                "UPDATE local_actions SET kind = 'purge' WHERE id = ?1",
+                [purged.id],
+            )
+            .unwrap();
+        assert_eq!(saved_copies(&store, "legacy body"), 2);
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(saved_copies(&store, "legacy body"), 0);
+        assert_eq!(saved_copies_for_action(&store, purged.id), 0);
+        let saved_html: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM local_action_bodies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(saved_html, 0);
+        assert_eq!(tombstones(&store, "gone@x"), 2);
+        gone.headers.message_id = MessageId::new("alias@x");
+        apply(&store, gone.clone());
+        gone.folders = vec![FOLDER_TRASH.into()];
+        apply(&store, gone);
+        assert!(messages(&store, "a1", &thread).is_empty());
+        assert!(!message_row_exists(store.connection(), &account("a1"), "alias@x").unwrap());
+        assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
+        drop(store);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

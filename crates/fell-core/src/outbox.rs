@@ -440,13 +440,22 @@ pub(crate) fn queue_moves(
 
 /// Undo of `action_id`, in the undo transaction: rows not sent yet go, and
 /// each row of this write-back generation the server applied, or may have,
-/// gets its reverse move. With write-back off, undo is local.
+/// gets its reverse move. Only messages whose snapshots remain are undone.
+/// An earlier move of a purged message still runs forward, into server Trash.
+/// With write-back off, undo is local.
 pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
     ensure_schema(conn)?;
+    let undoable = "EXISTS (
+        SELECT 1 FROM local_action_messages s
+        WHERE s.action_id = server_outbox.action_id AND s.message_id = server_outbox.message_id
+    )";
     // A sent row stays: its MOVE may have reached the server.
     conn.execute(
-        "DELETE FROM server_outbox
-         WHERE account_id = ?1 AND action_id = ?2 AND state = 'pending' AND sent = 0",
+        &format!(
+            "DELETE FROM server_outbox
+             WHERE account_id = ?1 AND action_id = ?2 AND state = 'pending' AND sent = 0
+               AND {undoable}"
+        ),
         params![account_id.as_str(), action_id],
     )?;
     if !enabled(conn, account_id)? {
@@ -461,6 +470,7 @@ pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: 
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND action_id = {action_id}
                AND state IN ('done', 'pending') AND generation = {generation}
+               AND {undoable}
              ORDER BY id"
         ),
         account_id,
@@ -1227,7 +1237,16 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             |row| row.get(0),
         )
         .optional()?;
-    if row_exists.is_none() {
+    // A queued chain can still carry a purged message to server Trash. Keep
+    // the placed UID for the next move even when the local row is gone.
+    if row_exists.is_none()
+        && !crate::actions::folder_was_purged(
+            conn,
+            account_id,
+            &sent.message_id,
+            &sent.target_folder,
+        )?
+    {
         return Ok(());
     }
     conn.execute(

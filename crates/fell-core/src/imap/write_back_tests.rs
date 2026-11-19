@@ -661,28 +661,79 @@ fn delete_and_spam_of_a_selection_are_server_moves_and_undo_reverses_them() {
 
 #[test]
 fn permanent_delete_never_reaches_the_server() {
-    let fx = with_trash_and_junk();
+    for state in ["queued", "sent", "settled"] {
+        let fx = with_trash_and_junk();
+        let alpha = fx.thread("INBOX", "Alpha");
+        let bravo = fx.thread("INBOX", "Bravo");
+        let batch = fx
+            .store
+            .delete_threads(&fx.account.id, &[alpha.clone(), bravo], "INBOX")
+            .unwrap();
+        if state == "sent" {
+            fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
+            assert!(fx.replay().interrupted.is_some());
+        } else if state == "settled" {
+            assert_eq!(fx.replay().sent, 2);
+        }
+        let before_purge = fx.store.outbox(&fx.account.id).unwrap();
+
+        fx.store
+            .purge_threads(&fx.account.id, &[alpha], "Deleted Items")
+            .unwrap();
+        assert_eq!(fx.store.outbox(&fx.account.id).unwrap(), before_purge);
+        assert_eq!(fx.store.undo(&fx.account.id).unwrap().id, batch.id);
+        assert_eq!(fx.subjects("INBOX"), vec!["Bravo"], "{state}");
+        assert!(fx.subjects("Deleted Items").is_empty(), "{state}");
+
+        fx.clear_commands();
+        let report = fx.replay();
+        assert_eq!(report.waiting, 0, "{state}: {report:?}");
+        fx.sync();
+        assert!(
+            fx.writes()
+                .iter()
+                .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE")),
+            "{state}"
+        );
+        assert_eq!(
+            fx.on_server("Deleted Items"),
+            vec![(1, "Alpha".to_string())],
+            "{state}"
+        );
+        assert_eq!(fx.subjects("INBOX"), vec!["Bravo"], "{state}");
+        assert!(fx.subjects("Deleted Items").is_empty(), "{state}");
+    }
+}
+
+#[test]
+fn queued_moves_can_still_carry_a_purged_message_to_server_trash() {
+    let fx = Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha")]),
+            mailbox("Archive", "\\Archive", 30, &[]),
+            mailbox("Deleted Items", "\\Trash", 50, &[]),
+        ]),
+    );
     let alpha = fx.thread("INBOX", "Alpha");
     let one = std::slice::from_ref(&alpha);
     fx.store
-        .delete_threads(&fx.account.id, one, "INBOX")
+        .archive_thread(&fx.account.id, &alpha, "INBOX")
         .unwrap();
-    assert_eq!(fx.replay().sent, 1);
-    fx.sync();
-    let queued = fx.store.outbox(&fx.account.id).unwrap().len();
-
+    fx.store
+        .delete_threads(&fx.account.id, one, "Archive")
+        .unwrap();
     fx.store
         .purge_threads(&fx.account.id, one, "Deleted Items")
         .unwrap();
-    assert_eq!(fx.store.outbox(&fx.account.id).unwrap().len(), queued);
-    fx.clear_commands();
-    fx.replay();
+    assert_eq!(fx.replay().sent, 2);
     fx.sync();
-    assert!(fx.writes().iter().all(|command| !command.contains("MOVE")
-        && !command.contains("STORE")
-        && !command.contains("EXPUNGE")));
-    // The server keeps its copy in its Trash; Fell does not show it again.
-    assert_eq!(fx.on_server("Deleted Items").len(), 1);
+    assert!(fx.on_server("INBOX").is_empty());
+    assert!(fx.on_server("Archive").is_empty());
+    assert_eq!(
+        fx.on_server("Deleted Items"),
+        vec![(1, "Alpha".to_string())]
+    );
     assert!(fx.subjects("Deleted Items").is_empty());
 }
 
