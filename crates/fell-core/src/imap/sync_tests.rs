@@ -3357,7 +3357,8 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
         .conn
         .execute_batch(
             "DELETE FROM message_bodies;
-             INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+             INSERT INTO body_backfill (account_id, message_id)
+             SELECT account_id, message_id FROM messages;",
         )
         .unwrap();
     {
@@ -3445,7 +3446,7 @@ fn a_new_uidvalidity_records_old_copies_without_bodies() {
         .conn
         .execute_batch(
             "DELETE FROM message_bodies WHERE message_id = 'smile@x';
-             INSERT INTO body_backfill VALUES ('a1', 'smile@x');",
+             INSERT INTO body_backfill (account_id, message_id) VALUES ('a1', 'smile@x');",
         )
         .unwrap();
     mailbox(&mut server.state.lock().expect("state"), "&Jjo-").uidvalidity = 8;
@@ -3476,7 +3477,8 @@ fn synced_without_parts(server: &TestServer, acct: &Account, backend: &ImapBacke
         .conn
         .execute_batch(
             "DELETE FROM message_bodies;
-             INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+             INSERT INTO body_backfill (account_id, message_id)
+             SELECT account_id, message_id FROM messages;",
         )
         .unwrap();
     server.state.lock().expect("state").commands.clear();

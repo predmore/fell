@@ -151,6 +151,14 @@ pub struct MimePart {
     pub nested: bool,
 }
 
+impl MimePart {
+    pub(crate) fn cid_image_id(&self) -> Option<&str> {
+        self.content_id.as_deref().filter(|_| {
+            self.mime_type.starts_with("image/") && self.disposition != Disposition::Attachment
+        })
+    }
+}
+
 /// What a [`MimePart`] is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartRole {
