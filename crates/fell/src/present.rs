@@ -49,13 +49,52 @@ pub struct ConvMessage {
     pub folders: String,
     pub date_unix: i64,
     pub snippet: String,
+    /// The stored text: what a message with no HTML part paints.
     pub body: RenderedBody,
+    /// The message's HTML, once read from the store and prepared.
+    pub rich: Rich,
     pub expanded: bool,
     /// Who else got the message. `None` when nothing is stored.
     pub recipients: Option<RecipientLine>,
     /// A draft's "In reply to" or "Forwarding" line, as its compose window
     /// says it. `None` for mail and for a new message.
     pub context: Option<String>,
+}
+
+/// What an expanded message paints for its body.
+#[derive(Clone)]
+pub enum Rich {
+    /// No HTML part is stored: paint [`ConvMessage::body`].
+    Plain,
+    /// No parts are stored at all yet (mail synced before they were kept).
+    /// Paints the stored text; opening the message asks sync for the parts.
+    Missing,
+    /// An HTML part is stored and is being read and prepared off the UI
+    /// thread. The body's space is reserved until it is ready.
+    Pending,
+    Html(std::sync::Arc<crate::mail_body::HtmlBody>),
+}
+
+impl PartialEq for Rich {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Html(a), Self::Html(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for Rich {}
+
+impl std::fmt::Debug for Rich {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Plain => "Plain",
+            Self::Missing => "Missing",
+            Self::Pending => "Pending",
+            Self::Html(_) => "Html",
+        })
+    }
 }
 
 /// Who else got a message, for the lines under an expanded message's sender.
@@ -168,7 +207,7 @@ fn label_of(label: &str) -> &'static str {
 
 /// The closed line that fits: the most whole people (up to `line.budget`)
 /// for which `fits(names, tail)` holds, the tail that goes with them
-/// (" +N more · bcc X · q"), and how many are left out. Never drops a
+/// (" +N more · bcc X"), and how many are left out. Never drops a
 /// name partway, so the count always matches what is on screen.
 pub fn fit_recipients(
     line: &RecipientLine,
@@ -188,7 +227,7 @@ pub fn fit_recipients(
         } else if bcc.is_empty() {
             String::new()
         } else {
-            format!("{bcc} · q")
+            bcc
         }
     };
     let most = line.budget.min(total);
@@ -684,6 +723,7 @@ pub fn conversation(
                 date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
                 body: render_stored_body(message.body_text.as_deref(), &message.snippet),
+                rich: Rich::Plain,
                 expanded: message.unread || index == last,
                 recipients: recipient_line(message, me),
                 context: None,
@@ -1873,9 +1913,10 @@ mod tests {
         let width = |text: &str| text.chars().count();
         let (text, tail, hidden) =
             fit_recipients(&line, |names, tail| width(names) + width(tail) <= 40);
-        assert_eq!(text, "to Ada · cc Maya");
-        assert_eq!(tail, " +5 more · bcc Riya · q");
-        assert_eq!(hidden, 5);
+        // No key hint in the tail leaves room for one more name.
+        assert_eq!(text, "to Ada · cc Maya, Sam");
+        assert_eq!(tail, " +4 more · bcc Riya");
+        assert_eq!(hidden, 4);
         // Nothing fits: the first person still shows, and the count is right.
         let (text, _, hidden) = fit_recipients(&line, |_, _| false);
         assert_eq!(text, "to Ada");

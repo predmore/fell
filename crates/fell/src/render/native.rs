@@ -1,11 +1,14 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use fell_render::{Block, ImageSource, Inline, ListItem, StyledDocument};
+use fell_render::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, RenderImage, SharedString,
-    StyledText, UnderlineStyle, div, img, prelude::*, px,
+    AnyElement, App, Bounds, Element, ElementId, FontStyle, FontWeight, GlobalElementId,
+    HighlightStyle, InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, SharedString,
+    StyledText, TextAlign, UnderlineStyle, Window, div, img, prelude::*, px,
 };
 use image::Frame;
 use smallvec::SmallVec;
@@ -86,6 +89,12 @@ impl ImageGallery {
         Some((image, cached.width, cached.height))
     }
 
+    /// Every decoded texture, so an owner that cannot take `&mut` (a shared
+    /// cache entry) can still remove them from the sprite atlas.
+    pub fn images(&self) -> impl Iterator<Item = &Arc<RenderImage>> {
+        self.held.iter()
+    }
+
     /// Remove every cached texture from the sprite atlas.
     pub fn release(&mut self, cx: &mut gpui::App) {
         for image in self.held.drain(..) {
@@ -128,8 +137,10 @@ fn walk_sources(blocks: &[Block], visit: &mut impl FnMut(&ImageSource)) {
                     walk_sources(&item.blocks, visit);
                 }
             }
-            Block::Quote { blocks } => walk_sources(blocks, visit),
-            Block::Table { header, rows } => {
+            Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+                walk_sources(blocks, visit)
+            }
+            Block::Table { header, rows, .. } => {
                 for cell in header {
                     walk_sources(cell, visit);
                 }
@@ -150,6 +161,7 @@ fn walk_inlines_sources(inlines: &[Inline], visit: &mut impl FnMut(&ImageSource)
         match inline {
             Inline::Emphasis(children)
             | Inline::Strong(children)
+            | Inline::Strike(children)
             | Inline::Link { children, .. } => {
                 walk_inlines_sources(children, visit);
             }
@@ -174,44 +186,89 @@ pub fn document_column(
     allow_remote: bool,
     gallery: &ImageGallery,
 ) -> gpui::Div {
-    // A short letter should reach the lower part of the pane. The gaps and
-    // line height do that without adding a fake closing rule.
-    let mut column = div()
-        .flex()
-        .flex_col()
-        .gap(px(BLOCK_GAP))
-        .line_height(px(22.));
     if document.is_empty() {
-        return column.child(
+        return blocks_column(&[], palette, allow_remote, gallery).child(
             div()
                 .text_color(paint(palette.dimmed))
                 .child("This message has no body."),
         );
     }
-    for (start, end) in column_runs(&document.blocks, allow_remote, gallery) {
-        column = if end - start == 2 {
-            column.child(sketch_with_caption(
-                &document.blocks[start],
-                &document.blocks[start + 1],
+    blocks_column(&document.blocks, palette, allow_remote, gallery)
+}
+
+/// A run of a document's blocks, as [`document_column`] paints them. The
+/// conversation paints a message's sections one at a time through this, so
+/// folded history keeps the same type and rhythm when it opens.
+pub fn blocks_column(
+    blocks: &[Block],
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+) -> gpui::Div {
+    blocks_column_spaced(blocks, palette, allow_remote, gallery, BLOCK_GAP)
+}
+
+/// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
+/// opened history sits tighter than the sender's own paragraphs.
+pub fn blocks_column_spaced(
+    blocks: &[Block],
+    palette: &Palette,
+    allow_remote: bool,
+    gallery: &ImageGallery,
+    gap: f32,
+) -> gpui::Div {
+    // A short letter should reach the lower part of the pane. The gaps and
+    // line height do that without adding a fake closing rule.
+    let mut column = div().flex().flex_col().line_height(px(22.));
+    let mut previous: Option<&Block> = None;
+    for (start, end) in column_runs(blocks, allow_remote, gallery) {
+        let child = if end - start == 2 {
+            sketch_with_caption(
+                &blocks[start],
+                &blocks[start + 1],
                 palette,
                 allow_remote,
                 gallery,
-            ))
+            )
         } else {
-            column.child(render_block(
-                &document.blocks[start],
-                palette,
-                allow_remote,
-                gallery,
-            ))
+            render_block(&blocks[start], palette, allow_remote, gallery)
         };
+        let gap = previous.map_or(0., |above| {
+            // Blocked-image lines stacked one under another read as a
+            // list of what is missing, a line apart.
+            if blocked_line(above, allow_remote, gallery)
+                && blocked_line(&blocks[start], allow_remote, gallery)
+            {
+                STACKED_LINE_GAP
+            } else {
+                gap_between(above, &blocks[start]) * gap
+            }
+        });
+        column = column.child(div().mt(px(gap)).child(child));
+        previous = Some(&blocks[end - 1]);
     }
     column
 }
 
-/// A decoded sketch and the gray placeholder under it share one column
-/// child. The column's own gap then stays the full paragraph gap before
-/// whatever follows, including a quote.
+/// Between two stacked blocked-image lines: the line height does the rest.
+const STACKED_LINE_GAP: f32 = 2.;
+
+/// A block that paints as one dimmed `Image blocked` line.
+fn blocked_line(block: &Block, allow_remote: bool, gallery: &ImageGallery) -> bool {
+    placeholder_caption(block, allow_remote, gallery)
+        || matches!(block, Block::Paragraph { inlines } if blocked_image_line(inlines, allow_remote).is_some())
+}
+
+/// Space above `block`, as a share of the column's gap. A heading sits
+/// closer to the text it introduces than to the text before it.
+fn gap_between(above: &Block, block: &Block) -> f32 {
+    match (above, block) {
+        (_, Block::Heading { .. }) => 1.5,
+        (Block::Heading { .. }, _) => 0.5,
+        _ => 1.0,
+    }
+}
+
 fn sketch_with_caption(
     sketch: &Block,
     caption: &Block,
@@ -320,6 +377,35 @@ fn render_block(
             .gap_2()
             .children(render_inlines(inlines, palette, allow_remote, gallery))
             .into_any_element(),
+        Block::Small { blocks } => {
+            let quiet = Palette {
+                foreground: palette.dimmed,
+                ..*palette
+            };
+            div()
+                .text_size(px(FINE_PRINT_PX))
+                .line_height(px(18.))
+                .text_color(paint(palette.dimmed))
+                .flex()
+                .flex_col()
+                .gap(px(BLOCK_GAP / 2.))
+                .children(
+                    blocks
+                        .iter()
+                        .map(|child| render_block(child, &quiet, allow_remote, gallery)),
+                )
+                .into_any_element()
+        }
+        Block::ReplyHeader { blocks } => div()
+            .flex()
+            .flex_col()
+            .gap(px(BLOCK_GAP))
+            .children(
+                blocks
+                    .iter()
+                    .map(|child| render_block(child, palette, allow_remote, gallery)),
+            )
+            .into_any_element(),
         Block::Quote { blocks } => div()
             .border_l(px(3.))
             .border_color(paint(palette.quote))
@@ -343,14 +429,18 @@ fn render_block(
             }))
             .into_any_element(),
         Block::Code { text } => div()
-            .font_family("Liberation Mono")
+            .font_family(CODE_FONT)
             .text_sm()
             .bg(paint(palette.code_bg))
             .p_3()
             .rounded(px(4.))
-            .child(text.clone())
+            .child(PreText::new(text))
             .into_any_element(),
-        Block::Table { header, rows } => render_table(header, rows, palette, allow_remote, gallery),
+        Block::Table {
+            header,
+            rows,
+            align,
+        } => render_table(header, rows, align, palette, allow_remote, gallery),
         Block::Image { source, alt } => image_el(source, alt, palette, allow_remote, gallery),
         Block::ThematicBreak => div()
             .h(px(1.))
@@ -373,9 +463,11 @@ fn list_item(
     } else {
         "•".to_string()
     };
+    // Top-aligned with the same line height, so the marker sits on the
+    // first line's baseline however many lines the item wraps to.
     div()
         .flex()
-        .items_center()
+        .items_start()
         .child(
             div()
                 .w(px(19.))
@@ -396,57 +488,387 @@ fn list_item(
 fn render_table(
     header: &[Vec<Block>],
     rows: &[Vec<Vec<Block>>],
+    align: &[Align],
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
 ) -> AnyElement {
-    let mut column = div()
-        .flex()
-        .flex_col()
-        .border(px(1.))
-        .border_color(paint(palette.border))
-        .rounded(px(4.));
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .chain(std::iter::once(header.len()))
+        .max()
+        .unwrap_or(0);
+    let cell = |cell: Option<&Vec<Block>>| -> (AnyElement, Vec<String>, bool) {
+        let blocks = cell.map(Vec::as_slice).unwrap_or_default();
+        let mut lines = Vec::new();
+        push_cell_lines(blocks, &mut lines);
+        let bold = blocks_are_bold(blocks);
+        let element = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(
+                blocks
+                    .iter()
+                    .map(|block| render_block(block, palette, allow_remote, gallery)),
+            )
+            .into_any_element();
+        (element, lines, bold)
+    };
+    let mut table_rows = Vec::new();
     if !header.is_empty() {
-        column = column.child(table_row(header, palette, allow_remote, gallery, true));
+        table_rows.push(TableRow {
+            header: true,
+            cells: (0..columns)
+                .map(|column| cell(header.get(column)))
+                .collect(),
+        });
     }
     for row in rows {
-        column = column.child(table_row(row, palette, allow_remote, gallery, false));
+        table_rows.push(TableRow {
+            header: false,
+            cells: (0..columns).map(|column| cell(row.get(column))).collect(),
+        });
     }
-    column.into_any_element()
+    TableElement {
+        rows: table_rows,
+        align: align.to_vec(),
+        palette: *palette,
+        inner: None,
+    }
+    .into_any_element()
 }
 
-fn table_row(
-    cells: &[Vec<Block>],
-    palette: &Palette,
-    allow_remote: bool,
-    gallery: &ImageGallery,
+struct TableRow {
     header: bool,
-) -> AnyElement {
-    let mut row = div()
-        .flex()
-        .border_b(px(1.))
-        .border_color(paint(palette.border));
-    if header {
-        row = row.font_weight(FontWeight::BOLD).bg(paint(palette.surface));
+    /// Each cell's painted content, its lines of text to measure, and
+    /// whether any of it is bold.
+    cells: Vec<(AnyElement, Vec<String>, bool)>,
+}
+
+/// A table whose columns are sized from their text as the body face sets
+/// it. The widths need the window's text system, so the rows are built
+/// when the element is laid out.
+struct TableElement {
+    rows: Vec<TableRow>,
+    align: Vec<Align>,
+    palette: Palette,
+    inner: Option<AnyElement>,
+}
+
+impl IntoElement for TableElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
-    // The same block renderer as the rest of the message, so a list keeps its
-    // bullet or number and a quote keeps its rule.
-    row.children(cells.iter().map(|cell| {
-        div().flex_1().p_2().flex().flex_col().gap_2().children(
-            cell.iter()
-                .map(|block| render_block(block, palette, allow_remote, gallery)),
-        )
-    }))
-    .into_any_element()
+}
+
+impl Element for TableElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let regular = window.text_system().resolve_font(&style.font());
+        let mut bold_font = style.font();
+        bold_font.weight = FontWeight::BOLD;
+        let bold = window.text_system().resolve_font(&bold_font);
+        let text_system = window.text_system().clone();
+        let measure = |text: &str, strong: bool| -> f32 {
+            let font = if strong { bold } else { regular };
+            text.chars()
+                .map(|ch| {
+                    text_system
+                        .advance(font, font_size, ch)
+                        .map(|size| f32::from(size.width))
+                        .unwrap_or(f32::from(font_size) * 0.55)
+                })
+                .sum()
+        };
+        let lines: Vec<MeasuredRow<'_>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.header,
+                    row.cells
+                        .iter()
+                        .map(|(_, lines, bold)| (lines.as_slice(), row.header || *bold))
+                        .collect(),
+                )
+            })
+            .collect();
+        let widths = column_widths(&lines, measure);
+        let palette = self.palette;
+        let mut table = div()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .border(px(1.))
+            .border_color(paint(palette.border))
+            .rounded(px(4.));
+        for row in std::mem::take(&mut self.rows) {
+            let mut line = div()
+                .flex()
+                .w_full()
+                .border_b(px(1.))
+                .border_color(paint(palette.border));
+            if row.header {
+                line = line
+                    .font_weight(FontWeight::BOLD)
+                    .bg(paint(palette.surface));
+            }
+            for (column, (content, _, _)) in row.cells.into_iter().enumerate() {
+                let width = widths[column];
+                // Basis at what the column needs; the rest of the row shared
+                // by how much more each could use. A cell clips to its own
+                // column, so nothing paints into a neighbour.
+                let mut slot = div()
+                    .flex_basis(px(width.basis))
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .px(px(TABLE_CELL_PAD_PX / 2.))
+                    .py_2()
+                    .flex()
+                    .flex_col();
+                slot.style().flex_grow = Some(width.max - width.basis + 1.0);
+                slot.style().flex_shrink = Some(1.0);
+                // The content fills its column and the text lines up inside
+                // it, so a right-aligned value ends at its own column's edge.
+                slot = match self.align.get(column).copied().unwrap_or_default() {
+                    Align::Start => slot,
+                    Align::Center => slot.text_align(TextAlign::Center),
+                    Align::End => slot.text_align(TextAlign::Right),
+                };
+                line = line.child(slot.child(content));
+            }
+            table = table.child(line);
+        }
+        let mut inner = table.into_any_element();
+        let layout = inner.request_layout(window, cx);
+        self.inner = Some(inner);
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.prepaint(window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.paint(window, cx);
+        }
+    }
+}
+
+/// A row to measure: whether it is the header, then each cell's lines and
+/// whether the cell is set bold.
+pub(crate) type MeasuredRow<'a> = (bool, Vec<(&'a [String], bool)>);
+
+/// A column's widths, padding included.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ColumnWidth {
+    /// Its longest word: narrower would break a word.
+    pub min: f32,
+    /// Its longest line unwrapped: wider is empty space.
+    pub max: f32,
+    /// What the row gives it first: its longest word, or for a column of
+    /// short values (prices, counts) its longest value, so a number never
+    /// wraps while a header over it may.
+    pub basis: f32,
+}
+
+/// Cell padding, both sides together.
+const TABLE_CELL_PAD_PX: f32 = 16.;
+
+/// No column asks for more than this as its narrowest, so one long URL
+/// cannot push the table past the pane.
+const TABLE_MAX_MIN_PX: f32 = 180.;
+
+/// A column whose body cells all fit in this keeps them on one line.
+const TABLE_SHORT_PX: f32 = 140.;
+
+/// Each column's widths from its cells' lines (`rows` holds whether each
+/// row is the header, then each cell's lines and whether it is set bold;
+/// `measure` takes text and that flag). The row gives every column
+/// its basis and shares what is left in proportion to `max - basis`, as a
+/// browser's auto table layout shares the room past min-content.
+pub(crate) fn column_widths(
+    rows: &[MeasuredRow<'_>],
+    measure: impl Fn(&str, bool) -> f32,
+) -> Vec<ColumnWidth> {
+    let columns = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
+    let mut min = vec![0f32; columns];
+    let mut max = vec![0f32; columns];
+    let mut body_max = vec![0f32; columns];
+    for (header, cells) in rows {
+        for (column, (lines, bold)) in cells.iter().enumerate() {
+            let word = lines
+                .iter()
+                .flat_map(|line| line.split_whitespace())
+                .map(|word| measure(word, *bold))
+                .fold(0.0, f32::max);
+            let line = lines
+                .iter()
+                .map(|line| measure(line.trim(), *bold))
+                .fold(0.0, f32::max);
+            min[column] = min[column].max(word.min(TABLE_MAX_MIN_PX));
+            max[column] = max[column].max(line);
+            if !header {
+                body_max[column] = body_max[column].max(line);
+            }
+        }
+    }
+    // A little slack, so rounding never wraps a word that fits.
+    const SLACK: f32 = 2.;
+    (0..columns)
+        .map(|column| {
+            let min = min[column] + TABLE_CELL_PAD_PX + SLACK;
+            let max = (max[column] + TABLE_CELL_PAD_PX + SLACK).max(min);
+            let short = body_max[column] + TABLE_CELL_PAD_PX + SLACK;
+            let basis = if body_max[column] <= TABLE_SHORT_PX {
+                min.max(short)
+            } else {
+                min
+            };
+            ColumnWidth { min, max, basis }
+        })
+        .collect()
+}
+
+/// Whether a cell has bold text in it, so it is measured in the bold face.
+fn blocks_are_bold(blocks: &[Block]) -> bool {
+    fn inlines(runs: &[Inline]) -> bool {
+        runs.iter().any(|inline| match inline {
+            Inline::Strong(_) => true,
+            Inline::Emphasis(children)
+            | Inline::Strike(children)
+            | Inline::Link { children, .. } => inlines(children),
+            _ => false,
+        })
+    }
+    blocks.iter().any(|block| match block {
+        Block::Heading { .. } => true,
+        Block::Paragraph { inlines: runs } => inlines(runs),
+        Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+            blocks_are_bold(blocks)
+        }
+        Block::List { items, .. } => items.iter().any(|item| blocks_are_bold(&item.blocks)),
+        _ => false,
+    })
+}
+
+/// A cell's lines of text: one per paragraph line, list item or code line.
+fn push_cell_lines(blocks: &[Block], out: &mut Vec<String>) {
+    fn inlines(runs: &[Inline], out: &mut Vec<String>) {
+        for inline in runs {
+            match inline {
+                Inline::Text(text) | Inline::Code(text) => {
+                    if out.is_empty() {
+                        out.push(String::new());
+                    }
+                    out.last_mut().expect("a line").push_str(text);
+                }
+                Inline::Emphasis(children)
+                | Inline::Strong(children)
+                | Inline::Strike(children)
+                | Inline::Link { children, .. } => inlines(children, out),
+                Inline::Image { alt, .. } => {
+                    if out.is_empty() {
+                        out.push(String::new());
+                    }
+                    out.last_mut().expect("a line").push_str(alt);
+                }
+                Inline::LineBreak => out.push(String::new()),
+            }
+        }
+    }
+    for block in blocks {
+        match block {
+            Block::Heading { inlines: text, .. } | Block::Paragraph { inlines: text } => {
+                let mut lines = Vec::new();
+                inlines(text, &mut lines);
+                out.extend(lines);
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    let mut lines = Vec::new();
+                    push_cell_lines(&item.blocks, &mut lines);
+                    // The marker column.
+                    out.extend(
+                        lines
+                            .into_iter()
+                            .map(|line| format!("\u{2003}\u{2003}{line}")),
+                    );
+                }
+            }
+            Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+                push_cell_lines(blocks, out)
+            }
+            Block::Code { text } => out.extend(text.lines().map(str::to_string)),
+            Block::Image { alt, .. } => out.push(format!("Image blocked \u{b7} {alt}")),
+            Block::Table { .. } | Block::ThematicBreak => {}
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Mark {
     strong: bool,
     emphasis: bool,
+    strike: bool,
+    /// On the code tint: the code and the padding either side of it.
     code: bool,
+    /// In the monospace face: the code itself.
+    mono: bool,
     link: bool,
 }
+
+/// Fine print's size: a step under the body, as the sender meant it.
+const FINE_PRINT_PX: f32 = 12.5;
+
+/// The face inline code and code blocks use.
+const CODE_FONT: &str = "Liberation Mono";
+
+/// About 2 px either side of inline code, inside its tint. No-break, so
+/// the padding never starts or ends a line on its own.
+const CODE_PAD: &str = "\u{202F}";
 
 fn render_inlines(
     inlines: &[Inline],
@@ -454,24 +876,44 @@ fn render_inlines(
     allow_remote: bool,
     gallery: &ImageGallery,
 ) -> Vec<AnyElement> {
+    if let Some(line) = blocked_image_line(inlines, allow_remote) {
+        return vec![dimmed_line(line, palette)];
+    }
     let mut out = Vec::new();
     let mut text = String::new();
     let mut ranges: Vec<(Range<usize>, Mark)> = Vec::new();
-    walk_inlines(
-        inlines,
-        &Mark {
-            strong: false,
-            emphasis: false,
-            code: false,
-            link: false,
-        },
-        palette,
-        allow_remote,
-        gallery,
-        &mut text,
-        &mut ranges,
-        &mut out,
-    );
+    let plain = Mark {
+        strong: false,
+        emphasis: false,
+        strike: false,
+        code: false,
+        mono: false,
+        link: false,
+    };
+    let mut at = 0;
+    while at < inlines.len() {
+        // Blocked images side by side in a sentence are one line too.
+        if !allow_remote
+            && let Some((end, alts)) = image_run(inlines, at)
+            && alts.len() >= 2
+        {
+            flush_text(&mut text, &mut ranges, palette, &mut out);
+            out.push(blocked_label(&alts, palette));
+            at = end;
+            continue;
+        }
+        walk_inlines(
+            &inlines[at..at + 1],
+            &plain,
+            palette,
+            allow_remote,
+            gallery,
+            &mut text,
+            &mut ranges,
+            &mut out,
+        );
+        at += 1;
+    }
     flush_text(&mut text, &mut ranges, palette, &mut out);
     if out.is_empty() {
         out.push(div().into_any_element());
@@ -495,13 +937,31 @@ fn walk_inlines(
             Inline::Text(value) => push_text(text, ranges, value, mark),
             Inline::LineBreak => push_text(text, ranges, "\n", mark),
             Inline::Code(value) => {
-                let mut code = mark.clone();
-                code.code = true;
+                let mut pad = mark.clone();
+                pad.code = true;
+                let mut code = pad.clone();
+                code.mono = true;
+                push_text(text, ranges, CODE_PAD, &pad);
                 push_text(text, ranges, value, &code);
+                push_text(text, ranges, CODE_PAD, &pad);
             }
             Inline::Emphasis(children) => {
                 let mut next = mark.clone();
                 next.emphasis = true;
+                walk_inlines(
+                    children,
+                    &next,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    text,
+                    ranges,
+                    out,
+                );
+            }
+            Inline::Strike(children) => {
+                let mut next = mark.clone();
+                next.strike = true;
                 walk_inlines(
                     children,
                     &next,
@@ -566,18 +1026,626 @@ fn flush_text(
     if text.is_empty() {
         return;
     }
-    let highlights = ranges.iter().filter_map(|(range, mark)| {
-        let style = highlight(mark, palette)?;
-        Some((range.clone(), style))
-    });
-    let styled = StyledText::new(SharedString::from(text.clone())).with_highlights(highlights);
-    out.push(div().child(styled).into_any_element());
+    let runs: Vec<(usize, Mark)> = ranges
+        .drain(..)
+        .map(|(range, mark)| (range.len(), mark))
+        .collect();
+    // gpui wraps a right-to-left line out of place (the second line of a
+    // Hebrew paragraph paints off the left edge), so a paragraph written
+    // right to left is wrapped here, a line at a time, and set flush right.
+    if is_right_to_left(text) {
+        let element = RtlText {
+            text: SharedString::from(text.clone()),
+            runs,
+            palette: *palette,
+            lines: Rc::default(),
+            line_height: px(0.),
+            font_size: px(0.),
+            text_runs: Vec::new(),
+        };
+        out.push(div().w_full().child(element).into_any_element());
+        text.clear();
+        return;
+    }
+    let styled = MailText {
+        text: SharedString::from(text.clone()),
+        runs,
+        palette: *palette,
+        inner: None,
+    };
+    out.push(div().w_full().child(styled).into_any_element());
     text.clear();
-    ranges.clear();
+}
+
+/// Set right to left: the first letter is of a right-to-left script
+/// (Hebrew, Arabic, Syriac, Thaana), as `dir="auto"` decides it.
+pub(crate) fn is_right_to_left(text: &str) -> bool {
+    text.chars()
+        .find(|ch| ch.is_alphabetic())
+        .is_some_and(|ch| matches!(ch as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF))
+}
+
+/// The runs of `runs` (covering the text in order) that fall in `range`,
+/// cut to it.
+fn slice_runs(runs: &[gpui::TextRun], range: &Range<usize>) -> Vec<gpui::TextRun> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        let from = start.max(range.start);
+        let to = end.min(range.end);
+        if from < to {
+            let mut cut = run.clone();
+            cut.len = to - from;
+            out.push(cut);
+        }
+        start = end;
+    }
+    out
+}
+
+/// Byte ranges of each line of `text` broken at spaces to fit `width`,
+/// from `measure` of a range's width. Hard line breaks are kept.
+pub(crate) fn wrap_words(
+    text: &str,
+    width: Option<f32>,
+    mut measure: impl FnMut(Range<usize>) -> f32,
+) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for hard in text.split('\n') {
+        let base = offset;
+        offset += hard.len() + 1;
+        let Some(width) = width else {
+            lines.push(base..base + hard.len());
+            continue;
+        };
+        let mut line_start = base;
+        let mut line_end = base;
+        let mut at = 0;
+        for word in hard.split(' ') {
+            let word_start = base + at;
+            let word_end = word_start + word.len();
+            at += word.len() + 1;
+            if line_end > line_start && measure(line_start..word_end) > width {
+                lines.push(line_start..line_end);
+                line_start = word_start;
+            }
+            line_end = word_end;
+        }
+        lines.push(line_start..line_end);
+    }
+    lines
+}
+
+/// A paragraph set right to left: wrapped at spaces to the width it is
+/// given, each line shaped on its own and painted flush right.
+struct RtlText {
+    text: SharedString,
+    runs: Vec<(usize, Mark)>,
+    palette: Palette,
+    lines: Rc<RefCell<Vec<Range<usize>>>>,
+    line_height: Pixels,
+    font_size: Pixels,
+    text_runs: Vec<gpui::TextRun>,
+}
+
+impl IntoElement for RtlText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RtlText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        _: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let base = window.text_style();
+        let font_size = base.font_size.to_pixels(window.rem_size());
+        let line_height = base
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        self.line_height = line_height;
+        self.font_size = font_size;
+        self.text_runs = self
+            .runs
+            .iter()
+            .map(|(len, mark)| {
+                let mut style = base.clone();
+                if let Some(highlight) = highlight(mark, &self.palette) {
+                    style = style.highlight(highlight);
+                }
+                if mark.mono {
+                    style.font_family = CODE_FONT.into();
+                }
+                style.to_run(*len)
+            })
+            .collect();
+        let text = self.text.clone();
+        let runs = self.text_runs.clone();
+        let lines = Rc::clone(&self.lines);
+        let layout = window.request_measured_layout(
+            gpui::Style::default(),
+            move |known, available, window, _| {
+                let width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let mut widest = 0f32;
+                let wrapped = wrap_words(&text, width.map(f32::from), |range| {
+                    let shaped = window.text_system().shape_line(
+                        SharedString::from(text[range.clone()].to_string()),
+                        font_size,
+                        &slice_runs(&runs, &range),
+                        None,
+                    );
+                    f32::from(shaped.width)
+                });
+                for range in &wrapped {
+                    let shaped = window.text_system().shape_line(
+                        SharedString::from(text[range.clone()].to_string()),
+                        font_size,
+                        &slice_runs(&runs, range),
+                        None,
+                    );
+                    widest = widest.max(f32::from(shaped.width));
+                }
+                let size = gpui::size(
+                    width.unwrap_or(px(widest)),
+                    line_height * wrapped.len() as f32,
+                );
+                *lines.borrow_mut() = wrapped;
+                size
+            },
+        );
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let font_size = self.font_size;
+        for (at, range) in self.lines.borrow().iter().enumerate() {
+            if range.is_empty() {
+                continue;
+            }
+            let shaped = window.text_system().shape_line(
+                SharedString::from(self.text[range.clone()].to_string()),
+                font_size,
+                &slice_runs(&self.text_runs, range),
+                None,
+            );
+            let origin = gpui::point(
+                bounds.right() - shaped.width,
+                bounds.origin.y + self.line_height * at as f32,
+            );
+            let _ = shaped.paint(origin, self.line_height, window, cx);
+        }
+    }
+}
+
+fn dimmed_line(line: String, palette: &Palette) -> AnyElement {
+    let mut label = div()
+        .text_sm()
+        .text_color(paint(palette.dimmed))
+        .child(line);
+    label.style().align_self = Some(gpui::AlignItems::FlexStart);
+    label.into_any_element()
+}
+
+fn blocked_label(alts: &[&str], palette: &Palette) -> AnyElement {
+    dimmed_line(blocked_text(alts), palette)
+}
+
+fn blocked_text(alts: &[&str]) -> String {
+    let named: Vec<&str> = alts.iter().copied().filter(|alt| !alt.is_empty()).collect();
+    if named.is_empty() {
+        format!("{} images blocked", alts.len())
+    } else {
+        format!("Images blocked \u{b7} {}", named.join(", "))
+    }
+}
+
+/// Remote images from `at` on, linked or not, with only spaces between:
+/// where the run ends and each image's alt text. `None` when `at` is not
+/// an image.
+pub(crate) fn image_run(inlines: &[Inline], at: usize) -> Option<(usize, Vec<&str>)> {
+    fn image_item<'a>(inline: &'a Inline, alts: &mut Vec<&'a str>) -> bool {
+        match inline {
+            Inline::Image {
+                source: ImageSource::Remote(_),
+                alt,
+            } => {
+                alts.push(alt.as_str());
+                true
+            }
+            Inline::Link { children, .. } => {
+                let mut inner = Vec::new();
+                let images = children.iter().all(|child| match child {
+                    Inline::Text(text) => text.chars().all(char::is_whitespace),
+                    other => image_item(other, &mut inner),
+                }) && !inner.is_empty();
+                if images {
+                    alts.extend(inner);
+                }
+                images
+            }
+            _ => false,
+        }
+    }
+    let mut alts = Vec::new();
+    if !image_item(inlines.get(at)?, &mut alts) {
+        return None;
+    }
+    let mut end = at + 1;
+    let mut next = end;
+    while let Some(inline) = inlines.get(next) {
+        match inline {
+            Inline::Text(text) if text.chars().all(char::is_whitespace) => next += 1,
+            Inline::LineBreak => next += 1,
+            other if image_item(other, &mut alts) => {
+                next += 1;
+                end = next;
+            }
+            _ => break,
+        }
+    }
+    Some((end, alts))
+}
+
+/// A paragraph that is only blocked remote images (a row of social icons,
+/// each perhaps in a link) reads as one line: `Images blocked · Mastodon,
+/// Photos, RSS`. `None` for anything else.
+fn blocked_image_line(inlines: &[Inline], allow_remote: bool) -> Option<String> {
+    fn collect<'a>(inlines: &'a [Inline], alts: &mut Vec<&'a str>) -> bool {
+        inlines.iter().all(|inline| match inline {
+            Inline::Image {
+                source: ImageSource::Remote(_),
+                alt,
+            } => {
+                alts.push(alt.as_str());
+                true
+            }
+            Inline::Link { children, .. } => collect(children, alts),
+            Inline::Text(text) => text.chars().all(|ch| ch.is_whitespace()),
+            Inline::LineBreak => true,
+            _ => false,
+        })
+    }
+    if allow_remote {
+        return None;
+    }
+    let mut alts = Vec::new();
+    if !collect(inlines, &mut alts) || alts.len() < 2 {
+        return None;
+    }
+    Some(blocked_text(&alts))
+}
+
+/// How far a wrapped `pre` line's continuation sits in from its start, so
+/// a reader sees where the source line goes on.
+const PRE_CONTINUATION_PX: f32 = 8.;
+
+/// A `pre` block's rows at `columns` characters: each source line, broken
+/// at the last space that fits (or at the column when there is none), with
+/// continuation rows `indent` columns shorter. `true` marks a continuation.
+pub(crate) fn wrap_pre(text: &str, columns: usize, indent: usize) -> Vec<(String, bool)> {
+    let columns = columns.max(8);
+    let indent = indent.min(columns / 2);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let line = line.replace('\t', "    ");
+        let chars: Vec<char> = line.trim_end().chars().collect();
+        if chars.is_empty() {
+            rows.push((String::new(), false));
+            continue;
+        }
+        let mut start = 0;
+        let mut continuation = false;
+        while start < chars.len() {
+            let room = if continuation {
+                columns - indent
+            } else {
+                columns
+            };
+            let mut end = (start + room).min(chars.len());
+            if end < chars.len()
+                && let Some(space) = chars[start..end].iter().rposition(|ch| *ch == ' ')
+                && space > room / 3
+            {
+                end = start + space + 1;
+            }
+            let row: String = chars[start..end].iter().collect();
+            rows.push((
+                if continuation {
+                    row.trim().to_string()
+                } else {
+                    row.trim_end().to_string()
+                },
+                continuation,
+            ));
+            start = end;
+            continuation = true;
+        }
+    }
+    rows
+}
+
+/// A code block whose long lines wrap with a continuation indent. The face
+/// is monospace, so the width of a row is its characters times one
+/// advance; the rows are laid out at the width the block is given and
+/// painted one shaped line each.
+struct PreText {
+    text: SharedString,
+    rows: Rc<RefCell<Vec<(String, bool)>>>,
+    style: Option<(gpui::Font, Pixels, Pixels, gpui::Hsla)>,
+}
+
+impl PreText {
+    fn new(text: &str) -> Self {
+        Self {
+            text: SharedString::from(text.to_string()),
+            rows: Rc::default(),
+            style: None,
+        }
+    }
+}
+
+impl IntoElement for PreText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for PreText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        _: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = window.text_style();
+        let font = style.font();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let font_id = window.text_system().resolve_font(&font);
+        let advance = window
+            .text_system()
+            .advance(font_id, font_size, 'm')
+            .map(|size| size.width)
+            .unwrap_or(font_size * 0.6);
+        self.style = Some((font, font_size, line_height, style.color));
+        let text = self.text.clone();
+        let rows = Rc::clone(&self.rows);
+        let indent = (PRE_CONTINUATION_PX / f32::from(advance).max(1.)).ceil() as usize;
+        let layout = window.request_measured_layout(
+            gpui::Style::default(),
+            move |known, available, _, _| {
+                let width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let columns = match width {
+                    Some(width) => (f32::from(width) / f32::from(advance).max(1.)).floor() as usize,
+                    None => usize::MAX / 2,
+                };
+                let wrapped = wrap_pre(&text, columns, indent);
+                let widest = wrapped
+                    .iter()
+                    .map(|(row, continuation)| {
+                        row.chars().count() + if *continuation { indent } else { 0 }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let size = gpui::size(
+                    (advance * widest as f32).min(width.unwrap_or(Pixels::MAX)),
+                    line_height * wrapped.len() as f32,
+                );
+                *rows.borrow_mut() = wrapped;
+                size
+            },
+        );
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((font, font_size, line_height, color)) = self.style.clone() else {
+            return;
+        };
+        for (at, (row, continuation)) in self.rows.borrow().iter().enumerate() {
+            if row.is_empty() {
+                continue;
+            }
+            let run = gpui::TextRun {
+                len: row.len(),
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window.text_system().shape_line(
+                SharedString::from(row.clone()),
+                font_size,
+                &[run],
+                None,
+            );
+            let x = if *continuation {
+                px(PRE_CONTINUATION_PX)
+            } else {
+                px(0.)
+            };
+            let origin = gpui::point(
+                bounds.origin.x + x,
+                bounds.origin.y + line_height * at as f32,
+            );
+            let _ = shaped.paint(origin, line_height, window, cx);
+        }
+    }
+}
+
+/// Text in the inherited face with runs of bold, italic, links and inline
+/// code. Inline code needs its own face, which a highlight cannot set, so
+/// the runs are built from the text style the element lays out in.
+struct MailText {
+    text: SharedString,
+    /// Byte length and marks of each run, covering the text in order.
+    runs: Vec<(usize, Mark)>,
+    palette: Palette,
+    inner: Option<StyledText>,
+}
+
+impl IntoElement for MailText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for MailText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let base = window.text_style();
+        let runs = self
+            .runs
+            .iter()
+            .map(|(len, mark)| {
+                let mut style = base.clone();
+                if let Some(highlight) = highlight(mark, &self.palette) {
+                    style = style.highlight(highlight);
+                }
+                if mark.mono {
+                    style.font_family = CODE_FONT.into();
+                }
+                style.to_run(*len)
+            })
+            .collect();
+        let inner = self
+            .inner
+            .insert(StyledText::new(self.text.clone()).with_runs(runs));
+        inner.request_layout(id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.prepaint(id, inspector_id, bounds, state, window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.paint(id, inspector_id, bounds, state, prepaint, window, cx);
+        }
+    }
 }
 
 fn highlight(mark: &Mark, palette: &Palette) -> Option<HighlightStyle> {
-    if !mark.strong && !mark.emphasis && !mark.code && !mark.link {
+    if !mark.strong && !mark.emphasis && !mark.strike && !mark.code && !mark.link {
         return None;
     }
     Some(HighlightStyle {
@@ -590,7 +1658,10 @@ fn highlight(mark: &Mark, palette: &Palette) -> Option<HighlightStyle> {
             color: Some(ink(palette.accent)),
             wavy: false,
         }),
-        strikethrough: None,
+        strikethrough: mark.strike.then(|| gpui::StrikethroughStyle {
+            thickness: px(1.),
+            color: None,
+        }),
         fade_out: None,
     })
 }
@@ -1287,8 +2358,8 @@ fn render_frame(mut data: image::RgbaImage) -> Arc<RenderImage> {
 
 #[cfg(test)]
 mod decode_tests {
-    use super::decode_image;
-    use fell_render::{Block, Inline, html_to_document};
+    use super::*;
+    use fell_render::html_to_document;
 
     fn find_images(inlines: &[Inline], out: &mut Vec<(String, usize)>) {
         for inline in inlines {
@@ -1303,7 +2374,10 @@ mod decode_tests {
                         assert!(decode_image(bytes).is_some(), "decode {alt}");
                     }
                 }
-                Inline::Emphasis(c) | Inline::Strong(c) | Inline::Link { children: c, .. } => {
+                Inline::Emphasis(c)
+                | Inline::Strong(c)
+                | Inline::Strike(c)
+                | Inline::Link { children: c, .. } => {
                     find_images(c, out);
                 }
                 _ => {}
@@ -1464,6 +2538,151 @@ mod decode_tests {
         let (_light, _dark, width, height) = theme_pair(&rgba);
         assert!((80. ..220.).contains(&width), "{width}x{height}");
         assert!((40. ..120.).contains(&height), "{width}x{height}");
+    }
+
+    fn corpus_doc(name: &str) -> fell_render::StyledDocument {
+        let mail = fell_render::corpus()
+            .into_iter()
+            .find(|mail| mail.name == name)
+            .expect(name);
+        fell_render::prepare(&mail.html, &mail.headers).document
+    }
+
+    /// Advances of a sans face, near enough to test the layout rule.
+    fn advance(text: &str, bold: bool) -> f32 {
+        text.chars().count() as f32 * if bold { 9.0 } else { 8.0 }
+    }
+
+    #[test]
+    fn table_columns_get_their_longest_word_and_short_values_their_width() {
+        let doc = corpus_doc("data-table");
+        let Some(fell_render::Block::Table { header, rows, .. }) = doc
+            .blocks
+            .iter()
+            .find(|block| matches!(block, fell_render::Block::Table { .. }))
+        else {
+            panic!("{:?}", doc.blocks);
+        };
+        let mut lines: Vec<Vec<Vec<String>>> = Vec::new();
+        for row in std::iter::once(header).chain(rows.iter()) {
+            lines.push(
+                row.iter()
+                    .map(|cell| {
+                        let mut out = Vec::new();
+                        push_cell_lines(cell, &mut out);
+                        out
+                    })
+                    .collect(),
+            );
+        }
+        let input: Vec<MeasuredRow<'_>> = lines
+            .iter()
+            .enumerate()
+            .map(|(at, row)| {
+                (
+                    at == 0,
+                    row.iter().map(|cell| (cell.as_slice(), at == 0)).collect(),
+                )
+            })
+            .collect();
+        let widths = column_widths(&input, advance);
+        assert_eq!(widths.len(), 7);
+        // Station: at least "Agricultural", and its long name gives room to share.
+        assert!(widths[0].min >= advance("Agricultural", false) + TABLE_CELL_PAD_PX);
+        assert!(widths[0].max > widths[0].min);
+        // Elevation: the header may wrap at its space, the numbers never.
+        assert!(widths[1].basis >= advance("2,015", false) + TABLE_CELL_PAD_PX);
+        assert!(widths[1].basis >= advance("Elevation", true) + TABLE_CELL_PAD_PX);
+        assert!(widths[1].basis < advance("Elevation (m)", true) + TABLE_CELL_PAD_PX);
+        // Notes: a sentence column starts at its longest word and takes the
+        // most of what is left.
+        assert_eq!(widths[6].basis, widths[6].min);
+        let share = |w: &ColumnWidth| w.max - w.basis;
+        assert!(widths[..6].iter().all(|w| share(w) < share(&widths[6])));
+        // A bold total is measured bold.
+        let receipt = corpus_doc("esp-receipt");
+        let Some(fell_render::Block::Table { rows, .. }) = receipt
+            .blocks
+            .iter()
+            .find(|block| matches!(block, fell_render::Block::Table { .. }))
+        else {
+            panic!();
+        };
+        assert!(blocks_are_bold(&rows[4][1]));
+        assert!(!blocks_are_bold(&rows[0][1]));
+    }
+
+    #[test]
+    fn blocked_images_side_by_side_are_one_run() {
+        let doc = corpus_doc("esp-marketing");
+        let social = doc
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                fell_render::Block::Paragraph { inlines }
+                    if blocked_image_line(inlines, false).is_some() =>
+                {
+                    blocked_image_line(inlines, false)
+                }
+                _ => None,
+            })
+            .expect("the social row");
+        assert_eq!(social, "Images blocked \u{b7} Social feed, Photos, Videos");
+        let inlines = vec![
+            Inline::Text("Follow us ".into()),
+            Inline::Link {
+                href: "https://a.test".into(),
+                children: vec![Inline::Image {
+                    source: ImageSource::Remote("https://a.test/1.png".into()),
+                    alt: "One".into(),
+                }],
+            },
+            Inline::Text("\u{a0} ".into()),
+            Inline::Image {
+                source: ImageSource::Remote("https://a.test/2.png".into()),
+                alt: "Two".into(),
+            },
+            Inline::Text(" today".into()),
+        ];
+        assert_eq!(image_run(&inlines, 0), None);
+        let (end, alts) = image_run(&inlines, 1).expect("a run");
+        assert_eq!((end, alts), (4, vec!["One", "Two"]));
+    }
+
+    #[test]
+    fn wrapped_pre_lines_continue_indented() {
+        let rows = wrap_pre(
+            "short\nERROR worker[3]: connection failed after 3 retries",
+            24,
+            1,
+        );
+        assert_eq!(rows[0], ("short".to_string(), false));
+        assert_eq!(rows[1], ("ERROR worker[3]:".to_string(), false));
+        assert!(rows[2..].iter().all(|(_, continuation)| *continuation));
+        assert!(
+            rows.iter()
+                .all(|(row, cont)| row.chars().count() <= if *cont { 23 } else { 24 })
+        );
+        let joined: String = rows[1..]
+            .iter()
+            .map(|(row, _)| row.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, "ERROR worker[3]: connection failed after 3 retries");
+        // A long word with no space breaks at the column.
+        let rows = wrap_pre(&"x".repeat(30), 10, 1);
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn right_to_left_paragraphs_wrap_at_spaces() {
+        assert!(is_right_to_left("\u{5e9}\u{5dc}\u{5d5}\u{5dd} Avi Peretz"));
+        assert!(!is_right_to_left("Avi \u{5e9}\u{5dc}\u{5d5}\u{5dd}"));
+        assert!(!is_right_to_left("18:00"));
+        let text = "aaa bbb ccc\nddd";
+        let lines = wrap_words(text, Some(7.0), |range| range.len() as f32);
+        let lines: Vec<&str> = lines.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(lines, ["aaa bbb", "ccc", "ddd"]);
     }
 
     #[test]
@@ -1725,6 +2944,7 @@ mod decode_tests {
                 } => return Some(bytes),
                 fell_render::Inline::Emphasis(children)
                 | fell_render::Inline::Strong(children)
+                | fell_render::Inline::Strike(children)
                 | fell_render::Inline::Link { children, .. } => {
                     if let Some(bytes) = find_data_inline(children) {
                         return Some(bytes);

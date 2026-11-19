@@ -7,15 +7,21 @@
 #![forbid(unsafe_code)]
 
 mod choose;
+mod corpus;
 mod document;
 mod fixtures;
+mod history;
 mod html;
 mod markdown;
 mod webview_html;
 
 pub use choose::{MailHeaders, PreparedMail, RenderMode, choose_view, layout_is_complex, prepare};
-pub use document::{Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument};
+pub use corpus::corpus;
+pub use document::{
+    Align, Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument,
+};
 pub use fixtures::{Fixture, fixture, fixtures};
+pub use history::{Fold, FoldedDocument, Section, fold_history, is_quoted_from_line};
 pub use html::{document_from_body, html_to_document, looks_like_html, plain_to_document};
 pub use markdown::markdown_to_document;
 pub use webview_html::{

@@ -603,6 +603,71 @@ pub(super) fn read(
     }))
 }
 
+/// Which parts one stored row has. A row with neither records that no
+/// server copy had a body to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PartKinds {
+    pub html: bool,
+    pub plain: bool,
+    /// Bytes of compressed HTML as stored, for a caller deciding where to
+    /// prepare it. 0 without HTML.
+    pub html_bytes: u64,
+    /// Changes when the stored parts change: a resync that replaces them,
+    /// or a backfill that fills HTML into a plain row. A cache of prepared
+    /// bodies keys on it as well as on the message id.
+    pub stamp: u64,
+}
+
+/// The stored rows among `message_ids`, by primary key. The blobs are not
+/// read: SQLite answers `length()` of a column from the record header.
+pub(super) fn kinds(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_ids: &[&str],
+) -> Result<std::collections::HashMap<String, PartKinds>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT html IS NOT NULL, plain IS NOT NULL,
+                coalesce(length(html), 0), coalesce(length(plain), 0),
+                length(bulk_headers), codec
+         FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2",
+    )?;
+    let mut out = std::collections::HashMap::new();
+    for id in message_ids {
+        let found = stmt
+            .query_row(params![account_id.as_str(), id], |row| {
+                let html_bytes: i64 = row.get(2)?;
+                let plain_bytes: i64 = row.get(3)?;
+                let header_bytes: i64 = row.get(4)?;
+                let codec: i64 = row.get(5)?;
+                Ok(PartKinds {
+                    html: row.get(0)?,
+                    plain: row.get(1)?,
+                    html_bytes: html_bytes.max(0) as u64,
+                    stamp: part_stamp(&[codec, html_bytes, plain_bytes, header_bytes]),
+                })
+            })
+            .optional()?;
+        if let Some(kinds) = found {
+            out.insert((*id).to_string(), kinds);
+        }
+    }
+    Ok(out)
+}
+
+/// FNV-1a over the stored sizes. Compressed sizes change with any edit
+/// that matters in practice, and reading them costs no blob read.
+fn part_stamp(sizes: &[i64]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for size in sizes {
+        for byte in size.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
 /// CROSS JOIN keeps the queue as the outer loop. Otherwise SQLite walks every
 /// message in date order to skip the sort, even with an empty queue.
 const MISSING_SQL: &str = "SELECT q.message_id FROM body_backfill q
@@ -820,6 +885,68 @@ mod tests {
             body(&store, "n1@x").unwrap().html.as_deref().map(str::trim),
             Some("<p>second</p>")
         );
+    }
+
+    #[test]
+    fn part_kinds_name_what_each_row_has_without_reading_it() {
+        let html = newsletter("h@x", "INBOX", 1, "<p>x</p>");
+        let mut plain = newsletter("p@x", "INBOX", 2, "<p>y</p>");
+        plain.parts.as_mut().unwrap().html = None;
+        let mut empty = newsletter("e@x", "INBOX", 3, "<p>z</p>");
+        empty.parts = Some(MessageParts::default());
+        let mut bare = newsletter("b@x", "INBOX", 4, "<p>w</p>");
+        bare.parts = None;
+        let store = store_with(vec![html, plain, empty, bare]);
+        let found = store
+            .stored_part_kinds(&account().id, &["h@x", "p@x", "e@x", "b@x", "gone@x"])
+            .unwrap();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found["h@x"].html && found["h@x"].plain);
+        assert!(found["h@x"].html_bytes > 0);
+        assert!(!found["p@x"].html && found["p@x"].plain);
+        assert_eq!(found["p@x"].html_bytes, 0);
+        assert!(!found["e@x"].html && !found["e@x"].plain);
+    }
+
+    #[test]
+    fn the_part_stamp_changes_when_the_parts_do() {
+        let first = newsletter("n@x", "INBOX", 1, "<p>first</p>");
+        let store = store_with(vec![first.clone()]);
+        let stamp =
+            |store: &Store| store.stored_part_kinds(&account().id, &["n@x"]).unwrap()["n@x"];
+        let before = stamp(&store);
+        // The same parts again: the same stamp.
+        store.upsert_message(&first).unwrap();
+        assert_eq!(stamp(&store), before);
+        // A resync that replaces them.
+        let mut changed = first.clone();
+        changed.parts.as_mut().unwrap().html =
+            Some("<p>the second version, a little longer than the first</p>".into());
+        store.upsert_message(&changed).unwrap();
+        let replaced = stamp(&store);
+        assert_ne!(replaced.stamp, before.stamp);
+        // A backfill filling HTML into a row that had only plain text.
+        let mut plain = newsletter("p@x", "INBOX", 2, "<p>y</p>");
+        plain.parts.as_mut().unwrap().html = None;
+        let store = store_with(vec![plain.clone()]);
+        let plain_only = store.stored_part_kinds(&account().id, &["p@x"]).unwrap()["p@x"];
+        store
+            .store_fetched_parts(
+                &account().id,
+                &[(
+                    MessageId::new("p@x"),
+                    Some(MessageParts {
+                        html: Some("<p>now with html</p>".into()),
+                        plain: Some("now".into()),
+                        bulk_headers: Vec::new(),
+                        mime_parts: Vec::new(),
+                    }),
+                )],
+            )
+            .unwrap();
+        let filled = store.stored_part_kinds(&account().id, &["p@x"]).unwrap()["p@x"];
+        assert!(filled.html);
+        assert_ne!(filled.stamp, plain_only.stamp);
     }
 
     #[test]

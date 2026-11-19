@@ -12,6 +12,7 @@ mod fixtures;
 mod frame_log;
 mod inbox_motion;
 mod keymap;
+mod mail_body;
 mod mailbox;
 mod model;
 mod motion;

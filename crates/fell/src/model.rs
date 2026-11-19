@@ -3050,6 +3050,7 @@ mod tests {
             date_unix: 0,
             snippet: "snip".into(),
             body: crate::text_render::render_stored_body(Some("body"), "snip"),
+            rich: crate::present::Rich::Plain,
             expanded,
             recipients: None,
             context: None,

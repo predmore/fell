@@ -7,6 +7,7 @@
 //! scroll glides start where the view changes them, because they need the
 //! positions from before the change.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::keymap::KeyId;
@@ -157,6 +158,11 @@ pub struct InboxMotion {
     /// to the new fit when typing changes how many there are.
     card_to: Option<f32>,
     card_glide: Option<Glide>,
+    /// Message bodies that came after their header, settling from
+    /// [`motion::ARRIVE_FROM`], by message id.
+    bodies: HashMap<String, Transition>,
+    /// Folded history opening (`true`) or closing, by message id.
+    folds: HashMap<String, (Transition, bool)>,
 }
 
 /// Scroll offsets a settle jumped to, for the view to apply.
@@ -201,6 +207,8 @@ impl InboxMotion {
             conv_from: None,
             card_to: None,
             card_glide: None,
+            bodies: HashMap::new(),
+            folds: HashMap::new(),
         }
     }
 
@@ -398,6 +406,8 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
+        self.bodies.clear();
+        self.folds.clear();
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -456,6 +466,9 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
+        self.bodies.retain(|_, fade| fade.running(now));
+        self.folds.retain(|_, (reveal, _)| reveal.running(now));
+        running |= !self.bodies.is_empty() || !self.folds.is_empty();
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -630,6 +643,55 @@ impl InboxMotion {
             1.0,
             motion::progress(self.arrival.as_ref(), now),
         )
+    }
+
+    /// A message's HTML body replaced the room kept for it, or its stored
+    /// text, under a header already drawn: it settles in over [`motion::QUICK`].
+    pub fn body_arrived(&mut self, id: &str, now: Instant) {
+        if let Some(fade) = self.motion.start(motion::QUICK, now) {
+            self.bodies.insert(id.to_string(), fade);
+        }
+    }
+
+    /// Opacity of each body still settling in, by message id.
+    pub fn body_alphas(&self, now: Instant) -> HashMap<String, f32> {
+        self.bodies
+            .iter()
+            .map(|(id, fade)| {
+                let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
+                (id.clone(), alpha)
+            })
+            .collect()
+    }
+
+    /// A message's folded history opened (`q`, a click) or closed. It grows
+    /// over [`motion::SLIDE`], and leaves over [`motion::FADE`] on the
+    /// gentler exit curve.
+    pub fn fold_toggled(&mut self, id: &str, open: bool, now: Instant) {
+        let duration = if open { motion::SLIDE } else { motion::FADE };
+        match self.motion.start(duration, now) {
+            Some(reveal) => {
+                self.folds.insert(id.to_string(), (reveal, open));
+            }
+            None => {
+                self.folds.remove(id);
+            }
+        }
+    }
+
+    /// How open each fold still moving is, 0 closed to 1 open, by message id.
+    pub fn fold_shown(&self, now: Instant) -> HashMap<String, f32> {
+        self.folds
+            .iter()
+            .map(|(id, (reveal, open))| {
+                let shown = if *open {
+                    reveal.progress(now)
+                } else {
+                    reveal.remaining(now)
+                };
+                (id.clone(), shown)
+            })
+            .collect()
     }
 
     /// How far the conversation is towards "focused": its edge and the
@@ -1131,6 +1193,35 @@ mod tests {
         motion.observe(&session, (false, true), now);
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
+        motion.body_arrived("a", now);
+        motion.fold_toggled("a", true, now);
+        assert!(motion.body_alphas(now).is_empty());
+        assert!(motion.fold_shown(now).is_empty());
         assert!(!motion.tick(now));
+    }
+
+    #[test]
+    fn a_body_settles_in_and_a_fold_grows_then_a_key_ends_both() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        motion.body_arrived("a", now);
+        motion.fold_toggled("b", true, now);
+        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
+        assert_eq!(motion.fold_shown(now)["b"], 0.0);
+        let mid = later(now, 40);
+        let alpha = motion.body_alphas(mid)["a"];
+        assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
+        assert!(motion.tick(mid));
+        // The body is in after QUICK; the fold still grows until SLIDE.
+        let after = later(now, 90);
+        assert!(motion.tick(after));
+        assert!(!motion.body_alphas(after).contains_key("a"));
+        assert!(motion.fold_shown(after)["b"] > 0.9);
+        // Closing leaves on the exit curve, and a key jumps to the end.
+        motion.fold_toggled("b", false, after);
+        assert_eq!(motion.fold_shown(after)["b"], 1.0);
+        motion.settle(later(after, 10));
+        assert!(motion.fold_shown(later(after, 10)).is_empty());
+        assert!(!motion.tick(later(after, 10)));
     }
 }

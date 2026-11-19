@@ -14,7 +14,7 @@ mod theme;
 mod webview;
 
 pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
-pub use native::document_column;
+pub use native::{ImageGallery, blocks_column, blocks_column_spaced, document_column};
 pub use theme::{Palette, ThemeKind};
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use body::BodyModel as Model;
-use native::{ImageGallery, decode_image, edge_color};
+use native::{decode_image, edge_color};
 use theme::{ThemeKind as Theme, paint};
 
 pub struct Reader {

@@ -40,6 +40,13 @@ impl MailHeaders {
         headers
     }
 
+    /// Every field, in order.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()

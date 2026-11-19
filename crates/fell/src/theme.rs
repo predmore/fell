@@ -205,6 +205,23 @@ pub(crate) fn every_test_theme() -> Vec<Theme> {
     themes
 }
 
+/// The border for marks a reader follows, like a quote's rule: the theme's
+/// border pushed toward the text until it reaches 3:1 non-text contrast on
+/// the background and the surface.
+pub fn strong_border(theme: &Theme) -> u32 {
+    let mut t = 0.16;
+    loop {
+        let color = mix(theme.background, theme.foreground, t);
+        let enough = [theme.background, theme.surface]
+            .iter()
+            .all(|bg| contrast(color, *bg) >= MARK_CONTRAST);
+        if enough || t >= 1.0 {
+            return color;
+        }
+        t = (t + 0.02).min(1.0);
+    }
+}
+
 pub fn contrast_ok(theme: &Theme) -> bool {
     let surfaces = [theme.background, theme.surface];
     for bg in surfaces {
@@ -923,5 +940,22 @@ mod tests {
         );
         drop(rx);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strong_border_reaches_mark_contrast_on_every_stock_theme() {
+        for theme in every_test_theme() {
+            let border = strong_border(&theme);
+            for bg in [theme.background, theme.surface] {
+                assert!(
+                    contrast(border, bg) >= MARK_CONTRAST,
+                    "{}: {:.2}",
+                    theme.name,
+                    contrast(border, bg)
+                );
+            }
+            // Still a rule, not text: quieter than the dimmed text.
+            assert!(contrast(border, theme.background) <= contrast(theme.dimmed, theme.background));
+        }
     }
 }

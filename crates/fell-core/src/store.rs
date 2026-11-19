@@ -29,7 +29,7 @@ mod summaries;
 mod threads;
 mod write_lock;
 
-pub use bodies::BodyRequest;
+pub use bodies::{BodyRequest, PartKinds};
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -916,6 +916,19 @@ impl Store {
                 copies: copies.clone(),
             })
             .collect())
+    }
+
+    /// Which parts are stored for each of `message_ids` (canonical ids, as
+    /// [`Store::thread_messages`] returns them). An id with no row is left
+    /// out: sync has not stored its parts yet. No part is read or inflated,
+    /// so a conversation can tell which bodies need preparing before it
+    /// reads any of them.
+    pub fn stored_part_kinds(
+        &self,
+        account_id: &AccountId,
+        message_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, PartKinds>> {
+        bodies::kinds(&self.conn, account_id, message_ids)
     }
 
     /// Up to `limit` messages stored before parts were kept, newest first,

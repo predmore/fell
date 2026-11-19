@@ -4088,3 +4088,45 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn bodies_opened_together_are_fetched_in_one_login() {
+    let server = TestServer::spawn(sample_state());
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    store
+        .conn
+        .execute_batch("DELETE FROM message_bodies WHERE message_id IN ('root@x', 'smile@x');")
+        .unwrap();
+    server.state.lock().expect("state").commands.clear();
+    let ids = [
+        crate::MessageId::new("root@x"),
+        crate::MessageId::new("smile@x"),
+        // Unknown here: nothing to fetch, which is an answer.
+        crate::MessageId::new("nowhere@x"),
+    ];
+    let answers = crate::fetch_message_bodies(&acct.id, &backend, &store, &ids).unwrap();
+    assert_eq!(answers.len(), 3);
+    assert!(
+        answers[0]
+            .as_ref()
+            .is_some_and(|parts| parts.plain.is_some() || parts.html.is_some())
+    );
+    assert!(
+        answers[1]
+            .as_ref()
+            .is_some_and(|parts| parts.plain.is_some() || parts.html.is_some())
+    );
+    assert_eq!(answers[2], Some(crate::MessageParts::default()));
+    let logins = commands(&server)
+        .iter()
+        .filter(|line| line.starts_with("LOGIN"))
+        .count();
+    assert_eq!(logins, 1, "{:?}", commands(&server));
+    assert_read_only(&server);
+}

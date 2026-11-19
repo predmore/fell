@@ -44,10 +44,71 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str) -> RenderedBod
             blocks: vec![BodyBlock::Text(shared(snippet.trim()))],
         };
     }
-    RenderedBody {
-        blocks: split_blocks(&raw),
+    let (head, history) = split_outlook_history(&raw);
+    let mut blocks = split_blocks(head);
+    if let Some(history) = history {
+        blocks.push(BodyBlock::Quote(shared(history.trim())));
     }
+    RenderedBody { blocks }
 }
+
+/// Outlook quotes no `>`: under the reply it writes a `From:` / `Sent:` /
+/// `Subject:` header (or `-----Original Message-----`) and then the earlier
+/// mail. Everything from that header on is history. The `From:` line must
+/// name an address, as a reply header's does, so a sender's own template
+/// lines stay; a forward (`Subject: FW:`) stays open. Nothing is split off
+/// when no reply text would be left above it, or no quoted text under it.
+fn split_outlook_history(raw: &str) -> (&str, Option<&str>) {
+    let lines: Vec<(usize, &str)> = raw
+        .split_inclusive('\n')
+        .scan(0, |at, line| {
+            let start = *at;
+            *at += line.len();
+            Some((start, line))
+        })
+        .collect();
+    for (index, (start, line)) in lines.iter().enumerate() {
+        let line = line.trim();
+        let header_end = if line.starts_with("-----Original Message-----") {
+            Some(index + 1)
+        } else if fell_render::is_quoted_from_line(line) {
+            let next = &lines[index..(index + 6).min(lines.len())];
+            let has = |prefix: &str| next.iter().any(|(_, l)| l.trim().starts_with(prefix));
+            let subject = next
+                .iter()
+                .position(|(_, l)| l.trim().starts_with("Subject:"));
+            match subject {
+                Some(at) if has("Sent:") || has("Date:") => {
+                    let value = next[at].1.trim()["Subject:".len()..]
+                        .trim()
+                        .to_ascii_lowercase();
+                    if value.starts_with("fw:") || value.starts_with("fwd:") {
+                        return (raw, None);
+                    }
+                    Some(index + at + 1)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(header_end) = header_end else {
+            continue;
+        };
+        let head = &raw[..*start];
+        let quoted = lines[header_end..]
+            .iter()
+            .any(|(_, l)| !l.trim().is_empty());
+        if head.trim().is_empty() || !quoted {
+            return (raw, None);
+        }
+        return (head, Some(&raw[*start..]));
+    }
+    (raw, None)
+}
+
+/// Longest signature shown in place, as the HTML path does.
+const INLINE_SIGNATURE_LINES: usize = 2;
 
 fn split_blocks(raw: &str) -> Vec<BodyBlock> {
     let mut blocks = Vec::new();
@@ -83,7 +144,17 @@ fn split_blocks(raw: &str) -> Vec<BodyBlock> {
         }
         let joined = signature.join("\n");
         signature.clear();
-        if !joined.trim().is_empty() {
+        let lines = joined
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if lines == 0 {
+            return;
+        }
+        // A name and a line under it read faster than the fold hiding them.
+        if lines <= INLINE_SIGNATURE_LINES {
+            blocks.push(BodyBlock::Text(shared(joined.trim())));
+        } else {
             blocks.push(BodyBlock::Signature(shared(joined.trim())));
         }
     };
@@ -160,7 +231,7 @@ mod tests {
 
     #[test]
     fn quotes_and_signature_are_separate_blocks() {
-        let body = "Thanks.\n\n-- \nCaleb\n\n> older line\n> second";
+        let body = "Thanks.\n\n-- \nCaleb\nFell\nfell.test\n\n> older line\n> second";
         let rendered = render_stored_body(Some(body), "");
         assert!(matches!(rendered.blocks[0], BodyBlock::Text(_)));
         assert!(
@@ -173,6 +244,22 @@ mod tests {
             rendered.blocks.iter().any(
                 |block| matches!(block, BodyBlock::Quote(text) if text.contains("older line"))
             )
+        );
+    }
+
+    #[test]
+    fn a_short_signature_shows_in_place() {
+        let rendered = render_stored_body(Some("Thanks.\n\n-- \nCaleb\nFell"), "");
+        assert!(
+            rendered
+                .blocks
+                .iter()
+                .all(|block| matches!(block, BodyBlock::Text(_))),
+            "{:?}",
+            rendered.blocks
+        );
+        assert!(
+            matches!(&rendered.blocks[..], [_, BodyBlock::Text(text)] if text == "Caleb\nFell")
         );
     }
 
@@ -212,13 +299,63 @@ mod tests {
             })
             .unwrap();
         assert!(text.contains("still visible"));
-        let signed = render_stored_body(Some("Thanks.\n-- \nCaleb"), "");
+        let signed = render_stored_body(Some("Thanks.\n-- \nCaleb\nFell\nfell.test"), "");
         assert!(
             signed
                 .blocks
                 .iter()
                 .any(|block| matches!(block, BodyBlock::Signature(text) if text.contains("Caleb")))
         );
+    }
+
+    #[test]
+    fn an_outlook_header_folds_the_rest() {
+        let body = "Amen\n\nGet Outlook for Android\n\nFrom: Ada <ada@example.test>\nSent: Monday, January 5, 2026 9:00 AM\nTo: Jon\nSubject: Re: Plans\n\nEarlier text\n\nFrom: Jon\nSent: Sunday\nSubject: Plans\n\nEven earlier";
+        let rendered = render_stored_body(Some(body), "");
+        assert_eq!(rendered.blocks.len(), 2, "{:?}", rendered.blocks);
+        assert!(matches!(&rendered.blocks[0], BodyBlock::Text(text) if text.starts_with("Amen")));
+        assert!(matches!(&rendered.blocks[1], BodyBlock::Quote(text)
+            if text.starts_with("From: Ada") && text.ends_with("Even earlier")));
+        // A From: line that is not a header stays.
+        let note = render_stored_body(Some("From: the team, thanks.\nSee you."), "");
+        assert!(matches!(&note.blocks[..], [BodyBlock::Text(_)]));
+        // Header lines a sender typed, with no address, stay.
+        let template = render_stored_body(
+            Some(
+                "Use this:\n\nFrom: Support\nSent: daily\nSubject: Your ticket\n\nThen attach the log.",
+            ),
+            "",
+        );
+        assert!(
+            matches!(&template.blocks[..], [BodyBlock::Text(_)]),
+            "{:?}",
+            template.blocks
+        );
+        // A header over nothing quotes nothing.
+        let empty = render_stored_body(
+            Some("Notes.\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: x\n"),
+            "",
+        );
+        assert!(
+            matches!(&empty.blocks[..], [BodyBlock::Text(_)]),
+            "{:?}",
+            empty.blocks
+        );
+        // A forward stays open.
+        let forward = render_stored_body(
+            Some(
+                "See below.\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: FW: Plans\n\nThe plan.",
+            ),
+            "",
+        );
+        assert!(
+            matches!(&forward.blocks[..], [BodyBlock::Text(_)]),
+            "{:?}",
+            forward.blocks
+        );
+        // Nothing above the header: nothing is folded.
+        let bare = render_stored_body(Some("From: Ada\nSent: Mon\nSubject: x\n\nHi"), "");
+        assert!(matches!(&bare.blocks[..], [BodyBlock::Text(_)]));
     }
 
     #[test]

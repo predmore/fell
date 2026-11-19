@@ -56,11 +56,12 @@ pub use send::{
 };
 pub use smtp::SmtpConfig;
 pub use store::{
-    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, Participant, SearchPage,
-    Store, ThreadList, ThreadSummary, folder_aliases,
+    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, Participant,
+    SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,
 };
 pub use sync::{
-    SyncReport, fetch_message_body, fetch_missing_bodies, sync_once, sync_with_progress,
+    SyncReport, fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once,
+    sync_with_progress,
 };
 pub use threading::{ThreadId, header_parent_thread_id, resolve_thread_id};
 
