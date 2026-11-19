@@ -137,12 +137,9 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
 /// UIDs from `low` to `high` that have a stored copy in `mailbox` (escaped
 /// as remote ids spell it) under `uidvalidity`, ascending.
 ///
-/// A copy counts only while its flags have somewhere to land: its row, or
-/// the snapshot of an open action that deleted the row (undo restores it).
-/// Any other copy is fetched again like new mail, so a flag change on it is
-/// never dropped while the checkpoint moves past it. A row that has only
-/// its headers (a first sync stopped before its body came) does not count
-/// either, so the next pass fetches the body.
+/// A copy counts when its row has a body, an undo snapshot accepts flag
+/// updates, or a purge tombstone suppresses the copy. The next pass
+/// fetches a body for a header-only row that still needs one.
 pub(super) fn stored_uids(
     conn: &Connection,
     account_id: &AccountId,
@@ -150,12 +147,17 @@ pub(super) fn stored_uids(
     uidvalidity: u32,
     (low, high): (u32, u32),
 ) -> Result<Vec<u32>> {
-    let snapshot = if table_exists(conn, "local_action_messages")? {
+    let local = if table_exists(conn, "local_action_messages")? {
         "OR EXISTS (
              SELECT 1 FROM local_action_messages s
              JOIN local_actions a ON a.id = s.action_id
              WHERE a.account_id = c.account_id AND a.undone = 0
                AND s.message_id = c.message_id
+         ) OR EXISTS (
+             SELECT 1 FROM local_folder_tombstones t
+             JOIN local_actions a ON a.id = t.action_id
+             WHERE t.account_id = c.account_id AND t.message_id = c.message_id
+               AND t.folder = c.folder COLLATE NOCASE AND a.kind = 'purge'
          )"
     } else {
         ""
@@ -177,7 +179,7 @@ pub(super) fn stored_uids(
                          )
                      )
                )
-               {snapshot}
+               {local}
            )
          ORDER BY c.uid"
     ))?;
