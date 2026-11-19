@@ -561,6 +561,36 @@ mod tests {
     }
 
     #[test]
+    fn a_purge_retires_only_the_affected_messages_in_a_flag_action() {
+        let (store, account) = store();
+        let mut purged = message("remove@x", None, "Trash", 100);
+        purged.folders.push("Sent".into());
+        let purged = store.upsert_message(&purged).unwrap();
+        let mut unaffected = message("keep@x", None, "INBOX", 200);
+        unaffected.headers.subject = "Unrelated mail".into();
+        let unaffected = store.upsert_message(&unaffected).unwrap();
+        store
+            .flag_threads(
+                &account,
+                &[purged.clone(), unaffected.clone()],
+                "INBOX",
+                FlagChange::Star,
+            )
+            .unwrap()
+            .unwrap();
+
+        store
+            .purge_threads(&account, std::slice::from_ref(&purged), "Trash")
+            .unwrap();
+        assert_eq!(store.undo(&account).unwrap().kind, ActionKind::Star);
+        assert!(
+            flags(&store, &account, &purged)[0].1,
+            "the Sent copy stays starred"
+        );
+        assert!(!flags(&store, &account, &unaffected)[0].1);
+    }
+
+    #[test]
     fn an_unknown_thread_is_an_error() {
         let (store, account) = store();
         let err = store

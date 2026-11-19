@@ -515,6 +515,7 @@ impl Store {
         if version < 5 {
             bodies::queue_unlisted_mail(&conn)?;
         }
+        crate::actions::migrate_purge_snapshots(&conn)?;
         Ok(Self {
             indexer: None,
             semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
