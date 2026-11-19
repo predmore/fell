@@ -415,6 +415,7 @@ mod tests {
             }),
             settle: crate::backend::Settle::All,
             roles: None,
+            progress: None,
         };
         store.apply_delta(&account_id, &end).unwrap();
 

@@ -612,6 +612,20 @@ impl Inbox {
                 .find(|row| &row.id == id)
                 .map(|row| row.message_count)
         });
+        // A first sync stores a row from its headers, then its body. When
+        // the body of the open conversation lands, it opens again as if
+        // just chosen, at its top: a pane with no body yet is not a reader
+        // who scrolled to the end.
+        let snippet_of = |rows: &[ThreadRow], id: &String| {
+            rows.iter()
+                .find(|row| &row.id == id)
+                .map(|row| row.snippet.clone())
+        };
+        let filled = self.open_thread.as_ref().is_some_and(|id| {
+            let before = snippet_of(&self.session.threads, id);
+            let after = snippet_of(&rows, id);
+            before.as_deref() == Some("") && after.is_some_and(|snippet| !snippet.is_empty())
+        });
         self.session.set_page(rows, more_before, more_after, unread);
         if let Some(key) = &intent.select {
             self.session.select_if_present(&key.thread_id.0);
@@ -652,7 +666,7 @@ impl Inbox {
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
         // A draft's preview follows its edits.
-        if open_changed || grew || self.session.cursor_draft().is_some() {
+        if open_changed || grew || filled || self.session.cursor_draft().is_some() {
             self.request_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
@@ -2854,8 +2868,11 @@ fn thread_line_two(
         FontWeight::NORMAL,
         Some(snippet_color),
     );
+    // As tall as line one whatever it holds, so a row whose body has not
+    // synced yet (no snippet) does not move when its snippet fills in.
     div()
         .w(px(text_width))
+        .h(px(22.))
         .flex()
         .flex_row()
         .items_center()

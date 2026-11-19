@@ -140,7 +140,9 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
 /// A copy counts only while its flags have somewhere to land: its row, or
 /// the snapshot of an open action that deleted the row (undo restores it).
 /// Any other copy is fetched again like new mail, so a flag change on it is
-/// never dropped while the checkpoint moves past it.
+/// never dropped while the checkpoint moves past it. A row that has only
+/// its headers (a first sync stopped before its body came) does not count
+/// either, so the next pass fetches the body.
 pub(super) fn stored_uids(
     conn: &Connection,
     account_id: &AccountId,
@@ -166,6 +168,14 @@ pub(super) fn stored_uids(
                EXISTS (
                    SELECT 1 FROM messages m
                    WHERE m.account_id = c.account_id AND m.message_id = c.message_id
+                     AND (
+                         m.body_text IS NOT NULL
+                         OR EXISTS (
+                             SELECT 1 FROM message_bodies b
+                             WHERE b.account_id = m.account_id
+                               AND b.message_id = m.message_id
+                         )
+                     )
                )
                {snapshot}
            )

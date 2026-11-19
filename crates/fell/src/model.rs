@@ -25,6 +25,8 @@ pub enum SyncKind {
     /// Messages written so far in this pass.
     Syncing {
         stored: usize,
+        /// The first sync of a folder under way, read newest first.
+        progress: Option<fell_core::SyncProgress>,
     },
     /// Unix time the last pass finished, and how many messages it wrote.
     Synced {
@@ -32,6 +34,19 @@ pub enum SyncKind {
         stored: usize,
     },
     Failed(SyncFailure),
+}
+
+/// `31882` as `31,882`.
+fn grouped(count: u32) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,8 +73,17 @@ impl SyncKind {
             Self::FirstSync => "no account".into(),
             Self::StoreError => "mailbox error".into(),
             Self::Connecting => "connecting…".into(),
-            Self::Syncing { stored: 0 } => "syncing…".into(),
-            Self::Syncing { stored } => format!("syncing · {stored} new"),
+            Self::Syncing {
+                progress: Some(progress),
+                ..
+            } => format!(
+                "syncing {} · {} of {}",
+                progress.folder,
+                grouped(progress.done),
+                grouped(progress.total)
+            ),
+            Self::Syncing { stored: 0, .. } => "syncing…".into(),
+            Self::Syncing { stored, .. } => format!("syncing · {stored} new"),
             Self::Synced { at, .. } => {
                 let ago = now.saturating_sub(*at).max(0);
                 if ago < 60 {
@@ -1738,7 +1762,7 @@ impl Session {
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
                 title: format!("Syncing {}", self.folder_title()),
                 hint: match &self.sync {
-                    SyncKind::Syncing { stored } if *stored > 0 => {
+                    SyncKind::Syncing { stored, .. } if *stored > 0 => {
                         format!("{stored} messages stored · conversations appear as they arrive")
                     }
                     _ => "Conversations appear as they arrive".into(),
@@ -1810,6 +1834,33 @@ mod tests {
     use super::*;
     use crate::keymap::keymap_from_text;
     use crate::present::NameSpan;
+
+    #[test]
+    fn a_first_sync_names_its_folder_and_how_far_it_is() {
+        let syncing = SyncKind::Syncing {
+            stored: 12,
+            progress: Some(fell_core::SyncProgress {
+                folder: "Inbox".into(),
+                done: 4_210,
+                total: 31_882,
+            }),
+        };
+        assert_eq!(syncing.status_at(0), "syncing Inbox · 4,210 of 31,882");
+        let catching_up = SyncKind::Syncing {
+            stored: 3,
+            progress: None,
+        };
+        assert_eq!(catching_up.status_at(0), "syncing · 3 new");
+        assert!(!syncing.is_error());
+        for (count, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(grouped(count), text);
+        }
+    }
 
     fn row(id: &str) -> ThreadRow {
         ThreadRow {

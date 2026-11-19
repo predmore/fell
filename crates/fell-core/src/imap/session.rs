@@ -51,6 +51,8 @@ pub(super) struct Fetched {
     /// `BODY[]` was not a literal, quoted string, or NIL, so the bytes were
     /// never read. The checkpoint must stay below this UID.
     pub body_missing: bool,
+    /// `RFC822.SIZE`, when the reply had it.
+    pub size: Option<u32>,
 }
 
 /// One reply to [`Session::uid_fetch_part`].
@@ -91,6 +93,9 @@ pub(super) enum FetchItems {
     Flags,
     /// `UID FLAGS BODY.PEEK[]`: the whole message, for mail not stored yet.
     Bodies,
+    /// `UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]`: enough for a list row and
+    /// threading, before the body is fetched.
+    Headers,
 }
 
 /// A UID and the header bytes fetched for it.
@@ -311,6 +316,7 @@ impl Session {
         let wanted = match items {
             FetchItems::Flags => "(UID FLAGS)",
             FetchItems::Bodies => "(UID FLAGS BODY.PEEK[])",
+            FetchItems::Headers => "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])",
         };
         let cmd = match changed_since {
             Some(modseq) if self.qresync => {
@@ -350,7 +356,7 @@ impl Session {
                 continue;
             }
             let fetched = match items {
-                FetchItems::Bodies => parse_fetch(&text, literals),
+                FetchItems::Bodies | FetchItems::Headers => parse_fetch(&text, literals),
                 FetchItems::Flags => parse_flags(&text),
             };
             if let Some(fetched) = fetched {
@@ -1624,6 +1630,7 @@ fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
         body,
         skipped,
         body_missing,
+        size: number_after(&upper, "RFC822.SIZE "),
     })
 }
 
@@ -1642,6 +1649,7 @@ fn parse_flags(text: &str) -> Option<Fetched> {
         body: Vec::new(),
         skipped: false,
         body_missing: false,
+        size: None,
     })
 }
 

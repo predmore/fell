@@ -180,6 +180,38 @@ pub(crate) fn to_message(
     }
 }
 
+/// A list row from a message's header alone, before its body is fetched.
+///
+/// It has no snippet, body or parts, so the store writes no body row for it
+/// and the fetch of the whole message fills them in place. The attachment
+/// marker waits for the body too: telling a file from an inline image needs
+/// the HTML.
+pub(crate) fn headers_message(
+    account_id: &AccountId,
+    mailbox_raw: &str,
+    folder: &str,
+    uidvalidity: u32,
+    uid: u32,
+    flags: &[String],
+    header: &[u8],
+) -> Message {
+    let mut message = to_message(
+        account_id,
+        mailbox_raw,
+        folder,
+        uidvalidity,
+        uid,
+        flags,
+        header,
+    );
+    message.snippet.clear();
+    message.body_text = None;
+    message.parts = None;
+    message.has_attachment = false;
+    message.attachment_names.clear();
+    message
+}
+
 /// Header names the renderer's bulk-mail check reads, matched exactly
 /// (ASCII case-insensitive).
 const BULK_HEADERS: &[&str] = &[

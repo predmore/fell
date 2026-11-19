@@ -34,8 +34,8 @@ pub use agent::{
 };
 pub use backend::{
     BridgeBackend, FetchedBody, FixtureBackend, FolderRemoval, ImapBackend, KnownCopies,
-    MailBackend, MailboxDelta, ProtonApiBackend, RemovalKind, Settle, SyncCursor, backend_for,
-    is_demo_account,
+    MailBackend, MailboxDelta, ProtonApiBackend, RemovalKind, Settle, SyncCursor, SyncProgress,
+    backend_for, is_demo_account,
 };
 pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,

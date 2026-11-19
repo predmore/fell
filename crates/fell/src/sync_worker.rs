@@ -200,6 +200,7 @@ fn run(
                     last_progress = Some(Instant::now());
                     alive &= send(SyncKind::Syncing {
                         stored: report.upserted,
+                        progress: report.progress.clone(),
                     });
                 }
             })

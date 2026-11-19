@@ -547,6 +547,37 @@ fn handle(
                         );
                         continue;
                     }
+                    if upper_cmd.contains("BODY.PEEK[HEADER]") {
+                        if matches!(message.body_form, BodyForm::Omitted) {
+                            continue;
+                        }
+                        let flags = message.flags.join(" ");
+                        if matches!(message.body_form, BodyForm::Absent) {
+                            let _ = write.write_all(
+                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
+                                    .as_bytes(),
+                            );
+                            continue;
+                        }
+                        let end = message
+                            .raw
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map_or(message.raw.len(), |at| at + 4);
+                        let header = &message.raw[..end];
+                        let _ = write.write_all(
+                            format!(
+                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}) BODY[HEADER] {{{}}}\r\n",
+                                message.uid,
+                                message.raw.len(),
+                                header.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = write.write_all(header);
+                        let _ = write.write_all(b")\r\n");
+                        continue;
+                    }
                     if !upper_cmd.contains("BODY") {
                         if upper_cmd.contains("FLAGS") {
                             let flags = message.flags.join(" ");
