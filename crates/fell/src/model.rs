@@ -9,7 +9,7 @@ use fell_core::compose::ReplyKind;
 use fell_core::{FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
-use crate::present::{ConvMessage, Pane, ThreadRow, merge_folders};
+use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, merge_folders};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
@@ -109,7 +109,14 @@ pub enum FolderIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
     pub text: String,
-    pub error: bool,
+    pub alert: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PurgePrompt {
+    ids: Vec<String>,
+    folder: String,
+    notice: u64,
 }
 
 /// Rows the list wants from the store beyond the ones it holds. The view
@@ -299,11 +306,11 @@ pub struct Session {
     toast_generation: u64,
     /// Destination chosen by `m`, consumed when the view applies the move.
     pub pending_move: Option<String>,
-    /// `#` in Trash asked "Delete permanently?" about these threads, in the
+    /// `#` in Trash asked to remove these threads from Fell, in the
     /// notice of this generation. The next key answers: `y` deletes them,
     /// anything else lets it go. A notice that replaced the question
     /// withdraws it, so `y` never answers a question no longer on screen.
-    pub confirm_purge: Option<(Vec<String>, u64)>,
+    confirm_purge: Option<PurgePrompt>,
     /// The threads `y` confirmed, consumed when the view deletes them.
     purge_ready: Option<Vec<String>>,
     /// The folder on screen has not been read from the store yet.
@@ -367,11 +374,11 @@ impl Session {
         }
     }
 
-    pub fn show_toast(&mut self, text: impl Into<String>, error: bool) {
+    pub fn show_toast(&mut self, text: impl Into<String>, alert: bool) {
         self.toast_generation = self.toast_generation.wrapping_add(1);
         self.toast = Some(Toast {
             text: text.into(),
-            error,
+            alert,
         });
     }
 
@@ -390,6 +397,7 @@ impl Session {
     pub fn clear_toast_if(&mut self, generation: u64) -> bool {
         if self.toast.is_some() && self.toast_generation == generation {
             self.toast = None;
+            self.confirm_purge = None;
             return true;
         }
         false
@@ -584,41 +592,53 @@ impl Session {
     }
 
     pub fn highlighted(&self) -> HashSet<String> {
+        if let Some(rows) = self.visual_rows() {
+            return rows.iter().map(|row| row.id.clone()).collect();
+        }
         let mut ids = self.picked.clone();
         if let Some(id) = &self.cursor_id
             && self.threads.iter().any(|thread| &thread.id == id)
         {
             ids.insert(id.clone());
         }
-        if !self.visual || self.threads.is_empty() {
-            return ids;
-        }
-        let Some(anchor) = self
-            .threads
-            .iter()
-            .position(|thread| Some(&thread.id) == self.anchor_id.as_ref())
-        else {
-            return ids;
-        };
-        let cursor = self.cursor_index().min(self.threads.len() - 1);
-        let (lo, hi) = if anchor <= cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        };
-        for thread in &self.threads[lo..=hi] {
-            ids.insert(thread.id.clone());
-        }
         ids
     }
 
-    /// What `#` and `!` act on: the picked rows and the visual range when
-    /// there are any, else the selected row. In list order.
+    fn visual_rows(&self) -> Option<&[ThreadRow]> {
+        if !self.visual {
+            return None;
+        }
+        let anchor = self
+            .threads
+            .iter()
+            .position(|thread| Some(&thread.id) == self.anchor_id.as_ref())?;
+        let cursor = self
+            .threads
+            .iter()
+            .position(|thread| Some(&thread.id) == self.cursor_id.as_ref())?;
+        Some(&self.threads[anchor.min(cursor)..=anchor.max(cursor)])
+    }
+
+    /// What `#` and `!` act on, in list order. A visual range takes
+    /// precedence over picks. The cursor supplies a target for single-row use.
     pub fn action_targets(&self) -> Vec<String> {
-        let marked = self.highlighted();
+        if self.visual {
+            return self
+                .visual_rows()
+                .unwrap_or_default()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect();
+        }
         self.threads
             .iter()
-            .filter(|thread| marked.contains(&thread.id))
+            .filter(|thread| {
+                if self.picked.is_empty() {
+                    Some(&thread.id) == self.cursor_id.as_ref()
+                } else {
+                    self.picked.contains(&thread.id)
+                }
+            })
             .map(|thread| thread.id.clone())
             .collect()
     }
@@ -626,6 +646,12 @@ impl Session {
     /// The threads `y` confirmed for a permanent delete, once.
     pub fn take_purge(&mut self) -> Option<Vec<String>> {
         self.purge_ready.take()
+    }
+
+    fn withdraw_purge(&mut self) {
+        if let Some(prompt) = self.confirm_purge.take() {
+            self.clear_toast_if(prompt.notice);
+        }
     }
 
     /// The folder on screen is the account's Trash.
@@ -657,6 +683,15 @@ impl Session {
             .as_ref()
             .and_then(|id| self.threads.iter().position(|thread| &thread.id == id));
         self.threads = threads;
+        if self.confirm_purge.as_ref().is_some_and(|prompt| {
+            prompt.folder != self.folder
+                || !prompt
+                    .ids
+                    .iter()
+                    .all(|id| self.threads.iter().any(|row| &row.id == id))
+        }) {
+            self.withdraw_purge();
+        }
         if let Some(id) = &previous {
             if self.threads.iter().any(|thread| &thread.id == id) {
                 self.cursor_id = Some(id.clone());
@@ -787,6 +822,7 @@ impl Session {
     /// Forget rows and cursor moves that belong to the folder on screen.
     /// A folder switch calls this.
     pub fn forget_window(&mut self) {
+        self.withdraw_purge();
         self.more_before = false;
         self.more_after = false;
         self.fetch = None;
@@ -1227,13 +1263,14 @@ impl Session {
         }
         // The question is asked once: any key answers it. `y` deletes;
         // Escape and `n` only let it go; any other key does what it does.
-        if let Some((ids, asked)) = self.confirm_purge.take()
-            && asked == self.toast_generation
+        if let Some(prompt) = self.confirm_purge.take()
+            && prompt.notice == self.toast_generation
+            && prompt.folder == self.folder
         {
             match key {
                 KeyId::Char('y') => {
                     self.count.clear();
-                    self.purge_ready = Some(ids);
+                    self.purge_ready = Some(prompt.ids);
                     return Step {
                         purge: true,
                         ..Step::default()
@@ -1589,11 +1626,15 @@ impl Session {
                 }
                 // Destructive and not undoable: ask, and show the answer key.
                 let question = match targets.len() {
-                    1 => "Delete permanently? It can't be undone · y".to_string(),
-                    n => format!("Delete {n} permanently? They can't be undone · y"),
+                    1 => format!("Remove from Fell only?{NOTICE_DOT}No undo{NOTICE_DOT}y"),
+                    n => format!("Remove {n} from Fell only?{NOTICE_DOT}No undo{NOTICE_DOT}y"),
                 };
-                self.show_toast(question, false);
-                self.confirm_purge = Some((targets, self.toast_generation));
+                self.show_toast(question, true);
+                self.confirm_purge = Some(PurgePrompt {
+                    ids: targets,
+                    folder: self.folder.clone(),
+                    notice: self.toast_generation,
+                });
             }
             Action::Undo => {
                 self.count.clear();
@@ -1786,9 +1827,7 @@ impl Session {
         self.chord.clear();
         self.note_chord();
         // A click withdraws the permanent-delete question, and it leaves.
-        if let Some((_, asked)) = self.confirm_purge.take() {
-            self.clear_toast_if(asked);
-        }
+        self.withdraw_purge();
     }
 
     fn clear_chord(&mut self) {
@@ -1882,7 +1921,7 @@ impl Session {
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
                 title: format!("No conversations in {}", self.folder_title()),
-                hint: "gi inbox · gf folders".into(),
+                hint: String::new(),
             },
         })
     }
@@ -2178,10 +2217,11 @@ mod tests {
         picked.cursor_id = Some("c".into());
         picked.on_key(KeyId::Char('x'), 4);
         picked.cursor_id = Some("e".into());
-        assert_eq!(picked.action_targets(), vec!["a", "c", "e"]);
+        assert_eq!(picked.action_targets(), vec!["a", "c"]);
         assert!(picked.on_key(KeyId::Char('#'), 4).delete);
 
         let mut session = session();
+        session.picked.insert("a".into());
         session.cursor_id = Some("b".into());
         session.on_key(KeyId::Char('V'), 4);
         session.on_key(KeyId::Char('j'), 4);
@@ -2232,24 +2272,40 @@ mod tests {
         assert!(!step.delete && !step.purge, "nothing happens before y");
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Delete 2 permanently? They can't be undone · y")
+            Some("Remove from Fell only?  ·  No undo  ·  y")
         );
+        assert!(session.toast.as_ref().unwrap().alert);
         // The view clears the notice before every key, as it does here.
         session.clear_toast();
         let step = session.on_key(KeyId::Char('y'), 4);
         assert!(step.purge && !step.delete);
-        assert_eq!(session.take_purge(), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(session.take_purge(), Some(vec!["a".into()]));
         assert_eq!(session.take_purge(), None);
         // `y` again answers nothing.
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
 
-        // One row says so in the singular.
-        session.picked.clear();
+        // Another picked row changes the count. An unpicked cursor does not.
+        session.picked.insert("c".into());
         session.on_key(KeyId::Char('#'), 4);
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Delete permanently? It can't be undone · y")
+            Some("Remove 2 from Fell only?  ·  No undo  ·  y")
         );
+    }
+
+    #[test]
+    fn replacing_the_confirmed_page_or_expiring_the_prompt_prevents_purge() {
+        let mut session = session();
+        session.folder = "Trash".into();
+        session.picked.extend(["a".to_string(), "b".to_string()]);
+        session.on_key(KeyId::Char('#'), 4);
+        session.set_threads(vec![row("b"), row("c")]);
+        assert!(session.toast.is_none());
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        session.on_key(KeyId::Char('#'), 4);
+        assert!(session.clear_toast_if(session.toast_generation()));
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
     }
 
     #[test]
@@ -2501,7 +2557,7 @@ mod tests {
         session.folder = "Archive".into();
         let banner = session.list_banner().unwrap();
         assert!(banner.title.contains("Archive"));
-        assert!(banner.hint.contains("gi"));
+        assert!(banner.hint.is_empty());
         // An empty drafts list says how to start one.
         session.folder = "Drafts".into();
         let banner = session.list_banner().unwrap();

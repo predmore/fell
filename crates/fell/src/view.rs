@@ -1418,8 +1418,8 @@ impl Inbox {
                 &self.session.folder_text(roles.name(FolderRole::Junk)),
             ),
             Removal::Purge => match count {
-                1 => "Deleted permanently".to_string(),
-                n => format!("Deleted {n} permanently"),
+                1 => "Removed from Fell".to_string(),
+                n => format!("Removed {n} from Fell"),
             },
         };
         let account = self.account_id.clone();
@@ -3185,13 +3185,10 @@ fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
                     .unwrap_or_default(),
             ),
         )
-        .child(
-            div().text_color(rgb(theme.dimmed)).child(
-                banner
-                    .as_ref()
-                    .map(|item| item.hint.clone())
-                    .unwrap_or_default(),
-            ),
+        .children(
+            banner
+                .filter(|item| !item.hint.is_empty())
+                .map(|item| div().text_color(rgb(theme.dimmed)).child(item.hint)),
         )
 }
 
@@ -3758,7 +3755,7 @@ fn status_bar(
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
-            .text_color(rgb(if toast.error {
+            .text_color(rgb(if toast.alert {
                 theme.error
             } else {
                 theme.foreground
