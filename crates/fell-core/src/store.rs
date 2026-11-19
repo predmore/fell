@@ -638,6 +638,11 @@ impl Store {
         // stored modseq means the server would not send that flag again.
         // Once local flag intents (#161) keep the user's state apart from
         // the server's, the flags could be committed in slices.
+        for message_id in &delta.too_large {
+            if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
+                bodies::mark_withheld(&tx, account_id, &canonical)?;
+            }
+        }
         for flag in &delta.flags {
             #[cfg(test)]
             self.stop_among_flags()?;
@@ -672,6 +677,19 @@ impl Store {
         tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
+    /// returns them) has its body yet, in the same order.
+    pub fn body_states(
+        &self,
+        account_id: &AccountId,
+        messages: &[MessageId],
+    ) -> Result<Vec<crate::BodyState>> {
+        messages
+            .iter()
+            .map(|id| bodies::state(&self.conn, account_id, id.as_str()))
+            .collect()
     }
 
     /// UIDs from `low` to `high` with a stored copy in one mailbox (named as

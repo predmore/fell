@@ -394,3 +394,198 @@ fn newest_inbox_threads_of_a_large_mailbox_arrive_quickly() {
     eprintln!("newest 50 INBOX threads stored {elapsed:?} after login began");
     assert!(elapsed <= Duration::from_secs(3), "{elapsed:?}");
 }
+
+#[test]
+fn a_body_too_large_to_keep_is_marked_and_not_asked_for_again() {
+    let _sizes = set_windows(SMALL);
+    let mut inbox = folder("INBOX", "", 3, "In", 30);
+    let big = inbox
+        .messages
+        .iter_mut()
+        .find(|message| message.uid == 25)
+        .unwrap();
+    big.raw.extend(std::iter::repeat_n(b'Q', 4_000));
+    big.raw.extend_from_slice(b"\r\n");
+    let _limit = super::session::limit_literals_to(2_000);
+    let server = TestServer::spawn(state_with(vec![inbox]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let acct = account("a1", BackendKind::Imap);
+    sync_once(&acct, &backend, &store).unwrap();
+
+    // The row keeps its headers and says why it has no body.
+    let ids = [
+        crate::MessageId::new("In25@x"),
+        crate::MessageId::new("In24@x"),
+    ];
+    let row = stored(&store, &acct, "In25@x").expect("the row stays");
+    assert_eq!(row.headers.subject, "In 25");
+    assert_eq!(
+        store.body_states(&acct.id, &ids).unwrap(),
+        vec![crate::BodyState::TooLarge, crate::BodyState::Stored]
+    );
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    for (name, checkpoint) in decode_cursor(cursor.as_ref()) {
+        assert_eq!(checkpoint.floor, None, "{name} is read to the oldest");
+    }
+
+    // Later passes count it as read and never download it again.
+    server.state.lock().expect("state").commands.clear();
+    let again = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(again.upserted, 0);
+    assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
+    assert!(store.missing_bodies(&acct.id, 100).unwrap().is_empty());
+}
+
+#[test]
+fn a_header_row_still_waiting_for_its_body_reads_as_pending() {
+    let _sizes = set_windows(SMALL);
+    let server = TestServer::spawn(state_with(vec![folder("INBOX", "", 3, "In", 30)]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    // Stop once the newest window's headers are stored, before its bodies.
+    let (_, result) = run_pass(&backend, &store, &mut |delta| {
+        !delta.messages.is_empty() && delta.messages.iter().all(headers_only)
+    });
+    assert!(result.is_err());
+    let acct = account("a1", BackendKind::Imap);
+    assert_eq!(
+        store
+            .body_states(&acct.id, &[crate::MessageId::new("In30@x")])
+            .unwrap(),
+        vec![crate::BodyState::Pending]
+    );
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(
+        store
+            .body_states(&acct.id, &[crate::MessageId::new("In30@x")])
+            .unwrap(),
+        vec![crate::BodyState::Stored]
+    );
+}
+
+#[test]
+fn a_uidvalidity_change_between_visits_starts_the_mailbox_over() {
+    let _sizes = set_windows(SMALL);
+    let server = TestServer::spawn(state_with(vec![
+        folder("INBOX", "", 3, "In", 200),
+        folder("Sent", "\\Sent", 4, "Out", 30),
+    ]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    // While Sent is read, the server renumbers the Inbox.
+    let state = server.state.clone();
+    let mut renumbered = false;
+    let (_, result) = run_pass(&backend, &store, &mut |delta| {
+        if !renumbered
+            && delta
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.folder == "Sent")
+        {
+            renumbered = true;
+            let mut state = state.lock().expect("state");
+            let inbox = state
+                .mailboxes
+                .iter_mut()
+                .find(|mailbox| mailbox.name == "INBOX")
+                .unwrap();
+            inbox.uidvalidity = 7;
+        }
+        false
+    });
+    result.unwrap();
+    assert!(renumbered);
+
+    let acct = account("a1", BackendKind::Imap);
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let inbox = decode_cursor(cursor.as_ref())
+        .into_iter()
+        .find(|(name, _)| name == "INBOX")
+        .map(|(_, checkpoint)| checkpoint)
+        .unwrap();
+    assert_eq!(inbox.uidvalidity, 7, "the walk went on under the new UIDs");
+    assert_eq!(inbox.floor, None);
+    // Every Inbox message is stored under the new UIDVALIDITY, with its body.
+    assert_eq!(
+        store.stored_uids(&acct.id, "INBOX", 7, (1, 200)).unwrap(),
+        (1..=200).collect::<Vec<_>>()
+    );
+    assert!(
+        store
+            .stored_uids(&acct.id, "INBOX", 3, (1, 200))
+            .unwrap()
+            .is_empty(),
+        "no copy is left under the old UIDVALIDITY"
+    );
+}
+
+#[test]
+fn without_condstore_a_flag_changed_during_the_walk_is_applied_at_its_end() {
+    let _sizes = set_windows(SMALL);
+    let server = TestServer::spawn(state_with(vec![
+        folder("INBOX", "", 3, "In", 200),
+        folder("Sent", "\\Sent", 4, "Out", 30),
+    ]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    // The newest Inbox message is read on another device while Sent is
+    // read, after its window was stored as unread.
+    let state = server.state.clone();
+    let mut read_elsewhere = false;
+    let (_, result) = run_pass(&backend, &store, &mut |delta| {
+        if !read_elsewhere
+            && delta
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.folder == "Sent")
+        {
+            read_elsewhere = true;
+            let mut state = state.lock().expect("state");
+            let inbox = state
+                .mailboxes
+                .iter_mut()
+                .find(|mailbox| mailbox.name == "INBOX")
+                .unwrap();
+            let newest = inbox
+                .messages
+                .iter_mut()
+                .find(|message| message.uid == 200)
+                .unwrap();
+            newest.flags.push("\\Seen".into());
+        }
+        false
+    });
+    result.unwrap();
+    assert!(read_elsewhere);
+    let acct = account("a1", BackendKind::Imap);
+    let newest = stored(&store, &acct, "In200@x").unwrap();
+    assert!(!newest.unread, "the change made during the walk landed");
+    assert!(stored(&store, &acct, "In199@x").unwrap().unread);
+}
+
+#[test]
+fn with_no_sent_role_the_sent_folder_by_name_is_read_early() {
+    let _sizes = set_windows(SMALL);
+    // The server marks Trash but not Sent, so no folder has the Sent role.
+    let server = TestServer::spawn(state_with(vec![
+        folder("INBOX", "", 3, "In", 200),
+        folder("Sent", "", 4, "Out", 100),
+        folder("Trash", "\\Trash", 5, "Bin", 100),
+    ]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let (_, result) = run_pass(&backend, &store, &mut |_| false);
+    result.unwrap();
+    let examined: Vec<String> = commands(&server)
+        .iter()
+        .filter_map(|line| {
+            line.split_once(" EXAMINE \"")
+                .map(|(_, rest)| rest.split('"').next().unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(
+        examined,
+        vec!["INBOX", "Sent", "INBOX", "Trash", "Sent", "Trash"]
+    );
+}

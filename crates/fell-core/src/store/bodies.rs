@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     bulk_headers TEXT NOT NULL DEFAULT '',
     -- 1 once message_parts holds this message's part list (maybe none).
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    -- 1 when sync kept no body: the message is larger than it downloads.
+    withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
 );
 
@@ -96,6 +98,11 @@ pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
     if !has_column(conn, "message_bodies", "parts_listed")? {
         conn.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if !has_column(conn, "message_bodies", "withheld")? {
+        conn.execute_batch(
+            "ALTER TABLE message_bodies ADD COLUMN withheld INTEGER NOT NULL DEFAULT 0",
         )?;
     }
     Ok(())
@@ -479,7 +486,8 @@ pub(super) fn write(
                 codec = excluded.codec,
                 html = excluded.html,
                 plain = excluded.plain,
-                bulk_headers = excluded.bulk_headers"
+                bulk_headers = excluded.bulk_headers,
+                withheld = 0"
         }
         // Nothing to replace with: only record a row when there is none.
         Write::Replace => {
@@ -520,8 +528,71 @@ const FILL_GAP_SQL: &str = "INSERT INTO message_bodies
         html = COALESCE(message_bodies.html, excluded.html),
         plain = COALESCE(message_bodies.plain, excluded.plain),
         bulk_headers = CASE WHEN message_bodies.bulk_headers = ''
-            THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END
+            THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END,
+        withheld = CASE WHEN excluded.html IS NOT NULL OR excluded.plain IS NOT NULL
+            THEN 0 ELSE message_bodies.withheld END
      WHERE message_bodies.codec = excluded.codec";
+
+/// Record that sync kept no body for `message_id` because it is larger than
+/// sync downloads, so later passes count the copy as read and the reader
+/// can say why there is no body. A body stored already is kept.
+pub(super) fn mark_withheld(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO message_bodies (account_id, message_id, codec, withheld)
+         VALUES (?1, ?2, ?3, 1)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET withheld = 1
+         WHERE message_bodies.html IS NULL AND message_bodies.plain IS NULL",
+        params![account_id.as_str(), message_id, CODEC_DEFLATE],
+    )?;
+    conn.execute(
+        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    Ok(())
+}
+
+/// Whether a stored message has its body: see [`crate::BodyState`]. A row
+/// with no body text, no snippet and no `message_bodies` row is one a
+/// first sync listed from its headers; mail with no server copy (a local
+/// write) is never pending.
+pub(super) fn state(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<crate::BodyState> {
+    let row = conn
+        .prepare_cached(
+            "SELECT m.body_text IS NULL AND m.snippet = '',
+                    b.message_id IS NOT NULL,
+                    IFNULL(b.withheld, 0),
+                    EXISTS (
+                        SELECT 1 FROM message_copies c
+                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+                    )
+             FROM messages m
+             LEFT JOIN message_bodies b
+               ON b.account_id = m.account_id AND b.message_id = m.message_id
+             WHERE m.account_id = ?1 AND m.message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| {
+            Ok((
+                row.get::<_, bool>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .optional()?;
+    Ok(match row {
+        Some((_, _, 1, _)) => crate::BodyState::TooLarge,
+        Some((true, false, _, true)) => crate::BodyState::Pending,
+        _ => crate::BodyState::Stored,
+    })
+}
 
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
 /// parts it lacks from `from`, as stored. `to` leaves the backfill queue

@@ -107,6 +107,10 @@ pub struct MailboxDelta {
     pub roles: Option<crate::folders::FolderRoles>,
     /// How far a first sync of one folder has come, while one runs.
     pub progress: Option<SyncProgress>,
+    /// Messages whose body sync read and did not keep, because it is
+    /// larger than sync downloads. Their rows keep their headers and say
+    /// so ([`crate::BodyState::TooLarge`]); later passes do not ask again.
+    pub too_large: Vec<crate::MessageId>,
 }
 
 /// A first sync of one folder, which reads it newest first.

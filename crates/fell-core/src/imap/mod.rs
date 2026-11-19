@@ -315,7 +315,17 @@ pub(crate) fn fetch_imap(
             }
             continue;
         };
-        if first && !catch_up(&mut pass, &mut session, mailbox, &examined, persist)? {
+        // A mailbox whose UIDVALIDITY changed since an earlier visit of
+        // this pass holds other mail under the same UIDs: it starts over,
+        // as on a first visit, instead of walking on below the old floor.
+        let renumbered = !first
+            && pass
+                .done
+                .get(&mailbox.raw)
+                .is_some_and(|checkpoint| checkpoint.uidvalidity != examined.uidvalidity);
+        if (first || renumbered) && !catch_up(&mut pass, &mut session, mailbox, &examined, persist)?
+        {
+            walking.remove(&index);
             continue;
         }
         let folder = roles.label(&mailbox.decoded);
@@ -396,9 +406,20 @@ enum Reach {
 /// then the newest of every other folder, then everything older.
 fn visit_order(listed: &[session::Listed], roles: &FolderRoles) -> Vec<(usize, Reach)> {
     let sizes = windows();
+    // A server that marks some folders but not Sent still has one: the
+    // name table's, so replies thread as early as with a marked one.
+    let sent_by_name = if roles.get(FolderRole::Sent).is_none() {
+        crate::folders::named(&listed_mailboxes(listed), FolderRole::Sent)
+            .map(|mailbox| mailbox.raw)
+    } else {
+        None
+    };
     let rank = |mailbox: &session::Listed| {
         if mailbox.decoded.eq_ignore_ascii_case("INBOX") {
             return 0;
+        }
+        if sent_by_name.as_deref() == Some(mailbox.raw.as_str()) {
+            return 1;
         }
         match roles
             .iter()
@@ -784,8 +805,10 @@ enum Walked {
 /// floor, so windows hold about as many messages however sparse UIDs are;
 /// a guess that lands above the floor is lowered and tried again.
 ///
-/// A body that cannot be read (too large, not sent) leaves its header row:
-/// opening the conversation fetches it again.
+/// A body too large to keep leaves its header row, marked so in the write
+/// that moves the floor below it ([`crate::BodyState::TooLarge`]), and is
+/// not asked for again. A body the server does not send lowers the
+/// checkpoint below it, so the catch-up of a later pass fetches it.
 fn walk_down(
     pass: &mut Pass<'_>,
     session: &mut session::Session,
@@ -875,6 +898,9 @@ fn walk_down(
         let stored = copies.stored(low, high)?;
         let mut flags = Vec::new();
         let mut headers = Vec::new();
+        // The Message-ID each header row was stored under, for a body too
+        // large to keep.
+        let mut header_ids: HashMap<u32, crate::MessageId> = HashMap::new();
         // Newest first, with RFC822.SIZE.
         let mut wanted: Vec<(u32, u32)> = Vec::new();
         for row in rows {
@@ -891,7 +917,7 @@ fn walk_down(
                 continue;
             }
             if !row.skipped && !row.body_missing {
-                headers.push(rfc822::headers_message(
+                let header = rfc822::headers_message(
                     pass.account_id,
                     &mailbox.raw,
                     &mailbox.decoded,
@@ -899,7 +925,9 @@ fn walk_down(
                     row.uid,
                     &row.flags,
                     &row.body,
-                ));
+                );
+                header_ids.insert(row.uid, header.headers.message_id.clone());
+                headers.push(header);
             }
             wanted.push((row.uid, row.size.unwrap_or(0)));
         }
@@ -918,6 +946,7 @@ fn walk_down(
                 (&mailbox.raw, &checkpoint),
                 chunk,
                 std::mem::take(&mut flags),
+                Vec::new(),
                 Some(progress(below)),
             )?;
         }
@@ -948,6 +977,9 @@ fn walk_down(
             let mut batch_bytes = 0usize;
             // Answered with a body, or too large to keep.
             let mut answered: HashSet<u32> = HashSet::with_capacity(uids.len());
+            // Header rows whose body is too large to keep: marked so, in
+            // the write that moves the floor below them.
+            let mut too_large: Vec<crate::MessageId> = Vec::new();
             let stop = session.uid_fetch_each(
                 &uid_set(&uids),
                 None,
@@ -957,6 +989,11 @@ fn walk_down(
                         return Ok(());
                     }
                     answered.insert(item.uid);
+                    if item.skipped
+                        && let Some(id) = header_ids.get(&item.uid)
+                    {
+                        too_large.push(id.clone());
+                    }
                     if item.skipped || rfc822::is_deleted(&item.flags) {
                         return Ok(());
                     }
@@ -978,6 +1015,7 @@ fn walk_down(
                             pass,
                             (&mailbox.raw, &checkpoint),
                             std::mem::take(&mut batch),
+                            Vec::new(),
                             Vec::new(),
                             Some(progress(below)),
                         )?;
@@ -1006,6 +1044,7 @@ fn walk_down(
                 (&mailbox.raw, &checkpoint),
                 batch,
                 Vec::new(),
+                too_large,
                 Some(progress(below)),
             )?;
             if !finished {
@@ -1021,6 +1060,7 @@ fn walk_down(
                 persist,
                 pass,
                 (&mailbox.raw, &checkpoint),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Some(progress(below)),
@@ -1045,6 +1085,28 @@ fn walk_down(
         pass.prior.get(&mailbox.raw),
         &FetchPlan::Full,
     )?;
+    // Flags of a window were read when it was, so a change on the server
+    // to mail read earlier in the walk would be lost. With CONDSTORE the
+    // modseq kept from where the walk began has the next pass ask for
+    // every flag changed since; without it, read them all once now.
+    let mut flags = Vec::new();
+    if examined.highest_modseq.is_none() {
+        match session.uid_flags("1:*") {
+            Ok(rows) => {
+                for (uid, flag_names) in rows {
+                    flags.push(flag_update(
+                        checkpoint.uidvalidity,
+                        uid,
+                        &escaped,
+                        &flag_names,
+                    ));
+                }
+            }
+            // Left for a later pass: the walk is done either way.
+            Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
     checkpoint.floor = None;
     checkpoint.pruned = tracked.pruned;
     // Mail that came while the walk ran is above what this pass caught up
@@ -1055,7 +1117,7 @@ fn walk_down(
         &pass.snapshot(),
         Some((&mailbox.raw, &checkpoint)),
         Vec::new(),
-        Vec::new(),
+        flags,
         tracked.removals,
     )?;
     pass.done.insert(mailbox.raw.clone(), checkpoint);
@@ -1069,10 +1131,12 @@ fn emit_walk(
     current: (&str, &MailboxCheckpoint),
     messages: Vec<Message>,
     flags: Vec<FlagUpdate>,
+    too_large: Vec<crate::MessageId>,
     progress: Option<SyncProgress>,
 ) -> Result<(), Error> {
     let mut delta = progress_delta(&pass.snapshot(), Some(current), messages, flags, Vec::new());
     delta.progress = progress;
+    delta.too_large = too_large;
     persist(delta)
 }
 
@@ -1500,6 +1564,7 @@ fn progress_delta(
         settle: Settle::Later,
         roles: None,
         progress: None,
+        too_large: Vec::new(),
     }
 }
 
@@ -1515,7 +1580,11 @@ fn untagged_overflow(err: &Error) -> bool {
 }
 
 fn listed_roles(listed: &[session::Listed], overrides: &[(FolderRole, String)]) -> FolderRoles {
-    let mailboxes: Vec<ListedMailbox> = listed
+    FolderRoles::detect(&listed_mailboxes(listed), overrides)
+}
+
+fn listed_mailboxes(listed: &[session::Listed]) -> Vec<ListedMailbox> {
+    listed
         .iter()
         .map(|mailbox| ListedMailbox {
             raw: mailbox.raw.clone(),
@@ -1523,8 +1592,7 @@ fn listed_roles(listed: &[session::Listed], overrides: &[(FolderRole, String)]) 
             delimiter: mailbox.delimiter,
             attributes: mailbox.attributes.clone(),
         })
-        .collect();
-    FolderRoles::detect(&mailboxes, overrides)
+        .collect()
 }
 
 #[derive(Clone, Copy)]

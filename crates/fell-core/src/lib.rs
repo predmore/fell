@@ -44,8 +44,8 @@ pub use embed::{
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
 pub use imap::{ImapConfig, ImapSecurity, InboxWait};
 pub use message::{
-    Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
-    RemoteId, TransferEncoding,
+    Address, BodyState, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart,
+    PartRole, RemoteId, TransferEncoding,
 };
 pub use outbox::{DropReason, DroppedMove, OutboxEntry, OutboxKind, OutboxState, ReplayReport};
 pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
