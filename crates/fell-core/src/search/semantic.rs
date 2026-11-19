@@ -179,6 +179,28 @@ impl Ready {
     }
 }
 
+/// A read transaction of its own, or nothing when the connection is already
+/// in one (a search holds one from the refresh to the last hit it reads).
+/// Deferred: it never asks for the write lock.
+pub(crate) struct Snapshot<'conn>(Option<rusqlite::Transaction<'conn>>);
+
+impl<'conn> Snapshot<'conn> {
+    pub(crate) fn begin(conn: &'conn Connection) -> Result<Self> {
+        Ok(Self(if conn.is_autocommit() {
+            Some(conn.unchecked_transaction()?)
+        } else {
+            None
+        }))
+    }
+
+    pub(crate) fn commit(self) -> Result<()> {
+        if let Some(tx) = self.0 {
+            tx.commit()?;
+        }
+        Ok(())
+    }
+}
+
 /// Every stored vector of one model, as int8 rows.
 pub(crate) struct VectorIndex {
     id: EmbedderId,
@@ -199,9 +221,10 @@ pub(crate) struct VectorIndex {
 }
 
 impl VectorIndex {
-    /// Every row `id` stored with `dims` values, read in one snapshot.
+    /// Every row `id` stored with `dims` values, read in one snapshot: the
+    /// caller's transaction when it is in one, else its own.
     pub(crate) fn load(conn: &Connection, id: EmbedderId, dims: usize) -> Result<Self> {
-        let tx = conn.unchecked_transaction()?;
+        let tx = Snapshot::begin(conn)?;
         let mut index = Self {
             id,
             dims,
@@ -213,12 +236,12 @@ impl VectorIndex {
             accounts: Vec::new(),
             rows: Vec::new(),
         };
-        index.seen = tx.query_row(
+        index.seen = conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM embedding_changes",
             [],
             |row| row.get(0),
         )?;
-        let count: i64 = tx.query_row(
+        let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM message_embeddings
              WHERE model = ?1 AND model_version = ?2 AND dims = ?3",
             params![id.model, id.version, index.dims_i64()],
@@ -230,7 +253,7 @@ impl VectorIndex {
         index.owners.reserve_exact(count);
         index.keys.reserve_exact(count);
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT account_id, message_id, vector FROM message_embeddings
                  WHERE model = ?1 AND model_version = ?2 AND dims = ?3
                    AND length(vector) = ?4",
@@ -287,10 +310,12 @@ impl VectorIndex {
     }
 
     /// Apply the log entries written since the last call. Reads one
-    /// snapshot, so an entry pruned meanwhile cannot be skipped.
+    /// snapshot, so an entry pruned meanwhile cannot be skipped. Inside the
+    /// caller's transaction that is the caller's snapshot, so a search scans
+    /// exactly the vectors of the rows it then reads.
     pub(crate) fn refresh(&mut self, conn: &Connection) -> Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        let (first, last): (Option<i64>, Option<i64>) = tx.query_row(
+        let tx = Snapshot::begin(conn)?;
+        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
             "SELECT MIN(seq), MAX(seq) FROM embedding_changes",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -305,7 +330,7 @@ impl VectorIndex {
             *self = Self::load(conn, self.id, self.dims)?;
             return Ok(());
         }
-        let mut keys = tx.prepare(
+        let mut keys = conn.prepare(
             "SELECT DISTINCT account_id, message_id FROM embedding_changes
              WHERE seq > ?1 AND seq <= ?2",
         )?;
@@ -315,7 +340,7 @@ impl VectorIndex {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(keys);
-        let mut vector = tx.prepare(
+        let mut vector = conn.prepare(
             "SELECT vector FROM message_embeddings
              WHERE account_id = ?1 AND message_id = ?2
                AND model = ?3 AND model_version = ?4 AND dims = ?5

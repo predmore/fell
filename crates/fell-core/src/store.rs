@@ -1059,12 +1059,21 @@ impl Store {
         query: &str,
         options: SearchOptions,
     ) -> Result<SearchResults> {
-        if !options.semantic {
-            return crate::search::execute(&self.conn, account_id, query, None);
-        }
-        let mut semantic = self.semantic.borrow_mut();
-        let ready = semantic.ready(&self.conn);
-        crate::search::execute(&self.conn, account_id, query, ready)
+        // One deferred read transaction from the matrix refresh to the last
+        // row read: a sync or indexer commit in between cannot pair one
+        // state's vectors or operator matches with another's rows. It never
+        // asks for the write lock, so in WAL it waits for no writer.
+        let snapshot = crate::search::semantic::Snapshot::begin(&self.conn)?;
+        let results = if options.semantic {
+            let mut semantic = self.semantic.borrow_mut();
+            let ready = semantic.ready(&self.conn);
+            crate::search::reached(crate::search::Step::Refreshed);
+            crate::search::execute(&self.conn, account_id, query, ready)?
+        } else {
+            crate::search::execute(&self.conn, account_id, query, None)?
+        };
+        snapshot.commit()?;
+        Ok(results)
     }
 
     /// Start loading the query model and the stored vectors on a background

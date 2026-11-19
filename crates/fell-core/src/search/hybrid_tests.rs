@@ -1215,3 +1215,122 @@ fn measure_hybrid_search_at_100k_messages() {
     println!("query embedding alone: {:.1?} each", started.elapsed() / 20);
     assert!(p95 <= Duration::from_millis(150), "p95 {p95:?}");
 }
+
+/// What a sync and the indexer write together when a bill is archived and
+/// its body rewritten: the folder, the text, and the vector of the new text.
+fn archive_and_rewrite(path: &std::path::Path, message: &str) {
+    let writer = rusqlite::Connection::open(path).unwrap();
+    writer.busy_timeout(Duration::from_secs(10)).unwrap();
+    let body = "Trim the garden hedge and the lawn.";
+    let vector: Vec<u8> = Concepts
+        .embed(body)
+        .unwrap()
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .and_then(|()| {
+            writer.execute(
+                "UPDATE messages SET folders = 'Archive', snippet = ?2, body_text = ?2
+                 WHERE message_id = ?1",
+                rusqlite::params![message, body],
+            )
+        })
+        .and_then(|_| {
+            writer.execute(
+                "UPDATE message_embeddings SET vector = ?2 WHERE message_id = ?1",
+                rusqlite::params![message, vector],
+            )
+        })
+        .and_then(|_| writer.execute_batch("COMMIT"))
+        .unwrap();
+}
+
+#[test]
+fn a_search_reads_one_snapshot_while_sync_and_the_indexer_commit() {
+    let _reset = EmbedderReset;
+    testing_embedder(Some(concepts));
+    let bill = "plumber-invoice@corpus.test";
+    let query = "money owed in:inbox";
+    for step in [Step::Refreshed, Step::Filtered, Step::Scanned] {
+        let path = temp_db("snapshot");
+        let store = Store::open(&path).unwrap();
+        let messages = corpus_mail();
+        fill(&store, &messages);
+        wait_for("the indexer did not embed the corpus", || {
+            vectors(&store) == messages.len() as i64
+        });
+        let before = hybrid(&store, query);
+        let hit = before
+            .hits
+            .iter()
+            .find(|hit| hit.message_id.as_str() == bill)
+            .expect("the bill is in the inbox and close to the query");
+        assert!(hit.snippet.contains("kitchen leak"), "{hit:?}");
+
+        // Another connection commits in the middle of the search. The
+        // search still reads the state it started in: the bill in Inbox,
+        // with the text its matched vector came from.
+        let writer_path = path.clone();
+        let mut wrote = false;
+        testing_on_step(Some(Box::new(move |at| {
+            if at == step && !wrote {
+                wrote = true;
+                archive_and_rewrite(&writer_path, bill);
+            }
+        })));
+        let during = hybrid(&store, query);
+        testing_on_step(None);
+        assert_eq!(during, before, "a commit at {step:?} split the search");
+
+        // The next search sees the commit: the bill is in Archive now.
+        let after = hybrid(&store, query);
+        assert!(
+            after.hits.iter().all(|hit| hit.message_id.as_str() != bill),
+            "{step:?}: {after:?}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[test]
+fn semantic_rows_apply_the_operators_again() {
+    let reset = EmbedderReset;
+    testing_embedder(Some(concepts));
+    let store = Store::open_in_memory().unwrap();
+    let mut messages = corpus_mail();
+    for message in &mut messages {
+        if message.headers.message_id.as_str() == "plumber-invoice@corpus.test" {
+            message.folders = vec!["Archive".into()];
+        }
+    }
+    fill(&store, &messages);
+    let rows = |query: &str| {
+        let parsed = parse_query(query).unwrap();
+        let mut found: Vec<String> = semantic_rows(
+            &store.conn,
+            &account_id(),
+            &parsed,
+            ["plumber-invoice@corpus.test", "refund@corpus.test"].into_iter(),
+        )
+        .unwrap()
+        .into_keys()
+        .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        rows("money"),
+        ["plumber-invoice@corpus.test", "refund@corpus.test"]
+    );
+    // Both an operator column and a stored filter.
+    assert_eq!(rows("money in:inbox"), ["refund@corpus.test"]);
+    assert_eq!(
+        rows("money from:brightline"),
+        ["plumber-invoice@corpus.test"]
+    );
+    assert!(rows("money from:brightline in:inbox").is_empty());
+    drop(reset);
+}

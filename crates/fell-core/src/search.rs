@@ -326,7 +326,9 @@ fn adjust_term(conn: &Connection, account_id: &str, term: &str, delta: i64) -> R
 }
 
 /// Keyword search, fused with the semantic side when `semantic` is a loaded
-/// model. With `None` this is keyword search exactly.
+/// model. With `None` this is keyword search exactly. The caller runs it in
+/// one read transaction, with `semantic` refreshed in that same snapshot, so
+/// the scan, the operators and the rows it returns all see one state.
 pub(crate) fn execute(
     conn: &Connection,
     account_id: &AccountId,
@@ -587,6 +589,7 @@ fn semantic_threads(
     } else {
         None
     };
+    reached(Step::Filtered);
     let nearest = ready.index.nearest(
         account_id.as_str(),
         &query,
@@ -596,30 +599,17 @@ fn semantic_threads(
     if nearest.is_empty() {
         return Ok(Vec::new());
     }
-    let mut found = HashMap::with_capacity(nearest.len());
-    for chunk in nearest.chunks(200) {
-        let mut sql = String::from(
-            "SELECT message_id, thread_id, subject, snippet, from_email, date_unix
-             FROM messages WHERE account_id = ? AND message_id IN (",
-        );
-        let mut params = Vec::with_capacity(chunk.len() + 1);
-        params.push(Value::Text(account_id.as_str().to_string()));
-        for (index, (message_id, _)) in chunk.iter().enumerate() {
-            if index > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-            params.push(Value::Text(message_id.to_string()));
-        }
-        sql.push(')');
-        for hit in query_hits(conn, &sql, params)? {
-            found.insert(hit.message_id.as_str().to_string(), hit);
-        }
-    }
+    reached(Step::Scanned);
+    let mut found = semantic_rows(
+        conn,
+        account_id,
+        parsed,
+        nearest.iter().map(|(message_id, _)| &**message_id),
+    )?;
     let mut threads = HashSet::new();
     let mut hits = Vec::new();
     for (message_id, _) in nearest {
-        // Gone since the matrix was refreshed: skip it.
+        // No row, or the row no longer passes the operators: skip it.
         let Some(mut hit) = found.remove(&*message_id) else {
             continue;
         };
@@ -642,31 +632,121 @@ fn filtered_message_ids(
     account_id: &AccountId,
     parsed: &ParsedQuery,
 ) -> Result<Vec<String>> {
-    let columns = ParsedQuery {
+    let (sql, params) = filtered_select(account_id, parsed, "m.message_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(Into::into)
+}
+
+/// The hits for `messages`, by message id, read with the query's operators
+/// as well, so a row that stopped passing them since the id filter ran is
+/// not returned. Ids with no row, or another account's, are left out.
+fn semantic_rows<'a>(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    messages: impl Iterator<Item = &'a str>,
+) -> Result<HashMap<String, SearchHit>> {
+    let messages: Vec<&str> = messages.collect();
+    let mut found = HashMap::with_capacity(messages.len());
+    for chunk in messages.chunks(200) {
+        let (mut sql, mut params) = filtered_select(
+            account_id,
+            parsed,
+            "m.message_id, m.thread_id, m.subject, m.snippet, m.from_email, m.date_unix",
+        );
+        sql.push_str(" AND m.message_id IN (");
+        for (index, message_id) in chunk.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            params.push(Value::Text((*message_id).to_string()));
+        }
+        sql.push(')');
+        for hit in query_hits(conn, &sql, params)? {
+            found.insert(hit.message_id.as_str().to_string(), hit);
+        }
+    }
+    Ok(found)
+}
+
+/// `SELECT columns` over the account's messages that pass every operator
+/// of `parsed`, ignoring its free words. `from:`, `to:` and `subject:` are
+/// a column `MATCH`; the rest are [`append_filters`].
+fn filtered_select(
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    columns: &str,
+) -> (String, Vec<Value>) {
+    let operators = ParsedQuery {
         from: parsed.from.clone(),
         to: parsed.to.clone(),
         subject: parsed.subject.clone(),
         ..ParsedQuery::default()
     };
     let mut params = vec![Value::Text(account_id.as_str().to_string())];
-    let mut sql = match fts_match(&columns) {
+    let mut sql = format!("SELECT {columns} ");
+    match fts_match(&operators) {
         Some(match_query) => {
             params.push(Value::Text(match_query));
-            String::from(
-                "SELECT m.message_id FROM messages_fts
+            sql.push_str(
+                "FROM messages_fts
                  JOIN messages m
                    ON m.account_id = messages_fts.account_id
                   AND m.message_id = messages_fts.message_id
                  WHERE m.account_id = ? AND messages_fts MATCH ?",
-            )
+            );
         }
-        None => String::from("SELECT m.message_id FROM messages m WHERE m.account_id = ?"),
-    };
+        None => sql.push_str("FROM messages m WHERE m.account_id = ?"),
+    }
     append_filters(&mut sql, &mut params, parsed);
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params.iter()), |row| row.get(0))?;
-    rows.collect::<rusqlite::Result<Vec<String>>>()
-        .map_err(Into::into)
+    (sql, params)
+}
+
+/// Points inside one search, for tests that write from another connection
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The vector matrix was brought up to date.
+    Refreshed,
+    /// The operators ran and chose which rows the scan may use.
+    Filtered,
+    /// The scan chose its messages; their rows are read next.
+    Scanned,
+}
+
+#[cfg(test)]
+type StepHook = Box<dyn FnMut(Step)>;
+
+#[cfg(test)]
+thread_local! {
+    static STEP_HOOK: std::cell::RefCell<Option<StepHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: run `hook` at each [`Step`] of searches on this thread.
+#[cfg(test)]
+pub(crate) fn testing_on_step(hook: Option<StepHook>) {
+    STEP_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+pub(crate) fn reached(step: Step) {
+    #[cfg(test)]
+    {
+        let hook = STEP_HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(step);
+            STEP_HOOK.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+    #[cfg(not(test))]
+    let _ = step;
 }
 
 /// Merge the keyword and semantic thread lists by reciprocal rank fusion.
