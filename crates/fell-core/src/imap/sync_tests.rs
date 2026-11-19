@@ -32,6 +32,15 @@ pub(super) fn config(port: u16) -> ImapConfig {
     }
 }
 
+pub(super) fn unused_smtp() -> crate::SmtpConfig {
+    crate::SmtpConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        security: ImapSecurity::StartTls,
+        accept_invalid_certs: false,
+    }
+}
+
 pub(super) fn sample_state() -> TestState {
     TestState {
         username: "caleb".into(),
@@ -190,6 +199,7 @@ fn local_server_syncs_into_the_store() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let report = sync_once(&acct, &backend, &store).unwrap();
@@ -272,6 +282,7 @@ fn second_sync_fetches_only_new_uids() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -316,6 +327,7 @@ fn uidvalidity_change_refetches_without_duplicating_message_ids() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -379,6 +391,7 @@ fn condstore_updates_unread_without_a_second_copy() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -468,6 +481,7 @@ fn a_seen_change_on_stored_mail_fetches_flags_not_bodies() {
         let backend = ImapBackend {
             account_id: acct.id.clone(),
             config: config(server.addr.port()),
+            smtp: unused_smtp(),
         };
         let store = Store::open_in_memory().unwrap();
         assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 500);
@@ -523,6 +537,7 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -570,6 +585,7 @@ fn without_uidnext_only_new_uids_are_downloaded() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -629,6 +645,7 @@ fn an_unread_change_on_the_other_copy_of_one_message_id_reaches_the_row() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -672,6 +689,7 @@ fn a_flag_change_after_trash_is_emptied_comes_back_with_undo() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -715,6 +733,7 @@ fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -789,6 +808,7 @@ fn a_deleted_uid_does_not_move_the_checkpoint_before_lower_bodies_arrive() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -834,6 +854,7 @@ fn bad_password_does_not_advance_the_cursor() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: imap,
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let err = sync_once(&acct, &backend, &store).unwrap_err();
@@ -853,6 +874,7 @@ fn two_accounts_keep_separate_rows() {
         let backend = ImapBackend {
             account_id: acct.id.clone(),
             config: config(server.addr.port()),
+            smtp: unused_smtp(),
         };
         sync_once(&acct, &backend, &store).unwrap();
     }
@@ -877,6 +899,7 @@ fn mismatched_account_on_the_backend_rolls_back() {
     let backend = ImapBackend {
         account_id: AccountId("other".into()),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let err = sync_once(&acct, &backend, &store).unwrap_err();
@@ -918,6 +941,7 @@ fn starttls_does_not_send_the_password_in_clear() {
     let backend = ImapBackend {
         account_id: AccountId("a1".into()),
         config: imap,
+        smtp: unused_smtp(),
     };
     let err = backend.fetch_changes(None).unwrap_err();
     assert!(matches!(err, crate::Error::Backend(_)));
@@ -953,6 +977,7 @@ fn same_body_different_message_ids_stay_distinct() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1007,6 +1032,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1071,6 +1097,7 @@ fn empty_mailbox_records_modseq_before_mail_arrives() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1168,6 +1195,7 @@ fn examine_refusal_does_not_drop_the_rest_of_the_account() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1298,6 +1326,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let report = sync_once(&acct, &backend, &store).unwrap();
@@ -1406,6 +1435,7 @@ fn fetch_refusal_does_not_block_the_rest_of_the_account() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1554,6 +1584,7 @@ fn fetch_io_error_aborts_before_the_cursor_moves() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1645,6 +1676,7 @@ fn non_ascii_password_logs_in_as_a_literal() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: imap,
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1729,6 +1761,7 @@ fn fetch_batches_survive_a_dropped_connection() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     assert!(sync_once(&acct, &backend, &store).is_err());
@@ -1856,6 +1889,7 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -1940,6 +1974,7 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2016,6 +2051,7 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2123,6 +2159,7 @@ fn mailbox_name_with_a_newline_does_not_abort_the_account() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2191,6 +2228,7 @@ fn idle_backend(server: &TestServer) -> (Account, ImapBackend) {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     (acct, backend)
 }
@@ -2541,6 +2579,7 @@ fn mail_deleted_on_the_server_is_gone_locally() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2586,6 +2625,7 @@ fn mail_moved_on_the_server_lists_only_the_new_folder() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2660,6 +2700,7 @@ fn a_merged_copy_keeps_the_row_while_another_copy_lives() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2698,6 +2739,7 @@ fn an_expunge_during_the_listing_waits_for_the_next_pass() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2722,6 +2764,7 @@ fn a_mailbox_that_cannot_be_read_keeps_rows_whose_copy_may_have_moved_there() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2754,6 +2797,7 @@ fn qresync_reports_vanished_mail_without_a_listing() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2788,6 +2832,7 @@ fn mail_that_moved_before_copies_were_recorded_still_leaves_the_old_folder() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2849,6 +2894,7 @@ fn a_uidvalidity_change_keeps_mail_the_refetch_skips() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2893,6 +2939,7 @@ fn a_uidvalidity_change_keeps_a_skipped_message_with_no_message_id() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2925,6 +2972,7 @@ fn a_vanished_set_ending_in_star_does_not_drop_higher_uids() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -2961,6 +3009,7 @@ fn an_expunge_qresync_did_not_report_is_still_found() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3037,6 +3086,7 @@ fn assert_provider_roles(
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: imap,
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3308,6 +3358,7 @@ fn a_later_listing_replaces_the_stored_roles() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3334,6 +3385,7 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3438,6 +3490,7 @@ fn a_new_uidvalidity_records_old_copies_without_bodies() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3490,6 +3543,7 @@ fn a_refused_or_cut_short_body_fetch_stores_nothing_and_is_tried_again() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = synced_without_parts(&server, &acct, &backend);
     let queued = store.missing_bodies(&acct.id, 100).unwrap();
@@ -3531,6 +3585,7 @@ fn a_body_backfill_batch_stops_at_its_byte_cap() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = synced_without_parts(&server, &acct, &backend);
     let queued = store.missing_bodies(&acct.id, 100).unwrap().len();
@@ -3624,6 +3679,7 @@ fn attachments_are_listed_on_sync_and_fetched_by_section() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3791,6 +3847,7 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3840,6 +3897,7 @@ fn part_server(
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3935,6 +3993,7 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(syncing.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -3948,6 +4007,7 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
     let part_backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(parts_server.addr.port()),
+        smtp: unused_smtp(),
     };
     let fetcher = crate::parts::PartFetcher::start(
         move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
@@ -4021,6 +4081,7 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(syncing.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
@@ -4032,6 +4093,7 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     let part_backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(parts_server.addr.port()),
+        smtp: unused_smtp(),
     };
     let fetcher = crate::parts::PartFetcher::start(
         move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
@@ -4115,6 +4177,7 @@ fn bodies_opened_together_are_fetched_in_one_login() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();

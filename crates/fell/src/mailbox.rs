@@ -124,7 +124,15 @@ pub fn send_account_config(account: &AccountId) -> Result<Option<AccountConfig>,
     if fell_core::is_demo_account(account) {
         return Ok(None);
     }
-    load_account_config()
+    load_account_config()?
+        .filter(|config| config.id == account.as_str())
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "unknown account {}: no account file entry for it; run fell account setup",
+                account.as_str()
+            )
+        })
 }
 
 /// The account file for `fell account show|check`, with the same mode check

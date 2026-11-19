@@ -309,6 +309,8 @@ pub struct ComposeView {
     known_hunks: Vec<u64>,
     /// Send was tried: a missing recipient now says it blocks send.
     send_tried: bool,
+    send_unavailable: bool,
+    send_check: Option<gpui::Task<()>>,
 }
 
 impl ComposeView {
@@ -326,7 +328,7 @@ impl ComposeView {
         // A closed window no longer counts as showing its draft.
         cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
             .detach();
-        Self {
+        let mut view = Self {
             hub,
             draft_id: draft_id.into(),
             folder,
@@ -363,7 +365,31 @@ impl ComposeView {
             touched: false,
             known_hunks: Vec::new(),
             send_tried: false,
-        }
+            send_unavailable: false,
+            send_check: None,
+        };
+        view.check_send_availability(cx);
+        view
+    }
+
+    /// Check the local account file without running the password command or
+    /// contacting the server. An attempted send reads the file again.
+    fn check_send_availability(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.hub.with_session(self.draft_id.as_ref(), |session| {
+            session.account_id().clone()
+        }) else {
+            return;
+        };
+        self.send_check = Some(cx.spawn(async move |this, cx| {
+            let unavailable = cx
+                .background_executor()
+                .spawn(async move { crate::mailbox::send_account_config(&account).is_err() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.send_unavailable = unavailable;
+                cx.notify();
+            });
+        }));
     }
 
     pub fn watch_live(&self, cx: &mut Context<Self>) {
@@ -698,6 +724,8 @@ impl ComposeView {
         self.subject_line = snap.subject.clone();
         self.sent = false;
         self.send_tried = false;
+        self.send_unavailable = false;
+        self.send_check = None;
         self.quote_open = false;
         self.status = "".into();
         self.start_on_recipients_if_empty(&snap);
@@ -863,7 +891,7 @@ impl ComposeView {
     }
 
     /// Check and build the message under the draft lock, then talk to SMTP
-    /// on a background thread. The window keeps painting while Bridge
+    /// on a background thread. The window keeps painting while the server
     /// answers. The draft is claimed for the send before it starts, so a
     /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -875,6 +903,11 @@ impl ComposeView {
         }
         if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
             self.status = lock.reason().into();
+            return;
+        }
+        if self.send_unavailable {
+            self.status = "".into();
+            self.check_send_availability(cx);
             return;
         }
         if self.field != Field::Body && !self.commit_field(self.field) {
@@ -923,6 +956,9 @@ impl ComposeView {
                 if let Some(status) = end.status {
                     this.sent = end.sent;
                     this.status = status.into();
+                    if matches!(outcome, Err(SendFailure::NotSent(_))) {
+                        this.check_send_availability(cx);
+                    }
                 }
                 if end.close {
                     this.closing = true;
@@ -1508,6 +1544,9 @@ impl Render for ComposeView {
             window.remove_window();
         }
         self.sync_from_hub();
+        if self.send_check.is_none() {
+            self.check_send_availability(cx);
+        }
         if self.leader && !self.which_visible {
             let ready = self
                 .leader_at
@@ -1533,10 +1572,13 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let snap = self
+        let mut snap = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| session.snapshot())
             .unwrap_or_else(|| empty_snapshot(self.draft_id.as_ref()));
+        if self.send_unavailable && snap.send_lock_reason().is_none() {
+            snap.send_block = Some(SEND_UNAVAILABLE.into());
+        }
         let colors = self.colors();
         let ui_family = self
             .look
@@ -2357,6 +2399,7 @@ const LABEL_PX: f32 = 100.0;
 
 /// Why send is blocked when To is empty.
 const NO_RECIPIENT: &str = "add at least one recipient";
+const SEND_UNAVAILABLE: &str = "send unavailable for this account";
 
 /// To addresses the original's Reply-To sent the reply to instead of its
 /// sender. Empty when the reply goes to the sender.
@@ -4249,7 +4292,7 @@ fn status_bar(
     // idle bar, so it never crowds out a message or reads as a count of
     // edits. Narrow: short enough to sit beside the mode and send.
     let fresh_label = match fresh {
-        _ if !idle => None,
+        _ if !idle || snap.send_block.as_deref() == Some(SEND_UNAVAILABLE) => None,
         0 => None,
         count if !wide => Some(format!("first-time: {count}")),
         1 => Some("1 first-time recipient".to_string()),
@@ -4382,6 +4425,7 @@ fn status_right(
         Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => {
             vec![(MAYBE_SENT_WARNING.into(), Tone::Error, false)]
         }
+        Some(reason) if reason == SEND_UNAVAILABLE => vec![(reason.clone(), Tone::Error, false)],
         // Narrow: the reason alone says send is blocked, and leaves the
         // message on the left its room. A missing recipient says so in two
         // words, so "send blocked" stays and reads as a block, not advice.
@@ -6099,6 +6143,18 @@ mod tests {
         // Any other block shows at once.
         snap.send_block = Some("from is not this account".into());
         assert!(super::shown_send_block(&snap, false).is_some());
+    }
+
+    #[test]
+    fn an_unavailable_account_explains_why_before_send_is_tried() {
+        let mut snap = super::empty_snapshot("d");
+        snap.send_block = Some(super::SEND_UNAVAILABLE.into());
+        for wide in [false, true] {
+            assert_eq!(
+                super::status_right(&snap, "insert", false, wide),
+                vec![(super::SEND_UNAVAILABLE.into(), super::Tone::Error, false)],
+            );
+        }
     }
 
     #[test]

@@ -1,21 +1,20 @@
-//! SMTP submission for Proton Mail Bridge.
+//! SMTP submission for Bridge and ordinary IMAP accounts.
 //!
-//! [`deliver`] is called from [`crate::backend::BridgeBackend::confirm_send`]
-//! after the editor's send confirmation matches. The bytes on the wire are
+//! [`confirm_send`] checks the editor's confirmation before delivery. The bytes on the wire are
 //! [`crate::PendingSend::mime`]. Bcc addresses are envelope recipients only.
 //!
 //! A failure before the server has the whole message is a plain
-//! [`Error::Backend`]: nothing was sent. Once the message bytes start going
-//! out after `354`, a lost connection or a timeout is
+//! [`Error::Backend`]: nothing was sent. Once the terminating dot starts going
+//! out, a lost connection or a timeout is
 //! [`Error::SendUncertain`], because the server may already have queued it.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::imap::{ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
-use crate::send::{Draft, PendingSend};
-use crate::{Error, Result};
+use crate::imap::{ImapConfig, ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
+use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
+use crate::{Error, RemoteId, Result};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -68,7 +67,24 @@ impl Endpoint {
     }
 }
 
-pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
+pub(crate) fn confirm_send(
+    config: &SmtpConfig,
+    login: &ImapConfig,
+    pending: PendingSend,
+    confirmation: UserSendConfirmation,
+) -> Result<SentMessage> {
+    require_confirmation(&pending, &confirmation)?;
+    let remote = deliver(
+        &Endpoint::new(config, &login.username, &login.password),
+        &pending,
+    )?;
+    Ok(SentMessage {
+        pending_id: pending.id,
+        remote_id: RemoteId(remote),
+    })
+}
+
+fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
     if pending.mime.is_empty() {
         return Err(smtp_err("smtp: message is empty"));
     }
@@ -656,15 +672,57 @@ Bcc: this is body text\r\n"
     fn bridge_delivers_after_confirmation_with_bcc_on_the_envelope() {
         let (sent, got) = exchange(Wire::Clear, ImapSecurity::Plain);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
         assert!(got.clear.is_empty());
+    }
+
+    #[test]
+    fn imap_account_uses_its_smtp_settings_and_classifies_delivery() {
+        use crate::{AccountConfig, BackendKind, backend_for};
+
+        for after in [AfterData::Accept, AfterData::Hangup, AfterData::Reject] {
+            let (port, rx, join) = serve(Wire::Clear, after);
+            let config = AccountConfig::parse(&format!(
+                "backend = \"imap\"\nid = \"mailbox\"\nemail = \"jon@example.com\"\n\
+                 host = \"127.0.0.2\"\nusername = \"imap-user\"\n\
+                 password_command = \"printf imap-secret\"\n\
+                 smtp_host = \"127.0.0.1\"\nsmtp_port = {port}\nsmtp_security = \"plain\"\n"
+            ))
+            .unwrap();
+            let backend = backend_for(&config.account().id, Some(&config)).unwrap();
+            assert_eq!(backend.kind(), BackendKind::Imap);
+            let pending = backend
+                .submit_composed(sample_pending().draft, sample_mime(), Vec::new())
+                .unwrap();
+            let mut changed = pending.clone();
+            changed.draft.bcc.clear();
+            assert!(matches!(
+                backend.confirm_send(pending.clone(), confirm(&changed)),
+                Err(Error::SendUnconfirmed)
+            ));
+
+            let result = backend.confirm_send(pending.clone(), confirm(&pending));
+            match after {
+                AfterData::Accept => {
+                    let sent = result.unwrap();
+                    assert_eq!(sent.pending_id, pending.id);
+                    assert_eq!(sent.remote_id.0, "queued as test-id");
+                }
+                AfterData::Hangup => assert!(matches!(result, Err(Error::SendUncertain(_)))),
+                AfterData::Reject => assert!(matches!(result, Err(Error::Backend(_)))),
+                _ => unreachable!(),
+            }
+            let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            join.join().unwrap();
+            assert_delivery(&got, "imap-user", "imap-secret");
+        }
     }
 
     #[test]
     fn implicit_tls_delivers() {
         let (sent, got) = exchange(Wire::Tls, ImapSecurity::Tls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
     }
 
     #[test]
@@ -727,7 +785,7 @@ Bcc: this is body text\r\n"
     fn starttls_hides_the_password_and_still_delivers() {
         let (sent, got) = exchange(Wire::StartTls, ImapSecurity::StartTls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
         let clear = String::from_utf8_lossy(&got.clear);
         assert!(!clear.to_ascii_uppercase().contains("AUTH"), "{clear}");
         assert!(!clear.contains("bridge-secret"), "{clear}");
@@ -801,11 +859,11 @@ Bcc: this is body text\r\n"
         assert!(got.auth.is_empty());
     }
 
-    fn assert_delivery(got: &Captured) {
+    fn assert_delivery(got: &Captured, username: &str, password: &str) {
         let mut token = vec![0];
-        token.extend_from_slice(b"bridge-user");
+        token.extend_from_slice(username.as_bytes());
         token.push(0);
-        token.extend_from_slice(b"bridge-secret");
+        token.extend_from_slice(password.as_bytes());
         assert_eq!(got.auth, b64(&token));
         assert_eq!(got.from, "jon@example.com");
         assert_eq!(

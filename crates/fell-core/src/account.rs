@@ -13,7 +13,7 @@ impl AccountId {
 pub enum BackendKind {
     /// Proton Mail Bridge over local IMAP. Bridge is a separate GPL-3.0 process.
     Bridge,
-    /// Any other IMAP account. Same read-only client as Bridge.
+    /// Any other IMAP account. Uses the same SMTP submission path as Bridge.
     Imap,
     /// Direct Proton API. Not implemented yet; same [`crate::MailBackend`] trait.
     ProtonApi,

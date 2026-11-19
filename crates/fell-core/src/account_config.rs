@@ -368,6 +368,7 @@ impl AccountConfig {
             BackendKind::Imap => Box::new(ImapBackend {
                 account_id: AccountId(self.id.clone()),
                 config: self.imap_config()?,
+                smtp: self.smtp_config(),
             }),
             _ => Box::new(self.bridge_backend()?),
         })
