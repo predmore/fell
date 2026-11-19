@@ -592,39 +592,34 @@ fn semantic_threads(
         None
     };
     reached(Step::Filtered);
-    let nearest = ready.index.nearest(
-        account_id.as_str(),
-        &query,
-        allowed.as_deref(),
-        semantic::CANDIDATES,
-    );
-    if nearest.is_empty() {
-        return Ok(Vec::new());
-    }
+    let mut nearest = ready
+        .index
+        .nearest(account_id.as_str(), &query, allowed.as_deref())
+        .map(|(message_id, _)| message_id);
     reached(Step::Scanned);
-    let mut found = semantic_rows(
-        conn,
-        account_id,
-        parsed,
-        nearest.iter().map(|(message_id, _)| &**message_id),
-    )?;
     let mut threads = HashSet::new();
     let mut hits = Vec::new();
-    for (message_id, _) in nearest {
-        // No row, or the row no longer passes the operators: skip it.
-        let Some(mut hit) = found.remove(&*message_id) else {
-            continue;
-        };
-        if !threads.insert(hit.thread_id.clone()) {
-            continue;
+    loop {
+        // Read one batch at a time. A run of near-identical replies
+        // may all belong to one thread.
+        let batch: Vec<_> = nearest.by_ref().take(SEMANTIC_LOOKUP_BATCH).collect();
+        if batch.is_empty() {
+            return Ok(hits);
         }
-        hit.semantic_only = true;
-        hits.push(hit);
-        if hits.len() == semantic::SEMANTIC_THREADS {
-            break;
+        let mut found = semantic_rows(conn, account_id, parsed, &batch)?;
+        for message_id in batch {
+            let Some(mut hit) = found.remove(message_id) else {
+                continue;
+            };
+            if threads.insert(hit.thread_id.clone()) {
+                hit.semantic_only = true;
+                hits.push(hit);
+                if hits.len() == semantic::SEMANTIC_THREADS {
+                    return Ok(hits);
+                }
+            }
         }
     }
-    Ok(hits)
 }
 
 /// Every message of the account that passes the query's operators, ignoring
@@ -641,37 +636,34 @@ fn filtered_message_ids(
         .map_err(Into::into)
 }
 
-/// The hits for `messages`, by message id, read with the query's operators
-/// as well, so a row that stopped passing them since the id filter ran is
-/// not returned. Ids with no row, or another account's, are left out.
-fn semantic_rows<'a>(
+/// One batch of candidates in the message lookup.
+const SEMANTIC_LOOKUP_BATCH: usize = 100;
+
+/// The hits for `messages`, by message id, with the query's operators applied.
+fn semantic_rows(
     conn: &Connection,
     account_id: &AccountId,
     parsed: &ParsedQuery,
-    messages: impl Iterator<Item = &'a str>,
+    messages: &[&str],
 ) -> Result<HashMap<String, SearchHit>> {
-    let messages: Vec<&str> = messages.collect();
-    let mut found = HashMap::with_capacity(messages.len());
-    for chunk in messages.chunks(200) {
-        let (mut sql, mut params) = filtered_select(
-            account_id,
-            parsed,
-            "m.message_id, m.thread_id, m.subject, m.snippet, m.from_email, m.date_unix",
-        );
-        sql.push_str(" AND m.message_id IN (");
-        for (index, message_id) in chunk.iter().enumerate() {
-            if index > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-            params.push(Value::Text((*message_id).to_string()));
+    let (mut sql, mut params) = filtered_select(
+        account_id,
+        parsed,
+        "m.message_id, m.thread_id, m.subject, m.snippet, m.from_email, m.date_unix",
+    );
+    sql.push_str(" AND m.message_id IN (");
+    for (index, message_id) in messages.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
         }
-        sql.push(')');
-        for hit in query_hits(conn, &sql, params)? {
-            found.insert(hit.message_id.as_str().to_string(), hit);
-        }
+        sql.push('?');
+        params.push(Value::Text((*message_id).to_string()));
     }
-    Ok(found)
+    sql.push(')');
+    Ok(query_hits(conn, &sql, params)?
+        .into_iter()
+        .map(|hit| (hit.message_id.as_str().to_string(), hit))
+        .collect())
 }
 
 /// `SELECT columns` over the account's messages that pass every operator
