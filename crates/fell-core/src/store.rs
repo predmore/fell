@@ -1084,6 +1084,15 @@ impl Store {
         self.semantic.borrow_mut().warm(self.path.as_deref());
     }
 
+    /// Tests in other crates: `true` once [`Store::warm_search`] was called
+    /// on this store, even when it had nothing to load. Only with the
+    /// `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn testing_search_warm_asked(&self) -> bool {
+        self.semantic.borrow().warm_asked
+    }
+
     /// Tests in other crates: fill every missing or outdated body vector
     /// with `embedder` on this thread. Returns the rows written. Only with
     /// the `test-utils` feature, which no release build enables.

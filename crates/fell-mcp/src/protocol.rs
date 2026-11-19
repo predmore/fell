@@ -96,6 +96,9 @@ impl Session {
         {
             return Err("agent id is empty or contains a control character".into());
         }
+        // Load the search model and vectors on their own thread now, so the
+        // agent's first hybrid search does not wait for them.
+        store.warm_search();
         Ok(Self {
             store,
             account_id,

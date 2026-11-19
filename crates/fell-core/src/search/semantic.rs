@@ -44,6 +44,9 @@ const RETRY_LOAD: Duration = Duration::from_secs(60);
 pub(crate) struct Semantic {
     source: EmbedderSource,
     state: State,
+    /// Tests: [`Semantic::warm`] was called, whatever it then did.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) warm_asked: bool,
 }
 
 enum State {
@@ -72,13 +75,22 @@ impl Semantic {
         } else {
             State::Off
         };
-        Self { source, state }
+        Self {
+            source,
+            state,
+            #[cfg(any(test, feature = "test-utils"))]
+            warm_asked: false,
+        }
     }
 
     /// Start loading the model and the matrix on a background thread with
     /// its own read-only connection, so the first search does not wait for
     /// it. Does nothing when there is no model or it is already loading.
     pub(crate) fn warm(&mut self, path: Option<&Path>) {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            self.warm_asked = true;
+        }
         let (State::Unstarted, Some(path)) = (&self.state, path) else {
             return;
         };

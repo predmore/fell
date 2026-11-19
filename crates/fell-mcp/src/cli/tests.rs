@@ -502,6 +502,8 @@ fn grant_list_revoke_round_trip_empties_a_running_session() {
         "codex",
     )
     .unwrap();
+    // Serving starts loading search, so the first hybrid search is quick.
+    assert!(session.store.testing_search_warm_asked());
     let call = |session: &mut Session, id: i64, method: &str, params: Value| -> Value {
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         serde_json::from_str(&session.handle_line(&line.to_string()).unwrap()).unwrap()
