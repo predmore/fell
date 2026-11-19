@@ -420,6 +420,11 @@ fn stored_delimiter(name: &str) -> char {
 
 /// The best mailbox for `role` by name: a top-level match first, then one
 /// directly under INBOX (`INBOX.Sent` on servers that nest everything there).
+/// The mailbox the name table gives `role`, whatever the server marked.
+pub(crate) fn named(listed: &[ListedMailbox], role: FolderRole) -> Option<ListedMailbox> {
+    by_name(listed, role).cloned()
+}
+
 fn by_name(listed: &[ListedMailbox], role: FolderRole) -> Option<&ListedMailbox> {
     let names = role.fallback_names();
     for wanted in names {

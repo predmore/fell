@@ -27,6 +27,8 @@ pub enum SyncKind {
     /// Messages written so far in this pass.
     Syncing {
         stored: usize,
+        /// The first sync of a folder under way, read newest first.
+        progress: Option<fell_core::SyncProgress>,
     },
     /// Unix time the last pass finished, and how many messages it wrote.
     Synced {
@@ -34,6 +36,19 @@ pub enum SyncKind {
         stored: usize,
     },
     Failed(SyncFailure),
+}
+
+/// `31882` as `31,882`.
+fn grouped(count: u32) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,8 +75,17 @@ impl SyncKind {
             Self::FirstSync => "no account".into(),
             Self::StoreError => "mailbox error".into(),
             Self::Connecting => "connecting…".into(),
-            Self::Syncing { stored: 0 } => "syncing…".into(),
-            Self::Syncing { stored } => format!("syncing · {stored} new"),
+            Self::Syncing {
+                progress: Some(progress),
+                ..
+            } => format!(
+                "syncing {} · {} of {}",
+                progress.folder,
+                grouped(progress.done),
+                grouped(progress.total)
+            ),
+            Self::Syncing { stored: 0, .. } => "syncing…".into(),
+            Self::Syncing { stored, .. } => format!("syncing · {stored} new"),
             Self::Synced { at, .. } => {
                 let ago = now.saturating_sub(*at).max(0);
                 if ago < 60 {
@@ -216,6 +240,8 @@ pub struct Step {
     pub scroll_pages: i32,
     /// Conversation lines. Positive moves down.
     pub scroll_lines: i32,
+    /// The reader expanded or folded a message, its quotes, or recipients.
+    pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
     /// `u` restores the latest local action.
@@ -1213,6 +1239,15 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
+    /// Reread of the same messages in the same order. Folder and header
+    /// changes land along with bodies. The reader's open state stays put.
+    pub fn fill_bodies(&mut self, mut messages: Vec<ConvMessage>) {
+        for (new, old) in messages.iter_mut().zip(&self.messages) {
+            new.expanded = old.expanded;
+        }
+        self.messages = messages;
+    }
+
     /// Reread of the thread already open (sync added or dropped a message).
     /// A reader on the last message follows to the new last one. A reader
     /// further up keeps their message and opened quotes. Returns whether the
@@ -1234,11 +1269,19 @@ impl Session {
                 new.expanded = old.expanded;
             }
         }
-        if at_end {
+        if at_end
+            && messages
+                .last()
+                .is_some_and(|last| self.messages.iter().all(|old| old.id != last.id))
+        {
             self.set_messages(messages);
             return true;
         }
-        let cursor = self.message_cursor;
+        let cursor = self
+            .messages
+            .get(self.message_cursor)
+            .and_then(|current| messages.iter().position(|message| message.id == current.id))
+            .unwrap_or(self.message_cursor);
         let len = messages.len();
         for set in [&mut self.quotes_open, &mut self.recipients_open] {
             set.retain(|id| messages.iter().any(|message| &message.id == id));
@@ -1590,6 +1633,7 @@ impl Session {
                     self.opened(&mut step);
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
+                    step.message_disclosure_changed = true;
                 }
             }
             Action::Back => {
@@ -1761,7 +1805,10 @@ impl Session {
             }
             Action::ToggleQuotes => {
                 self.count.clear();
-                self.toggle_open(self.message_cursor);
+                if self.messages.get(self.message_cursor).is_some() {
+                    self.toggle_open(self.message_cursor);
+                    step.message_disclosure_changed = true;
+                }
             }
             Action::Palette => {
                 self.count.clear();
@@ -2114,7 +2161,7 @@ impl Session {
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
                 title: format!("Syncing {}", self.folder_title()),
                 hint: match &self.sync {
-                    SyncKind::Syncing { stored } if *stored > 0 => {
+                    SyncKind::Syncing { stored, .. } if *stored > 0 => {
                         format!("{stored} messages stored · conversations appear as they arrive")
                     }
                     _ => "Conversations appear as they arrive".into(),
@@ -2187,6 +2234,33 @@ mod tests {
     use crate::keymap::keymap_from_text;
     use crate::present::NameSpan;
 
+    #[test]
+    fn a_first_sync_names_its_folder_and_how_far_it_is() {
+        let syncing = SyncKind::Syncing {
+            stored: 12,
+            progress: Some(fell_core::SyncProgress {
+                folder: "Inbox".into(),
+                done: 4_210,
+                total: 31_882,
+            }),
+        };
+        assert_eq!(syncing.status_at(0), "syncing Inbox · 4,210 of 31,882");
+        let catching_up = SyncKind::Syncing {
+            stored: 3,
+            progress: None,
+        };
+        assert_eq!(catching_up.status_at(0), "syncing · 3 new");
+        assert!(!syncing.is_error());
+        for (count, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(grouped(count), text);
+        }
+    }
+
     fn row(id: &str) -> ThreadRow {
         ThreadRow {
             id: id.into(),
@@ -2225,6 +2299,62 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn a_body_filled_in_keeps_the_reader_where_they_are() {
+        let mut session = session();
+        let mut older = empty_message(true);
+        older.body_state = fell_core::BodyState::Pending;
+        let mut newest = empty_message(true);
+        newest.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![older.clone(), newest.clone()]);
+        // The reader went up to the older message, closed the newest and
+        // opened the older one's quotes.
+        session.message_cursor = 0;
+        session.messages[1].expanded = false;
+        session.quotes_open.insert(older.id.clone());
+
+        // Sync fills in the older message's body (not the latest's).
+        let mut read = vec![older.clone(), newest.clone()];
+        read[0].body_state = fell_core::BodyState::Stored;
+        read[0].body = crate::text_render::render_stored_body(Some("it came"), "it came");
+        read[1].expanded = true;
+        let changed = crate::present::bodies_filled(&session.messages, &read);
+        assert_eq!(changed, Some(vec![0]), "an in-place fill, of message 0");
+        session.fill_bodies(read);
+        assert_eq!(session.message_cursor, 0, "the cursor stays");
+        assert!(
+            !session.messages[1].expanded,
+            "what was closed stays closed"
+        );
+        assert!(session.quotes_open.contains(&older.id));
+        assert_eq!(session.messages[0].body_state, fell_core::BodyState::Stored);
+    }
+
+    #[test]
+    fn a_metadata_reread_updates_a_pending_message_without_landing() {
+        let mut session = session();
+        let mut pending = empty_message(true);
+        pending.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![pending.clone()]);
+        session.toggle_open(0);
+
+        let mut read = pending;
+        read.folders = "Inbox, Archive".into();
+        assert_eq!(
+            crate::present::bodies_filled(&session.messages, std::slice::from_ref(&read)),
+            Some(vec![])
+        );
+        session.fill_bodies(vec![read]);
+        assert_eq!(session.messages[0].folders, "Inbox, Archive");
+        assert_eq!(
+            session.messages[0].body_state,
+            fell_core::BodyState::Pending
+        );
+        assert!(session.is_open(0));
+        assert!(!session.refresh_messages(session.messages.clone(), true));
+        assert!(session.is_open(0));
     }
 
     #[test]
@@ -3931,6 +4061,7 @@ mod tests {
             expanded,
             recipients: None,
             context: None,
+            body_state: fell_core::BodyState::Stored,
         }
     }
 }

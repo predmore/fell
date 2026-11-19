@@ -654,13 +654,13 @@ impl Store {
             insert_message(&tx, &message)?;
         }
         let inserted = !delta.messages.is_empty();
-        // Every flag in one transaction. Committing among them would let a
-        // read or unread change land between two of them and then be
-        // overwritten with what the server said before the pass, and the
-        // stored modseq means the server would not send that flag again.
-        // Local flag intents (#161) now keep the user's read state apart
-        // from the server's, so the flags could be committed in slices
-        // again; that is left for a later change.
+        for message_id in &delta.too_large {
+            if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
+                bodies::mark_withheld(&tx, account_id, &canonical)?;
+            }
+        }
+        // Apply every flag in one transaction. Local flag intents keep the
+        // user's read state separate from updates reported by the server.
         for flag in &delta.flags {
             #[cfg(test)]
             self.stop_among_flags()?;
@@ -695,6 +695,19 @@ impl Store {
         tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
+    /// returns them) has its body yet, in the same order.
+    pub fn body_states(
+        &self,
+        account_id: &AccountId,
+        messages: &[MessageId],
+    ) -> Result<Vec<crate::BodyState>> {
+        messages
+            .iter()
+            .map(|id| bodies::state(&self.conn, account_id, id.as_str()))
+            .collect()
     }
 
     /// UIDs from `low` to `high` with a stored copy in one mailbox (named as
