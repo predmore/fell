@@ -1064,7 +1064,10 @@ impl Inbox {
             if same {
                 self.session.refresh_messages(shown, true);
             } else {
-                self.session.set_messages(shown);
+                // Fades in as a synced draft's messages do, so `j` between
+                // the two kinds never pops.
+                self.motion.show_thread(&mut self.session, shown);
+                self.scroll_conversation();
             }
             self.session.clear_query_fault(QueryFault::Message);
             self.mark_open(id);
@@ -1110,8 +1113,7 @@ impl Inbox {
                             let bottom = inbox.conversation_at_bottom();
                             inbox.session.refresh_messages(view, bottom)
                         } else {
-                            inbox.session.set_messages(view);
-                            inbox.motion.thread_arrived();
+                            inbox.motion.show_thread(&mut inbox.session, view);
                             true
                         };
                         inbox.mark_open(id);
