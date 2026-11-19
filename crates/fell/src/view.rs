@@ -1,6 +1,7 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
-use std::cell::RefCell;
+mod disclosure;
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -25,7 +26,7 @@ use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
-use crate::inbox_motion::{InboxMotion, PaneEntry, StatusMotion};
+use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
 use crate::keymap::KeyId;
 use crate::mail_body::{self, BodyAsks, BodyCache, BodyJob, HtmlBody, PreparedBody};
 use crate::mailbox;
@@ -39,6 +40,8 @@ use crate::sync_worker::{self, SyncEvent, SyncHandle};
 use crate::text_cut;
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
+
+use self::disclosure::disclosure;
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -231,12 +234,6 @@ struct Inbox {
     bodies_busy: HashSet<String>,
     /// Messages whose parts were asked of sync, and what came back.
     bodies_asked: BodyAsks,
-    /// Which messages had their history open last frame, to notice a change
-    /// however it came.
-    quotes_seen: HashSet<String>,
-    /// Each opened fold's natural height, measured as it paints, so the
-    /// next reveal of it grows to the right size.
-    fold_heights: Rc<RefCell<HashMap<String, f32>>>,
     /// The reader's message to hold at the top of the conversation until
     /// they scroll it. See [`Inbox::hold_landing`].
     landing: Option<Landing>,
@@ -326,8 +323,6 @@ impl Inbox {
             bodies: BodyCache::default(),
             bodies_busy: HashSet::new(),
             bodies_asked: BodyAsks::default(),
-            quotes_seen: HashSet::new(),
-            fold_heights: Rc::new(RefCell::new(HashMap::new())),
             landing: None,
         };
         let sync_with = config.zip(startup.path.ok());
@@ -842,7 +837,7 @@ impl Inbox {
             }
             Some(mut warm) => {
                 let conv_width = if show_list && show_conv {
-                    (width - list_width(width, self.split)).max(120.0)
+                    width - list_width(width, self.split) - SPLITTER_PX
                 } else {
                     width
                 };
@@ -862,7 +857,7 @@ impl Inbox {
                         None,
                         conv_width,
                         Live(false),
-                        &ConvFrame::still(&self.fold_heights),
+                        &ConvFrame::default(),
                         window,
                         cx,
                     )
@@ -1437,29 +1432,6 @@ impl Inbox {
     fn reread_open_thread(&mut self, cx: &mut Context<Self>) {
         if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
             self.request_messages(true, cx);
-        }
-    }
-
-    /// This frame's body fades and fold reveals. A fold that opened or
-    /// closed since the last frame, by `q`, a click or anything else,
-    /// starts its reveal here. [`InboxMotion::tick`] asks for the frames.
-    fn body_motion(&mut self, now: Instant) -> ConvFrame {
-        let open = &self.session.quotes_open;
-        if self.quotes_seen != *open {
-            for id in open.difference(&self.quotes_seen) {
-                self.motion.fold_toggled(id, true, now);
-            }
-            for id in self.quotes_seen.difference(open) {
-                self.motion.fold_toggled(id, false, now);
-            }
-            self.quotes_seen = open.clone();
-        }
-        ConvFrame {
-            alphas: self.motion.body_alphas(now),
-            folds: self.motion.fold_shown(now),
-            heights: Rc::clone(&self.fold_heights),
-            landing: self.landing.as_ref().map(|landing| landing.index),
-            frames: self.frames.clone(),
         }
     }
 
@@ -2370,7 +2342,12 @@ impl Render for Inbox {
         self.frame_now = now;
         self.want_bodies(cx);
         self.hold_landing();
-        let conv = self.body_motion(now);
+        let conv = ConvFrame {
+            alphas: self.motion.body_alphas(now),
+            disclosures: self.motion.disclosures(&self.session, now),
+            landing: self.landing.as_ref().map(|landing| landing.index),
+            frames: self.frames.clone(),
+        };
         let width = f32::from(window.viewport_size().width);
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
         self.motion.observe(&self.session, panes, now);
@@ -2501,30 +2478,16 @@ struct Landing {
 }
 
 /// What the conversation's bodies show this frame beyond the session.
+#[derive(Default)]
 struct ConvFrame {
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
-    /// Folds still moving and how open they are, 0 to 1, by message id.
-    folds: HashMap<String, f32>,
-    /// Natural height of each opened fold, by [`fold_key`].
-    heights: Rc<RefCell<HashMap<String, f32>>>,
+    disclosures: Disclosures,
     /// The message held at the top of the conversation, if any.
     landing: Option<usize>,
     frames: Option<SharedFrameLog>,
 }
 
-impl ConvFrame {
-    /// Nothing moving: what a copy drawn unseen shows.
-    fn still(heights: &Rc<RefCell<HashMap<String, f32>>>) -> Self {
-        Self {
-            alphas: HashMap::new(),
-            folds: HashMap::new(),
-            heights: Rc::clone(heights),
-            landing: None,
-            frames: None,
-        }
-    }
-}
 #[allow(clippy::too_many_arguments)]
 fn shell(
     theme: Theme,
@@ -2695,7 +2658,7 @@ fn shell(
                 })
                 .when(show_conv, |row| {
                     let conv_width = if show_list {
-                        (width - list_width).max(120.0)
+                        width - list_width - SPLITTER_PX
                     } else {
                         width
                     };
@@ -3470,10 +3433,12 @@ fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
         )
 }
 
+const SPLITTER_PX: f32 = 7.;
+
 fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
     div()
         .id("split")
-        .w(px(7.))
+        .w(px(SPLITTER_PX))
         .h_full()
         .flex_none()
         .flex()
@@ -3491,6 +3456,10 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
         )
         .child(div().w(px(1.)).h_full().bg(rgb(theme.border)))
 }
+
+const CONVERSATION_RULE_PX: f32 = 2.;
+const CONVERSATION_PAD_PX: f32 = 20.;
+const MESSAGE_PAD_PX: f32 = 8.;
 
 #[allow(clippy::too_many_arguments)]
 fn conversation(
@@ -3544,7 +3513,7 @@ fn conversation(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .border_l(px(2.))
+        .border_l(px(CONVERSATION_RULE_PX))
         .border_color(rgb(motion::mix(
             theme.background,
             theme.accent,
@@ -3585,7 +3554,7 @@ fn conversation(
                         })),
                     None => body.overflow_hidden(),
                 })
-                .px(px(20.))
+                .px(px(CONVERSATION_PAD_PX))
                 .pb(px(28.))
                 .when(arrival < 1.0, |body| body.opacity(arrival))
                 .children(messages);
@@ -3863,11 +3832,12 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let quotes = session.is_open(index);
+    let body_width =
+        (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.);
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
-        .px(px(8.))
+        .px(px(MESSAGE_PAD_PX))
         .py(px(10.))
         .mb(px(8.))
         .rounded_md()
@@ -3921,8 +3891,17 @@ fn expanded_message(
                 ),
         )
         .children(message.recipients.as_ref().map(|line| {
-            let open = session.recipients_are_open(index);
-            recipient_lines(theme, line, open, index, conv_width, live, window, cx)
+            recipient_lines(
+                theme,
+                line,
+                session.recipients_are_open(index),
+                frame.disclosures.recipients.get(&message.id).copied(),
+                index,
+                body_width.min(680.),
+                live,
+                window,
+                cx,
+            )
         }))
         // What a draft answers, under who it goes to, as in its window.
         .children(message.context.as_ref().map(|line| {
@@ -3942,7 +3921,8 @@ fn expanded_message(
             theme,
             message,
             FoldView {
-                open: quotes,
+                open: session.is_open(index),
+                width: body_width,
                 name_key: index == session.message_cursor,
                 focused: cursor,
                 index,
@@ -3959,6 +3939,7 @@ fn expanded_message(
 struct FoldView {
     /// `q` has opened them.
     open: bool,
+    width: f32,
     /// The first fold names `q`: this is the reader's message.
     name_key: bool,
     /// How much the message shows the cursor in the focused
@@ -3971,11 +3952,7 @@ struct FoldView {
 
 /// Height a folded line takes, its margin included.
 const FOLD_ROW_PX: f32 = 34.0;
-
-/// A fold's key in [`ConvFrame::heights`].
-fn fold_key(id: &str, section: usize) -> String {
-    format!("{id}#{section}")
-}
+const FOLD_GAP_PX: f32 = 6.0;
 
 /// The body under an expanded message's header: prepared HTML, the stored
 /// text, or the room kept while the HTML is prepared.
@@ -3987,9 +3964,9 @@ fn message_body(
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let alpha = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
-    let reveal = frame.folds.get(&message.id).copied();
+    let reveal = frame.disclosures.quotes.get(&message.id).copied();
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
-        Rich::Html(body) => html_sections(theme, message, body, folds, reveal, frame, cx),
+        Rich::Html(body) => html_sections(theme, body, folds, reveal, cx),
         Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
         Rich::Plain | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
@@ -4051,7 +4028,6 @@ fn message_body(
                             },
                             folds,
                             reveal,
-                            (fold_key(&message.id, at), &frame.heights),
                             move || {
                                 div()
                                     .max_w(px(READING_MEASURE_PX - HISTORY_INDENT_PX))
@@ -4077,11 +4053,9 @@ const READING_MEASURE_PX: f32 = 600.;
 /// painted; quoted history and the signature fold to one line until `q`.
 fn html_sections(
     theme: &Theme,
-    message: &ConvMessage,
-    body: &Arc<HtmlBody>,
+    body: &HtmlBody,
     folds: FoldView,
     reveal: Option<f32>,
-    frame: &ConvFrame,
     cx: &mut Context<Inbox>,
 ) -> Vec<gpui::AnyElement> {
     let palette = mail_body::palette(theme);
@@ -4099,6 +4073,11 @@ fn html_sections(
         .enumerate()
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
+            let width = if rtl {
+                folds.width.min(READING_MEASURE_PX)
+            } else {
+                folds.width
+            };
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.
@@ -4116,7 +4095,7 @@ fn html_sections(
                                 None,
                                 &quiet,
                                 &body.gallery,
-                                (theme, rtl),
+                                (theme, rtl, width),
                             )),
                     )
                     .into_any_element(),
@@ -4135,6 +4114,7 @@ fn html_sections(
                             if section.quiet { &quiet } else { &palette },
                             false,
                             &body.gallery,
+                            width,
                             crate::render::BLOCK_GAP,
                             (!rtl).then_some(READING_MEASURE_PX),
                         )
@@ -4142,9 +4122,7 @@ fn html_sections(
                     )
                     .into_any_element(),
                 Some(kind) => {
-                    let body = Arc::clone(body);
                     let history = mail_body::history_palette(theme);
-                    let theme_for = theme.clone();
                     fold_section(
                         theme,
                         FoldLabel {
@@ -4155,15 +4133,13 @@ fn html_sections(
                         },
                         folds,
                         reveal,
-                        (fold_key(&message.id, at), &frame.heights),
-                        move || {
-                            let section = &body.folded.sections[at];
+                        || {
                             history_blocks(
                                 body.folded.blocks(section),
                                 Some(kind),
                                 &history,
                                 &body.gallery,
-                                (&theme_for, rtl),
+                                (theme, rtl, width),
                             )
                         },
                         cx,
@@ -4198,7 +4174,7 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl): (&Theme, bool),
+    (theme, rtl, width): (&Theme, bool, f32),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
     let nested = matches!(
@@ -4207,8 +4183,9 @@ fn history_blocks(
     );
     let line_height = px(theme.ui_px * 1.4);
     let measure = (!rtl).then_some(READING_MEASURE_PX - HISTORY_INDENT_PX);
-    let column = |run: &[Block], measure: Option<f32>| {
-        crate::render::blocks_column_spaced(run, history, false, gallery, 8., measure)
+    let width = (width - HISTORY_INDENT_PX).max(0.);
+    let column = |run: &[Block], width: f32, measure: Option<f32>| {
+        crate::render::blocks_column_spaced(run, history, false, gallery, width, 8., measure)
             .line_height(line_height)
     };
     div()
@@ -4221,12 +4198,13 @@ fn history_blocks(
                     history_rule(div(), rtl, crate::theme::strong_border(theme))
                         .child(column(
                             blocks,
+                            (width - HISTORY_INDENT_PX).max(0.),
                             measure.map(|measure| measure - HISTORY_INDENT_PX),
                         ))
                         .into_any_element()
                 }
-                Block::Quote { blocks } => column(blocks, measure).into_any_element(),
-                other => column(std::slice::from_ref(other), measure).into_any_element(),
+                Block::Quote { blocks } => column(blocks, width, measure).into_any_element(),
+                other => column(std::slice::from_ref(other), width, measure).into_any_element(),
             }
         }))
         .into_any_element()
@@ -4276,72 +4254,34 @@ impl FoldLabel {
     }
 }
 
-/// One fold: its line while closed, the history under a rule while open,
-/// and a 120 ms height and opacity change between the two. Both states hang
-/// off the same 2 px rule, so the line reads as the history's edge.
+/// A fold's summary and details share an edge. The disclosure keeps both
+/// at their natural heights while it moves the blocks below.
 fn fold_section(
     theme: &Theme,
     label: FoldLabel,
     folds: FoldView,
     reveal: Option<f32>,
-    (key, heights): (String, &Rc<RefCell<HashMap<String, f32>>>),
     opened: impl FnOnce() -> gpui::AnyElement,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    // How open the fold is: 1 open, 0 closed.
-    let shown = reveal.unwrap_or(if folds.open { 1.0 } else { 0.0 });
-    let lines = label.lines;
-    let line_el = (shown < 1.0).then(|| folded_line(theme, &label, folds, cx));
-    if shown <= 0.0 {
-        return line_el.expect("closed fold has a line");
-    }
-    let estimate = lines.max(1) as f32 * theme.ui_px * 1.4 + 8.0;
-    let natural = heights.borrow().get(&key).copied().unwrap_or(estimate);
-    let measured = Rc::clone(heights);
-    // The rule and indent are on a plain block inside a box with no
-    // padding: the history is laid out at the width it paints at, so its
-    // box is as tall as its wrapped lines and nothing under it is
-    // overlapped. Its prose keeps the reading measure; a table or code
-    // block in it takes the pane. Once open, the box sizes itself; the
-    // measured height only paces the next reveal. Right to left, the box
-    // keeps the measure so the rule stays beside the text.
-    let content = div()
-        .pb(px(8.))
-        .when(label.rtl, |content| content.max_w(px(READING_MEASURE_PX)))
-        .on_children_prepainted(move |bounds, _, _| {
-            if let Some(bounds) = bounds.first() {
-                measured
-                    .borrow_mut()
-                    .insert(key.clone(), f32::from(bounds.size.height) + 8.0);
-            }
-        })
-        .child(
-            history_rule(div(), label.rtl, crate::theme::strong_border(theme))
-                .text_color(rgb(theme.dimmed))
-                .child(opened()),
-        );
-    let Some(line_el) = line_el else {
-        return content.into_any_element();
-    };
-    // Mid-reveal: the line gives way as the history grows in its place.
-    div()
-        .flex()
-        .flex_col()
-        .child(
+    disclosure(
+        folds.width,
+        folds.open,
+        reveal,
+        || folded_line(theme, &label, folds, cx),
+        || {
             div()
-                .overflow_hidden()
-                .max_h(px(FOLD_ROW_PX * (1.0 - shown)))
-                .opacity(1.0 - shown)
-                .child(line_el),
-        )
-        .child(
-            div()
-                .overflow_hidden()
-                .max_h(px(natural * shown))
-                .opacity(shown)
-                .child(content),
-        )
-        .into_any_element()
+                .min_h(px(FOLD_ROW_PX))
+                .pb(px(8.))
+                .when(label.rtl, |content| content.max_w(px(READING_MEASURE_PX)))
+                .child(
+                    history_rule(div(), label.rtl, crate::theme::strong_border(theme))
+                        .text_color(rgb(theme.dimmed))
+                        .child(opened()),
+                )
+                .into_any_element()
+        },
+    )
 }
 
 /// The one line a folded quote or signature shows. A click opens it, as
@@ -4362,8 +4302,8 @@ fn folded_line(
     };
     let accent = theme.accent;
     history_rule(div(), label.rtl, rule)
-        .h(px(28.))
-        .mb(px(6.))
+        .h(px(FOLD_ROW_PX - FOLD_GAP_PX))
+        .mb(px(FOLD_GAP_PX))
         .flex()
         .items_center()
         .when(label.rtl, |line| {
@@ -4397,8 +4337,9 @@ fn recipient_lines(
     theme: &Theme,
     line: &present::RecipientLine,
     open: bool,
+    reveal: Option<f32>,
     index: usize,
-    conv_width: f32,
+    width: f32,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -4412,7 +4353,7 @@ fn recipient_lines(
         cx.notify();
     });
     let size = px(theme.ui_px - 1.0);
-    let body = if open {
+    let details = || {
         div()
             .flex()
             .flex_col()
@@ -4472,20 +4413,21 @@ fn recipient_lines(
                             })
                     })
             }))
-    } else {
+            .into_any_element()
+    };
+    let summary = || {
         // Whole people only, measured like the thread list, so the count
         // always matches the names on screen; the Bcc and key always show.
         // Only a single name too long for the pane is cut, with an ellipsis.
         // The text takes the box's colour, so hover reaches it.
-        let room = (conv_width - 48.0).min(680.0);
         let (names, tail, _) = present::fit_recipients(line, |names, tail| {
             line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
-                <= room
+                <= width
         });
         let names = clip_line(
             window,
             &names,
-            (room - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
+            (width - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
             FontWeight::NORMAL,
         );
         div()
@@ -4497,16 +4439,21 @@ fn recipient_lines(
             })
             .child(div().whitespace_nowrap().child(names))
             .child(div().flex_shrink_0().whitespace_nowrap().child(tail))
+            .into_any_element()
     };
     div()
         .id(gpui::ElementId::named_usize("recipients", index))
         .max_w(px(680.))
         .pb(px(10.))
         .text_size(size)
-        .child(body.when(live.0, |body| {
-            body.cursor_pointer()
-                .on_mouse_down(MouseButton::Left, toggle)
-        }))
+        .child(
+            div()
+                .when(live.0, |body| {
+                    body.cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, toggle)
+                })
+                .child(disclosure(width, open, reveal, summary, details)),
+        )
         .into_any_element()
 }
 

@@ -7,7 +7,7 @@
 //! scroll glides start where the view changes them, because they need the
 //! positions from before the change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::keymap::KeyId;
@@ -161,8 +161,62 @@ pub struct InboxMotion {
     /// Message bodies that came after their header, settling from
     /// [`motion::ARRIVE_FROM`], by message id.
     bodies: HashMap<String, Transition>,
-    /// Folded history opening (`true`) or closing, by message id.
-    folds: HashMap<String, (Transition, bool)>,
+    quotes: DisclosureMotion,
+    recipients: DisclosureMotion,
+}
+
+/// How open each moving disclosure is, from 0 to 1, by message id.
+#[derive(Default)]
+pub struct Disclosures {
+    pub quotes: HashMap<String, f32>,
+    pub recipients: HashMap<String, f32>,
+}
+
+#[derive(Default)]
+struct DisclosureMotion {
+    open: HashSet<String>,
+    transitions: HashMap<String, (Transition, bool)>,
+}
+
+impl DisclosureMotion {
+    fn sample(
+        &mut self,
+        open: &HashSet<String>,
+        motion: &Motion,
+        now: Instant,
+    ) -> HashMap<String, f32> {
+        if self.open != *open {
+            for (changed, opening) in [
+                (open.difference(&self.open), true),
+                (self.open.difference(open), false),
+            ] {
+                let duration = if opening { motion::SLIDE } else { motion::FADE };
+                if let Some(transition) = motion.start(duration, now) {
+                    for id in changed {
+                        self.transitions.insert(id.clone(), (transition, opening));
+                    }
+                }
+            }
+            self.open = open.clone();
+        }
+        self.transitions
+            .iter()
+            .map(|(id, (transition, opening))| {
+                let shown = if *opening {
+                    transition.progress(now)
+                } else {
+                    transition.remaining(now)
+                };
+                (id.clone(), shown)
+            })
+            .collect()
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        self.transitions
+            .retain(|_, (transition, _)| transition.running(now));
+        !self.transitions.is_empty()
+    }
 }
 
 /// Scroll offsets a settle jumped to, for the view to apply.
@@ -208,7 +262,8 @@ impl InboxMotion {
             card_to: None,
             card_glide: None,
             bodies: HashMap::new(),
-            folds: HashMap::new(),
+            quotes: DisclosureMotion::default(),
+            recipients: DisclosureMotion::default(),
         }
     }
 
@@ -407,7 +462,8 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = false;
         self.bodies.clear();
-        self.folds.clear();
+        self.quotes.transitions.clear();
+        self.recipients.transitions.clear();
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -467,8 +523,9 @@ impl InboxMotion {
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
         self.bodies.retain(|_, fade| fade.running(now));
-        self.folds.retain(|_, (reveal, _)| reveal.running(now));
-        running |= !self.bodies.is_empty() || !self.folds.is_empty();
+        running |= self.quotes.tick(now);
+        running |= self.recipients.tick(now);
+        running |= !self.bodies.is_empty();
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -664,34 +721,15 @@ impl InboxMotion {
             .collect()
     }
 
-    /// A message's folded history opened (`q`, a click) or closed. It grows
-    /// over [`motion::SLIDE`], and leaves over [`motion::FADE`] on the
-    /// gentler exit curve.
-    pub fn fold_toggled(&mut self, id: &str, open: bool, now: Instant) {
-        let duration = if open { motion::SLIDE } else { motion::FADE };
-        match self.motion.start(duration, now) {
-            Some(reveal) => {
-                self.folds.insert(id.to_string(), (reveal, open));
-            }
-            None => {
-                self.folds.remove(id);
-            }
+    /// History and recipients can open together with `q` or separately by
+    /// click. Both use the same timing and reduced-motion setting.
+    pub fn disclosures(&mut self, session: &Session, now: Instant) -> Disclosures {
+        Disclosures {
+            quotes: self.quotes.sample(&session.quotes_open, &self.motion, now),
+            recipients: self
+                .recipients
+                .sample(&session.recipients_open, &self.motion, now),
         }
-    }
-
-    /// How open each fold still moving is, 0 closed to 1 open, by message id.
-    pub fn fold_shown(&self, now: Instant) -> HashMap<String, f32> {
-        self.folds
-            .iter()
-            .map(|(id, (reveal, open))| {
-                let shown = if *open {
-                    reveal.progress(now)
-                } else {
-                    reveal.remaining(now)
-                };
-                (id.clone(), shown)
-            })
-            .collect()
     }
 
     /// How far the conversation is towards "focused": its edge and the
@@ -1194,34 +1232,56 @@ mod tests {
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
         motion.body_arrived("a", now);
-        motion.fold_toggled("a", true, now);
+        session.quotes_open.insert("a".into());
+        session.recipients_open.insert("a".into());
         assert!(motion.body_alphas(now).is_empty());
-        assert!(motion.fold_shown(now).is_empty());
+        let shown = motion.disclosures(&session, now);
+        assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
     }
 
     #[test]
-    fn a_body_settles_in_and_a_fold_grows_then_a_key_ends_both() {
+    fn history_and_recipients_move_together_and_a_key_settles_them() {
         let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
         let now = Instant::now();
         motion.body_arrived("a", now);
-        motion.fold_toggled("b", true, now);
+        session.quotes_open.insert("b".into());
+        session.recipients_open.insert("b".into());
         assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
-        assert_eq!(motion.fold_shown(now)["b"], 0.0);
+        let opening = motion.disclosures(&session, now);
+        assert_eq!(opening.quotes["b"], 0.0);
+        assert_eq!(opening.recipients["b"], 0.0);
+
         let mid = later(now, 40);
         let alpha = motion.body_alphas(mid)["a"];
         assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
         assert!(motion.tick(mid));
-        // The body is in after QUICK; the fold still grows until SLIDE.
+        let shown = motion.disclosures(&session, mid);
+        assert_eq!(shown.quotes, shown.recipients);
+        assert!((0.0..1.0).contains(&shown.quotes["b"]));
+
+        // The body is in after QUICK; both disclosures keep moving until SLIDE.
         let after = later(now, 90);
         assert!(motion.tick(after));
         assert!(!motion.body_alphas(after).contains_key("a"));
-        assert!(motion.fold_shown(after)["b"] > 0.9);
-        // Closing leaves on the exit curve, and a key jumps to the end.
-        motion.fold_toggled("b", false, after);
-        assert_eq!(motion.fold_shown(after)["b"], 1.0);
-        motion.settle(later(after, 10));
-        assert!(motion.fold_shown(later(after, 10)).is_empty());
-        assert!(!motion.tick(later(after, 10)));
+        assert!(motion.disclosures(&session, after).quotes["b"] > 0.9);
+
+        let close = later(now, 130);
+        assert!(!motion.tick(close));
+        session.quotes_open.clear();
+        session.recipients_open.clear();
+        let closing = motion.disclosures(&session, close);
+        assert_eq!(closing.quotes["b"], 1.0);
+        assert_eq!(closing.recipients["b"], 1.0);
+        let next = later(close, 20);
+        let shown = motion.disclosures(&session, next);
+        assert_eq!(shown.quotes, shown.recipients);
+        assert!((0.0..1.0).contains(&shown.quotes["b"]));
+
+        motion.settle(next);
+        let end = motion.disclosures(&session, next);
+        assert!(end.quotes.is_empty() && end.recipients.is_empty());
+        assert!(!motion.tick(next));
     }
 }

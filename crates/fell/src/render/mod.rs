@@ -432,7 +432,7 @@ impl Render for Reader {
                             .child(action),
                     ),
             )
-            .child(message_body(self, &palette))
+            .child(message_body(self, &palette, window))
     }
 }
 
@@ -446,7 +446,12 @@ fn remote_image_mark(tone: u32) -> gpui::Div {
         .bg(paint(tone))
 }
 
-fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpui::Div> {
+fn message_body(
+    reader: &Reader,
+    palette: &theme::Palette,
+    window: &Window,
+) -> gpui::Stateful<gpui::Div> {
+    const NATIVE_BODY_PAD_PX: f32 = 16.;
     let web = reader.model.mode() == RenderMode::Web;
     let mut body = div()
         .id("message-body")
@@ -461,7 +466,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
         };
         body = body.bg(paint(page));
     } else {
-        body = body.px_4().py_4();
+        body = body.p(px(NATIVE_BODY_PAD_PX));
     }
     if web {
         if let Some(image) = reader.web_image.clone() {
@@ -485,6 +490,7 @@ fn message_body(reader: &Reader, palette: &theme::Palette) -> gpui::Stateful<gpu
             palette,
             reader.model.remote_images_allowed(),
             &reader.gallery,
+            (f32::from(window.viewport_size().width) - 2. * NATIVE_BODY_PAD_PX).max(0.),
         ))
     }
 }

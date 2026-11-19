@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn fixture_account() -> Account {
     Account {
         id: AccountId("local".into()),
-        display_name: "Caleb".into(),
-        email: "caleb@fell.test".into(),
+        display_name: "Tessa".into(),
+        email: "tessa@harbor.test".into(),
         backend_kind: BackendKind::Bridge,
     }
 }
@@ -38,12 +38,12 @@ fn extra_count() -> usize {
 }
 
 const EXTRA_SENDERS: [(&str, &str); 6] = [
-    ("Ada", "ada@fell.test"),
-    ("Build bot", "builds@fell.test"),
-    ("Mira", "mira@fell.test"),
-    ("Theo", "theo@fell.test"),
-    ("Calendar", "calendar@fell.test"),
-    ("Priya", "priya@fell.test"),
+    ("Ada", "ada@harbor.test"),
+    ("Build bot", "builds@harbor.test"),
+    ("Mira", "mira@harbor.test"),
+    ("Theo", "theo@harbor.test"),
+    ("Calendar", "calendar@harbor.test"),
+    ("Priya", "priya@harbor.test"),
 ];
 
 const EXTRA_SUBJECTS: [&str; 6] = [
@@ -136,8 +136,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
     let rows = [
         DraftMail {
             id: "cabin-1@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Cabin weekend",
             body: "Did the cabin come through? I can drive if you sort the food.",
             ago: 26 * 3600 + 20 * 60,
@@ -152,9 +152,9 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "cabin-2@fell.test",
             name: "Ada",
-            email: "ada@fell.test",
+            email: "ada@harbor.test",
             subject: "Re: Cabin weekend",
-            body: "Caleb,\n\nThe cabin is ours for the 14th to the 16th. A few things before we go:\n\n* Bring the good headlamp; the path from the car is dark.\n* Maya has the key. She gets there Friday at 6.\n* Firewood is on the porch, and there is more in the shed.\n\nThe map is below, and the booking is here if you want to check the dates.\n\nCan't wait.\n\n-- \nAda\nField notes, mostly\nnotes.fell.test\n\nOn Mon, Nov 16, 2026 at 8:12 PM Caleb <caleb@fell.test> wrote:\n> Did the cabin come through? I can drive if you sort the food.",
+            body: "Tessa,\n\nThe cabin is ours for the 14th to the 16th. A few things before we go:\n\n* Bring the good headlamp; the path from the car is dark.\n* Maya has the key. She gets there Friday at 6.\n* Firewood is on the porch, and there is more in the shed.\n\nThe map is below, and the booking is here if you want to check the dates.\n\nCan't wait.\n\n-- \nAda\nField notes, mostly\nnotes.harbor.test\n\nOn Mon, Nov 16, 2026 at 8:12 PM Tessa <tessa@harbor.test> wrote:\n> Did the cabin come through? I can drive if you sort the food.",
             ago: 25 * 60,
             unread: true,
             folders: &["INBOX"],
@@ -182,7 +182,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "venue-1@fell.test",
             name: "Priya Natarajan",
-            email: "priya@fell.test",
+            email: "priya@harbor.test",
             subject: "Venue for the launch",
             body: "Two options: the hall on Mill Lane, or the back room at the library. Mill Lane is bigger.",
             ago: 30 * 3600,
@@ -196,8 +196,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "venue-2@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Re: Venue for the launch",
             body: "Mill Lane works for me. Can you check they have a projector?\n\n> Two options: the hall on Mill Lane, or the back room at the library.",
             ago: 28 * 3600,
@@ -212,9 +212,9 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "venue-3@fell.test",
             name: "Priya Natarajan",
-            email: "priya@fell.test",
+            email: "priya@harbor.test",
             subject: "Re: Venue for the launch",
-            body: "Booked. The hall on Mill Lane holds 80, and they'll leave the projector up for us.\nDeposit is paid; I'll send the receipt to Sam.\n\nGet Outlook for Android\n\nFrom: Caleb <caleb@fell.test>\nSent: Tuesday, November 17, 2026 4:02 PM\nTo: Priya Natarajan <priya@fell.test>\nSubject: Re: Venue for the launch\n\nMill Lane works for me. Can you check they have a projector?",
+            body: "Booked. The hall on Mill Lane holds 80, and they'll leave the projector up for us.\nDeposit is paid; I'll send the receipt to Sam.\n\nGet Outlook for Android\n\nFrom: Tessa <tessa@harbor.test>\nSent: Tuesday, November 17, 2026 4:02 PM\nTo: Priya Natarajan <priya@harbor.test>\nSubject: Re: Venue for the launch\n\nMill Lane works for me. Can you check they have a projector?",
             ago: 3 * 3600 + 30 * 60,
             unread: false,
             folders: &["INBOX"],
@@ -226,8 +226,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "offsite@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Offsite plan for March",
             body: "Booked the lodge for the 12th to the 14th. Agenda to follow; send me anything you want on it by Friday.",
             ago: 5 * 60,
@@ -242,8 +242,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "thread-a-1@fell.test",
-            name: "Jon",
-            email: "jon@fell.test",
+            name: "Ruben",
+            email: "ruben@harbor.test",
             subject: "Sent copies in the thread",
             body: "Can we keep Sent in the thread?\n\nI don't want a second sidebar for it.",
             ago: 2 * 86_400,
@@ -257,10 +257,10 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "thread-a-2@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Re: Sent copies in the thread",
-            body: "The list stays one folder wide. Your reply in Sent still shows up here.\n\n-- \nCaleb\n\n> Can we keep Sent in the thread?",
+            body: "The list stays one folder wide. Your reply in Sent still shows up here.\n\n-- \nTessa\n\n> Can we keep Sent in the thread?",
             ago: 86_400,
             unread: false,
             folders: &["Sent"],
@@ -272,10 +272,10 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "thread-a-3@fell.test",
-            name: "Jon",
-            email: "jon@fell.test",
+            name: "Ruben",
+            email: "ruben@harbor.test",
             subject: "Re: Sent copies in the thread",
-            body: "Yes. m moves the copies in this folder. The Sent copy stays in Sent.\n\n-- \nJon\n\n> Can we keep Sent in the thread?\n> I don't want a second sidebar for it.\n>> The list stays one folder wide.\n> > Your reply in Sent still shows up here.",
+            body: "Yes. m moves the copies in this folder. The Sent copy stays in Sent.\n\n-- \nRuben\n\n> Can we keep Sent in the thread?\n> I don't want a second sidebar for it.\n>> The list stays one folder wide.\n> > Your reply in Sent still shows up here.",
             ago: 12 * 60,
             unread: true,
             folders: &["INBOX"],
@@ -288,9 +288,9 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "rows@fell.test",
             name: "Ada",
-            email: "ada@fell.test",
+            email: "ada@harbor.test",
             subject: "Row height for the inbox",
-            body: "Two lines is enough. Here are the numbers from the test, so you can check me:\n\nDensity | Row height | Rows on screen | Notes\nCompact | 44 px | 19 | Snippet cut early on narrow tiles\nDefault | 52 px | 16 | Who, then subject and snippet\nRoomy | 64 px | 13 | Feels slow with j held down\n\nWhat I'd do, in order:\n\n1. Ship Default.\n2. Keep Compact behind a setting.\n3. Drop Roomy.\n\nThe paperclip is the diagram; the spec is on the wiki.\n\nOn Sun, Nov 15, 2026 at 9:02 AM Caleb <caleb@fell.test> wrote:\n> How many lines should a row be?",
+            body: "Two lines is enough. Here are the numbers from the test, so you can check me:\n\nDensity | Row height | Rows on screen | Notes\nCompact | 44 px | 19 | Snippet cut early on narrow tiles\nDefault | 52 px | 16 | Who, then subject and snippet\nRoomy | 64 px | 13 | Feels slow with j held down\n\nWhat I'd do, in order:\n\n1. Ship Default.\n2. Keep Compact behind a setting.\n3. Drop Roomy.\n\nThe paperclip is the diagram; the spec is on the wiki.\n\nOn Sun, Nov 15, 2026 at 9:02 AM Tessa <tessa@harbor.test> wrote:\n> How many lines should a row be?",
             ago: 40 * 60,
             unread: true,
             folders: &["INBOX"],
@@ -303,7 +303,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "narrow@fell.test",
             name: "Maya",
-            email: "maya@fell.test",
+            email: "maya@harbor.test",
             subject: "Narrow window check",
             body: "When the tile gets narrow, show one pane. Enter opens, Esc comes back.",
             ago: 2 * 3600,
@@ -317,8 +317,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "bridge@fell.test",
-            name: "Jon",
-            email: "jon@fell.test",
+            name: "Ruben",
+            email: "ruben@harbor.test",
             subject: "Bridge on port 1143",
             body: "STARTTLS before LOGIN. The UI should not wait on it.",
             ago: 3 * 3600,
@@ -333,7 +333,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "dinner@fell.test",
             name: "Sam",
-            email: "sam@fell.test",
+            email: "sam@harbor.test",
             subject: "Thursday dinner",
             body: "Same place as last time, 7pm. I'll grab the corner table.",
             ago: 26 * 3600,
@@ -348,7 +348,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "tiles@fell.test",
             name: "Maya",
-            email: "maya@fell.test",
+            email: "maya@harbor.test",
             subject: "Hyprland tiles",
             body: "A half-width tile should not crush the split. One pane, same keys.",
             ago: 3 * 86_400,
@@ -363,7 +363,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "tickets@fell.test",
             name: "Maya",
-            email: "maya@fell.test",
+            email: "maya@harbor.test",
             subject: "Tickets for Friday",
             body: "Two seats, aisle. I'll forward the PDF when it lands.",
             ago: 4 * 86_400,
@@ -377,8 +377,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "qresync@fell.test",
-            name: "Jon",
-            email: "jon@fell.test",
+            name: "Ruben",
+            email: "ruben@harbor.test",
             subject: "QRESYNC notes",
             body: "CONDSTORE when the server has it. Otherwise just the new UIDs.",
             ago: 5 * 86_400,
@@ -393,7 +393,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "font@fell.test",
             name: "Ada",
-            email: "ada@fell.test",
+            email: "ada@harbor.test",
             subject: "Font on Omarchy",
             body: "Use the UI face and the size Omarchy already set. Don't invent a third.",
             ago: 6 * 86_400,
@@ -408,7 +408,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "weekly@fell.test",
             name: "Weekly",
-            email: "notes@fell.test",
+            email: "notes@harbor.test",
             subject: "Weekly notes",
             body: "A short note on native text.\n\nQuoted history stays folded.\n\n> older weekly\n> still folded",
             ago: 9 * 86_400,
@@ -423,7 +423,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "labels@fell.test",
             name: "Ada",
-            email: "ada@fell.test",
+            email: "ada@harbor.test",
             subject: "Labels are not folders",
             body: "A chip on the row, not a sidebar. l will edit them later.",
             ago: 8 * 86_400,
@@ -437,8 +437,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "intro@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Introducing Fell",
             body: "Threads first, local store, no send from the agent.",
             ago: 5 * 86_400,
@@ -452,8 +452,8 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         },
         DraftMail {
             id: "invoice@fell.test",
-            name: "Caleb",
-            email: "caleb@fell.test",
+            name: "Tessa",
+            email: "tessa@harbor.test",
             subject: "Re: Invoice",
             body: "Draft only. Not sent.",
             ago: 6 * 3600,
@@ -468,7 +468,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
         DraftMail {
             id: "hosting@fell.test",
             name: "Sam",
-            email: "sam@fell.test",
+            email: "sam@harbor.test",
             subject: "Old hosting bill",
             body: "Already paid. Sitting in Archive.",
             ago: 20 * 86_400,
@@ -824,35 +824,35 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
 type People = &'static [(&'static str, &'static str)];
 
 fn recipients(row: &DraftMail, me: &str) -> (People, People, People) {
-    const TEAM: People = &[("Ada", "ada@fell.test"), ("Maya", "maya@fell.test")];
+    const TEAM: People = &[("Ada", "ada@harbor.test"), ("Maya", "maya@harbor.test")];
     const EVERYONE: People = &[
-        ("Ada", "ada@fell.test"),
-        ("Maya", "maya@fell.test"),
-        ("Sam", "sam@fell.test"),
-        ("Priya Natarajan", "priya@fell.test"),
+        ("Ada", "ada@harbor.test"),
+        ("Maya", "maya@harbor.test"),
+        ("Sam", "sam@harbor.test"),
+        ("Priya Natarajan", "priya@harbor.test"),
     ];
     match row.id {
-        "thread-a-1@fell.test" => (&[("Caleb", "caleb@fell.test")], TEAM, &[]),
+        "thread-a-1@fell.test" => (&[("Tessa", "tessa@harbor.test")], TEAM, &[]),
         "thread-a-2@fell.test" => (
-            &[("Jon", "jon@fell.test")],
+            &[("Ruben", "ruben@harbor.test")],
             TEAM,
-            &[("Sam", "sam@fell.test")],
+            &[("Sam", "sam@harbor.test")],
         ),
-        "thread-a-3@fell.test" => (&[("Caleb", "caleb@fell.test")], EVERYONE, &[]),
+        "thread-a-3@fell.test" => (&[("Tessa", "tessa@harbor.test")], EVERYONE, &[]),
         "offsite@fell.test" => (
-            &[("Ada", "ada@fell.test")],
+            &[("Ada", "ada@harbor.test")],
             &[
-                ("Maya", "maya@fell.test"),
-                ("Sam", "sam@fell.test"),
-                ("Priya Natarajan", "priya@fell.test"),
-                ("Jon", "jon@fell.test"),
-                ("Bob Stone", "bob@fell.test"),
-                ("Lena Ortiz", "lena@fell.test"),
+                ("Maya", "maya@harbor.test"),
+                ("Sam", "sam@harbor.test"),
+                ("Priya Natarajan", "priya@harbor.test"),
+                ("Ruben", "ruben@harbor.test"),
+                ("Bob Stone", "bob@harbor.test"),
+                ("Lena Ortiz", "lena@harbor.test"),
             ],
-            &[("Riya", "riya@fell.test")],
+            &[("Riya", "riya@harbor.test")],
         ),
-        _ if row.email == me => (&[("Jon", "jon@fell.test")], &[], &[]),
-        _ => (&[("Caleb", "caleb@fell.test")], &[], &[]),
+        _ if row.email == me => (&[("Ruben", "ruben@harbor.test")], &[], &[]),
+        _ => (&[("Tessa", "tessa@harbor.test")], &[], &[]),
     }
 }
 
@@ -1014,7 +1014,7 @@ fn attachment_parts(row: &DraftMail) -> Vec<fell_core::MimePart> {
 
 /// A reply as Gmail writes it: lists, a link, a remote image, a signature
 /// after `-- `, and the earlier message in a `gmail_quote`.
-const CABIN_REPLY_HTML: &str = r#"<div dir="ltr"><div>Caleb,</div><div><br></div><div>The cabin is ours for the <b>14th to the 16th</b>. A few things before we go:</div><ul><li>Bring the <i>good</i> headlamp; the path from the car is dark.</li><li>Maya has the key. She gets there Friday at 6.</li><li>Firewood is on the porch, and there is more in the shed.</li></ul><div>The map is below, and the booking is <a href="https://cabins.test/booking/4821">here</a> if you want to check the dates.</div><div><br></div><div><img src="https://cabins.test/map/lake-path.png" alt="Map of the lake path" width="480"></div><div><br></div><div>Can't wait.</div><div><br></div>-- <br><div dir="ltr" class="gmail_signature"><div>Ada</div><div>Field notes, mostly</div><div>notes.fell.test</div></div></div><br><div class="gmail_quote gmail_quote_container"><div dir="ltr" class="gmail_attr">On Mon, Nov 16, 2026 at 8:12 PM Caleb &lt;caleb@fell.test&gt; wrote:<br></div><blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex"><div dir="ltr">Did the cabin come through? I can drive if you sort the food.</div></blockquote></div>"#;
+const CABIN_REPLY_HTML: &str = r#"<div dir="ltr"><div>Tessa,</div><div><br></div><div>The cabin is ours for the <b>14th to the 16th</b>. A few things before we go:</div><ul><li>Bring the <i>good</i> headlamp; the path from the car is dark.</li><li>Maya has the key. She gets there Friday at 6.</li><li>Firewood is on the porch, and there is more in the shed.</li></ul><div>The map is below, and the booking is <a href="https://cabins.test/booking/4821">here</a> if you want to check the dates.</div><div><br></div><div><img src="https://cabins.test/map/lake-path.png" alt="Map of the lake path" width="480"></div><div><br></div><div>Can't wait.</div><div><br></div>-- <br><div dir="ltr" class="gmail_signature"><div>Ada</div><div>Field notes, mostly</div><div>notes.harbor.test</div></div></div><br><div class="gmail_quote gmail_quote_container"><div dir="ltr" class="gmail_attr">On Mon, Nov 16, 2026 at 8:12 PM Tessa &lt;tessa@harbor.test&gt; wrote:<br></div><blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex"><div dir="ltr">Did the cabin come through? I can drive if you sort the food.</div></blockquote></div>"#;
 
 /// A newsletter as ESPs send them: a hidden preheader padded with
 /// `&zwnj;&nbsp;`, nested presentation tables, remote images, a two-column
@@ -1070,18 +1070,18 @@ const ROWS_REPLY_HTML: &str = r#"<div dir="ltr"><div>Two lines is enough. Here a
 <div><br></div><div>What I'd do, in order:</div>
 <ol><li>Ship <b>Default</b>.</li><li>Keep <code>Compact</code> behind a setting.<ol><li>Only if someone asks.</li></ol></li><li>Drop Roomy.</li></ol>
 <div>The paperclip is the diagram; the spec is <a href="https://design.test/rows">on the wiki</a>.</div>
-<div><br></div><div class="gmail_quote"><div dir="ltr" class="gmail_attr">On Sun, Nov 15, 2026 at 9:02 AM Caleb &lt;caleb@fell.test&gt; wrote:<br></div><blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">How many lines should a row be?<br><blockquote class="gmail_quote">Earlier: three felt like a lot.</blockquote></blockquote></div></div>"#;
+<div><br></div><div class="gmail_quote"><div dir="ltr" class="gmail_attr">On Sun, Nov 15, 2026 at 9:02 AM Tessa &lt;tessa@harbor.test&gt; wrote:<br></div><blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">How many lines should a row be?<br><blockquote class="gmail_quote">Earlier: three felt like a lot.</blockquote></blockquote></div></div>"#;
 
 const VENUE_FIRST_HTML: &str = r#"<div style="font-family:Aptos,sans-serif;font-size:12pt">Two options: the hall on <b>Mill Lane</b>, or the back room at the library. Mill Lane is bigger.</div><div><br></div><div id="ms-outlook-mobile-signature">Get Outlook for Android</div>"#;
 
 /// Outlook's reply: no `>` and no blockquote, only a `From:` / `Sent:`
 /// header over each earlier message.
-const VENUE_REPLY_HTML: &str = r#"<div style="font-family:Aptos,sans-serif;font-size:12pt">Booked. The hall on Mill Lane holds 80, and they'll leave the projector up for us.</div><div style="font-family:Aptos,sans-serif;font-size:12pt">Deposit is paid; I'll send the receipt to Sam.</div><div><br></div><div id="ms-outlook-mobile-signature">Get Outlook for Android</div><div id="appendonsend"></div><hr style="display:inline-block;width:98%"><div id="divRplyFwdMsg" dir="ltr"><font face="Calibri, sans-serif" style="font-size:11pt"><b>From:</b> Caleb &lt;caleb@fell.test&gt;<br><b>Sent:</b> Tuesday, November 17, 2026 4:02 PM<br><b>To:</b> Priya Natarajan &lt;priya@fell.test&gt;<br><b>Subject:</b> Re: Venue for the launch</font><div>&nbsp;</div></div><div>Mill Lane works for me. Can you check they have a projector?</div><div><br></div><hr style="display:inline-block;width:98%"><div><font face="Calibri, sans-serif" style="font-size:11pt"><b>From:</b> Priya Natarajan &lt;priya@fell.test&gt;<br><b>Sent:</b> Tuesday, November 17, 2026 11:40 AM<br><b>To:</b> Caleb &lt;caleb@fell.test&gt;<br><b>Subject:</b> Venue for the launch</font></div><div>Two options: the hall on Mill Lane, or the back room at the library. Mill Lane is bigger.</div>"#;
+const VENUE_REPLY_HTML: &str = r#"<div style="font-family:Aptos,sans-serif;font-size:12pt">Booked. The hall on Mill Lane holds 80, and they'll leave the projector up for us.</div><div style="font-family:Aptos,sans-serif;font-size:12pt">Deposit is paid; I'll send the receipt to Sam.</div><div><br></div><div id="ms-outlook-mobile-signature">Get Outlook for Android</div><div id="appendonsend"></div><hr style="display:inline-block;width:98%"><div id="divRplyFwdMsg" dir="ltr"><font face="Calibri, sans-serif" style="font-size:11pt"><b>From:</b> Tessa &lt;tessa@harbor.test&gt;<br><b>Sent:</b> Tuesday, November 17, 2026 4:02 PM<br><b>To:</b> Priya Natarajan &lt;priya@harbor.test&gt;<br><b>Subject:</b> Re: Venue for the launch</font><div>&nbsp;</div></div><div>Mill Lane works for me. Can you check they have a projector?</div><div><br></div><hr style="display:inline-block;width:98%"><div><font face="Calibri, sans-serif" style="font-size:11pt"><b>From:</b> Priya Natarajan &lt;priya@harbor.test&gt;<br><b>Sent:</b> Tuesday, November 17, 2026 11:40 AM<br><b>To:</b> Tessa &lt;tessa@harbor.test&gt;<br><b>Subject:</b> Venue for the launch</font></div><div>Two options: the hall on Mill Lane, or the back room at the library. Mill Lane is bigger.</div>"#;
 
 /// The newsletter answers at its own address, so `r` on it shows Reply-To.
 fn reply_address(id: &str) -> Vec<Address> {
     match id {
-        "weekly@fell.test" => people(&[("Weekly replies", "weekly-replies@fell.test")]),
+        "weekly@fell.test" => people(&[("Weekly replies", "weekly-replies@harbor.test")]),
         _ => Vec::new(),
     }
 }

@@ -185,15 +185,16 @@ pub fn document_column(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> gpui::Div {
     if document.is_empty() {
-        return blocks_column(&[], palette, allow_remote, gallery).child(
+        return blocks_column(&[], palette, allow_remote, gallery, width).child(
             div()
                 .text_color(paint(palette.dimmed))
                 .child("This message has no body."),
         );
     }
-    blocks_column(&document.blocks, palette, allow_remote, gallery)
+    blocks_column(&document.blocks, palette, allow_remote, gallery, width)
 }
 
 /// A run of a document's blocks, as [`document_column`] paints them. The
@@ -204,8 +205,17 @@ pub fn blocks_column(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> gpui::Div {
-    blocks_column_spaced(blocks, palette, allow_remote, gallery, BLOCK_GAP, None)
+    blocks_column_spaced(
+        blocks,
+        palette,
+        allow_remote,
+        gallery,
+        width,
+        BLOCK_GAP,
+        None,
+    )
 }
 
 /// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
@@ -218,6 +228,7 @@ pub fn blocks_column_spaced(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
     gap: f32,
     measure: Option<f32>,
 ) -> gpui::Div {
@@ -226,6 +237,12 @@ pub fn blocks_column_spaced(
     let mut column = div().flex().flex_col().line_height(px(22.));
     let mut previous: Option<&Block> = None;
     for (start, end) in column_runs(blocks, allow_remote, gallery) {
+        let wide = matches!(
+            blocks[start],
+            Block::Table { .. } | Block::Code { large: false, .. }
+        );
+        let measure = measure.filter(|_| !wide);
+        let block_width = measure.map_or(width, |measure| measure.min(width));
         let child = if end - start == 2 {
             sketch_with_caption(
                 &blocks[start],
@@ -233,9 +250,10 @@ pub fn blocks_column_spaced(
                 palette,
                 allow_remote,
                 gallery,
+                block_width,
             )
         } else {
-            render_block(&blocks[start], palette, allow_remote, gallery)
+            render_block(&blocks[start], palette, allow_remote, gallery, block_width)
         };
         let gap = previous.map_or(0., |above| {
             // Blocked-image lines stacked one under another read as a
@@ -248,16 +266,10 @@ pub fn blocks_column_spaced(
                 gap_between(above, &blocks[start]) * gap
             }
         });
-        let wide = matches!(
-            blocks[start],
-            Block::Table { .. } | Block::Code { large: false, .. }
-        );
         column = column.child(
             div()
                 .mt(px(gap))
-                .when_some(measure.filter(|_| !wide), |prose, measure| {
-                    prose.max_w(px(measure))
-                })
+                .when_some(measure, |prose, measure| prose.max_w(px(measure)))
                 .child(child),
         );
         previous = Some(&blocks[end - 1]);
@@ -290,13 +302,14 @@ fn sketch_with_caption(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(CAPTION_GAP))
-        .child(render_block(sketch, palette, allow_remote, gallery))
-        .child(render_block(caption, palette, allow_remote, gallery))
+        .child(render_block(sketch, palette, allow_remote, gallery, width))
+        .child(render_block(caption, palette, allow_remote, gallery, width))
         .into_any_element()
 }
 
@@ -370,6 +383,7 @@ fn render_block(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> AnyElement {
     match block {
         Block::Heading { level, inlines } => {
@@ -407,7 +421,7 @@ fn render_block(
                 .children(
                     blocks
                         .iter()
-                        .map(|child| render_block(child, &quiet, allow_remote, gallery)),
+                        .map(|child| render_block(child, &quiet, allow_remote, gallery, width)),
                 )
                 .into_any_element()
         }
@@ -418,29 +432,33 @@ fn render_block(
             .children(
                 blocks
                     .iter()
-                    .map(|child| render_block(child, palette, allow_remote, gallery)),
+                    .map(|child| render_block(child, palette, allow_remote, gallery, width)),
             )
             .into_any_element(),
         Block::Quote { blocks } => div()
-            .border_l(px(3.))
+            .border_l(px(QUOTE_RULE_PX))
             .border_color(paint(palette.quote))
-            .pl_4()
+            .pl(px(QUOTE_INSET_PX - QUOTE_RULE_PX))
             .text_color(paint(palette.foreground))
             .flex()
             .flex_col()
             .gap_2()
-            .children(
-                blocks
-                    .iter()
-                    .map(|child| render_block(child, palette, allow_remote, gallery)),
-            )
+            .children(blocks.iter().map(|child| {
+                render_block(
+                    child,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    (width - QUOTE_INSET_PX).max(0.),
+                )
+            }))
             .into_any_element(),
         Block::List { ordered, items } => div()
             .flex()
             .flex_col()
             .gap_2()
             .children(items.iter().enumerate().map(|(index, item)| {
-                list_item(index, *ordered, item, palette, allow_remote, gallery)
+                list_item(index, *ordered, item, palette, allow_remote, gallery, width)
             }))
             .into_any_element(),
         Block::Code { text, large: false } => div()
@@ -469,7 +487,7 @@ fn render_block(
             header,
             rows,
             align,
-        } => render_table(header, rows, align, palette, allow_remote, gallery),
+        } => render_table(header, rows, align, palette, allow_remote, gallery, width),
         Block::Image { source, alt } => image_el(source, alt, palette, allow_remote, gallery),
         Block::ThematicBreak => div()
             .h(px(1.))
@@ -479,6 +497,10 @@ fn render_block(
     }
 }
 
+const QUOTE_RULE_PX: f32 = 3.;
+const QUOTE_INSET_PX: f32 = QUOTE_RULE_PX + 16.;
+const LIST_MARKER_PX: f32 = 19.;
+
 fn list_item(
     index: usize,
     ordered: bool,
@@ -486,6 +508,7 @@ fn list_item(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> AnyElement {
     let marker = if ordered {
         format!("{}.", index + 1)
@@ -499,17 +522,27 @@ fn list_item(
         .items_start()
         .child(
             div()
-                .w(px(19.))
+                .w(px(LIST_MARKER_PX))
                 .flex_shrink_0()
                 .text_color(paint(palette.foreground))
                 .child(marker),
         )
         .child(
-            div().flex_1().flex().flex_col().gap_1().children(
-                item.blocks
-                    .iter()
-                    .map(|block| render_block(block, palette, allow_remote, gallery)),
-            ),
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(item.blocks.iter().map(|block| {
+                    render_block(
+                        block,
+                        palette,
+                        allow_remote,
+                        gallery,
+                        (width - LIST_MARKER_PX).max(0.),
+                    )
+                })),
         )
         .into_any_element()
 }
@@ -521,68 +554,54 @@ fn render_table(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    width: f32,
 ) -> AnyElement {
-    let columns = rows
-        .iter()
-        .map(Vec::len)
-        .chain(std::iter::once(header.len()))
-        .max()
-        .unwrap_or(0);
-    let cell = |cell: Option<&Vec<Block>>| -> (AnyElement, Vec<String>, bool) {
-        let blocks = cell.map(Vec::as_slice).unwrap_or_default();
+    let cell = |blocks: &Vec<Block>| {
         let mut lines = Vec::new();
         push_cell_lines(blocks, &mut lines);
-        let bold = blocks_are_bold(blocks);
-        let element = div()
+        let content = div()
             .flex()
             .flex_col()
             .gap_2()
             .children(
                 blocks
                     .iter()
-                    .map(|block| render_block(block, palette, allow_remote, gallery)),
+                    .map(|block| render_block(block, palette, allow_remote, gallery, width)),
             )
             .into_any_element();
-        (element, lines, bold)
+        TableCell {
+            content,
+            lines,
+            bold: blocks_are_bold(blocks),
+        }
     };
-    let mut table_rows = Vec::new();
-    if !header.is_empty() {
-        table_rows.push(TableRow {
-            header: true,
-            cells: (0..columns)
-                .map(|column| cell(header.get(column)))
-                .collect(),
-        });
-    }
-    for row in rows {
-        table_rows.push(TableRow {
-            header: false,
-            cells: (0..columns).map(|column| cell(row.get(column))).collect(),
-        });
-    }
     TableElement {
-        rows: table_rows,
+        header: header.iter().map(cell).collect(),
+        rows: rows
+            .iter()
+            .map(|row| row.iter().map(cell).collect())
+            .collect(),
         align: align.to_vec(),
         palette: *palette,
+        width,
         inner: None,
     }
     .into_any_element()
 }
 
-struct TableRow {
-    header: bool,
-    /// Each cell's painted content, its lines of text to measure, and
-    /// whether any of it is bold.
-    cells: Vec<(AnyElement, Vec<String>, bool)>,
+struct TableCell {
+    content: AnyElement,
+    lines: Vec<String>,
+    bold: bool,
 }
 
-/// A table whose columns are sized from their text as the body face sets
-/// it. The widths need the window's text system, so the rows are built
-/// when the element is laid out.
+/// Measure with the inherited body face before laying out the rows.
 struct TableElement {
-    rows: Vec<TableRow>,
+    header: Vec<TableCell>,
+    rows: Vec<Vec<TableCell>>,
     align: Vec<Align>,
     palette: Palette,
+    width: f32,
     inner: Option<AnyElement>,
 }
 
@@ -615,81 +634,51 @@ impl Element for TableElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let regular = window.text_system().resolve_font(&style.font());
-        let mut bold_font = style.font();
-        bold_font.weight = FontWeight::BOLD;
-        let bold = window.text_system().resolve_font(&bold_font);
-        let text_system = window.text_system().clone();
+        let mut bold_style = style.clone();
+        bold_style.font_weight = FontWeight::BOLD;
+        let text_system = window.text_system();
         let measure = |text: &str, strong: bool| -> f32 {
-            let font = if strong { bold } else { regular };
-            text.chars()
-                .map(|ch| {
-                    text_system
-                        .advance(font, font_size, ch)
-                        .map(|size| f32::from(size.width))
-                        .unwrap_or(f32::from(font_size) * 0.55)
+            let style = if strong { &bold_style } else { &style };
+            text.split('\n')
+                .map(|line| {
+                    let run = style.to_run(line.len());
+                    f32::from(
+                        text_system
+                            .shape_line(line.to_string().into(), font_size, &[run], None)
+                            .width,
+                    )
                 })
-                .sum()
+                .fold(0., f32::max)
         };
-        let lines: Vec<MeasuredRow<'_>> = self
-            .rows
-            .iter()
-            .map(|row| {
+        let lines: Vec<MeasuredRow<'_>> = std::iter::once(&self.header)
+            .chain(&self.rows)
+            .enumerate()
+            .map(|(row, cells)| {
                 (
-                    row.header,
-                    row.cells
+                    row == 0,
+                    cells
                         .iter()
-                        .map(|(_, lines, bold)| (lines.as_slice(), row.header || *bold))
+                        .map(|cell| (cell.lines.as_slice(), row == 0 || cell.bold))
                         .collect(),
                 )
             })
             .collect();
         let widths = column_widths(&lines, measure);
         let palette = self.palette;
-        let mut table = div()
+        let table = div()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border(px(1.))
+            .border(px(TABLE_BORDER_PX))
             .border_color(paint(palette.border))
             .rounded(px(4.));
-        for row in std::mem::take(&mut self.rows) {
-            let mut line = div()
-                .flex()
-                .w_full()
-                .border_b(px(1.))
-                .border_color(paint(palette.border));
-            if row.header {
-                line = line
-                    .font_weight(FontWeight::BOLD)
-                    .bg(paint(palette.surface));
-            }
-            for (column, (content, _, _)) in row.cells.into_iter().enumerate() {
-                let width = widths[column];
-                // Basis at what the column needs; the rest of the row shared
-                // by how much more each could use. A cell clips to its own
-                // column, so nothing paints into a neighbour.
-                let mut slot = div()
-                    .flex_basis(px(width.basis))
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .px(px(TABLE_CELL_PAD_PX / 2.))
-                    .py_2()
-                    .flex()
-                    .flex_col();
-                slot.style().flex_grow = Some(width.max - width.basis + 1.0);
-                slot.style().flex_shrink = Some(1.0);
-                // The content fills its column and the text lines up inside
-                // it, so a right-aligned value ends at its own column's edge.
-                slot = match self.align.get(column).copied().unwrap_or_default() {
-                    Align::Start => slot,
-                    Align::Center => slot.text_align(TextAlign::Center),
-                    Align::End => slot.text_align(TextAlign::Right),
-                };
-                line = line.child(slot.child(content));
-            }
-            table = table.child(line);
-        }
+        let header = std::mem::take(&mut self.header);
+        let rows = std::mem::take(&mut self.rows);
+        let table = if table_columns_fit(&widths, self.width) {
+            self.grid(table, header, rows, &widths)
+        } else {
+            self.stacked(table, header, rows, &widths, measure)
+        };
         let mut inner = table.into_any_element();
         let layout = inner.request_layout(window, cx);
         self.inner = Some(inner);
@@ -726,13 +715,140 @@ impl Element for TableElement {
     }
 }
 
+impl TableElement {
+    fn grid(
+        &self,
+        mut table: gpui::Div,
+        header: Vec<TableCell>,
+        rows: Vec<Vec<TableCell>>,
+        widths: &[ColumnWidth],
+    ) -> gpui::Div {
+        for (index, row) in std::iter::once(header).chain(rows).enumerate() {
+            if index == 0 && row.is_empty() {
+                continue;
+            }
+            let mut cells = row.into_iter();
+            let mut line = self.row().w_full();
+            if index == 0 {
+                line = line
+                    .font_weight(FontWeight::BOLD)
+                    .bg(paint(self.palette.surface));
+            }
+            for (column, width) in widths.iter().enumerate() {
+                let mut slot = div()
+                    .flex_basis(px(width.basis))
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .px(px(TABLE_CELL_PAD_PX / 2.))
+                    .py_2()
+                    .flex()
+                    .flex_col();
+                slot.style().flex_grow = Some(width.max - width.basis + 1.0);
+                slot = match self.align.get(column).copied().unwrap_or_default() {
+                    Align::Start => slot,
+                    Align::Center => slot.text_align(TextAlign::Center),
+                    Align::End => slot.text_align(TextAlign::Right),
+                };
+                line = line.child(slot.children(cells.next().map(|cell| cell.content)));
+            }
+            table = table.child(line);
+        }
+        table
+    }
+
+    fn stacked(
+        &self,
+        table: gpui::Div,
+        header: Vec<TableCell>,
+        rows: Vec<Vec<TableCell>>,
+        widths: &[ColumnWidth],
+        measure: impl Fn(&str, bool) -> f32,
+    ) -> gpui::Div {
+        if rows.is_empty() {
+            return table.child(
+                self.row()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .font_weight(FontWeight::BOLD)
+                    .children(header.into_iter().map(|cell| cell.content)),
+            );
+        }
+        let labels: Vec<_> = (0..widths.len())
+            .map(|column| {
+                let label = header
+                    .get(column)
+                    .map_or_else(String::new, |cell| cell.lines.join(" "));
+                if label.trim().is_empty() {
+                    format!("Column {}", column + 1)
+                } else {
+                    label
+                }
+            })
+            .collect();
+        let room = (self.width - 2. * TABLE_BORDER_PX - TABLE_CELL_PAD_PX).max(0.);
+        // Share a label column across rows while it leaves room for the
+        // values. At very small widths a label sits over its own value.
+        let label_width = labels
+            .iter()
+            .map(|label| measure(label, true))
+            .fold(0., f32::max)
+            + 2.;
+        let value_basis = widths.iter().map(|width| width.basis).fold(0., f32::max);
+        let beside = label_width + TABLE_CELL_PAD_PX + value_basis <= room;
+        table.children(rows.into_iter().map(|row| {
+            let mut cells = row.into_iter();
+            self.row()
+                .flex_col()
+                .gap(px(4.))
+                .px(px(TABLE_CELL_PAD_PX / 2.))
+                .py_2()
+                .children(labels.iter().map(|label| {
+                    let label = div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(paint(self.palette.dimmed))
+                        .child(label.clone())
+                        .when(beside, |label| label.w(px(label_width)).flex_none());
+                    let value = div()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .when(beside, |value| value.flex_1())
+                        .children(cells.next().map(|cell| cell.content));
+                    div()
+                        .flex()
+                        .when_else(
+                            beside,
+                            |field| field.gap(px(TABLE_CELL_PAD_PX)),
+                            |field| field.flex_col(),
+                        )
+                        .child(label)
+                        .child(value)
+                }))
+        }))
+    }
+
+    fn row(&self) -> gpui::Div {
+        div()
+            .flex()
+            .border_b(px(1.))
+            .border_color(paint(self.palette.border))
+    }
+}
+
+fn table_columns_fit(widths: &[ColumnWidth], width: f32) -> bool {
+    widths.iter().map(|column| column.basis).sum::<f32>() + 2. * TABLE_BORDER_PX <= width
+}
+
+const TABLE_BORDER_PX: f32 = 1.;
+
 /// A row to measure: whether it is the header, then each cell's lines and
 /// whether the cell is set bold.
-pub(crate) type MeasuredRow<'a> = (bool, Vec<(&'a [String], bool)>);
+type MeasuredRow<'a> = (bool, Vec<(&'a [String], bool)>);
 
 /// A column's widths, padding included.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ColumnWidth {
+struct ColumnWidth {
     /// Its longest word: narrower would break a word.
     pub min: f32,
     /// Its longest line unwrapped: wider is empty space.
@@ -758,7 +874,7 @@ const TABLE_SHORT_PX: f32 = 140.;
 /// `measure` takes text and that flag). The row gives every column
 /// its basis and shares what is left in proportion to `max - basis`, as a
 /// browser's auto table layout shares the room past min-content.
-pub(crate) fn column_widths(
+fn column_widths(
     rows: &[MeasuredRow<'_>],
     measure: impl Fn(&str, bool) -> f32,
 ) -> Vec<ColumnWidth> {
@@ -2674,6 +2790,13 @@ mod decode_tests {
             .collect();
         let widths = column_widths(&input, advance);
         assert_eq!(widths.len(), 7);
+        assert!(
+            !super::table_columns_fit(&widths, 502.),
+            "560 px conversation after padding"
+        );
+        assert!(super::table_columns_fit(&widths, 750.));
+        assert!(widths[2].basis >= advance("142.0", false) + TABLE_CELL_PAD_PX);
+        assert!(widths[4].basis >= advance("14.2", false) + TABLE_CELL_PAD_PX);
         // Station: at least "Agricultural", and its long name gives room to share.
         assert!(widths[0].min >= advance("Agricultural", false) + TABLE_CELL_PAD_PX);
         assert!(widths[0].max > widths[0].min);
@@ -2697,6 +2820,35 @@ mod decode_tests {
         };
         assert!(blocks_are_bold(&rows[4][1]));
         assert!(!blocks_are_bold(&rows[0][1]));
+    }
+
+    #[test]
+    fn the_same_pane_can_fit_a_small_table_and_stack_a_wider_one() {
+        let columns = ["Period", "Subtotal", "Tax", "Paid"].map(|text| [text.to_string()]);
+        let rows = ["February", "2,015.00", "9.512 %", "1,952.34"].map(|text| [text.to_string()]);
+        let widths_for = |count| {
+            column_widths(
+                &[
+                    (
+                        true,
+                        columns[..count]
+                            .iter()
+                            .map(|text| (text.as_slice(), true))
+                            .collect(),
+                    ),
+                    (
+                        false,
+                        rows[..count]
+                            .iter()
+                            .map(|text| (text.as_slice(), false))
+                            .collect(),
+                    ),
+                ],
+                advance,
+            )
+        };
+        assert!(super::table_columns_fit(&widths_for(2), 250.));
+        assert!(!super::table_columns_fit(&widths_for(4), 250.));
     }
 
     #[test]
