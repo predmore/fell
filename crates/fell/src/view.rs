@@ -16,7 +16,7 @@ use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, TextStyle,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
     prelude::*, px, rgb, size, uniform_list,
 };
@@ -3811,8 +3811,10 @@ fn thread_line_two(
     let snippet_w = (text_width - rest_x).max(24.0);
     // Shaped once here and drawn from that shaping: a row that comes into
     // view shapes each of its two texts at most twice.
+    let style = window.text_style();
     let snippet = clip_shaped(
         window,
+        &style,
         &row.snippet,
         snippet_w,
         FontWeight::NORMAL,
@@ -3821,6 +3823,7 @@ fn thread_line_two(
     let subject = (!row.subject.is_empty()).then(|| {
         let shaped = clip_shaped(
             window,
+            &style,
             &row.subject,
             room,
             row_weight(frame.bold),
@@ -3875,13 +3878,18 @@ fn thread_line_two(
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
-    shape_ui_line(window, text, weight, None).map_or(0.0, |line| f32::from(line.width))
+    line_px_with_style(window, &window.text_style(), text, weight)
+}
+
+fn line_px_with_style(window: &Window, style: &TextStyle, text: &str, weight: FontWeight) -> f32 {
+    shape_ui_line(window, style, text, weight, None).map_or(0.0, |line| f32::from(line.width))
 }
 
 /// `text` shaped as one line in the UI font at `weight`, in `color` (the
 /// inherited one when `None`).
 fn shape_ui_line(
     window: &Window,
+    style: &TextStyle,
     text: &str,
     weight: FontWeight,
     color: Option<u32>,
@@ -3889,7 +3897,7 @@ fn shape_ui_line(
     if text.is_empty() {
         return None;
     }
-    let mut style = window.text_style();
+    let mut style = style.clone();
     style.font_weight = weight;
     if let Some(color) = color {
         style.color = rgb(color).into();
@@ -3963,8 +3971,14 @@ thread_local! {
 }
 
 /// Shorten one line to `max_px`, ending on an ellipsis that reaches that width.
-fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> String {
-    clip_shaped(window, text, max_px, weight, None)
+fn clip_line(
+    window: &Window,
+    style: &TextStyle,
+    text: &str,
+    max_px: f32,
+    weight: FontWeight,
+) -> String {
+    clip_shaped(window, style, text, max_px, weight, None)
         .map_or_else(String::new, |line| line.text.to_string())
 }
 
@@ -3979,6 +3993,7 @@ fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> St
 /// wider than the room does it shape again, a cluster shorter at least.
 fn clip_shaped(
     window: &Window,
+    style: &TextStyle,
     text: &str,
     max_px: f32,
     weight: FontWeight,
@@ -3986,19 +4001,19 @@ fn clip_shaped(
 ) -> Option<gpui::ShapedLine> {
     // No glyph of a UI font is narrower than a fifth of an em, so more
     // characters than this can never fit.
-    let font_px = f32::from(window.text_style().font_size.to_pixels(window.rem_size()));
+    let font_px = f32::from(style.font_size.to_pixels(window.rem_size()));
     let most = (max_px / (font_px * 0.2).max(1.0)).ceil() as usize + 2;
     let probe = match text.char_indices().nth(most) {
         Some((cut, _)) => &text[..cut],
         None => text,
     };
-    let mut line = shape_ui_line(window, probe, weight, color)?;
+    let mut line = shape_ui_line(window, style, probe, weight, color)?;
     if f32::from(line.width) <= max_px {
         if probe.len() == text.len() {
             return Some(line);
         }
         // Narrower glyphs than any font has: measure the whole line.
-        line = shape_ui_line(window, text, weight, color)?;
+        line = shape_ui_line(window, style, text, weight, color)?;
         if f32::from(line.width) <= max_px {
             return Some(line);
         }
@@ -4013,13 +4028,13 @@ fn clip_shaped(
         f32::from(line.width),
         shaped.len(),
     );
-    let mut room = max_px - line_px(window, "…", weight);
+    let mut room = max_px - line_px_with_style(window, style, "…", weight);
     // The whole line does not fit: the cut is before its end.
     let mut before = shaped.len();
     loop {
         let kept = text_cut::kept(&shaped[..cuts.fit(room, before)]);
         // No space or punctuation before the ellipsis: "Friday…".
-        let cut = shape_ui_line(window, &present::ellipsis(kept), weight, color)?;
+        let cut = shape_ui_line(window, style, &present::ellipsis(kept), weight, color)?;
         if kept.is_empty() || f32::from(cut.width) <= max_px {
             return Some(cut);
         }
@@ -4319,6 +4334,16 @@ fn message_block(
     }
 }
 
+/// Conversation elements measure during render, before the root's font is active.
+fn conversation_line_style(window: &Window, theme: &Theme, size: gpui::Pixels) -> TextStyle {
+    let mut style = window.text_style();
+    style.font_size = size.into();
+    if let Some(family) = &theme.ui_family {
+        style.font_family = SharedString::from(family.clone());
+    }
+    style
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapsed_message(
     theme: &Theme,
@@ -4332,12 +4357,14 @@ fn collapsed_message(
 ) -> gpui::AnyElement {
     let date = present::relative_date(now_unix(), message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
-    let date_w = line_px(window, &date, FontWeight::NORMAL);
+    let style = conversation_line_style(window, theme, px(theme.ui_px));
+    let date_w = line_px_with_style(window, &style, &date, FontWeight::NORMAL);
     // Sender column, gaps, row padding, and a little air before the date.
     let snippet_w = (conv_width - 56.0 - 140.0 - date_w).max(24.0);
     let missing = present::missing_body_line(message.body_state);
     let snippet = clip_line(
         window,
+        &style,
         missing.as_deref().unwrap_or(&message.snippet),
         snippet_w,
         FontWeight::NORMAL,
@@ -5008,14 +5035,15 @@ fn recipient_lines(
         // always matches the names on screen; the Bcc and key always show.
         // Only a single name too long for the pane is cut, with an ellipsis.
         // The text takes the box's colour, so hover reaches it.
-        let (names, tail, _) = present::fit_recipients(line, |names, tail| {
-            line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
-                <= width
-        });
+        let style = conversation_line_style(window, theme, size);
+        let measure = |text: &str| line_px_with_style(window, &style, text, FontWeight::NORMAL);
+        let (names, tail, _) =
+            present::fit_recipients(line, |names, tail| measure(names) + measure(tail) <= width);
         let names = clip_line(
             window,
+            &style,
             &names,
-            (width - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
+            (width - measure(&tail)).max(40.0),
             FontWeight::NORMAL,
         );
         div()
