@@ -158,10 +158,19 @@ fn read_thread(session: &Session, args: &Value) -> Result<Value, String> {
     if messages.is_empty() {
         return Err("unknown thread".into());
     }
+    let ids: Vec<_> = messages
+        .iter()
+        .map(|message| message.headers.message_id.clone())
+        .collect();
+    let states = session
+        .store
+        .body_states(&session.account_id, &ids)
+        .map_err(store_error)?;
     let mut budget = max_chars;
     let messages = messages
         .iter()
-        .map(|message| message_json(session, message, &mut budget))
+        .zip(states)
+        .map(|(message, state)| message_json(session, message, state, &mut budget))
         .collect::<Vec<_>>();
     Ok(json!({
         "thread_id": session.show_id(thread_id.as_str()),
@@ -781,8 +790,20 @@ fn attachments_json(session: &Session, message: &Message) -> (Vec<Value>, usize)
     )
 }
 
-fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -> Value {
-    let body = message.body_text.as_deref().unwrap_or("");
+fn message_json(
+    session: &Session,
+    message: &Message,
+    state: fell_core::BodyState,
+    body_budget: &mut usize,
+) -> Value {
+    // A body not downloaded is not an empty one: `body` is null, and the
+    // flags say why, so an agent never reads "" as what was sent.
+    let body = match state {
+        fell_core::BodyState::Stored => {
+            untrusted::envelope_body(message.body_text.as_deref().unwrap_or(""), body_budget)
+        }
+        fell_core::BodyState::Pending | fell_core::BodyState::TooLarge => Value::Null,
+    };
     let (attachments, attachments_omitted) = attachments_json(session, message);
     json!({
         "message_id": session.show_id(message.headers.message_id.as_str()),
@@ -791,7 +812,9 @@ fn message_json(session: &Session, message: &Message, body_budget: &mut usize) -
         "from_name": message.headers.from.name.as_deref().map(|name| untrusted::envelope(name, SNIPPET_CHARS)),
         "subject": untrusted::envelope(&message.headers.subject, SNIPPET_CHARS),
         "snippet": untrusted::envelope(&message.snippet, SNIPPET_CHARS),
-        "body": untrusted::envelope_body(body, body_budget),
+        "body": body,
+        "body_pending": state == fell_core::BodyState::Pending,
+        "body_too_large": state == fell_core::BodyState::TooLarge,
         "unread": message.unread,
         "starred": message.starred,
         "has_attachment": message.has_attachment,
@@ -1082,7 +1105,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "read_thread",
-            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name, MIME type (both untrusted_email_content) and decoded size in bytes, never their contents, at most 20 per message; attachments_omitted counts the rest. Signatures and images shown inside the HTML are not attachments. Mail synced before parts were listed has names only, and has_attachment can be true with no names on mail synced before names were kept. No remote fetch.",
+            description: "Read one thread. Bodies are plain text, truncated to max_chars (default 8000, at most 16000), and returned only as untrusted_email_content. Subject, snippet, the sender's display name, and attachment names use that same object. Attachments are listed by name, MIME type (both untrusted_email_content) and decoded size in bytes, never their contents, at most 20 per message; attachments_omitted counts the rest. Signatures and images shown inside the HTML are not attachments. Mail synced before parts were listed has names only, and has_attachment can be true with no names on mail synced before names were kept. A message whose body sync has not downloaded yet has body null and body_pending true (read it again later); one larger than sync downloads has body null and body_too_large true. No remote fetch.",
             scope: ToolScope::Read,
             schema: object_schema(
                 Map::from_iter([
