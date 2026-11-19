@@ -169,7 +169,9 @@ fn map_palette(
         selection,
         on_selection,
         on_selection_dim,
-        error: ensure_all(error_raw, &[background, surface], TEXT_CONTRAST),
+        // A warning chip sits on a selected row too, so the error colour
+        // holds AA on the selection as well as on the page.
+        error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
         border: mix(background, foreground, 0.16),
         star: ensure_all(star_raw, &[background, surface], TEXT_CONTRAST),
         ui_family: fonts.ui_family.clone(),
@@ -217,6 +219,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
     }
     contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.error, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.foreground, theme.background)
             >= contrast(theme.dimmed, theme.background) + 0.8
         && contrast(theme.on_selection, theme.selection)
@@ -768,7 +771,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("palette {name}"));
             assert!(
                 contrast_ok(&theme),
-                "{name} fg {:06x}/{:.2} dim {:06x}/{:.2}/{:.2} accent {:06x}/{:.2} sel {:06x}/{:.2} on {:06x}/{:.2} err {:06x}/{:.2} star {:06x}/{:.2} bg {:06x} surface {:06x}",
+                "{name} fg {:06x}/{:.2} dim {:06x}/{:.2}/{:.2} accent {:06x}/{:.2} sel {:06x}/{:.2} on {:06x}/{:.2} err {:06x}/{:.2}/sel {:.2} star {:06x}/{:.2} bg {:06x} surface {:06x}",
                 theme.foreground,
                 contrast(theme.foreground, theme.background),
                 theme.dimmed,
@@ -782,6 +785,7 @@ mod tests {
                 contrast(theme.on_selection, theme.selection),
                 theme.error,
                 contrast(theme.error, theme.background),
+                contrast(theme.error, theme.selection),
                 theme.star,
                 contrast(theme.star, theme.background),
                 theme.background,

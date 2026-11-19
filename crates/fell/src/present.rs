@@ -447,14 +447,15 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
         parts: None,
     };
     // The folder line is replaced below, so no account roles are needed.
-    let mut shown = conversation(&[message], me, &FolderRoles::default(), &[]);
+    let mut shown = conversation(&[message], me, &FolderRoles::default(), &[], "");
     for message in &mut shown {
+        // Every row in Drafts is a draft, so the header doesn't say so. The
+        // row's chip says what to do, in the error colour; here, only why,
+        // so the warning is said once.
         message.folders = if draft.maybe_sent {
-            // The row's chip says what to do, in the error colour; here,
-            // only why, so the warning is said once.
-            "Draft · may have been sent".into()
+            "may have been sent".into()
         } else {
-            "Draft".into()
+            String::new()
         };
         message.expanded = true;
         // The markdown the person wrote, styled as the compose window and
@@ -644,12 +645,16 @@ fn recipient_label(raw: &str, known: &std::collections::BTreeMap<String, String>
 /// `roles` names each message's folders the way the account uses them;
 /// `names` are the account's folders, so a label that two folders share
 /// carries the folder's own name ([`FolderRoles::label_among`]).
+/// `viewing` is the folder the list shows: inside Drafts, a draft's
+/// header doesn't say "Draft", since every row there is one.
 pub fn conversation(
     messages: &[Message],
     me: &str,
     roles: &FolderRoles,
     names: &[String],
+    viewing: &str,
 ) -> Vec<ConvMessage> {
+    let in_drafts = roles.is(FolderRole::Drafts, viewing);
     let last = messages.len().saturating_sub(1);
     messages
         .iter()
@@ -663,13 +668,15 @@ pub fn conversation(
                 folders: message
                     .folders
                     .iter()
-                    // A message in Drafts is a draft: "Draft", as a compose
-                    // draft's preview says it.
-                    .map(|folder| {
-                        if roles.is(FolderRole::Drafts, folder) {
-                            "Draft".to_string()
+                    // A message in Drafts is a draft: "Draft", unless the
+                    // reader is in Drafts, where every row is one.
+                    .filter_map(|folder| {
+                        if !roles.is(FolderRole::Drafts, folder) {
+                            Some(roles.label_among(folder, names))
+                        } else if in_drafts {
+                            None
                         } else {
-                            roles.label_among(folder, names)
+                            Some("Draft".to_string())
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1015,6 +1022,32 @@ fn shorten_name(text: &str, max_px: f32, measure: &impl Fn(&str) -> f32) -> Opti
         .find(|candidate| measure(candidate) <= max_px)
 }
 
+/// `head`, cut short: an ellipsis after its last word, with no space or
+/// punctuation left in between ("Friday…", not "Friday.…").
+pub fn ellipsis(head: &str) -> String {
+    let word = head.trim_end_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '.' | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '-'
+                    | '\u{2013}'
+                    | '\u{2014}'
+                    | '\u{b7}'
+                    | '('
+                    | '['
+                    | '{'
+                    | '\u{201c}'
+                    | '\u{2018}'
+            )
+    });
+    format!("{word}\u{2026}")
+}
+
 /// The longest start of `middle` that fits between `before` and `after`,
 /// with an ellipsis.
 fn cut_to(
@@ -1030,7 +1063,7 @@ fn cut_to(
     while lo <= hi {
         let mid = (lo + hi) / 2;
         let short: String = chars[..mid].iter().collect();
-        let candidate = format!("{before}{}…{after}", short.trim_end());
+        let candidate = format!("{before}{}{after}", ellipsis(&short));
         if measure(&candidate) <= max_px {
             best = candidate;
             lo = mid + 1;
@@ -1140,7 +1173,8 @@ mod tests {
         let shown = draft_conversation(&summary, "me@example.com", 2_000);
         let line = shown[0].recipients.as_ref().unwrap();
         assert!(line.short.contains("Ada Lovelace"), "{line:?}");
-        assert_eq!(shown[0].folders, "Draft");
+        // Inside Drafts, every row is a draft: the header doesn't say so.
+        assert_eq!(shown[0].folders, "");
     }
 
     fn draft(body: &str) -> DraftSummary {
@@ -1213,7 +1247,7 @@ mod tests {
         assert_eq!(row.labels, vec!["check Sent"]);
         assert!(row.warn);
         let shown = draft_conversation(&maybe, "me@example.com", 2_000);
-        assert_eq!(shown[0].folders, "Draft · may have been sent");
+        assert_eq!(shown[0].folders, "may have been sent");
     }
 
     #[test]
@@ -1594,6 +1628,20 @@ mod tests {
     }
 
     #[test]
+    fn an_ellipsis_follows_the_last_word() {
+        assert_eq!(
+            ellipsis("send me anything by Friday."),
+            "send me anything by Friday\u{2026}"
+        );
+        assert_eq!(ellipsis("Agenda to follow; "), "Agenda to follow\u{2026}");
+        assert_eq!(ellipsis("the plan \u{2014} "), "the plan\u{2026}");
+        assert_eq!(ellipsis("see (files"), "see (files\u{2026}");
+        assert_eq!(ellipsis("it said \u{201c}"), "it said\u{2026}");
+        assert_eq!(ellipsis("(plan)"), "(plan)\u{2026}");
+        assert_eq!(ellipsis(". "), "\u{2026}");
+    }
+
+    #[test]
     fn unread_and_latest_start_expanded() {
         let message = |id: &str, unread: bool, folder: &str| Message {
             account_id: AccountId("local".into()),
@@ -1638,11 +1686,21 @@ mod tests {
             "me@x",
             &FolderRoles::default(),
             &[],
+            "INBOX",
         );
         assert!(!messages[0].expanded);
         assert!(!messages[1].expanded);
         assert!(messages[2].expanded);
         assert_eq!(messages[1].folders, "Sent");
+        // A draft says so beside the mail it answers, but not inside
+        // Drafts, where every row is a draft.
+        let roles = FolderRoles::from_names(&["INBOX".into(), "Drafts".into()]);
+        let thread = [message("a", false, "INBOX"), message("d", false, "Drafts")];
+        let from_inbox = conversation(&thread, "me@x", &roles, &[], "INBOX");
+        assert_eq!(from_inbox[1].folders, "Draft");
+        let from_drafts = conversation(&thread, "me@x", &roles, &[], "Drafts");
+        assert_eq!(from_drafts[0].folders, "Inbox");
+        assert_eq!(from_drafts[1].folders, "");
     }
 
     fn addressed(

@@ -658,7 +658,7 @@ impl Inbox {
             let messages = store.thread_messages(&account, &last.thread_id).ok()?;
             Some((
                 present::thread_rows(&page.threads, &me),
-                present::conversation(&messages, &me, &roles, &names),
+                present::conversation(&messages, &me, &roles, &names, &reading),
             ))
         });
         cx.spawn(async move |this, cx| {
@@ -1076,6 +1076,7 @@ impl Inbox {
         let me = self.session.account_email.clone();
         let roles = self.session.roles.clone();
         let names = self.session.folders.clone();
+        let viewing = self.session.folder.clone();
         let thread = id.clone();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
@@ -1084,7 +1085,7 @@ impl Inbox {
             Some(
                 store
                     .thread_messages(&account, &ThreadId(thread))
-                    .map(|messages| present::conversation(&messages, &me, &roles, &names))
+                    .map(|messages| present::conversation(&messages, &me, &roles, &names, &viewing))
                     .map_err(|err| err.to_string()),
             )
         });
@@ -2686,19 +2687,11 @@ fn thread_line_one(
         .when(row.has_attachment, |line| {
             line.child(div().text_color(rgb(dim)).child("⧉"))
         })
-        .children(row.labels.iter().take(2).enumerate().map(|(index, label)| {
-            let warn = row.warn && index == 0;
-            div()
-                .flex_shrink_0()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(if warn { theme.error } else { theme.border }))
-                .text_size(px((theme.ui_px - 2.0).max(11.0)))
-                .text_color(rgb(if warn { theme.error } else { dim }))
-                .child(label.clone())
-        }))
+        .children(
+            row.labels.iter().take(2).enumerate().map(|(index, label)| {
+                label_chip(theme, label, row.warn && index == 0, selected, dim)
+            }),
+        )
         .child(div().flex_1())
         .child(
             div()
@@ -2707,6 +2700,35 @@ fn thread_line_one(
                 .child(present::relative_date(now_unix(), row.date_unix)),
         )
 }
+
+/// A label on a row: an outline that fits inside the 22 px line, so all
+/// four of its edges show. A warning is in the error colour, which holds
+/// AA on the selection as well as on the page. On a selected row the
+/// outline is drawn from the selection, so it stays as visible there.
+fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) -> gpui::Div {
+    let size = (theme.ui_px - 2.0).max(11.0);
+    let outline = match (warn, selected) {
+        (true, _) => theme.error,
+        (false, true) => theme::mix(theme.selection, dim, 0.35),
+        (false, false) => theme.border,
+    };
+    div()
+        .flex_shrink_0()
+        .h(px(LABEL_CHIP_PX))
+        .flex()
+        .items_center()
+        .px(px(6.))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(outline))
+        .text_size(px(size))
+        .line_height(px(size + 2.0))
+        .text_color(rgb(if warn { theme.error } else { dim }))
+        .child(label.to_string())
+}
+
+/// A row chip's height, border included: under the 22 px line it sits on.
+const LABEL_CHIP_PX: f32 = 20.;
 
 fn names(
     theme: &Theme,
@@ -2948,7 +2970,8 @@ fn clip_shaped(
     let mut before = shaped.len();
     loop {
         let kept = text_cut::kept(&shaped[..cuts.fit(room, before)]);
-        let cut = shape_ui_line(window, &format!("{kept}…"), weight, color)?;
+        // No space or punctuation before the ellipsis: "Friday…".
+        let cut = shape_ui_line(window, &present::ellipsis(kept), weight, color)?;
         if kept.is_empty() || f32::from(cut.width) <= max_px {
             return Some(cut);
         }
