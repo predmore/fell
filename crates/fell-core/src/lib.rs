@@ -28,7 +28,7 @@ pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
-pub use actions::{ActionKind, LabelChange, LocalAction};
+pub use actions::{ActionKind, FlagChange, LabelChange, LocalAction};
 pub use agent::{
     AgentGrant, AgentSummary, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft,
 };
@@ -55,6 +55,7 @@ pub use send::{
     message_digest,
 };
 pub use smtp::SmtpConfig;
+pub use store::PendingFlags;
 pub use store::{
     FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, Participant, SearchPage,
     Store, ThreadList, ThreadSummary, folder_aliases,

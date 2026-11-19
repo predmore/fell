@@ -17,6 +17,7 @@ mod model;
 mod motion;
 mod png;
 mod present;
+mod row_widths;
 mod setup;
 mod store_actor;
 mod sync_worker;
