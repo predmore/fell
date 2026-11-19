@@ -49,7 +49,7 @@ pub use message::{
 };
 pub use outbox::{DropReason, DroppedMove, OutboxEntry, OutboxKind, OutboxState, ReplayReport};
 pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
-pub use search::{SearchHit, SearchResults};
+pub use search::{SearchHit, SearchOptions, SearchResults};
 pub use send::{
     Draft, PendingSend, PendingSendId, SentMessage, SubmittedFile, UserSendConfirmation,
     message_digest,

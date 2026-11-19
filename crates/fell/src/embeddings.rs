@@ -23,8 +23,9 @@ fell embeddings install [--yes]  download the pinned all-MiniLM-L6-v2 files, aft
 fell embeddings remove           delete those files; indexing goes back to local-hash-v1
 
 Fell does not download a model unless you run `install`. Until then it
-indexes with local-hash-v1, a lexical hash. Search stays keyword search
-either way.
+indexes with local-hash-v1, a lexical hash, and search is keyword search.
+With the model installed and loaded, search is hybrid: it also finds mail
+close in meaning. If the model does not load, search stays keyword search.
 
   --yes   do not ask first (needed when stdin is not a terminal)
 
@@ -109,24 +110,24 @@ fn status(model: &LocalModel, root: &Path, console: &mut Console<'_>) -> Result<
     let dir = model_dir(model, root);
     let text = match load_local_embedder(model, Some(root)) {
         LocalEmbedder::Model(_) => format!(
-            "Indexing with {} version {} ({}).\nFiles: {} (checksums match, the model loads).\nSearch is keyword search; the vectors are not used for ranking yet.",
+            "Indexing with {} version {} ({}).\nFiles: {} (checksums match, the model loads).\nSearch is hybrid: it matches the words and also finds mail close in meaning.",
             model.id.model,
             model.id.version,
             model.title,
             dir.display()
         ),
         LocalEmbedder::Unavailable(err) => format!(
-            "Not indexing: the model files at {} are installed but do not load: {err}\nThe index is left as it is, and Fell tries the model again later and each time it opens the mailbox.\nRun `fell embeddings remove` to index with {EMBEDDING_MODEL} instead.",
+            "Not indexing: the model files at {} are installed but do not load: {err}\nThe index is left as it is, and search stays keyword search. Fell tries the model again later and each time it opens the mailbox.\nRun `fell embeddings remove` to index with {EMBEDDING_MODEL} instead.",
             dir.display()
         ),
         LocalEmbedder::Placeholder(ModelError::Missing) => format!(
-            "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model).\nNo model is installed at {}.\nRun `fell embeddings install` to download {} ({}).",
+            "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model). Search is keyword search.\nNo model is installed at {}.\nRun `fell embeddings install` to download {} ({}).",
             dir.display(),
             model.title,
             megabytes(model.download_bytes())
         ),
         LocalEmbedder::Placeholder(err) => format!(
-            "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model).\nThe files at {} do not pass their check: {err}\nRun `fell embeddings install` to replace them, or `fell embeddings remove`.",
+            "Indexing with {EMBEDDING_MODEL} version {EMBEDDING_VERSION}, a lexical hash (no model). Search is keyword search.\nThe files at {} do not pass their check: {err}\nRun `fell embeddings install` to replace them, or `fell embeddings remove`.",
             dir.display()
         ),
     };
@@ -150,7 +151,9 @@ fn plan(model: &LocalModel, root: &Path) -> String {
         "\nLicense: {} (model card: {})\nSaved to: {} (owner-only)\n\n\
          Each file is checked against the SHA-256 above and deleted if it does not match.\n\
          Once installed, Fell re-indexes mail with this model in the background the next\n\
-         time it opens the mailbox. Search stays keyword search.",
+         time it opens the mailbox, and search becomes hybrid: it also finds mail close in\n\
+         meaning, among the mail indexed so far. If the model does not load, search stays\n\
+         keyword search.",
         model.license,
         model.card_url,
         model_dir(model, root).display()
@@ -356,6 +359,7 @@ mod tests {
         assert_eq!(calls, 0);
         assert!(out.contains("local-hash-v1"), "{out}");
         assert!(out.contains("fell embeddings install"), "{out}");
+        assert!(out.contains("Search is keyword search"), "{out}");
         assert!(!root.exists());
     }
 
@@ -377,6 +381,8 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("[y/N]"), "{out}");
+        assert!(out.contains("search becomes hybrid"), "{out}");
+        assert!(out.contains("search stays\nkeyword search"), "{out}");
         assert!(out.contains("Nothing downloaded"), "{out}");
         assert!(!root.exists(), "declining creates nothing");
     }
@@ -444,6 +450,11 @@ mod tests {
         let (help, text, _) = invoke(&[], &root, true, "", never);
         help.unwrap();
         assert!(text.contains("fell embeddings install"));
+        assert!(text.contains("search is hybrid"), "{text}");
+        assert!(
+            text.contains("does not load, search stays keyword search"),
+            "{text}"
+        );
     }
 
     /// A model pinned to `onnx` and `vocab`, so those bytes pass the check.
@@ -490,6 +501,7 @@ mod tests {
         assert!(!out.contains("Indexing with"), "{out}");
         assert!(out.contains("do not load"), "{out}");
         assert!(out.contains("left as it is"), "{out}");
+        assert!(out.contains("search stays keyword search"), "{out}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
