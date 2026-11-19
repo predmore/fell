@@ -21,10 +21,91 @@ pub fn seed_if_empty(store: &Store, account: &Account) -> fell_core::Result<Sync
     if !store.list_threads(&account.id)?.is_empty() {
         return Ok(SyncReport::default());
     }
-    let backend = FixtureBackend {
-        messages: fixture_messages(account),
-    };
+    let mut messages = fixture_messages(account);
+    messages.extend(extra_messages(account, extra_count()));
+    let backend = FixtureBackend { messages };
     sync_once(account, &backend, store)
+}
+
+/// `FELL_DEMO_EXTRA=N` pads a fresh demo mailbox with N plain inbox threads
+/// below the fixtures, for frame-time runs that need a long list.
+fn extra_count() -> usize {
+    std::env::var("FELL_DEMO_EXTRA")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+        .min(100_000)
+}
+
+const EXTRA_SENDERS: [(&str, &str); 6] = [
+    ("Ada", "ada@fell.test"),
+    ("Build bot", "builds@fell.test"),
+    ("Mira", "mira@fell.test"),
+    ("Theo", "theo@fell.test"),
+    ("Calendar", "calendar@fell.test"),
+    ("Priya", "priya@fell.test"),
+];
+
+const EXTRA_SUBJECTS: [&str; 6] = [
+    "Weekly numbers",
+    "Build passed on main",
+    "Notes from the design review",
+    "Can you look at this before Friday?",
+    "Invitation: planning sync",
+    "Draft of the release post",
+];
+
+fn extra_messages(account: &Account, count: usize) -> Vec<Message> {
+    // Older than every fixture, so the fixtures stay on top.
+    let base = now().saturating_sub(30 * 86_400);
+    (0..count)
+        .map(|index| {
+            let (name, email) = EXTRA_SENDERS[index % EXTRA_SENDERS.len()];
+            let subject = format!(
+                "{} #{}",
+                EXTRA_SUBJECTS[index % EXTRA_SUBJECTS.len()],
+                index + 1
+            );
+            let id = MessageId::new(format!("extra-{index}@fell.test"));
+            Message {
+                account_id: account.id.clone(),
+                headers: MessageHeaders {
+                    message_id: id.clone(),
+                    proton_conversation_id: None,
+                    in_reply_to: None,
+                    references: Vec::new(),
+                    from: Address {
+                        name: Some(name.into()),
+                        email: email.into(),
+                    },
+                    subject,
+                    date_unix: base.saturating_sub(index as i64 * 3_600),
+                },
+                remote_id: RemoteId(format!("fixture:extra-{index}")),
+                thread_id: ThreadId::from_message_id(&id),
+                snippet: "A filler thread for long-list runs.".into(),
+                body_text: Some("A filler thread for long-list runs.".into()),
+                unread: index % 3 == 0,
+                folders: vec!["INBOX".into()],
+                labels: Vec::new(),
+                arrived_via: vec![account.email.clone()],
+                to: vec![Address {
+                    name: Some(account.display_name.clone()),
+                    email: account.email.clone(),
+                }],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                starred: false,
+                has_attachment: false,
+                archived: false,
+                snooze_until: None,
+                list_id: None,
+                reply_to: Vec::new(),
+                attachment_names: Vec::new(),
+                parts: None,
+            }
+        })
+        .collect()
 }
 
 fn now() -> i64 {

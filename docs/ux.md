@@ -14,6 +14,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Transitions are quick: 80–160 ms with an ease-out curve. Input never waits for one; a key press during a transition jumps straight to the new state.
 - No layout shift: reserve space for text that is still loading, keep row heights stable, and keep the selection where the eye is.
 - Animation is off when `reduce_motion` is set or the desktop asks for reduced motion. It never pushes a frame past the key-to-frame budget.
+- In the code: `crates/fell/src/motion.rs` holds the curve, the named durations and the helpers every view uses. Until there is a settings file, `FELL_REDUCE_MOTION=1` is the `reduce_motion` setting (`=0` forces motion on); otherwise `gtk-enable-animations=false` in the GTK settings turns it off. A key ends fades in and overlay openings at once; what is leaving (a notice, a closed overlay) keeps fading out and takes no input. A scroll or a row that is still moving starts its next move from where it is drawn instead of snapping first; what the key acts on is already the final state. Everything that leaves fades out over `FADE` (120 ms), as long as it took to come in, so an exit never reads as a cut. Content that replaces other content in place (another thread, another folder) arrives from 40 % opacity, never through an empty frame.
 
 ## Quiet: no noise
 - Do not print key hints for obvious actions (`Esc` to close, `Enter` to open, `j`/`k`, `q` to quit). An empty state says what is true ("No mail matches"), not how to leave it.
@@ -24,7 +25,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Left: the thread list for the current folder (or search results).
 - Right: the open conversation.
 - No folder sidebar. Switch folders with `gi` / `gs` / `gd` and a fuzzy folder picker (`gf`, also in the `:` palette).
-- A one-line header above the list shows the account, the current folder, and the unread count; a one-line status bar at the bottom shows mode, sync state and, after the leader, which-key hints.
+- A one-line header above the list shows the account, the current folder, and the unread count; a one-line status bar at the bottom shows mode, sync state and, after the leader, which-key hints. It shows no key hints at rest; a count or a chord's prefix shows while it is typed.
 - Pane split is resizable and remembered; `Enter`/`o` focuses the conversation, `Esc`/`h` returns to the list. A key toggles a full-width conversation for long mail.
 - Narrow windows (Hyprland tiles): below a width threshold show one pane at a time with the same keys, never a cramped split.
 

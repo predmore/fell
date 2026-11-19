@@ -403,13 +403,8 @@ impl Session {
         self.roles.label(&self.folder)
     }
 
-    /// The open folder's own name, shown dimmed beside its title only when
-    /// another folder would read the same (see [`Self::folder_detail`]).
-    pub fn folder_title_detail(&self) -> Option<String> {
-        self.folder_detail(&self.folder)
-    }
-
-    /// `folder`'s own name when its label alone would read like another of
+    /// `folder`'s own name, shown dimmed beside its title in the header,
+    /// when its label alone would read like another of
     /// the account's folders: Gmail's `[Gmail]/Sent Mail` beside a label
     /// called `Sent`. `None` for every folder in the usual case.
     pub fn folder_detail(&self, folder: &str) -> Option<String> {
@@ -705,7 +700,12 @@ impl Session {
     /// it is still in the folder. New mail moved it above rows that do not
     /// reach the top of the folder. Without this the row that took its
     /// place would be selected, and opened.
+    /// A `G` or `gg` waiting for these rows moves the selection anyway, so
+    /// there is nothing to follow.
     pub fn moved_selection(&self, rows: &[ThreadRow], found: Option<ListKey>) -> Option<ListKey> {
+        if matches!(self.pending, Some(Pending::Last | Pending::Row(_))) {
+            return None;
+        }
         let key = found?;
         let id = self.cursor_id.as_deref()?;
         (key.thread_id.0 == id && !rows.iter().any(|row| row.id == id)).then_some(key)
@@ -2015,7 +2015,7 @@ mod tests {
         assert_eq!(session.folder, "[Gmail]/Sent Mail");
         assert_eq!(session.folder_title(), "Sent");
         assert_eq!(
-            session.folder_title_detail().as_deref(),
+            session.folder_detail(&session.folder).as_deref(),
             Some("[Gmail]/Sent Mail")
         );
         assert_eq!(
@@ -2807,6 +2807,53 @@ mod tests {
         assert_eq!(session.cursor_id.as_deref(), Some("t04"));
         session.on_key(KeyId::Char('j'), 4);
         assert_eq!(session.cursor_id.as_deref(), Some("t05"));
+    }
+
+    #[test]
+    fn a_jump_past_the_loaded_rows_glides_when_it_lands() {
+        use crate::motion::{GLIDE_MAX_VIEWPORTS, Glide, Motion, SLIDE};
+        use crate::present::{Landing, landing, list_scroll_target};
+        // 150 threads, 100 loaded: `G` and `gg` wait for rows.
+        let (mut session, folder) = paged(150, 100, 40);
+        let (row, view) = (68.0, 680.0);
+        for (keys, expected) in [(&['G'][..], "t149"), (&['g', 'g'][..], "t00")] {
+            for key in keys {
+                session.on_key(KeyId::Char(*key), 10);
+            }
+            let before = session.cursor_id.clone();
+            let fetch = session.take_fetch().expect("the jump asks for rows");
+            // The old selection is not in the rows the jump reads, but the
+            // view must not read again to follow it: the jump moves it.
+            let key = session.cursor_thread().map(row_key);
+            let span = session.span(fetch, None, None);
+            let (rows, _, _) = folder.read(&span);
+            assert!(!rows.iter().any(|row| Some(&row.id) == before.as_ref()));
+            assert_eq!(session.moved_selection(&rows, key), None);
+            // The read the view sends for it holds the viewport: no switch,
+            // no change, nothing to select.
+            refresh_with(&mut session, &folder, fetch, None);
+            land(&mut session, &folder);
+            assert_eq!(session.cursor_id.as_deref(), Some(expected));
+            let same = session.cursor_id == before;
+            assert_eq!(landing(false, true, same), Landing::Glide, "{keys:?}");
+            // The glide covers at most one viewport, however far it went.
+            let index = session.selected_index().unwrap();
+            let target = list_scroll_target(0.0, index, None, session.threads.len(), row, view);
+            let glide = Glide::start(
+                &Motion::new(true),
+                -60.0 * row,
+                target,
+                view * GLIDE_MAX_VIEWPORTS,
+                SLIDE,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+            assert!((glide.from - glide.to).abs() <= view);
+        }
+        // A folder switch, or the reader's own change, still jumps.
+        assert_eq!(landing(true, false, false), Landing::Jump);
+        assert_eq!(landing(false, false, false), Landing::Jump);
+        assert_eq!(landing(false, true, true), Landing::Hold);
     }
 
     #[test]
