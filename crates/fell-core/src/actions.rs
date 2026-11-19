@@ -1681,6 +1681,35 @@ fn action_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     )?)
 }
 
+/// Undo snapshots and tombstones refer to the row as it was when edited.
+pub(crate) fn protect_undo_messages(
+    conn: &Connection,
+    account_id: &AccountId,
+    protected: &mut HashSet<String>,
+) -> Result<()> {
+    for table in ["local_action_messages", "local_action_flags"] {
+        if !action_table_exists(conn, table)? {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT s.message_id FROM local_actions a JOIN {table} s ON s.action_id = a.id
+             WHERE a.account_id = ?1 AND a.undone = 0 AND a.kind != 'purge'"
+        ))?;
+        for id in stmt.query_map([account_id.as_str()], |row| row.get(0))? {
+            protected.insert(id?);
+        }
+    }
+    if action_table_exists(conn, "local_folder_tombstones")? {
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id FROM local_folder_tombstones WHERE account_id = ?1",
+        )?;
+        for id in stmt.query_map([account_id.as_str()], |row| row.get(0))? {
+            protected.insert(id?);
+        }
+    }
+    Ok(())
+}
+
 fn fold_deleted_snapshot(conn: &Connection, message: &Message) -> Result<()> {
     // The parts this copy gives the snapshot: a copy with a body, or with
     // files and no text. One with neither (fetched without its body) leaves

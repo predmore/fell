@@ -1162,8 +1162,17 @@ fn folder_names_in(conn: &Connection, account_id: &AccountId) -> Result<Vec<Stri
             .map_err(Into::into);
     }
     // A writer skipped the refresh, so `account_folders` may be stale. Read
-    // the up-to-date threads' rows and compute the queued ones.
-    let mut seen: Vec<(i64, i64, String, String)> = {
+    // clean memberships and only the folder fields of queued messages.
+    let mut earliest = HashMap::new();
+    let mut add_name = |key: String, rowid: i64, pos: i64, name: String| {
+        let first = earliest
+            .entry(key)
+            .or_insert_with(|| (rowid, pos, name.clone()));
+        if (rowid, pos) < (first.0, first.1) {
+            *first = (rowid, pos, name);
+        }
+    };
+    {
         let mut stmt = conn.prepare_cached(
             "SELECT tf.first_rowid, tf.first_pos, tf.folder_key, tf.display
              FROM thread_folders tf
@@ -1173,32 +1182,27 @@ fn folder_names_in(conn: &Connection, account_id: &AccountId) -> Result<Vec<Stri
                    WHERE d.account_id = tf.account_id AND d.thread_id = tf.thread_id
                )",
         )?;
-        let rows = stmt.query_map(params![account], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+        let mut rows = stmt.query(params![account])?;
+        while let Some(row) = rows.next()? {
+            add_name(row.get(2)?, row.get(0)?, row.get(1)?, row.get(3)?);
+        }
+    }
+    let mut messages = conn.prepare_cached(
+        "SELECT rowid, folders FROM messages WHERE account_id = ?1 AND thread_id = ?2",
+    )?;
     for thread in queued {
-        if let Some(summary) = compute(conn, account, &thread)? {
-            for membership in summary.folders {
-                if let Some(display) = membership.display {
-                    seen.push((
-                        membership.first_rowid,
-                        membership.first_pos as i64,
-                        membership.key,
-                        display,
-                    ));
-                }
+        let mut rows = messages.query(params![account, thread])?;
+        while let Some(row) = rows.next()? {
+            let rowid = row.get::<_, i64>(0)?;
+            let folders = row.get::<_, String>(1)?;
+            for (pos, name) in split_field(&folders).into_iter().enumerate() {
+                add_name(name.to_ascii_lowercase(), rowid, pos as i64, name);
             }
         }
     }
-    seen.sort_by_key(|(first, pos, _, _)| (*first, *pos));
-    let mut keys = HashSet::new();
-    Ok(seen
-        .into_iter()
-        .filter(|(_, _, key, _)| keys.insert(key.clone()))
-        .map(|(_, _, _, display)| display)
-        .collect())
+    let mut names: Vec<_> = earliest.into_values().collect();
+    names.sort_unstable_by_key(|(rowid, pos, _)| (*rowid, *pos));
+    Ok(names.into_iter().map(|(_, _, name)| name).collect())
 }
 
 fn queued_threads(conn: &Connection, account: &str) -> Result<Vec<String>> {
