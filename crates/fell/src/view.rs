@@ -1295,7 +1295,7 @@ impl Inbox {
         let account = self.account_id.clone();
         let thread = ThreadId(id.clone());
         let key = self.selected_key();
-        self.take_out_of_list(&id, cx);
+        self.take_out_of_list(std::slice::from_ref(&id), cx);
         self.change_mailbox(
             move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
             move |inbox, result| match result {
@@ -1341,7 +1341,7 @@ impl Inbox {
         let from = self.list_folder.clone();
         let to = destination.clone();
         let key = self.selected_key();
-        self.take_out_of_list(&id, cx);
+        self.take_out_of_list(std::slice::from_ref(&id), cx);
         self.change_mailbox(
             move |store| store.move_thread(&account, &thread, &from, &to).map(|_| ()),
             move |inbox, result| match result {
@@ -1378,13 +1378,103 @@ impl Inbox {
         }
     }
 
-    /// Remove `id` from the rows on screen before its write lands and open
-    /// the row that took its place.
-    fn take_out_of_list(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.pending_removals.insert(id.to_string());
+    /// `#`, `!`, or a confirmed permanent delete on `ids` (the selection,
+    /// or the selected row). They leave the list in this frame, as an
+    /// archived row does, and the row after them is selected.
+    fn remove_threads(&mut self, ids: Vec<String>, removal: Removal, cx: &mut Context<Self>) {
+        if self.session.folder != self.list_folder {
+            self.session
+                .show_toast("The folder is still loading", false);
+            return;
+        }
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| self.session.threads.iter().any(|row| &row.id == id))
+            .collect();
+        let Some(key) = ids.first().and_then(|first| {
+            self.session
+                .threads
+                .iter()
+                .find(|row| &row.id == first)
+                .map(row_key)
+        }) else {
+            self.session.show_toast("No conversation", true);
+            return;
+        };
+        let roles = &self.session.roles;
+        let folder = self.list_folder.clone();
+        let count = ids.len();
+        let done_text = match removal {
+            Removal::Delete => moved_notice(
+                count,
+                &self.session.folder_text(roles.name(FolderRole::Trash)),
+            ),
+            Removal::Spam if roles.is(FolderRole::Junk, &folder) => moved_notice(
+                count,
+                &self.session.folder_text(roles.name(FolderRole::Inbox)),
+            ),
+            Removal::Spam => moved_notice(
+                count,
+                &self.session.folder_text(roles.name(FolderRole::Junk)),
+            ),
+            Removal::Purge => match count {
+                1 => "Removed from Fell".to_string(),
+                n => format!("Removed {n} from Fell"),
+            },
+        };
+        let account = self.account_id.clone();
+        let threads: Vec<ThreadId> = ids.iter().cloned().map(ThreadId).collect();
+        self.session.picked.clear();
+        self.session.visual = false;
+        self.take_out_of_list(&ids, cx);
+        self.change_mailbox(
+            move |store| {
+                match removal {
+                    Removal::Delete => store.delete_threads(&account, &threads, &folder),
+                    Removal::Spam => store.spam_threads(&account, &threads, &folder),
+                    Removal::Purge => store.purge_threads(&account, &threads, &folder),
+                }
+                .map(|_| ())
+            },
+            move |inbox, result| {
+                for id in &ids {
+                    inbox.pending_removals.remove(id);
+                }
+                match result {
+                    Ok(()) => {
+                        // Undo finds the first of them again; nothing
+                        // comes back after a permanent delete.
+                        inbox.moved_thread = (removal != Removal::Purge).then_some(key);
+                        inbox.session.show_toast(done_text, false);
+                        inbox.send_to_server();
+                        Some(ReadIntent {
+                            changed: true,
+                            ..ReadIntent::default()
+                        })
+                    }
+                    Err(err) => {
+                        inbox.session.show_toast(err.to_string(), true);
+                        Some(ReadIntent {
+                            changed: true,
+                            select: Some(key),
+                            ..ReadIntent::default()
+                        })
+                    }
+                }
+            },
+            cx,
+        );
+    }
+
+    /// Remove `ids` from the rows on screen before their write lands and
+    /// open the row that took their place. Rows below slide up together.
+    fn take_out_of_list(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        self.pending_removals.extend(ids.iter().cloned());
         let now = self.motion.clock.now();
         let drawn = self.drawn_rows(now);
-        self.session.remove_thread(id);
+        for id in ids {
+            self.session.remove_thread(id);
+        }
         self.scroll_list_to_cursor();
         self.start_list_shift(drawn, false);
         self.request_messages(true, cx);
@@ -1734,6 +1824,19 @@ impl Inbox {
         }
         if step.archive {
             self.archive_current(cx);
+        }
+        if step.delete {
+            let ids = self.session.action_targets();
+            self.remove_threads(ids, Removal::Delete, cx);
+        }
+        if step.spam {
+            let ids = self.session.action_targets();
+            self.remove_threads(ids, Removal::Spam, cx);
+        }
+        if step.purge
+            && let Some(ids) = self.session.take_purge()
+        {
+            self.remove_threads(ids, Removal::Purge, cx);
         }
         if step.reopen_review {
             let reopened = cx
@@ -3078,13 +3181,10 @@ fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
                     .unwrap_or_default(),
             ),
         )
-        .child(
-            div().text_color(rgb(theme.dimmed)).child(
-                banner
-                    .as_ref()
-                    .map(|item| item.hint.clone())
-                    .unwrap_or_default(),
-            ),
+        .children(
+            banner
+                .filter(|item| !item.hint.is_empty())
+                .map(|item| div().text_color(rgb(theme.dimmed)).child(item.hint)),
         )
 }
 
@@ -3651,7 +3751,7 @@ fn status_bar(
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
-            .text_color(rgb(if toast.error {
+            .text_color(rgb(if toast.alert {
                 theme.error
             } else {
                 theme.foreground
@@ -4200,6 +4300,25 @@ fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div 
         )
 }
 
+/// What `#`, `!`, and a confirmed permanent delete do to the threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removal {
+    /// To Trash.
+    Delete,
+    /// To Spam, or from Spam to the inbox.
+    Spam,
+    /// Out of Trash for good, in Fell only.
+    Purge,
+}
+
+/// "Moved to Trash · u", or "Moved 3 to Trash · u" for a selection.
+fn moved_notice(count: usize, to: &str) -> String {
+    match count {
+        1 => format!("Moved to {to} · u"),
+        n => format!("Moved {n} to {to} · u"),
+    }
+}
+
 fn archive_failure(err: &fell_core::Error) -> String {
     match err {
         fell_core::Error::Action(message) if message.contains("into Archive") => {
@@ -4260,6 +4379,8 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
                 Some(KeyId::Char(match ch {
                     '/' => '?',
                     ';' => ':',
+                    '3' => '#',
+                    '1' => '!',
                     other => other.to_ascii_uppercase(),
                 }))
             } else {
@@ -4406,6 +4527,8 @@ mod tests {
             key_from(&stroke("slash", "?", true)),
             Some(KeyId::Char('?'))
         );
+        assert_eq!(key_from(&stroke("3", "#", true)), Some(KeyId::Char('#')));
+        assert_eq!(key_from(&stroke("1", "!", true)), Some(KeyId::Char('!')));
     }
 
     fn controlled(key: &str) -> Keystroke {
