@@ -1,0 +1,6 @@
+G-dark load 2.06 -> 2.14
+narrow-dark load 2.29 -> 2.16
+gs-dark load 2.07 -> 2.07
+G-light load 2.31 -> 2.36
+narrow-light load 2.17 -> 2.14
+gs-light load 2.05 -> 2.05
