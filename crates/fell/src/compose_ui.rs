@@ -19,6 +19,7 @@ use image::Frame;
 use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
+use crate::present::display_safe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -1842,7 +1843,7 @@ impl ComposeView {
             block = block.child(render_doc(
                 &html_to_doc(html),
                 &self.folder,
-                Links::Target,
+                Paint::compose(Links::Target),
                 colors,
             ));
         }
@@ -2210,23 +2211,6 @@ fn agent_label(agent: &str) -> String {
     display_safe(agent.strip_prefix("agent:").unwrap_or(agent))
 }
 
-/// Text from outside (an agent name, a sender, a subject) without line
-/// breaks or the invisible marks that reorder or hide what is drawn.
-fn display_safe(text: &str) -> String {
-    text.chars()
-        .filter(|ch| {
-            !ch.is_control()
-                && !matches!(
-                    *ch,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2060}'..='\u{2069}'
-                        | '\u{FEFF}'
-                )
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn field_row(
     parent: gpui::Div,
@@ -2403,7 +2387,12 @@ fn reply_row(
                 .to
                 .iter()
                 .any(|address| redirects.contains(&address.email.trim().to_lowercase()));
-            let sender = if redirected && parent.sender_email != parent.sender {
+            // The person's own message is "me", as the inbox says it.
+            let mine = fell_core::compose::email_of(&snap.from)
+                .is_some_and(|me| me.eq_ignore_ascii_case(parent.sender_email.trim()));
+            let sender = if mine {
+                "me".to_string()
+            } else if redirected && parent.sender_email != parent.sender {
                 format!("{} <{}>", parent.sender, parent.sender_email)
             } else {
                 parent.sender.clone()
@@ -2415,7 +2404,7 @@ fn reply_row(
             );
             let subject = display_safe(&parent.subject);
             let what = fit(&who, &dot_before(&subject), &when);
-            if what.chars().count() < 12 && who != parent.sender {
+            if what.chars().count() < 12 && who != parent.sender && !mine {
                 // Too little room beside the sender's address: the subject
                 // and date take the next line.
                 let what = fit("", &subject, &when);
@@ -2423,8 +2412,10 @@ fn reply_row(
             }
             context_row("In reply to", &who, &what, Some(when), colors)
         }
+        // The original is gone from the mailbox: said in words, as the
+        // drafts list says it, not as a raw Message-ID.
         (None, Some(id)) if !id.trim().is_empty() => {
-            context_row("In reply to", &display_safe(id), "", None, colors)
+            context_row("In reply to", crate::present::REPLY_GONE, "", None, colors)
         }
         _ => context_row("In reply to", "none (new message)", "", None, colors),
     }
@@ -2919,7 +2910,7 @@ fn styled_body(
                         block, &text, editor, &edits, focused, links, colors, was_lines,
                     )
                 } else {
-                    render_block(block, folder, links, colors)
+                    render_block(block, folder, Paint::compose(links), colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -3040,7 +3031,7 @@ fn raw_source_block(
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
-        return render_block(block, Path::new(""), links, colors);
+        return render_block(block, Path::new(""), Paint::compose(links), colors);
     };
     let slice = &text[start.min(text.len())..end.min(text.len())];
     let mut column = div().flex().flex_col();
@@ -3644,11 +3635,106 @@ fn caret(colors: Palette, mode: Mode) -> gpui::Div {
         .bg(rgb(colors.caret))
 }
 
-fn render_doc(doc: &StyledDoc, folder: &Path, links: Links, colors: Palette) -> gpui::Div {
+/// A compose draft in the inbox's reading pane: the compose window's
+/// rendering, at the inbox's text size. Links show where they go by the
+/// editor's rules: an agent's draft shows each link's host, the person's
+/// own a label that reads as an address and goes elsewhere. Its text loses
+/// bidi and invisible format characters, as headers do.
+pub(crate) fn render_draft_doc(
+    doc: &StyledDoc,
+    agent: bool,
+    theme: &crate::theme::Theme,
+) -> gpui::Div {
+    let paint = Paint {
+        links: if agent { Links::Host } else { Links::Label },
+        text_px: theme.ui_px,
+    };
+    render_doc(
+        &safe_doc(doc),
+        Path::new(""),
+        paint,
+        palette_from_theme(theme),
+    )
+}
+
+/// `doc` with each text run through [`text_safe`].
+fn safe_doc(doc: &StyledDoc) -> StyledDoc {
+    fn inlines(items: &[fell_core::compose::Inline]) -> Vec<fell_core::compose::Inline> {
+        use fell_core::compose::Inline;
+        items
+            .iter()
+            .map(|item| match item {
+                Inline::Text(text) => Inline::Text(text_safe(text)),
+                Inline::Code(text) => Inline::Code(text_safe(text)),
+                Inline::Em(inner) => Inline::Em(inlines(inner)),
+                Inline::Strong(inner) => Inline::Strong(inlines(inner)),
+                Inline::Link { text, href } => Inline::Link {
+                    text: text_safe(text),
+                    href: href.clone(),
+                },
+                Inline::Image { alt, src } => Inline::Image {
+                    alt: text_safe(alt),
+                    src: src.clone(),
+                },
+            })
+            .collect()
+    }
+    fn safe_block(block: &fell_core::compose::Block) -> fell_core::compose::Block {
+        let body = match &block.body {
+            BlockBody::Heading {
+                level,
+                inlines: items,
+            } => BlockBody::Heading {
+                level: *level,
+                inlines: inlines(items),
+            },
+            BlockBody::Paragraph { inlines: items } => BlockBody::Paragraph {
+                inlines: inlines(items),
+            },
+            BlockBody::List { ordered, items } => BlockBody::List {
+                ordered: *ordered,
+                items: items.iter().map(|item| inlines(item)).collect(),
+            },
+            BlockBody::Quote { blocks } => BlockBody::Quote {
+                blocks: blocks.iter().map(safe_block).collect(),
+            },
+            BlockBody::Code { text } => BlockBody::Code {
+                text: text_safe(text),
+            },
+            BlockBody::Image { alt, src } => BlockBody::Image {
+                alt: text_safe(alt),
+                src: src.clone(),
+            },
+        };
+        fell_core::compose::Block {
+            source: block.source,
+            body,
+        }
+    }
+    StyledDoc {
+        blocks: doc.blocks.iter().map(safe_block).collect(),
+    }
+}
+
+/// Body text without bidi controls and invisible format characters, which
+/// could reorder what a line reads as. Line breaks and tabs stay.
+fn text_safe(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            line.split('\t')
+                .map(display_safe)
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_doc(doc: &StyledDoc, folder: &Path, paint: Paint, colors: Palette) -> gpui::Div {
     let mut column = div().flex().flex_col();
     let mut previous = None;
     for block in &doc.blocks {
-        let mut painted = render_block(block, folder, links, colors);
+        let mut painted = render_block(block, folder, paint, colors);
         if previous.is_some() && !joins_previous(previous, Some(&block.body)) {
             painted = painted.mt_2();
         }
@@ -3674,16 +3760,36 @@ enum Links {
 }
 
 /// Where a link goes, muted after its label.
+/// How styled blocks paint: how links show, and the body text size that
+/// headings and list markers scale from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Paint {
+    links: Links,
+    text_px: f32,
+}
+
+impl Paint {
+    /// The compose window, whose body text is 16 px.
+    fn compose(links: Links) -> Self {
+        Self {
+            links,
+            text_px: 16.,
+        }
+    }
+}
+
 fn render_block(
     block: &fell_core::compose::Block,
     folder: &Path,
-    links: Links,
+    paint: Paint,
     colors: Palette,
 ) -> gpui::Div {
+    let links = paint.links;
     match &block.body {
+        // 28 and 22 px over the compose window's 16.
         BlockBody::Heading { level, inlines } => div()
             .font_weight(FontWeight(680.))
-            .text_size(px(if *level <= 1 { 28. } else { 22. }))
+            .text_size(px(paint.text_px * if *level <= 1 { 1.75 } else { 1.375 }))
             .child(render_inlines(inlines, links, colors)),
         BlockBody::Paragraph { inlines } => match plain_lines(inlines) {
             // Plain text wraps at the window's edge, one line per break,
@@ -3709,7 +3815,7 @@ fn render_block(
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(18.))
+                                .text_size(px(paint.text_px * 1.125))
                                 .font_weight(FontWeight(700.))
                                 .text_color(rgb(colors.accent))
                                 .child(marker),
@@ -3726,7 +3832,7 @@ fn render_block(
                 .pl_3()
                 .text_color(rgb(colors.dim));
             for block in blocks {
-                quote = quote.child(render_block(block, folder, links, colors));
+                quote = quote.child(render_block(block, folder, paint, colors));
             }
             quote
         }
@@ -4464,7 +4570,12 @@ fn preview_panel(snap: &Snapshot, colors: Palette) -> impl IntoElement {
                     .text_color(rgb(colors.dim))
                     .child("HTML preview"),
             )
-            .child(render_doc(&doc, Path::new(""), Links::Target, colors)),
+            .child(render_doc(
+                &doc,
+                Path::new(""),
+                Paint::compose(Links::Target),
+                colors,
+            )),
     )
 }
 
@@ -5952,6 +6063,28 @@ mod tests {
             assert!(super::idle_status(status), "{status}");
         }
         assert!(!super::idle_status("Sending…"));
+    }
+
+    #[test]
+    fn a_draft_preview_loses_bidi_controls_but_keeps_its_lines() {
+        let doc = fell_core::compose::markdown_to_doc(
+            "Pay \u{202e}eciovni\u{202c} [here\u{200b}](https://example.com)\nnow\n",
+        );
+        let safe = super::safe_doc(&doc);
+        let fell_core::compose::BlockBody::Paragraph { inlines } = &safe.blocks[0].body else {
+            panic!("{safe:?}");
+        };
+        let text: String = inlines
+            .iter()
+            .map(|inline| match inline {
+                fell_core::compose::Inline::Text(text) => text.clone(),
+                fell_core::compose::Inline::Link { text, .. } => format!("[{text}]"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(text, "Pay eciovni [here] now");
+        // Breaks and tabs, which plain lines and code keep, stay.
+        assert_eq!(super::text_safe("a\nb\u{202e}c\td"), "a\nbc\td");
     }
 
     #[test]

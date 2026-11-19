@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::keymap::KeyId;
 use crate::model::{FolderIntent, Overlay, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
-use crate::present::{Pane, ThreadRow};
+use crate::present::{ConvMessage, Pane, ThreadRow};
 
 /// The old selection's highlight starts its fade from this much, so on a
 /// slow frame two rows never look selected.
@@ -362,8 +362,13 @@ impl InboxMotion {
             .or(self.card_to)
     }
 
-    /// Another thread's messages replaced the conversation.
-    pub fn thread_arrived(&mut self) {
+    /// Put another thread's messages in the conversation. They fade in
+    /// with the next frame however they were read: a thread from the
+    /// store, or a compose draft in the Drafts list from memory. Every
+    /// path that replaces the conversation goes through here, so none
+    /// pops in.
+    pub fn show_thread(&mut self, session: &mut Session, messages: Vec<ConvMessage>) {
+        session.set_messages(messages);
         self.arrival = None;
         self.arrival_pending = true;
     }
@@ -975,6 +980,53 @@ mod tests {
         motion.settle(later(back, 40));
         assert!(motion.pane_leaving(later(back, 40)).is_none());
         assert_eq!(motion.pane_entry(Pane::List, later(back, 40)).dx, 0.0);
+    }
+
+    #[test]
+    fn a_compose_draft_fades_in_as_a_synced_one_does() {
+        // #169 round 6: `j` to a compose draft in Drafts set its messages
+        // from memory without the arrival fade, so its title and body
+        // popped in, while a synced draft's faded in.
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        motion.observe(&session, (true, true), now);
+        assert_eq!(motion.arrival(now), 1.0);
+        let draft = fell_core::compose::DraftSummary {
+            id: "d1".into(),
+            from: "a@x".into(),
+            to: vec!["sam@example.com".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Notes".into(),
+            body: "## Agenda\n\nA **short** list\n".into(),
+            owner: String::new(),
+            updated_unix: 1_000,
+            maybe_sent: false,
+            reply_context: None,
+            forwarded: None,
+            in_reply_to: None,
+            known_names: Default::default(),
+        };
+        let shown = crate::present::draft_conversation(&draft, "a@x", 2_000);
+        motion.show_thread(&mut session, shown);
+        assert_eq!(session.messages.len(), 1);
+        // The frame that first draws it starts the fade, from ARRIVE_FROM:
+        // the pane never blinks to empty.
+        let drawn = later(now, 500);
+        motion.observe(&session, (true, true), drawn);
+        assert_eq!(motion.arrival(drawn), motion::ARRIVE_FROM);
+        assert!(motion.tick(later(drawn, 40)));
+        let mid = motion.arrival(later(drawn, 40));
+        assert!(mid > motion::ARRIVE_FROM && mid < 1.0, "{mid}");
+        assert!(!motion.tick(later(drawn, 200)));
+        assert_eq!(motion.arrival(later(drawn, 200)), 1.0);
+        // Off with reduce_motion: it is simply there.
+        let mut still = InboxMotion::new(Motion::new(false));
+        let shown = crate::present::draft_conversation(&draft, "a@x", 2_000);
+        still.show_thread(&mut session, shown);
+        still.observe(&session, (true, true), drawn);
+        assert_eq!(still.arrival(drawn), 1.0);
     }
 
     #[test]

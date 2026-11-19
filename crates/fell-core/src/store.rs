@@ -1236,6 +1236,81 @@ impl Store {
         summaries::folder_threads(&self.conn, account_id, folder)
     }
 
+    /// The name each address last sent mail under, by lowercase address,
+    /// for addresses that have sent this account mail with a name. Reads
+    /// the account's latest 20,000 messages at most, newest first.
+    pub fn sender_names(
+        &self,
+        account_id: &AccountId,
+        emails: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let wanted: std::collections::HashSet<String> = emails
+            .iter()
+            .map(|email| email.trim().to_lowercase())
+            .filter(|email| !email.is_empty())
+            .collect();
+        let mut out = std::collections::HashMap::new();
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT from_email, from_name FROM messages
+             WHERE account_id = ?1 AND trim(coalesce(from_name, '')) <> ''
+             ORDER BY date_unix DESC LIMIT 20000",
+        )?;
+        let mut rows = stmt.query(params![account_id.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let email = row.get::<_, String>(0)?.trim().to_lowercase();
+            if wanted.contains(&email) && !out.contains_key(&email) {
+                let name: String = row.get(1)?;
+                out.insert(email, name.trim().to_string());
+                if out.len() == wanted.len() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Who each thread's latest message in `folder` is addressed to: its To,
+    /// then its Cc. The Drafts list names a synced draft by who it is to, as
+    /// it does a compose draft. A thread with no message in the folder is
+    /// left out.
+    pub fn folder_recipients(
+        &self,
+        account_id: &AccountId,
+        folder: &str,
+        threads: &[ThreadId],
+    ) -> Result<std::collections::HashMap<ThreadId, Vec<Address>>> {
+        let names: Vec<String> = folder_query_names(folder)
+            .into_iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT folders, to_line, cc_line FROM messages
+             WHERE account_id = ?1 AND thread_id = ?2
+             ORDER BY date_unix DESC, rowid DESC",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for thread in threads {
+            let mut rows = stmt.query(params![account_id.as_str(), thread.0])?;
+            while let Some(row) = rows.next()? {
+                let folders: String = row.get(0)?;
+                let here = split_field(&folders)
+                    .iter()
+                    .any(|name| names.contains(&name.to_ascii_lowercase()));
+                if !here {
+                    continue;
+                }
+                let mut people = decode_addresses(&row.get::<_, String>(1)?);
+                people.extend(decode_addresses(&row.get::<_, String>(2)?));
+                out.insert(thread.clone(), people);
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// One window of the list [`Store::folder_threads`] returns, whether the
     /// folder has rows beyond it on either side, and the folder's unread
     /// count. A window is found by list position (see [`ListKey`]), so its
@@ -3923,6 +3998,82 @@ mod tests {
         let plan = plan.join("\n");
         assert!(plan.contains("idx_messages_thread_date"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn a_sender_is_named_as_their_latest_mail_names_them() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let mut old = msg("old@x", None, None, "One", "first");
+        old.headers.from = Address {
+            name: Some("Ada L".into()),
+            email: "Ada@X".into(),
+        };
+        old.headers.date_unix = 10;
+        store.upsert_message(&old).unwrap();
+        let mut new = msg("new@x", None, None, "Two", "second");
+        new.headers.from = Address {
+            name: Some("Ada Lovelace".into()),
+            email: "ada@x".into(),
+        };
+        new.headers.date_unix = 20;
+        store.upsert_message(&new).unwrap();
+        let mut unnamed = msg("bare@x", None, None, "Three", "third");
+        unnamed.headers.from = Address {
+            name: None,
+            email: "sam@x".into(),
+        };
+        store.upsert_message(&unnamed).unwrap();
+        let names = store
+            .sender_names(&AccountId("a1".into()), &["ADA@x".into(), "sam@x".into()])
+            .unwrap();
+        assert_eq!(names.get("ada@x").map(String::as_str), Some("Ada Lovelace"));
+        assert_eq!(names.get("sam@x"), None, "no name is made up");
+    }
+
+    #[test]
+    fn drafts_name_who_the_latest_draft_is_to() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let ada = Address {
+            name: Some("Ada Lovelace".into()),
+            email: "ada@x".into(),
+        };
+        let mut root = msg("root@x", None, None, "Plan", "the plan");
+        root.headers.from = ada.clone();
+        root.folders = vec!["INBOX".into()];
+        let thread = store.upsert_message(&root).unwrap();
+        // The person's synced reply sits in Drafts in the same thread.
+        let mut draft = msg("draft@x", None, Some("root@x"), "Re: Plan", "sounds good");
+        draft.headers.from = Address {
+            name: None,
+            email: "c@x".into(),
+        };
+        draft.headers.date_unix = 2;
+        draft.folders = vec!["Drafts".into()];
+        draft.to = vec![ada.clone()];
+        draft.cc = vec![Address {
+            name: None,
+            email: "sam@x".into(),
+        }];
+        assert_eq!(store.upsert_message(&draft).unwrap(), thread);
+        let mut other = msg("other@x", None, None, "Other", "inbox only");
+        other.folders = vec!["INBOX".into()];
+        let elsewhere = store.upsert_message(&other).unwrap();
+        let found = store
+            .folder_recipients(
+                &AccountId("a1".into()),
+                "drafts",
+                &[thread.clone(), elsewhere.clone()],
+            )
+            .unwrap();
+        let people: Vec<&str> = found[&thread]
+            .iter()
+            .map(|person| person.email.as_str())
+            .collect();
+        // The draft's recipients, not the received message's sender.
+        assert_eq!(people, vec!["ada@x", "sam@x"]);
+        assert!(!found.contains_key(&elsewhere));
     }
 
     #[test]
