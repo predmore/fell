@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use fell_core::{Account, AccountId, AgentGrant, Store};
 
@@ -147,8 +147,9 @@ where
 /// `APPIMAGE` and `APPDIR` are plain environment variables, so they are not
 /// trusted alone: this binary must be the same file as
 /// `$APPDIR/usr/bin/fell-mcp`, `APPDIR` must not be `/` or an install prefix
-/// (`APPDIR=/` would make `/usr/bin/fell-mcp` look bundled), and `APPIMAGE`
-/// must be a regular file.
+/// (`APPDIR=/` would make `/usr/bin/fell-mcp` look bundled), and both
+/// `$APPDIR/usr/bin/fell-mcp` and `APPIMAGE` must be regular files reached
+/// without following symlinks.
 fn inside_appimage(
     exe: Option<&Path>,
     appimage: Option<PathBuf>,
@@ -156,24 +157,17 @@ fn inside_appimage(
 ) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let (exe, appimage, appdir) = (exe?, appimage?, appdir?);
-    let plain = |path: &Path| {
-        path.is_absolute()
-            && path
-                .components()
-                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
-    };
-    if !plain(&appimage) || !plain(&appdir) {
-        return None;
-    }
     let prefixes = ["/", "/usr", "/usr/local", "/opt"];
     if prefixes.iter().any(|prefix| appdir == Path::new(prefix)) {
         return None;
     }
-    let bundled = std::fs::metadata(appdir.join("usr/bin/fell-mcp")).ok()?;
+    let bundled = setup::regular_file_without_symlinks(&appdir.join("usr/bin/fell-mcp"))?;
     let running = std::fs::metadata(exe).ok()?;
-    let same = bundled.dev() == running.dev() && bundled.ino() == running.ino();
-    let image = std::fs::metadata(&appimage).ok()?;
-    (same && image.is_file()).then_some(appimage)
+    if bundled.dev() != running.dev() || bundled.ino() != running.ino() {
+        return None;
+    }
+    setup::regular_file_without_symlinks(&appimage)?;
+    Some(appimage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
