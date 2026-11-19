@@ -942,9 +942,17 @@ pub fn one_line(text: &str) -> String {
 }
 
 pub fn relative_date(now: i64, then: i64) -> String {
+    relative_date_label(now, then, false)
+}
+
+pub(crate) fn compact_relative_date(now: i64, then: i64) -> String {
+    relative_date_label(now, then, true)
+}
+
+fn relative_date_label(now: i64, then: i64, compact: bool) -> String {
     // A future timestamp is not "now". Compare first: saturating_sub never goes negative.
     if then > now {
-        return month_day(now, then);
+        return month_day(now, then, compact);
     }
     let delta = now.saturating_sub(then);
     if delta < 45 {
@@ -962,24 +970,26 @@ pub fn relative_date(now: i64, then: i64) -> String {
         return format!("{th:02}:{tm:02}");
     }
     if yesterday(ny, nmo, nd) == (ty, tmo, td) {
-        return "Yesterday".into();
+        return if compact { "Yest." } else { "Yesterday" }.into();
     }
     if delta < 7 * 24 * 60 * 60 {
         if ty != ny {
-            return month_day(now, then);
+            return month_day(now, then, compact);
         }
         return weekday(tw).into();
     }
-    month_day(now, then)
+    month_day(now, then, compact)
 }
 
-fn month_day(now: i64, then: i64) -> String {
+fn month_day(now: i64, then: i64, compact: bool) -> String {
     let (now_year, _, _, _, _, _) = local_parts(now);
     let (year, month, day, _, _, _) = local_parts(then);
-    if year != now_year {
-        format!("{} {day}, {year}", month_name(month))
-    } else {
+    if year == now_year {
         format!("{} {day}", month_name(month))
+    } else if compact {
+        format!("{month}/{day}/{:02}", year.rem_euclid(100))
+    } else {
+        format!("{} {day}, {year}", month_name(month))
     }
 }
 
@@ -1705,10 +1715,15 @@ mod tests {
         assert_eq!(relative_date(now, now), "now");
         assert_eq!(relative_date(now, now - 30), "now");
         assert_eq!(relative_date(now, now - 120), "2m");
+        assert_eq!(relative_date(now, now - 86_400), "Yesterday");
+        assert_eq!(compact_relative_date(now, now - 86_400), "Yest.");
         let soon = now + 180;
         let tomorrow = now + 86_400;
-        assert_eq!(relative_date(now, soon), month_day(now, soon));
-        assert_eq!(relative_date(now, tomorrow), month_day(now, tomorrow));
+        assert_eq!(relative_date(now, soon), month_day(now, soon, false));
+        assert_eq!(
+            relative_date(now, tomorrow),
+            month_day(now, tomorrow, false)
+        );
         assert_ne!(relative_date(now, soon), "now");
         assert_ne!(relative_date(now, tomorrow), "now");
         let last_year = now - 400 * 86_400;
@@ -1716,8 +1731,12 @@ mod tests {
         let (past_year, _, _, _, _, _) = local_parts(last_year);
         let (future_year, _, _, _, _, _) = local_parts(next_year);
         assert!(relative_date(now, last_year).contains(&past_year.to_string()));
+        assert!(
+            compact_relative_date(now, last_year)
+                .ends_with(&format!("/{:02}", past_year.rem_euclid(100)))
+        );
         assert!(relative_date(now, next_year).contains(&future_year.to_string()));
-        assert!(!month_day(now, now).contains(&local_parts(now).0.to_string()));
+        assert!(!month_day(now, now, false).contains(&local_parts(now).0.to_string()));
         let mut boundary = 1_704_240_000_i64;
         for _ in 0..40 {
             let earlier = boundary - 5 * 86_400;
