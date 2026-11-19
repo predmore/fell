@@ -2,6 +2,7 @@
 //! text, through the same document model the conversation renderer uses.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -4664,12 +4665,18 @@ fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
     if href.is_empty() {
         return None;
     }
-    let host = || Some(format!("({})", link_host(href)));
     match links {
         Links::Target => link_target(text, href),
-        _ if idn_place(href).is_some() || label_misleads(text, href) => host(),
-        Links::Host if !label_names(text, href) => host(),
-        Links::Host | Links::Label => None,
+        Links::Host | Links::Label => {
+            let mut places = text
+                .split_whitespace()
+                .filter_map(|word| place_of_word(word, links))
+                .peekable();
+            (idn_place(href).is_some()
+                || (links == Links::Host && places.peek().is_none())
+                || label_misleads(places, href))
+            .then(|| format!("({})", link_host(href)))
+        }
     }
 }
 
@@ -4798,12 +4805,19 @@ fn place_of_href(href: &str) -> Option<Place> {
 }
 
 /// The place one word of a label reads as, if it reads as one at all:
-/// a scheme (`https://…`), a `www.`, an address with `@`, or a dotted name
-/// ending in letters (`bank.com`, not `v1.2` or `e.g.`).
-fn place_of_word(word: &str) -> Option<Place> {
-    let word = word.trim_matches(|ch: char| {
-        !(ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~'))
-    });
+/// a scheme (`https://…`), an address with `@`, or a dotted name ending
+/// in letters. In the user's draft a bare IP can also name a host.
+fn place_of_word(word: &str, links: Links) -> Option<Place> {
+    let word_char =
+        |ch: char| ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~');
+    if links == Links::Label {
+        // Keep IPv6 brackets long enough to distinguish an optional port.
+        let literal = word.trim_matches(|ch| !(word_char(ch) || matches!(ch, '[' | ']')));
+        if let Some(host) = literal_ip_host(literal) {
+            return Some(Place::Host(host));
+        }
+    }
+    let word = word.trim_matches(|ch| !word_char(ch));
     let lower = word.to_lowercase();
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
     if lower.contains("://") {
@@ -4821,16 +4835,39 @@ fn place_of_word(word: &str) -> Option<Place> {
         });
     }
     let name = lower.split(['/', '?', '#']).next()?;
-    let name = name.rsplit_once(':').map_or(name, |(host, port)| {
+    let name = without_port(name);
+    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    ascii_host(dotted_name(name)?).map(Place::Host)
+}
+
+fn without_port(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(host, port)| {
         if port.chars().all(|ch| ch.is_ascii_digit()) {
             host
         } else {
             name
         }
-    });
-    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
-    let name = name.strip_suffix('.').unwrap_or(name);
-    ascii_host(dotted_name(name)?).map(Place::Host)
+    })
+}
+
+/// A bare IP in the same form as a URL host.
+fn literal_ip_host(word: &str) -> Option<String> {
+    let name = word.split(['/', '?', '#']).next()?;
+    // For IPv6 without brackets, every colon belongs to the address.
+    if let Ok(ip) = name.parse::<Ipv6Addr>() {
+        return Some(url::Host::<String>::Ipv6(ip).to_string());
+    }
+    let name = without_port(name);
+    // Require four parts for bare IPv4 so decimals and version numbers
+    // like `3.5` do not pass as shorthand addresses.
+    if !(name.starts_with('[') || name.strip_suffix('.').unwrap_or(name).split('.').count() == 4) {
+        return None;
+    }
+    match url::Host::parse(name).ok()? {
+        ip @ (url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Some(ip.to_string()),
+        url::Host::Domain(_) => None,
+    }
 }
 
 /// `name` when it reads as a domain: two or more dotted parts, the last
@@ -4843,30 +4880,15 @@ fn dotted_name(name: &str) -> Option<&str> {
     (parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()) && letters).then_some(name)
 }
 
-/// The places a label's words read as.
-fn label_places(text: &str) -> Vec<Place> {
-    text.split_whitespace().filter_map(place_of_word).collect()
-}
-
 /// Whether a word of the label reads as an address that is not where the
 /// link goes: "Sign in at paypal.com" to another host.
-fn label_misleads(text: &str, href: &str) -> bool {
+fn label_misleads(mut places: impl Iterator<Item = Place>, href: &str) -> bool {
     let target = place_of_href(href);
-    label_places(text)
-        .iter()
-        .any(|place| match (&target, place) {
-            (None, _) => true,
-            (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => {
-                address != word
-            }
-            (Some(target), place) => target.domain() != place.domain(),
-        })
-}
-
-/// Whether the label already names where the link goes.
-fn label_names(text: &str, href: &str) -> bool {
-    let places = label_places(text);
-    !places.is_empty() && !label_misleads(text, href)
+    places.any(|place| match (&target, &place) {
+        (None, _) => true,
+        (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => address != word,
+        (Some(target), place) => target.domain() != place.domain(),
+    })
 }
 
 fn canonical_body(body: &str) -> String {
@@ -5889,6 +5911,81 @@ mod tests {
             shown_target("the plan", "https://example.com/plan", Links::Target).as_deref(),
             Some("(https://example.com/plan)")
         );
+    }
+
+    #[test]
+    fn folded_ip_links_show_a_different_destination() {
+        use super::{Links, Urls, inline_pieces, palette};
+        let colors = palette(super::ThemeKind::Dark);
+        for (label, href, host) in [
+            ("192.0.2.7", "https://docs.example/notes", "docs.example"),
+            (
+                "2001:db8::7",
+                "https://[2001:db8::8]/notes",
+                "[2001:db8::8]",
+            ),
+        ] {
+            let line = format!("[{label}]({href})");
+            let expected = format!("{label} ({host})");
+            assert_eq!(shown(&line, false, Urls::Fold(Links::Label)), expected);
+            assert_eq!(shown(&line, true, Urls::Source), line);
+            let doc = markdown_to_doc(&line);
+            let super::BlockBody::Paragraph { inlines } = &doc.blocks[0].body else {
+                panic!("expected a paragraph");
+            };
+            let styled: String = inline_pieces(inlines, Links::Label, colors)
+                .0
+                .iter()
+                .map(piece_text)
+                .collect();
+            assert_eq!(styled, expected);
+        }
+    }
+
+    #[test]
+    fn literal_ip_labels_use_the_same_host_normalization_as_urls() {
+        use super::{Links, shown_target};
+        for (label, href, host) in [
+            (
+                "See 192.000.002.007.:8443/notes",
+                "https://192.0.2.7/",
+                "192.0.2.7",
+            ),
+            (
+                "2001:0DB8:0:0:0:0:0:7",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "See ([2001:DB8::7]:8443/notes).",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "::ffff:192.0.2.7",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+        ] {
+            assert_eq!(shown_target(label, href, Links::Label), None, "{label}");
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label).as_deref(),
+                Some("(docs.example)"),
+                "{label}"
+            );
+            assert_eq!(
+                shown_target(label, href, Links::Host),
+                Some(format!("({host})")),
+                "{label}"
+            );
+        }
+        for label in ["3.5 stars", "v1.2.3.4 notes", "192.0.2.999", "2001:db8:7"] {
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label),
+                None,
+                "{label}"
+            );
+        }
     }
 
     #[test]
