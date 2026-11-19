@@ -240,6 +240,8 @@ pub struct Step {
     pub scroll_pages: i32,
     /// Conversation lines. Positive moves down.
     pub scroll_lines: i32,
+    /// The reader expanded or folded a message, its quotes, or recipients.
+    pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
     /// `u` restores the latest local action.
@@ -1631,6 +1633,7 @@ impl Session {
                     self.opened(&mut step);
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
+                    step.message_disclosure_changed = true;
                 }
             }
             Action::Back => {
@@ -1802,7 +1805,10 @@ impl Session {
             }
             Action::ToggleQuotes => {
                 self.count.clear();
-                self.toggle_open(self.message_cursor);
+                if self.messages.get(self.message_cursor).is_some() {
+                    self.toggle_open(self.message_cursor);
+                    step.message_disclosure_changed = true;
+                }
             }
             Action::Palette => {
                 self.count.clear();

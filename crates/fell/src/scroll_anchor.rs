@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{AnyElement, App, Bounds, IntoElement, LayoutId, Pixels, ScrollHandle, Window, px};
 
-use crate::frame_log::SharedFrameLog;
+use crate::{frame_log::SharedFrameLog, present};
 
 /// A message's index and its top relative to the scroll viewport.
 #[derive(Clone, Copy)]
@@ -20,7 +20,7 @@ impl ScrollAnchor {
         // GPUI clamps wheel deltas during prepaint. Capture the position
         // the wheel would have drawn with the old content.
         let raw_offset = scroll.offset().y;
-        let offset = raw_offset.clamp(-scroll.max_offset().height, px(0.));
+        let offset = clamped_offset(scroll);
         // top_item uses the raw offset, which can be past the last visible
         // message if the wheel overshot the bottom.
         let start = if raw_offset < offset {
@@ -32,6 +32,64 @@ impl ScrollAnchor {
             let item = scroll.bounds_for_item(index)?;
             visible_top(view, offset, item).map(|y| Self { index, y })
         })
+    }
+
+    /// Capture a selected message, which can be below the first visible one.
+    fn capture_message(scroll: &ScrollHandle, index: usize) -> Option<Self> {
+        let item = scroll.bounds_for_item(index)?;
+        visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y })
+    }
+}
+
+fn clamped_offset(scroll: &ScrollHandle) -> Pixels {
+    scroll.offset().y.clamp(-scroll.max_offset().height, px(0.))
+}
+
+/// A short, untouched conversation may reveal its newest message after a
+/// body download. Reader input takes over until another thread opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reveal {
+    Waiting,
+    /// The next frame lays out the bodies.
+    Laying,
+    /// The new message bounds can now be read.
+    Ready,
+    /// Hold a selected message after message navigation, or the first visible
+    /// message after scrolling.
+    Reading {
+        selected: bool,
+    },
+}
+
+impl Reveal {
+    pub fn pending(self) -> bool {
+        matches!(self, Self::Laying | Self::Ready)
+    }
+
+    pub fn body_changed(&mut self, previously_fit: bool) {
+        if self.pending() || (*self == Self::Waiting && previously_fit) {
+            *self = Self::Laying;
+        }
+    }
+
+    pub fn cancel_pending(&mut self) {
+        if self.pending() {
+            *self = Self::Waiting;
+        }
+    }
+
+    pub fn body_anchor(self, scroll: &ScrollHandle, cursor: usize) -> Option<ScrollAnchor> {
+        if self.pending() {
+            return None;
+        }
+        if let Self::Reading { selected } = self {
+            if selected && let Some(anchor) = ScrollAnchor::capture_message(scroll, cursor) {
+                return Some(anchor);
+            }
+        } else if present::conversation_fits(f32::from(scroll.max_offset().height)) {
+            return None;
+        }
+        ScrollAnchor::capture(scroll)
     }
 }
 
@@ -203,6 +261,24 @@ mod tests {
 
     fn vertical_bounds(y: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(0.), px(y)), size(px(100.), px(height)))
+    }
+
+    #[test]
+    fn only_an_untouched_conversation_can_reveal_a_new_body() {
+        let mut reveal = Reveal::Waiting;
+        reveal.body_changed(false);
+        assert!(!reveal.pending());
+        reveal.body_changed(true);
+        assert_eq!(reveal, Reveal::Laying);
+        reveal = Reveal::Ready;
+        reveal.body_changed(false);
+        assert_eq!(reveal, Reveal::Laying, "remeasure a second batch");
+
+        let reading = Reveal::Reading { selected: true };
+        reveal = reading;
+        reveal.cancel_pending();
+        reveal.body_changed(true);
+        assert_eq!(reveal, reading, "input persists across body batches");
     }
 
     #[test]
