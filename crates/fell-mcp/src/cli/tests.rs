@@ -785,6 +785,36 @@ fn appimage_detection_rejects_symlinked_image() {
 }
 
 #[test]
+fn appimage_detection_rejects_symlinked_parent_directories() {
+    let dir = TempDir::new();
+    let appdir = dir.path().join("AppDir");
+    let bin_dir = appdir.join("usr/bin");
+    let running = bin_dir.join("fell-mcp");
+    let image = dir.path().join("fell.AppImage");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(&running, "").unwrap();
+    std::fs::write(&image, "").unwrap();
+
+    let linked_appdir = dir.path().join("LinkedAppDir");
+    symlink(&appdir, &linked_appdir).unwrap();
+    assert_eq!(
+        inside_appimage(Some(&running), Some(image.clone()), Some(linked_appdir)),
+        None
+    );
+
+    let linked_image_dir = dir.path().join("LinkedImageDir");
+    symlink(dir.path(), &linked_image_dir).unwrap();
+    assert_eq!(
+        inside_appimage(
+            Some(&running),
+            Some(linked_image_dir.join("fell.AppImage")),
+            Some(appdir),
+        ),
+        None
+    );
+}
+
+#[test]
 fn without_home_add_says_so_and_a_write_fails() {
     let mut ctx = Ctx::new();
     ctx.no_home = true;
