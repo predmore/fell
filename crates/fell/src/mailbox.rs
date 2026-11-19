@@ -17,6 +17,9 @@ use crate::model::SyncKind;
 pub struct Startup {
     pub keymap: Keymap,
     pub split: f32,
+    /// `read_dwell_ms` in ui.toml: how long a thread stays open before it
+    /// is marked read. 0, the default, marks it as it opens.
+    pub read_dwell_ms: u64,
     pub error: Option<String>,
     pub config: Option<AccountConfig>,
     pub path: Result<PathBuf, String>,
@@ -32,6 +35,7 @@ pub struct Opened {
 pub fn startup() -> Startup {
     let (keymap, keymap_error) = load_keymap();
     let split = load_split();
+    let read_dwell_ms = load_read_dwell();
     let (config, config_error) = match load_account_config() {
         Ok(config) => (config, None),
         Err(err) => (None, Some(err)),
@@ -39,6 +43,7 @@ pub fn startup() -> Startup {
     Startup {
         keymap,
         split,
+        read_dwell_ms,
         error: join_errors([keymap_error, config_error]),
         config,
         path: store_path(),
@@ -291,24 +296,32 @@ fn load_keymap() -> (Keymap, Option<String>) {
     }
 }
 
+fn ui_settings() -> Option<String> {
+    let path = config_dir()?.join("ui.toml");
+    fs::read_to_string(path).ok()
+}
+
+/// The value of `key = value` in ui.toml text.
+fn ui_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        (name.trim() == key).then(|| value.trim())
+    })
+}
+
 fn load_split() -> f32 {
-    let Some(path) = config_dir().map(|dir| dir.join("ui.toml")) else {
-        return 0.38;
-    };
-    let Ok(text) = fs::read_to_string(path) else {
-        return 0.38;
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(value) = line.strip_prefix("split") else {
-            continue;
-        };
-        let value = value.trim().trim_start_matches('=').trim();
-        if let Ok(split) = value.parse::<f32>() {
-            return split.clamp(0.22, 0.52);
-        }
-    }
-    0.38
+    ui_settings()
+        .as_deref()
+        .and_then(|text| ui_value(text, "split")?.parse::<f32>().ok())
+        .map_or(0.38, |split| split.clamp(0.22, 0.52))
+}
+
+/// At most ten seconds, so a typo cannot leave mail unread for good.
+fn load_read_dwell() -> u64 {
+    ui_settings()
+        .as_deref()
+        .and_then(|text| ui_value(text, "read_dwell_ms")?.parse::<u64>().ok())
+        .map_or(0, |ms| ms.min(10_000))
 }
 
 pub fn save_split(split: f32) {
@@ -320,7 +333,18 @@ pub fn save_split(split: f32) {
     }
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let path = dir.join("ui.toml");
-    if fs::write(&path, format!("split = {split:.3}\n")).is_ok() {
+    // Keep the other settings in the file.
+    let kept: String = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.trim()
+                .split_once('=')
+                .is_none_or(|(name, _)| name.trim() != "split")
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if fs::write(&path, format!("split = {split:.3}\n{kept}")).is_ok() {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
 }
@@ -328,6 +352,14 @@ pub fn save_split(split: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_settings_read_by_name() {
+        let text = "split = 0.400\nread_dwell_ms = 750\n# split = 9\n";
+        assert_eq!(ui_value(text, "split"), Some("0.400"));
+        assert_eq!(ui_value(text, "read_dwell_ms"), Some("750"));
+        assert_eq!(ui_value(text, "split_ms"), None);
+    }
 
     #[test]
     fn missing_home_does_not_put_mail_in_tmp() {

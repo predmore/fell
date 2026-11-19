@@ -613,7 +613,7 @@ impl crate::Store {
         if action.kind == "draft" {
             undo_draft(&tx, account_id, action.id)?;
         } else {
-            undo_messages(&tx, account_id, action.id)?;
+            undo_messages(&tx, account_id, &action)?;
         }
         tx.execute(
             "UPDATE agent_actions SET undone = 1 WHERE id = ?1",
@@ -686,6 +686,17 @@ impl crate::Store {
                     account_id.as_str(),
                     new.message_id,
                 ],
+            )?;
+        }
+        // Sync keeps a read state an agent set until the server agrees, and
+        // a star until write-back sends it (sync does not read stars yet).
+        for (old, new) in &writes {
+            crate::store::intents::record(
+                &tx,
+                account_id,
+                &new.message_id,
+                (old.unread != new.unread).then_some(new.unread != 0),
+                (old.starred != new.starred).then_some(new.starred != 0),
             )?;
         }
         tx.commit()?;
@@ -1014,47 +1025,79 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewDraft> {
     })
 }
 
-fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT message_id, labels, folders, unread, archived, snooze_until, starred
-         FROM agent_action_messages WHERE action_id = ?1 ORDER BY rowid ASC",
+fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAction) -> Result<()> {
+    // The snapshot holds all fields, but undo owns only the fields this
+    // action changed. A user or sync may have edited the others since.
+    let (restore, flags) = match action.kind.as_str() {
+        "label" | "unlabel" => ("labels = s.labels", None),
+        "archive" | "move" => ("folders = s.folders, archived = s.archived", None),
+        "snooze" | "unsnooze" => ("snooze_until = s.snooze_until", None),
+        "mark_read" | "mark_unread" => ("unread = s.unread", Some(FlagUndo::Unread)),
+        // Messages logged before the starred column may have no star to restore.
+        "star" | "unstar" => (
+            "starred = COALESCE(s.starred, m.starred)",
+            Some(FlagUndo::Star),
+        ),
+        _ => return Err(Error::Action(format!("unknown action {}", action.kind))),
+    };
+    let flag_states = match flags {
+        Some(flag) => flag_changes(conn, account_id, action.id, flag)?,
+        None => Vec::new(),
+    };
+    conn.execute(
+        &format!(
+            "UPDATE messages AS m SET {restore}
+             FROM agent_action_messages AS s
+             WHERE s.action_id = ?1 AND m.account_id = ?2 AND m.message_id = s.message_id"
+        ),
+        params![action.id, account_id.as_str()],
     )?;
-    let rows = stmt.query_map(params![action_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-            row.get::<_, Option<i64>>(6)?,
-        ))
-    })?;
-    let mut saved = Vec::new();
-    for row in rows {
-        saved.push(row?);
-    }
-    drop(stmt);
-    for (message_id, labels, folders, unread, archived, snooze_until, starred) in saved {
-        // A row logged before stars were recorded has no star to restore.
-        conn.execute(
-            "UPDATE messages
-             SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
-                 starred = COALESCE(?6, starred)
-             WHERE account_id = ?7 AND message_id = ?8",
-            params![
-                labels,
-                folders,
-                unread,
-                archived,
-                snooze_until,
-                starred,
-                account_id.as_str(),
-                message_id,
-            ],
-        )?;
+    for (message_id, unread, starred) in flag_states {
+        crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
     }
     Ok(())
+}
+
+/// Messages whose read state or star undo of `action_id` changes, as
+/// `(id, unread, starred)`; `None` where that flag stays as it is. A row
+/// logged before stars were recorded restores no star.
+type FlagRestore = (String, Option<bool>, Option<bool>);
+
+enum FlagUndo {
+    Unread,
+    Star,
+}
+
+fn flag_changes(
+    conn: &Connection,
+    account_id: &AccountId,
+    action_id: i64,
+    flag: FlagUndo,
+) -> Result<Vec<FlagRestore>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.message_id,
+                CASE WHEN ?3 AND m.unread != s.unread THEN s.unread END,
+                CASE WHEN NOT ?3 AND m.starred != s.starred
+                     THEN s.starred END
+         FROM agent_action_messages s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
+         WHERE s.action_id = ?1",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            action_id,
+            account_id.as_str(),
+            matches!(flag, FlagUndo::Unread)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?.map(|unread| unread != 0),
+                row.get::<_, Option<i64>>(2)?.map(|starred| starred != 0),
+            ))
+        },
+    )?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
 fn undo_draft(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
@@ -1546,6 +1589,33 @@ mod tests {
         let messages = only_message(&store, &account_id, &thread_id);
         assert!(messages.iter().all(|message| message.starred));
         assert!(messages[0].unread);
+    }
+
+    #[test]
+    fn agent_undo_star_preserves_the_users_read_action() {
+        let (store, account_id, thread_id) = seeded();
+        store
+            .star_thread(&account_id, &thread_id, true, "agent:bot")
+            .unwrap()
+            .unwrap();
+        store
+            .flag_threads(
+                &account_id,
+                std::slice::from_ref(&thread_id),
+                "INBOX",
+                crate::FlagChange::Read,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.undo_actor(&account_id, "agent:bot").unwrap().kind,
+            "star"
+        );
+        assert!(
+            only_message(&store, &account_id, &thread_id)
+                .iter()
+                .all(|message| !message.unread && !message.starred)
+        );
     }
 
     #[test]

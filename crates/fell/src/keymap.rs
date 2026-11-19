@@ -1,8 +1,8 @@
 //! Leader chords, which-key, and the command palette index.
 //!
-//! `m` moves the thread out of the current folder. `e` archives it, `#`
-//! deletes it to Trash, and `!` marks it as spam (or, in Spam, not spam).
-//! `u` undoes any of them.
+//! Use `m` to move, `e` to archive, `#` to move to Trash, and `!` for
+//! spam or not spam. `U` toggles unread and `s` toggles star. `u` undoes
+//! the latest reversible action.
 
 use std::fmt::Write as _;
 
@@ -41,6 +41,8 @@ pub enum Action {
     FolderPicker,
     Move,
     Archive,
+    ToggleUnread,
+    ToggleStar,
     Delete,
     Spam,
     Undo,
@@ -75,6 +77,8 @@ impl Action {
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
+            Self::ToggleUnread => "Mark unread or read",
+            Self::ToggleStar => "Star or unstar",
             Self::Delete => "Delete",
             Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
@@ -94,7 +98,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 29] = [
+const ALL_ACTIONS: [Action; 31] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -113,6 +117,8 @@ const ALL_ACTIONS: [Action; 29] = [
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
+    Action::ToggleUnread,
+    Action::ToggleStar,
     Action::Delete,
     Action::Spam,
     Action::Undo,
@@ -211,6 +217,8 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('f')], Action::Forward, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
+    bind(&[KeyId::Char('U')], Action::ToggleUnread, None);
+    bind(&[KeyId::Char('s')], Action::ToggleStar, None);
     bind(&[KeyId::Char('#')], Action::Delete, None);
     bind(&[KeyId::Char('!')], Action::Spam, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);

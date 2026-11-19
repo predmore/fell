@@ -471,7 +471,7 @@ fn a_body_too_large_to_keep_is_marked_and_not_asked_for_again() {
 }
 
 #[test]
-fn a_header_row_still_waiting_for_its_body_reads_as_pending() {
+fn a_pending_row_can_be_marked_read_before_its_body_arrives() {
     let _sizes = set_windows(SMALL);
     let server = TestServer::spawn(state_with(vec![folder("INBOX", "", 3, "In", 30)]));
     let backend = backend_for(&server);
@@ -488,6 +488,17 @@ fn a_header_row_still_waiting_for_its_body_reads_as_pending() {
             .unwrap(),
         vec![crate::BodyState::Pending]
     );
+    let pending = stored(&store, &acct, "In30@x").unwrap();
+    assert!(pending.unread);
+    store
+        .flag_threads(
+            &acct.id,
+            &[pending.thread_id],
+            "INBOX",
+            crate::FlagChange::Read,
+        )
+        .unwrap()
+        .unwrap();
     sync_once(&acct, &backend, &store).unwrap();
     assert_eq!(
         store
@@ -495,6 +506,7 @@ fn a_header_row_still_waiting_for_its_body_reads_as_pending() {
             .unwrap(),
         vec![crate::BodyState::Stored]
     );
+    assert!(!stored(&store, &acct, "In30@x").unwrap().unread);
 }
 
 #[test]

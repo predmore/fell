@@ -162,6 +162,10 @@ pub struct InboxMotion {
     /// to the new fit when typing changes how many there are.
     card_to: Option<f32>,
     card_glide: Option<Glide>,
+    /// The header's unread count as the last frame drew it, and its folder.
+    last_unread: Option<(String, usize)>,
+    /// The count it replaced in the same folder, fading out under the new one.
+    unread_out: Option<(usize, Transition)>,
 }
 
 /// Scroll offsets a settle jumped to, for the view to apply.
@@ -209,6 +213,8 @@ impl InboxMotion {
             conv_from: None,
             card_to: None,
             card_glide: None,
+            last_unread: None,
+            unread_out: None,
         }
     }
 
@@ -343,6 +349,17 @@ impl InboxMotion {
         }
         self.last_panes = panes;
 
+        // The unread count cross-fades when a thread turns read or unread.
+        // A new folder's count is another number, not this one changing.
+        let unread = (session.folder.clone(), session.unread_threads());
+        if let Some((folder, old)) = &self.last_unread
+            && *folder == unread.0
+            && *old != unread.1
+        {
+            self.unread_out = start(motion::FADE).map(|fade| (*old, fade));
+        }
+        self.last_unread = Some(unread);
+
         if session.cursor_id != self.last_selected {
             // The new row is highlighted at once; only the old one fades.
             self.selection_out = self
@@ -432,6 +449,7 @@ impl InboxMotion {
         self.arrival_pending = false;
         self.bodies_in = None;
         self.bodies_pending = false;
+        self.unread_out = None;
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -496,6 +514,7 @@ impl InboxMotion {
         }
         running |= self.card_glide.is_some();
         running |= keep_with(&mut self.selection_out, now);
+        running |= keep_with(&mut self.unread_out, now);
         if self.pane.is_some_and(|(t, _)| !t.running(now)) {
             self.pane = None;
         }
@@ -535,6 +554,14 @@ impl InboxMotion {
         self.list
             .as_ref()
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
+    }
+
+    /// The header's unread count being replaced: the old count and how far
+    /// the new one has faded in over it.
+    pub fn unread_count(&self, now: Instant) -> Option<(usize, f32)> {
+        self.unread_out
+            .as_ref()
+            .map(|(old, fade)| (*old, fade.progress(now)))
     }
 
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
@@ -722,6 +749,42 @@ mod tests {
         still.bodies_filled(vec!["b".into()]);
         still.observe(&session, (true, true), now);
         assert_eq!(still.body_opacity("b", now), 1.0);
+    }
+
+    #[test]
+    fn the_unread_count_cross_fades_and_a_key_settles_it() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.unread_count = 3;
+        let now = Instant::now();
+        motion.observe(&session, (true, true), now);
+        assert_eq!(motion.unread_count(now), None);
+        // Opened a thread: 3 → 2 in the same folder.
+        session.unread_count = 2;
+        motion.observe(&session, (true, true), now);
+        assert_eq!(motion.unread_count(now), Some((3, 0.0)));
+        let (old, mid) = motion.unread_count(later(now, 60)).unwrap();
+        assert_eq!(old, 3);
+        assert!(mid > 0.5 && mid < 1.0, "{mid}");
+        assert!(!motion.tick(later(now, 120)));
+        assert_eq!(motion.unread_count(later(now, 120)), None);
+        // A key mid-fade shows the new count alone.
+        session.unread_count = 1;
+        motion.observe(&session, (true, true), later(now, 200));
+        assert!(motion.unread_count(later(now, 210)).is_some());
+        motion.settle(later(now, 210));
+        assert_eq!(motion.unread_count(later(now, 210)), None);
+        // Another folder's count does not fade from this one.
+        session.folder = "Archive".into();
+        session.unread_count = 7;
+        motion.observe(&session, (true, true), later(now, 300));
+        assert_eq!(motion.unread_count(later(now, 300)), None);
+        // Nor with motion reduced.
+        let mut reduced = InboxMotion::new(Motion::new(false));
+        reduced.observe(&session, (true, true), now);
+        session.unread_count = 6;
+        reduced.observe(&session, (true, true), now);
+        assert_eq!(reduced.unread_count(now), None);
     }
 
     #[test]

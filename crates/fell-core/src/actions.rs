@@ -39,6 +39,9 @@ use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
+mod flags;
+pub use flags::FlagChange;
+
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
 
@@ -163,6 +166,10 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    Read,
+    Unread,
+    Star,
+    Unstar,
     /// Moved into the account's Junk folder.
     Spam,
     /// Moved out of Junk back to the inbox.
@@ -178,6 +185,10 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::Read => "read",
+            Self::Unread => "unread",
+            Self::Star => "star",
+            Self::Unstar => "unstar",
             Self::Spam => "spam",
             Self::NotSpam => "not_spam",
             Self::Purge => "purge",
@@ -190,11 +201,20 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "read" => Ok(Self::Read),
+            "unread" => Ok(Self::Unread),
+            "star" => Ok(Self::Star),
+            "unstar" => Ok(Self::Unstar),
             "spam" => Ok(Self::Spam),
             "not_spam" => Ok(Self::NotSpam),
             "purge" => Ok(Self::Purge),
             _ => Err(Error::Action(format!("unknown action {raw}"))),
         }
+    }
+
+    /// Read, unread, or star: the thread stays in its folder.
+    pub fn is_flag(self) -> bool {
+        matches!(self, Self::Read | Self::Unread | Self::Star | Self::Unstar)
     }
 }
 
@@ -474,9 +494,12 @@ impl Store {
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        let rows = load_snapshots(&tx, action.id)?;
-        for row in &rows {
-            restore_row(&tx, account_id, row)?;
+        if action.kind.is_flag() {
+            flags::undo(&tx, account_id, &action)?;
+        } else {
+            for row in &load_snapshots(&tx, action.id)? {
+                restore_row(&tx, account_id, row)?;
+            }
         }
         crate::outbox::undo_action(&tx, account_id, action.id)?;
         tx.execute(
@@ -635,6 +658,7 @@ impl Store {
 
 fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
+    conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
     if !crate::store::bodies::has_column(conn, "local_action_bodies", "parts_listed")? {
         conn.execute_batch(
@@ -751,6 +775,7 @@ fn finish_purge(conn: &Connection, id: i64, account_id: &AccountId) -> Result<()
         "local_action_bodies",
         "local_action_parts",
         "local_action_aliases",
+        "local_action_flags",
     ] {
         let by_canonical = if table == "local_action_aliases" {
             format!("OR canonical_message_id IN ({purged_ids})")
@@ -804,7 +829,10 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
         .query_row(
             "SELECT id, kind, summary FROM local_actions a
              WHERE account_id = ?1 AND undone = 0 AND kind != 'purge'
-               AND EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
+               AND (
+                   EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
+                   OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+               )
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),

@@ -1,0 +1,196 @@
+//! Read and star changes made in Fell that the server has not seen yet.
+//!
+//! Fell keeps a read state the reader (or an agent) set until the server
+//! reports the same value. Until then a sync pass that still reports the old
+//! one does not write it over the local change. One row can stand for several
+//! server copies (INBOX and Sent, an alias merged by fingerprint), so the
+//! intent is dropped only once every copy recorded for the row has reported
+//! the new value since it was set. After that, later server changes win again.
+//!
+//! Stars are recorded too, so write-back (#104) can send them, but sync does
+//! not read `\Flagged` yet (#102): it never compares or clears a star intent,
+//! and a star change stays pending until write-back or #102 settles it.
+
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::Result;
+use crate::account::AccountId;
+
+pub(super) const INTENT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS local_flag_intents (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    -- NULL: no pending change to that flag.
+    unread INTEGER,
+    starred INTEGER,
+    PRIMARY KEY (account_id, message_id)
+);
+
+-- Server copies (by remote id) that have reported the pending read state
+-- since it was set.
+CREATE TABLE IF NOT EXISTS local_flag_intent_copies (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    remote_id TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id, remote_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS local_flag_intents_gone AFTER DELETE ON messages BEGIN
+    DELETE FROM local_flag_intents
+    WHERE account_id = old.account_id AND message_id = old.message_id;
+    DELETE FROM local_flag_intent_copies
+    WHERE account_id = old.account_id AND message_id = old.message_id;
+END;
+"#;
+
+/// Remember that Fell set these flags on `message_id`. `None` leaves that
+/// flag's intent as it was. A new read state starts over: no copy has
+/// reported it yet.
+pub(crate) fn record(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    unread: Option<bool>,
+    starred: Option<bool>,
+) -> Result<()> {
+    if unread.is_none() && starred.is_none() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO local_flag_intents (account_id, message_id, unread, starred)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+            unread = COALESCE(excluded.unread, unread),
+            starred = COALESCE(excluded.starred, starred)",
+        params![
+            account_id.as_str(),
+            message_id,
+            unread.map(i64::from),
+            starred.map(i64::from),
+        ],
+    )?;
+    if unread.is_some() {
+        conn.execute(
+            "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The unread value the server copy `remote_id` may write to `message_id`:
+/// the server's, unless Fell changed it and some copy has not caught up.
+///
+/// A copy that reports the pending value is noted. The intent is dropped
+/// once every copy recorded for the row (and this one) has reported it; a
+/// copy that still disagrees, or has not been seen since, keeps it.
+pub(crate) fn server_unread(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    remote_id: &str,
+    server: bool,
+) -> Result<bool> {
+    let pending: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT unread FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(local) = pending.flatten().map(|value| value != 0) else {
+        return Ok(server);
+    };
+    if local != server {
+        conn.execute(
+            "DELETE FROM local_flag_intent_copies
+             WHERE account_id = ?1 AND message_id = ?2 AND remote_id = ?3",
+            params![account_id.as_str(), message_id, remote_id],
+        )?;
+        return Ok(local);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO local_flag_intent_copies (account_id, message_id, remote_id)
+         VALUES (?1, ?2, ?3)",
+        params![account_id.as_str(), message_id, remote_id],
+    )?;
+    let waiting: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM message_copies c
+         WHERE c.account_id = ?1 AND c.message_id = ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM local_flag_intent_copies a
+               WHERE a.account_id = c.account_id AND a.message_id = c.message_id
+                 AND a.remote_id = 'imap:' || c.uidvalidity || ':' || c.uid || ':' || c.mailbox
+           )",
+        params![account_id.as_str(), message_id],
+        |row| row.get(0),
+    )?;
+    if waiting == 0 {
+        settle_unread(conn, account_id, message_id)?;
+    }
+    Ok(server)
+}
+
+/// Every copy agrees: the read state is the server's again.
+fn settle_unread(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE local_flag_intents SET unread = NULL WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    conn.execute(
+        "DELETE FROM local_flag_intents
+         WHERE account_id = ?1 AND message_id = ?2 AND unread IS NULL AND starred IS NULL",
+        params![account_id.as_str(), message_id],
+    )?;
+    conn.execute(
+        "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    Ok(())
+}
+
+/// The star Fell set on `message_id`, if one is pending. Sync does not read
+/// `\Flagged` yet (#102), so a server copy's star says nothing about whether
+/// the server saw the change: the pending value wins and is never cleared
+/// here. Write-back (#104) clears it once it has sent it.
+pub(crate) fn local_star(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Option<bool>> {
+    let pending: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT starred FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(pending.flatten().map(|value| value != 0))
+}
+
+/// A read or star change made in Fell that the server has not reported back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFlags {
+    pub message_id: String,
+    /// `None`: read state is the server's.
+    pub unread: Option<bool>,
+    /// `None`: the star is the server's. Sync does not read stars yet
+    /// (#102), so a star set in Fell stays here until write-back sends it.
+    pub starred: Option<bool>,
+}
+
+/// Every pending change on the account, by Message-ID.
+pub(crate) fn pending(conn: &Connection, account_id: &AccountId) -> Result<Vec<PendingFlags>> {
+    let mut stmt = conn.prepare(
+        "SELECT message_id, unread, starred FROM local_flag_intents
+         WHERE account_id = ?1 ORDER BY message_id",
+    )?;
+    let rows = stmt.query_map(params![account_id.as_str()], |row| {
+        Ok(PendingFlags {
+            message_id: row.get(0)?,
+            unread: row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
+            starred: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
