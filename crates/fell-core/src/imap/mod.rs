@@ -838,9 +838,12 @@ fn walk_down(
     let stored_above = copies.stored(floor, u32::MAX)?.len() as u32;
     let mut below = total.saturating_sub(stored_above);
     let mut read = 0u32;
-    let progress = |below: u32| SyncProgress {
+    // A window that only has its headers is visible, but its bodies are
+    // still pending. Keep missing bodies pending for the rest of the visit.
+    let mut pending_bodies = 0u32;
+    let progress = |below: u32, pending: u32| SyncProgress {
         folder: folder.to_string(),
-        done: total.saturating_sub(below),
+        done: total.saturating_sub(below.saturating_add(pending)),
         total,
     };
     while floor > 1 {
@@ -948,6 +951,8 @@ fn walk_down(
         }
         below = below.saturating_sub(in_window);
         read = read.saturating_add(in_window);
+        let requested = wanted.len() as u32;
+        pending_bodies = pending_bodies.saturating_add(requested);
         // Rows first, so the list shows the window before its bodies.
         let mut rows_left = headers.into_iter();
         loop {
@@ -962,13 +967,14 @@ fn walk_down(
                 chunk,
                 std::mem::take(&mut flags),
                 Vec::new(),
-                Some(progress(below)),
+                Some(progress(below, pending_bodies)),
             )?;
         }
         // A copy whose message another folder already gave a body to
         // needs no second download.
         let filled = copies.stored(low, high)?;
         wanted.retain(|(uid, _)| filled.binary_search(uid).is_err());
+        pending_bodies -= requested - wanted.len() as u32;
         let mut chunks: Vec<&[(u32, u32)]> = Vec::new();
         let mut start = 0;
         while start < wanted.len() {
@@ -1003,7 +1009,9 @@ fn walk_down(
                     if uids.binary_search(&item.uid).is_err() || item.body_missing {
                         return Ok(());
                     }
-                    answered.insert(item.uid);
+                    if !answered.insert(item.uid) {
+                        return Ok(());
+                    }
                     if item.skipped
                         && let Some(id) = header_ids.get(&item.uid)
                     {
@@ -1032,7 +1040,10 @@ fn walk_down(
                             std::mem::take(&mut batch),
                             Vec::new(),
                             Vec::new(),
-                            Some(progress(below)),
+                            Some(progress(
+                                below,
+                                pending_bodies - answered.len() as u32 + too_large.len() as u32,
+                            )),
                         )?;
                     }
                     Ok(())
@@ -1053,6 +1064,7 @@ fn walk_down(
                 floor = if index + 1 == count { low } else { uids[0] };
                 checkpoint.floor = Some(floor);
             }
+            pending_bodies -= answered.len() as u32;
             emit_walk(
                 persist,
                 pass,
@@ -1060,7 +1072,7 @@ fn walk_down(
                 batch,
                 Vec::new(),
                 too_large,
-                Some(progress(below)),
+                Some(progress(below, pending_bodies)),
             )?;
             if !finished {
                 pass.complete = false;
@@ -1078,7 +1090,7 @@ fn walk_down(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Some(progress(below)),
+                Some(progress(below, pending_bodies)),
             )?;
         }
         pass.done.insert(mailbox.raw.clone(), checkpoint.clone());

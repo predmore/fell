@@ -155,7 +155,7 @@ fn a_first_sync_shows_the_newest_inbox_rows_before_any_body() {
         first.progress,
         Some(SyncProgress {
             folder: "Inbox".into(),
-            done: 10,
+            done: 0,
             total: 200,
         })
     );
@@ -356,12 +356,19 @@ fn progress_reaches_the_report_while_a_first_sync_runs() {
         first,
         SyncProgress {
             folder: "Inbox".into(),
-            done: 10,
+            done: 0,
             total: 80,
         }
     );
-    // Rows from headers do not count as stored until their bodies come.
+    // Rows from headers do not count as complete until their bodies come.
     assert_eq!(reports[0].upserted, 0);
+    assert!(reports.iter().any(|report| {
+        report.upserted == 10
+            && report
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.done == 10)
+    }));
 }
 
 #[test]
