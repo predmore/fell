@@ -383,7 +383,7 @@ impl Store {
             return Err(Error::Action("nothing to undo".into()));
         };
         if action.kind.is_flag() {
-            flags::undo(&tx, account_id, action.id)?;
+            flags::undo(&tx, account_id, &action)?;
         } else {
             let rows = load_snapshots(&tx, action.id)?;
             if rows.is_empty() {

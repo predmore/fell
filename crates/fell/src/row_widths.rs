@@ -262,6 +262,10 @@ impl RowWidths {
             // Eases from where it is drawn, or lands at once with motion
             // reduced.
             let drawn = kept.frame(now).subject_w;
+            if let Some((_, bold, _)) = &mut kept.unread_transition {
+                // Let the accent finish while the weight fits the new box.
+                *bold = kept.unread;
+            }
             kept.slide = motion.start(RELAX, now).map(|relax| (drawn, relax));
             kept.width = kept.natural;
         }
@@ -469,6 +473,21 @@ mod tests {
             narrow
         );
         assert!(!widths.running(at(key, 200)));
+    }
+
+    #[test]
+    fn relaxing_during_an_unread_fade_uses_the_weight_that_fits() {
+        let mut widths = RowWidths::default();
+        let t0 = Instant::now();
+        let before = draw(&mut widths, "t1", true, t0);
+        let started = at(t0, 16);
+        assert!(draw(&mut widths, "t1", false, started).bold);
+        widths.relax();
+        let pointer_move = draw(&mut widths, "t1", false, at(started, 30));
+        assert!(!pointer_move.bold);
+        assert_eq!(pointer_move.subject_w, before.subject_w);
+        assert!(pointer_move.subject_room < pointer_move.subject_w);
+        assert!(pointer_move.unread > 0.0);
     }
 
     #[test]

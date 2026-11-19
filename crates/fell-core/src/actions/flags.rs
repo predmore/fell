@@ -33,8 +33,8 @@ pub enum FlagChange {
     /// The thread's latest message in the folder on screen is unread, so
     /// the row shows unread there and reopening expands only that message.
     Unread,
-    /// The latest message in the folder on screen is starred, unless some
-    /// message already is.
+    /// The latest message in the folder on screen is starred, unless a
+    /// message in that folder already is.
     Star,
     /// No message in the thread is starred.
     Unstar,
@@ -144,16 +144,18 @@ impl Store {
 /// The messages to change in one thread, oldest first, with their new
 /// read and star values.
 fn plan(rows: Vec<Row>, folder: &str, change: FlagChange, out: &mut Vec<(Row, bool, bool)>) {
-    let latest_here = rows
+    let latest_in_folder = rows.iter().rposition(|row| in_folder(row, folder));
+    let latest_here = latest_in_folder.or(rows.len().checked_sub(1));
+    let already_starred = rows
         .iter()
-        .rposition(|row| in_folder(row, folder))
-        .or(rows.len().checked_sub(1));
-    let any_starred = rows.iter().any(|row| row.starred);
+        .any(|row| row.starred && (latest_in_folder.is_none() || in_folder(row, folder)));
     for (index, row) in rows.into_iter().enumerate() {
         let (unread, starred) = match change {
             FlagChange::Read => (false, row.starred),
             FlagChange::Unread if Some(index) == latest_here => (true, row.starred),
-            FlagChange::Star if Some(index) == latest_here && !any_starred => (row.unread, true),
+            FlagChange::Star if Some(index) == latest_here && !already_starred => {
+                (row.unread, true)
+            }
             FlagChange::Unstar => (row.unread, false),
             _ => (row.unread, row.starred),
         };
@@ -214,15 +216,15 @@ fn set_flags(
     Ok(())
 }
 
-/// Put back the read and star state `action_id` saved. The restored values
-/// are the reader's intent now, so sync does not undo the undo.
-pub(super) fn undo(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {
+/// Restore the flag the action changed, alongside its local intent. The
+/// other flag may have changed independently since the action was recorded.
+pub(super) fn undo(conn: &Connection, account_id: &AccountId, action: &LocalAction) -> Result<()> {
     let saved: Vec<(String, bool, bool)> = {
         let mut stmt = conn.prepare(
             "SELECT message_id, unread, starred FROM local_action_flags
              WHERE action_id = ?1 ORDER BY rowid ASC",
         )?;
-        stmt.query_map(params![action_id], |row| {
+        stmt.query_map(params![action.id], |row| {
             Ok((
                 row.get(0)?,
                 row.get::<_, i64>(1)? != 0,
@@ -234,6 +236,7 @@ pub(super) fn undo(conn: &Connection, account_id: &AccountId, action_id: i64) ->
     if saved.is_empty() {
         return Err(Error::Action("action has no messages".into()));
     }
+    let restore_unread = matches!(action.kind, ActionKind::Read | ActionKind::Unread);
     for (message_id, unread, starred) in &saved {
         let now: Option<(bool, bool)> = conn
             .query_row(
@@ -246,18 +249,23 @@ pub(super) fn undo(conn: &Connection, account_id: &AccountId, action_id: i64) ->
         let Some((now_unread, now_starred)) = now else {
             continue;
         };
-        set_flags(conn, account_id, message_id, *unread, *starred)?;
+        let (unread, starred) = if restore_unread {
+            (*unread, now_starred)
+        } else {
+            (now_unread, *starred)
+        };
+        set_flags(conn, account_id, message_id, unread, starred)?;
         intents::record(
             conn,
             account_id,
             message_id,
-            (now_unread != *unread).then_some(*unread),
-            (now_starred != *starred).then_some(*starred),
+            (now_unread != unread).then_some(unread),
+            (now_starred != starred).then_some(starred),
         )?;
     }
     conn.execute(
         "DELETE FROM local_action_flags WHERE action_id = ?1",
-        params![action_id],
+        params![action.id],
     )?;
     Ok(())
 }
@@ -486,6 +494,50 @@ mod tests {
         assert!(flags(&store, &account, &thread)[1].1);
         assert_eq!(store.undo(&account).unwrap().kind, ActionKind::Star);
         assert!(flags(&store, &account, &thread).iter().all(|f| !f.1));
+    }
+
+    #[test]
+    fn an_existing_star_in_sent_does_not_block_starring_inbox() {
+        let (store, account) = store();
+        let thread = conversation(&store, "a@x");
+        for folder in ["Sent", "INBOX"] {
+            assert!(
+                store
+                    .flag_threads(
+                        &account,
+                        std::slice::from_ref(&thread),
+                        folder,
+                        FlagChange::Star,
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            flags(&store, &account, &thread),
+            vec![(true, false), (true, true), (false, true)]
+        );
+    }
+
+    #[test]
+    fn undo_star_preserves_a_read_change_from_sync() {
+        let (store, account) = store();
+        let thread = conversation(&store, "a@x");
+        store
+            .flag_threads(
+                &account,
+                std::slice::from_ref(&thread),
+                "INBOX",
+                FlagChange::Star,
+            )
+            .unwrap();
+        store
+            .apply_delta(&account, &flag_delta("a@x-reply", false))
+            .unwrap();
+        assert_eq!(flags(&store, &account, &thread)[1], (false, true));
+
+        assert_eq!(store.undo(&account).unwrap().kind, ActionKind::Star);
+        assert_eq!(flags(&store, &account, &thread)[1], (false, false));
     }
 
     #[test]

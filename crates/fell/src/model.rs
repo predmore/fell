@@ -1216,8 +1216,12 @@ impl Session {
     }
 
     pub fn on_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        self.apply_input(|session| session.handle_key(key, page_rows))
+    }
+
+    fn apply_input(&mut self, apply: impl FnOnce(&mut Self) -> Step) -> Step {
         let before = (self.pane, self.cursor_id.clone(), self.folder.clone());
-        let mut step = self.handle_key(key, page_rows);
+        let mut step = apply(self);
         if before != (self.pane, self.cursor_id.clone(), self.folder.clone()) {
             self.cancel_read_delay();
         }
@@ -1227,10 +1231,9 @@ impl Session {
         step
     }
 
-    /// A read delay still running belongs to a thread that is no longer the
-    /// one open; it must not mark anything.
+    /// Invalidate the read delay after navigation or an explicit read edit.
     pub fn cancel_read_delay(&mut self) {
-        self.read_gen += 1;
+        self.read_gen = self.read_gen.wrapping_add(1);
     }
 
     fn handle_key(&mut self, key: KeyId, page_rows: usize) -> Step {
@@ -1456,7 +1459,7 @@ impl Session {
     }
 
     pub fn perform(&mut self, action: Action, page_rows: usize) -> Step {
-        self.run(action, page_rows)
+        self.apply_input(|session| session.run(action, page_rows))
     }
 
     fn run(&mut self, action: Action, page_rows: usize) -> Step {
@@ -1562,6 +1565,7 @@ impl Session {
             }
             Action::Undo => {
                 self.count.clear();
+                self.cancel_read_delay();
                 return Step {
                     undo: true,
                     ..Step::default()
@@ -1746,6 +1750,9 @@ impl Session {
         // change itself. Say it only when the reader cannot see it there.
         let toast = count > 1 || !self.flag_targets_in_view(&ids);
         let flags = self.mark_rows(ids, change);
+        if !star {
+            self.cancel_read_delay();
+        }
         if toast {
             // A selection counts the rows that changed, not the ones that
             // already had it.
@@ -2349,6 +2356,39 @@ mod tests {
         session.on_key(KeyId::Char('g'), 10);
         session.on_key(KeyId::Char('s'), 10);
         assert_eq!(session.read_after_dwell("a", generation), None);
+    }
+
+    #[test]
+    fn explicit_read_edits_cancel_the_dwell_of_an_open_conversation() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.cursor_id = Some("a".into());
+        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        session.on_key(KeyId::Char('U'), 10);
+        session.on_key(KeyId::Char('U'), 10);
+        assert_eq!(session.read_after_dwell("a", generation), None);
+        assert!(session.threads[0].unread);
+
+        session.on_key(KeyId::Escape, 10);
+        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        assert!(session.on_key(KeyId::Char('u'), 10).undo);
+        assert_eq!(session.read_after_dwell("a", generation), None);
+    }
+
+    #[test]
+    fn opening_from_the_palette_stamps_the_read_delay() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.cursor_id = Some("a".into());
+        session.cancel_read_delay();
+        let (id, generation) = session.perform(Action::Open, 10).read_after.unwrap();
+        assert_ne!(generation, 0);
+        assert_eq!(
+            session.read_after_dwell(&id, generation).unwrap().change,
+            FlagChange::Read
+        );
     }
 
     #[test]
