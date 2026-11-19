@@ -419,10 +419,18 @@ fn handle(
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let count = mailbox.messages.len() as u32;
+                let uid_range = strip_prefix_ignore(&range, "UID ");
+                let upper = match uid_range {
+                    Some(_) => mailbox.messages.last().map_or(0, |message| message.uid),
+                    None => mailbox.messages.len() as u32,
+                };
                 let mut line = String::from("* SEARCH");
                 for (index, message) in mailbox.messages.iter().enumerate() {
-                    if uid_in_range(index as u32 + 1, &range, count) {
+                    let (number, range) = match uid_range {
+                        Some(range) => (message.uid, range),
+                        None => (index as u32 + 1, range.as_str()),
+                    };
+                    if uid_in_range(number, range, upper) {
                         line.push_str(&format!(" {}", message.uid));
                     }
                 }

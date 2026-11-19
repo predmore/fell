@@ -787,9 +787,9 @@ struct Walking<'a> {
 enum Walked {
     /// It read as far as the visit allowed; older mail is left.
     Paused,
-    /// It reached the oldest message.
+    /// It reached the oldest message and finalized the mailbox.
     Finished,
-    /// The server refused a fetch. The next pass picks up from here.
+    /// The server did not finish a window or the final flag sweep.
     Stopped,
 }
 
@@ -892,8 +892,23 @@ fn walk_down(
             pass.complete = false;
             return Ok(Walked::Stopped);
         }
-        rows.sort_by_key(|row| std::cmp::Reverse(row.uid));
+        rows.sort_by_key(|row| row.uid);
         rows.dedup_by_key(|row| row.uid);
+        // A tagged OK can end a short FETCH. SEARCH lists the UIDs that
+        // actually exist in the range, including across gaps in the UID space.
+        // Search after the fetch so an expunged UID does not hold up the walk.
+        let listed = match session.uid_search_range(low, high) {
+            Ok(listed) => listed,
+            Err(err) if untagged_overflow(&err) => None,
+            Err(err) => return Err(err),
+        };
+        if !listed.is_some_and(|uids| {
+            uids.iter()
+                .all(|uid| rows.binary_search_by_key(uid, |row| row.uid).is_ok())
+        }) {
+            pass.complete = false;
+            return Ok(Walked::Stopped);
+        }
         let in_window = rows.len() as u32;
         let stored = copies.stored(low, high)?;
         let mut flags = Vec::new();
@@ -903,7 +918,7 @@ fn walk_down(
         let mut header_ids: HashMap<u32, crate::MessageId> = HashMap::new();
         // Newest first, with RFC822.SIZE.
         let mut wanted: Vec<(u32, u32)> = Vec::new();
-        for row in rows {
+        for row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
                 flags.push(flag_update(
                     checkpoint.uidvalidity,
@@ -1068,6 +1083,23 @@ fn walk_down(
         }
         pass.done.insert(mailbox.raw.clone(), checkpoint.clone());
     }
+    let seen = Seen {
+        uidvalidity: examined.uidvalidity,
+        uidnext: examined.uidnext,
+        exists: examined.exists,
+    };
+    // CONDSTORE can use the modseq from the start of the walk. Otherwise
+    // read every flag once more. Keep floor=1 on failure so the next pass
+    // retries this sweep without downloading the windows again.
+    let flags = if examined.highest_modseq.is_none() {
+        let Some(flags) = walk_flags(session, mailbox, seen, &escaped)? else {
+            pass.complete = false;
+            return Ok(Walked::Stopped);
+        };
+        flags
+    } else {
+        Vec::new()
+    };
     // The oldest message is read. Report the copies that left while the
     // walk ran, as the end of a full first pass would (with the checkpoint
     // the pass began from, so a UIDVALIDITY change or a walk resumed from
@@ -1077,36 +1109,10 @@ fn walk_down(
     let tracked = track_removals(
         session,
         mailbox,
-        Seen {
-            uidvalidity: examined.uidvalidity,
-            uidnext: examined.uidnext,
-            exists: examined.exists,
-        },
+        seen,
         pass.prior.get(&mailbox.raw),
         &FetchPlan::Full,
     )?;
-    // Flags of a window were read when it was, so a change on the server
-    // to mail read earlier in the walk would be lost. With CONDSTORE the
-    // modseq kept from where the walk began has the next pass ask for
-    // every flag changed since; without it, read them all once now.
-    let mut flags = Vec::new();
-    if examined.highest_modseq.is_none() {
-        match session.uid_flags("1:*") {
-            Ok(rows) => {
-                for (uid, flag_names) in rows {
-                    flags.push(flag_update(
-                        checkpoint.uidvalidity,
-                        uid,
-                        &escaped,
-                        &flag_names,
-                    ));
-                }
-            }
-            // Left for a later pass: the walk is done either way.
-            Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {}
-            Err(err) => return Err(err),
-        }
-    }
     checkpoint.floor = None;
     checkpoint.pruned = tracked.pruned;
     // Mail that came while the walk ran is above what this pass caught up
@@ -1122,6 +1128,38 @@ fn walk_down(
     )?;
     pass.done.insert(mailbox.raw.clone(), checkpoint);
     Ok(Walked::Finished)
+}
+
+/// Refresh flags in bounded UID sets. An incomplete reply leaves the sweep
+/// pending, and an expunge can change which messages the listing covers.
+fn walk_flags(
+    session: &mut session::Session,
+    mailbox: &session::Listed,
+    seen: Seen,
+    escaped: &str,
+) -> Result<Option<Vec<FlagUpdate>>, Error> {
+    let Some((uids, _)) = list_mailbox(session, mailbox, seen, false)? else {
+        return Ok(None);
+    };
+    let mut flags = Vec::with_capacity(uids.len());
+    for chunk in uids.chunks(UIDS_PER_FETCH) {
+        let mut rows = match session.uid_flags(&uid_set(chunk)) {
+            Ok(rows) => rows,
+            Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        rows.retain(|(uid, _)| chunk.binary_search(uid).is_ok());
+        rows.sort_by_key(|(uid, _)| *uid);
+        rows.dedup_by_key(|(uid, _)| *uid);
+        if rows.len() != chunk.len() {
+            return Ok(None);
+        }
+        flags.extend(
+            rows.into_iter()
+                .map(|(uid, names)| flag_update(seen.uidvalidity, uid, escaped, &names)),
+        );
+    }
+    Ok(Some(flags))
 }
 
 /// Persist rows, flags and the checkpoint of a mailbox being walked.

@@ -1163,12 +1163,13 @@ impl Inbox {
                         };
                         let follow = if let Some(changed) = filled {
                             // Bodies came in where the reader is: in place,
-                            // fading in. A reader who has not moved the
-                            // pane is shown the newest message's start once
-                            // it is laid out; one who scrolled stays put.
+                            // fading in. Reveal the newest message if the
+                            // conversation only became scrollable on this fill.
                             if !changed.is_empty() {
                                 let ids = changed.iter().map(|at| view[*at].id.clone()).collect();
-                                if inbox.conversation_untouched() {
+                                if present::conversation_fits(f32::from(
+                                    inbox.conv_scroll.max_offset().height,
+                                )) {
                                     inbox.reveal = Reveal::Laying;
                                 }
                                 inbox.session.fill_bodies(view);
@@ -1872,15 +1873,7 @@ impl Inbox {
     fn conversation_at_bottom(&self) -> bool {
         let max = f32::from(self.conv_scroll.max_offset().height);
         let offset = f32::from(self.conv_scroll.offset().y);
-        max <= 1.0 || offset <= -max + 24.0
-    }
-
-    /// The reader has not moved the conversation ([`present::conversation_untouched`]).
-    fn conversation_untouched(&self) -> bool {
-        present::conversation_untouched(
-            f32::from(self.conv_scroll.offset().y),
-            f32::from(self.conv_scroll.max_offset().height),
-        )
+        present::conversation_fits(max) || offset <= -max + 24.0
     }
 
     /// The frame after bodies were filled in laid them out: glide to the

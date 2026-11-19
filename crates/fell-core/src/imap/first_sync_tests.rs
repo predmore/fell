@@ -310,6 +310,32 @@ fn a_restart_resumes_below_the_windows_already_read() {
 }
 
 #[test]
+fn an_omitted_header_does_not_advance_the_floor_past_its_uid() {
+    let _sizes = set_windows(SMALL);
+    let mut inbox = folder("INBOX", "", 3, "In", 70);
+    inbox.messages.retain(|message| message.uid != 44);
+    inbox.messages[44].body_form = BodyForm::Omitted;
+    assert_eq!(inbox.messages[44].uid, 46);
+    let server = TestServer::spawn(state_with(vec![inbox]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let acct = account("a1", BackendKind::Imap);
+
+    sync_once(&acct, &backend, &store).unwrap();
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let checkpoints = decode_cursor(cursor.as_ref());
+    assert_eq!(checkpoints[0].1.floor, Some(61));
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 10);
+    server.state.lock().unwrap().mailboxes[0].messages[44].body_form = BodyForm::Literal;
+
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 69);
+    assert!(!stored(&store, &acct, "In46@x").unwrap().snippet.is_empty());
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    assert_eq!(decode_cursor(cursor.as_ref())[0].1.floor, None);
+}
+
+#[test]
 fn progress_reaches_the_report_while_a_first_sync_runs() {
     let _sizes = set_windows(SMALL);
     let server = TestServer::spawn(state_with(vec![folder("INBOX", "", 3, "In", 80)]));
@@ -562,6 +588,44 @@ fn without_condstore_a_flag_changed_during_the_walk_is_applied_at_its_end() {
     let newest = stored(&store, &acct, "In200@x").unwrap();
     assert!(!newest.unread, "the change made during the walk landed");
     assert!(stored(&store, &acct, "In199@x").unwrap().unread);
+}
+
+#[test]
+fn a_refused_final_flag_sweep_retries_in_pages_without_fetching_bodies() {
+    let _sizes = set_windows(SMALL);
+    // The mailbox exceeds the reply cap, but each flag batch fits.
+    let _limit = super::session::limit_untagged_to(275);
+    let server = TestServer::spawn(state_with(vec![folder("INBOX", "", 3, "In", 300)]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let acct = account("a1", BackendKind::Imap);
+    let (_, result) = run_pass(&backend, &store, &mut |delta| {
+        if decode_cursor(delta.cursor.as_ref())
+            .iter()
+            .any(|(_, checkpoint)| checkpoint.floor == Some(1))
+        {
+            let mut state = server.state.lock().unwrap();
+            let inbox = &mut state.mailboxes[0];
+            inbox.messages.last_mut().unwrap().flags = vec!["\\Seen".into()];
+            inbox.reject_fetch = true;
+        }
+        false
+    });
+    result.unwrap();
+    assert!(stored(&store, &acct, "In300@x").unwrap().unread);
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    assert_eq!(decode_cursor(cursor.as_ref())[0].1.floor, Some(1));
+
+    {
+        let mut state = server.state.lock().unwrap();
+        state.mailboxes[0].reject_fetch = false;
+        state.commands.clear();
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(!stored(&store, &acct, "In300@x").unwrap().unread);
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    assert_eq!(decode_cursor(cursor.as_ref())[0].1.floor, None);
+    assert!(body_fetches(&server).is_empty());
 }
 
 #[test]

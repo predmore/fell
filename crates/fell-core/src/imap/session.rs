@@ -285,19 +285,10 @@ impl Session {
         let lines = self
             .command("UID FETCH", &format!("UID FETCH {range} (UID FLAGS)"))?
             .untagged;
-        let mut out = Vec::new();
-        for line in lines {
-            let upper = line.text.to_ascii_uppercase();
-            if !upper.contains("FETCH") {
-                continue;
-            }
-            let Some(uid) = number_after(&upper, "UID ") else {
-                continue;
-            };
-            let flags = paren_after(&line.text, "FLAGS").unwrap_or_default();
-            out.push((uid, flags));
-        }
-        Ok(out)
+        Ok(lines
+            .iter()
+            .filter_map(|line| parse_flags(&line.text).map(|row| (row.uid, row.flags)))
+            .collect())
     }
 
     /// Deliver each FETCH as it arrives. Bodies are not kept after `on_fetched`
@@ -372,14 +363,27 @@ impl Session {
         first: u32,
         last: u32,
     ) -> Result<Option<Vec<u32>>, Error> {
-        let lines = match self.command("UID SEARCH", &format!("UID SEARCH {first}:{last}")) {
+        self.uid_search(&format!("{first}:{last}"))
+    }
+
+    /// UIDs present in a UID range, which can contain gaps.
+    pub(super) fn uid_search_range(
+        &mut self,
+        low: u32,
+        high: u32,
+    ) -> Result<Option<Vec<u32>>, Error> {
+        self.uid_search(&format!("UID {low}:{high}"))
+    }
+
+    fn uid_search(&mut self, criteria: &str) -> Result<Option<Vec<u32>>, Error> {
+        let lines = match self.command("UID SEARCH", &format!("UID SEARCH {criteria}")) {
             Ok(reply) => reply.untagged,
             Err(Error::Backend(message)) if message.contains("UID SEARCH failed:") => {
                 return Ok(None);
             }
             Err(err) => return Err(err),
         };
-        Ok(Some(search_uids(&lines)))
+        Ok(search_uids(&lines))
     }
 
     /// UID and `Message-ID` header of messages `first..=last` by sequence
@@ -984,25 +988,31 @@ enum LiteralBytes {
 }
 
 /// The UIDs in a `UID SEARCH` reply's `* SEARCH` lines, ascending.
-fn search_uids(lines: &[Logical]) -> Vec<u32> {
-    let mut uids = Vec::new();
+fn search_uids(lines: &[Logical]) -> Option<Vec<u32>> {
+    let mut result = None;
     for line in lines {
-        let Some(rest) = line.text.trim().strip_prefix('*') else {
+        let mut words = line.text.split_whitespace();
+        if words.next() != Some("*")
+            || !words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("SEARCH"))
+        {
             continue;
-        };
-        let Some(rest) = strip_prefix_ignore_ascii_case(rest.trim_start(), "SEARCH") else {
-            continue;
-        };
-        for word in rest.split_whitespace() {
+        }
+        let uids = result.get_or_insert_with(Vec::new);
+        for word in words {
             match word.parse() {
                 Ok(uid) => uids.push(uid),
                 // A modifier such as `(MODSEQ n)`, not a UID.
-                Err(_) => break,
+                Err(_) if word.starts_with('(') => break,
+                Err(_) => return None,
             }
         }
     }
-    uids.sort_unstable();
-    uids
+    result.map(|mut uids| {
+        uids.sort_unstable();
+        uids
+    })
 }
 
 struct Logical {
@@ -1645,7 +1655,7 @@ fn parse_flags(text: &str) -> Option<Fetched> {
     }
     Some(Fetched {
         uid: number_after(&upper, "UID ")?,
-        flags: paren_after(text, "FLAGS").unwrap_or_default(),
+        flags: paren_after(text, "FLAGS")?,
         body: Vec::new(),
         skipped: false,
         body_missing: false,

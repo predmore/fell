@@ -99,11 +99,11 @@ pub fn bodies_filled(shown: &[ConvMessage], read: &[ConvMessage]) -> Option<Vec<
     )
 }
 
-/// The reader has not moved the conversation: it is at its top, or has
-/// nothing to scroll (a pane of bodies not downloaded yet). A body that
-/// arrives may then bring the newest message's start into view.
-pub fn conversation_untouched(offset: f32, max: f32) -> bool {
-    max <= 1.0 || offset >= -1.0
+/// A conversation that fits before new bodies arrive can reveal the newest
+/// message after layout. In a scrollable conversation every offset is a
+/// possible reading position, including the top.
+pub fn conversation_fits(max_offset: f32) -> bool {
+    max_offset <= 1.0
 }
 
 /// Room a message's start needs on screen to count as in view.
@@ -1206,13 +1206,8 @@ mod tests {
 
     #[test]
     fn a_body_arriving_moves_the_pane_only_to_show_the_newest_start() {
-        // Untouched: at the top, or nothing to scroll.
-        assert!(conversation_untouched(0.0, 400.0));
-        assert!(conversation_untouched(-120.0, 0.0));
-        assert!(
-            !conversation_untouched(-120.0, 400.0),
-            "the reader scrolled"
-        );
+        assert!(conversation_fits(0.0));
+        assert!(!conversation_fits(400.0), "keep any reading position");
         // Viewport 100..700. The newest message starts in view: stay.
         assert_eq!(offset_to_show_start(300.0, 100.0, 700.0, 0.0, 900.0), None);
         // Older bodies pushed its start below the fold: glide to it.
