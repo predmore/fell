@@ -114,6 +114,9 @@ pub struct Snapshot {
     pub reply_context: Option<ReplyContext>,
     /// What a forward carries, read from its header block.
     pub forwarded: Option<super::reply::ForwardSummary>,
+    /// An agent wrote this draft (`create_draft`), so every word of it,
+    /// the first body too, is the agent's and not yet the person's.
+    pub agent_authored: bool,
 }
 
 /// The parent message of a reply, read from the mailbox when the draft opens.
@@ -141,6 +144,25 @@ pub enum SendLock {
 }
 
 impl Snapshot {
+    /// Where the body starts in [`Self::text`], the serialized draft.
+    pub fn body_start(&self) -> Option<usize> {
+        let tail = usize::from(!self.body.is_empty() && !self.body.ends_with('\n'));
+        let start = self.text.len().checked_sub(self.body.len() + tail)?;
+        self.text[start..]
+            .starts_with(self.body.as_str())
+            .then_some(start)
+            .filter(|start| self.text.is_char_boundary(*start))
+    }
+
+    /// A byte range of [`Self::text`] (a hunk's) as a range of the body,
+    /// cut to the part inside it. `None` when none of it is in the body.
+    pub fn body_range(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        let base = self.body_start()?;
+        let start = start.max(base) - base;
+        let end = end.min(base + self.body.len()).checked_sub(base)?;
+        (start < end).then_some((start, end))
+    }
+
     /// Why this draft cannot be sent again, when a send went out or may have.
     pub fn send_lock_reason(&self) -> Option<&'static str> {
         match self.send_block.as_deref() {
@@ -1149,6 +1171,7 @@ impl DraftSession {
             send_requested_by: self.send_requested_by.clone(),
             reply_context: self.reply_context.clone(),
             forwarded: super::reply::forward_summary(&self.reply.quote_text),
+            agent_authored: !self.owner.is_empty(),
         }
     }
 
@@ -2080,6 +2103,25 @@ mod tests {
             .unwrap();
         assert_eq!(session.snapshot().unreviewed, 1);
         assert_eq!(session.snapshot().hunks.len(), 1);
+    }
+
+    #[test]
+    fn a_hunk_maps_onto_its_own_place_in_the_body() {
+        let link = "[pay](https://example.com/pay)";
+        let (_root, mut session) = temp_session(&format!("{link}\n\nlater\n"));
+        let revision = session.revision();
+        session.edit(revision, "later", link).unwrap();
+        let snap = session.snapshot();
+        let hunk = snap.hunks.first().expect("one hunk");
+        let (start, end) = snap.body_range(hunk.start, hunk.end).unwrap();
+        // The second copy, the one the agent wrote, not the first.
+        assert_eq!(start, snap.body.rfind(link).unwrap());
+        assert_eq!(&snap.body[start..end], link);
+        // A range in the header is not in the body.
+        assert_eq!(snap.body_range(0, 3), None);
+        assert!(!snap.agent_authored, "a person's draft");
+        session.set_owner("agent:bot");
+        assert!(session.snapshot().agent_authored);
     }
 
     #[test]
