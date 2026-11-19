@@ -3479,7 +3479,10 @@ mod tests {
         // Mail stored before parts were kept, waiting for the backfill.
         store
             .connection()
-            .execute("INSERT INTO body_backfill VALUES ('a1', 'old@x')", [])
+            .execute(
+                "INSERT INTO body_backfill (account_id, message_id) VALUES ('a1', 'old@x')",
+                [],
+            )
             .unwrap();
         expunge(&store, &thread);
         assert!(!queued(&store, "old@x"));

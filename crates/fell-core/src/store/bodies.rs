@@ -19,8 +19,9 @@
 //! Mail stored before this table existed is queued in `body_backfill` once,
 //! by the schema version 4 upgrade; sync fetches those messages again from a
 //! server copy ([`crate::sync::fetch_missing_bodies`]) and any write of
-//! parts takes a message off the queue. New mail never joins the queue, so a
-//! mailbox that is caught up pays nothing per pass.
+//! parts takes a message off the queue. The CID upgrade also queues listed
+//! parts that need their source to be reclassified. New mail never joins
+//! the queue, so a mailbox that is caught up pays nothing per pass.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -29,6 +30,8 @@ use crate::message::{
     Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
 };
 use crate::{Error, Result};
+
+pub(super) mod cid_upgrade;
 
 const BODIES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS message_bodies (
@@ -97,10 +100,11 @@ CREATE TABLE IF NOT EXISTS message_parts (
     PRIMARY KEY (account_id, message_id, section)
 ) WITHOUT ROWID;
 
--- Messages stored before message_bodies, still to fetch again.
+-- Messages still to fetch again, including a targeted CID role refresh.
 CREATE TABLE IF NOT EXISTS body_backfill (
     account_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
+    refresh_cid_roles INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
 ) WITHOUT ROWID;
 
@@ -121,17 +125,24 @@ END;
 /// Queueing mail stored before them is [`queue_stored_mail`], which runs
 /// after the version 3 merge so it sees only the rows that survive it.
 pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
-    conn.execute_batch(BODIES_SCHEMA)?;
-    if !has_column(conn, "message_bodies", "parts_listed")? {
-        conn.execute_batch(
+    let tx = super::begin_immediate(conn)?;
+    tx.execute_batch(BODIES_SCHEMA)?;
+    if !has_column(&tx, "message_bodies", "parts_listed")? {
+        tx.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
         )?;
     }
-    if !has_column(conn, "message_bodies", "withheld")? {
-        conn.execute_batch(
+    if !has_column(&tx, "message_bodies", "withheld")? {
+        tx.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN withheld INTEGER NOT NULL DEFAULT 0",
         )?;
     }
+    if !has_column(&tx, "body_backfill", "refresh_cid_roles")? {
+        tx.execute_batch(
+            "ALTER TABLE body_backfill ADD COLUMN refresh_cid_roles INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1189,7 +1200,8 @@ mod tests {
             .conn
             .execute_batch(
                 "DELETE FROM message_bodies;
-                 INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+                 INSERT INTO body_backfill (account_id, message_id)
+                 SELECT account_id, message_id FROM messages;",
             )
             .unwrap();
 

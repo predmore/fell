@@ -519,6 +519,7 @@ impl Store {
         if version < 5 {
             bodies::queue_unlisted_mail(&conn)?;
         }
+        bodies::cid_upgrade::run(&conn)?;
         crate::actions::migrate_purge_snapshots(&conn)?;
         Ok(Self {
             indexer: None,
@@ -1019,7 +1020,8 @@ impl Store {
     /// Store parts fetched again for messages that had none. `None` parts
     /// record that no copy could be fetched, so the backfill stops asking;
     /// a later sync of the message still fills them. Parts already stored
-    /// are kept. Returns how many messages gained a body.
+    /// are kept, with unresolved CID roles refreshed for the upgrade queue.
+    /// Returns how many messages gained a body.
     pub fn store_fetched_parts(
         &self,
         account_id: &AccountId,
@@ -1042,6 +1044,10 @@ impl Store {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
+            if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, parts.mime_parts())?
+            {
+                continue;
+            }
             if parts.has_body() {
                 filled += 1;
             }

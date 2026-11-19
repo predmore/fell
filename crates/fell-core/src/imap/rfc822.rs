@@ -479,21 +479,14 @@ fn leaf(
         Some(value) if value.ctype().eq_ignore_ascii_case("attachment") => Disposition::Attachment,
         _ => Disposition::Unspecified,
     };
-    let role = part_role(
-        &mime_type,
-        filename.as_deref(),
-        content_id.as_deref(),
-        disposition,
-        cids,
-    );
     let encoding = match part.encoding() {
         mail_parser::Encoding::Base64 => TransferEncoding::Base64,
         mail_parser::Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
         mail_parser::Encoding::None => TransferEncoding::Identity,
     };
-    out.push(MimePart {
+    let mut listed = MimePart {
         section: section.clone(),
-        role,
+        role: PartRole::Attachment,
         mime_type,
         filename,
         size,
@@ -502,36 +495,15 @@ fn leaf(
         content_id,
         disposition,
         nested: depth > 0,
-    });
+    };
+    listed.role = cids.role_for(&listed);
+    out.push(listed);
     if let Some(inner) = nested_message
         && depth < MAX_NESTED_MESSAGES
     {
         let html = joined(inner.html_body(), |kind| matches!(kind, PartKind::Html));
         let cids = CidReferences::new(html.as_deref());
         walk_message(inner, &section, &cids, depth + 1, out);
-    }
-}
-
-/// What a part is to the reader. Anything that is not clearly a signature
-/// or an image the HTML shows stays a file the reader can open: a part is
-/// never hidden on the word of its position or of text in the body alone.
-fn part_role(
-    mime_type: &str,
-    filename: Option<&str>,
-    content_id: Option<&str>,
-    disposition: Disposition,
-    cids: &CidReferences<'_>,
-) -> PartRole {
-    if SIGNATURE_TYPES.contains(&mime_type) || filename.is_some_and(is_signature_name) {
-        return PartRole::Signature;
-    }
-    let shown = mime_type.starts_with("image/")
-        && disposition != Disposition::Attachment
-        && content_id.is_some_and(|id| cids.contains(id));
-    if shown {
-        PartRole::Inline
-    } else {
-        PartRole::Attachment
     }
 }
 
@@ -581,16 +553,29 @@ pub(crate) fn is_bidi_control(ch: char) -> bool {
 }
 
 /// Parse each HTML body only when a part could be an inline image.
-struct CidReferences<'a> {
+pub(crate) struct CidReferences<'a> {
     html: Option<&'a str>,
     ids: OnceCell<HashSet<String>>,
 }
 
 impl<'a> CidReferences<'a> {
-    fn new(html: Option<&'a str>) -> Self {
+    pub(crate) fn new(html: Option<&'a str>) -> Self {
         Self {
             html,
             ids: OnceCell::new(),
+        }
+    }
+
+    /// Files stay visible unless they are signatures or the HTML loads them.
+    pub(crate) fn role_for(&self, part: &MimePart) -> PartRole {
+        if SIGNATURE_TYPES.contains(&part.mime_type.as_str())
+            || part.filename.as_deref().is_some_and(is_signature_name)
+        {
+            PartRole::Signature
+        } else if part.cid_image_id().is_some_and(|id| self.contains(id)) {
+            PartRole::Inline
+        } else {
+            PartRole::Attachment
         }
     }
 
