@@ -285,6 +285,21 @@ pub(crate) const SELECT_MESSAGE_COLS: &str =
         to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until, list_id,
         reply_to_line, attachment_names";
 
+fn message_lookup_sql() -> String {
+    // Separate the two lookups so SQLite can seek by account and message ID.
+    format!(
+        "SELECT {SELECT_MESSAGE_COLS} FROM messages m
+         WHERE m.account_id = ?1 AND m.message_id = ?2
+         UNION ALL
+         SELECT {SELECT_MESSAGE_COLS} FROM messages m
+         WHERE m.account_id = ?1 AND m.message_id = (
+             SELECT a.canonical_message_id FROM message_aliases a
+             WHERE a.account_id = ?1 AND a.message_id = ?2
+         )
+         LIMIT 1"
+    )
+}
+
 /// Flags in a delta, at or past which [`Store::apply_delta`] commits them
 /// before the delta's copy work and lets a waiting write in between.
 const SPLIT_DELTA_AT: usize = 1_000;
@@ -861,17 +876,8 @@ impl Store {
         message_id: &MessageId,
     ) -> Result<Option<Message>> {
         self.conn
+            .prepare_cached(&message_lookup_sql())?
             .query_row(
-                &format!(
-                    "SELECT {SELECT_MESSAGE_COLS} FROM messages
-                     WHERE account_id = ?1 AND (
-                         message_id = ?2 OR message_id IN (
-                             SELECT canonical_message_id FROM message_aliases
-                             WHERE account_id = ?1 AND message_id = ?2
-                         )
-                     )
-                     LIMIT 1"
-                ),
                 params![account_id.as_str(), message_id.as_str()],
                 row_to_message,
             )
@@ -4062,6 +4068,58 @@ mod tests {
         body: &str,
     ) -> Message {
         msg_for("a1", id, proton, in_reply_to, subject, body)
+    }
+
+    #[test]
+    fn message_lookup_seeks_by_account_and_message_id() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", message_lookup_sql()))
+            .unwrap()
+            .query_map(["a1", "id@x"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(!plan.contains("SCAN m"), "{plan}");
+        for (table, expected) in [("SEARCH m ", 2), ("SEARCH a ", 1)] {
+            let seeks = plan
+                .lines()
+                .filter(|detail| {
+                    detail.starts_with(table) && detail.ends_with("(account_id=? AND message_id=?)")
+                })
+                .count();
+            assert_eq!(seeks, expected, "{plan}");
+        }
+    }
+
+    #[test]
+    fn message_lookup_resolves_aliases_within_the_requested_account() {
+        let store = Store::open_in_memory().unwrap();
+        let first = account();
+        let second = account_b();
+        store.upsert_account(&first).unwrap();
+        store.upsert_account(&second).unwrap();
+        store
+            .upsert_message(&msg("post@x", None, None, "First account", "first"))
+            .unwrap();
+        let kept = msg_for("a2", "post@x", None, None, "Second account", "second");
+        store.upsert_message(&kept).unwrap();
+        let alias = msg_for("a2", "echo@x", None, None, "List echo", "second");
+        remember_alias(&store.conn, &alias, kept.headers.message_id.as_str()).unwrap();
+
+        let direct = store
+            .message(&second.id, &kept.headers.message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.account_id, second.id);
+        assert_eq!(direct.headers.subject, kept.headers.subject);
+        for id in ["echo@x", " <echo@x> "] {
+            let id = MessageId::new(id);
+            assert_eq!(store.message(&second.id, &id).unwrap().unwrap(), direct);
+            assert!(store.message(&first.id, &id).unwrap().is_none());
+        }
     }
 
     #[test]
