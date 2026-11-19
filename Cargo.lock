@@ -1907,6 +1907,7 @@ dependencies = [
 name = "fell"
 version = "0.1.0"
 dependencies = [
+ "cosmic-text",
  "fell-confirm",
  "fell-core",
  "fell-render",

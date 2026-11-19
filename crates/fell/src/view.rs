@@ -29,6 +29,7 @@ use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
+use crate::text_cut;
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
 
@@ -139,6 +140,9 @@ fn reply_notice_prefix(kind: ReplyKind) -> &'static str {
 /// Height of one thread row. Rows never change height, so the list can
 /// place, scroll to and animate any row from its index.
 const ROW_PX: f32 = 68.0;
+/// A glide further than this (about four rows) eases on the gentler
+/// curve, so one late frame cannot carry it half the way ([`Glide::gentle_beyond`]).
+const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
 struct Inbox {
     focus: FocusHandle,
@@ -189,7 +193,28 @@ struct Inbox {
     frame_now: Instant,
     /// `FELL_FRAME_LOG`: frame times, for the key-to-frame budget.
     frames: Option<SharedFrameLog>,
+    /// The folder's last rows and their thread, read ahead for a `G` and
+    /// drawn unseen once ([`Self::warm_layer`]).
+    warm: Option<Warm>,
+    /// The folder the last rows were read ahead for.
+    warmed_folder: Option<String>,
 }
+
+/// What a `G` will show, read ahead: the folder's last rows and the
+/// conversation of the last one.
+struct Warm {
+    folder: String,
+    rows: Vec<ThreadRow>,
+    subject: String,
+    messages: Vec<ConvMessage>,
+    /// Rows drawn so far. They are drawn [`WARM_ROWS`] a frame, then the
+    /// conversation in a frame of its own, so no frame does much of it.
+    rows_drawn: usize,
+}
+
+/// Rows a frame draws ahead ([`Inbox::warm_layer`]): a couple of
+/// milliseconds.
+const WARM_ROWS: usize = 2;
 
 impl Inbox {
     fn new(cx: &mut Context<Self>) -> Self {
@@ -250,6 +275,8 @@ impl Inbox {
             motion: InboxMotion::new(Motion::from_env()),
             frame_now: Instant::now(),
             frames: FrameLog::from_env(),
+            warm: None,
+            warmed_folder: None,
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -574,6 +601,9 @@ impl Inbox {
             present::Landing::Jump => self.scroll_list_to_cursor(),
         }
         self.start_list_shift(drawn, switched);
+        if self.warmed_folder.as_deref() != Some(self.list_folder.as_str()) {
+            self.warm_bottom(more_after, cx);
+        }
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
         // A draft's preview follows its edits.
@@ -583,6 +613,202 @@ impl Inbox {
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
         cx.notify();
+    }
+
+    /// Read the folder's last rows and their thread's conversation ahead,
+    /// on the background lane, for [`Self::warm_layer`] to draw unseen
+    /// while nothing moves. A folder whose rows all fit on screen has
+    /// nothing a `G` would show for the first time.
+    fn warm_bottom(&mut self, more_after: bool, cx: &mut Context<Self>) {
+        let folder = self.list_folder.clone();
+        self.warmed_folder = Some(folder.clone());
+        self.warm = None;
+        let shown = (self.list_viewport().unwrap_or(760.0) / ROW_PX).ceil() as usize + 1;
+        if !more_after && self.session.threads.len() <= shown {
+            return;
+        }
+        // A `G` glides in over the last viewport from one viewport above
+        // it ([`motion::GLIDE_MAX_VIEWPORTS`]): its first frames show those
+        // rows, its last ones the folder's end.
+        let reach = 2 * shown;
+        let account = self.account_id.clone();
+        let me = self.session.account_email.clone();
+        let roles = self.session.roles.clone();
+        let names = self.session.folders.clone();
+        let reading = folder.clone();
+        let reply = self.store.call_background(move |store: &fell_core::Store| {
+            let page = store
+                .folder_page(&account, &reading, &FolderSpan::Bottom { rows: reach })
+                .ok()?;
+            let last = page.threads.last()?;
+            let messages = store.thread_messages(&account, &last.thread_id).ok()?;
+            Some((
+                present::thread_rows(&page.threads, &me),
+                present::conversation(&messages, &me, &roles, &names),
+            ))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some((rows, messages))) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.list_folder != folder {
+                    return;
+                }
+                let subject = rows
+                    .last()
+                    .map(|row| row.subject.clone())
+                    .unwrap_or_default();
+                inbox.warm = Some(Warm {
+                    folder,
+                    rows,
+                    subject,
+                    messages,
+                    rows_drawn: 0,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What a `G` will show, drawn unseen under the panes so the frame
+    /// that shows it does not shape and rasterize it cold: once per
+    /// folder, in frames where nothing moves, the folder's last rows a few
+    /// at a time and then their thread's conversation, read ahead by
+    /// [`Self::warm_bottom`]. Their shaping stays in the row cache and
+    /// their glyphs in the atlas.
+    ///
+    /// Drawn at opacity 0, and taking no pointer input ([`Live`]).
+    fn warm_layer(
+        &mut self,
+        width: f32,
+        (show_list, show_conv): (bool, bool),
+        animating: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = self.theme.clone();
+        let now = self.frame_now;
+        let mut parts = Vec::new();
+        let ahead = self
+            .warm
+            .take()
+            .filter(|warm| warm.folder == self.list_folder);
+        match ahead {
+            Some(warm) if animating => self.warm = Some(warm),
+            Some(mut warm) if warm.rows_drawn < warm.rows.len() => {
+                let list_width = if show_list && show_conv {
+                    list_width(width, self.split)
+                } else {
+                    width
+                };
+                let look = RowLook {
+                    selected: false,
+                    fading: None,
+                    ghost: true,
+                    bar_dx: 0.0,
+                };
+                let text_width = row_text_width(list_width);
+                let from = warm.rows_drawn;
+                let chunk: Vec<ThreadRow> = warm
+                    .rows
+                    .iter()
+                    .skip(from)
+                    .take(WARM_ROWS)
+                    .cloned()
+                    .collect();
+                let count = chunk.len();
+                let row_theme = theme.clone();
+                let entity = cx.entity();
+                // Built where the list builds its rows, in prepaint, so they
+                // shape in the UI font the list's text style sets: built
+                // here in render they would use GPUI's default text style,
+                // and their shaping would never be the list's.
+                parts.push(
+                    uniform_list("warm-rows", count, move |range, window, app| {
+                        entity.update(app, |_, cx| {
+                            range
+                                .map(|index| {
+                                    thread_row(
+                                        &row_theme,
+                                        &chunk[index],
+                                        index,
+                                        look,
+                                        text_width,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .w(px(list_width))
+                    .h(px(count as f32 * ROW_PX))
+                    .flex_none()
+                    .into_any_element(),
+                );
+                warm.rows_drawn = (from + WARM_ROWS).min(warm.rows.len());
+                self.warm = Some(warm);
+                window.request_animation_frame();
+            }
+            Some(mut warm) => {
+                let conv_width = if show_list && show_conv {
+                    (width - list_width(width, self.split)).max(120.0)
+                } else {
+                    width
+                };
+                // Drawn as the session would show it once `G` opens it.
+                std::mem::swap(&mut self.session.messages, &mut warm.messages);
+                let cursor = std::mem::replace(
+                    &mut self.session.message_cursor,
+                    self.session.messages.len().saturating_sub(1),
+                );
+                parts.push(
+                    conversation(
+                        &theme,
+                        &self.session,
+                        warm.subject.clone(),
+                        &self.motion,
+                        now,
+                        None,
+                        conv_width,
+                        Live(false),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                );
+                std::mem::swap(&mut self.session.messages, &mut warm.messages);
+                self.session.message_cursor = cursor;
+            }
+            None => {}
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("warm")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .overflow_hidden()
+                .opacity(0.0)
+                .children(parts.into_iter().enumerate().map(|(index, part)| {
+                    div()
+                        .id(gpui::ElementId::named_usize("warm", index))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(part)
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Read the rows the list asked for. While the reader's own read is in
@@ -742,6 +968,17 @@ impl Inbox {
         let mut carried = self.motion.carried_ghosts();
         carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
         let reach = self.list_viewport().unwrap_or(640.0);
+        // Rows of a list this one replaced that sat below its last row:
+        // nothing arrives over them, so they fade out where they were.
+        let end = self.session.threads.len() as f32 * ROW_PX;
+        let below = drawn
+            .into_iter()
+            .map(|old| {
+                let top = old.top - offset;
+                (old.row, top)
+            })
+            .filter(|(_, top)| *top >= end)
+            .collect();
         self.motion.list = ListShift::start(
             &self.motion.motion,
             before,
@@ -750,7 +987,8 @@ impl Inbox {
             reach,
             replace,
             now,
-        );
+        )
+        .map(|shift| shift.fading_below(below));
     }
 
     /// Move each glide one frame along, and end the ones that arrived.
@@ -1581,7 +1819,8 @@ impl Inbox {
         self.conv_scroll.set_offset(point(x, px(to)));
         let now = self.motion.clock.now();
         self.motion.conv_glide =
-            Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now);
+            Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now)
+                .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
         if let Some(glide) = self.motion.conv_glide {
             self.conv_scroll.set_offset(point(x, px(glide.from)));
         }
@@ -1697,7 +1936,8 @@ impl Inbox {
             view * motion::GLIDE_MAX_VIEWPORTS,
             motion::SLIDE,
             now,
-        );
+        )
+        .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
         self.set_list_offset(self.motion.list_glide.map_or(target, |glide| glide.from));
     }
 
@@ -1781,6 +2021,7 @@ impl Render for Inbox {
             );
             layer.swap(&mut self.session);
         }
+        let warm = self.warm_layer(width, panes, animating, window, cx);
         let subject = self.shown_subject();
         shell(
             theme,
@@ -1791,6 +2032,7 @@ impl Render for Inbox {
                 subject,
                 folder: self.list_folder.clone(),
                 leaving,
+                warm,
                 card,
                 frames: frames.clone(),
             },
@@ -1836,6 +2078,8 @@ struct Shown {
     subject: String,
     /// Overlays fading out, drawn under any open one.
     leaving: Vec<gpui::AnyElement>,
+    /// What a `G` will show, drawn unseen under the panes.
+    warm: Option<gpui::AnyElement>,
     /// The palette's or folder picker's height as drawn this frame.
     card: Option<f32>,
     /// The folder the rows on screen come from. The header names it, so
@@ -1862,7 +2106,7 @@ fn shell(
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let (show_list, show_conv) = present::visible_panes(width, session.pane, session.full_width);
-    let list_width = (width * split).clamp(280.0, (width - 400.0).max(280.0));
+    let list_width = list_width(width, split);
     let list_entry = motion.pane_entry(Pane::List, now);
     let conv_entry = motion.pane_entry(Pane::Conversation, now);
     let status = motion.status(session, now);
@@ -1870,33 +2114,39 @@ fn shell(
         subject,
         folder,
         leaving,
+        warm,
         card,
         frames,
     } = shown;
     let mut subject = Some(subject);
-    // A narrow window's pane that a key just swapped out fades beneath the
-    // one coming in, where it was, full width.
-    let swapped_out = motion
-        .pane_leaving(now)
-        .filter(|(pane, _)| match pane {
-            Pane::List => !show_list,
-            Pane::Conversation => !show_conv,
-        })
-        .map(|(pane, entry)| {
-            let pane = match pane {
-                Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), cx),
-                Pane::Conversation => conversation(
-                    &theme,
-                    session,
-                    subject.take().unwrap_or_default(),
-                    motion,
-                    now,
-                    conv_scroll.clone(),
-                    width,
-                    window,
-                    cx,
-                ),
-            };
+    // A narrow window's pane that a key just swapped out stays beneath the
+    // one coming in, where it was, full width. The incoming pane is drawn
+    // on an opaque fill from its first frame, so the old pane shows only
+    // in the strip its slide uncovers, and only the new pane's content
+    // fades in. The old pane is drawn for paint only: a layer that takes
+    // every click and scroll sits on it, strip included, so a click during
+    // the swap never selects a row under the conversation.
+    let swap = motion.pane_swap((show_list, show_conv), now);
+    let swapped_out = swap.map(|swap| {
+        let (pane, entry) = (swap.leaving, swap.out);
+        let pane = match pane {
+            Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), cx),
+            Pane::Conversation => conversation(
+                &theme,
+                session,
+                subject.take().unwrap_or_default(),
+                motion,
+                now,
+                Some(conv_scroll.clone()),
+                width,
+                // Paint only: the shield over it takes the pointer too.
+                Live(false),
+                window,
+                cx,
+            ),
+        };
+        let (cover_left, cover_width) = swap.cover(width);
+        [
             // A flex row, as the panes' own row is, so the pane fills it.
             div()
                 .absolute()
@@ -1906,7 +2156,25 @@ fn shell(
                 .flex()
                 .flex_row()
                 .child(entering(pane, entry))
-        });
+                .into_any_element(),
+            div()
+                .id("pane-swap-shield")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .into_any_element(),
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(cover_left))
+                .w(px(cover_width))
+                .bg(rgb(theme.background))
+                .into_any_element(),
+        ]
+    });
     div()
         .id("fell-root")
         .track_focus(&focus)
@@ -1968,7 +2236,8 @@ fn shell(
                 .flex()
                 .flex_row()
                 .overflow_hidden()
-                .children(swapped_out)
+                .children(warm)
+                .children(swapped_out.into_iter().flatten())
                 .when(show_list, |row| {
                     row.child(entering(
                         thread_list(
@@ -1998,8 +2267,9 @@ fn shell(
                             subject.take().unwrap_or_default(),
                             motion,
                             now,
-                            conv_scroll,
+                            Some(conv_scroll),
                             conv_width,
+                            Live(true),
                             window,
                             cx,
                         ),
@@ -2026,6 +2296,12 @@ fn shell(
             ))
         })
 }
+
+/// Whether a conversation drawn takes the pointer. The warm copies
+/// ([`Inbox::warm_layer`]) do not: they are drawn under the panes, and
+/// GPUI passes a click through to every element under the pointer.
+#[derive(Clone, Copy)]
+struct Live(bool);
 
 /// A pane that just came into view slides in from its side as it fades in.
 fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful<gpui::Div> {
@@ -2121,10 +2397,11 @@ fn thread_list(
                     cx.defer_in(window, |inbox, _, cx| inbox.issue_fetch(cx));
                 }
                 let highlighted = inbox.session.highlighted();
-                let text_width = (list_width - 2.0 - 3.0 - 24.0).max(48.0);
+                let text_width = row_text_width(list_width);
                 let now = inbox.frame_now;
                 let offset = inbox.list_offset();
                 let last = inbox.session.threads.len().saturating_sub(1);
+                let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
                 range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -2136,6 +2413,7 @@ fn thread_list(
                                 .selection_left(&row.id, now)
                                 .filter(|_| !selected),
                             ghost: false,
+                            bar_dx,
                         };
                         let element =
                             thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
@@ -2166,6 +2444,7 @@ fn thread_list(
                                     selected: false,
                                     fading: None,
                                     ghost: true,
+                                    bar_dx,
                                 };
                                 slot_layer(dy, opacity).child(thread_row(
                                     &theme_for_rows,
@@ -2214,7 +2493,7 @@ fn thread_list(
         .min_h(px(0.))
         .min_w(px(0.))
         .overflow_hidden()
-        .border_l(px(2.))
+        .border_l(px(LIST_BORDER_PX))
         .border_color(rgb(theme.border));
     pane = if beside {
         pane.w(px(list_width)).flex_none()
@@ -2226,6 +2505,17 @@ fn thread_list(
     } else {
         pane.child(rows)
     }
+}
+
+/// The list's width beside the conversation in a window `width` wide.
+fn list_width(width: f32, split: f32) -> f32 {
+    (width * split).clamp(280.0, (width - 400.0).max(280.0))
+}
+
+/// The width of a row's text in a list `list_width` wide: less the
+/// border, the unread bar and the row's padding.
+fn row_text_width(list_width: f32) -> f32 {
+    (list_width - LIST_BORDER_PX - 3.0 - 24.0).max(48.0)
 }
 
 /// One layer of a row slot while the list animates: a row drawn `dy` from
@@ -2248,6 +2538,20 @@ struct RowLook {
     fading: Option<f32>,
     /// A row that left the list, fading where it was. Not clickable.
     ghost: bool,
+    /// How far right of its place the unread bar is drawn ([`unread_bar_dx`]).
+    bar_dx: f32,
+}
+
+/// The list's left border, which the unread bars sit just inside.
+const LIST_BORDER_PX: f32 = 2.0;
+
+/// A list sliding in from the left by `pane_dx` (negative) would carry the
+/// unread bars at its left edge outside the window until the last frames
+/// of the slide, so they would pop in at full colour. They are drawn at
+/// the window's edge instead until the list brings them past it: this is
+/// how far right of their place that is.
+fn unread_bar_dx(pane_dx: f32) -> f32 {
+    (-(pane_dx.round() + LIST_BORDER_PX)).max(0.0)
 }
 
 fn thread_row(
@@ -2308,6 +2612,9 @@ fn thread_row(
                 .w(px(3.))
                 .h(px(44.))
                 .rounded_r_sm()
+                .when(look.bar_dx > 0.0, |bar| {
+                    bar.relative().left(px(look.bar_dx))
+                })
                 .when(row.unread, |bar| bar.bg(rgb(theme.accent))),
         )
         .child(
@@ -2577,8 +2884,12 @@ fn clip_line(window: &Window, text: &str, max_px: f32, weight: FontWeight) -> St
 /// [`clip_line`], shaped and ready to paint ([`shaped_text`]), so the row
 /// does not shape the same text again to draw it.
 ///
-/// It shapes at most twice: once to find the cut, once for the line that
-/// is drawn. Only as much of a long snippet as could ever fit is shaped.
+/// The text is shaped once, whole (only as much of a long snippet as could
+/// ever fit), and cut from that shaping at a cluster the shaper made, so an
+/// emoji sequence or a flag is never split, and by logical index, so a
+/// right-to-left subject keeps its first words ([`text_cut::LineCuts`]).
+/// The cut line is shaped once more to draw; only when kerning makes it
+/// wider than the room does it shape again, a cluster shorter at least.
 fn clip_shaped(
     window: &Window,
     text: &str,
@@ -2605,30 +2916,29 @@ fn clip_shaped(
             return Some(line);
         }
     }
-    // The shaped line says where each glyph starts, so the cut is found
-    // without shaping every candidate.
     let shaped = line.text.clone();
-    let room = max_px - line_px(window, "…", weight);
-    let mut end = line
-        .index_for_x(px(room.max(0.0)))
-        .unwrap_or(shaped.len())
-        .min(shaped.len());
-    while !shaped.is_char_boundary(end) {
-        end -= 1;
-    }
+    let cuts = text_cut::LineCuts::new(
+        line.runs.iter().flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
+        }),
+        f32::from(line.width),
+        shaped.len(),
+    );
+    let mut room = max_px - line_px(window, "…", weight);
+    // The whole line does not fit: the cut is before its end.
+    let mut before = shaped.len();
     loop {
-        let kept = shaped[..end].trim_end();
-        let candidate = format!("{kept}…");
-        let cut = shape_ui_line(window, &candidate, weight, color)?;
-        // Kerning can make the cut line a little wider than its prefix
-        // was inside the whole line: step back until it fits.
+        let kept = text_cut::kept(&shaped[..cuts.fit(room, before)]);
+        let cut = shape_ui_line(window, &format!("{kept}…"), weight, color)?;
         if kept.is_empty() || f32::from(cut.width) <= max_px {
             return Some(cut);
         }
-        end = shaped[..kept.len()]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(index, _)| index);
+        // Kerning made the cut line wider than its prefix was inside the
+        // whole line: take that much more off, and cut shorter than this.
+        room -= f32::from(cut.width) - max_px;
+        before = kept.len();
     }
 }
 
@@ -2723,8 +3033,10 @@ fn conversation(
     subject: String,
     motion: &InboxMotion,
     now: Instant,
-    scroll: ScrollHandle,
+    // `None`: a copy drawn unseen, which neither scrolls nor takes the wheel.
+    scroll: Option<ScrollHandle>,
     conv_width: f32,
+    live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -2743,7 +3055,7 @@ fn conversation(
                 0.0
             };
             message_block(
-                theme, session, message, index, cursor, conv_width, window, cx,
+                theme, session, message, index, cursor, conv_width, live, window, cx,
             )
         })
         .collect();
@@ -2784,8 +3096,10 @@ fn conversation(
                 .id("conversation-scroll")
                 .flex_1()
                 .min_h(px(0.))
-                .overflow_y_scroll()
-                .track_scroll(&scroll)
+                .map(|body| match &scroll {
+                    Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
+                    None => body.overflow_hidden(),
+                })
                 .px(px(20.))
                 .pb(px(28.))
                 .when(arrival < 1.0, |body| body.opacity(arrival))
@@ -2802,24 +3116,27 @@ fn message_block(
     index: usize,
     cursor: f32,
     conv_width: f32,
+    live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     if message.expanded {
         expanded_message(
-            theme, session, message, index, cursor, conv_width, window, cx,
+            theme, session, message, index, cursor, conv_width, live, window, cx,
         )
     } else {
-        collapsed_message(theme, message, index, cursor, conv_width, window, cx)
+        collapsed_message(theme, message, index, cursor, conv_width, live, window, cx)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
     cursor: f32,
     conv_width: f32,
+    live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -2847,19 +3164,21 @@ fn collapsed_message(
             theme.on_selection,
             cursor,
         )))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |inbox, _, window, cx| {
-                window.focus(&inbox.focus);
-                inbox.cancel_pending_keys(cx);
-                inbox.session.pane = Pane::Conversation;
-                inbox.session.message_cursor = index;
-                if let Some(message) = inbox.session.messages.get_mut(index) {
-                    message.expanded = true;
-                }
-                cx.notify();
-            }),
-        )
+        .when(live.0, |row| {
+            row.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, window, cx| {
+                    window.focus(&inbox.focus);
+                    inbox.cancel_pending_keys(cx);
+                    inbox.session.pane = Pane::Conversation;
+                    inbox.session.message_cursor = index;
+                    if let Some(message) = inbox.session.messages.get_mut(index) {
+                        message.expanded = true;
+                    }
+                    cx.notify();
+                }),
+            )
+        })
         .child(
             div()
                 .w(px(140.))
@@ -2890,6 +3209,7 @@ fn expanded_message(
     index: usize,
     cursor: f32,
     conv_width: f32,
+    live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -2902,16 +3222,18 @@ fn expanded_message(
         .mb(px(8.))
         .rounded_md()
         .bg(rgb(motion::mix(theme.background, theme.surface, cursor)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |inbox, _, window, cx| {
-                window.focus(&inbox.focus);
-                inbox.cancel_pending_keys(cx);
-                inbox.session.pane = Pane::Conversation;
-                inbox.session.message_cursor = index;
-                cx.notify();
-            }),
-        )
+        .when(live.0, |card| {
+            card.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |inbox, _, window, cx| {
+                    window.focus(&inbox.focus);
+                    inbox.cancel_pending_keys(cx);
+                    inbox.session.pane = Pane::Conversation;
+                    inbox.session.message_cursor = index;
+                    cx.notify();
+                }),
+            )
+        })
         .child(
             div()
                 .flex()
@@ -2950,7 +3272,7 @@ fn expanded_message(
         )
         .children(message.recipients.as_ref().map(|line| {
             let open = session.recipients_are_open(index);
-            recipient_lines(theme, line, open, index, conv_width, window, cx)
+            recipient_lines(theme, line, open, index, conv_width, live, window, cx)
         }))
         .children({
             // `q` opens every collapsed block in the message at once, so
@@ -2968,7 +3290,15 @@ fn expanded_message(
                 .iter()
                 .enumerate()
                 .map(|(at, block)| {
-                    body_block(theme, block, quotes, Some(at) == first_hidden, index, cx)
+                    body_block(
+                        theme,
+                        block,
+                        quotes,
+                        Some(at) == first_hidden,
+                        index,
+                        live,
+                        cx,
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -2985,6 +3315,7 @@ fn recipient_lines(
     open: bool,
     index: usize,
     conv_width: f32,
+    live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -3083,7 +3414,9 @@ fn recipient_lines(
             .flex()
             .min_w(px(0.))
             .text_color(rgb(theme.dimmed))
-            .hover(|style| style.text_color(rgb(theme.foreground)))
+            .when(live.0, |names| {
+                names.hover(|style| style.text_color(rgb(theme.foreground)))
+            })
             .child(div().whitespace_nowrap().child(names))
             .child(div().flex_shrink_0().whitespace_nowrap().child(tail))
     };
@@ -3092,10 +3425,10 @@ fn recipient_lines(
         .max_w(px(680.))
         .pb(px(10.))
         .text_size(size)
-        .child(
+        .child(body.when(live.0, |body| {
             body.cursor_pointer()
-                .on_mouse_down(MouseButton::Left, toggle),
-        )
+                .on_mouse_down(MouseButton::Left, toggle)
+        }))
         .into_any_element()
 }
 
@@ -3105,6 +3438,7 @@ fn body_block(
     quotes_open: bool,
     show_key: bool,
     index: usize,
+    live: Live,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     match block {
@@ -3143,17 +3477,19 @@ fn body_block(
                     } else {
                         label.to_string()
                     })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |inbox, _, window, cx| {
-                            window.focus(&inbox.focus);
-                            inbox.cancel_pending_keys(cx);
-                            inbox.session.pane = Pane::Conversation;
-                            inbox.session.message_cursor = index;
-                            inbox.session.toggle_quotes(index);
-                            cx.notify();
-                        }),
-                    )
+                    .when(live.0, |label| {
+                        label.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |inbox, _, window, cx| {
+                                window.focus(&inbox.focus);
+                                inbox.cancel_pending_keys(cx);
+                                inbox.session.pane = Pane::Conversation;
+                                inbox.session.message_cursor = index;
+                                inbox.session.toggle_quotes(index);
+                                cx.notify();
+                            }),
+                        )
+                    })
                     .into_any_element()
             }
         }
@@ -3918,9 +4254,10 @@ impl<T: Styled> FontOpt for T {
 
 #[cfg(test)]
 mod tests {
-    use super::{ctrl_letter, key_from, should_follow_visible};
+    use super::{LIST_BORDER_PX, ctrl_letter, key_from, should_follow_visible, unread_bar_dx};
     use crate::keymap::KeyId;
     use crate::model::Overlay;
+    use crate::motion;
     use crate::present::Pane;
     use gpui::{Keystroke, Modifiers};
 
@@ -3933,6 +4270,25 @@ mod tests {
             key: key.into(),
             key_char: Some(key_char.into()),
         }
+    }
+
+    #[test]
+    fn unread_bars_stay_in_the_window_while_the_list_slides_in() {
+        // The list 24 px left of its place: its bars would sit at -22 px.
+        let dx = unread_bar_dx(-motion::PANE_SLIDE_PX);
+        assert_eq!(
+            -motion::PANE_SLIDE_PX + LIST_BORDER_PX + dx,
+            0.0,
+            "at the edge"
+        );
+        // Once the list brings them into the window they ride with it.
+        assert_eq!(unread_bar_dx(-2.0), 0.0);
+        assert_eq!(unread_bar_dx(-1.0), 0.0);
+        assert_eq!(unread_bar_dx(0.0), 0.0);
+        // A pane sliding in from the right never moves them.
+        assert_eq!(unread_bar_dx(motion::PANE_SLIDE_PX), 0.0);
+        // Half way, they are still held at the edge.
+        assert_eq!(-10.0 + LIST_BORDER_PX + unread_bar_dx(-10.0), 0.0);
     }
 
     #[test]

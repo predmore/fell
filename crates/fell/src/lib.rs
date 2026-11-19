@@ -20,6 +20,7 @@ mod present;
 mod setup;
 mod store_actor;
 mod sync_worker;
+mod text_cut;
 mod text_render;
 mod theme;
 mod view;

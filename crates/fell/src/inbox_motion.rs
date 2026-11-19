@@ -82,6 +82,26 @@ pub struct PaneEntry {
     pub dx: f32,
 }
 
+/// A narrow window swapping one pane for the other, as one frame draws it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneSwap {
+    /// The pane going out, drawn beneath for paint only.
+    pub leaving: Pane,
+    pub out: PaneEntry,
+    /// The pane coming in, drawn on top.
+    pub incoming: PaneEntry,
+}
+
+impl PaneSwap {
+    /// Left edge and width of the opaque fill under the incoming pane, in
+    /// a row `width` pixels wide: the pane's own place as drawn (its slide
+    /// rounded as the view rounds it). The old pane shows only in the rest
+    /// of the row, the strip the slide uncovers.
+    pub fn cover(&self, width: f32) -> (f32, f32) {
+        (self.incoming.dx.round(), width)
+    }
+}
+
 pub struct InboxMotion {
     pub motion: Motion,
     /// The time every transition here runs on.
@@ -356,7 +376,8 @@ impl InboxMotion {
     /// Rows still sliding keep sliding: the next list change starts from
     /// where they are drawn, and the list the key acts on is already final.
     /// What is leaving (a notice, an overlay) keeps fading: no key acts on
-    /// it.
+    /// it. The exception is the pane a narrow window swapped out: the
+    /// pane that replaced it is now in place and covers it, so it goes.
     pub fn settle(&mut self, now: Instant) -> Settled {
         let list = self.list_glide.take();
         let conversation = self.conv_glide.take();
@@ -367,6 +388,7 @@ impl InboxMotion {
         self.which = None;
         self.overlay = None;
         self.pane = None;
+        self.pane_out = None;
         self.focus = None;
         self.selection_out = None;
         self.arrival = None;
@@ -554,7 +576,10 @@ impl InboxMotion {
     /// was as it moves a little towards its own side (the list left, the
     /// conversation right): the way the new one came in, continued.
     pub fn pane_leaving(&self, now: Instant) -> Option<(Pane, PaneEntry)> {
-        let (pane, fade) = self.pane_out.as_ref()?;
+        let (pane, fade) = self
+            .pane_out
+            .as_ref()
+            .filter(|(_, fade)| fade.running(now))?;
         let shows = fade.remaining(now);
         let side = if *pane == Pane::List { -1.0 } else { 1.0 };
         Some((
@@ -564,6 +589,22 @@ impl InboxMotion {
                 dx: side * motion::PANE_SLIDE_PX * (1.0 - shows),
             },
         ))
+    }
+
+    /// The pane swap a narrow window is drawing, if any. `shown`: which
+    /// panes this frame shows (list, conversation).
+    pub fn pane_swap(&self, shown: (bool, bool), now: Instant) -> Option<PaneSwap> {
+        let (leaving, out) = self.pane_leaving(now)?;
+        let incoming = match (leaving, shown) {
+            (Pane::List, (false, true)) => Pane::Conversation,
+            (Pane::Conversation, (true, false)) => Pane::List,
+            _ => return None,
+        };
+        Some(PaneSwap {
+            leaving,
+            out,
+            incoming: self.pane_entry(incoming, now),
+        })
     }
 
     /// How much of the selection highlight row `id` still shows, when the
@@ -929,6 +970,57 @@ mod tests {
             .pane_leaving(back)
             .expect("the conversation is leaving");
         assert_eq!(pane, Pane::Conversation);
+        // A key mid-swap puts the list in place: nothing of the
+        // conversation is drawn under it any more.
+        motion.settle(later(back, 40));
+        assert!(motion.pane_leaving(later(back, 40)).is_none());
+        assert_eq!(motion.pane_entry(Pane::List, later(back, 40)).dx, 0.0);
+    }
+
+    #[test]
+    fn a_pane_swap_shows_the_old_pane_only_in_the_uncovered_strip() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        let width = 700.0;
+        motion.observe(&session, (true, false), now);
+        session.pane = Pane::Conversation;
+        motion.observe(&session, (false, true), now);
+        // Enter: the conversation covers all but a strip on the left from
+        // its first frame, and the strip closes as it slides in.
+        let mut strip = f32::INFINITY;
+        for ms in [0, 16, 33, 50, 80, 119] {
+            let swap = motion
+                .pane_swap((false, true), later(now, ms))
+                .expect("swapping");
+            assert_eq!(swap.leaving, Pane::List);
+            let (left, cover) = swap.cover(width);
+            assert_eq!(cover, width);
+            assert!(
+                (0.0..=motion::PANE_SLIDE_PX).contains(&left),
+                "{ms} ms: {left}"
+            );
+            assert!(left <= strip, "the strip never widens");
+            strip = left;
+            if ms == 0 {
+                assert_eq!(left, motion::PANE_SLIDE_PX, "covered from the first frame");
+                assert_eq!(swap.incoming.opacity, motion::ARRIVE_FROM);
+            }
+        }
+        // A frame that shows both panes is not a swap.
+        assert!(motion.pane_swap((true, true), now).is_none());
+        // Esc: the list comes from the left; the strip is on the right.
+        session.pane = Pane::List;
+        let back = later(now, 300);
+        motion.observe(&session, (true, false), back);
+        let swap = motion
+            .pane_swap((true, false), back)
+            .expect("swapping back");
+        assert_eq!(swap.leaving, Pane::Conversation);
+        let (left, cover) = swap.cover(width);
+        assert_eq!(left, -motion::PANE_SLIDE_PX);
+        assert!(left + cover < width, "a strip shows on the right");
+        assert!(motion.pane_swap((true, false), later(back, 200)).is_none());
     }
 
     #[test]

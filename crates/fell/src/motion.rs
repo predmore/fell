@@ -70,6 +70,13 @@ pub fn fade_out(t: f32) -> f32 {
     (1.0 - t.clamp(0.0, 1.0)).powi(2)
 }
 
+/// Ease-out quadratic: the curve of a long glide ([`Glide::gentle_beyond`]).
+/// It leads the clock less than [`ease_out`] early on, so one late frame
+/// (up to [`MAX_STEP`] of a [`SLIDE`]) covers 48 % of the way, not 63 %.
+pub fn ease_out_quad(t: f32) -> f32 {
+    1.0 - fade_out(t)
+}
+
 pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
     from + (to - from) * t
 }
@@ -119,9 +126,23 @@ impl Clock {
     /// Motion time now, for a transition a key or a store reply starts.
     /// The next frame measures its step from here.
     pub fn now(&mut self) -> Instant {
-        let real = Instant::now();
-        self.last.get_or_insert(real);
-        self.at(real)
+        self.now_at(Instant::now())
+    }
+
+    /// [`Self::now`] at wall-clock `real`. Between frames this is the
+    /// motion time the next frame draws at: once wall time is more than
+    /// [`MAX_STEP`] past the last frame (a stall, a hidden window), that
+    /// frame is capped there, so a transition started now must start
+    /// there too, or it would sit at its start state until the capped
+    /// clock caught up with it.
+    pub fn now_at(&mut self, real: Instant) -> Instant {
+        match self.last {
+            Some(last) => self.at(real.min(last + MAX_STEP)),
+            None => {
+                self.last = Some(real);
+                self.at(real)
+            }
+        }
     }
 
     /// A frame starts at wall-clock `real`: the motion time it draws at.
@@ -260,6 +281,8 @@ pub struct Glide {
     pub from: f32,
     pub to: f32,
     transition: Transition,
+    /// On the gentler [`ease_out_quad`] curve: a long glide.
+    gentle: bool,
 }
 
 impl Glide {
@@ -287,11 +310,25 @@ impl Glide {
             from,
             to,
             transition: motion.start(duration, now)?,
+            gentle: false,
         })
     }
 
+    /// A glide over more than `distance` pixels eases out on the
+    /// quadratic curve, so one late frame cannot carry it half the way.
+    pub fn gentle_beyond(mut self, distance: f32) -> Glide {
+        self.gentle = (self.to - self.from).abs() > distance;
+        self
+    }
+
     pub fn value(&self, now: Instant) -> f32 {
-        lerp(self.from, self.to, self.transition.progress(now))
+        let t = self.transition.linear(now);
+        let p = if self.gentle {
+            ease_out_quad(t)
+        } else {
+            ease_out(t)
+        };
+        lerp(self.from, self.to, p)
     }
 
     pub fn running(&self, now: Instant) -> bool {
@@ -406,6 +443,23 @@ impl<R: Clone> ListShift<R> {
             replaced,
             reach,
         })
+    }
+
+    /// The list was replaced (another folder): the old list's rows below
+    /// the new list's last row, with their top in list content, have no
+    /// row arriving over them, so they fade out where they were over
+    /// [`FADE`] instead of vanishing in one frame. A shift that is not a
+    /// replacement already fades the rows that left; this does nothing.
+    pub fn fading_below(mut self, rows: Vec<(R, f32)>) -> ListShift<R> {
+        if self.replaced {
+            let fade = Transition::new(self.transition.started, FADE);
+            self.ghosts.extend(rows.into_iter().map(|(row, top)| Ghost {
+                row,
+                top,
+                transition: fade,
+            }));
+        }
+        self
     }
 
     /// How far row `id`, whose slot starts at viewport `top`, starts from
@@ -796,6 +850,79 @@ mod tests {
     }
 
     #[test]
+    fn a_transition_started_after_a_gap_starts_on_the_next_frame() {
+        let start = Instant::now();
+        let mut clock = Clock::default();
+        clock.frame(start);
+        clock.frame(at(start, 16));
+        // A key 80 ms after the last frame, and its frame right after it.
+        // That frame is capped one step on; the fade must start there,
+        // not 80 ms of wall time ahead of it.
+        let began = clock.now_at(at(start, 96));
+        assert_eq!(began, at(start, 16) + MAX_STEP);
+        let fade = Transition::new(began, QUICK);
+        let first = clock.frame(at(start, 97));
+        assert_eq!(first, began, "the first frame draws its start");
+        let second = clock.frame(at(start, 113));
+        assert!(fade.linear(second) > 0.19, "{}", fade.linear(second));
+        assert!(fade.running(second));
+        // Steady frames from there finish it in its time from the first.
+        let mut t = second;
+        for ms in [129, 145, 161, 177] {
+            t = clock.frame(at(start, ms));
+        }
+        assert!(!fade.running(t), "{}", fade.linear(t));
+        // Within one step of the last frame, a key starts at wall time.
+        let soon = clock.now_at(at(start, 187));
+        assert_eq!(soon, clock.at(at(start, 187)));
+    }
+
+    #[test]
+    fn a_transition_started_in_a_hidden_window_starts_when_it_shows() {
+        let start = Instant::now();
+        let mut clock = Clock::default();
+        clock.frame(start);
+        // Hidden: no frame for two seconds, then a store reply starts a fade.
+        let began = clock.now_at(at(start, 2000));
+        let fade = Transition::new(began, QUICK);
+        // Another start before the window shows lands on the same time.
+        assert_eq!(clock.now_at(at(start, 2500)), began);
+        // Shown at last: its first frame draws the start, the next ones run.
+        let first = clock.frame(at(start, 3000));
+        assert_eq!(fade.linear(first), 0.0);
+        let next = clock.frame(at(start, 3016));
+        assert!(fade.running(next) && fade.linear(next) > 0.0);
+        let mut t = next;
+        for ms in [3032, 3048, 3064, 3080] {
+            t = clock.frame(at(start, ms));
+        }
+        assert!(!fade.running(t), "{}", fade.linear(t));
+    }
+
+    #[test]
+    fn a_long_glide_eases_on_the_gentler_curve() {
+        let motion = Motion::new(true);
+        let start = Instant::now();
+        let short = Glide::start(&motion, 0.0, 100.0, 0.0, SLIDE, start)
+            .unwrap()
+            .gentle_beyond(300.0);
+        let long = Glide::start(&motion, 0.0, 600.0, 0.0, SLIDE, start)
+            .unwrap()
+            .gentle_beyond(300.0);
+        // One late frame: a whole MAX_STEP of the glide at once.
+        let late = start + MAX_STEP;
+        assert!(
+            short.value(late) / 100.0 > 0.6,
+            "short keeps the snappier curve"
+        );
+        let share = long.value(late) / 600.0;
+        assert!(share < 0.5, "one late frame covers {share}");
+        assert_eq!(long.value(at(start, 120)), 600.0, "lands exactly");
+        assert_eq!(ease_out_quad(0.0), 0.0);
+        assert_eq!(ease_out_quad(1.0), 1.0);
+    }
+
+    #[test]
     fn a_late_first_frame_does_not_eat_the_arrival() {
         let start = Instant::now();
         let mut switched = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], true, start);
@@ -835,6 +962,40 @@ mod tests {
         let b = switched.row("b", 0.0, None, at(start, 20));
         assert_eq!(b.dy, 0.0, "a shared row fades in with the rest");
         assert!(b.opacity < 1.0);
+    }
+
+    #[test]
+    fn a_shorter_folder_fades_out_the_rows_below_its_end() {
+        let start = Instant::now();
+        // `gs` from a long inbox: Sent has two rows, the inbox showed four.
+        let mut switched = shift(
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0), ("d", 204.0)],
+            &[],
+            vec![],
+            true,
+            start,
+        )
+        .fading_below(vec![("c", 136.0), ("d", 204.0)]);
+        // Sent's rows arrive in place; the inbox's last two fade below them.
+        let fading = switched.ghosts_in(68.0, f32::INFINITY, start);
+        assert_eq!(fading.len(), 2);
+        assert!(fading.iter().all(|(_, _, opacity)| *opacity == 1.0));
+        let row = switched.row("s1", 0.0, None, start);
+        assert!(row.opacity < 1.0, "Sent's rows arrive");
+        let mid = switched.ghosts_in(68.0, f32::INFINITY, at(start, 60));
+        assert!(
+            mid.iter()
+                .all(|(_, _, opacity)| *opacity > 0.0 && *opacity < 1.0)
+        );
+        assert!(switched.running(at(start, 100)));
+        assert!(
+            switched
+                .ghosts_in(68.0, f32::INFINITY, at(start, 120))
+                .is_empty()
+        );
+        // Not a replacement: nothing is added (rows that left are ghosts already).
+        let kept = shift(&[("a", 0.0)], &[], vec![], false, start).fading_below(vec![("z", 68.0)]);
+        assert!(kept.ghosts_in(0.0, f32::INFINITY, start).is_empty());
     }
 
     #[test]
