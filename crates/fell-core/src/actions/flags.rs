@@ -317,6 +317,7 @@ mod tests {
             list_id: None,
             reply_to: Vec::new(),
             attachment_names: Vec::new(),
+            parts: None,
         }
     }
 
@@ -772,6 +773,38 @@ mod tests {
             store.apply_delta(&account, &inbox_still_unread).unwrap();
             assert!(flags(&store, &account, &thread)[0].0);
         }
+    }
+
+    #[test]
+    fn a_flags_only_update_keeps_a_local_read_whichever_way_it_finds_the_row() {
+        // FLAGS-only updates find their row by its remote id, by an alias
+        // (another Message-ID folded onto it), or by a copy recorded for it
+        // (#175). Each of those must keep the read made in Fell.
+        let (store, account) = store();
+        let thread = two_copies(&store, &account);
+        store
+            .conn
+            .execute(
+                "INSERT INTO message_aliases (
+                    account_id, message_id, canonical_message_id, remote_id, folder
+                 ) VALUES (?1, 'list-copy@x', 'c@x', 'imap:1:7:Lists', 'Lists')",
+                rusqlite::params![account.as_str()],
+            )
+            .unwrap();
+        for (remote, path) in [
+            ("imap:1:5:INBOX", "remote id"),
+            ("imap:1:7:Lists", "alias"),
+            ("imap:1:9:Sent", "recorded copy"),
+        ] {
+            store
+                .apply_delta(&account, &copy_delta(remote, true))
+                .unwrap();
+            assert!(
+                !flags(&store, &account, &thread)[0].0,
+                "a FLAGS-only unread found by its {path} took back the read"
+            );
+        }
+        assert_eq!(store.pending_flag_changes(&account).unwrap().len(), 1);
     }
 
     #[test]

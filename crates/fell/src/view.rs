@@ -781,12 +781,6 @@ impl Inbox {
                 } else {
                     width
                 };
-                let look = RowLook {
-                    selected: false,
-                    fading: None,
-                    ghost: true,
-                    bar_dx: 0.0,
-                };
                 let text_width = row_text_width(list_width);
                 let from = warm.rows_drawn;
                 let chunk: Vec<ThreadRow> = warm
@@ -808,13 +802,19 @@ impl Inbox {
                         entity.update(app, |_, cx| {
                             range
                                 .map(|index| {
+                                    let look = RowLook {
+                                        selected: false,
+                                        fading: None,
+                                        ghost: true,
+                                        bar_dx: 0.0,
+                                        frame: still_frame(&chunk[index], window),
+                                    };
                                     thread_row(
                                         &row_theme,
                                         &chunk[index],
                                         index,
                                         look,
                                         text_width,
-                                        still_frame(&chunk[index], window),
                                         window,
                                         cx,
                                     )
@@ -2671,17 +2671,10 @@ fn thread_list(
                                 .filter(|_| !selected),
                             ghost: false,
                             bar_dx,
-                        };
-                        let element = thread_row(
-                            &theme_for_rows,
-                            &row,
-                            index,
-                            look,
-                            text_width,
                             frame,
-                            window,
-                            cx,
-                        );
+                        };
+                        let element =
+                            thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
                         let Some(shift) = inbox.motion.list.as_mut() else {
                             return element;
                         };
@@ -2710,15 +2703,14 @@ fn thread_list(
                                     fading: None,
                                     ghost: true,
                                     bar_dx,
+                                    frame: still_frame(&gone, window),
                                 };
-                                let frame = still_frame(&gone, window);
                                 slot_layer(dy, opacity).child(thread_row(
                                     &theme_for_rows,
                                     &gone,
                                     index,
                                     look,
                                     text_width,
-                                    frame,
                                     window,
                                     cx,
                                 ))
@@ -2820,6 +2812,8 @@ struct RowLook {
     ghost: bool,
     /// How far right of its place the unread bar is drawn ([`unread_bar_dx`]).
     bar_dx: f32,
+    /// Its weight, star and subject box this frame.
+    frame: RowFrame,
 }
 
 /// The list's left border, which the unread bars sit just inside.
@@ -2840,11 +2834,11 @@ fn thread_row(
     index: usize,
     look: RowLook,
     text_width: f32,
-    frame: RowFrame,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let selected = look.selected;
+    let frame = look.frame;
     let id = row.id.clone();
     let element_id = if look.ghost {
         gpui::ElementId::Name(format!("ghost-{}", row.id).into())
