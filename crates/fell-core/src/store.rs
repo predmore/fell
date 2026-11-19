@@ -29,7 +29,7 @@ mod summaries;
 mod threads;
 mod write_lock;
 
-pub use bodies::{BodyRequest, PartKinds};
+pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -858,6 +858,18 @@ impl Store {
             return Ok(None);
         };
         bodies::read(&self.conn, account_id, &canonical)
+    }
+
+    /// Read a canonical message's HTML, plain text and bulk headers only if
+    /// its stored body still has the revision returned by
+    /// [`Store::stored_part_kinds`]. Attachment metadata is left out.
+    pub fn message_body_at_stamp(
+        &self,
+        account_id: &AccountId,
+        message_id: &str,
+        stamp: PartStamp,
+    ) -> Result<Option<crate::MessageParts>> {
+        bodies::read_at_stamp(&self.conn, account_id, message_id, stamp)
     }
 
     /// The attachments, `cid:` images and signatures of one message, by its

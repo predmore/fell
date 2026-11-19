@@ -70,6 +70,8 @@ pub struct ConvMessage {
 pub enum Rich {
     /// No HTML part is stored: paint [`ConvMessage::body`].
     Plain,
+    /// The stored plain part, used when the HTML has no native output.
+    PlainPart(std::sync::Arc<RenderedBody>),
     /// No parts are stored at all yet (mail synced before they were kept).
     /// Paints the stored text; opening the message asks sync for the parts.
     Missing,
@@ -83,6 +85,7 @@ impl PartialEq for Rich {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Html(a), Self::Html(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::PlainPart(a), Self::PlainPart(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
@@ -93,7 +96,7 @@ impl Eq for Rich {}
 impl std::fmt::Debug for Rich {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Plain => "Plain",
+            Self::Plain | Self::PlainPart(_) => "Plain",
             Self::Missing => "Missing",
             Self::Pending => "Pending",
             Self::Html(_) => "Html",

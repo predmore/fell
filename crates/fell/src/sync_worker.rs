@@ -106,9 +106,8 @@ enum Ask {
     WriteBack,
 }
 
-/// The parts of one message fetched on open, or why they could not be.
-/// `Ok(None)` means the server had none to give.
-pub type BodyReply = Result<Option<MessageParts>, String>;
+/// Whether the fetch left a stored HTML part, or why it did not finish.
+pub type BodyReply = Result<bool, String>;
 
 pub struct SyncHandle {
     wake: Sender<Request>,
@@ -212,14 +211,12 @@ impl BodyQueue {
     }
 }
 
-/// What the window hears for one message: parts with a body, `None` when
-/// the server has none, or an error to ask again later when the fetch
-/// stopped short of it.
+/// The window only needs to know whether to reread for HTML. A fetch
+/// that stopped short of this message can be asked for again later.
 fn body_answer(parts: Option<MessageParts>) -> BodyReply {
     match parts {
         None => Err("not fetched yet".to_string()),
-        Some(parts) if parts.html.is_none() && parts.plain.is_none() => Ok(None),
-        Some(parts) => Ok(Some(parts)),
+        Some(parts) => Ok(parts.html.is_some()),
     }
 }
 
@@ -594,13 +591,20 @@ mod body_queue_tests {
     #[test]
     fn only_a_real_answer_is_final() {
         assert!(body_answer(None).is_err());
-        assert_eq!(body_answer(Some(MessageParts::default())), Ok(None));
+        assert_eq!(body_answer(Some(MessageParts::default())), Ok(false));
+        assert_eq!(
+            body_answer(Some(MessageParts {
+                plain: Some("plain".into()),
+                ..MessageParts::default()
+            })),
+            Ok(false)
+        );
         let parts = MessageParts {
             html: Some("<p>x</p>".into()),
             plain: None,
             bulk_headers: Vec::new(),
             mime_parts: Vec::new(),
         };
-        assert_eq!(body_answer(Some(parts.clone())), Ok(Some(parts)));
+        assert_eq!(body_answer(Some(parts)), Ok(true));
     }
 }

@@ -56,8 +56,8 @@ pub use send::{
 };
 pub use smtp::SmtpConfig;
 pub use store::{
-    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, Participant,
-    SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,
+    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, PartStamp,
+    Participant, SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,
 };
 pub use sync::{
     SyncReport, fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once,

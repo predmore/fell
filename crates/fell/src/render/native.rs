@@ -1217,17 +1217,16 @@ fn shape_one(
 
 /// The x of each byte of a shaped left-to-right line, as `x_for_index`
 /// gives it: where the first glyph at or after the byte starts. The last
-/// entry is the line's width.
-fn byte_xs(line: &gpui::LineLayout, len: usize) -> Vec<f32> {
-    let mut xs = vec![f32::from(line.width); len + 1];
-    let glyphs: Vec<(usize, f32)> = line
-        .runs
-        .iter()
-        .flat_map(|run| run.glyphs.iter())
-        .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
-        .collect();
+/// entry is the line's width. Mixed-direction glyph order can make byte
+/// offsets unusable even in a paragraph that's left-aligned.
+fn byte_xs(glyphs: impl Iterator<Item = (usize, f32)>, len: usize, width: f32) -> Option<Vec<f32>> {
+    let glyphs: Vec<_> = glyphs.collect();
+    if !glyphs.iter().map(|(index, _)| index).is_sorted() {
+        return None;
+    }
+    let mut xs = vec![width; len + 1];
     let mut next = glyphs.len();
-    let mut x = f32::from(line.width);
+    let mut x = width;
     for at in (0..=len).rev() {
         while next > 0 && glyphs[next - 1].0 >= at {
             next -= 1;
@@ -1235,7 +1234,7 @@ fn byte_xs(line: &gpui::LineLayout, len: usize) -> Vec<f32> {
         }
         xs[at] = x;
     }
-    xs
+    Some(xs)
 }
 
 /// The byte ranges of inline code (with its padding), which a line breaks
@@ -1447,25 +1446,31 @@ impl Element for MailText {
                         &slice_runs(&runs, range),
                     )
                 };
-                // Left to right, a range's width is the distance between
+                // In byte order, a range's width is the distance between
                 // its ends on its whole line, shaped once, with each byte's
                 // x looked up, so a long run of text without spaces wraps
-                // in linear time. Right to left, glyphs are not in byte
-                // order: each range is shaped.
-                let mut hard: Vec<(usize, Vec<f32>)> = Vec::new();
+                // in linear time. When glyphs are reordered, shape each
+                // range instead.
+                let mut hard = Vec::new();
                 if !rtl {
                     let mut at = 0;
                     for line in text.split('\n') {
                         let range = at..at + line.len();
                         let shaped = shape(&range, window);
-                        hard.push((at, byte_xs(&shaped.unwrapped_layout, line.len())));
+                        let layout = &shaped.unwrapped_layout;
+                        let glyphs = layout
+                            .runs
+                            .iter()
+                            .flat_map(|run| &run.glyphs)
+                            .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
+                        hard.push((at, byte_xs(glyphs, line.len(), f32::from(layout.width))));
                         at += line.len() + 1;
                     }
                 }
                 let wrapped = wrap_mail(&text, width.map(f32::from), &keep, |range| {
                     let line = hard.partition_point(|(start, _)| *start <= range.start);
                     match line.checked_sub(1).map(|line| &hard[line]) {
-                        Some((start, xs)) if range.end - start < xs.len() => {
+                        Some((start, Some(xs))) if range.end - start < xs.len() => {
                             xs[range.end - start] - xs[range.start - start]
                         }
                         _ => f32::from(shape(&range, window).unwrapped_layout.width),
@@ -2922,6 +2927,23 @@ mod decode_tests {
         let lines = wrap_words(text, Some(7.0), |range| range.len() as f32);
         let lines: Vec<&str> = lines.iter().map(|range| &text[range.clone()]).collect();
         assert_eq!(lines, ["aaa bbb", "ccc", "ddd"]);
+    }
+
+    #[test]
+    fn english_led_mixed_direction_glyphs_need_range_shaping() {
+        let text = "Hi אבג now";
+        assert!(!super::is_right_to_left(text));
+        // The Hebrew word's clusters go backward in visual glyph order.
+        let visual_order = [0, 1, 2, 7, 5, 3, 9, 10, 11, 12];
+        let glyphs = visual_order
+            .into_iter()
+            .enumerate()
+            .map(|(x, byte)| (byte, x as f32));
+        assert!(super::byte_xs(glyphs, text.len(), 10.0).is_none());
+        assert_eq!(
+            super::byte_xs([(0, 0.0), (1, 2.0), (1, 3.0)].into_iter(), 3, 5.0),
+            Some(vec![0.0, 2.0, 5.0, 5.0])
+        );
     }
 
     #[test]

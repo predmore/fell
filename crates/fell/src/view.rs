@@ -28,7 +28,9 @@ use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
 use crate::keymap::KeyId;
-use crate::mail_body::{self, BodyAsks, BodyCache, BodyJob, HtmlBody, PreparedBody};
+use crate::mail_body::{
+    self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
+};
 use crate::mailbox;
 use crate::model::{
     DRAFT_NOT_THREAD, Fetch, Overlay, QueryFault, Session, Step, SyncKind, Toast, row_key,
@@ -230,8 +232,8 @@ struct Inbox {
     warmed_folder: Option<String>,
     /// Prepared HTML bodies by message id, so reopening prepares nothing.
     bodies: BodyCache,
-    /// Bodies being read or prepared now.
-    bodies_busy: HashSet<String>,
+    /// Body revisions to load for the current conversation and work in flight.
+    body_loads: BodyLoads,
     /// Messages whose parts were asked of sync, and what came back.
     bodies_asked: BodyAsks,
     /// The reader's message to hold at the top of the conversation until
@@ -321,7 +323,7 @@ impl Inbox {
             warm: None,
             warmed_folder: None,
             bodies: BodyCache::default(),
-            bodies_busy: HashSet::new(),
+            body_loads: BodyLoads::default(),
             bodies_asked: BodyAsks::default(),
             landing: None,
         };
@@ -1122,6 +1124,7 @@ impl Inbox {
         if let Some(draft) = self.session.cursor_draft() {
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
+            self.body_loads.clear();
             let shown = self
                 .drafts
                 .iter()
@@ -1151,8 +1154,7 @@ impl Inbox {
         let names = self.session.folders.clone();
         let viewing = self.session.folder.clone();
         let thread = id.clone();
-        let cached = self.bodies.snapshot();
-        let busy = self.bodies_busy.clone();
+        let cached = self.bodies.stamps();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
                 return None;
@@ -1163,8 +1165,7 @@ impl Inbox {
                     .map(|messages| {
                         let mut view =
                             present::conversation(&messages, &me, &roles, &names, &viewing);
-                        let reads =
-                            mail_body::read_bodies(store, &account, &mut view, &cached, &busy);
+                        let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
                         (view, reads)
                     })
                     .map_err(|err| err.to_string()),
@@ -1183,12 +1184,10 @@ impl Inbox {
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
                     Ok((mut view, reads)) => {
-                        for prepared in &reads.prepared {
-                            inbox.cache_body(prepared, cx);
-                        }
-                        for job in reads.jobs {
-                            inbox.prepare_body(job, cx);
-                        }
+                        let evicted = inbox
+                            .body_loads
+                            .accept(reads, &mut inbox.bodies, &mut view);
+                        Self::drop_body_images(evicted, cx);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
                         if same {
@@ -1242,12 +1241,12 @@ impl Inbox {
             else {
                 continue;
             };
-            if !matches!(old.rich, Rich::Plain | Rich::Missing) {
+            if !matches!(old.rich, Rich::Plain | Rich::PlainPart(_) | Rich::Missing) {
                 continue;
             }
             match message.rich {
                 Rich::Pending => message.rich = old.rich.clone(),
-                Rich::Html(_) => {
+                Rich::Html(_) | Rich::PlainPart(_) if message.rich != old.rich => {
                     let now = self.motion.clock.now();
                     self.motion.body_arrived(&message.id, now);
                 }
@@ -1258,14 +1257,15 @@ impl Inbox {
 
     /// Prepare one body on the background executor. It lands in the cache
     /// and, if its thread is still open, fades in under its header.
-    fn prepare_body(&mut self, job: BodyJob, cx: &mut Context<Self>) {
-        self.bodies_busy.insert(job.id.clone());
+    fn prepare_body(&mut self, job: BodyJob, load: BodyLoad, cx: &mut Context<Self>) {
         let task = cx.background_executor().spawn(async move { job.prepare() });
         cx.spawn(async move |this, cx| {
             let prepared = task.await;
             let _ = this.update(cx, |inbox, cx| {
-                inbox.bodies_busy.remove(&prepared.id);
-                inbox.body_ready(prepared, cx);
+                if inbox.body_loads.finish(&prepared.id, load) {
+                    inbox.body_ready(prepared, cx);
+                }
+                // A stale completion has freed the slot for a newer revision.
                 cx.notify();
             });
         })
@@ -1273,16 +1273,20 @@ impl Inbox {
     }
 
     fn body_ready(&mut self, prepared: PreparedBody, cx: &mut Context<Self>) {
-        self.cache_body(&prepared, cx);
+        Self::drop_body_images(self.bodies.insert(&prepared), cx);
+        let rich = prepared.rich();
         let id = prepared.id;
         let mut above_reader = false;
         for (index, message) in self.session.messages.iter_mut().enumerate() {
             if message.id != id {
                 continue;
             }
-            let arrived = matches!(message.rich, Rich::Pending | Rich::Missing | Rich::Plain);
-            let changed = message.rich != Rich::Html(Arc::clone(&prepared.body));
-            message.rich = Rich::Html(Arc::clone(&prepared.body));
+            let arrived = matches!(
+                message.rich,
+                Rich::Pending | Rich::Missing | Rich::Plain | Rich::PlainPart(_)
+            );
+            let changed = message.rich != rich;
+            message.rich = rich.clone();
             if message.expanded && changed {
                 above_reader |= index < self.session.message_cursor;
                 if arrived {
@@ -1313,8 +1317,8 @@ impl Inbox {
         (f32::from(cursor.top() + offset) - f32::from(viewport.top())).abs() < 1.0
     }
 
-    fn cache_body(&mut self, prepared: &PreparedBody, cx: &mut Context<Self>) {
-        for old in self.bodies.insert(prepared) {
+    fn drop_body_images(evicted: Vec<Arc<HtmlBody>>, cx: &mut Context<Self>) {
+        for old in evicted {
             for image in old.gallery.images() {
                 cx.drop_image(Arc::clone(image), None);
             }
@@ -1336,19 +1340,16 @@ impl Inbox {
     /// that keeps it open) starts its body.
     fn want_bodies(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let mut read: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut read = Vec::new();
         let mut fetch = Vec::new();
         for message in self.session.messages.iter().filter(|m| m.expanded) {
-            match message.rich {
-                Rich::Pending if !self.bodies_busy.contains(&message.id) => {
-                    read.push((message.id.clone(), message.mail_headers.clone()));
-                }
-                Rich::Missing
-                    if self.sync.is_some() && self.bodies_asked.should_ask(&message.id, now) =>
-                {
-                    fetch.push(message.id.clone());
-                }
-                _ => {}
+            if let Some(load) = self.body_loads.begin(&message.id) {
+                read.push((message.id.clone(), load, message.mail_headers.clone()));
+            } else if message.rich == Rich::Missing
+                && self.sync.is_some()
+                && self.bodies_asked.should_ask(&message.id, now)
+            {
+                fetch.push(message.id.clone());
             }
         }
         for id in fetch {
@@ -1357,28 +1358,36 @@ impl Inbox {
         if read.is_empty() {
             return;
         }
-        self.bodies_busy
-            .extend(read.iter().map(|(id, _)| id.clone()));
+        let pending: Vec<_> = read
+            .iter()
+            .map(|(id, load, _)| (id.clone(), *load))
+            .collect();
         let account = self.account_id.clone();
         let reply = self.store.call(move |store| {
             read.into_iter()
-                .map(|(id, headers)| {
-                    let job = mail_body::read_job(store, &account, &id, &headers);
-                    (id, job)
+                .map(|(id, load, headers)| {
+                    mail_body::read_job_at_stamp(store, &account, &id, load.stamp, &headers)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn(async move |this, cx| {
-            let Ok(jobs) = reply.await else {
-                return;
-            };
+            let mut jobs = reply.await.unwrap_or_default().into_iter();
             let _ = this.update(cx, |inbox, cx| {
-                for (id, job) in jobs {
-                    inbox.bodies_busy.remove(&id);
-                    match job {
-                        Some(job) => inbox.prepare_body(job, cx),
-                        None => inbox.body_is_plain(&id),
+                let mut reread = false;
+                for (id, load) in pending {
+                    match jobs.next() {
+                        Some(Ok(Some(job))) if inbox.body_loads.is_wanted(&id, load) => {
+                            inbox.prepare_body(job, load, cx);
+                        }
+                        result if inbox.body_loads.finish(&id, load) => {
+                            inbox.body_is_plain(&id);
+                            reread |= matches!(result, Some(Ok(None)));
+                        }
+                        _ => {}
                     }
+                }
+                if reread {
+                    inbox.reread_open_thread(cx);
                 }
                 cx.notify();
             });
@@ -1401,12 +1410,16 @@ impl Inbox {
             let reply = answer.await;
             let _ = this.update(cx, |inbox, cx| {
                 match reply {
-                    Ok(Ok(parts)) => {
+                    Ok(Ok(has_html)) => {
                         inbox.bodies_asked.answered(&id);
-                        if parts.is_some_and(|parts| parts.html.is_some()) {
+                        if has_html {
                             inbox.reread_open_thread(cx);
                         } else {
-                            inbox.body_is_plain(&id);
+                            for message in &mut inbox.session.messages {
+                                if message.id == id && message.rich == Rich::Missing {
+                                    message.rich = Rich::Plain;
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -1919,6 +1932,7 @@ impl Inbox {
     }
 
     fn clear_open_message(&mut self) {
+        self.body_loads.clear();
         self.session.messages.clear();
         self.open_thread = None;
         self.open_subject.clear();
@@ -3968,12 +3982,16 @@ fn message_body(
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(body) => html_sections(theme, body, folds, reveal, cx),
         Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
-        Rich::Plain | Rich::Missing => {
+        Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
             let mut drafts: HashMap<usize, gpui::AnyElement> = HashMap::new();
-            for (at, block) in message.body.blocks.iter().enumerate() {
+            let body = match &message.rich {
+                Rich::PlainPart(plain) => plain,
+                _ => &message.body,
+            };
+            for (at, block) in body.blocks.iter().enumerate() {
                 let (kind, text) = match block {
                     BodyBlock::Text(text) => (None, text.as_str()),
                     BodyBlock::Markdown { doc, agent } => {

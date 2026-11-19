@@ -18,15 +18,16 @@
 //! so reopening a thread prepares nothing and a resync that replaces a
 //! body is prepared again.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fell_core::{AccountId, MessageId, Store};
+use fell_core::{AccountId, PartStamp, Store};
 use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
 
 use crate::present::{ConvMessage, Rich};
 use crate::render::{ImageGallery, Palette};
+use crate::text_render::{RenderedBody, render_stored_body};
 use crate::theme::Theme;
 
 /// One message's HTML, prepared for the native painter.
@@ -45,22 +46,42 @@ pub struct HtmlBody {
 pub struct BodyJob {
     pub id: String,
     /// [`fell_core::PartKinds::stamp`] of the parts read.
-    pub stamp: u64,
+    pub stamp: PartStamp,
     html: String,
+    plain: Option<String>,
     headers: Vec<(String, String)>,
 }
 
 /// A prepared body and the stamp of the parts it was prepared from.
 pub struct PreparedBody {
     pub id: String,
-    pub stamp: u64,
+    pub stamp: PartStamp,
     pub body: Arc<HtmlBody>,
+    fallback: Option<Arc<RenderedBody>>,
+}
+
+impl PreparedBody {
+    pub fn rich(&self) -> Rich {
+        if !self.body.folded.document.is_empty() {
+            Rich::Html(Arc::clone(&self.body))
+        } else if let Some(plain) = &self.fallback {
+            Rich::PlainPart(Arc::clone(plain))
+        } else {
+            Rich::Plain
+        }
+    }
 }
 
 impl BodyJob {
     pub fn prepare(self) -> PreparedBody {
+        let body = prepare_html(&self.html, &self.headers);
+        let fallback = self
+            .plain
+            .filter(|plain| body.folded.document.is_empty() && !plain.trim().is_empty())
+            .map(|plain| Arc::new(render_stored_body(Some(&plain), "")));
         PreparedBody {
-            body: Arc::new(prepare_html(&self.html, &self.headers)),
+            body: Arc::new(body),
+            fallback,
             id: self.id,
             stamp: self.stamp,
         }
@@ -126,33 +147,34 @@ const CACHED_BODIES: usize = 96;
 /// on the background executor instead.
 pub const STORE_PREPARE_BYTES: u64 = 32 * 1024;
 
-/// Cached bodies by message id, with the stamp of the parts each came from.
-pub type CachedBodies = HashMap<String, (u64, Arc<HtmlBody>)>;
-
 #[derive(Default)]
 pub struct BodyCache {
-    entries: CachedBodies,
+    entries: HashMap<String, (PartStamp, Rich)>,
     order: VecDeque<String>,
 }
 
 impl BodyCache {
-    /// The cached bodies, for a store-thread read to use instead of
-    /// preparing again. Clones handles, not documents.
-    pub fn snapshot(&self) -> CachedBodies {
-        self.entries.clone()
+    /// Which bodies were already prepared when a store read started.
+    pub fn stamps(&self) -> HashMap<String, PartStamp> {
+        self.entries
+            .iter()
+            .map(|(id, (stamp, _))| (id.clone(), *stamp))
+            .collect()
     }
 
     /// Cache a prepared body. Returns what fell out, whose images the
     /// caller removes from the sprite atlas.
     pub fn insert(&mut self, prepared: &PreparedBody) -> Vec<Arc<HtmlBody>> {
         let id = prepared.id.clone();
-        let body = Arc::clone(&prepared.body);
+        let rich = prepared.rich();
         let mut evicted = Vec::new();
         if let Some((_, old)) = self
             .entries
-            .insert(id.clone(), (prepared.stamp, Arc::clone(&body)))
+            .insert(id.clone(), (prepared.stamp, rich.clone()))
         {
-            if !Arc::ptr_eq(&old, &body) {
+            if old != rich
+                && let Rich::Html(old) = old
+            {
                 evicted.push(old);
             }
             self.order.retain(|known| known != &id);
@@ -160,7 +182,7 @@ impl BodyCache {
         self.order.push_back(id);
         while self.order.len() > CACHED_BODIES {
             if let Some(oldest) = self.order.pop_front()
-                && let Some((_, old)) = self.entries.remove(&oldest)
+                && let Some((_, Rich::Html(old))) = self.entries.remove(&oldest)
             {
                 evicted.push(old);
             }
@@ -177,29 +199,22 @@ impl BodyCache {
 /// What the store thread found for a conversation's bodies.
 #[derive(Default)]
 pub struct BodyReads {
-    /// Bodies prepared on the store thread, to cache.
-    pub prepared: Vec<PreparedBody>,
-    /// Bodies to prepare on the background executor.
-    pub jobs: Vec<BodyJob>,
+    /// Bodies prepared on the store thread and their positions in the read.
+    prepared: Vec<(usize, PreparedBody)>,
+    /// The stored revision of each HTML body in the read.
+    stamps: HashMap<String, PartStamp>,
 }
 
-/// Fill in each message's [`Rich`] state on the store thread.
+/// Find which messages have HTML on the store thread.
 ///
-/// A cached body prepared from the stored parts is used as it is. An
-/// expanded message's HTML is read, and prepared here when it sits above
-/// the last message and fits what is left of [`STORE_PREPARE_BYTES`], so the
-/// thread arrives with the bodies above the reader's message in place. The
-/// last message's HTML, and any past the budget, come back as jobs.
-/// Collapsed messages stay [`Rich::Pending`] until they open; `busy` ids are
-/// being prepared already. An expanded message whose cached body is stale
-/// (the parts changed since) keeps painting it until the new one is ready.
-/// A store error leaves a message on its stored text.
+/// Prepare small expanded bodies above the last message here so they
+/// arrive in place. The window resolves the rest against its live cache
+/// and starts any remaining loads for the revisions returned here.
 pub fn read_bodies(
     store: &Store,
     account: &AccountId,
     messages: &mut [ConvMessage],
-    cached: &CachedBodies,
-    busy: &HashSet<String>,
+    cached: &HashMap<String, PartStamp>,
 ) -> BodyReads {
     let mut reads = BodyReads::default();
     let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -209,80 +224,154 @@ pub fn read_bodies(
     let last = messages.len().saturating_sub(1);
     let mut budget = STORE_PREPARE_BYTES;
     for (index, message) in messages.iter_mut().enumerate() {
-        let found = kinds.get(&message.id).copied();
-        let mut stale = false;
-        message.rich = match found {
-            Some(kinds) if kinds.html => match cached.get(&message.id) {
-                Some((stamp, body)) if *stamp == kinds.stamp => Rich::Html(Arc::clone(body)),
-                Some((_, body)) if message.expanded => {
-                    stale = true;
-                    Rich::Html(Arc::clone(body))
+        match kinds.get(&message.id) {
+            Some(kinds) if kinds.html => {
+                message.rich = Rich::Pending;
+                reads.stamps.insert(message.id.clone(), kinds.stamp);
+                if message.expanded
+                    && index < last
+                    && kinds.html_bytes <= budget
+                    && cached.get(&message.id) != Some(&kinds.stamp)
+                {
+                    budget -= kinds.html_bytes;
+                    if let Ok(Some(job)) = read_job_at_stamp(
+                        store,
+                        account,
+                        &message.id,
+                        kinds.stamp,
+                        &message.mail_headers,
+                    ) {
+                        reads.prepared.push((index, job.prepare()));
+                    }
                 }
-                _ => Rich::Pending,
-            },
-            Some(kinds) if kinds.plain => Rich::Plain,
-            _ => Rich::Missing,
-        };
-        if !message.expanded || busy.contains(&message.id) {
-            continue;
-        }
-        if !(stale || message.rich == Rich::Pending) {
-            continue;
-        }
-        let Some(kinds) = found else {
-            continue;
-        };
-        match read_job_with(
-            store,
-            account,
-            &message.id,
-            kinds.stamp,
-            &message.mail_headers,
-        ) {
-            Some(job) if index < last && kinds.html_bytes <= budget => {
-                budget -= kinds.html_bytes;
-                let prepared = job.prepare();
-                message.rich = Rich::Html(Arc::clone(&prepared.body));
-                reads.prepared.push(prepared);
             }
-            Some(job) => reads.jobs.push(job),
-            None if stale => {}
-            None => message.rich = Rich::Plain,
+            Some(kinds) if kinds.plain => message.rich = Rich::Plain,
+            _ => message.rich = Rich::Missing,
         }
     }
     reads
 }
 
-/// One message's stored HTML. `None` when it has none or the read failed.
-/// `mail_headers`: its [`ConvMessage::mail_headers`].
+/// Read the text parts that belong to the expected revision. `None` means
+/// the row changed or went away since the conversation read.
+pub fn read_job_at_stamp(
+    store: &Store,
+    account: &AccountId,
+    id: &str,
+    stamp: PartStamp,
+    mail_headers: &[(String, String)],
+) -> fell_core::Result<Option<BodyJob>> {
+    let Some(parts) = store.message_body_at_stamp(account, id, stamp)? else {
+        return Ok(None);
+    };
+    let mut headers = mail_headers.to_vec();
+    headers.extend(parts.bulk_headers);
+    Ok(parts.html.map(|html| BodyJob {
+        id: id.to_string(),
+        stamp,
+        html,
+        plain: parts.plain,
+        headers,
+    }))
+}
+
+#[cfg(test)]
 pub fn read_job(
     store: &Store,
     account: &AccountId,
     id: &str,
-    mail_headers: &[(String, String)],
+    headers: &[(String, String)],
 ) -> Option<BodyJob> {
     let stamp = store.stored_part_kinds(account, &[id]).ok()?.get(id)?.stamp;
-    read_job_with(store, account, id, stamp, mail_headers)
+    read_job_at_stamp(store, account, id, stamp, headers).ok()?
 }
 
-fn read_job_with(
-    store: &Store,
-    account: &AccountId,
-    id: &str,
-    stamp: u64,
-    mail_headers: &[(String, String)],
-) -> Option<BodyJob> {
-    let parts = store
-        .message_body(account, &MessageId(id.to_string()))
-        .ok()??;
-    let mut headers = mail_headers.to_vec();
-    headers.extend(parts.bulk_headers);
-    Some(BodyJob {
-        id: id.to_string(),
-        stamp,
-        html: parts.html?,
-        headers,
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyLoad {
+    pub stamp: PartStamp,
+    generation: u64,
+}
+
+/// Owns the unresolved revisions from the latest conversation read and the
+/// loads already running for them. A reread can change what is wanted while
+/// a load occupies the slot. The completion frees the slot for the new load.
+#[derive(Default)]
+pub struct BodyLoads {
+    wanted: HashMap<String, PartStamp>,
+    active: HashMap<String, BodyLoad>,
+    generation: u64,
+}
+
+impl BodyLoads {
+    /// Install the accepted conversation's bodies and remember what still
+    /// needs loading. Returns the cached images' owners that were evicted.
+    pub fn accept(
+        &mut self,
+        BodyReads { mut stamps, prepared }: BodyReads,
+        cache: &mut BodyCache,
+        messages: &mut [ConvMessage],
+    ) -> Vec<Arc<HtmlBody>> {
+        for message in messages.iter_mut() {
+            let Some(wanted) = stamps.get(&message.id) else {
+                continue;
+            };
+            if let Some((stamp, rich)) = cache.entries.get(&message.id) {
+                if stamp == wanted {
+                    message.rich = rich.clone();
+                    stamps.remove(&message.id);
+                } else if message.expanded {
+                    message.rich = rich.clone();
+                }
+            }
+        }
+        // Resolve the live cache before inserting anything. Cache eviction
+        // must not take a ready body away from this conversation.
+        let mut evicted = Vec::new();
+        for (index, body) in prepared {
+            if stamps.get(&body.id) == Some(&body.stamp) {
+                stamps.remove(&body.id);
+                messages[index].rich = body.rich();
+                evicted.extend(cache.insert(&body));
+            }
+        }
+        self.wanted = stamps;
+        evicted
+    }
+
+    pub fn clear(&mut self) {
+        self.wanted.clear();
+    }
+
+    pub fn begin(&mut self, id: &str) -> Option<BodyLoad> {
+        let stamp = *self.wanted.get(id)?;
+        if self.active.contains_key(id) {
+            return None;
+        }
+        self.generation += 1;
+        let load = BodyLoad {
+            stamp,
+            generation: self.generation,
+        };
+        self.active.insert(id.to_string(), load);
+        Some(load)
+    }
+
+    pub fn finish(&mut self, id: &str, load: BodyLoad) -> bool {
+        if self.active.get(id) != Some(&load) {
+            return false;
+        }
+        self.active.remove(id);
+        if self.is_wanted(id, load) {
+            self.wanted.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_wanted(&self, id: &str, load: BodyLoad) -> bool {
+        self.wanted.get(id) == Some(&load.stamp)
+    }
 }
 
 /// How long after a failed ask (sync not started, no connection) a body
@@ -369,8 +458,8 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 mod tests {
     use super::*;
     use fell_core::{
-        Account, Address, BackendKind, FolderRoles, Message, MessageHeaders, MessageParts,
-        RemoteId, ThreadId,
+        Account, Address, BackendKind, FolderRoles, Message, MessageHeaders, MessageId,
+        MessageParts, RemoteId, ThreadId,
     };
     use fell_render::{Fold, fixtures};
 
@@ -463,6 +552,17 @@ mod tests {
         store
     }
 
+    fn job(store: &Store, message: &ConvMessage, load: BodyLoad) -> Option<BodyJob> {
+        read_job_at_stamp(
+            store,
+            &account().id,
+            &message.id,
+            load.stamp,
+            &message.mail_headers,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_render_corpus_is_identical_through_the_inbox_path() {
         for fixture in fixtures().into_iter().chain(fell_render::corpus()) {
@@ -498,16 +598,13 @@ mod tests {
             }
             let store = store_with(&[message]);
             let mut view = open(&store, &id);
-            let reads = read_bodies(
-                &store,
-                &account().id,
-                &mut view,
-                &HashMap::new(),
-                &HashSet::new(),
-            );
+            let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+            assert!(reads.prepared.is_empty());
+            let mut loads = BodyLoads::default();
+            loads.accept(reads, &mut BodyCache::default(), &mut view);
             assert_eq!(view[0].rich, Rich::Pending, "{}", fixture.name);
-            assert_eq!(reads.jobs.len(), 1, "{}", fixture.name);
-            let body = reads.jobs.into_iter().next().unwrap().prepare().body;
+            let load = loads.begin(&view[0].id).unwrap();
+            let body = job(&store, &view[0], load).unwrap().prepare();
             // The same calls on the fixture as it sits on disk.
             let direct = prepare(&fixture.html, &fixture.headers);
             let expected = if fixture.headers.is_bulk() {
@@ -518,7 +615,11 @@ mod tests {
                     fixture.headers.get("Subject").unwrap_or_default(),
                 )
             };
-            assert_eq!(body.folded, expected, "{}", fixture.name);
+            match body.rich() {
+                Rich::Html(body) => assert_eq!(body.folded, expected, "{}", fixture.name),
+                Rich::Plain => assert!(expected.document.is_empty(), "{}", fixture.name),
+                other => panic!("unexpected body for {}: {other:?}", fixture.name),
+            }
         }
     }
 
@@ -555,13 +656,10 @@ mod tests {
         );
         let store = store_with(&[first, second, plain, bare, last]);
         let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &HashMap::new(),
-            &HashSet::new(),
-        );
+        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        assert_eq!(reads.prepared.len(), 1);
+        let mut loads = BodyLoads::default();
+        loads.accept(reads, &mut BodyCache::default(), &mut view);
         let states: Vec<_> = view
             .iter()
             .map(|message| format!("{:?}", message.rich))
@@ -570,9 +668,8 @@ mod tests {
         // read. Plain-only: stored text. No parts: stored text, and collapsed
         // so not asked for. Last: a job.
         assert_eq!(states, ["Html", "Pending", "Plain", "Missing", "Pending"]);
-        assert_eq!(reads.prepared.len(), 1);
-        assert_eq!(reads.jobs.len(), 1);
-        assert_eq!(reads.jobs[0].id, "e@fell.test");
+        assert!(loads.begin("a@fell.test").is_none());
+        assert!(loads.begin("e@fell.test").is_some());
         let Rich::Html(body) = &view[0].rich else {
             unreachable!()
         };
@@ -586,37 +683,25 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_body_is_used_and_a_busy_one_is_not_read_again() {
-        let only = mail(
-            "a@fell.test",
-            "a@fell.test",
-            0,
-            Some(html_parts("<p>x</p>", &[])),
-        );
-        let store = store_with(&[only]);
-        let prepared = read_job(&store, &account().id, "a@fell.test", &[])
-            .unwrap()
-            .prepare();
-        let body = Arc::clone(&prepared.body);
+    fn a_reread_uses_a_body_cached_since_it_started() {
+        let id = "a@fell.test";
+        let store = store_with(&[mail(id, id, 0, Some(html_parts("<p>x</p>", &[])))]);
         let mut cache = BodyCache::default();
+        let mut loads = BodyLoads::default();
+        let mut view = open(&store, id);
+        let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+        loads.accept(reads, &mut cache, &mut view);
+        let load = loads.begin(id).unwrap();
+
+        let mut next_view = open(&store, id);
+        let reread = read_bodies(&store, &account().id, &mut next_view, &cache.stamps());
+        let prepared = job(&store, &view[0], load).unwrap().prepare();
+        assert!(loads.finish(id, load));
         cache.insert(&prepared);
 
-        let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &cache.snapshot(),
-            &HashSet::new(),
-        );
-        assert_eq!(view[0].rich, Rich::Html(body));
-        assert!(reads.jobs.is_empty() && reads.prepared.is_empty());
-
-        let mut view = open(&store, "a@fell.test");
-        let busy: HashSet<String> = std::iter::once("a@fell.test".to_string()).collect();
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new(), &busy);
-        assert_eq!(view[0].rich, Rich::Pending);
-        assert!(reads.jobs.is_empty());
+        loads.accept(reread, &mut cache, &mut next_view);
+        assert_eq!(next_view[0].rich, prepared.rich());
+        assert!(loads.begin(id).is_none());
     }
 
     #[test]
@@ -624,15 +709,9 @@ mod tests {
         let only = mail("a@fell.test", "a@fell.test", 0, None);
         let store = store_with(&[only]);
         let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &HashMap::new(),
-            &HashSet::new(),
-        );
+        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
         assert_eq!(view[0].rich, Rich::Missing);
-        assert!(reads.jobs.is_empty() && reads.prepared.is_empty());
+        assert!(reads.stamps.is_empty() && reads.prepared.is_empty());
     }
 
     #[test]
@@ -669,8 +748,9 @@ mod tests {
         let body = Arc::new(prepare_html("<p>x</p>", &[]));
         let entry = |id: String, body: &Arc<HtmlBody>| PreparedBody {
             id,
-            stamp: 1,
+            stamp: PartStamp::default(),
             body: Arc::clone(body),
+            fallback: None,
         };
         let mut evicted = 0;
         for index in 0..CACHED_BODIES + 3 {
@@ -678,10 +758,10 @@ mod tests {
         }
         assert_eq!(evicted, 3);
         assert_eq!(cache.len(), CACHED_BODIES);
-        assert!(!cache.snapshot().contains_key("m0"));
+        assert!(!cache.stamps().contains_key("m0"));
         assert!(
             cache
-                .snapshot()
+                .stamps()
                 .contains_key(&format!("m{}", CACHED_BODIES + 2))
         );
         // Replacing an entry hands back the old one, unless it is the same.
@@ -692,49 +772,109 @@ mod tests {
     }
 
     #[test]
-    fn a_body_whose_parts_changed_is_prepared_again_and_shows_until_then() {
-        let first = mail(
-            "a@fell.test",
-            "a@fell.test",
-            0,
-            Some(html_parts("<p>first</p>", &[])),
-        );
-        let store = store_with(std::slice::from_ref(&first));
+    fn a_replacement_waits_for_older_work_then_loads_once() {
+        let id = "a@fell.test";
+        let mut message = mail(id, id, 0, Some(html_parts("<p>first</p>", &[])));
+        let store = store_with(std::slice::from_ref(&message));
         let mut cache = BodyCache::default();
-        let old = read_job(&store, &account().id, "a@fell.test", &[])
+        let mut loads = BodyLoads::default();
+        let mut first_view = open(&store, id);
+        let reads = read_bodies(&store, &account().id, &mut first_view, &cache.stamps());
+        loads.accept(reads, &mut cache, &mut first_view);
+        let first = loads.begin(id).unwrap();
+        let first_job = job(&store, &first_view[0], first).unwrap();
+
+        // A newer revision arrives while the initial prepare is running.
+        message.parts = Some(html_parts("<p>other</p>", &[]));
+        store.upsert_message(&message).unwrap();
+        let mut view = open(&store, id);
+        let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+        let second_stamp = reads.stamps[id];
+        assert_ne!(first.stamp, second_stamp);
+        loads.accept(reads, &mut cache, &mut view);
+        assert!(loads.begin(id).is_none());
+        assert!(job(&store, &first_view[0], first).is_none());
+
+        let stale = first_job.prepare();
+        assert!(!loads.finish(&stale.id, first));
+        let second = loads.begin(id).unwrap();
+        assert_eq!(second.stamp, second_stamp);
+        assert!(!loads.finish(id, first));
+        assert!(loads.begin(id).is_none());
+        let prepared = job(&store, &view[0], second).unwrap().prepare();
+        assert!(loads.finish(id, second));
+        assert!(loads.begin(id).is_none());
+        let Rich::Html(html) = prepared.rich() else {
+            panic!("expected the replacement HTML");
+        };
+        assert_eq!(html.folded.document.plain_text(), "other");
+
+        // The previously prepared body can stay on screen during a refresh.
+        cache.insert(&prepared);
+        message.parts = Some(html_parts("<p>third</p>", &[]));
+        store.upsert_message(&message).unwrap();
+        let mut view = open(&store, id);
+        let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+        loads.accept(reads, &mut cache, &mut view);
+        assert_eq!(view[0].rich, prepared.rich());
+        assert!(loads.begin(id).is_some());
+    }
+
+    #[test]
+    fn empty_prepared_html_uses_the_plain_part_then_the_stored_body_text() {
+        use crate::text_render::BodyBlock;
+
+        let id = "a@fell.test";
+        const PLAIN: &str = "Plain reply\n\n> Old text";
+        for plain in [Some(PLAIN), Some("   "), None] {
+            let mut parts = html_parts("<script>hidden()</script>", &[]);
+            parts.plain = plain.map(str::to_string);
+            let store = store_with(&[mail(id, id, 0, Some(parts))]);
+            let mut view = open(&store, id);
+            let mut cache = BodyCache::default();
+            let mut loads = BodyLoads::default();
+            let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+            loads.accept(reads, &mut cache, &mut view);
+            let load = loads.begin(id).unwrap();
+            let prepared = job(&store, &view[0], load).unwrap().prepare();
+            assert!(loads.finish(id, load));
+            cache.insert(&prepared);
+            let reread = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+            loads.accept(reread, &mut cache, &mut view);
+            assert!(loads.begin(id).is_none());
+            match (&view[0].rich, plain) {
+                (Rich::PlainPart(body), Some(PLAIN)) => {
+                    assert!(matches!(
+                        body.blocks.as_slice(),
+                        [BodyBlock::Text(text), BodyBlock::Quote(quote)]
+                            if text.as_str() == "Plain reply" && quote.contains("Old text")
+                    ));
+                }
+                (Rich::Plain, Some("   ") | None) => assert!(matches!(
+                    view[0].body.blocks.as_slice(),
+                    [BodyBlock::Text(text)] if text.as_str() == "stored text"
+                )),
+                (other, _) => panic!("unexpected fallback: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nonempty_native_html_keeps_its_output_even_without_text() {
+        let id = "a@fell.test";
+        let mut parts = html_parts(r#"<img src="https://news.test/chart.png">"#, &[]);
+        parts.plain = Some("plain alternative".to_string());
+        let store = store_with(&[mail(id, id, 0, Some(parts))]);
+        let mut view = open(&store, id);
+        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        let job = read_job_at_stamp(&store, &account().id, id, reads.stamps[id], &[])
             .unwrap()
-            .prepare();
-        cache.insert(&old);
-        // A resync replaces the parts.
-        let mut replaced = first.clone();
-        replaced.parts = Some(html_parts("<p>the second, longer version</p>", &[]));
-        store.upsert_message(&replaced).unwrap();
-        let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &cache.snapshot(),
-            &HashSet::new(),
-        );
-        // The old body stays on screen while the new one is prepared.
-        assert_eq!(view[0].rich, Rich::Html(Arc::clone(&old.body)));
-        assert_eq!(reads.jobs.len(), 1);
-        let new = reads.jobs.into_iter().next().unwrap().prepare();
-        assert_ne!(new.stamp, old.stamp);
-        assert!(new.body.folded.document.plain_text().contains("second"));
-        // Once cached, it is used as it is.
-        cache.insert(&new);
-        let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &cache.snapshot(),
-            &HashSet::new(),
-        );
-        assert_eq!(view[0].rich, Rich::Html(new.body));
-        assert!(reads.jobs.is_empty());
+            .unwrap();
+        let Rich::Html(body) = job.prepare().rich() else {
+            panic!("the native image placeholder was lost");
+        };
+        assert!(!body.folded.document.is_empty());
+        assert!(body.folded.document.plain_text().is_empty());
     }
 
     #[test]
@@ -775,13 +915,10 @@ mod tests {
         ));
         let store = store_with(&messages);
         let mut view = open(&store, "m0@fell.test");
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &HashMap::new(),
-            &HashSet::new(),
-        );
+        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        assert_eq!(reads.prepared.len(), 1);
+        let mut loads = BodyLoads::default();
+        loads.accept(reads, &mut BodyCache::default(), &mut view);
         let states: Vec<_> = view
             .iter()
             .map(|message| format!("{:?}", message.rich))
@@ -789,8 +926,10 @@ mod tests {
         // The first fits the budget; the next two do not and go to the
         // background with the last, holding their space meanwhile.
         assert_eq!(states, ["Html", "Pending", "Pending", "Pending"]);
-        assert_eq!(reads.prepared.len(), 1);
-        assert_eq!(reads.jobs.len(), 3);
+        assert!(loads.begin("m0@fell.test").is_none());
+        for id in ["m1@fell.test", "m2@fell.test", "last@fell.test"] {
+            assert!(loads.begin(id).is_some());
+        }
     }
 
     #[test]
@@ -856,40 +995,32 @@ mod tests {
         let mut cache = BodyCache::default();
         // Cold: every expanded body is read and prepared.
         let mut view = open(&store, "m0@fell.test");
+        let mut loads = BodyLoads::default();
         let started = Instant::now();
-        let reads = read_bodies(
-            &store,
-            &account().id,
-            &mut view,
-            &cache.snapshot(),
-            &HashSet::new(),
-        );
+        let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+        loads.accept(reads, &mut cache, &mut view);
+        for message in view.iter().filter(|message| message.expanded) {
+            if let Some(load) = loads.begin(&message.id) {
+                cache.insert(&job(&store, message, load).unwrap().prepare());
+                assert!(loads.finish(&message.id, load));
+            }
+        }
         let cold = started.elapsed();
-        for prepared in &reads.prepared {
-            cache.insert(prepared);
-        }
-        for job in reads.jobs {
-            cache.insert(&job.prepare());
-        }
         // Warm the rest, as opening each message would.
         for message in &view {
-            if let Some(job) = read_job(&store, &account().id, &message.id, &message.mail_headers) {
-                cache.insert(&job.prepare());
+            if let Some(load) = loads.begin(&message.id) {
+                cache.insert(&job(&store, message, load).unwrap().prepare());
+                assert!(loads.finish(&message.id, load));
             }
         }
         let mut samples = Vec::new();
         for _ in 0..25 {
             let started = Instant::now();
             let mut view = open(&store, "m0@fell.test");
-            let reads = read_bodies(
-                &store,
-                &account().id,
-                &mut view,
-                &cache.snapshot(),
-                &HashSet::new(),
-            );
+            let reads = read_bodies(&store, &account().id, &mut view, &cache.stamps());
+            assert!(reads.prepared.is_empty());
+            loads.accept(reads, &mut cache, &mut view);
             samples.push(started.elapsed());
-            assert!(reads.jobs.is_empty() && reads.prepared.is_empty());
             assert!(
                 view.iter()
                     .all(|message| matches!(message.rich, Rich::Html(_)))
