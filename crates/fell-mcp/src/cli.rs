@@ -147,8 +147,8 @@ where
 /// `APPIMAGE` and `APPDIR` are plain environment variables, so they are not
 /// trusted alone: this binary must be the same file as
 /// `$APPDIR/usr/bin/fell-mcp`, `APPDIR` must not be `/` or an install prefix
-/// (`APPDIR=/` would make `/usr/bin/fell-mcp` look bundled), and `APPIMAGE`
-/// must be a regular file.
+/// (`APPDIR=/` would make `/usr/bin/fell-mcp` look bundled), and both
+/// `$APPDIR/usr/bin/fell-mcp` and `APPIMAGE` must be regular file entries.
 fn inside_appimage(
     exe: Option<&Path>,
     appimage: Option<PathBuf>,
@@ -169,10 +169,11 @@ fn inside_appimage(
     if prefixes.iter().any(|prefix| appdir == Path::new(prefix)) {
         return None;
     }
-    let bundled = std::fs::metadata(appdir.join("usr/bin/fell-mcp")).ok()?;
+    let bundled = std::fs::symlink_metadata(appdir.join("usr/bin/fell-mcp")).ok()?;
     let running = std::fs::metadata(exe).ok()?;
-    let same = bundled.dev() == running.dev() && bundled.ino() == running.ino();
-    let image = std::fs::metadata(&appimage).ok()?;
+    let same =
+        bundled.is_file() && bundled.dev() == running.dev() && bundled.ino() == running.ino();
+    let image = std::fs::symlink_metadata(&appimage).ok()?;
     (same && image.is_file()).then_some(appimage)
 }
 

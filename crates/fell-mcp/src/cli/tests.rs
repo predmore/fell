@@ -1,7 +1,7 @@
 use super::*;
 use fell_core::{Account, AccountId, BackendKind};
 use serde_json::{Value, json};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -745,6 +745,43 @@ fn inside_an_appimage_harnesses_start_the_appimage() {
         None
     );
     assert_eq!(inside_appimage(Some(&bundled), Some(image), None), None);
+}
+
+#[test]
+fn appimage_detection_rejects_symlinked_bundled_binary() {
+    let dir = TempDir::new();
+    let appdir = dir.path().join("AppDir");
+    let bin_dir = appdir.join("usr/bin");
+    let running = dir.path().join("fell-mcp");
+    let image = dir.path().join("fell.AppImage");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(&running, "").unwrap();
+    std::fs::write(&image, "").unwrap();
+    symlink(&running, bin_dir.join("fell-mcp")).unwrap();
+
+    assert_eq!(
+        inside_appimage(Some(&running), Some(image), Some(appdir)),
+        None
+    );
+}
+
+#[test]
+fn appimage_detection_rejects_symlinked_image() {
+    let dir = TempDir::new();
+    let appdir = dir.path().join("AppDir");
+    let bin_dir = appdir.join("usr/bin");
+    let running = bin_dir.join("fell-mcp");
+    let image = dir.path().join("fell.AppImage");
+    let linked_image = dir.path().join("linked.AppImage");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(&running, "").unwrap();
+    std::fs::write(&image, "").unwrap();
+    symlink(&image, &linked_image).unwrap();
+
+    assert_eq!(
+        inside_appimage(Some(&running), Some(linked_image), Some(appdir)),
+        None
+    );
 }
 
 #[test]
