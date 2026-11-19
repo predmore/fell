@@ -29,6 +29,8 @@ pub(in crate::imap) struct WriteFixture {
     pub lose_reply_to: Option<&'static str>,
     pub before_store: Option<Box<dyn FnOnce() + Send>>,
     pub modified_no: bool,
+    pub omit_store_modseq: bool,
+    pub omit_fetch_flags: bool,
     pub nomodseq: bool,
 }
 
@@ -183,14 +185,18 @@ fn fetch_flag(tag: &str, args: &str, state: &TestState, writes: &WriteFixture) -
             .enumerate()
             .find(|(_, m)| Some(m.uid) == uid)
     {
-        let flags = message.flags.join(" ");
+        let flags = if writes.omit_fetch_flags {
+            String::new()
+        } else {
+            format!(" FLAGS ({})", message.flags.join(" "))
+        };
         let revision = if state.condstore && !writes.nomodseq {
             format!(" MODSEQ ({})", message.modseq)
         } else {
             String::new()
         };
         reply.push_str(&format!(
-            "* {} FETCH (UID {} FLAGS ({flags}){revision})\r\n",
+            "* {} FETCH (UID {}{flags}{revision})\r\n",
             index + 1,
             message.uid
         ));
@@ -260,7 +266,7 @@ fn store_flag(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixtur
             .retain(|current| !current.eq_ignore_ascii_case(flag));
     }
     message.modseq = revision;
-    if conditional {
+    if conditional && !writes.omit_store_modseq {
         format!(
             "* {} FETCH (UID {uid} MODSEQ ({revision}))\r\n{tag} OK STORE\r\n",
             index + 1

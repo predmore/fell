@@ -7,8 +7,8 @@
 //! intent is dropped only once every copy recorded for the row has reported
 //! the new value since it was set. After that, later server changes win again.
 //!
-//! The write-back outbox settles both flags. Read-only sync only observes
-//! `\Seen`, so it can also settle a local read intent when no write is queued.
+//! The write-back outbox settles both flags. Read-only sync can settle a
+//! local read intent when no write is queued.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -195,10 +195,9 @@ pub(crate) fn clear_flag(
     Ok(())
 }
 
-/// The star Fell set on `message_id`, if one is pending. Sync does not read
-/// `\Flagged` yet (#102), so a server copy's star says nothing about whether
-/// the server saw the change: the pending value wins and is never cleared
-/// here. Write-back (#104) clears it once it has sent it.
+/// The star Fell set on `message_id`, if one is pending. The outbox settles
+/// the intent. Sync collects `\Flagged` as evidence for replay. Applying it
+/// to the displayed star during sync belongs to #102.
 pub(crate) fn local_star(
     conn: &Connection,
     account_id: &AccountId,

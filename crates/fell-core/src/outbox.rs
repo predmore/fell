@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     settled_unix INTEGER,
     -- write_back_accounts.generation when the row was queued.
     generation INTEGER NOT NULL DEFAULT 0,
-    -- 1 once a MOVE for the row may have reached the server.
+    -- 1 once the write for this row may have reached the server.
     sent INTEGER NOT NULL DEFAULT 0,
     -- The target's UIDVALIDITY and UIDNEXT just before the first MOVE was
     -- sent: a copy found there later counts only at or above this UIDNEXT.
@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     reverses INTEGER NOT NULL DEFAULT 0,
     flag_value INTEGER,
     flag_modseq BLOB,
+    -- Known value of the targeted flag at flag_modseq.
+    flag_base INTEGER,
     -- An earlier flag write may have reached the server. Recover its result
     -- before replaying the replacement, without sending the old value again.
     flag_superseded INTEGER NOT NULL DEFAULT 0
@@ -134,6 +136,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "reverses", "INTEGER NOT NULL DEFAULT 0"),
     ("server_outbox", "flag_value", "INTEGER"),
     ("server_outbox", "flag_modseq", "BLOB"),
+    ("server_outbox", "flag_base", "INTEGER"),
     (
         "server_outbox",
         "flag_superseded",
@@ -241,7 +244,7 @@ pub struct OutboxEntry {
     pub error: String,
     /// The write-back generation the row was queued in.
     pub generation: i64,
-    /// A MOVE for the row may have reached the server.
+    /// The write for this row may have reached the server.
     pub sent: bool,
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
@@ -249,7 +252,7 @@ pub struct OutboxEntry {
     /// Desired presence of the system flag, for Seen and Flagged rows.
     pub flag_value: Option<bool>,
     pub(crate) flag_modseq: Option<u64>,
-    pub(crate) flag_superseded: bool,
+    pub(crate) flag_base: Option<bool>,
 }
 
 /// What one replay pass did ([`crate::AccountConfig::replay_outbox`]).
@@ -297,7 +300,7 @@ pub enum DropReason {
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
     attempts, retry_unix, error, generation, sent, reverses,
-    flag_value, flag_modseq, flag_superseded";
+    flag_value, flag_modseq, flag_base";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -748,7 +751,7 @@ fn select_entries(
                 row.get::<_, i64>(18)?,
                 row.get::<_, Option<bool>>(19)?,
                 row.get::<_, Option<[u8; 8]>>(20)?.map(u64::from_be_bytes),
-                row.get::<_, bool>(21)?,
+                row.get::<_, Option<bool>>(21)?,
             ),
         ))
     })?;
@@ -777,7 +780,7 @@ fn select_entries(
                 reverses,
                 flag_value,
                 flag_modseq,
-                flag_superseded,
+                flag_base,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -802,7 +805,7 @@ fn select_entries(
             reverses: (reverses != 0).then_some(reverses),
             flag_value,
             flag_modseq,
-            flag_superseded,
+            flag_base,
         });
     }
     Ok(out)

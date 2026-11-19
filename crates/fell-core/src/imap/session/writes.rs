@@ -7,6 +7,7 @@
 
 use crate::Error;
 use crate::outbox::OutboxKind;
+use crate::store::copies::CopyFlags;
 
 use super::super::ImapConfig;
 use super::{
@@ -86,12 +87,11 @@ impl WriteSession {
         self.conditional
     }
 
-    /// The selected copy's current flag and revision, if the UID still exists.
-    pub(in crate::imap) fn uid_flag(
+    /// The selected copy's current flags and revision, if the UID still exists.
+    pub(in crate::imap) fn uid_copy_flags(
         &mut self,
         uid: u32,
-        flag: &str,
-    ) -> Result<Option<(bool, Option<u64>)>, WriteError> {
+    ) -> Result<Option<CopyFlags>, WriteError> {
         let items = if self.conditional {
             "UID FLAGS MODSEQ"
         } else {
@@ -101,16 +101,27 @@ impl WriteSession {
         Ok(reply
             .untagged
             .iter()
-            .filter_map(|line| parse_flags(&line.text))
-            .rfind(|item| item.uid == uid)
-            .map(|item| {
-                (
-                    item.flags
-                        .iter()
-                        .any(|value| value.eq_ignore_ascii_case(flag)),
-                    item.modseq,
-                )
-            }))
+            .filter_map(|line| {
+                if let Some(item) = parse_flags(&line.text) {
+                    let has = |flag: &str| {
+                        item.flags
+                            .iter()
+                            .any(|value| value.eq_ignore_ascii_case(flag))
+                    };
+                    return (item.uid == uid).then(|| CopyFlags {
+                        modseq: item.modseq,
+                        seen: Some(has("\\Seen")),
+                        flagged: Some(has("\\Flagged")),
+                    });
+                }
+                let upper = line.text.to_ascii_uppercase();
+                (super::uid_in_fetch_text(&upper) == Some(uid)).then(|| CopyFlags {
+                    modseq: fetch_modseq(&upper),
+                    seen: None,
+                    flagged: None,
+                })
+            })
+            .max_by_key(|flags| (flags.modseq, flags.seen.is_some())))
     }
 
     pub(in crate::imap) fn uid_store_flag(

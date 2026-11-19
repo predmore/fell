@@ -393,6 +393,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread: false,
+                    flagged: None,
                     modseq: None,
                 })
                 .collect(),
@@ -471,6 +472,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread,
+                    flagged: None,
                     modseq: None,
                 })
                 .collect(),
@@ -825,6 +827,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread: uid % 3 == 0,
+                    flagged: None,
                     modseq: None,
                 })
                 .collect(),

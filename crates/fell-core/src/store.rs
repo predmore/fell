@@ -2287,8 +2287,8 @@ fn write_kept(
         &message.remote_id.0,
         message.unread,
     )?;
-    // Sync does not read `\Flagged` yet (#102): a pending local star wins,
-    // otherwise copies merge as before.
+    // Applying server stars to the displayed row during sync belongs to
+    // #102. Keep a pending local star and otherwise merge copies as before.
     let starred = intents::local_star(conn, &message.account_id, &stored.canonical_id)?
         .unwrap_or(stored.starred || message.starred);
     let from_email = if alias {
@@ -3071,7 +3071,17 @@ fn apply_flag(
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
     if let (Some(copy), Some(modseq)) = (&copy, flag.modseq)
-        && !copies::observe_modseq(conn, account_id, copy, modseq)?
+        && !copies::observe_flags(
+            conn,
+            account_id,
+            copy,
+            copies::CopyFlags {
+                seen: Some(!flag.unread),
+                flagged: flag.flagged,
+                modseq: Some(modseq),
+            },
+            copies::FlagSource::Sync,
+        )?
     {
         return Ok(());
     }
@@ -6969,6 +6979,7 @@ mod tests {
                     flags: vec![crate::backend::FlagUpdate {
                         remote_id: RemoteId("imap:sent".into()),
                         unread: false,
+                        flagged: None,
                         modseq: None,
                     }],
                     cursor: None,

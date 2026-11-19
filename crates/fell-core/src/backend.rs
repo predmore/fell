@@ -20,6 +20,8 @@ pub struct SyncCursor {
 pub struct FlagUpdate {
     pub remote_id: crate::RemoteId,
     pub unread: bool,
+    /// Server star evidence for replay. Sync still only applies unread to the row.
+    pub flagged: Option<bool>,
     /// The revision of this copy's flags, when the server supports CONDSTORE.
     pub modseq: Option<u64>,
 }

@@ -31,9 +31,10 @@ use crate::Error;
 use crate::account::AccountId;
 use crate::outbox::{
     self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
-    Settled, flags,
+    Settled,
+    flags::{self, FetchReason, Observation, Progress},
 };
-use crate::store::Store;
+use crate::store::{Store, copies::CopyFlags};
 
 use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_uid_message_id};
@@ -170,129 +171,156 @@ impl Pass<'_> {
     }
 
     fn replay_flag(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
-        let Some(mut entry) = flags::pending(self.store, self.account_id, self.entries[index].id)?
-        else {
+        // Retry a safely rebased STORE once in this pass. A server that
+        // keeps changing the copy uses the ordinary retry schedule.
+        for _ in 0..2 {
+            let Some(entry) = self.pending_flag(index)? else {
+                return Ok(());
+            };
+            if !self.try_flag(session, index, entry)? {
+                return Ok(());
+            }
+        }
+        self.retry(
+            index,
+            DropReason::Refused,
+            "flag revision kept changing during STORE",
+        )
+    }
+
+    fn pending_flag(&mut self, index: usize) -> Result<Option<OutboxEntry>, Stop> {
+        let entry = flags::pending(self.store, self.account_id, self.entries[index].id)?;
+        if entry.is_none() {
             self.settled[index] = true;
-            return Ok(());
-        };
-        let (Some(mailbox), Some(validity), Some(uid), Some(value), Some(flag)) = (
+        }
+        Ok(entry)
+    }
+
+    /// Send one conditional STORE attempt. Only a safe rebase asks for a
+    /// second attempt; all other observations settle or use normal backoff.
+    fn try_flag(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+        mut entry: OutboxEntry,
+    ) -> Result<bool, Stop> {
+        let (Some(mailbox), Some(validity), Some(uid), Some(value)) = (
             &entry.source_mailbox,
             entry.uidvalidity,
             entry.uid,
             entry.flag_value,
-            entry.kind.flag_name(),
         ) else {
             return Err(Error::Action("invalid flag write in outbox".into()).into());
         };
         match self.select(session, mailbox)? {
             Ok(current) if current != validity => {
-                return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
+                self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed")?;
+                return Ok(false);
             }
-            Err(message) => return self.retry(index, DropReason::Refused, &message),
+            Err(message) => {
+                self.retry(index, DropReason::Refused, &message)?;
+                return Ok(false);
+            }
             Ok(_) => {}
         }
-        if !session.conditional() {
-            entry.flag_modseq = None;
-        }
         if entry.sent || (session.conditional() && entry.flag_modseq.is_none()) {
-            let Some((server, modseq)) = self.read_flag(session, index, uid, flag)? else {
-                return Ok(());
+            let Some(current) = self.read_flags(session, index, uid)? else {
+                return Ok(false);
             };
-            if entry.sent && server == value {
-                return self.finish_flag(
-                    index,
-                    &entry,
-                    flags::Observed::Applied {
-                        modseq,
-                        from_store: false,
-                    },
-                );
+            if !self.observe_flag(
+                index,
+                &entry,
+                Observation::Fetched(current, FetchReason::BeforeStore),
+            )? {
+                return Ok(false);
             }
-            if entry.flag_superseded {
-                return self.finish_flag(index, &entry, flags::Observed::Superseded);
-            }
-            entry.flag_modseq = entry.flag_modseq.or(modseq);
+            let Some(rebased) = self.pending_flag(index)? else {
+                return Ok(false);
+            };
+            entry = rebased;
         }
 
-        (self.before_send)();
-        if !flags::mark_sent(self.store, self.account_id, &entry, entry.flag_modseq)? {
-            return Ok(());
+        if !session.conditional() {
+            entry.flag_modseq = None;
+            entry.flag_base = None;
         }
-        let observed = match session.uid_store_flag(uid, entry.kind, value, entry.flag_modseq) {
-            Ok(FlagReply::Stored(modseq)) if modseq.is_some() || !session.conditional() => {
-                flags::Observed::Applied {
-                    modseq,
-                    from_store: true,
-                }
+        (self.before_send)();
+        match flags::mark_sent(self.store, self.account_id, &entry)? {
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Retired => {
+                self.settled[index] = true;
+                return Ok(false);
             }
-            // A conditional STORE reports MODSEQ even with .SILENT. If it
-            // did not, check whether the UID still exists and what it holds.
-            Ok(_) => {
-                let Some((server, Some(modseq))) = self.read_flag(session, index, uid, flag)?
-                else {
-                    return Ok(());
-                };
-                if server == value {
-                    flags::Observed::Applied {
-                        modseq: Some(modseq),
-                        from_store: false,
-                    }
-                } else {
-                    flags::Observed::Conflict {
-                        value: server,
-                        modseq,
-                    }
-                }
+            Settled::Recorded => {}
+        }
+        let reason = match session.uid_store_flag(uid, entry.kind, value, entry.flag_modseq) {
+            Ok(FlagReply::Stored(None)) if session.conditional() => FetchReason::AfterStore,
+            Ok(FlagReply::Stored(modseq)) => {
+                return self.observe_flag(index, &entry, Observation::Stored(modseq));
             }
+            Ok(FlagReply::Modified) => FetchReason::Modified,
             Err(WriteError::Refused(message)) => {
-                return self.retry_as(index, DropReason::Refused, &message, true);
+                self.retry_as(index, DropReason::Refused, &message, true)?;
+                return Ok(false);
             }
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
         };
-        self.finish_flag(index, &entry, observed)
+        let Some(current) = self.read_flags(session, index, uid)? else {
+            return Ok(false);
+        };
+        self.observe_flag(index, &entry, Observation::Fetched(current, reason))
     }
 
-    fn read_flag(
+    fn read_flags(
         &mut self,
         session: &mut WriteSession,
         index: usize,
         uid: u32,
-        flag: &str,
-    ) -> Result<Option<(bool, Option<u64>)>, Stop> {
-        match session.uid_flag(uid, flag) {
-            Ok(Some((_, None))) if session.conditional() => {
+    ) -> Result<Option<CopyFlags>, Stop> {
+        match session.uid_copy_flags(uid) {
+            Ok(Some(current)) if current.modseq.is_none() && session.conditional() => {
                 self.retry(
                     index,
                     DropReason::Refused,
-                    "server did not report the flag's MODSEQ",
+                    "server did not report the copy's MODSEQ",
                 )?;
             }
             Ok(Some(current)) => return Ok(Some(current)),
             Ok(None) => {
-                self.drop_row(index, DropReason::NotFound, "message is not on the server")?
+                self.drop_row(index, DropReason::NotFound, "message is not on the server")?;
             }
             Err(WriteError::Refused(message)) => {
-                self.retry(index, DropReason::Refused, &message)?
+                self.retry(index, DropReason::Refused, &message)?;
             }
             Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
         }
         Ok(None)
     }
 
-    fn finish_flag(
+    /// True when the observation authorizes a STORE at the rebased MODSEQ.
+    fn observe_flag(
         &mut self,
         index: usize,
         entry: &OutboxEntry,
-        observed: flags::Observed,
-    ) -> Result<(), Stop> {
-        match flags::finish(self.store, self.account_id, entry, observed)? {
-            flags::Finished::Stale => return Err(Stop::Stale),
-            flags::Finished::Superseded => {}
-            flags::Finished::Applied => self.report.sent += 1,
-            flags::Finished::Conflict { changed } => self.report.flags_changed |= changed,
+        observation: Observation,
+    ) -> Result<bool, Stop> {
+        match flags::observe(self.store, self.account_id, entry, observation)? {
+            Progress::Stale => return Err(Stop::Stale),
+            Progress::Ready => return Ok(true),
+            Progress::Unconfirmed => {
+                self.retry(
+                    index,
+                    DropReason::Refused,
+                    "FETCH did not report current flags and revision",
+                )?;
+                return Ok(false);
+            }
+            Progress::Retired => {}
+            Progress::Applied => self.report.sent += 1,
+            Progress::Conflict { changed } => self.report.flags_changed |= changed,
         }
         self.settled[index] = true;
-        Ok(())
+        Ok(false)
     }
 
     /// Send the move at `index`, with every later row that moves another

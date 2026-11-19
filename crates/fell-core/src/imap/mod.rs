@@ -897,7 +897,7 @@ fn uid_set(uids: &[u32]) -> String {
     out
 }
 
-/// The unread state of one stored copy, from its flags.
+/// Flag evidence from one server copy.
 fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> FlagUpdate {
     let uid = item.uid;
     FlagUpdate {
@@ -906,6 +906,11 @@ fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> Flag
             .flags
             .iter()
             .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        flagged: Some(
+            item.flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
+        ),
         modseq: item.modseq,
     }
 }
