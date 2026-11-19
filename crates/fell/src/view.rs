@@ -4297,7 +4297,8 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, ctrl_letter, key_from, not_sent_notice, should_follow_visible, unread_bar_dx,
+        LIST_BORDER_PX, ctrl_letter, key_from, not_sent_notice, should_follow_visible,
+        unread_bar_dx,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
