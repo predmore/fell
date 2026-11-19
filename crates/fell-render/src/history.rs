@@ -36,6 +36,10 @@ pub struct Section {
     /// A short signature shown in place ("Sent from my iPhone"): painted
     /// in the dimmed colour. Only on an open section.
     pub quiet: bool,
+    /// Quoted text the sender answers below it, in an interleaved reply:
+    /// open, under the history rule, in the dimmed colour. Only on an open
+    /// section.
+    pub quoted: bool,
 }
 
 /// A document and its sections, in order. The sections cover every block.
@@ -56,6 +60,7 @@ impl FoldedDocument {
                 fold: None,
                 blocks: 0..len,
                 quiet: false,
+                quoted: false,
             }]
         };
         Self { document, sections }
@@ -112,9 +117,21 @@ pub(crate) fn marker(element: &scraper::node::Element) -> Option<Marker> {
 }
 
 /// One quote for a history container. The `blockquote` inside it is the same
-/// quote, so its blocks join the attribution line under one rule.
+/// quote, so its blocks join the attribution line under one rule. A reply
+/// written inline (Gmail puts the answers between the quoted pieces, inside
+/// the container) stays as it is, so each answer keeps its own place.
 pub(crate) fn quote_container(blocks: Vec<Block>) -> Vec<Block> {
     if blocks.is_empty() {
+        return blocks;
+    }
+    let first_quote = blocks
+        .iter()
+        .position(|block| matches!(block, Block::Quote { .. }));
+    if let Some(first) = first_quote
+        && blocks[first + 1..]
+            .iter()
+            .any(|block| !matches!(block, Block::Quote { .. }) && !is_blank(block))
+    {
         return blocks;
     }
     let mut joined = Vec::with_capacity(blocks.len());
@@ -149,43 +166,71 @@ pub(crate) fn signature_container(mut blocks: Vec<Block>) -> Vec<Block> {
 
 /// Mark quoted history and signatures among the top-level blocks.
 ///
+/// Only the history after the sender's last own words folds: in an
+/// interleaved reply (a question quoted, answered, the next quoted) the
+/// quotes the sender answers stay open, marked [`Section::quoted`].
+/// `subject` is the message's own subject: a forward (`Fwd:`, `FW:` and
+/// their translations) is what the sender is sending, so nothing in it
+/// folds as quoted history, and neither does anything under Gmail's or
+/// Apple Mail's forward line.
+///
 /// Folds nothing when that would leave nothing unfolded, so a bare forward
-/// or a message that is all quote still shows. A forwarded message inside a
-/// quote container stays open too: it is what the sender is sending.
-pub fn fold_history(document: StyledDocument) -> FoldedDocument {
+/// or a message that is all quote still shows.
+pub fn fold_history(document: StyledDocument, subject: &str) -> FoldedDocument {
     let (blocks, header_ends) =
         flatten_reply_headers(split_history_lines(split_signature_rules(document.blocks)));
     let mut kinds: Vec<Option<Fold>> = Vec::with_capacity(blocks.len());
     let mut drop = vec![false; blocks.len()];
     let mut rest_is_quote = false;
     let mut in_signature = false;
+    // Under a forward line, or in a forward, quotes are the forwarded mail.
+    let mut forwarding = is_forward_subject(subject);
     for (at, block) in blocks.iter().enumerate() {
         if rest_is_quote {
             kinds.push(Some(Fold::Quote));
             continue;
         }
-        let starts_history = match header_ends[at] {
-            Some(end) => !is_forward_header(&blocks[at..end]) && content_after(&blocks[end..]),
+        let header = match header_ends[at] {
+            Some(end) => {
+                content_after(&blocks[end..]).then_some(is_forward_header(&blocks[at..end]))
+            }
             None => starts_outlook_history(&blocks, at),
         };
-        if starts_history {
-            rest_is_quote = true;
-            // The rule Outlook draws above the header goes with it.
-            if at > 0 && matches!(blocks[at - 1], Block::ThematicBreak) {
-                kinds[at - 1] = Some(Fold::Quote);
+        match header {
+            // The forwarded mail's own header: it ends the sender's
+            // signature and stays open, with everything under it.
+            Some(true) => {
+                in_signature = false;
+                forwarding = true;
+                kinds.push(None);
+                continue;
             }
-            kinds.push(Some(Fold::Quote));
-            continue;
+            Some(false) if forwarding => {
+                in_signature = false;
+                kinds.push(None);
+                continue;
+            }
+            Some(false) => {
+                rest_is_quote = true;
+                // The rule Outlook draws above the header goes with it.
+                if at > 0 && matches!(blocks[at - 1], Block::ThematicBreak) {
+                    kinds[at - 1] = Some(Fold::Quote);
+                }
+                kinds.push(Some(Fold::Quote));
+                continue;
+            }
+            None => {}
         }
         match block {
             // A forward is what the sender is sending, even under their
             // signature: it ends the signature and stays open.
-            Block::Quote { blocks: inner } if is_forward(inner) => {
+            Block::Quote { blocks: inner } if forwarding || is_forward(inner) => {
                 in_signature = false;
                 kinds.push(None);
             }
             Block::Paragraph { inlines } if is_forward_line(&inlines_text(inlines)) => {
                 in_signature = false;
+                forwarding = true;
                 kinds.push(None);
             }
             Block::Quote { .. } => {
@@ -204,7 +249,7 @@ pub fn fold_history(document: StyledDocument) -> FoldedDocument {
             Block::Paragraph { inlines } if is_mobile_signature(inlines) => {
                 kinds.push(Some(Fold::Signature));
             }
-            Block::Code { text } if code_starts_with_rule(text) => {
+            Block::Code { text, .. } if code_starts_with_rule(text) => {
                 in_signature = true;
                 kinds.push(Some(Fold::Signature));
             }
@@ -212,17 +257,27 @@ pub fn fold_history(document: StyledDocument) -> FoldedDocument {
             _ => kinds.push(None),
         }
     }
-    let body_left = blocks
-        .iter()
-        .zip(&kinds)
-        .zip(&drop)
-        .any(|((block, kind), dropped)| kind.is_none() && !dropped && !is_blank(block));
-    if !body_left {
+    let own = |at: usize| {
+        kinds[at].is_none()
+            && !drop[at]
+            && !is_blank(&blocks[at])
+            // A disclaimer a server adds under the quote is not an answer.
+            && !matches!(blocks[at], Block::Small { .. })
+    };
+    let Some(last_own) = (0..blocks.len()).rev().find(|&at| own(at)) else {
         return FoldedDocument::unfolded(StyledDocument { blocks });
+    };
+    // Quotes the sender answers under them stay open.
+    let mut quoted = vec![false; blocks.len()];
+    for at in 0..last_own {
+        if kinds[at] == Some(Fold::Quote) {
+            kinds[at] = None;
+            quoted[at] = true;
+        }
     }
     let mut kept = Vec::with_capacity(blocks.len());
     let mut sections: Vec<Section> = Vec::new();
-    for ((block, kind), dropped) in blocks.into_iter().zip(kinds).zip(drop) {
+    for (((block, kind), dropped), quoted) in blocks.into_iter().zip(kinds).zip(drop).zip(quoted) {
         if dropped {
             continue;
         }
@@ -233,7 +288,9 @@ pub fn fold_history(document: StyledDocument) -> FoldedDocument {
                     None => continue,
                 }
             }
-            (Some(Fold::Signature), Block::Code { text }) if code_starts_with_rule(&text) => {
+            (Some(Fold::Signature), Block::Code { text, large })
+                if code_starts_with_rule(&text) =>
+            {
                 let rest = text
                     .split_once('\n')
                     .map(|(_, rest)| rest.to_string())
@@ -241,18 +298,19 @@ pub fn fold_history(document: StyledDocument) -> FoldedDocument {
                 if rest.trim().is_empty() {
                     continue;
                 }
-                Block::Code { text: rest }
+                Block::Code { text: rest, large }
             }
             (_, block) => block,
         };
         let at = kept.len();
         kept.push(block);
         match sections.last_mut() {
-            Some(last) if last.fold == kind => last.blocks.end = at + 1,
+            Some(last) if last.fold == kind && last.quoted == quoted => last.blocks.end = at + 1,
             _ => sections.push(Section {
                 fold: kind,
                 blocks: at..at + 1,
                 quiet: false,
+                quoted,
             }),
         }
     }
@@ -284,7 +342,11 @@ fn show_short_signatures(sections: Vec<Section>, blocks: &[Block]) -> Vec<Sectio
             }
         }
         match out.last_mut() {
-            Some(last) if last.fold == section.fold && last.quiet == section.quiet => {
+            Some(last)
+                if last.fold == section.fold
+                    && last.quiet == section.quiet
+                    && last.quoted == section.quoted =>
+            {
                 last.blocks.end = section.blocks.end
             }
             _ => out.push(section),
@@ -325,7 +387,8 @@ fn join_adjacent_folds(sections: Vec<Section>) -> Vec<Section> {
 
 /// Give a history line its own block when it ends or starts a paragraph of
 /// lines: an `On … wrote:` line over a quote, an Outlook `From:` header
-/// line or `-----Original Message-----`, and a phone's `Sent from my …`.
+/// line or `-----Original Message-----`, a forward line, and a phone's
+/// `Sent from my …`.
 fn split_history_lines(blocks: Vec<Block>) -> Vec<Block> {
     let mut out = Vec::with_capacity(blocks.len());
     let mut blocks = blocks.into_iter().peekable();
@@ -342,7 +405,8 @@ fn split_history_lines(blocks: Vec<Block>) -> Vec<Block> {
         let quote_next = matches!(blocks.peek(), Some(Block::Quote { .. }));
         let last_text = inlines_text(lines[lines.len() - 1]);
         let last_line_is_history = (quote_next && last_text.trim_end().ends_with("wrote:"))
-            || is_phone_signature(&last_text);
+            || is_phone_signature(&last_text)
+            || is_forward_line(&last_text);
         let cut = if last_line_is_history {
             Some(lines.len() - 1)
         } else {
@@ -352,7 +416,9 @@ fn split_history_lines(blocks: Vec<Block>) -> Vec<Block> {
                 .position(|line| {
                     let text = inlines_text(line);
                     let text = text.trim_start();
-                    text.starts_with("-----Original Message-----") || is_quoted_from_line(text)
+                    text.starts_with("-----Original Message-----")
+                        || is_quoted_from_line(text)
+                        || is_forward_line(text)
                 })
                 .map(|at| at + 1)
         };
@@ -521,25 +587,22 @@ fn is_phone_signature(text: &str) -> bool {
 /// Outlook's header over the earlier message, written as text: the older
 /// `-----Original Message-----` line, or a `From:` line that names an
 /// address followed by `Sent:` or `Date:` and `Subject:`, in this block or
-/// the few after it. A sender's own `From:` / `Subject:` lines (a template,
-/// a ticket) name no address, and a header with nothing under it quotes
-/// nothing; neither folds. A forward (`Subject: FW: …`) stays open.
-fn starts_outlook_history(blocks: &[Block], at: usize) -> bool {
-    let Some(first) = block_text(&blocks[at]) else {
-        return false;
-    };
+/// the few after it. `Some(true)` when the header is a forward's
+/// (`Subject: FW: …`), which stays open. A sender's own `From:` /
+/// `Subject:` lines (a template, a ticket) name no address, and a header
+/// with nothing under it quotes nothing; neither is a header.
+fn starts_outlook_history(blocks: &[Block], at: usize) -> Option<bool> {
+    let first = block_text(&blocks[at])?;
     let first = first.trim_start();
     if let Some(rest) = first.strip_prefix("-----Original Message-----") {
-        return !rest.trim().is_empty() || content_after(&blocks[at + 1..]);
+        return (!rest.trim().is_empty() || content_after(&blocks[at + 1..])).then_some(false);
     }
     if !first.lines().next().is_some_and(is_quoted_from_line) {
-        return false;
+        return None;
     }
     let mut sent = false;
     for (offset, block) in blocks[at..].iter().take(5).enumerate() {
-        let Some(text) = block_text(block) else {
-            break;
-        };
+        let text = block_text(block)?;
         let lines: Vec<&str> = text.lines().collect();
         for (index, line) in lines.iter().enumerate() {
             let line = line.trim_start();
@@ -548,17 +611,15 @@ fn starts_outlook_history(blocks: &[Block], at: usize) -> bool {
                 if !sent {
                     continue;
                 }
-                if is_forward_subject(subject) {
-                    return false;
-                }
                 let below = lines[index + 1..]
                     .iter()
                     .any(|line| !line.trim().is_empty());
-                return below || content_after(&blocks[at + offset + 1..]);
+                return (below || content_after(&blocks[at + offset + 1..]))
+                    .then(|| is_forward_subject(subject));
             }
         }
     }
-    false
+    None
 }
 
 /// A `From:` line of a quoted header: it names an address, as every
@@ -582,9 +643,20 @@ fn names_an_address(text: &str) -> bool {
         })
 }
 
-fn is_forward_subject(subject: &str) -> bool {
-    let subject = subject.trim_start().to_ascii_lowercase();
-    subject.starts_with("fw:") || subject.starts_with("fwd:")
+/// A forward's subject: `Fwd:`, `FW:`, and the German, French and Spanish
+/// `WG:`, `TR:` and `RV:`, after any `[list]` tags.
+pub fn is_forward_subject(subject: &str) -> bool {
+    let mut rest = subject.trim_start();
+    while let Some(tagged) = rest.strip_prefix('[') {
+        match tagged.split_once(']') {
+            Some((_, after)) => rest = after.trim_start(),
+            None => break,
+        }
+    }
+    let lower = rest.to_lowercase();
+    ["fwd:", "fw:", "wg:", "tr:", "rv:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 /// An Outlook `#divRplyFwdMsg` header over a forward.
@@ -667,7 +739,7 @@ mod tests {
     use crate::html_to_document;
 
     fn folded(html: &str) -> FoldedDocument {
-        fold_history(html_to_document(html))
+        fold_history(html_to_document(html), "Re: Plans")
     }
 
     fn texts(doc: &FoldedDocument) -> Vec<(Option<Fold>, String)> {
@@ -896,21 +968,78 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_quotes_fold_one_by_one() {
+    fn an_interleaved_reply_folds_only_the_history_after_the_last_answer() {
         let doc = folded(
-            "<blockquote><p>First question?</p></blockquote><p>First answer.</p><blockquote><p>Second?</p></blockquote><p>Second answer.</p>",
+            "<blockquote><p>First question?</p></blockquote><p>First answer.</p><blockquote><p>Second?</p></blockquote><p>Second answer.</p><p>-- <br>Jon Ames<br>Fell<br>fell.test</p><blockquote><p>Earlier, unanswered.</p></blockquote>",
         );
-        let folds: Vec<_> = doc.sections.iter().map(|section| section.fold).collect();
+        let shape: Vec<_> = doc
+            .sections
+            .iter()
+            .map(|section| (section.fold, section.quoted))
+            .collect();
         assert_eq!(
-            folds,
-            vec![Some(Fold::Quote), None, Some(Fold::Quote), None]
+            shape,
+            vec![
+                (None, true),
+                (None, false),
+                (None, true),
+                (None, false),
+                (Some(Fold::SignatureAndQuote), false),
+            ]
         );
+        // The attribution over an answered quote stays with it, open.
+        let doc =
+            folded("<p>On Monday, Ada wrote:</p><blockquote><p>Lunch?</p></blockquote><p>Yes.</p>");
+        let sections = texts(&doc);
+        assert_eq!(sections[0].1, "On Monday, Ada wrote:\nLunch?");
+        assert!(doc.sections[0].quoted && doc.sections[0].fold.is_none());
+        assert_eq!(sections[1], (None, "Yes.".into()));
+        // Fine print under the quote is not an answer: the quote folds.
+        let doc = folded(
+            "<p>Agreed.</p><blockquote><p>Shall we?</p></blockquote><p style=\"font-size:10px\">Confidential.</p>",
+        );
+        assert_eq!(doc.sections[1].fold, Some(Fold::Quote), "{:?}", texts(&doc));
+    }
+
+    #[test]
+    fn a_forward_by_its_subject_stays_open() {
+        // Outlook: `FW:` on the outer subject, the original's in the header.
+        let html = "<div>See below.</div><div>-- <br>Ruth Allard<br>Facilities<br>example.org</div><hr><div id=\"divRplyFwdMsg\"><b>From:</b> Ada &lt;ada@example.test&gt;<br><b>Sent:</b> Monday<br><b>Subject:</b> Plans</div><div>The plan.</div>";
+        for subject in [
+            "FW: Plans",
+            "fwd: Plans",
+            "[team] Fwd: Plans",
+            "WG: Plans",
+            "TR: Plans",
+            "RV: Plans",
+        ] {
+            let doc = fold_history(html_to_document(html), subject);
+            let sections = texts(&doc);
+            assert_eq!(sections[0], (None, "See below.".into()), "{subject}");
+            assert_eq!(sections[1].0, Some(Fold::Signature), "{subject}");
+            assert_eq!(sections[2].0, None, "{subject}: {sections:?}");
+            assert!(sections[2].1.ends_with("The plan."), "{subject}");
+        }
+        // The same as a reply folds the earlier mail.
+        let doc = fold_history(html_to_document(html), "RE: Plans");
+        assert_eq!(
+            doc.sections.last().unwrap().fold,
+            Some(Fold::SignatureAndQuote)
+        );
+        // Apple Mail's forward line keeps the quote under it open.
+        let doc = folded(
+            "<div>FYI</div><div>Begin forwarded message:</div><blockquote type=\"cite\"><div><b>From: </b>Ada</div><p>The plan.</p></blockquote>",
+        );
+        assert!(!doc.has_folds(), "{:?}", texts(&doc));
     }
 
     #[test]
     fn sections_cover_every_block_in_order() {
         for fixture in crate::fixtures() {
-            let doc = fold_history(html_to_document(&fixture.html));
+            let doc = fold_history(
+                html_to_document(&fixture.html),
+                fixture.headers.get("Subject").unwrap_or_default(),
+            );
             let mut next = 0;
             for section in &doc.sections {
                 assert_eq!(section.blocks.start, next, "{}", fixture.name);

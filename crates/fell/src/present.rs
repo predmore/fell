@@ -46,6 +46,10 @@ pub struct ConvMessage {
     pub id: String,
     pub sender: String,
     pub email: String,
+    /// The message's own `From:` and `Subject:`, which the HTML body is
+    /// prepared with: a forward's subject keeps its history open, and a
+    /// logo named for the sender draws no `Image blocked` line.
+    pub mail_headers: Vec<(String, String)>,
     pub folders: String,
     pub date_unix: i64,
     pub snippet: String,
@@ -207,7 +211,7 @@ fn label_of(label: &str) -> &'static str {
 
 /// The closed line that fits: the most whole people (up to `line.budget`)
 /// for which `fits(names, tail)` holds, the tail that goes with them
-/// (" +N more · bcc X"), and how many are left out. Never drops a
+/// (" +N more · bcc X · q"), and how many are left out. Never drops a
 /// name partway, so the count always matches what is on screen.
 pub fn fit_recipients(
     line: &RecipientLine,
@@ -227,7 +231,7 @@ pub fn fit_recipients(
         } else if bcc.is_empty() {
             String::new()
         } else {
-            bcc
+            format!("{bcc} · q")
         }
     };
     let most = line.budget.min(total);
@@ -702,6 +706,10 @@ pub fn conversation(
             let email = message.headers.from.email.clone();
             ConvMessage {
                 id: message.headers.message_id.as_str().to_string(),
+                mail_headers: vec![
+                    ("Subject".into(), message.headers.subject.clone()),
+                    ("From".into(), from_header(&message.headers.from)),
+                ],
                 sender: display_name(&message.headers.from.name, &email, me),
                 email,
                 folders: message
@@ -1112,6 +1120,14 @@ fn cut_to(
         }
     }
     best
+}
+
+/// `Name <address>`, or the address alone, as a `From:` header writes it.
+fn from_header(from: &fell_core::Address) -> String {
+    match from.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => format!("{name} <{}>", from.email),
+        _ => from.email.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1913,10 +1929,9 @@ mod tests {
         let width = |text: &str| text.chars().count();
         let (text, tail, hidden) =
             fit_recipients(&line, |names, tail| width(names) + width(tail) <= 40);
-        // No key hint in the tail leaves room for one more name.
-        assert_eq!(text, "to Ada · cc Maya, Sam");
-        assert_eq!(tail, " +4 more · bcc Riya");
-        assert_eq!(hidden, 4);
+        assert_eq!(text, "to Ada · cc Maya");
+        assert_eq!(tail, " +5 more · bcc Riya · q");
+        assert_eq!(hidden, 5);
         // Nothing fits: the first person still shows, and the count is right.
         let (text, _, hidden) = fit_recipients(&line, |_, _| false);
         assert_eq!(text, "to Ada");

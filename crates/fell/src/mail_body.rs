@@ -34,6 +34,9 @@ pub struct HtmlBody {
     pub folded: FoldedDocument,
     /// Lines of text in each section, for a folded section's label.
     pub fold_lines: Vec<usize>,
+    /// Each section is written right to left: its rule and fold line are
+    /// mirrored.
+    pub rtl: Vec<bool>,
     /// Decoded `data:` images, keyed by the document's own bytes.
     pub gallery: ImageGallery,
 }
@@ -64,38 +67,52 @@ impl BodyJob {
     }
 }
 
-/// Bulk mail (List-Unsubscribe, Precedence, ESP headers) is not folded: a
-/// newsletter's pull quote is content, not history.
-pub fn prepare_html(html: &str, bulk_headers: &[(String, String)]) -> HtmlBody {
+/// `headers`: the message's `Subject:` and `From:`, then the bulk headers
+/// sync kept. Bulk mail (List-Unsubscribe, Precedence, ESP headers) is not
+/// folded: a newsletter's pull quote is content, not history.
+pub fn prepare_html(html: &str, headers_in: &[(String, String)]) -> HtmlBody {
     let mut headers = MailHeaders::new();
-    for (name, value) in bulk_headers {
+    for (name, value) in headers_in {
         headers.add(name.as_str(), value.as_str());
     }
     let prepared = prepare(html, &headers);
     let folded = if headers.is_bulk() {
         FoldedDocument::unfolded(prepared.document)
     } else {
-        fold_history(prepared.document)
+        fold_history(
+            prepared.document,
+            headers.get("Subject").unwrap_or_default(),
+        )
     };
     // Built after folding: the gallery keys images by their bytes' address.
     let gallery = ImageGallery::from_document(&folded.document);
-    let fold_lines = folded
+    let texts: Vec<String> = folded
         .sections
         .iter()
-        .map(|section| match section.fold {
-            None => 0,
-            Some(_) => fell_render::StyledDocument {
+        .map(|section| {
+            fell_render::StyledDocument {
                 blocks: folded.blocks(section).to_vec(),
             }
             .plain_text()
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
         })
+        .collect();
+    let fold_lines = folded
+        .sections
+        .iter()
+        .zip(&texts)
+        .map(|(section, text)| match section.fold {
+            None => 0,
+            Some(_) => text.lines().filter(|line| !line.trim().is_empty()).count(),
+        })
+        .collect();
+    let rtl = texts
+        .iter()
+        .map(|text| crate::render::is_right_to_left(text))
         .collect();
     HtmlBody {
         folded,
         fold_lines,
+        rtl,
         gallery,
     }
 }
@@ -215,7 +232,13 @@ pub fn read_bodies(
         let Some(kinds) = found else {
             continue;
         };
-        match read_job_with(store, account, &message.id, kinds.stamp) {
+        match read_job_with(
+            store,
+            account,
+            &message.id,
+            kinds.stamp,
+            &message.mail_headers,
+        ) {
             Some(job) if index < last && kinds.html_bytes <= budget => {
                 budget -= kinds.html_bytes;
                 let prepared = job.prepare();
@@ -231,20 +254,34 @@ pub fn read_bodies(
 }
 
 /// One message's stored HTML. `None` when it has none or the read failed.
-pub fn read_job(store: &Store, account: &AccountId, id: &str) -> Option<BodyJob> {
+/// `mail_headers`: its [`ConvMessage::mail_headers`].
+pub fn read_job(
+    store: &Store,
+    account: &AccountId,
+    id: &str,
+    mail_headers: &[(String, String)],
+) -> Option<BodyJob> {
     let stamp = store.stored_part_kinds(account, &[id]).ok()?.get(id)?.stamp;
-    read_job_with(store, account, id, stamp)
+    read_job_with(store, account, id, stamp, mail_headers)
 }
 
-fn read_job_with(store: &Store, account: &AccountId, id: &str, stamp: u64) -> Option<BodyJob> {
+fn read_job_with(
+    store: &Store,
+    account: &AccountId,
+    id: &str,
+    stamp: u64,
+    mail_headers: &[(String, String)],
+) -> Option<BodyJob> {
     let parts = store
         .message_body(account, &MessageId(id.to_string()))
         .ok()??;
+    let mut headers = mail_headers.to_vec();
+    headers.extend(parts.bulk_headers);
     Some(BodyJob {
         id: id.to_string(),
         stamp,
         html: parts.html?,
-        headers: parts.bulk_headers,
+        headers,
     })
 }
 
@@ -428,11 +465,38 @@ mod tests {
 
     #[test]
     fn the_render_corpus_is_identical_through_the_inbox_path() {
-        for fixture in fixtures() {
+        for fixture in fixtures().into_iter().chain(fell_render::corpus()) {
             let mut parts = html_parts(&fixture.html, &[]);
-            parts.bulk_headers = fixture_header_lines(&fixture.name);
+            // Sync keeps only the headers that mark bulk mail; the message's
+            // own From and Subject come from its row.
+            parts.bulk_headers = fixture
+                .headers
+                .fields()
+                .filter(|(name, value)| {
+                    let mut one = MailHeaders::new();
+                    one.add(*name, *value);
+                    one.is_bulk()
+                })
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
             let id = format!("{}@fell.test", fixture.name);
-            let store = store_with(&[mail(&id, &id, 0, Some(parts))]);
+            let mut message = mail(&id, &id, 0, Some(parts));
+            if let Some(subject) = fixture.headers.get("Subject") {
+                message.headers.subject = subject.to_string();
+            }
+            if let Some(from) = fixture.headers.get("From") {
+                let (name, email) = match from.rsplit_once('<') {
+                    Some((name, email)) => {
+                        (name.trim().trim_matches('"'), email.trim_end_matches('>'))
+                    }
+                    None => ("", from),
+                };
+                message.headers.from = Address {
+                    name: (!name.is_empty()).then(|| name.to_string()),
+                    email: email.to_string(),
+                };
+            }
+            let store = store_with(&[message]);
             let mut view = open(&store, &id);
             let reads = read_bodies(
                 &store,
@@ -449,47 +513,13 @@ mod tests {
             let expected = if fixture.headers.is_bulk() {
                 FoldedDocument::unfolded(direct.document)
             } else {
-                fold_history(direct.document)
+                fold_history(
+                    direct.document,
+                    fixture.headers.get("Subject").unwrap_or_default(),
+                )
             };
             assert_eq!(body.folded, expected, "{}", fixture.name);
         }
-    }
-
-    /// The `.headers` text of a corpus fixture, as `(name, value)` pairs, the
-    /// way sync stores bulk headers.
-    fn fixture_header_lines(name: &str) -> Vec<(String, String)> {
-        let text = match name {
-            "native-bulk-simple" => {
-                include_str!("../../fell-render/fixtures/native-bulk-simple.headers")
-            }
-            "native-esp-simple" => {
-                include_str!("../../fell-render/fixtures/native-esp-simple.headers")
-            }
-            "native-list-discussion" => {
-                include_str!("../../fell-render/fixtures/native-list-discussion.headers")
-            }
-            "native-personal-complex" => {
-                include_str!("../../fell-render/fixtures/native-personal-complex.headers")
-            }
-            "native-personal-reply" => {
-                include_str!("../../fell-render/fixtures/native-personal-reply.headers")
-            }
-            "native-personal-table" => {
-                include_str!("../../fell-render/fixtures/native-personal-table.headers")
-            }
-            "web-list-digest" => include_str!("../../fell-render/fixtures/web-list-digest.headers"),
-            "web-newsletter" => include_str!("../../fell-render/fixtures/web-newsletter.headers"),
-            "web-sendgrid" => include_str!("../../fell-render/fixtures/web-sendgrid.headers"),
-            other => panic!("no headers for fixture {other}"),
-        };
-        text.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                Some((name.trim().to_string(), value.trim().to_string()))
-            })
-            .collect()
     }
 
     #[test]
@@ -564,7 +594,7 @@ mod tests {
             Some(html_parts("<p>x</p>", &[])),
         );
         let store = store_with(&[only]);
-        let prepared = read_job(&store, &account().id, "a@fell.test")
+        let prepared = read_job(&store, &account().id, "a@fell.test", &[])
             .unwrap()
             .prepare();
         let body = Arc::clone(&prepared.body);
@@ -671,7 +701,7 @@ mod tests {
         );
         let store = store_with(std::slice::from_ref(&first));
         let mut cache = BodyCache::default();
-        let old = read_job(&store, &account().id, "a@fell.test")
+        let old = read_job(&store, &account().id, "a@fell.test", &[])
             .unwrap()
             .prepare();
         cache.insert(&old);
@@ -843,7 +873,7 @@ mod tests {
         }
         // Warm the rest, as opening each message would.
         for message in &view {
-            if let Some(job) = read_job(&store, &account().id, &message.id) {
+            if let Some(job) = read_job(&store, &account().id, &message.id, &message.mail_headers) {
                 cache.insert(&job.prepare());
             }
         }

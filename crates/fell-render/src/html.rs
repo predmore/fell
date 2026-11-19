@@ -165,7 +165,8 @@ pub(crate) fn parse_html(html: &str) -> Html {
 
 pub fn html_to_document(html: &str) -> StyledDocument {
     let dom = parse_html(html);
-    let mut blocks: Vec<Block> = split_blank_lines(children_blocks(dom.root_element(), 0))
+    let blocks = split_blank_lines(children_blocks(dom.root_element(), 0));
+    let mut blocks: Vec<Block> = quote_marked_lines(blocks)
         .into_iter()
         .filter(|block| !block_is_empty(block))
         .collect();
@@ -276,7 +277,7 @@ fn styled_blocks(
     if blocks.is_empty() {
         return blocks;
     }
-    if is_fine_print(element) {
+    if is_fine_print(element) || fine_print_inside(node) {
         return vec![Block::Small {
             blocks: blocks
                 .into_iter()
@@ -291,8 +292,12 @@ fn styled_blocks(
         return blocks;
     };
     if is_mono(element) {
+        // A code set large (a booking or sign-in code) is one the reader
+        // reads off and types: it keeps a little of that size.
+        let large = text_size_px(node, 0).is_some_and(|size| size >= 20.0);
         return vec![Block::Code {
             text: inlines_plain(inlines),
+            large,
         }];
     }
     if let Some(level) = heading_level(node)
@@ -393,6 +398,7 @@ fn visible_element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str, depth: 
         }
         "pre" => vec![Block::Code {
             text: visible(&raw_text(node)).trim_matches('\n').to_string(),
+            large: false,
         }],
         "ul" => vec![list_block(node, false, depth)],
         "ol" => vec![list_block(node, true, depth)],
@@ -707,6 +713,218 @@ pub(crate) fn is_image_row(inlines: &[Inline]) -> bool {
     }
     let mut images = 0;
     walk(inlines, &mut images) && images > 0
+}
+
+/// Lines quoted with `>` in mail written as lines and `<br>`s, as plain
+/// text clients and some webmail reply: a run of them is a quote, and
+/// `>>` a quote inside it. One `>` line on its own is the sender's text
+/// unless an `… wrote:` line introduces it.
+fn quote_marked_lines(blocks: Vec<Block>) -> Vec<Block> {
+    quote_lines(blocks, false)
+}
+
+/// `nested`: inside a quote this pass made, where one `>` line is a
+/// quote too.
+fn quote_lines(blocks: Vec<Block>, nested: bool) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    // The last block out is a quote this pass made, which the next
+    // paragraph's quoted lines continue.
+    let mut open_quote = false;
+    let mut after_attribution = false;
+    for block in blocks {
+        let Block::Paragraph { inlines } = block else {
+            open_quote = false;
+            after_attribution = false;
+            out.push(block);
+            continue;
+        };
+        let lines: Vec<&[Inline]> = inlines
+            .split(|inline| matches!(inline, Inline::LineBreak))
+            .collect();
+        let marked: Vec<bool> = lines
+            .iter()
+            .map(|line| quote_mark(line).is_some())
+            .collect();
+        let count = marked.iter().filter(|marked| **marked).count();
+        let introduced = |at: usize| {
+            let before = if at == 0 {
+                after_attribution
+            } else {
+                inlines_plain(lines[at - 1]).trim_end().ends_with("wrote:")
+            };
+            before || open_quote || nested
+        };
+        if count == 0
+            || (count == 1
+                && !marked
+                    .iter()
+                    .enumerate()
+                    .any(|(at, m)| *m && introduced(at)))
+        {
+            after_attribution = inlines_plain(lines[lines.len() - 1])
+                .trim_end()
+                .ends_with("wrote:");
+            open_quote = false;
+            out.push(Block::Paragraph { inlines });
+            continue;
+        }
+        let mut at = 0;
+        while at < lines.len() {
+            let start = at;
+            let quoted = marked[at];
+            while at < lines.len() && marked[at] == quoted {
+                at += 1;
+            }
+            let run = &lines[start..at];
+            if quoted {
+                let inner = quote_lines(
+                    lines_to_paragraphs(run.iter().map(|line| strip_quote_mark(line)).collect()),
+                    true,
+                );
+                match out.last_mut() {
+                    Some(Block::Quote { blocks }) if open_quote => blocks.extend(inner),
+                    _ => out.push(Block::Quote { blocks: inner }),
+                }
+                open_quote = true;
+            } else {
+                let mut paragraph = Vec::new();
+                for (index, line) in run.iter().enumerate() {
+                    if index > 0 {
+                        paragraph.push(Inline::LineBreak);
+                    }
+                    paragraph.extend_from_slice(line);
+                }
+                out.push(Block::Paragraph { inlines: paragraph });
+                open_quote = false;
+            }
+        }
+        after_attribution = false;
+    }
+    out
+}
+
+/// Where a line's `>` mark is: the first inline is text that starts with it.
+fn quote_mark(line: &[Inline]) -> Option<()> {
+    match line.first() {
+        Some(Inline::Text(text)) if text.trim_start().starts_with('>') => Some(()),
+        _ => None,
+    }
+}
+
+/// The line without its first `>` and the space after it.
+fn strip_quote_mark(line: &[Inline]) -> Vec<Inline> {
+    let mut out = line.to_vec();
+    if let Some(Inline::Text(text)) = out.first_mut() {
+        let rest = text.trim_start().strip_prefix('>').unwrap_or(text);
+        *text = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+        if text.is_empty() {
+            out.remove(0);
+        }
+    }
+    out
+}
+
+/// Lines into paragraphs, a blank line between two.
+fn lines_to_paragraphs(lines: Vec<Vec<Inline>>) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut current: Vec<Inline> = Vec::new();
+    for line in lines {
+        let blank = line.iter().all(|inline| match inline {
+            Inline::Text(text) => text.trim().is_empty(),
+            _ => false,
+        });
+        if blank {
+            if !current.is_empty() {
+                out.push(Block::Paragraph {
+                    inlines: std::mem::take(&mut current),
+                });
+            }
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(Inline::LineBreak);
+        }
+        current.extend(line);
+    }
+    if !current.is_empty() {
+        out.push(Block::Paragraph { inlines: current });
+    }
+    out
+}
+
+/// Drop a blocked image whose `Image blocked` line would only repeat what
+/// the reader sees anyway: a logo named for the sender (`alt="Bayline
+/// Ferries"` in mail from Bayline Ferries), or a banner whose alt text
+/// starts with the heading right under it.
+pub(crate) fn drop_named_images(document: &mut StyledDocument, sender: &str) {
+    let normal = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let sender = normal(sender);
+    let blocks = std::mem::take(&mut document.blocks);
+    let mut out = Vec::with_capacity(blocks.len());
+    for (at, block) in blocks.iter().enumerate() {
+        let redundant = lone_remote_alt(block).is_some_and(|alt| {
+            let alt = normal(alt);
+            if alt.is_empty() {
+                return false;
+            }
+            let heading = blocks[at + 1..]
+                .iter()
+                .find(|next| !block_is_empty(next))
+                .and_then(|next| match next {
+                    Block::Heading { inlines, .. } => Some(normal(&inlines_plain(inlines))),
+                    _ => None,
+                });
+            (!sender.is_empty() && alt == sender)
+                || heading.is_some_and(|heading| !heading.is_empty() && alt.starts_with(&heading))
+        });
+        if !redundant {
+            out.push(block.clone());
+        }
+    }
+    document.blocks = out;
+}
+
+/// The alt text of a block that is one remote image, linked or not.
+fn lone_remote_alt(block: &Block) -> Option<&str> {
+    fn inline(inline: &Inline) -> Option<&str> {
+        match inline {
+            Inline::Image {
+                source: ImageSource::Remote(_),
+                alt,
+            } => Some(alt),
+            Inline::Link { children, .. } => match children.as_slice() {
+                [only] => inline_alt(only),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    match block {
+        Block::Image {
+            source: ImageSource::Remote(_),
+            alt,
+        } => Some(alt),
+        Block::Paragraph { inlines } => match inlines.as_slice() {
+            [only] => inline(only),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn inline_alt(inline: &Inline) -> Option<&str> {
+    match inline {
+        Inline::Image {
+            source: ImageSource::Remote(_),
+            alt,
+        } => Some(alt),
+        _ => None,
+    }
 }
 
 /// A paragraph with an empty line in it (`<br><br>`) is two paragraphs.
@@ -1567,8 +1785,29 @@ fn font_px(element: &scraper::node::Element) -> Option<f32> {
     None
 }
 
-/// Fine print: 12 px or smaller, as newsletters set their footer.
+/// Fine print set on the one element a block wraps:
+/// `<p><span style="font-size:x-small">Legal</span></p>`.
+fn fine_print_inside(node: ego_tree::NodeRef<'_, Node>) -> bool {
+    let mut only = None;
+    for child in node.children() {
+        match child.value() {
+            Node::Text(text) if is_blank_text(text) => {}
+            Node::Element(_) if only.is_none() => only = Some(child),
+            _ => return false,
+        }
+    }
+    only.and_then(|child| child.value().as_element())
+        .is_some_and(|element| !is_block_tag(element.name()) && is_fine_print(element))
+}
+
+/// Fine print: 12 px or smaller, as newsletters set their footer, or the
+/// `small` and `x-small` keywords Outlook and Gmail write for it.
 fn is_fine_print(element: &scraper::node::Element) -> bool {
+    if style_value(element, "font-size")
+        .is_some_and(|value| matches!(value.as_str(), "small" | "x-small" | "xx-small"))
+    {
+        return true;
+    }
     font_px(element).is_some_and(|size| size > 0.0 && size <= 12.0)
 }
 
@@ -1754,7 +1993,7 @@ fn block_is_empty(block: &Block) -> bool {
         }
         Block::List { items, .. } => items.is_empty(),
         Block::Quote { blocks } => blocks.is_empty(),
-        Block::Code { text } => text.trim().is_empty(),
+        Block::Code { text, .. } => text.trim().is_empty(),
         Block::Table { header, rows, .. } => header.is_empty() && rows.is_empty(),
         Block::Image { .. } | Block::ThematicBreak => false,
     }
@@ -1987,7 +2226,7 @@ mod tests {
     #[test]
     fn pre_and_code_keep_a_newline_for_each_br() {
         let doc = html_to_document("<pre>a<br>b</pre><p><code>c<br>d</code></p>");
-        let Block::Code { text } = &doc.blocks[0] else {
+        let Block::Code { text, .. } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks);
         };
         assert_eq!(text, "a\nb");
@@ -2193,5 +2432,69 @@ mod tests {
             panic!("{:?}", plain.blocks);
         };
         assert_eq!(align, &vec![Align::Start, Align::Start]);
+    }
+
+    #[test]
+    fn gt_quoted_lines_in_line_break_mail_are_a_quote() {
+        let doc = html_to_document(
+            "<div>Sounds good.<br><br>On Monday, Ada wrote:<br>&gt; Lunch on Thursday?<br>&gt;<br>&gt; &gt; Or Friday.<br>&gt; Either works.</div>",
+        );
+        assert_eq!(doc.blocks.len(), 3, "{:?}", doc.blocks);
+        assert_eq!(doc.plain_text().lines().next(), Some("Sounds good."));
+        let Block::Quote { blocks } = &doc.blocks[2] else {
+            panic!("{:?}", doc.blocks);
+        };
+        assert!(matches!(blocks[0], Block::Paragraph { .. }));
+        assert!(matches!(blocks[1], Block::Quote { .. }), "{blocks:?}");
+        assert!(format!("{blocks:?}").contains("Either works."));
+        // One `>` line the sender wrote stays theirs.
+        let doc = html_to_document("<div>Score so far:<br>&gt; 3 wins</div>");
+        assert!(matches!(doc.blocks[0], Block::Paragraph { .. }));
+        assert_eq!(doc.blocks.len(), 1);
+    }
+
+    #[test]
+    fn small_font_keywords_are_fine_print() {
+        for size in ["small", "x-small", "XX-SMALL"] {
+            let doc = html_to_document(&format!(
+                "<p>Body</p><p style=\"font-size:{size}\">Legal</p>"
+            ));
+            assert!(matches!(doc.blocks[1], Block::Small { .. }), "{size}");
+        }
+        let doc = html_to_document("<p>Body</p><p style=\"font-size:medium\">More</p>");
+        assert!(matches!(doc.blocks[1], Block::Paragraph { .. }));
+    }
+
+    #[test]
+    fn a_code_set_large_is_marked_large() {
+        let doc = html_to_document(
+            "<p>Your code:</p><div style=\"font-family:monospace;font-size:28px\">482 913</div><div style=\"font-family:monospace\">ls -la</div>",
+        );
+        assert_eq!(
+            doc.blocks[1],
+            Block::Code {
+                text: "482 913".into(),
+                large: true
+            }
+        );
+        assert_eq!(
+            doc.blocks[2],
+            Block::Code {
+                text: "ls -la".into(),
+                large: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_blocked_logo_named_for_the_sender_or_its_heading_goes() {
+        let mut doc = html_to_document(
+            "<img src=\"https://a.test/logo.png\" alt=\"Bayline  Ferries\"><h2>Booked</h2><a href=\"https://a.test\"><img src=\"https://a.test/b.png\" alt=\"Ridge Parka in moss\"></a><h3>Ridge Parka</h3><img src=\"https://a.test/c.png\" alt=\"Map of the route\"><p>Text</p>",
+        );
+        drop_named_images(&mut doc, "Bayline Ferries");
+        let text = format!("{:?}", doc.blocks);
+        assert!(!text.contains("logo.png"), "{text}");
+        assert!(!text.contains("b.png"), "{text}");
+        assert!(text.contains("Map of the route"), "{text}");
     }
 }

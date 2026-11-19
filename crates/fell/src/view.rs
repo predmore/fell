@@ -1341,12 +1341,12 @@ impl Inbox {
     /// that keeps it open) starts its body.
     fn want_bodies(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let mut read = Vec::new();
+        let mut read: Vec<(String, Vec<(String, String)>)> = Vec::new();
         let mut fetch = Vec::new();
         for message in self.session.messages.iter().filter(|m| m.expanded) {
             match message.rich {
                 Rich::Pending if !self.bodies_busy.contains(&message.id) => {
-                    read.push(message.id.clone());
+                    read.push((message.id.clone(), message.mail_headers.clone()));
                 }
                 Rich::Missing
                     if self.sync.is_some() && self.bodies_asked.should_ask(&message.id, now) =>
@@ -1362,12 +1362,13 @@ impl Inbox {
         if read.is_empty() {
             return;
         }
-        self.bodies_busy.extend(read.iter().cloned());
+        self.bodies_busy
+            .extend(read.iter().map(|(id, _)| id.clone()));
         let account = self.account_id.clone();
         let reply = self.store.call(move |store| {
             read.into_iter()
-                .map(|id| {
-                    let job = mail_body::read_job(store, &account, &id);
+                .map(|(id, headers)| {
+                    let job = mail_body::read_job(store, &account, &id, &headers);
                     (id, job)
                 })
                 .collect::<Vec<_>>()
@@ -1458,6 +1459,7 @@ impl Inbox {
             folds: self.motion.fold_shown(now),
             heights: Rc::clone(&self.fold_heights),
             landing: self.landing.as_ref().map(|landing| landing.index),
+            frames: self.frames.clone(),
         }
     }
 
@@ -2508,6 +2510,7 @@ struct ConvFrame {
     heights: Rc<RefCell<HashMap<String, f32>>>,
     /// The message held at the top of the conversation, if any.
     landing: Option<usize>,
+    frames: Option<SharedFrameLog>,
 }
 
 impl ConvFrame {
@@ -2518,6 +2521,7 @@ impl ConvFrame {
             folds: HashMap::new(),
             heights: Rc::clone(heights),
             landing: None,
+            frames: None,
         }
     }
 }
@@ -3590,6 +3594,7 @@ fn conversation(
                     inner: body.into_any_element(),
                     probe: Rc::clone(&probe),
                     scroll: scroll.clone(),
+                    frames: frame.frames.clone(),
                 }
                 .into_any_element(),
                 _ => body.into_any_element(),
@@ -3610,6 +3615,8 @@ struct LandingHold {
     /// The layout of the reader's message, from [`LayoutProbe`].
     probe: Rc<std::cell::Cell<Option<gpui::LayoutId>>>,
     scroll: ScrollHandle,
+    /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
+    frames: Option<SharedFrameLog>,
 }
 
 impl IntoElement for LandingHold {
@@ -3651,18 +3658,23 @@ impl gpui::Element for LandingHold {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let before = self.scroll.offset();
         if let Some(item) = self.probe.get() {
             // Both are this frame's layout, before the scroll offset: the
             // offset that puts the message's top at the viewport's top. The
             // scroll area clamps it when the thread is shorter.
             let item = window.layout_bounds(item);
             let want = f32::from(bounds.top() - item.top()).min(0.0);
-            let offset = self.scroll.offset();
-            if (f32::from(offset.y) - want).abs() > 0.5 {
-                self.scroll.set_offset(point(offset.x, px(want)));
-            }
+            self.scroll.set_offset(point(before.x, px(want)));
         }
         self.inner.prepaint(window, cx);
+        // What the scroll area drew at, once clamped, if it moved.
+        let after = f32::from(self.scroll.offset().y);
+        if (after - f32::from(before.y)).abs() > 0.5
+            && let Some(log) = &self.frames
+        {
+            log.borrow_mut().note("landing", after);
+        }
     }
 
     fn paint(
@@ -4035,12 +4047,14 @@ fn message_body(
                                 kind,
                                 lines,
                                 show_key: Some(run) == first_hidden,
+                                rtl: crate::render::is_right_to_left(&text),
                             },
                             folds,
                             reveal,
                             (fold_key(&message.id, at), &frame.heights),
                             move || {
                                 div()
+                                    .max_w(px(READING_MEASURE_PX - HISTORY_INDENT_PX))
                                     .line_height(line_height)
                                     .child(text)
                                     .into_any_element()
@@ -4083,76 +4097,139 @@ fn html_sections(
         .sections
         .iter()
         .enumerate()
-        .map(|(at, section)| match section.fold {
-            // A short signature shown in place ("Sent from my iPhone") is
-            // the dimmed colour, as history is.
-            None => div()
-                .max_w(px(READING_MEASURE_PX))
-                .pb(px(8.))
-                // A paragraph's gap above it, and the dimmed colour.
-                .when(section.quiet, |quiet| {
-                    quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
-                })
-                .child(
-                    crate::render::blocks_column(
-                        folded.blocks(section),
-                        if section.quiet { &quiet } else { &palette },
-                        false,
-                        &body.gallery,
+        .map(|(at, section)| {
+            let rtl = body.rtl.get(at).copied().unwrap_or(false);
+            match section.fold {
+                // A quote the sender answers under it: open, under the
+                // history rule, in the dimmed colour.
+                // A quote the sender answers sits a step apart from the
+                // answers around it, closer than two paragraphs.
+                None if section.quoted => div()
+                    .pt(px(8.))
+                    .pb(px(16.))
+                    .when(rtl, |quote| quote.max_w(px(READING_MEASURE_PX)))
+                    .child(
+                        history_rule(div(), rtl, crate::theme::strong_border(theme))
+                            .text_color(rgb(theme.dimmed))
+                            .child(history_blocks(
+                                folded.blocks(section),
+                                None,
+                                &quiet,
+                                &body.gallery,
+                                (theme, rtl),
+                            )),
                     )
-                    .line_height(line),
-                )
-                .into_any_element(),
-            Some(kind) => {
-                let body = Arc::clone(body);
-                let history = mail_body::history_palette(theme);
-                let line_height = px(theme.ui_px * 1.4);
-                fold_section(
-                    theme,
-                    FoldLabel {
-                        kind,
-                        lines: body.fold_lines.get(at).copied().unwrap_or(0),
-                        show_key: Some(at) == first_fold,
-                    },
-                    folds,
-                    reveal,
-                    (fold_key(&message.id, at), &frame.heights),
-                    move || {
-                        let section = &body.folded.sections[at];
-                        // The section draws the quote rule, so a quote's
-                        // own rule is not drawn again inside it.
-                        let runs: Vec<&[fell_render::Block]> = body
-                            .folded
-                            .blocks(section)
-                            .iter()
-                            .map(|block| match block {
-                                fell_render::Block::Quote { blocks } => blocks.as_slice(),
-                                other => std::slice::from_ref(other),
-                            })
-                            .collect();
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .children(runs.into_iter().map(|run| {
-                                // History reads as a block: lines closer than
-                                // the sender's own paragraphs.
-                                crate::render::blocks_column_spaced(
-                                    run,
-                                    &history,
-                                    false,
-                                    &body.gallery,
-                                    8.,
-                                )
-                                .line_height(line_height)
-                            }))
-                            .into_any_element()
-                    },
-                    cx,
-                )
+                    .into_any_element(),
+                // A short signature shown in place ("Sent from my iPhone")
+                // is the dimmed colour, as history is.
+                None => div()
+                    .pb(px(8.))
+                    .when(rtl, |open| open.max_w(px(READING_MEASURE_PX)))
+                    // A paragraph's gap above it, and the dimmed colour.
+                    .when(section.quiet, |quiet| {
+                        quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
+                    })
+                    .child(
+                        crate::render::blocks_column_spaced(
+                            folded.blocks(section),
+                            if section.quiet { &quiet } else { &palette },
+                            false,
+                            &body.gallery,
+                            crate::render::BLOCK_GAP,
+                            (!rtl).then_some(READING_MEASURE_PX),
+                        )
+                        .line_height(line),
+                    )
+                    .into_any_element(),
+                Some(kind) => {
+                    let body = Arc::clone(body);
+                    let history = mail_body::history_palette(theme);
+                    let theme_for = theme.clone();
+                    fold_section(
+                        theme,
+                        FoldLabel {
+                            kind,
+                            lines: body.fold_lines.get(at).copied().unwrap_or(0),
+                            show_key: Some(at) == first_fold,
+                            rtl,
+                        },
+                        folds,
+                        reveal,
+                        (fold_key(&message.id, at), &frame.heights),
+                        move || {
+                            let section = &body.folded.sections[at];
+                            history_blocks(
+                                body.folded.blocks(section),
+                                Some(kind),
+                                &history,
+                                &body.gallery,
+                                (&theme_for, rtl),
+                            )
+                        },
+                        cx,
+                    )
+                }
             }
         })
         .collect()
+}
+
+/// Space between a history rule and the text it marks.
+const HISTORY_INDENT_PX: f32 = 12.0;
+
+/// The 2 px rule history hangs off, with its 10 px indent: on the left, or
+/// on the right of text written right to left.
+fn history_rule(block: gpui::Div, rtl: bool, color: u32) -> gpui::Div {
+    let block = block.border_color(rgb(color));
+    if rtl {
+        block.pr(px(10.)).border_r(px(2.))
+    } else {
+        block.pl(px(10.)).border_l(px(2.))
+    }
+}
+
+/// History under its rule. A quote's own rule is the section's, so it is
+/// not drawn again, except where a signature shares the fold: there the
+/// quote keeps a rule of its own inside, so the sender's signature and the
+/// mail it answers read as two things. History reads as a block: lines
+/// closer than the sender's own paragraphs.
+fn history_blocks(
+    blocks: &[fell_render::Block],
+    kind: Option<fell_render::Fold>,
+    history: &crate::render::Palette,
+    gallery: &crate::render::ImageGallery,
+    (theme, rtl): (&Theme, bool),
+) -> gpui::AnyElement {
+    use fell_render::{Block, Fold};
+    let nested = matches!(
+        kind,
+        Some(Fold::SignatureAndQuote | Fold::QuoteAndSignature)
+    );
+    let line_height = px(theme.ui_px * 1.4);
+    let measure = (!rtl).then_some(READING_MEASURE_PX - HISTORY_INDENT_PX);
+    let column = |run: &[Block], measure: Option<f32>| {
+        crate::render::blocks_column_spaced(run, history, false, gallery, 8., measure)
+            .line_height(line_height)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .children(blocks.iter().map(|block| {
+            match block {
+                Block::Quote { blocks } if nested => {
+                    history_rule(div(), rtl, crate::theme::strong_border(theme))
+                        .child(column(
+                            blocks,
+                            measure.map(|measure| measure - HISTORY_INDENT_PX),
+                        ))
+                        .into_any_element()
+                }
+                Block::Quote { blocks } => column(blocks, measure).into_any_element(),
+                other => column(std::slice::from_ref(other), measure).into_any_element(),
+            }
+        }))
+        .into_any_element()
 }
 
 /// The fold a run of two kinds of history makes.
@@ -4171,6 +4248,9 @@ struct FoldLabel {
     kind: fell_render::Fold,
     lines: usize,
     show_key: bool,
+    /// The history is written right to left: the rule is on the right and
+    /// the line is set flush right, as the text it stands for.
+    rtl: bool,
 }
 
 impl FoldLabel {
@@ -4218,15 +4298,16 @@ fn fold_section(
     let estimate = lines.max(1) as f32 * theme.ui_px * 1.4 + 8.0;
     let natural = heights.borrow().get(&key).copied().unwrap_or(estimate);
     let measured = Rc::clone(heights);
-    // The measure is set on a box with no padding, and the rule and indent
-    // on a plain block inside it, as an open section is built: the history
-    // is then laid out at the width it paints at (the measure less the
-    // indent), so its box is as tall as its wrapped lines and nothing under
-    // it is overlapped. Once open, the box sizes itself; the measured height
-    // only paces the next reveal.
+    // The rule and indent are on a plain block inside a box with no
+    // padding: the history is laid out at the width it paints at, so its
+    // box is as tall as its wrapped lines and nothing under it is
+    // overlapped. Its prose keeps the reading measure; a table or code
+    // block in it takes the pane. Once open, the box sizes itself; the
+    // measured height only paces the next reveal. Right to left, the box
+    // keeps the measure so the rule stays beside the text.
     let content = div()
-        .max_w(px(READING_MEASURE_PX))
         .pb(px(8.))
+        .when(label.rtl, |content| content.max_w(px(READING_MEASURE_PX)))
         .on_children_prepainted(move |bounds, _, _| {
             if let Some(bounds) = bounds.first() {
                 measured
@@ -4235,10 +4316,7 @@ fn fold_section(
             }
         })
         .child(
-            div()
-                .pl(px(10.))
-                .border_l(px(2.))
-                .border_color(rgb(crate::theme::strong_border(theme)))
+            history_rule(div(), label.rtl, crate::theme::strong_border(theme))
                 .text_color(rgb(theme.dimmed))
                 .child(opened()),
         );
@@ -4283,14 +4361,14 @@ fn folded_line(
         theme.border
     };
     let accent = theme.accent;
-    div()
+    history_rule(div(), label.rtl, rule)
         .h(px(28.))
         .mb(px(6.))
-        .pl(px(10.))
-        .border_l(px(2.))
-        .border_color(rgb(rule))
         .flex()
         .items_center()
+        .when(label.rtl, |line| {
+            line.max_w(px(READING_MEASURE_PX)).justify_end()
+        })
         .text_color(rgb(theme.dimmed))
         .child(label.text())
         .when(folds.live, |line| {

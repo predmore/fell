@@ -1,0 +1,11 @@
+## open
+p Staging is on retries = 5 now and the last six deploys went through.
+p I will change production after the morning batch.
+p Kai
+## fold quote
+p On 18 Nov 2026 09:12, Jun Takeda wrote:
+quote
+  p Could someone try a longer retry on staging first?
+  quote
+    p The relay deploy failed again at 22:14.
+      | Here is the tail of the log.

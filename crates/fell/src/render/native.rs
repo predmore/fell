@@ -8,7 +8,7 @@ use fell_render::{Align, Block, ImageSource, Inline, ListItem, StyledDocument};
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, FontStyle, FontWeight, GlobalElementId,
     HighlightStyle, InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, SharedString,
-    StyledText, TextAlign, UnderlineStyle, Window, div, img, prelude::*, px,
+    TextAlign, UnderlineStyle, Window, div, img, prelude::*, px,
 };
 use image::Frame;
 use smallvec::SmallVec;
@@ -173,7 +173,7 @@ fn walk_inlines_sources(inlines: &[Inline], visit: &mut impl FnMut(&ImageSource)
 
 /// Space between blocks. A short letter uses this rhythm instead of a
 /// closing rule.
-const BLOCK_GAP: f32 = 24.;
+pub const BLOCK_GAP: f32 = 24.;
 
 /// A caption under a sketch uses half the paragraph rhythm, so it reads as
 /// a label for the drawing. The next block still gets [`BLOCK_GAP`].
@@ -205,17 +205,21 @@ pub fn blocks_column(
     allow_remote: bool,
     gallery: &ImageGallery,
 ) -> gpui::Div {
-    blocks_column_spaced(blocks, palette, allow_remote, gallery, BLOCK_GAP)
+    blocks_column_spaced(blocks, palette, allow_remote, gallery, BLOCK_GAP, None)
 }
 
 /// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
-/// opened history sits tighter than the sender's own paragraphs.
+/// opened history sits tighter than the sender's own paragraphs. With a
+/// `measure`, prose is held to that width while tables and code blocks
+/// take the whole column: a table's columns need the room, and a log line
+/// wrapped at 72 characters is harder to read, not easier.
 pub fn blocks_column_spaced(
     blocks: &[Block],
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
     gap: f32,
+    measure: Option<f32>,
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
@@ -244,7 +248,18 @@ pub fn blocks_column_spaced(
                 gap_between(above, &blocks[start]) * gap
             }
         });
-        column = column.child(div().mt(px(gap)).child(child));
+        let wide = matches!(
+            blocks[start],
+            Block::Table { .. } | Block::Code { large: false, .. }
+        );
+        column = column.child(
+            div()
+                .mt(px(gap))
+                .when_some(measure.filter(|_| !wide), |prose, measure| {
+                    prose.max_w(px(measure))
+                })
+                .child(child),
+        );
         previous = Some(&blocks[end - 1]);
     }
     column
@@ -428,13 +443,27 @@ fn render_block(
                 list_item(index, *ordered, item, palette, allow_remote, gallery)
             }))
             .into_any_element(),
-        Block::Code { text } => div()
+        Block::Code { text, large: false } => div()
             .font_family(CODE_FONT)
             .text_sm()
             .bg(paint(palette.code_bg))
             .p_3()
             .rounded(px(4.))
             .child(PreText::new(text))
+            .into_any_element(),
+        // A box that fits the code, not the line: it reads as one thing.
+        Block::Code { text, large: true } => div()
+            .flex()
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(CODE_FONT)
+                    .bg(paint(palette.code_bg))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(4.))
+                    .child(PreText::large(text)),
+            )
             .into_any_element(),
         Block::Table {
             header,
@@ -841,7 +870,7 @@ fn push_cell_lines(blocks: &[Block], out: &mut Vec<String>) {
             Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
                 push_cell_lines(blocks, out)
             }
-            Block::Code { text } => out.extend(text.lines().map(str::to_string)),
+            Block::Code { text, .. } => out.extend(text.lines().map(str::to_string)),
             Block::Image { alt, .. } => out.push(format!("Image blocked \u{b7} {alt}")),
             Block::Table { .. } | Block::ThematicBreak => {}
         }
@@ -1030,36 +1059,89 @@ fn flush_text(
         .drain(..)
         .map(|(range, mark)| (range.len(), mark))
         .collect();
-    // gpui wraps a right-to-left line out of place (the second line of a
-    // Hebrew paragraph paints off the left edge), so a paragraph written
-    // right to left is wrapped here, a line at a time, and set flush right.
-    if is_right_to_left(text) {
-        let element = RtlText {
-            text: SharedString::from(text.clone()),
-            runs,
-            palette: *palette,
-            lines: Rc::default(),
-            line_height: px(0.),
-            font_size: px(0.),
-            text_runs: Vec::new(),
-        };
-        out.push(div().w_full().child(element).into_any_element());
-        text.clear();
-        return;
-    }
-    let styled = MailText {
+    // Each paragraph wraps itself, a line at a time (see [`MailText`]).
+    let element = MailText {
+        rtl: is_right_to_left(text),
+        keep: code_ranges(&runs),
         text: SharedString::from(text.clone()),
         runs,
         palette: *palette,
-        inner: None,
+        lines: Rc::default(),
+        line_height: px(0.),
+        font_size: px(0.),
+        text_runs: Vec::new(),
     };
-    out.push(div().w_full().child(styled).into_any_element());
+    out.push(div().w_full().child(element).into_any_element());
     text.clear();
+}
+
+/// One line of text shaped with its runs. `shape_text`, not `shape_line`:
+/// gpui 0.2.2's `shape_line` joins a run whose font changes (bold, code)
+/// into the one before it when the colour and decorations match, so a bold
+/// label at the start of a line set the whole line bold.
+fn shape_one(
+    window: &mut Window,
+    text: &str,
+    font_size: Pixels,
+    runs: &[gpui::TextRun],
+) -> gpui::WrappedLine {
+    window
+        .text_system()
+        .shape_text(
+            SharedString::from(text.to_string()),
+            font_size,
+            runs,
+            None,
+            None,
+        )
+        .ok()
+        .and_then(|lines| lines.into_iter().next())
+        .unwrap_or_default()
+}
+
+/// The x of each byte of a shaped left-to-right line, as `x_for_index`
+/// gives it: where the first glyph at or after the byte starts. The last
+/// entry is the line's width.
+fn byte_xs(line: &gpui::LineLayout, len: usize) -> Vec<f32> {
+    let mut xs = vec![f32::from(line.width); len + 1];
+    let glyphs: Vec<(usize, f32)> = line
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
+        .collect();
+    let mut next = glyphs.len();
+    let mut x = f32::from(line.width);
+    for at in (0..=len).rev() {
+        while next > 0 && glyphs[next - 1].0 >= at {
+            next -= 1;
+            x = glyphs[next].1;
+        }
+        xs[at] = x;
+    }
+    xs
+}
+
+/// The byte ranges of inline code (with its padding), which a line breaks
+/// inside only when it is wider than the line.
+fn code_ranges(runs: &[(usize, Mark)]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let mut at = 0;
+    for (len, mark) in runs {
+        if mark.code {
+            match out.last_mut() {
+                Some(last) if last.end == at => last.end = at + len,
+                _ => out.push(at..at + len),
+            }
+        }
+        at += len;
+    }
+    out
 }
 
 /// Set right to left: the first letter is of a right-to-left script
 /// (Hebrew, Arabic, Syriac, Thaana), as `dir="auto"` decides it.
-pub(crate) fn is_right_to_left(text: &str) -> bool {
+pub fn is_right_to_left(text: &str) -> bool {
     text.chars()
         .find(|ch| ch.is_alphabetic())
         .is_some_and(|ch| matches!(ch as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF))
@@ -1086,9 +1168,24 @@ fn slice_runs(runs: &[gpui::TextRun], range: &Range<usize>) -> Vec<gpui::TextRun
 
 /// Byte ranges of each line of `text` broken at spaces to fit `width`,
 /// from `measure` of a range's width. Hard line breaks are kept.
+#[cfg(test)]
 pub(crate) fn wrap_words(
     text: &str,
     width: Option<f32>,
+    measure: impl FnMut(Range<usize>) -> f32,
+) -> Vec<Range<usize>> {
+    wrap_mail(text, width, &[], measure)
+}
+
+/// Byte ranges of each line of `text`, broken at spaces to fit `width`,
+/// from `measure` of a range's width. Hard line breaks are kept. A `keep`
+/// range (inline code) is not broken at its spaces unless it is wider than
+/// the line. A word wider than the line breaks between letters, as late as
+/// fits.
+pub(crate) fn wrap_mail(
+    text: &str,
+    width: Option<f32>,
+    keep: &[Range<usize>],
     mut measure: impl FnMut(Range<usize>) -> f32,
 ) -> Vec<Range<usize>> {
     let mut lines = Vec::new();
@@ -1100,29 +1197,65 @@ pub(crate) fn wrap_words(
             lines.push(base..base + hard.len());
             continue;
         };
+        let end = base + hard.len();
+        // Spaces inside code that fits on a line are not breaks.
+        let held: Vec<&Range<usize>> = keep
+            .iter()
+            .filter(|range| range.start < end && range.end > base)
+            .filter(|range| measure((*range).clone()) <= width)
+            .collect();
+        let breaks: Vec<usize> = hard
+            .match_indices(' ')
+            .map(|(at, _)| base + at)
+            .filter(|at| !held.iter().any(|range| range.contains(at)))
+            .collect();
         let mut line_start = base;
         let mut line_end = base;
-        let mut at = 0;
-        for word in hard.split(' ') {
-            let word_start = base + at;
-            let word_end = word_start + word.len();
-            at += word.len() + 1;
+        let mut word_start = base;
+        for word_end in breaks.iter().copied().chain(std::iter::once(end)) {
             if line_end > line_start && measure(line_start..word_end) > width {
                 lines.push(line_start..line_end);
                 line_start = word_start;
             }
+            // A word wider than the line on its own.
+            while line_start < word_end && measure(line_start..word_end) > width {
+                let mut cut = line_start;
+                for (at, ch) in text[line_start..word_end].char_indices() {
+                    let next = line_start + at + ch.len_utf8();
+                    if cut > line_start && measure(line_start..next) > width {
+                        break;
+                    }
+                    cut = next;
+                }
+                if cut >= word_end {
+                    break;
+                }
+                lines.push(line_start..cut);
+                line_start = cut;
+            }
             line_end = word_end;
+            word_start = word_end + 1;
         }
         lines.push(line_start..line_end);
     }
     lines
 }
 
-/// A paragraph set right to left: wrapped at spaces to the width it is
-/// given, each line shaped on its own and painted flush right.
-struct RtlText {
+/// Text in the inherited face with runs of bold, italic, links and inline
+/// code, wrapped here rather than by gpui: at spaces only, so inline code
+/// (`/mnt/archive`) never breaks at its slash, and a line at a time, so a
+/// link's underline ends with its last letter on each line instead of
+/// running into the next line's indent. A paragraph written right to left
+/// is set flush right (gpui would wrap it out of place). Inline code needs
+/// its own face, which a highlight cannot set, so the runs are built from
+/// the text style the element lays out in.
+struct MailText {
     text: SharedString,
+    /// Byte length and marks of each run, covering the text in order.
     runs: Vec<(usize, Mark)>,
+    /// Inline code, kept on one line when it fits.
+    keep: Vec<Range<usize>>,
+    rtl: bool,
     palette: Palette,
     lines: Rc<RefCell<Vec<Range<usize>>>>,
     line_height: Pixels,
@@ -1130,7 +1263,7 @@ struct RtlText {
     text_runs: Vec<gpui::TextRun>,
 }
 
-impl IntoElement for RtlText {
+impl IntoElement for MailText {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -1138,7 +1271,7 @@ impl IntoElement for RtlText {
     }
 }
 
-impl Element for RtlText {
+impl Element for MailText {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -1180,6 +1313,8 @@ impl Element for RtlText {
             .collect();
         let text = self.text.clone();
         let runs = self.text_runs.clone();
+        let keep = self.keep.clone();
+        let rtl = self.rtl;
         let lines = Rc::clone(&self.lines);
         let layout = window.request_measured_layout(
             gpui::Style::default(),
@@ -1188,24 +1323,41 @@ impl Element for RtlText {
                     gpui::AvailableSpace::Definite(width) => Some(width),
                     _ => None,
                 });
-                let mut widest = 0f32;
-                let wrapped = wrap_words(&text, width.map(f32::from), |range| {
-                    let shaped = window.text_system().shape_line(
-                        SharedString::from(text[range.clone()].to_string()),
-                        font_size,
-                        &slice_runs(&runs, &range),
-                        None,
-                    );
-                    f32::from(shaped.width)
-                });
-                for range in &wrapped {
-                    let shaped = window.text_system().shape_line(
-                        SharedString::from(text[range.clone()].to_string()),
+                let shape = |range: &Range<usize>, window: &mut Window| {
+                    shape_one(
+                        window,
+                        &text[range.clone()],
                         font_size,
                         &slice_runs(&runs, range),
-                        None,
-                    );
-                    widest = widest.max(f32::from(shaped.width));
+                    )
+                };
+                // Left to right, a range's width is the distance between
+                // its ends on its whole line, shaped once, with each byte's
+                // x looked up, so a long run of text without spaces wraps
+                // in linear time. Right to left, glyphs are not in byte
+                // order: each range is shaped.
+                let mut hard: Vec<(usize, Vec<f32>)> = Vec::new();
+                if !rtl {
+                    let mut at = 0;
+                    for line in text.split('\n') {
+                        let range = at..at + line.len();
+                        let shaped = shape(&range, window);
+                        hard.push((at, byte_xs(&shaped.unwrapped_layout, line.len())));
+                        at += line.len() + 1;
+                    }
+                }
+                let wrapped = wrap_mail(&text, width.map(f32::from), &keep, |range| {
+                    let line = hard.partition_point(|(start, _)| *start <= range.start);
+                    match line.checked_sub(1).map(|line| &hard[line]) {
+                        Some((start, xs)) if range.end - start < xs.len() => {
+                            xs[range.end - start] - xs[range.start - start]
+                        }
+                        _ => f32::from(shape(&range, window).unwrapped_layout.width),
+                    }
+                });
+                let mut widest = 0f32;
+                for range in &wrapped {
+                    widest = widest.max(f32::from(shape(range, window).unwrapped_layout.width));
                 }
                 let size = gpui::size(
                     width.unwrap_or(px(widest)),
@@ -1244,17 +1396,21 @@ impl Element for RtlText {
             if range.is_empty() {
                 continue;
             }
-            let shaped = window.text_system().shape_line(
-                SharedString::from(self.text[range.clone()].to_string()),
+            let shaped = shape_one(
+                window,
+                &self.text[range.clone()],
                 font_size,
                 &slice_runs(&self.text_runs, range),
-                None,
             );
-            let origin = gpui::point(
-                bounds.right() - shaped.width,
-                bounds.origin.y + self.line_height * at as f32,
-            );
-            let _ = shaped.paint(origin, self.line_height, window, cx);
+            let x = if self.rtl {
+                bounds.right() - shaped.unwrapped_layout.width
+            } else {
+                bounds.left()
+            };
+            let origin = gpui::point(x, bounds.origin.y + self.line_height * at as f32);
+            let align = TextAlign::Left;
+            let _ = shaped.paint_background(origin, self.line_height, align, None, window, cx);
+            let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
         }
     }
 }
@@ -1414,6 +1570,8 @@ struct PreText {
     text: SharedString,
     rows: Rc<RefCell<Vec<(String, bool)>>>,
     style: Option<(gpui::Font, Pixels, Pixels, gpui::Hsla)>,
+    /// Pixels over the inherited size: a code the reader copies.
+    grow: f32,
 }
 
 impl PreText {
@@ -1422,9 +1580,23 @@ impl PreText {
             text: SharedString::from(text.to_string()),
             rows: Rc::default(),
             style: None,
+            grow: 0.,
+        }
+    }
+
+    /// [`LARGE_CODE_GROW_PX`] over the body size, with room between lines.
+    fn large(text: &str) -> Self {
+        Self {
+            grow: LARGE_CODE_GROW_PX,
+            ..Self::new(text)
         }
     }
 }
+
+/// How much larger than the body a code set large in the mail (a sign-in
+/// or booking code) is painted: big enough to read off and type, not the
+/// sender's 24 to 32 px.
+const LARGE_CODE_GROW_PX: f32 = 4.;
 
 impl IntoElement for PreText {
     type Element = Self;
@@ -1455,10 +1627,14 @@ impl Element for PreText {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let style = window.text_style();
         let font = style.font();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = style
-            .line_height
-            .to_pixels(font_size.into(), window.rem_size());
+        let font_size = style.font_size.to_pixels(window.rem_size()) + px(self.grow);
+        let line_height = if self.grow > 0. {
+            font_size * 1.4
+        } else {
+            style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size())
+        };
         let font_id = window.text_system().resolve_font(&font);
         let advance = window
             .text_system()
@@ -1555,95 +1731,6 @@ impl Element for PreText {
     }
 }
 
-/// Text in the inherited face with runs of bold, italic, links and inline
-/// code. Inline code needs its own face, which a highlight cannot set, so
-/// the runs are built from the text style the element lays out in.
-struct MailText {
-    text: SharedString,
-    /// Byte length and marks of each run, covering the text in order.
-    runs: Vec<(usize, Mark)>,
-    palette: Palette,
-    inner: Option<StyledText>,
-}
-
-impl IntoElement for MailText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for MailText {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let base = window.text_style();
-        let runs = self
-            .runs
-            .iter()
-            .map(|(len, mark)| {
-                let mut style = base.clone();
-                if let Some(highlight) = highlight(mark, &self.palette) {
-                    style = style.highlight(highlight);
-                }
-                if mark.mono {
-                    style.font_family = CODE_FONT.into();
-                }
-                style.to_run(*len)
-            })
-            .collect();
-        let inner = self
-            .inner
-            .insert(StyledText::new(self.text.clone()).with_runs(runs));
-        inner.request_layout(id, inspector_id, window, cx)
-    }
-
-    fn prepaint(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        state: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.prepaint(id, inspector_id, bounds, state, window, cx);
-        }
-    }
-
-    fn paint(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        state: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.paint(id, inspector_id, bounds, state, prepaint, window, cx);
-        }
-    }
-}
-
 fn highlight(mark: &Mark, palette: &Palette) -> Option<HighlightStyle> {
     if !mark.strong && !mark.emphasis && !mark.strike && !mark.code && !mark.link {
         return None;
@@ -1698,8 +1785,8 @@ fn image_el(
                 format!("Remote image · {alt}")
             }
         }
-        ImageSource::Cid(cid) => format!("Inline image · {cid}"),
-        ImageSource::Data { .. } => {
+        // A `cid:` is the attachment's id, not a name: the alt says what it is.
+        ImageSource::Cid(_) | ImageSource::Data { .. } => {
             if alt.is_empty() {
                 "Inline image".to_string()
             } else {
@@ -2683,6 +2770,36 @@ mod decode_tests {
         let lines = wrap_words(text, Some(7.0), |range| range.len() as f32);
         let lines: Vec<&str> = lines.iter().map(|range| &text[range.clone()]).collect();
         assert_eq!(lines, ["aaa bbb", "ccc", "ddd"]);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn inline_code_stays_whole_unless_it_is_wider_than_the_line() {
+        let width = |range: Range<usize>| range.len() as f32;
+        let show = |text: &str, lines: Vec<Range<usize>>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|range| text[range.clone()].to_string())
+                .collect()
+        };
+        // Breaks only at spaces: `/mnt/archive` is one word anyway.
+        let text = "change it to /mnt/archive when";
+        let lines = super::wrap_mail(text, Some(16.0), &[13..25], width);
+        assert_eq!(show(text, lines), ["change it to", "/mnt/archive", "when"]);
+        // Code with spaces stays on one line when it fits.
+        let text = "try retries = 5 on staging";
+        let lines = super::wrap_mail(text, Some(14.0), &[4..15], width);
+        assert_eq!(show(text, lines), ["try", "retries = 5 on", "staging"]);
+        // Wider than the line: it breaks at its spaces first.
+        let lines = super::wrap_mail(text, Some(9.0), &[4..15], width);
+        assert_eq!(show(text, lines), ["try", "retries =", "5 on", "staging"]);
+        // A word wider than the line breaks between letters.
+        let text = "see https://a.test/very/long/path ok";
+        let lines = super::wrap_mail(text, Some(12.0), &[], width);
+        assert_eq!(
+            show(text, lines),
+            ["see", "https://a.te", "st/very/long", "/path ok"]
+        );
     }
 
     #[test]

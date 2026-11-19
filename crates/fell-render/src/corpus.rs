@@ -3,8 +3,10 @@
 //! Each mail mirrors one family's markup: Gmail's per-line `<div>`s and
 //! nested `gmail_quote`, Apple Mail's `blockquote type="cite"`, Outlook's
 //! `MsoNormal` paragraphs and `#divRplyFwdMsg`, Proton, Thunderbird, Yahoo,
-//! an ESP sale and receipt, a wide data table, `<pre>` code and a
-//! right-to-left reply. The content is invented and every address is on an
+//! an ESP sale and receipt, a wide data table, `<pre>` code, a
+//! right-to-left reply, interleaved replies, forwards, a pasted photo, a
+//! signature logo, a CJK note, a calendar invite, `>`-quoted lines and a
+//! sign-in code. The content is invented and every address is on an
 //! `example` domain. Each has a checked-in outline of what the conversation
 //! paints (`fixtures/corpus/<name>.outline`); `FELL_UPDATE_SNAPSHOTS=1`
 //! rewrites them.
@@ -43,6 +45,16 @@ const CORPUS: &[Embedded] = corpus!(
     "data-table",
     "pre-code",
     "rtl-reply",
+    "thunderbird-inline-reply",
+    "gmail-inline-reply",
+    "outlook-forward",
+    "apple-forward",
+    "personal-photo",
+    "outlook-signature-logo",
+    "cjk-note",
+    "calendar-invite",
+    "webmail-gt-reply",
+    "otp-code",
 );
 
 /// The corpus, in a stable order.
@@ -74,6 +86,7 @@ pub(crate) mod outline {
         for section in &doc.sections {
             let name = match section.fold {
                 None if section.quiet => "quiet",
+                None if section.quoted => "open quoted",
                 None => "open",
                 Some(Fold::Quote) => "fold quote",
                 Some(Fold::Signature) => "fold signature",
@@ -129,8 +142,8 @@ pub(crate) mod outline {
                     push_block(out, child, depth + 1);
                 }
             }
-            Block::Code { text } => {
-                line(out, depth, "code");
+            Block::Code { text, large } => {
+                line(out, depth, if *large { "code large" } else { "code" });
                 for code in text.lines() {
                     line(out, depth, &format!("   | {code}"));
                 }
@@ -231,7 +244,10 @@ mod tests {
         if fixture.headers.is_bulk() {
             FoldedDocument::unfolded(prepared.document)
         } else {
-            fold_history(prepared.document)
+            fold_history(
+                prepared.document,
+                fixture.headers.get("Subject").unwrap_or_default(),
+            )
         }
     }
 
@@ -266,6 +282,10 @@ mod tests {
         for fixture in &corpus {
             for text in [&fixture.html, &format!("{:?}", fixture.headers)] {
                 for word in text.split(|ch: char| ch.is_whitespace() || "<>\"'();,&".contains(ch)) {
+                    // A `cid:` names an attachment, not an address.
+                    if word.starts_with("cid:") {
+                        continue;
+                    }
                     let Some((_, domain)) = word.split_once('@') else {
                         continue;
                     };
@@ -443,7 +463,7 @@ mod tests {
                 .document
                 .blocks
                 .iter()
-                .any(|block| matches!(block, Block::Code { text } if text == "BX7-42QK"))
+                .any(|block| matches!(block, Block::Code { text, .. } if text == "BX7-42QK"))
         );
     }
 

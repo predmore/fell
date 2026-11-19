@@ -1,8 +1,7 @@
 ## open
-p ![Bayline Ferries](remote)
 h2 Your booking is confirmed
 p Thanks, Ada. Show this code at the check-in kiosk, or to the crew as you board.
-code
+code large
    | BX7-42QK
 table [start, end]
   td p Adult, Harbour Town to Gull Island | p $24.00

@@ -114,6 +114,17 @@ impl FrameLog {
         out
     }
 
+    /// A value the frame being drawn decided, as a `note` line: the
+    /// conversation offset the landing hold set before paint.
+    pub fn note(&mut self, name: &str, value: f32) {
+        let t_ms = ms(self.opened, Instant::now());
+        let _ = writeln!(
+            self.out,
+            "{{\"t_ms\":{t_ms:.1},\"note\":{name:?},\"value\":{value:.1}}}"
+        );
+        let _ = self.out.flush();
+    }
+
     /// The view's element tree is built; layout and paint follow.
     pub fn built(&mut self, at: Instant) {
         self.built_at = Some(at);

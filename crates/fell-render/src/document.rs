@@ -27,6 +27,10 @@ pub enum Block {
     },
     Code {
         text: String,
+        /// Set at 20 px or more in the mail: a confirmation or one-time
+        /// code the reader copies. Painted a step larger, in a box that
+        /// fits it.
+        large: bool,
     },
     /// Cells are blocks, so a paragraph break, list marker, or quote inside a
     /// cell survives. Flattening a cell to inlines glues `<p>Hello</p><p>World</p>`
@@ -134,7 +138,7 @@ fn push_block(out: &mut String, block: &Block) {
                 push_block(out, child);
             }
         }
-        Block::Code { text } => {
+        Block::Code { text, .. } => {
             out.push_str(text);
             out.push('\n');
         }
