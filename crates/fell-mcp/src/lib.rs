@@ -64,4 +64,30 @@ mod tests {
             );
         }
     }
+
+    /// `test-utils` lets a caller rewrite the vector index and swap the
+    /// search ranker. Only the tests may turn it on, never the binary.
+    #[test]
+    fn only_the_tests_enable_fell_core_test_utils() {
+        let manifest: toml_edit::DocumentMut = include_str!("../Cargo.toml").parse().unwrap();
+        let features = |table: &str| -> Vec<String> {
+            manifest
+                .get(table)
+                .and_then(|deps| deps.get("fell-core"))
+                .and_then(|dep| dep.get("features"))
+                .and_then(|features| features.as_array())
+                .map(|features| {
+                    features
+                        .iter()
+                        .filter_map(|feature| feature.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(features("dependencies").is_empty());
+        assert!(features("build-dependencies").is_empty());
+        assert!(manifest.get("features").is_none());
+        assert!(manifest.get("target").is_none());
+        assert_eq!(features("dev-dependencies"), ["test-utils"]);
+    }
 }

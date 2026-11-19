@@ -17,7 +17,7 @@
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
-//! # write_back = true           # send archive and move to the server (off by default)
+//! # write_back = true           # send archive, move, delete, spam to the server (off by default)
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -78,7 +78,8 @@ pub struct AccountConfig {
     pub smtp_security: Option<ImapSecurity>,
     /// `sent_folder = "..."` and the like, in [`FolderRole::ALL`] order.
     pub folders: Vec<(FolderRole, String)>,
-    /// `write_back = true`: archive and move are sent to the server too.
+    /// `write_back = true`: archive, move, delete to Trash, and spam are
+    /// sent to the server too. A permanent delete never is.
     pub write_back: bool,
 }
 

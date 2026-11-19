@@ -1,8 +1,16 @@
-//! Local-store keyword search.
+//! Local-store search: keyword, and hybrid when a local model is installed.
 //!
 //! `execute` reads SQLite only. It does not call a mail backend, so a result
-//! changes only when the store changes. Hits are one per thread, ordered by
-//! the best BM25 score of a message that matched every term and operator.
+//! changes only when the store changes. Keyword hits are one per thread,
+//! ordered by the best BM25 score of a message that matched every term and
+//! operator.
+//!
+//! With a sentence model installed (`fell embeddings install`), the words of
+//! the query are also embedded and matched against the stored body vectors
+//! ([`semantic`]). The operators filter that side too. Both lists are grouped
+//! per thread and merged by reciprocal rank fusion. A thread only the vectors
+//! found is marked [`SearchHit::semantic_only`]. Without a model, or with
+//! [`SearchOptions::semantic`] off, search is keyword search alone.
 //!
 //! Exact text uses FTS5 (`unicode61`) with `bm25`. `from:`, `to:`, and
 //! `subject:` are column filters. `in:`, `label:`, `has:attachment`,
@@ -11,7 +19,7 @@
 //! proposes corrections and Damerau-Levenshtein confirms them. If the
 //! corrected query matches, those hits are returned with `did_you_mean`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -24,10 +32,15 @@ use crate::message::MessageId;
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
-/// One FTS hit. The UI and MCP both consume this; they do not query SQLite themselves.
+pub(crate) mod semantic;
+
+#[cfg(test)]
+mod hybrid_tests;
+
+/// One search hit. The UI and MCP both consume this; they do not query SQLite themselves.
 ///
 /// Hits are grouped by thread: at most one row per conversation, ranked by the
-/// best BM25 score of its messages.
+/// best BM25 score of its messages, or by fusion with the semantic ranking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub message_id: MessageId,
@@ -37,18 +50,41 @@ pub struct SearchHit {
     /// Address only. The display name stays out of search hits.
     pub sender_email: String,
     pub date_unix: i64,
+    /// No message in this thread matched the words; its body is only close
+    /// in meaning to the query. Always `false` for keyword search. The UI
+    /// marks these hits "related".
+    pub semantic_only: bool,
 }
 
-/// Keyword search against the local store.
+/// Search against the local store.
 ///
 /// `hits` is empty when nothing matches. `did_you_mean` is set only when the
 /// typed query matched nothing and a trigram correction did; in that case
-/// `hits` are the corrected results.
+/// the keyword hits are the corrected results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResults {
     pub hits: Vec<SearchHit>,
     pub did_you_mean: Option<String>,
 }
+
+/// How [`crate::Store::search_with`] searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Rank with the local sentence model as well as the words, when one is
+    /// installed. `false` is keyword search only. Without a model this
+    /// changes nothing.
+    pub semantic: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { semantic: true }
+    }
+}
+
+/// Reciprocal rank fusion constant: a hit at rank `r` on one side adds
+/// `1 / (RRF_K + r)`. 60 is the value from the original paper.
+const RRF_K: f64 = 60.0;
 
 /// Quote a user query as an FTS5 phrase so operators in the input are literal.
 pub(crate) fn fts5_phrase(raw: &str) -> String {
@@ -289,7 +325,41 @@ fn adjust_term(conn: &Connection, account_id: &str, term: &str, delta: i64) -> R
     Ok(())
 }
 
+/// Keyword search, fused with the semantic side when `semantic` is a loaded
+/// model. With `None` this is keyword search exactly. The caller runs it in
+/// one read transaction, with `semantic` refreshed in that same snapshot, so
+/// the scan, the operators and the rows it returns all see one state.
 pub(crate) fn execute(
+    conn: &Connection,
+    account_id: &AccountId,
+    query: &str,
+    semantic: Option<&mut semantic::Ready>,
+) -> Result<SearchResults> {
+    let keyword = execute_keyword(conn, account_id, query)?;
+    let Some(ready) = semantic else {
+        return Ok(keyword);
+    };
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(keyword);
+    }
+    // When the keyword side corrected the query, its hits are for the
+    // correction, so the semantic side embeds and filters that too.
+    let parsed = parse_query(keyword.did_you_mean.as_deref().unwrap_or(query))?;
+    if no_match_possible(&parsed) || parsed.text_phrases.is_empty() {
+        return Ok(keyword);
+    }
+    let related = semantic_threads(conn, account_id, &parsed, ready)?;
+    if related.is_empty() {
+        return Ok(keyword);
+    }
+    Ok(SearchResults {
+        hits: fuse(keyword.hits, related),
+        did_you_mean: keyword.did_you_mean,
+    })
+}
+
+fn execute_keyword(
     conn: &Connection,
     account_id: &AccountId,
     query: &str,
@@ -343,13 +413,14 @@ pub(crate) fn execute(
     })
 }
 
+/// An unknown `has:`/`is:` value or an empty date range matches nothing.
+fn no_match_possible(parsed: &ParsedQuery) -> bool {
+    parsed.unmatched_flag
+        || matches!((parsed.after, parsed.before), (Some(after), Some(before)) if after >= before)
+}
+
 fn run(conn: &Connection, account_id: &AccountId, parsed: &ParsedQuery) -> Result<Vec<SearchHit>> {
-    if parsed.unmatched_flag {
-        return Ok(Vec::new());
-    }
-    if let (Some(after), Some(before)) = (parsed.after, parsed.before)
-        && after >= before
-    {
+    if no_match_possible(parsed) {
         return Ok(Vec::new());
     }
     match fts_match(parsed) {
@@ -474,6 +545,7 @@ fn query_hits(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<Vec<Se
             snippet: row.get(3)?,
             sender_email: row.get(4)?,
             date_unix: row.get(5)?,
+            semantic_only: false,
         })
     })?;
     let mut hits = Vec::new();
@@ -481,6 +553,252 @@ fn query_hits(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<Vec<Se
         hits.push(row?);
     }
     Ok(hits)
+}
+
+/// True when the query has an operator that narrows which messages match.
+fn has_filters(parsed: &ParsedQuery) -> bool {
+    !parsed.from.is_empty()
+        || !parsed.to.is_empty()
+        || !parsed.subject.is_empty()
+        || !parsed.folders.is_empty()
+        || !parsed.labels.is_empty()
+        || parsed.has_attachment
+        || parsed.is_unread
+        || parsed.before.is_some()
+        || parsed.after.is_some()
+}
+
+/// Threads whose messages are nearest the query's words in meaning, best
+/// first, one hit per thread, at most [`semantic::SEMANTIC_THREADS`]. Only
+/// messages that pass every operator take part.
+fn semantic_threads(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    ready: &semantic::Ready,
+) -> Result<Vec<SearchHit>> {
+    let text = parsed.text_phrases.join(" ");
+    let Some(query) = ready.embed_query(&text) else {
+        return Ok(Vec::new());
+    };
+    let allowed = if has_filters(parsed) {
+        let ids = filtered_message_ids(conn, account_id, parsed)?;
+        Some(
+            ready
+                .index
+                .rows_of(account_id.as_str(), ids.iter().map(String::as_str)),
+        )
+    } else {
+        None
+    };
+    reached(Step::Filtered);
+    let nearest = ready.index.nearest(
+        account_id.as_str(),
+        &query,
+        allowed.as_deref(),
+        semantic::CANDIDATES,
+    );
+    if nearest.is_empty() {
+        return Ok(Vec::new());
+    }
+    reached(Step::Scanned);
+    let mut found = semantic_rows(
+        conn,
+        account_id,
+        parsed,
+        nearest.iter().map(|(message_id, _)| &**message_id),
+    )?;
+    let mut threads = HashSet::new();
+    let mut hits = Vec::new();
+    for (message_id, _) in nearest {
+        // No row, or the row no longer passes the operators: skip it.
+        let Some(mut hit) = found.remove(&*message_id) else {
+            continue;
+        };
+        if !threads.insert(hit.thread_id.clone()) {
+            continue;
+        }
+        hit.semantic_only = true;
+        hits.push(hit);
+        if hits.len() == semantic::SEMANTIC_THREADS {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+/// Every message of the account that passes the query's operators, ignoring
+/// its free words.
+fn filtered_message_ids(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+) -> Result<Vec<String>> {
+    let (sql, params) = filtered_select(account_id, parsed, "m.message_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(Into::into)
+}
+
+/// The hits for `messages`, by message id, read with the query's operators
+/// as well, so a row that stopped passing them since the id filter ran is
+/// not returned. Ids with no row, or another account's, are left out.
+fn semantic_rows<'a>(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    messages: impl Iterator<Item = &'a str>,
+) -> Result<HashMap<String, SearchHit>> {
+    let messages: Vec<&str> = messages.collect();
+    let mut found = HashMap::with_capacity(messages.len());
+    for chunk in messages.chunks(200) {
+        let (mut sql, mut params) = filtered_select(
+            account_id,
+            parsed,
+            "m.message_id, m.thread_id, m.subject, m.snippet, m.from_email, m.date_unix",
+        );
+        sql.push_str(" AND m.message_id IN (");
+        for (index, message_id) in chunk.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            params.push(Value::Text((*message_id).to_string()));
+        }
+        sql.push(')');
+        for hit in query_hits(conn, &sql, params)? {
+            found.insert(hit.message_id.as_str().to_string(), hit);
+        }
+    }
+    Ok(found)
+}
+
+/// `SELECT columns` over the account's messages that pass every operator
+/// of `parsed`, ignoring its free words. `from:`, `to:` and `subject:` are
+/// a column `MATCH`; the rest are [`append_filters`].
+fn filtered_select(
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    columns: &str,
+) -> (String, Vec<Value>) {
+    let operators = ParsedQuery {
+        from: parsed.from.clone(),
+        to: parsed.to.clone(),
+        subject: parsed.subject.clone(),
+        ..ParsedQuery::default()
+    };
+    let mut params = vec![Value::Text(account_id.as_str().to_string())];
+    let mut sql = format!("SELECT {columns} ");
+    match fts_match(&operators) {
+        Some(match_query) => {
+            params.push(Value::Text(match_query));
+            sql.push_str(
+                "FROM messages_fts
+                 JOIN messages m
+                   ON m.account_id = messages_fts.account_id
+                  AND m.message_id = messages_fts.message_id
+                 WHERE m.account_id = ? AND messages_fts MATCH ?",
+            );
+        }
+        None => sql.push_str("FROM messages m WHERE m.account_id = ?"),
+    }
+    append_filters(&mut sql, &mut params, parsed);
+    (sql, params)
+}
+
+/// Points inside one search, for tests that write from another connection
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The vector matrix was brought up to date.
+    Refreshed,
+    /// The operators ran and chose which rows the scan may use.
+    Filtered,
+    /// The scan chose its messages; their rows are read next.
+    Scanned,
+}
+
+#[cfg(test)]
+type StepHook = Box<dyn FnMut(Step)>;
+
+#[cfg(test)]
+thread_local! {
+    static STEP_HOOK: std::cell::RefCell<Option<StepHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: run `hook` at each [`Step`] of searches on this thread.
+#[cfg(test)]
+pub(crate) fn testing_on_step(hook: Option<StepHook>) {
+    STEP_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+pub(crate) fn reached(step: Step) {
+    #[cfg(test)]
+    {
+        let hook = STEP_HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(step);
+            STEP_HOOK.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Merge the keyword and semantic thread lists by reciprocal rank fusion.
+///
+/// A thread on both lists keeps its keyword hit. Ties keep keyword order,
+/// then semantic order.
+fn fuse(keyword: Vec<SearchHit>, semantic: Vec<SearchHit>) -> Vec<SearchHit> {
+    struct Fused {
+        score: f64,
+        keyword_rank: usize,
+        semantic_rank: usize,
+        hit: SearchHit,
+    }
+    let rrf = |rank: usize| 1.0 / (RRF_K + rank as f64 + 1.0);
+    let mut by_thread: HashMap<ThreadId, usize> = HashMap::new();
+    let mut fused: Vec<Fused> = Vec::with_capacity(keyword.len() + semantic.len());
+    for (rank, hit) in keyword.into_iter().enumerate() {
+        by_thread.insert(hit.thread_id.clone(), fused.len());
+        fused.push(Fused {
+            score: rrf(rank),
+            keyword_rank: rank,
+            semantic_rank: usize::MAX,
+            hit,
+        });
+    }
+    for (rank, hit) in semantic.into_iter().enumerate() {
+        match by_thread.get(&hit.thread_id) {
+            Some(&at) => {
+                fused[at].score += rrf(rank);
+                fused[at].semantic_rank = rank;
+            }
+            None => {
+                by_thread.insert(hit.thread_id.clone(), fused.len());
+                fused.push(Fused {
+                    score: rrf(rank),
+                    keyword_rank: usize::MAX,
+                    semantic_rank: rank,
+                    hit,
+                });
+            }
+        }
+    }
+    fused.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.keyword_rank.cmp(&b.keyword_rank))
+            .then(a.semantic_rank.cmp(&b.semantic_rank))
+            .then_with(|| a.hit.thread_id.as_str().cmp(b.hit.thread_id.as_str()))
+    });
+    fused.into_iter().map(|entry| entry.hit).collect()
 }
 
 fn fts_match(parsed: &ParsedQuery) -> Option<String> {

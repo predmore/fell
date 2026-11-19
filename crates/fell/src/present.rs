@@ -1049,7 +1049,7 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
 }
 
 /// How the inbox separates a notice's clauses.
-const NOTICE_DOT: &str = "  ·  ";
+pub(crate) const NOTICE_DOT: &str = "  ·  ";
 
 fn quoted_span(text: &str) -> Option<(usize, usize)> {
     text.find('\u{201c}').and_then(|open| {
@@ -1469,6 +1469,13 @@ mod tests {
             fit_notice(notice, 36.0, width),
             "May have been sent  ·  gs sent"
         );
+    }
+
+    #[test]
+    fn removal_notice_keeps_its_answer_key_when_the_middle_clause_does_not_fit() {
+        let prompt = "Remove 20 from Fell only?  ·  No undo  ·  y";
+        let fitted = fit_notice(prompt, 34.0, |text| text.chars().count() as f32);
+        assert_eq!(fitted, "Remove 20 from Fell only?  ·  y");
     }
 
     #[test]

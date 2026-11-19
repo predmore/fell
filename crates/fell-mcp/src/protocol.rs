@@ -96,6 +96,9 @@ impl Session {
         {
             return Err("agent id is empty or contains a control character".into());
         }
+        // Load the search model and vectors on their own thread now, so the
+        // agent's first hybrid search does not wait for them.
+        store.warm_search();
         Ok(Self {
             store,
             account_id,
@@ -565,6 +568,132 @@ mod tests {
         }
     }
 
+    /// Test model: one dimension for money words, one for everything else
+    /// it knows. Nothing to download.
+    struct MoneyWords;
+
+    impl fell_core::BodyEmbedder for MoneyWords {
+        fn id(&self) -> fell_core::EmbedderId {
+            fell_core::EmbedderId {
+                model: "test-money",
+                version: "1",
+            }
+        }
+
+        fn dims(&self) -> usize {
+            2
+        }
+
+        fn embed(&self, body: &str) -> Result<Vec<f32>, fell_core::embed::ModelError> {
+            let mut values = vec![0.0f32; 2];
+            for word in body.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+                match word {
+                    "pay" | "invoice" | "owed" | "money" | "bill" => values[0] += 1.0,
+                    "label" | "hidden" | "garden" => values[1] += 1.0,
+                    _ => {}
+                }
+            }
+            let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                values.iter_mut().for_each(|v| *v /= norm);
+            }
+            Ok(values)
+        }
+    }
+
+    #[test]
+    fn search_mode_hybrid_finds_mail_close_in_meaning() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        session
+            .store
+            .upsert_message(&message(
+                "a1",
+                "garden@x",
+                "Weekend",
+                "the garden needs work",
+                "home",
+            ))
+            .unwrap();
+        session.store.testing_index_embeddings(&MoneyWords).unwrap();
+        session
+            .store
+            .testing_search_embedder(Box::new(MoneyWords))
+            .unwrap();
+        init(&mut session);
+
+        // "money owed" shares no word with the invoice mail.
+        let hits = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "money owed" }),
+        ));
+        assert_eq!(hits["mode"], "hybrid");
+        let found = hits["hits"].as_array().unwrap();
+        assert_eq!(found.len(), 1, "{hits}");
+        assert_eq!(found[0]["thread_id"], thread.as_str());
+        assert_eq!(found[0]["related"], true);
+        assert_eq!(
+            found[0]["snippet"]["untrusted_email_content"]["text"],
+            "please pay the invoice"
+        );
+        assert!(found[0].get("body").is_none());
+        // The other account's mail never shows, by words or by meaning.
+        let secret = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "hidden label" }),
+        ));
+        assert!(
+            secret["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|hit| hit["thread_id"] != "secret@x"),
+            "{secret}"
+        );
+        // A word match is not related.
+        let words = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "invoice", "mode": "hybrid" }),
+        ));
+        assert_eq!(words["hits"][0]["related"], false);
+        assert!(words["did_you_mean"].is_null(), "{words}");
+        // A misspelling: the hits are for the correction, and say so.
+        let typo = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "invioce", "mode": "hybrid" }),
+        ));
+        assert_eq!(typo["mode"], "hybrid");
+        assert_eq!(typo["did_you_mean"], "invoice", "{typo}");
+        assert_eq!(typo["hits"][0]["thread_id"], thread.as_str());
+        assert_eq!(typo["hits"][0]["related"], false);
+        // keyword mode is word matching only.
+        let keyword = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "money owed", "mode": "keyword" }),
+        ));
+        assert_eq!(keyword["mode"], "keyword");
+        assert!(keyword["hits"].as_array().unwrap().is_empty());
+        let bad = call(
+            &mut session,
+            "search",
+            json!({ "query": "money", "mode": "vector" }),
+        );
+        assert_eq!(bad["result"]["isError"], true);
+        assert!(tool_text(&bad).contains("mode must be keyword or hybrid"));
+        // A cursor near usize::MAX is refused, not wrapped into an earlier page.
+        let huge = call(
+            &mut session,
+            "search",
+            json!({ "query": "money owed", "mode": "hybrid", "cursor": usize::MAX.to_string() }),
+        );
+        assert_eq!(huge["result"]["isError"], true, "{huge}");
+        assert!(tool_text(&huge).contains("cursor is not a page token"));
+    }
+
     #[test]
     fn disabled_agent_has_no_tools() {
         let (mut session, _) = session_with(AgentGrant::DISABLED, "bot");
@@ -592,6 +721,9 @@ mod tests {
             ]
         );
         let hits = tool_json(&call(&mut session, "search", json!({ "query": "invoice" })));
+        // No local model: the default is keyword search, as before.
+        assert_eq!(hits["mode"], "keyword");
+        assert!(hits["hits"][0].get("related").is_none());
         assert_eq!(hits["hits"][0]["thread_id"], thread.as_str());
         assert_eq!(hits["hits"][0]["sender_address"], "ada@x");
         assert_eq!(hits["hits"][0]["date_unix"], 30);

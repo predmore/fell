@@ -1,6 +1,8 @@
 //! Leader chords, which-key, and the command palette index.
 //!
-//! `m` moves the thread out of the current folder. `e` archives it. `u` undoes either.
+//! `m` moves the thread out of the current folder. `e` archives it, `#`
+//! deletes it to Trash, and `!` marks it as spam (or, in Spam, not spam).
+//! `u` undoes any of them.
 
 use std::fmt::Write as _;
 
@@ -39,6 +41,8 @@ pub enum Action {
     FolderPicker,
     Move,
     Archive,
+    Delete,
+    Spam,
     Undo,
     SyncNow,
     ToggleSelect,
@@ -71,6 +75,8 @@ impl Action {
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
+            Self::Delete => "Delete",
+            Self::Spam => "Spam / not spam",
             Self::Undo => "Undo",
             Self::SyncNow => "Sync now",
             Self::ToggleSelect => "Toggle select",
@@ -88,7 +94,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 27] = [
+const ALL_ACTIONS: [Action; 29] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -107,6 +113,8 @@ const ALL_ACTIONS: [Action; 27] = [
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
+    Action::Delete,
+    Action::Spam,
     Action::Undo,
     Action::SyncNow,
     Action::ToggleSelect,
@@ -203,6 +211,8 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('f')], Action::Forward, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
+    bind(&[KeyId::Char('#')], Action::Delete, None);
+    bind(&[KeyId::Char('!')], Action::Spam, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);
@@ -234,6 +244,16 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('m')],
         Action::Move,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('#')],
+        Action::Delete,
+        Some("folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('!')],
+        Action::Spam,
         Some("folders"),
     );
     bind(&[KeyId::Leader, KeyId::Char('s')], Action::SyncNow, None);
@@ -620,6 +640,45 @@ mod tests {
             match_seq(&keymap, &[KeyId::Leader, KeyId::Char('f')]),
             SeqMatch::Prefix
         );
+    }
+
+    #[test]
+    fn hash_deletes_and_bang_marks_spam_in_the_palette_and_which_key() {
+        let keymap = Keymap::default();
+        for (key, action, label) in [
+            ('#', Action::Delete, "Delete"),
+            ('!', Action::Spam, "Spam / not spam"),
+        ] {
+            assert_eq!(
+                match_seq(&keymap, &[KeyId::Char(key)]),
+                SeqMatch::Action(action)
+            );
+            assert_eq!(
+                match_seq(
+                    &keymap,
+                    &[KeyId::Leader, KeyId::Char('f'), KeyId::Char(key)]
+                ),
+                SeqMatch::Action(action)
+            );
+            let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
+            assert!(
+                folders
+                    .iter()
+                    .any(|item| item.key == key.to_string() && item.label == label),
+                "{folders:?}"
+            );
+            let item = palette_items(&keymap, "", &[])
+                .into_iter()
+                .find(|item| item.action == action)
+                .expect("in the palette");
+            assert_eq!(item.label, label);
+            assert_eq!(item.binding, format!("{key} · space f {key}"));
+        }
+        assert_eq!(
+            palette_items(&keymap, "delete", &[])[0].action,
+            Action::Delete
+        );
+        assert_eq!(palette_items(&keymap, "spam", &[])[0].action, Action::Spam);
     }
 
     #[test]

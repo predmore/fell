@@ -42,6 +42,10 @@ impl StoreClient {
                 // the file, so the second one never races it for the lock.
                 if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
                     spawn_background(path, lane);
+                    // Search runs on this connection. Its model and vectors
+                    // load on a thread of their own, so the first search
+                    // does not wait for them and the window never does.
+                    store.warm_search();
                 }
                 let _ = ready_tx.send(info);
                 // Jobs run in order. The loop ends when the window drops its client.
@@ -156,6 +160,26 @@ mod tests {
         let second = client.call(|_| 2);
         assert_eq!(futures::executor::block_on(second).unwrap(), 2);
         assert_eq!(futures::executor::block_on(first).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_mailbox_file_starts_loading_search_when_it_opens() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-warm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = dir.join("mail.db");
+        let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
+        futures::executor::block_on(ready).unwrap();
+        let asked = client.call(|store| store.testing_search_warm_asked());
+        assert!(futures::executor::block_on(asked).unwrap());
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
