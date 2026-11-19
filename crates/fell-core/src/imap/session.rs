@@ -21,7 +21,7 @@ use super::ImapSecurity;
 use super::utf7::decode_modified_utf7;
 
 mod writes;
-pub(super) use writes::{Placed, WriteError, WriteSession};
+pub(super) use writes::{FlagReply, Placed, WriteError, WriteSession};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -44,6 +44,7 @@ pub(super) struct Examined {
 pub(super) struct Fetched {
     pub uid: u32,
     pub flags: Vec<String>,
+    pub modseq: Option<u64>,
     pub body: Vec<u8>,
     /// The body was larger than the cap. The UID is kept so the checkpoint
     /// can move past it; the bytes were not stored.
@@ -107,6 +108,8 @@ pub(super) struct Session {
     caps: Vec<String>,
     /// Server advertised CONDSTORE after login, so EXAMINE sends that modifier.
     condstore: bool,
+    /// The selected mailbox reported HIGHESTMODSEQ, so FETCH can ask for MODSEQ.
+    mailbox_modseq: bool,
     /// `ENABLE QRESYNC` succeeded, so a CHANGEDSINCE fetch can ask for VANISHED.
     qresync: bool,
     /// The server announced an expunge since the last EXAMINE, so message
@@ -140,6 +143,7 @@ impl Session {
                 tag: 0,
                 caps: Vec::new(),
                 condstore: false,
+                mailbox_modseq: false,
                 qresync: false,
                 expunged: false,
                 vanished: Vec::new(),
@@ -152,6 +156,7 @@ impl Session {
                 tag: 0,
                 caps: Vec::new(),
                 condstore: false,
+                mailbox_modseq: false,
                 qresync: false,
                 expunged: false,
                 vanished: Vec::new(),
@@ -269,6 +274,7 @@ impl Session {
         }
         let uidvalidity = uidvalidity
             .ok_or_else(|| imap_err(format!("EXAMINE {mailbox} returned no UIDVALIDITY")))?;
+        self.mailbox_modseq = highest_modseq.is_some();
         self.expunged = false;
         self.vanished.clear();
         self.vanished_unknown = false;
@@ -281,13 +287,17 @@ impl Session {
     }
 
     /// Flags only. Used to learn unread state before the first modseq is stored.
-    pub(super) fn uid_flags(&mut self, range: &str) -> Result<Vec<(u32, Vec<String>)>, Error> {
+    pub(super) fn uid_flags(&mut self, range: &str) -> Result<Vec<Fetched>, Error> {
+        let revision = if self.mailbox_modseq { " MODSEQ" } else { "" };
         let lines = self
-            .command("UID FETCH", &format!("UID FETCH {range} (UID FLAGS)"))?
+            .command(
+                "UID FETCH",
+                &format!("UID FETCH {range} (UID FLAGS{revision})"),
+            )?
             .untagged;
         Ok(lines
             .iter()
-            .filter_map(|line| parse_flags(&line.text).map(|row| (row.uid, row.flags)))
+            .filter_map(|line| parse_flags(&line.text))
             .collect())
     }
 
@@ -304,11 +314,19 @@ impl Session {
         items: FetchItems,
         mut on_fetched: impl FnMut(Fetched) -> Result<(), Error>,
     ) -> Result<FetchStop, Error> {
-        let wanted = match items {
-            FetchItems::Flags => "(UID FLAGS)",
-            FetchItems::Bodies => "(UID FLAGS BODY.PEEK[])",
-            FetchItems::Headers => "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])",
+        let body = match items {
+            FetchItems::Flags => "",
+            FetchItems::Bodies => " BODY.PEEK[]",
+            FetchItems::Headers => " RFC822.SIZE BODY.PEEK[HEADER]",
         };
+        // CHANGEDSINCE already requests MODSEQ implicitly. Other FETCHes
+        // need to request it to retain a baseline for later conditional STORE.
+        let revision = if self.mailbox_modseq && changed_since.is_none() {
+            " MODSEQ"
+        } else {
+            ""
+        };
+        let wanted = format!("(UID FLAGS{revision}{body})");
         let cmd = match changed_since {
             Some(modseq) if self.qresync => {
                 format!("UID FETCH {range} {wanted} (CHANGEDSINCE {modseq} VANISHED)")
@@ -1637,6 +1655,7 @@ fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
     Some(Fetched {
         uid,
         flags,
+        modseq: fetch_modseq(&upper),
         body,
         skipped,
         body_missing,
@@ -1656,11 +1675,42 @@ fn parse_flags(text: &str) -> Option<Fetched> {
     Some(Fetched {
         uid: number_after(&upper, "UID ")?,
         flags: paren_after(text, "FLAGS")?,
+        modseq: fetch_modseq(&upper),
         body: Vec::new(),
         skipped: false,
         body_missing: false,
         size: None,
     })
+}
+
+fn fetch_modseq(upper: &str) -> Option<u64> {
+    // FETCH may contain quoted body text or nested lists. Only a top-level
+    // attribute can be a revision. Literal bytes are already out of band.
+    let (_, items) = upper.split_once("FETCH")?;
+    if !items.contains("MODSEQ (") {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut bytes = items.bytes().enumerate();
+    while let Some((index, byte)) = bytes.next() {
+        match byte {
+            b'\\' if quoted => {
+                bytes.next();
+            }
+            b'"' => quoted = !quoted,
+            _ if quoted => {}
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'M' if depth == 1 && matches!(items.as_bytes()[index - 1], b'(' | b' ') => {
+                if let Some(revision) = items[index..].strip_prefix("MODSEQ (") {
+                    return revision.split_once(')')?.0.parse().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The `<origin>` of a partial `BODY[<section>]<origin>` in a FETCH reply.

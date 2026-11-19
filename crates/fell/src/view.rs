@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fell_core::{
-    AccountConfig, AccountId, DropReason, FolderRole, FolderRoles, FolderSpan, ListKey, MessageId,
-    ThreadId,
+    AccountConfig, AccountId, DropReason, DroppedWrite, FolderRole, FolderRoles, FolderSpan,
+    ListKey, MessageId, OutboxKind, ThreadId,
 };
 use futures::StreamExt;
 use gpui::{
@@ -141,16 +141,68 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
-/// One line for moves the server will never get. The change stays in Fell,
-/// and no key would fix it, so none is shown.
-fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String {
-    let folder = session.folder_text(&not_sent.folder);
-    let messages = if not_sent.count == 1 {
+/// Use one notice so a flag failure and a move failure can both be seen.
+fn write_back_notice(
+    session: &Session,
+    dropped: &[DroppedWrite],
+    flag_recovery_delayed: bool,
+) -> String {
+    let Some(first) = dropped.first() else {
+        return "Read/star sync delayed. Retrying".to_string();
+    };
+    let is_move = |write: &DroppedWrite| write.kind == OutboxKind::Move;
+    let folder_matters = matches!(
+        first.reason,
+        DropReason::FolderReset | DropReason::NotFound | DropReason::Abandoned
+    );
+    if !flag_recovery_delayed
+        && dropped.iter().all(|write| {
+            is_move(write) == is_move(first)
+                && write.reason == first.reason
+                && (!folder_matters || write.source_folder == first.source_folder)
+        })
+    {
+        return not_sent_detail(session, first, dropped.len());
+    }
+
+    let moves = dropped.iter().any(is_move);
+    let flags = dropped.iter().any(|write| !is_move(write));
+    let no_move = dropped
+        .iter()
+        .any(|write| write.reason == DropReason::NoMove);
+    let summary = match (moves, flags, no_move) {
+        (true, true, true) => "Server can't move mail. Read/star sync failed",
+        (true, true, false) => "Moves and read/star changes failed to sync",
+        (true, false, true) => "Server can't move mail",
+        (true, false, false) => "Some moves failed to sync",
+        (false, _, _) => "Some read/star changes failed to sync",
+    };
+    if flag_recovery_delayed {
+        format!("{summary}. Read/star retry pending")
+    } else {
+        summary.to_string()
+    }
+}
+
+fn not_sent_detail(session: &Session, write: &DroppedWrite, count: usize) -> String {
+    let folder = session.folder_text(&write.source_folder);
+    if write.kind != OutboxKind::Move {
+        return match write.reason {
+            DropReason::FolderReset => {
+                format!("{folder} was reset on the server. Read or star changes stayed in Fell")
+            }
+            DropReason::NotFound => {
+                format!("Mail with read or star changes was missing from {folder} on the server")
+            }
+            _ => "The server refused to update read or star flags".to_string(),
+        };
+    }
+    let messages = if count == 1 {
         "1 message".to_string()
     } else {
-        format!("{} messages", not_sent.count)
+        format!("{count} messages")
     };
-    match not_sent.reason {
+    match write.reason {
         DropReason::FolderReset => {
             format!("{folder} was reset on the server; {messages} moved only in Fell")
         }
@@ -417,15 +469,22 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
-                            SyncEvent::NotSent(not_sent) => {
-                                let text = not_sent_notice(&inbox.session, &not_sent);
+                            SyncEvent::WriteBackNotice {
+                                dropped,
+                                flag_recovery_delayed,
+                            } => {
+                                let text = write_back_notice(
+                                    &inbox.session,
+                                    &dropped,
+                                    flag_recovery_delayed,
+                                );
                                 inbox.session.show_toast(text, true);
                                 cx.notify();
                                 return;
                             }
-                            // Old mail got its parts: the open thread may
-                            // be showing text where HTML is now stored.
-                            SyncEvent::BodiesStored => {
+                            // Refresh the open thread when either its parts
+                            // or its read and star state may have changed.
+                            SyncEvent::BodiesStored | SyncEvent::FlagsChanged => {
                                 inbox.request_threads(
                                     ReadIntent {
                                         refresh_open: true,
@@ -1733,7 +1792,7 @@ impl Inbox {
         );
     }
 
-    /// Archive, move, and undo may have queued a server move: send it now
+    /// Local actions may have queued a server write: send it now
     /// rather than at the next pass.
     fn send_to_server(&self) {
         if let Some(sync) = &self.sync {
@@ -1910,17 +1969,15 @@ impl Inbox {
         let change = edit.change;
         let ids = edit.ids;
         self.change_mailbox(
-            move |store| {
-                store
-                    .flag_threads(&account, &threads, &folder, change)
-                    .map(|_| ())
-            },
+            move |store| store.flag_threads(&account, &threads, &folder, change),
             move |inbox, result| {
                 inbox
                     .pending_flags
                     .retain(|id, (written, _, _)| !(ids.contains(id) && *written == generation));
-                if let Err(err) = result {
-                    inbox.session.show_toast(err.to_string(), true);
+                match result {
+                    Ok(Some(_)) => inbox.send_to_server(),
+                    Ok(None) => {}
+                    Err(err) => inbox.session.show_toast(err.to_string(), true),
                 }
                 Some(ReadIntent {
                     changed: true,
@@ -5753,8 +5810,8 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, ctrl_letter, key_from, moved_in_list, not_sent_notice,
-        should_follow_visible, unread_bar_dx,
+        LIST_BORDER_PX, ctrl_letter, key_from, moved_in_list, should_follow_visible, unread_bar_dx,
+        write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -5965,19 +6022,17 @@ mod tests {
     fn moves_the_server_will_not_get_say_so_in_one_line() {
         use crate::keymap::Keymap;
         use crate::model::{Session, SyncKind};
-        use crate::sync_worker::NotSent;
-        use fell_core::DropReason;
+        use fell_core::{DropReason, DroppedWrite, OutboxKind};
 
         let session = Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         let notice = |reason, count| {
-            not_sent_notice(
-                &session,
-                &NotSent {
-                    reason,
-                    folder: "INBOX".into(),
-                    count,
-                },
-            )
+            let write = DroppedWrite {
+                reason,
+                kind: OutboxKind::Move,
+                source_folder: "INBOX".into(),
+                target_folder: "Archive".into(),
+            };
+            write_back_notice(&session, &vec![write; count], false)
         };
         assert_eq!(
             notice(DropReason::FolderReset, 1),
@@ -6009,5 +6064,45 @@ mod tests {
             let text = notice(reason, 2);
             assert!(!text.contains('\n') && text.chars().count() <= 64, "{text}");
         }
+    }
+
+    #[test]
+    fn the_status_notice_covers_both_move_and_flag_failures() {
+        use crate::keymap::Keymap;
+        use crate::model::{Session, SyncKind};
+        use fell_core::{DropReason, DroppedWrite, OutboxKind};
+
+        let session = Session::new(
+            "Reader",
+            "me@example.test",
+            SyncKind::FixtureOffline,
+            Keymap::default(),
+        );
+        let move_failure = DroppedWrite {
+            reason: DropReason::NoMove,
+            kind: OutboxKind::Move,
+            source_folder: "INBOX".into(),
+            target_folder: "Archive".into(),
+        };
+        let flag_failure = DroppedWrite {
+            reason: DropReason::FolderReset,
+            kind: OutboxKind::Seen,
+            source_folder: "INBOX".into(),
+            target_folder: String::new(),
+        };
+        let mut dropped = [move_failure, flag_failure];
+        assert_eq!(
+            write_back_notice(&session, &dropped, false),
+            "Server can't move mail. Read/star sync failed"
+        );
+        dropped.reverse();
+        assert_eq!(
+            write_back_notice(&session, &dropped, false),
+            "Server can't move mail. Read/star sync failed"
+        );
+        assert_eq!(
+            write_back_notice(&session, &[], true),
+            "Read/star sync delayed. Retrying"
+        );
     }
 }

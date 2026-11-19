@@ -578,11 +578,12 @@ fn catch_up(
     let done = &pass.done;
     let stop = stream_bodies(session, &plan, &copies, |streamed| {
         let item = match streamed {
-            Streamed::Stored { uid, flags } => {
+            Streamed::Stored(item) => {
+                let uid = item.uid;
                 if seen_through.is_none_or(|floor| uid > floor) {
                     stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                 }
-                pending_flags.push(flag_update(uidvalidity, uid, &escaped, &flags));
+                pending_flags.push(flag_update(uidvalidity, &escaped, &item));
                 if pending_flags.len() >= BATCH_FLAGS {
                     flush_batch(
                         &mut batch,
@@ -613,6 +614,9 @@ fn catch_up(
             return Ok(());
         }
         let raw_len = item.body.len();
+        if item.modseq.is_some() {
+            pending_flags.push(flag_update(uidvalidity, &escaped, &item));
+        }
         batch.push(rfc822::to_message(
             account_id,
             &mailbox.raw,
@@ -676,9 +680,10 @@ fn catch_up(
     if needs_baseline {
         match session.uid_flags("1:*") {
             Ok(rows) => {
-                for (uid, flag_names) in rows {
-                    flags.push(flag_update(uidvalidity, uid, &escaped, &flag_names));
-                }
+                flags.extend(
+                    rows.iter()
+                        .map(|item| flag_update(uidvalidity, &escaped, item)),
+                );
             }
             Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
                 flags_complete = false;
@@ -923,12 +928,7 @@ fn walk_down(
         let mut wanted: Vec<(u32, u32)> = Vec::new();
         for row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
-                flags.push(flag_update(
-                    checkpoint.uidvalidity,
-                    row.uid,
-                    &escaped,
-                    &row.flags,
-                ));
+                flags.push(flag_update(checkpoint.uidvalidity, &escaped, &row));
                 continue;
             }
             if rfc822::is_deleted(&row.flags) {
@@ -945,7 +945,10 @@ fn walk_down(
                     &row.body,
                 );
                 header_ids.insert(row.uid, header.headers.message_id.clone());
-                headers.push(header);
+                let learned = row
+                    .modseq
+                    .map(|_| flag_update(checkpoint.uidvalidity, &escaped, &row));
+                headers.push((header, learned));
             }
             wanted.push((row.uid, row.size.unwrap_or(0)));
         }
@@ -956,7 +959,8 @@ fn walk_down(
         // Rows first, so the list shows the window before its bodies.
         let mut rows_left = headers.into_iter();
         loop {
-            let chunk: Vec<Message> = rows_left.by_ref().take(HEADER_ROWS).collect();
+            let (chunk, learned): (Vec<_>, Vec<_>) = rows_left.by_ref().take(HEADER_ROWS).unzip();
+            flags.extend(learned.into_iter().flatten());
             if chunk.is_empty() && flags.is_empty() {
                 break;
             }
@@ -995,6 +999,7 @@ fn walk_down(
             let mut uids: Vec<u32> = chunk.iter().map(|(uid, _)| *uid).collect();
             uids.sort_unstable();
             let mut batch = Vec::new();
+            let mut body_flags = Vec::new();
             let mut batch_bytes = 0usize;
             // Answered with a body, or too large to keep.
             let mut answered: HashSet<u32> = HashSet::with_capacity(uids.len());
@@ -1021,6 +1026,9 @@ fn walk_down(
                         return Ok(());
                     }
                     batch_bytes += item.body.len();
+                    if item.modseq.is_some() {
+                        body_flags.push(flag_update(checkpoint.uidvalidity, &escaped, &item));
+                    }
                     batch.push(rfc822::to_message(
                         pass.account_id,
                         &mailbox.raw,
@@ -1038,7 +1046,7 @@ fn walk_down(
                             pass,
                             (&mailbox.raw, &checkpoint),
                             std::mem::take(&mut batch),
-                            Vec::new(),
+                            std::mem::take(&mut body_flags),
                             Vec::new(),
                             Some(progress(
                                 below,
@@ -1070,7 +1078,7 @@ fn walk_down(
                 pass,
                 (&mailbox.raw, &checkpoint),
                 batch,
-                Vec::new(),
+                body_flags,
                 too_large,
                 Some(progress(below, pending_bodies)),
             )?;
@@ -1160,15 +1168,15 @@ fn walk_flags(
             Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => return Ok(None),
             Err(err) => return Err(err),
         };
-        rows.retain(|(uid, _)| chunk.binary_search(uid).is_ok());
-        rows.sort_by_key(|(uid, _)| *uid);
-        rows.dedup_by_key(|(uid, _)| *uid);
+        rows.retain(|row| chunk.binary_search(&row.uid).is_ok());
+        rows.sort_by_key(|row| (row.uid, std::cmp::Reverse(row.modseq)));
+        rows.dedup_by_key(|row| row.uid);
         if rows.len() != chunk.len() {
             return Ok(None);
         }
         flags.extend(
-            rows.into_iter()
-                .map(|(uid, names)| flag_update(seen.uidvalidity, uid, escaped, &names)),
+            rows.iter()
+                .map(|row| flag_update(seen.uidvalidity, escaped, row)),
         );
     }
     Ok(Some(flags))
@@ -1405,7 +1413,7 @@ enum Streamed {
     /// Not stored yet: fetched with its body.
     Fetched(session::Fetched),
     /// Stored already: only its flags were fetched.
-    Stored { uid: u32, flags: Vec<String> },
+    Stored(session::Fetched),
     /// Not stored and flagged `\Deleted`: dropped either way, so its body
     /// was not fetched.
     Deleted { uid: u32 },
@@ -1461,7 +1469,7 @@ fn flags_then_bodies(
     copies: &Copies<'_>,
     mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
 ) -> Result<session::FetchStop, Error> {
-    let mut rows: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut rows = Vec::new();
     let listed = session.uid_fetch_each(
         &format!("{start}:*"),
         changed_since,
@@ -1469,7 +1477,7 @@ fn flags_then_bodies(
         |item| {
             // `n:*` names the highest UID even when it is below `n`.
             if item.uid >= start {
-                rows.push((item.uid, item.flags));
+                rows.push(item);
             }
             Ok(())
         },
@@ -1479,17 +1487,18 @@ fn flags_then_bodies(
         session::FetchStop::Refused => return Ok(session::FetchStop::Refused),
         session::FetchStop::Truncated { min_skipped_uid } => Some(min_skipped_uid),
     };
-    rows.sort_by_key(|(uid, _)| *uid);
-    rows.dedup_by_key(|(uid, _)| *uid);
+    rows.sort_by_key(|item| (item.uid, std::cmp::Reverse(item.modseq)));
+    rows.dedup_by_key(|item| item.uid);
     let stored = match (rows.first(), rows.last()) {
-        (Some((low, _)), Some((high, _))) => copies.stored(*low, *high)?,
+        (Some(low), Some(high)) => copies.stored(low.uid, high.uid)?,
         _ => Vec::new(),
     };
     let mut wanted = Vec::new();
-    for (uid, flags) in rows {
+    for item in rows {
+        let uid = item.uid;
         if stored.binary_search(&uid).is_ok() {
-            on_fetched(Streamed::Stored { uid, flags })?;
-        } else if rfc822::is_deleted(&flags) {
+            on_fetched(Streamed::Stored(item))?;
+        } else if rfc822::is_deleted(&item.flags) {
             // Not stored either way, so its body is not worth the bytes.
             on_fetched(Streamed::Deleted { uid })?;
         } else {
@@ -1553,11 +1562,21 @@ fn uid_set(uids: &[u32]) -> String {
     out
 }
 
-/// The unread state of one stored copy, from its flags.
-fn flag_update(uidvalidity: u32, uid: u32, escaped: &str, flags: &[String]) -> FlagUpdate {
+/// Flag evidence from one server copy.
+fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> FlagUpdate {
+    let uid = item.uid;
     FlagUpdate {
         remote_id: RemoteId(format!("imap:{uidvalidity}:{uid}:{escaped}")),
-        unread: !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        unread: !item
+            .flags
+            .iter()
+            .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        flagged: Some(
+            item.flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
+        ),
+        modseq: item.modseq,
     }
 }
 

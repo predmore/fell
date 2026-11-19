@@ -544,7 +544,7 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
     assert!(!stored(&store, &acct, "reply@x").unwrap().unread);
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ BODY.PEEK[])"),
         "only the copy the store does not hold is downloaded: {bodies:?}"
     );
 }
@@ -742,7 +742,7 @@ fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
     assert!(
         body_fetches(&server)
             .iter()
-            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS BODY.PEEK[])")),
+            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ BODY.PEEK[])")),
         "{:?}",
         commands(&server)
     );

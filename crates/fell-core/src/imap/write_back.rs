@@ -2,10 +2,8 @@
 //!
 //! One pass loads the rows not yet applied and, only if there are any,
 //! logs in on a [`WriteSession`] (never the read-only sync session). For
-//! each source mailbox it sends `SELECT`, checks UIDVALIDITY, and moves the
-//! queued UIDs with one `UID MOVE` per target. A server without MOVE keeps
-//! the change in Fell: nothing is copied, flagged, or expunged, and the
-//! user is told once.
+//! each source mailbox it sends `SELECT` and checks UIDVALIDITY. It sends
+//! `UID MOVE` for moves and `UID STORE` for read and star changes.
 //!
 //! Before a row's first `UID MOVE`, replay records the target's UIDVALIDITY
 //! and UIDNEXT (`STATUS`), then marks the row sent. When the reply is lost
@@ -20,8 +18,10 @@
 //!
 //! A refusal (NO or BAD) is retried with backoff and the row is dropped
 //! after [`MAX_ATTEMPTS`]. A dropped connection ends the pass and costs the
-//! rows nothing; the next pass tries again. Rows for one message go in the
-//! order they were queued: one that waits holds back the rest.
+//! rows nothing; the next pass tries again. Moves keep their queue order
+//! because a move can change a later write's UID. A refused STORE can
+//! retry on its own. A STORE with an unknown outcome holds its copy until
+//! replay can check what reached the server.
 //!
 //! Undo's reverse of a row that was sent but not settled waits behind it,
 //! then moves the copy that row placed. If that row never reached the
@@ -32,14 +32,15 @@ use std::collections::{HashMap, HashSet};
 use crate::Error;
 use crate::account::AccountId;
 use crate::outbox::{
-    self, DropReason, DroppedMove, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
+    self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
     Settled,
+    flags::{self, FetchReason, Observation, Progress},
 };
-use crate::store::Store;
+use crate::store::{Store, copies::CopyFlags};
 
 use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_uid_message_id};
-use super::session::{Placed, WriteError, WriteSession};
+use super::session::{FlagReply, Placed, WriteError, WriteSession};
 
 /// Refusals (or "not on the server yet") before a row is dropped.
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
@@ -82,7 +83,8 @@ pub(super) fn replay_with(
         now,
         entries: &entries,
         settled: vec![false; entries.len()],
-        held: HashSet::new(),
+        held_moves: HashMap::new(),
+        unconfirmed_stores: HashMap::new(),
         listing: None,
         selected: None,
         bounds: HashMap::new(),
@@ -110,6 +112,13 @@ enum Stop {
     Stale,
 }
 
+enum MoveHold {
+    /// An earlier MOVE can change which copy a later write should use.
+    EarlierMove,
+    /// A MOVE needs the copy with an unconfirmed STORE. Other copies can write.
+    StoreRecovery,
+}
+
 impl From<Error> for Stop {
     fn from(err: Error) -> Self {
         Self::Store(err)
@@ -123,8 +132,9 @@ struct Pass<'a> {
     entries: &'a [OutboxEntry],
     /// Rows that reached Done or Dropped in this pass.
     settled: Vec<bool>,
-    /// Messages with a row that did not finish: their later rows wait.
-    held: HashSet<String>,
+    held_moves: HashMap<String, MoveHold>,
+    /// Mailbox, UIDVALIDITY, and UID of each STORE still being confirmed.
+    unconfirmed_stores: HashMap<String, HashSet<(u32, u32)>>,
     /// Folder name → raw mailbox name, from LIST when first needed.
     listing: Option<HashMap<String, String>>,
     /// The mailbox selected now and its UIDVALIDITY.
@@ -140,31 +150,216 @@ impl Pass<'_> {
     fn run(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
         // Whether the user hears of it is up to the status line's report
         // (`outbox::report_for_status`): that notice is said once.
-        if !session.has_move() {
-            for index in 0..self.entries.len() {
-                if self.entries[index].retry_unix <= self.now {
+        let mut visited = vec![false; self.entries.len()];
+        let has_move = session.has_move();
+        if has_move {
+            outbox::note_move_missing(self.store, self.account_id, false)?;
+        } else {
+            for (index, entry) in self.entries.iter().enumerate() {
+                if entry.kind == OutboxKind::Move && entry.retry_unix <= self.now {
                     self.drop_row(index, DropReason::NoMove, "server has no MOVE")?;
+                    visited[index] = true;
                 }
             }
-            return Ok(());
+            self.held_moves.clear();
         }
-        outbox::note_move_missing(self.store, self.account_id, false)?;
-        let mut visited = vec![false; self.entries.len()];
         for index in 0..self.entries.len() {
-            if visited[index] {
+            if visited[index] || (!has_move && self.entries[index].kind == OutboxKind::Move) {
                 continue;
             }
             visited[index] = true;
             let entry = &self.entries[index];
-            if self.held.contains(&entry.message_id) || entry.retry_unix > self.now {
-                self.held.insert(entry.message_id.clone());
-                continue;
-            }
+            let held_move = self.held_moves.get(&entry.message_id);
             match entry.kind {
+                OutboxKind::Move if held_move.is_some() => {}
+                OutboxKind::Move if entry.retry_unix > self.now => {
+                    self.held_moves
+                        .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+                }
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
+                _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
+                OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
             }
         }
         Ok(())
+    }
+
+    fn replay_flag(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
+        // Retry a safely rebased STORE once in this pass. A server that
+        // keeps changing the copy uses the ordinary retry schedule.
+        for _ in 0..2 {
+            let Some(entry) = self.pending_flag(index)? else {
+                return Ok(());
+            };
+            if !self.try_flag(session, index, entry)? {
+                return Ok(());
+            }
+        }
+        self.retry(
+            index,
+            DropReason::Refused,
+            "flag revision kept changing during STORE",
+        )
+    }
+
+    fn pending_flag(&mut self, index: usize) -> Result<Option<OutboxEntry>, Stop> {
+        let entry = flags::pending(self.store, self.account_id, self.entries[index].id)?;
+        if entry.is_none() {
+            self.settled[index] = true;
+        }
+        Ok(entry)
+    }
+
+    fn store_unconfirmed(&self, mailbox: &str, validity: u32, uid: u32) -> bool {
+        self.unconfirmed_stores
+            .get(mailbox)
+            .is_some_and(|copies| copies.contains(&(validity, uid)))
+    }
+
+    fn hold_unconfirmed_store(&mut self, entry: &OutboxEntry) {
+        if entry.sent
+            && let (Some(mailbox), Some(validity), Some(uid)) =
+                (&entry.source_mailbox, entry.uidvalidity, entry.uid)
+        {
+            self.unconfirmed_stores
+                .entry(mailbox.clone())
+                .or_default()
+                .insert((validity, uid));
+        }
+    }
+
+    /// Send one conditional STORE attempt. Only a safe rebase asks for a
+    /// second attempt; all other observations settle or use normal backoff.
+    fn try_flag(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+        mut entry: OutboxEntry,
+    ) -> Result<bool, Stop> {
+        let (Some(mailbox), Some(validity), Some(uid), Some(value)) = (
+            &entry.source_mailbox,
+            entry.uidvalidity,
+            entry.uid,
+            entry.flag_value,
+        ) else {
+            return Err(Error::Action("invalid flag write in outbox".into()).into());
+        };
+        if self.store_unconfirmed(mailbox, validity, uid) {
+            return Ok(false);
+        }
+        if entry.retry_unix > self.now {
+            self.hold_unconfirmed_store(&entry);
+            return Ok(false);
+        }
+        match self.select(session, mailbox)? {
+            Ok(current) if current != validity => {
+                self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed")?;
+                return Ok(false);
+            }
+            Err(message) => {
+                self.retry(index, DropReason::Refused, &message)?;
+                return Ok(false);
+            }
+            Ok(_) => {}
+        }
+        if entry.sent || (session.conditional() && entry.flag_modseq.is_none()) {
+            let Some(current) = self.read_flags(session, index, uid)? else {
+                return Ok(false);
+            };
+            if !self.observe_flag(
+                index,
+                &entry,
+                Observation::Fetched(current, FetchReason::BeforeStore),
+            )? {
+                return Ok(false);
+            }
+            let Some(rebased) = self.pending_flag(index)? else {
+                return Ok(false);
+            };
+            entry = rebased;
+        }
+
+        if !session.conditional() {
+            entry.flag_modseq = None;
+            entry.flag_base = None;
+        }
+        (self.before_send)();
+        match flags::mark_sent(self.store, self.account_id, &entry)? {
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Retired => {
+                self.settled[index] = true;
+                return Ok(false);
+            }
+            Settled::Recorded | Settled::Recovering => {}
+        }
+        let reason = match session.uid_store_flag(uid, entry.kind, value, entry.flag_modseq) {
+            Ok(FlagReply::Stored(None)) if session.conditional() => FetchReason::AfterStore,
+            Ok(FlagReply::Stored(modseq)) => {
+                return self.observe_flag(index, &entry, Observation::Stored(modseq));
+            }
+            Ok(FlagReply::Modified) => FetchReason::Modified,
+            Err(WriteError::Refused(message)) => {
+                self.retry_as(index, DropReason::Refused, &message, true)?;
+                return Ok(false);
+            }
+            Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+        };
+        let Some(current) = self.read_flags(session, index, uid)? else {
+            return Ok(false);
+        };
+        self.observe_flag(index, &entry, Observation::Fetched(current, reason))
+    }
+
+    fn read_flags(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+        uid: u32,
+    ) -> Result<Option<CopyFlags>, Stop> {
+        match session.uid_copy_flags(uid) {
+            Ok(Some(current)) if current.modseq.is_none() && session.conditional() => {
+                self.retry(
+                    index,
+                    DropReason::Refused,
+                    "server did not report the copy's MODSEQ",
+                )?;
+            }
+            Ok(Some(current)) => return Ok(Some(current)),
+            Ok(None) => {
+                self.drop_row(index, DropReason::NotFound, "message is not on the server")?;
+            }
+            Err(WriteError::Refused(message)) => {
+                self.retry(index, DropReason::Refused, &message)?;
+            }
+            Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+        }
+        Ok(None)
+    }
+
+    /// True when the observation authorizes a STORE at the rebased MODSEQ.
+    fn observe_flag(
+        &mut self,
+        index: usize,
+        entry: &OutboxEntry,
+        observation: Observation,
+    ) -> Result<bool, Stop> {
+        match flags::observe(self.store, self.account_id, entry, observation)? {
+            Progress::Stale => return Err(Stop::Stale),
+            Progress::Ready => return Ok(true),
+            Progress::Unconfirmed => {
+                self.retry(
+                    index,
+                    DropReason::Refused,
+                    "FETCH did not report current flags and revision",
+                )?;
+                return Ok(false);
+            }
+            Progress::Retired => {}
+            Progress::Applied => self.report.sent += 1,
+            Progress::Conflict { changed } => self.report.flags_changed |= changed,
+        }
+        self.settled[index] = true;
+        Ok(false)
     }
 
     /// Send the move at `index`, with every later row that moves another
@@ -187,11 +382,13 @@ impl Pass<'_> {
             None => None,
             Some(Reversed::Placed(uidvalidity, uid)) => Some((uidvalidity, uid)),
             Some(Reversed::Waiting) => {
-                self.held.insert(entry.message_id.clone());
+                self.held_moves
+                    .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 return Ok(());
             }
             Some(Reversed::Gone) => {
-                return self.drop_quietly(index, "the move it reverses never reached the server");
+                self.drop_quietly(index, "the move it reverses never reached the server")?;
+                return Ok(());
             }
         };
         let Some(source) = self.mailbox(
@@ -239,6 +436,13 @@ impl Pass<'_> {
                 }
             }
         };
+        if self.store_unconfirmed(&source, uidvalidity, uid) {
+            // Moving this copy would replace the UID and revision needed
+            // to confirm the earlier STORE.
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::StoreRecovery);
+            return Ok(());
+        }
 
         // Later rows that can go in the same command.
         let mut batch = vec![(index, uid)];
@@ -248,7 +452,7 @@ impl Pass<'_> {
                 continue;
             }
             let other = &entries[later];
-            let fits = !self.held.contains(&other.message_id)
+            let fits = !self.held_moves.contains_key(&other.message_id)
                 && !waiting.contains(other.message_id.as_str())
                 && !batch
                     .iter()
@@ -257,7 +461,9 @@ impl Pass<'_> {
                 && other.kind == entry.kind
                 && other.source_mailbox.as_deref() == Some(source.as_str())
                 && other.uidvalidity == Some(uidvalidity)
-                && other.uid.is_some()
+                && other
+                    .uid
+                    .is_some_and(|uid| !self.store_unconfirmed(&source, uidvalidity, uid))
                 && self.known_target(other).as_deref() == Some(target.as_str());
             if fits {
                 visited[later] = true;
@@ -424,7 +630,7 @@ impl Pass<'_> {
             outcome,
         )? {
             Settled::Stale => Err(Stop::Stale),
-            Settled::Recorded | Settled::Retired => Ok(()),
+            Settled::Recorded | Settled::Recovering | Settled::Retired => Ok(()),
         }
     }
 
@@ -504,9 +710,9 @@ impl Pass<'_> {
         let entries = self.entries;
         let entry = &entries[index];
         let last = entry.attempts + 1 >= MAX_ATTEMPTS;
-        // A refusal is recorded even on the last try: if undo reversed the
-        // row, it is retired there without a notice.
-        if last && !refused {
+        // A MOVE refusal can need to retire a queued undo. A flag retry can
+        // still be recovering an earlier STORE for a newer edit.
+        if last && !refused && entry.kind == OutboxKind::Move {
             return self.drop_row(index, reason, message);
         }
         let wait = BACKOFF_SECS[(entry.attempts as usize).min(BACKOFF_SECS.len() - 1)];
@@ -533,18 +739,32 @@ impl Pass<'_> {
                         self.settled[at] = true;
                     }
                 }
+                if entry.kind != OutboxKind::Move {
+                    return Ok(());
+                }
             }
             Settled::Recorded if last => return self.drop_row(index, reason, message),
-            Settled::Recorded => {}
+            Settled::Recovering if entry.attempts + 1 == MAX_ATTEMPTS => {
+                self.report.flag_recovery_delayed = true;
+            }
+            Settled::Recorded | Settled::Recovering => {}
         }
-        self.held.insert(entry.message_id.clone());
+        if entry.kind == OutboxKind::Move {
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+        } else if !refused && let Some(current) = self.pending_flag(index)? {
+            self.hold_unconfirmed_store(&current);
+        }
         Ok(())
     }
 
     fn drop_row(&mut self, index: usize, reason: DropReason, message: &str) -> Result<(), Stop> {
-        self.drop_quietly(index, message)?;
+        if self.drop_quietly(index, message)? == Settled::Retired {
+            return Ok(());
+        }
         let entry = &self.entries[index];
-        self.report.dropped.push(DroppedMove {
+        self.report.dropped.push(DroppedWrite {
+            kind: entry.kind,
             source_folder: entry.source_folder.clone(),
             target_folder: entry.target_folder.clone(),
             reason,
@@ -553,7 +773,7 @@ impl Pass<'_> {
     }
 
     /// Drop the row without a notice: the user has nothing to learn from it.
-    fn drop_quietly(&mut self, index: usize, message: &str) -> Result<(), Stop> {
+    fn drop_quietly(&mut self, index: usize, message: &str) -> Result<Settled, Stop> {
         let entries = self.entries;
         let entry = &entries[index];
         let settled = outbox::settle(
@@ -568,8 +788,11 @@ impl Pass<'_> {
             return Err(Stop::Stale);
         }
         self.settled[index] = true;
-        self.held.insert(entry.message_id.clone());
-        Ok(())
+        if entry.kind == OutboxKind::Move {
+            self.held_moves
+                .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+        }
+        Ok(settled)
     }
 }
 

@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS message_copies (
     uid INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     folder TEXT NOT NULL,
+    -- Big-endian u64, so SQLite orders the full unsigned MODSEQ range.
+    modseq BLOB,
+    seen INTEGER,
+    flagged INTEGER,
+    seen_handled INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, mailbox, uidvalidity, uid)
 );
 
@@ -52,7 +57,7 @@ CREATE TABLE IF NOT EXISTS copy_orphans (
 /// Create the tables. The first time, record the one copy each row and alias
 /// already names, so mail synced before this table existed can still go.
 pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
-    if table_exists(conn, "message_copies")? {
+    if has_flag_column(conn, "seen_handled")? {
         return conn.execute_batch(COPIES_SCHEMA).map_err(Into::into);
     }
     // One transaction: a large mailbox is not one commit per row, and a
@@ -60,11 +65,92 @@ pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let existed = table_exists(&tx, "message_copies")?;
     tx.execute_batch(COPIES_SCHEMA)?;
+    for (name, ty) in [
+        ("modseq", "BLOB"),
+        ("seen", "INTEGER"),
+        ("flagged", "INTEGER"),
+        ("seen_handled", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !has_flag_column(&tx, name)? {
+            tx.execute_batch(&format!(
+                "ALTER TABLE message_copies ADD COLUMN {name} {ty}"
+            ))?;
+        }
+    }
     if !existed {
         backfill(&tx)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+fn has_flag_column(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('message_copies') WHERE name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CopyFlags {
+    pub modseq: Option<u64>,
+    pub seen: Option<bool>,
+    pub flagged: Option<bool>,
+}
+
+pub(crate) enum FlagSource {
+    Sync,
+    Replay {
+        seen_handled: bool,
+        /// A successful conditional STORE preserves the other flag at this revision.
+        before_store: Option<u64>,
+    },
+}
+
+/// Record the values known at the observed revision. Sync still gets to apply
+/// a Seen change first discovered while replaying a different flag.
+pub(crate) fn observe_flags(
+    conn: &Connection,
+    account_id: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+    flags: CopyFlags,
+    source: FlagSource,
+) -> Result<bool> {
+    let (sync, seen_handled, before_store) = match source {
+        FlagSource::Sync => (true, true, None),
+        FlagSource::Replay {
+            seen_handled,
+            before_store,
+        } => (false, seen_handled, before_store),
+    };
+    let updated = conn
+        .prepare_cached(
+            "UPDATE message_copies SET modseq = COALESCE(?5, modseq),
+                 seen = COALESCE(?6, CASE WHEN ?5 IS NULL OR modseq = ?5 OR modseq = ?8 THEN seen END),
+                 flagged = COALESCE(?7, CASE WHEN ?5 IS NULL OR modseq = ?5 OR modseq = ?8 THEN flagged END),
+                 seen_handled = CASE
+                     WHEN ?9 THEN 1
+                     WHEN ?6 = seen OR (?6 IS NULL AND (?5 IS NULL OR modseq = ?5 OR modseq = ?8))
+                         THEN seen_handled
+                     ELSE 0 END
+             WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4
+               AND (?5 IS NULL OR modseq IS NULL OR modseq < ?5
+                    OR (modseq = ?5 AND (NOT ?10 OR NOT seen_handled)))",
+        )?
+        .execute(params![
+            account_id.as_str(),
+            copy.mailbox,
+            copy.uidvalidity,
+            copy.uid,
+            flags.modseq.map(u64::to_be_bytes),
+            flags.seen,
+            flags.flagged,
+            before_store.map(u64::to_be_bytes),
+            seen_handled,
+            sync,
+        ])?;
+    Ok(updated != 0 || row_of(conn, account_id, copy)?.is_none())
 }
 
 fn backfill(conn: &Connection) -> Result<()> {
@@ -699,7 +785,7 @@ fn moving_into(
     let hit: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM server_outbox
-             WHERE account_id = ?1 AND message_id = ?2 AND state = 'pending'
+             WHERE account_id = ?1 AND message_id = ?2 AND kind = 'move' AND state = 'pending'
                AND target_folder = ?3 COLLATE NOCASE
              LIMIT 1",
             params![account_id.as_str(), message_id, folder],

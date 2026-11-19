@@ -212,6 +212,7 @@ fn handle(
     let mut condstore_enabled = false;
     let mut utf8_enabled = false;
     let mut selected_condstore = false;
+    let mut selected_write = false;
     let mut qresync_enabled = false;
     while let Some((line, literals)) = read_client_command(&mut read, &mut write) {
         if line.is_empty() {
@@ -235,7 +236,22 @@ fn handle(
             }
         }
         let verb_upper = verb.to_ascii_uppercase();
-        if authed && writes::handle(&tag, &verb_upper, &rest, state, writes, &mut write) {
+        match verb_upper.as_str() {
+            "SELECT" => selected_write = true,
+            "EXAMINE" => selected_write = false,
+            _ => {}
+        }
+        if authed
+            && writes::handle(
+                &tag,
+                &verb_upper,
+                &rest,
+                state,
+                writes,
+                selected_write,
+                &mut write,
+            )
+        {
             continue;
         }
         match verb_upper.as_str() {
@@ -543,6 +559,14 @@ fn handle(
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
+                    let revision = if guard.condstore
+                        && (condstore_enabled || selected_condstore)
+                        && (upper_cmd.contains("MODSEQ") || changed_since.is_some())
+                    {
+                        format!(" MODSEQ ({})", message.modseq)
+                    } else {
+                        String::new()
+                    };
                     if let Some((section, window)) = part_request(&upper_cmd) {
                         write_part(
                             &mut write,
@@ -562,8 +586,11 @@ fn handle(
                         let flags = message.flags.join(" ");
                         if matches!(message.body_form, BodyForm::Absent) {
                             let _ = write.write_all(
-                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
-                                    .as_bytes(),
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision})\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
                             );
                             continue;
                         }
@@ -575,7 +602,7 @@ fn handle(
                         let header = &message.raw[..end];
                         let _ = write.write_all(
                             format!(
-                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}) BODY[HEADER] {{{}}}\r\n",
+                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}){revision} BODY[HEADER] {{{}}}\r\n",
                                 message.uid,
                                 message.raw.len(),
                                 header.len()
@@ -590,8 +617,11 @@ fn handle(
                         if upper_cmd.contains("FLAGS") {
                             let flags = message.flags.join(" ");
                             let _ = write.write_all(
-                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
-                                    .as_bytes(),
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision})\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
                             );
                         } else {
                             let _ = write.write_all(
@@ -607,7 +637,7 @@ fn handle(
                     match message.body_form {
                         BodyForm::Literal => {
                             let header = format!(
-                                "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {{{}}}\r\n",
+                                "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] {{{}}}\r\n",
                                 message.uid,
                                 message.raw.len()
                             );
@@ -619,7 +649,7 @@ fn handle(
                             let quoted = quote_bytes(&message.raw);
                             let _ = write.write_all(
                                 format!(
-                                    "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] {quoted})\r\n",
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] {quoted})\r\n",
                                     message.uid
                                 )
                                 .as_bytes(),
@@ -628,7 +658,7 @@ fn handle(
                         BodyForm::Nil => {
                             let _ = write.write_all(
                                 format!(
-                                    "* {seq} FETCH (UID {} FLAGS ({flags}) BODY[] NIL)\r\n",
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] NIL)\r\n",
                                     message.uid
                                 )
                                 .as_bytes(),
@@ -637,8 +667,11 @@ fn handle(
                         BodyForm::Omitted => {}
                         BodyForm::Absent => {
                             let _ = write.write_all(
-                                format!("* {seq} FETCH (UID {} FLAGS ({flags}))\r\n", message.uid)
-                                    .as_bytes(),
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision})\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
                             );
                         }
                     }

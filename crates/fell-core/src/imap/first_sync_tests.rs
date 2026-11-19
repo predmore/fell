@@ -510,6 +510,38 @@ fn a_pending_row_can_be_marked_read_before_its_body_arrives() {
 }
 
 #[test]
+fn a_header_only_copy_supplies_the_revision_for_flag_write_back() {
+    let _sizes = set_windows(SMALL);
+    let mut inbox = folder("INBOX", "", 3, "In", 1);
+    inbox.messages[0].modseq = 7;
+    let mut state = state_with(vec![inbox]);
+    state.condstore = true;
+    let server = TestServer::spawn(state);
+    let store = Store::open_in_memory().unwrap();
+    let (_, result) = run_pass(&backend_for(&server), &store, &mut |delta| {
+        !delta.messages.is_empty() && delta.messages.iter().all(headers_only)
+    });
+    assert!(result.is_err());
+
+    let acct = account("a1", BackendKind::Imap);
+    store.set_write_back(&acct.id, true).unwrap();
+    let pending = stored(&store, &acct, "In1@x").unwrap();
+    store
+        .flag_threads(
+            &acct.id,
+            &[pending.thread_id],
+            "INBOX",
+            crate::FlagChange::Read,
+        )
+        .unwrap()
+        .unwrap();
+    let outbox = store.outbox(&acct.id).unwrap();
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].flag_modseq, Some(7));
+    assert_eq!(outbox[0].flag_base, Some(false));
+}
+
+#[test]
 fn a_uidvalidity_change_between_visits_starts_the_mailbox_over() {
     let _sizes = set_windows(SMALL);
     let server = TestServer::spawn(state_with(vec![

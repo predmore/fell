@@ -1,9 +1,7 @@
 //! The test server's write-back verbs: `SELECT` and `UID MOVE`, plus the
 //! `STATUS`, `UID SEARCH HEADER Message-ID`, and Message-ID header fetch
-//! replay uses to find a moved message. `UID MOVE` is off unless a test
-//! turns it on in [`WriteFixture`]; sync tests never do. There is no
-//! `COPY`, `STORE`, or `EXPUNGE`: write-back never sends them, and a test
-//! that sees one in the command log fails.
+//! replay uses to find a moved message. The selected write connection also
+//! supports UID STORE for Seen and Flagged, with conditional conflicts.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -14,7 +12,7 @@ use super::{
 };
 
 /// What the server offers and how it answers writes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(in crate::imap) struct WriteFixture {
     /// Advertise MOVE (RFC 6851).
     pub moves: bool,
@@ -29,6 +27,12 @@ pub(in crate::imap) struct WriteFixture {
     /// Apply the next command with this verb (`"MOVE"`), then drop the
     /// connection before any reply.
     pub lose_reply_to: Option<&'static str>,
+    pub before_store: Option<Box<dyn FnOnce() + Send>>,
+    pub refuse_store_uid: Option<u32>,
+    pub modified_no: bool,
+    pub omit_store_modseq: bool,
+    pub omit_fetch_flags: bool,
+    pub nomodseq: bool,
 }
 
 pub(super) fn caps(writes: &Mutex<WriteFixture>) -> String {
@@ -51,10 +55,16 @@ pub(super) fn handle(
     rest: &str,
     state: &Arc<Mutex<TestState>>,
     writes: &Arc<Mutex<WriteFixture>>,
+    selected_write: bool,
     out: &mut Counted,
 ) -> bool {
     let reply = match verb {
-        "SELECT" => select(tag, rest, &state.lock().expect("state")),
+        "SELECT" => select(
+            tag,
+            rest,
+            &state.lock().expect("state"),
+            writes.lock().expect("writes").nomodseq,
+        ),
         "STATUS" => status(tag, rest, &state.lock().expect("state")),
         "UID" => {
             let rest = rest.trim();
@@ -73,9 +83,23 @@ pub(super) fn handle(
                 && args
                     .to_ascii_uppercase()
                     .contains("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]")
-                && selected(&state).is_some()
+                && selected_write
             {
                 fetch_message_ids(tag, args, &state)
+            } else if let Some(args) = strip_prefix_ignore(rest, "STORE ") {
+                if !selected_write {
+                    format!("{tag} BAD STORE requires SELECT\r\n")
+                } else {
+                    if let Some(hook) = writes.before_store.take() {
+                        hook();
+                    }
+                    store_flag(tag, args, &mut state, &writes)
+                }
+            } else if let Some(args) = strip_prefix_ignore(rest, "FETCH ")
+                && selected_write
+                && args.to_ascii_uppercase().contains("UID FLAGS")
+            {
+                fetch_flag(tag, args, &state, &writes)
             } else if let Some(args) = strip_prefix_ignore(rest, "MOVE ") {
                 if !writes.moves {
                     format!("{tag} BAD MOVE not offered\r\n")
@@ -93,7 +117,7 @@ pub(super) fn handle(
                     }
                     reply
                 }
-            } else if ["COPY ", "STORE ", "EXPUNGE"]
+            } else if ["COPY ", "EXPUNGE"]
                 .iter()
                 .any(|verb| strip_prefix_ignore(rest, verb).is_some())
             {
@@ -125,19 +149,135 @@ fn selected(state: &TestState) -> Option<String> {
     })
 }
 
-fn select(tag: &str, rest: &str, state: &TestState) -> String {
+fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {
     let name = mailbox_name(rest);
     let Some(mailbox) = state.mailboxes.iter().find(|item| item.name == name) else {
         return format!("{tag} NO no such mailbox\r\n");
     };
     let highest = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
     let next = mailbox.uidnext.unwrap_or(highest + 1);
+    let revision = if !state.condstore {
+        String::new()
+    } else if nomodseq {
+        "* OK [NOMODSEQ] no revisions\r\n".into()
+    } else {
+        let highest = mailbox.messages.iter().map(|m| m.modseq).max().unwrap_or(1);
+        format!("* OK [HIGHESTMODSEQ {highest}] highest\r\n")
+    };
     format!(
         "* {} EXISTS\r\n* OK [UIDVALIDITY {}] UIDs valid\r\n* OK [UIDNEXT {next}] next\r\n\
-         {tag} OK [READ-WRITE] SELECT completed\r\n",
+         {revision}{tag} OK [READ-WRITE] SELECT completed\r\n",
         mailbox.messages.len(),
         mailbox.uidvalidity
     )
+}
+
+fn fetch_flag(tag: &str, args: &str, state: &TestState, writes: &WriteFixture) -> String {
+    let uid = args
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok());
+    let mut reply = String::new();
+    if let Some(mailbox) =
+        selected(state).and_then(|name| state.mailboxes.iter().find(|m| m.name == name))
+        && let Some((index, message)) = mailbox
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| Some(m.uid) == uid)
+    {
+        let flags = if writes.omit_fetch_flags {
+            String::new()
+        } else {
+            format!(" FLAGS ({})", message.flags.join(" "))
+        };
+        let revision = if state.condstore && !writes.nomodseq {
+            format!(" MODSEQ ({})", message.modseq)
+        } else {
+            String::new()
+        };
+        reply.push_str(&format!(
+            "* {} FETCH (UID {}{flags}{revision})\r\n",
+            index + 1,
+            message.uid
+        ));
+    }
+    reply.push_str(&format!("{tag} OK FETCH\r\n"));
+    reply
+}
+
+fn store_flag(tag: &str, args: &str, state: &mut TestState, writes: &WriteFixture) -> String {
+    let Some((uid, rest)) = args.split_once(' ') else {
+        return format!("{tag} BAD expected UID\r\n");
+    };
+    let Ok(uid) = uid.parse::<u32>() else {
+        return format!("{tag} BAD expected UID\r\n");
+    };
+    if writes.refuse_store_uid == Some(uid) {
+        return format!("{tag} NO STORE refused\r\n");
+    }
+    let conditional = state.condstore && !writes.nomodseq;
+    let (expected, rest) = if let Some(modifier) = rest.strip_prefix("(UNCHANGEDSINCE ") {
+        let Some((revision, rest)) = modifier.split_once(") ") else {
+            return format!("{tag} BAD invalid UNCHANGEDSINCE\r\n");
+        };
+        let Ok(revision) = revision.parse::<u64>() else {
+            return format!("{tag} BAD invalid MODSEQ\r\n");
+        };
+        if !conditional {
+            return format!("{tag} BAD conditional STORE unavailable\r\n");
+        }
+        (Some(revision), rest)
+    } else {
+        (None, rest)
+    };
+    let (add, flag) = match rest {
+        "+FLAGS.SILENT (\\Seen)" => (true, "\\Seen"),
+        "-FLAGS.SILENT (\\Seen)" => (false, "\\Seen"),
+        "+FLAGS.SILENT (\\Flagged)" => (true, "\\Flagged"),
+        "-FLAGS.SILENT (\\Flagged)" => (false, "\\Flagged"),
+        _ => return format!("{tag} BAD expected one supported system flag\r\n"),
+    };
+    let Some(mailbox) =
+        selected(state).and_then(|name| state.mailboxes.iter_mut().find(|m| m.name == name))
+    else {
+        return format!("{tag} BAD no selected mailbox\r\n");
+    };
+    let revision = mailbox.messages.iter().map(|m| m.modseq).max().unwrap_or(0) + 1;
+    let Some((index, message)) = mailbox
+        .messages
+        .iter_mut()
+        .enumerate()
+        .find(|(_, m)| m.uid == uid)
+    else {
+        return format!("{tag} OK STORE\r\n");
+    };
+    if expected.is_some_and(|expected| message.modseq > expected) {
+        let status = if writes.modified_no { "NO" } else { "OK" };
+        return format!("{tag} {status} [MODIFIED {uid}] conditional STORE failed\r\n");
+    }
+    if add {
+        if !message
+            .flags
+            .iter()
+            .any(|current| current.eq_ignore_ascii_case(flag))
+        {
+            message.flags.push(flag.into());
+        }
+    } else {
+        message
+            .flags
+            .retain(|current| !current.eq_ignore_ascii_case(flag));
+    }
+    message.modseq = revision;
+    if conditional && !writes.omit_store_modseq {
+        format!(
+            "* {} FETCH (UID {uid} MODSEQ ({revision}))\r\n{tag} OK STORE\r\n",
+            index + 1
+        )
+    } else {
+        format!("{tag} OK STORE\r\n")
+    }
 }
 
 /// `STATUS <mailbox> (UIDVALIDITY UIDNEXT)`.
