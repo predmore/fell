@@ -117,7 +117,10 @@ impl UserSendConfirmation {
     /// Snapshots the pending id, account, recipients, subject, body, reply
     /// parent, attachments, and a hash of the message bytes.
     /// `fell-mcp` cannot name [`fell_confirm::InteractiveUi`] without adding a
-    /// Cargo dependency on `fell-confirm`. There is no send MCP tool.
+    /// Cargo dependency on `fell-confirm`, and builds `fell-core` without the
+    /// `ui-confirm` feature, so this function does not exist there. There is
+    /// no send MCP tool.
+    #[cfg(any(test, feature = "ui-confirm"))]
     pub fn from_interactive_ui(_ui: &impl fell_confirm::UiProof, pending: &PendingSend) -> Self {
         Self {
             pending_id: pending.id.clone(),

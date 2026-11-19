@@ -1,0 +1,11 @@
+--- stdout
+[mcp_servers.fell]
+command = "/opt/fell/fell-mcp"
+args = ["serve", "--store", "$TMP/mail.db", "--account", "demo", "--agent", "codex"]
+--- stderr
+Granted codex read, draft on demo (demo@example.com). It cannot send mail.
+
+For ~/.codex/config.toml:
+
+
+Revoke any time with `fell-mcp revoke codex`.

@@ -17,10 +17,11 @@ mod cli;
 #[cfg(test)]
 mod corpus;
 mod protocol;
+mod setup;
 mod tools;
 mod untrusted;
 
-pub use cli::cli_main;
+pub use cli::{FELL_MCP_ARG0, cli_main};
 pub use protocol::Session;
 
 #[cfg(test)]
@@ -34,6 +35,7 @@ mod tests {
             include_str!("tools.rs"),
             include_str!("protocol.rs"),
             include_str!("main.rs"),
+            include_str!("setup.rs"),
         ];
         let banned = [
             format!("{}{}", "fell_", "confirm"),

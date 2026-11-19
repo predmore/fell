@@ -1,0 +1,9 @@
+--- stdout
+claude mcp add --scope user fell -- /opt/fell/fell-mcp serve --store $TMP/mail.db --account demo --agent claude-code
+--- stderr
+Granted claude-code read, draft on demo (demo@example.com). It cannot send mail.
+
+Run this to add Fell to Claude Code:
+
+
+Revoke any time with `fell-mcp revoke claude-code`.

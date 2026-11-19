@@ -43,6 +43,15 @@ impl AgentGrant {
     }
 }
 
+/// One row of [`crate::Store::list_agent_grants`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub agent_id: String,
+    pub account_id: AccountId,
+    pub grant: AgentGrant,
+    pub last_action_unix: Option<i64>,
+}
+
 /// One logged triage or draft action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedAction {
@@ -154,6 +163,37 @@ impl crate::Store {
         tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Every stored grant, revoked ones included, by agent then account.
+    /// `last_action_unix` is the newest logged triage or draft action; reads
+    /// are not logged.
+    pub fn list_agent_grants(&self) -> Result<Vec<AgentSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft,
+                    (SELECT MAX(a.created_unix) FROM agent_actions a
+                     WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id)
+             FROM agent_grants g
+             ORDER BY g.agent_id, g.account_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AgentSummary {
+                agent_id: row.get(0)?,
+                account_id: AccountId(row.get(1)?),
+                grant: AgentGrant {
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    read: row.get::<_, i64>(3)? != 0,
+                    triage: row.get::<_, i64>(4)? != 0,
+                    draft: row.get::<_, i64>(5)? != 0,
+                },
+                last_action_unix: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// The stored grant. An unknown agent on a known account is disabled.
@@ -1133,6 +1173,39 @@ mod tests {
 
     fn only_message(store: &Store, account_id: &AccountId, thread_id: &ThreadId) -> Vec<Message> {
         store.thread_messages(account_id, thread_id).unwrap()
+    }
+
+    #[test]
+    fn list_agent_grants_reports_scopes_and_the_last_action_per_agent() {
+        let (store, acct, thread) = seeded();
+        store.upsert_account(&account("a2")).unwrap();
+        assert!(store.list_agent_grants().unwrap().is_empty());
+        store
+            .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, false, true))
+            .unwrap();
+        store
+            .set_agent_grant(&AccountId("a2".into()), "bot", AgentGrant::DISABLED)
+            .unwrap();
+        store
+            .set_agent_grant(&acct, "alpha", AgentGrant::enabled(true, true, false))
+            .unwrap();
+        store
+            .agent_archive_thread(&acct, &thread, "agent:bot")
+            .unwrap();
+        // A person's action and another agent's do not count for `bot`.
+        store.mark_thread_read(&acct, &thread, "user").unwrap();
+        let rows = store.list_agent_grants().unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| (row.agent_id.as_str(), row.account_id.as_str()))
+            .collect();
+        assert_eq!(ids, [("alpha", "a1"), ("bot", "a1"), ("bot", "a2")]);
+        assert_eq!(rows[0].grant, AgentGrant::enabled(true, true, false));
+        assert_eq!(rows[0].last_action_unix, None);
+        assert_eq!(rows[1].grant, AgentGrant::enabled(true, false, true));
+        assert!(rows[1].last_action_unix.is_some_and(|at| at > 0));
+        assert_eq!(rows[2].grant, AgentGrant::DISABLED);
+        assert_eq!(rows[2].last_action_unix, None);
     }
 
     #[test]

@@ -7,8 +7,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# `UserSendConfirmation::from_interactive_ui`, for the GPUI app only. It is
+# the only use of `fell-confirm`, so `fell-mcp` (which leaves it off) does
+# not link that crate at all.
+ui-confirm = ["dep:fell-confirm"]
+
 [dependencies]
-fell-confirm.workspace = true
+fell-confirm = { workspace = true, optional = true }
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Stored body parts (src/store/bodies.rs). Pure Rust DEFLATE, MIT OR Zlib OR
 # Apache-2.0, already in the tree through `png`.
@@ -31,6 +37,8 @@ unicode-normalization = "0.1.24"
 unicode-properties = { version = "0.1.3", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
+# Tests mint send confirmations.
+fell-confirm.workspace = true
 # Checks that stored bulk headers drive the renderer's bulk-mail check.
 fell-render.workspace = true
 # Builds a tiny ONNX graph in tests. Same major version tract-onnx uses.

@@ -1,0 +1,25 @@
+--- stdout
+extensions:
+  fell:
+    name: fell
+    description: Fell mail (no send tool)
+    type: stdio
+    cmd: "/opt/fell/fell-mcp"
+    args:
+      - "serve"
+      - "--store"
+      - "$TMP/mail.db"
+      - "--account"
+      - "demo"
+      - "--agent"
+      - "goose"
+    enabled: true
+    envs: {}
+    timeout: 300
+--- stderr
+Granted goose read, draft on demo (demo@example.com). It cannot send mail.
+
+For ~/.config/goose/config.yaml:
+
+
+Revoke any time with `fell-mcp revoke goose`.
