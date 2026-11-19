@@ -166,7 +166,10 @@ fn hybrid_search(session: &Session, query: &str, cursor: Option<&str>) -> Result
         .take(SEARCH_PAGE_ROWS)
         .map(|hit| hit_json(session, hit, Some(hit.semantic_only)))
         .collect::<Vec<_>>();
-    let next = offset + SEARCH_PAGE_ROWS;
+    // A cursor this large is not one this tool handed out.
+    let next = offset
+        .checked_add(SEARCH_PAGE_ROWS)
+        .ok_or_else(|| "cursor is not a page token".to_string())?;
     Ok(json!({
         "mode": "hybrid",
         "hits": hits,

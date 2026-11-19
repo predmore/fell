@@ -684,6 +684,14 @@ mod tests {
         );
         assert_eq!(bad["result"]["isError"], true);
         assert!(tool_text(&bad).contains("mode must be keyword or hybrid"));
+        // A cursor near usize::MAX is refused, not wrapped into an earlier page.
+        let huge = call(
+            &mut session,
+            "search",
+            json!({ "query": "money owed", "mode": "hybrid", "cursor": usize::MAX.to_string() }),
+        );
+        assert_eq!(huge["result"]["isError"], true, "{huge}");
+        assert!(tool_text(&huge).contains("cursor is not a page token"));
     }
 
     #[test]
