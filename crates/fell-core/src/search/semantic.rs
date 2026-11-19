@@ -17,7 +17,7 @@
 //! Everything here reads. In WAL mode a read never waits for a writer, so
 //! search does not block on the indexer or sync.
 
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,8 +32,6 @@ use crate::embed::{CHANGES_KEPT, EmbedderId, EmbedderSource, SendEmbedder};
 /// Cosine similarity below which a message is not related to the query.
 /// Unrelated mail scores about 0 to 0.2 with all-MiniLM-L6-v2.
 pub(crate) const MIN_SIMILARITY: f32 = 0.3;
-/// Nearest messages the scan hands on, before they are grouped by thread.
-pub(crate) const CANDIDATES: usize = 300;
 /// Threads the semantic side brings to the fusion.
 pub(crate) const SEMANTIC_THREADS: usize = 50;
 /// How long a model that is installed but did not load stays off before a
@@ -469,46 +467,36 @@ impl VectorIndex {
         allowed
     }
 
-    /// Up to `limit` messages of `account` nearest `query`, most similar
-    /// first, each at least [`MIN_SIMILARITY`]. With `allowed`, only the
-    /// marked rows are considered.
+    /// Yield related messages from highest score down. The caller can stop
+    /// once it has enough distinct threads. The heap keeps only the score
+    /// and row index, and a candidate never needs to be scored twice.
     pub(crate) fn nearest(
         &self,
         account: &str,
         query: &[f32],
         allowed: Option<&[bool]>,
-        limit: usize,
-    ) -> Vec<(Arc<str>, f32)> {
+    ) -> impl Iterator<Item = (&str, f32)> + '_ {
+        let mut candidates = Vec::new();
         // `load` refuses zero dimensions, and `chunks_exact(0)` would panic.
-        let (Some(slot), false) = (self.account_slot(account), self.dims == 0) else {
-            return Vec::new();
-        };
-        let Some((query, query_scale)) = quantize(query.iter().copied(), self.dims) else {
-            return Vec::new();
-        };
-        let slot = slot as u32;
-        let mut best: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(limit + 1);
-        for (row, codes) in self.codes.chunks_exact(self.dims).enumerate() {
-            if self.owners[row] != slot || allowed.is_some_and(|allowed| !allowed[row]) {
-                continue;
-            }
-            let score = dot(&query, codes) as f32 * self.scales[row] * query_scale;
-            if score < MIN_SIMILARITY {
-                continue;
-            }
-            if best.len() < limit {
-                best.push(Reverse(Scored(score, row as u32)));
-            } else if best.peek().is_some_and(|Reverse(low)| score > low.0) {
-                best.pop();
-                best.push(Reverse(Scored(score, row as u32)));
+        if let (Some(slot), false) = (self.account_slot(account), self.dims == 0)
+            && let Some((query, query_scale)) = quantize(query.iter().copied(), self.dims)
+        {
+            let slot = slot as u32;
+            for (row, codes) in self.codes.chunks_exact(self.dims).enumerate() {
+                if self.owners[row] != slot || allowed.is_some_and(|allowed| !allowed[row]) {
+                    continue;
+                }
+                let score = dot(&query, codes) as f32 * self.scales[row] * query_scale;
+                if score >= MIN_SIMILARITY {
+                    candidates.push(Scored(score, row as u32));
+                }
             }
         }
-        let mut found: Vec<Scored> = best.into_iter().map(|Reverse(scored)| scored).collect();
-        found.sort_by(|a, b| b.cmp(a));
-        found
-            .into_iter()
-            .map(|Scored(score, row)| (Arc::clone(&self.keys[row as usize]), score))
-            .collect()
+        let mut nearest = BinaryHeap::from(candidates);
+        std::iter::from_fn(move || {
+            let Scored(score, row) = nearest.pop()?;
+            Some((self.keys[row as usize].as_ref(), score))
+        })
     }
 }
 
@@ -603,8 +591,8 @@ mod tests {
         index.upsert("a", "far", &blob(&[0.0, 0.2, 0.9]));
         index.upsert("a", "mid", &blob(&[0.6, 0.6, 0.0]));
         index.upsert("b", "other", &blob(&[1.0, 0.0, 0.0]));
-        let found = index.nearest("a", &[1.0, 0.0, 0.0], None, 10);
-        let names: Vec<&str> = found.iter().map(|(key, _)| &**key).collect();
+        let found: Vec<_> = index.nearest("a", &[1.0, 0.0, 0.0], None).collect();
+        let names: Vec<_> = found.iter().map(|(key, _)| *key).collect();
         // `far` is below the similarity floor; `other` is another account.
         assert_eq!(names, ["near", "mid"]);
         let near = 0.9 / (0.81f32 + 0.01).sqrt();
@@ -619,29 +607,33 @@ mod tests {
         index.upsert("a", "z", &blob(&[0.7, 0.7]));
         index.remove("a", "x");
         assert_eq!(index.len(), 2);
-        let found = index.nearest("a", &[0.7, 0.7], None, 10);
-        assert_eq!(&*found[0].0, "z");
+        let found = index.nearest("a", &[0.7, 0.7], None).next().unwrap();
+        assert_eq!(found.0, "z");
         let allowed = index.rows_of("a", ["y"]);
-        let found = index.nearest("a", &[0.0, 1.0], Some(&allowed), 10);
-        assert_eq!(found.len(), 1);
-        assert_eq!(&*found[0].0, "y");
+        let mut found = index.nearest("a", &[0.0, 1.0], Some(&allowed));
+        assert_eq!(found.next().unwrap().0, "y");
+        assert!(found.next().is_none());
+        drop(found);
         // A rewrite replaces the row in place, and a zero vector drops it.
         index.upsert("a", "y", &blob(&[1.0, 0.0]));
         assert_eq!(index.len(), 2);
-        assert_eq!(&*index.nearest("a", &[1.0, 0.0], None, 1)[0].0, "y");
+        assert_eq!(index.nearest("a", &[1.0, 0.0], None).next().unwrap().0, "y");
         index.upsert("a", "y", &blob(&[0.0, 0.0]));
         assert_eq!(index.len(), 1);
     }
 
     #[test]
-    fn the_scan_keeps_only_the_best_rows() {
+    fn the_scan_yields_the_best_rows_first() {
         let mut index = index(2);
         for step in 0..50 {
             let angle = step as f32 / 100.0;
             index.upsert("a", &format!("m{step}"), &blob(&[angle.cos(), angle.sin()]));
         }
-        let found = index.nearest("a", &[1.0, 0.0], None, 5);
-        let names: Vec<&str> = found.iter().map(|(key, _)| &**key).collect();
+        let names: Vec<_> = index
+            .nearest("a", &[1.0, 0.0], None)
+            .take(5)
+            .map(|(key, _)| key)
+            .collect();
         assert_eq!(names, ["m0", "m1", "m2", "m3", "m4"]);
     }
 }
