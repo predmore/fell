@@ -6,7 +6,9 @@
 //! Every other MIME part is listed by its IMAP section ([`MimePart`]); its
 //! bytes are not kept.
 
+use std::cell::OnceCell;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use mail_parser::{HeaderForm, MessageParser, MessageRef, PartKind};
 
@@ -393,15 +395,14 @@ const SIGNATURE_TYPES: &[&str] = &[
 /// whole message.
 fn list_parts(message: MessageRef<'_>, html: Option<&str>) -> Vec<MimePart> {
     let mut out = Vec::new();
-    let cids = html.map(cid_references).unwrap_or_default();
-    walk_message(message, "", &cids, 0, &mut out);
+    walk_message(message, "", &CidReferences::new(html), 0, &mut out);
     out
 }
 
 fn walk_message(
     message: MessageRef<'_>,
     prefix: &str,
-    cids: &HashSet<String>,
+    cids: &CidReferences<'_>,
     depth: usize,
     out: &mut Vec<MimePart>,
 ) {
@@ -416,7 +417,7 @@ fn walk_message(
 fn walk_children(
     container: mail_parser::MessagePart<'_>,
     prefix: &str,
-    cids: &HashSet<String>,
+    cids: &CidReferences<'_>,
     depth: usize,
     out: &mut Vec<MimePart>,
 ) {
@@ -444,7 +445,7 @@ fn section(prefix: &str, number: usize) -> String {
 fn leaf(
     part: mail_parser::MessagePart<'_>,
     section: String,
-    cids: &HashSet<String>,
+    cids: &CidReferences<'_>,
     depth: usize,
     out: &mut Vec<MimePart>,
 ) {
@@ -506,7 +507,7 @@ fn leaf(
         && depth < MAX_NESTED_MESSAGES
     {
         let html = joined(inner.html_body(), |kind| matches!(kind, PartKind::Html));
-        let cids = html.as_deref().map(cid_references).unwrap_or_default();
+        let cids = CidReferences::new(html.as_deref());
         walk_message(inner, &section, &cids, depth + 1, out);
     }
 }
@@ -519,14 +520,14 @@ fn part_role(
     filename: Option<&str>,
     content_id: Option<&str>,
     disposition: Disposition,
-    cids: &HashSet<String>,
+    cids: &CidReferences<'_>,
 ) -> PartRole {
     if SIGNATURE_TYPES.contains(&mime_type) || filename.is_some_and(is_signature_name) {
         return PartRole::Signature;
     }
     let shown = mime_type.starts_with("image/")
         && disposition != Disposition::Attachment
-        && content_id.is_some_and(|id| cids.contains(&id.to_ascii_lowercase()));
+        && content_id.is_some_and(|id| cids.contains(id));
     if shown {
         PartRole::Inline
     } else {
@@ -579,54 +580,47 @@ pub(crate) fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// The Content-IDs an HTML body loads by `cid:` URL (RFC 2392), lowercase
-/// and percent-decoded: as a `src`, `background` or `poster` attribute, or a
-/// CSS `url(...)`. A `cid:` that is only text, or a link the reader would
-/// have to follow, does not count.
-fn cid_references(html: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let lower = html.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(found) = lower[from..].find("cid:") {
-        let at = from + found;
-        let start = at + 4;
-        let end = lower[start..]
-            .find(|ch: char| ch.is_whitespace() || "\"'()<>".contains(ch))
-            .map_or(lower.len(), |len| start + len);
-        let id = percent_decode(&lower[start..end]);
-        if !id.is_empty() && id.len() <= MAX_PART_NAME && loads_url(&lower[..at]) {
-            out.insert(id);
-        }
-        from = end.max(start);
-        if out.len() >= MAX_MIME_PARTS {
-            break;
-        }
-    }
-    out
+/// Parse each HTML body only when a part could be an inline image.
+struct CidReferences<'a> {
+    html: Option<&'a str>,
+    ids: OnceCell<HashSet<String>>,
 }
 
-/// Whether the lowercase HTML just before a URL makes that URL something the
-/// page loads: `src=`, `background=`, `poster=` (quoted or not), or `url(`.
-fn loads_url(before: &str) -> bool {
-    let before = before.trim_end_matches(|ch: char| ch.is_ascii_whitespace());
-    let before = before
-        .strip_suffix(['"', '\''])
-        .unwrap_or(before)
-        .trim_end_matches(|ch: char| ch.is_ascii_whitespace());
-    if before.ends_with("url(") {
-        return true;
+impl<'a> CidReferences<'a> {
+    fn new(html: Option<&'a str>) -> Self {
+        Self {
+            html,
+            ids: OnceCell::new(),
+        }
     }
-    let Some(name) = before.strip_suffix('=') else {
-        return false;
-    };
-    let name = name.trim_end_matches(|ch: char| ch.is_ascii_whitespace());
-    ["src", "background", "poster"].iter().any(|attr| {
-        name.strip_suffix(attr).is_some_and(|rest| {
-            rest.chars()
-                .next_back()
-                .is_none_or(|ch| ch.is_ascii_whitespace() || ch == '"' || ch == '\'' || ch == '/')
+
+    fn contains(&self, id: &str) -> bool {
+        self.html.is_some_and(|html| {
+            self.ids
+                .get_or_init(|| cid_references(html))
+                .contains(&id.to_ascii_lowercase())
         })
-    })
+    }
+}
+
+/// Normalize CID URL payloads (RFC 2392) for comparison with MIME headers.
+fn cid_references(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let _ = fell_render::visit_cid_image_urls(html, |payload| {
+        // Each decoded byte can occupy up to three bytes in the URL.
+        if payload.len() <= 3 * MAX_PART_NAME {
+            let id = percent_decode(payload);
+            if id.len() <= MAX_PART_NAME {
+                out.insert(id);
+            }
+        }
+        if out.len() >= MAX_MIME_PARTS {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    out
 }
 
 fn percent_decode(text: &str) -> String {
@@ -1200,26 +1194,19 @@ mod tests {
         let shown = [
             "<img src=\"cid:part@x\">",
             "<img SRC = 'cid:part@x'>",
-            "<td background=cid:part@x>",
+            "<img src=' CID&#58;PART%40x '>",
+            "<body background=cid:part@x>",
+            "<table><tr><td background=cid:part@x>Logo</td></tr></table>",
+            "<video poster=cid:part@x></video>",
             "<div style=\"background: url(cid:part@x)\">",
-            "<div style=\"background: url( 'cid:part@x' )\">",
+            "<div style=\"background: URL( &quot;cid:part@x&quot; )\">",
+            r"<style>@media screen { .logo { background: image-set(url(\63 id:part@x) 1x) } }</style>",
+            "<noscript><img src=cid:part@x></noscript>",
         ];
         for html in shown {
             let (message, parts) = related_with(html, png);
             assert_eq!(parts[0].role, PartRole::Inline, "{html}");
             assert!(!message.has_attachment, "{html}");
-        }
-        // A cid: the page does not load leaves the image a file to open.
-        let not_shown = [
-            "<p>see cid:part@x</p>",
-            "<a href=\"cid:part@x\">logo</a>",
-            "<img data-src=\"cid:part@x\">",
-            "<img alt=\"cid:part@x\">",
-        ];
-        for html in not_shown {
-            let (message, parts) = related_with(html, png);
-            assert_eq!(parts[0].role, PartRole::Attachment, "{html}");
-            assert_eq!(message.attachment_names, vec!["logo.png"], "{html}");
         }
         // An image sent as an attachment stays one, even when the HTML shows it.
         let (message, parts) = related_with(
@@ -1235,6 +1222,49 @@ mod tests {
         );
         assert_eq!(parts[0].role, PartRole::Attachment);
         assert_eq!(message.attachment_names, vec!["invoice.pdf"]);
+    }
+
+    #[test]
+    fn cid_mentions_without_an_image_reference_leave_the_attachment() {
+        let png = "Content-Type: image/png; name=\"logo.png\"";
+        for html in [
+            "<p>see cid:part@x</p>",
+            "<p>Write src=cid:part@x in the message</p>",
+            "<p>Write background=cid:part@x in the message</p>",
+            "<p>Write poster=cid:part@x in the message</p>",
+            "<p>Write url(cid:part@x) in the message</p>",
+            "<code>&lt;img src=cid:part@x&gt;</code>",
+            "<!-- <img src=cid:part@x> -->",
+            "<script>const example = '<img src=cid:part@x>';</script>",
+            "<template><img src=cid:part@x></template>",
+            "<a href=\"cid:part@x\">logo</a>",
+            "<img data-src=\"cid:part@x\">",
+            "<img alt=\"cid:part@x\">",
+            "<img alt=\"Write src=cid:part@x in the message\">",
+            "<img src=\"cid:part@x extra\">",
+            "<video src=cid:part@x></video>",
+            "<div background=cid:part@x poster=cid:part@x></div>",
+            "<div data-style=\"background: url(cid:part@x)\"></div>",
+            "<div style=\"Write url(cid:part@x) here\"></div>",
+            "<div style=\"/* background: url(cid:part@x) */\"></div>",
+            "<style>p::before { content: 'url(cid:part@x)' }</style>",
+            "<style>p { background: not-url(cid:part@x) }</style>",
+            "<style>@import url(cid:part@x);</style>",
+            "<style>@font-face { font-family: Example; src: url(cid:part@x) }</style>",
+            "<style>@supports (background: url(cid:part@x)) { p { color: red } }</style>",
+            "<style type=text/plain>p { background: url(cid:part@x) }</style>",
+        ] {
+            let (message, parts) = related_with(html, png);
+            assert_eq!(parts[0].role, PartRole::Attachment, "{html}");
+            assert!(message.has_attachment, "{html}");
+            assert_eq!(message.attachment_names, vec!["logo.png"], "{html}");
+        }
+        let (message, parts) = related_with(
+            "<p>Write src=cid:part@x in the message</p>",
+            "Content-Type: image/png\r\nContent-Disposition: inline; filename=\"photo.png\"",
+        );
+        assert_eq!(parts[0].role, PartRole::Attachment);
+        assert_eq!(message.attachment_names, vec!["photo.png"]);
     }
 
     #[test]
