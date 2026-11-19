@@ -30,7 +30,9 @@ use crate::model::{
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, ThreadRow};
 use crate::row_widths::{self, RowFrame, RowWidths};
-use crate::scroll_anchor::{LandingHold, LayoutProbe, LayoutSlot, Reveal, ScrollAnchor};
+use crate::scroll_anchor::{
+    LandingHold, LayoutProbe, LayoutSlot, Reveal, RevealPhase, ScrollAnchor, clamped_offset,
+};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
 use crate::text_cut;
@@ -1132,6 +1134,7 @@ impl Inbox {
 
     /// A key arrived: jump every transition to its end state first.
     fn settle_motion(&mut self) {
+        self.reveal.cancel_pending();
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
@@ -1963,7 +1966,6 @@ impl Inbox {
         // Input never waits on an animation.
         self.settle_motion();
         window.focus(&self.focus);
-        let before = self.before_step();
         // The wheel moves the viewport without moving message_cursor. j, k,
         // and q aim at the message now on screen in either pane. Enter and o
         // do that only while the conversation is focused, so they expand the
@@ -1977,6 +1979,8 @@ impl Inbox {
         ) {
             self.follow_visible_message();
         }
+        // A command can re-target the message on screen before it runs.
+        let before = self.before_step();
         let page = self.page_rows();
         // `U` and `s` say what they did only when the row is not on screen.
         let width = f32::from(window.viewport_size().width);
@@ -2143,22 +2147,20 @@ impl Inbox {
     }
 
     fn follow_visible_message(&mut self) {
-        if self.session.messages.is_empty() || self.conv_scroll.bounds_for_item(0).is_none() {
+        if self.session.messages.is_empty() {
             return;
         }
-        let viewport = self.conv_scroll.bounds();
-        let offset = self.conv_scroll.offset().y;
-        if let Some(cursor) = self
-            .conv_scroll
-            .bounds_for_item(self.session.message_cursor)
-            && cursor.bottom() + offset > viewport.top()
-            && cursor.top() + offset < viewport.bottom()
+        let scrolled = self.reveal == (Reveal::Reading { selected: false });
+        if !scrolled
+            && ScrollAnchor::capture_message(&self.conv_scroll, self.session.message_cursor)
+                .is_some()
         {
             return;
         }
-        let index = self.conv_scroll.top_item();
-        if index < self.session.messages.len() {
-            self.session.message_cursor = index;
+        if let Some(anchor) = ScrollAnchor::capture(&self.conv_scroll)
+            && anchor.index < self.session.messages.len()
+        {
+            self.session.message_cursor = anchor.index;
         }
     }
 
@@ -2211,13 +2213,13 @@ impl Inbox {
     /// shows already.
     fn reveal_newest(&mut self, window: &mut Window) {
         match self.reveal {
-            Reveal::Waiting | Reveal::Reading { .. } => {}
-            Reveal::Laying => {
-                self.reveal = Reveal::Ready;
+            Reveal::Waiting | Reveal::Following(RevealPhase::Idle) | Reveal::Reading { .. } => {}
+            Reveal::Following(RevealPhase::Laying) => {
+                self.reveal = Reveal::Following(RevealPhase::Ready);
                 window.request_animation_frame();
             }
-            Reveal::Ready => {
-                self.reveal = Reveal::Waiting;
+            Reveal::Following(RevealPhase::Ready) => {
+                self.reveal = Reveal::Following(RevealPhase::Idle);
                 let last = self.session.messages.len().saturating_sub(1);
                 let Some(item) = self.conv_scroll.bounds_for_item(last) else {
                     return;
@@ -2559,6 +2561,42 @@ struct Shown {
     frames: Option<SharedFrameLog>,
 }
 
+/// Observe GPUI's scroll offset before and after it handles a wheel event.
+/// The observer is painted before the scroll pane, so it runs after that
+/// pane in the bubble phase. Clamping here uses its current layout.
+fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -> impl IntoElement {
+    use gpui::{DispatchPhase, ScrollWheelEvent};
+
+    let inbox = cx.entity().downgrade();
+    gpui::canvas(
+        |_, _, _| (),
+        move |_, (), window, _| {
+            let mut before = px(0.);
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| match phase {
+                DispatchPhase::Capture => before = clamped_offset(&scroll),
+                DispatchPhase::Bubble => {
+                    let over_reader = showing && scroll.bounds().contains(&event.position);
+                    let moved = clamped_offset(&scroll) != before;
+                    let _ = inbox.update(cx, |inbox, cx| {
+                        if over_reader && inbox.session.overlay == Overlay::None {
+                            if !moved {
+                                return;
+                            }
+                            inbox.reader_took_over(false);
+                        } else {
+                            inbox.reveal.cancel_pending();
+                        }
+                        inbox.motion.cancel_glides();
+                        cx.notify();
+                    });
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shell(
     theme: Theme,
@@ -2658,10 +2696,7 @@ fn shell(
         .on_key_down(cx.listener(|inbox, event: &KeyDownEvent, window, cx| {
             inbox.on_key_down(event, window, cx);
         }))
-        // The wheel takes over from a glide where the viewport is.
-        .on_scroll_wheel(cx.listener(|inbox, _: &gpui::ScrollWheelEvent, _, _| {
-            inbox.motion.cancel_glides();
-        }))
+        .child(observe_wheel(conv_scroll.clone(), show_conv, cx))
         .on_mouse_move(cx.listener(|inbox, event: &MouseMoveEvent, window, cx| {
             if !inbox.dragging {
                 return;
@@ -3844,13 +3879,7 @@ fn conversation(
                 .flex_1()
                 .min_h(px(0.))
                 .map(|body| match &scroll {
-                    Some(scroll) => body
-                        .overflow_y_scroll()
-                        .track_scroll(scroll)
-                        .on_scroll_wheel(cx.listener(|inbox, _, _, cx| {
-                            inbox.reader_took_over(false);
-                            cx.notify();
-                        })),
+                    Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
                     None => body.overflow_hidden(),
                 })
                 .px(px(20.))
@@ -4669,6 +4698,7 @@ fn palette(
                                 cx.stop_propagation();
                                 window.focus(&inbox.focus);
                                 inbox.session.overlay = Overlay::None;
+                                inbox.reveal.cancel_pending();
                                 let page = inbox.page_rows();
                                 let before = inbox.before_step();
                                 let step = inbox.session.perform(action, page);

@@ -35,13 +35,13 @@ impl ScrollAnchor {
     }
 
     /// Capture a selected message, which can be below the first visible one.
-    fn capture_message(scroll: &ScrollHandle, index: usize) -> Option<Self> {
+    pub fn capture_message(scroll: &ScrollHandle, index: usize) -> Option<Self> {
         let item = scroll.bounds_for_item(index)?;
         visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y })
     }
 }
 
-fn clamped_offset(scroll: &ScrollHandle) -> Pixels {
+pub(super) fn clamped_offset(scroll: &ScrollHandle) -> Pixels {
     scroll.offset().y.clamp(-scroll.max_offset().height, px(0.))
 }
 
@@ -50,10 +50,7 @@ fn clamped_offset(scroll: &ScrollHandle) -> Pixels {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reveal {
     Waiting,
-    /// The next frame lays out the bodies.
-    Laying,
-    /// The new message bounds can now be read.
-    Ready,
+    Following(RevealPhase),
     /// Hold a selected message after message navigation, or the first visible
     /// message after scrolling.
     Reading {
@@ -61,20 +58,32 @@ pub(super) enum Reveal {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RevealPhase {
+    Idle,
+    /// The next frame lays out the bodies.
+    Laying,
+    /// The new message bounds can now be read.
+    Ready,
+}
+
 impl Reveal {
     pub fn pending(self) -> bool {
-        matches!(self, Self::Laying | Self::Ready)
+        matches!(
+            self,
+            Self::Following(RevealPhase::Laying | RevealPhase::Ready)
+        )
     }
 
     pub fn body_changed(&mut self, previously_fit: bool) {
-        if self.pending() || (*self == Self::Waiting && previously_fit) {
-            *self = Self::Laying;
+        if matches!(self, Self::Following(_)) || (*self == Self::Waiting && previously_fit) {
+            *self = Self::Following(RevealPhase::Laying);
         }
     }
 
     pub fn cancel_pending(&mut self) {
         if self.pending() {
-            *self = Self::Waiting;
+            *self = Self::Following(RevealPhase::Idle);
         }
     }
 
@@ -264,15 +273,20 @@ mod tests {
     }
 
     #[test]
-    fn only_an_untouched_conversation_can_reveal_a_new_body() {
+    fn a_short_conversation_follows_later_batches_until_the_reader_takes_over() {
         let mut reveal = Reveal::Waiting;
         reveal.body_changed(false);
         assert!(!reveal.pending());
         reveal.body_changed(true);
-        assert_eq!(reveal, Reveal::Laying);
-        reveal = Reveal::Ready;
+        assert_eq!(reveal, Reveal::Following(RevealPhase::Laying));
+        reveal = Reveal::Following(RevealPhase::Ready);
+        reveal.cancel_pending();
+        assert!(!reveal.pending(), "input can cancel the current reveal");
+
+        // The previous batch now overflows. Passive follow resumes when
+        // another body comes, even after the previous reveal settled.
         reveal.body_changed(false);
-        assert_eq!(reveal, Reveal::Laying, "remeasure a second batch");
+        assert_eq!(reveal, Reveal::Following(RevealPhase::Laying));
 
         let reading = Reveal::Reading { selected: true };
         reveal = reading;
