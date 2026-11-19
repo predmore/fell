@@ -584,6 +584,56 @@ fn operators_filter_the_semantic_side() {
 }
 
 #[test]
+fn quoted_replies_do_not_crowd_out_related_threads() {
+    let _reset = EmbedderReset;
+    testing_embedder(Some(concepts));
+    let store = Store::open_in_memory().unwrap();
+
+    // The old 300-message window filled with eight 40-message threads.
+    // Each reply quotes the preceding note and scores above the hotel bill.
+    let mut messages = Vec::new();
+    for thread in 0..8 {
+        let mut parent = None;
+        let mut previous_note = String::new();
+        for reply in 0..40 {
+            let note = format!("Payment update {reply}. Please check the invoice.");
+            let body = if previous_note.is_empty() {
+                note.clone()
+            } else {
+                format!("{note}\n\n> {previous_note}")
+            };
+            let mut message = mail(
+                &format!("billing-{thread}-{reply}"),
+                "accounts@work.test",
+                &format!("Paperwork {thread}"),
+                &body,
+                1_700_000_000 + thread * 40 + reply,
+            );
+            message.headers.in_reply_to = parent.replace(message.headers.message_id.clone());
+            messages.push(message);
+            previous_note = note;
+        }
+    }
+    let hotel = mail(
+        "hotel-bill",
+        "desk@hotel.test",
+        "Receipt",
+        "Your bill covers the room, booking and lodging.",
+        1_700_001_000,
+    );
+    let hotel_id = hotel.headers.message_id.clone();
+    messages.push(hotel);
+    fill(&store, &messages);
+    index_with(&store, &Concepts);
+
+    assert!(keyword(&store, "money owed").hits.is_empty());
+    let results = hybrid(&store, "money owed");
+    assert_eq!(results.hits.len(), 9);
+    assert!(results.hits.iter().all(|hit| hit.semantic_only));
+    assert_eq!(results.hits.last().unwrap().message_id, hotel_id);
+}
+
+#[test]
 fn without_a_model_search_is_exactly_keyword_search() {
     let queries = [
         "invoice",
@@ -1313,7 +1363,7 @@ fn semantic_rows_apply_the_operators_again() {
             &store.conn,
             &account_id(),
             &parsed,
-            ["plumber-invoice@corpus.test", "refund@corpus.test"].into_iter(),
+            &["plumber-invoice@corpus.test", "refund@corpus.test"],
         )
         .unwrap()
         .into_keys()

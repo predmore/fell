@@ -39,6 +39,9 @@ use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
+mod flags;
+pub use flags::FlagChange;
+
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
 
@@ -124,6 +127,7 @@ CREATE TABLE IF NOT EXISTS local_action_bodies (
     plain BLOB,
     bulk_headers TEXT NOT NULL DEFAULT '',
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (action_id, message_id),
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
@@ -163,6 +167,10 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    Read,
+    Unread,
+    Star,
+    Unstar,
     /// Moved into the account's Junk folder.
     Spam,
     /// Moved out of Junk back to the inbox.
@@ -178,6 +186,10 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::Read => "read",
+            Self::Unread => "unread",
+            Self::Star => "star",
+            Self::Unstar => "unstar",
             Self::Spam => "spam",
             Self::NotSpam => "not_spam",
             Self::Purge => "purge",
@@ -190,11 +202,20 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "read" => Ok(Self::Read),
+            "unread" => Ok(Self::Unread),
+            "star" => Ok(Self::Star),
+            "unstar" => Ok(Self::Unstar),
             "spam" => Ok(Self::Spam),
             "not_spam" => Ok(Self::NotSpam),
             "purge" => Ok(Self::Purge),
             _ => Err(Error::Action(format!("unknown action {raw}"))),
         }
+    }
+
+    /// Read, unread, or star: the thread stays in its folder.
+    pub fn is_flag(self) -> bool {
+        matches!(self, Self::Read | Self::Unread | Self::Star | Self::Unstar)
     }
 }
 
@@ -474,9 +495,12 @@ impl Store {
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        let rows = load_snapshots(&tx, action.id)?;
-        for row in &rows {
-            restore_row(&tx, account_id, row)?;
+        if action.kind.is_flag() {
+            flags::undo(&tx, account_id, &action)?;
+        } else {
+            for row in &load_snapshots(&tx, action.id)? {
+                restore_row(&tx, account_id, row)?;
+            }
         }
         crate::outbox::undo_action(&tx, account_id, action.id)?;
         tx.execute(
@@ -635,11 +659,14 @@ impl Store {
 
 fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
+    conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
-    if !crate::store::bodies::has_column(conn, "local_action_bodies", "parts_listed")? {
-        conn.execute_batch(
-            "ALTER TABLE local_action_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
-        )?;
+    for column in ["parts_listed", "withheld"] {
+        if !crate::store::bodies::has_column(conn, "local_action_bodies", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE local_action_bodies ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -751,6 +778,7 @@ fn finish_purge(conn: &Connection, id: i64, account_id: &AccountId) -> Result<()
         "local_action_bodies",
         "local_action_parts",
         "local_action_aliases",
+        "local_action_flags",
     ] {
         let by_canonical = if table == "local_action_aliases" {
             format!("OR canonical_message_id IN ({purged_ids})")
@@ -804,7 +832,10 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
         .query_row(
             "SELECT id, kind, summary FROM local_actions a
              WHERE account_id = ?1 AND undone = 0 AND kind != 'purge'
-               AND EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
+               AND (
+                   EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
+                   OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+               )
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -946,7 +977,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
 
 /// Put back the parts a removed row had, replacing any a later sync wrote
 /// for the same id, as the row itself is, with its part list. A row that had
-/// none, or no list, is queued to be fetched again.
+/// no list is queued for backfill unless sync withheld it for size.
 fn restore_bodies(
     conn: &Connection,
     account_id: &AccountId,
@@ -960,10 +991,10 @@ fn restore_bodies(
     ] {
         conn.execute(sql, params![account_id.as_str(), message_id])?;
     }
-    let restored = conn.execute(
+    conn.execute(
         "INSERT INTO message_bodies
-            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed)
-         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
+         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
          FROM local_action_bodies
          WHERE action_id = ?3 AND message_id = ?2",
         params![account_id.as_str(), message_id, action_id],
@@ -977,13 +1008,14 @@ fn restore_bodies(
         ),
         params![account_id.as_str(), message_id, action_id],
     )?;
-    let listed = crate::store::bodies::parts_listed(conn, account_id, message_id)?;
-    if restored == 0 || !listed {
-        conn.execute(
-            "INSERT OR IGNORE INTO body_backfill (account_id, message_id) VALUES (?1, ?2)",
-            params![account_id.as_str(), message_id],
-        )?;
-    }
+    conn.execute(
+        "INSERT OR IGNORE INTO body_backfill (account_id, message_id)
+         SELECT ?1, ?2 WHERE NOT EXISTS (
+             SELECT 1 FROM message_bodies WHERE account_id = ?1 AND message_id = ?2
+                 AND (parts_listed = 1 OR withheld = 1)
+         )",
+        params![account_id.as_str(), message_id],
+    )?;
     Ok(())
 }
 
@@ -1432,8 +1464,8 @@ fn insert_snapshot(
         // them for undo as stored.
         conn.execute(
             "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed)
-             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
+             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
              FROM message_bodies
              WHERE account_id = ?2 AND message_id = ?3",
             params![action_id, account_id.as_str(), plan.before.message_id],
@@ -3194,6 +3226,40 @@ mod tests {
         store
             .delete_thread(&account("a1"), thread, FOLDER_TRASH)
             .unwrap()
+    }
+
+    #[test]
+    fn undo_of_expunge_restores_the_size_limit_marker_without_backfill() {
+        let store = open(&[("a1", "a@x")]);
+        let account = account("a1");
+        let mut note = sample("a1", "note@x", "Note", "");
+        note.remote_id = crate::RemoteId("imap:7:1:INBOX".into());
+        note.body_text = None;
+        note.snippet.clear();
+        let thread = store.upsert_message(&note).unwrap();
+        let id = note.headers.message_id;
+        let ids = [id];
+        store
+            .apply_delta(
+                &account,
+                &MailboxDelta {
+                    too_large: ids.to_vec(),
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.body_states(&account, &ids).unwrap(),
+            [crate::BodyState::TooLarge]
+        );
+
+        expunge(&store, &thread);
+        store.undo(&account).unwrap();
+        assert_eq!(
+            store.body_states(&account, &ids).unwrap(),
+            [crate::BodyState::TooLarge]
+        );
+        assert!(!queued(&store, "note@x"));
     }
 
     #[test]

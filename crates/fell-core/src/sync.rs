@@ -10,6 +10,9 @@ const BODY_BATCH: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncReport {
     pub upserted: usize,
+    /// The first sync of a folder under way, as of the last delta. `None`
+    /// while the pass only catches folders up.
+    pub progress: Option<crate::backend::SyncProgress>,
 }
 
 /// Pull a backend delta into the local store. The UI should call this off the frame path.
@@ -36,15 +39,29 @@ pub fn sync_with_progress(
         store.stored_uids(&account.id, mailbox, uidvalidity, range)
     };
     backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
-        let count = delta.messages.len();
+        // A row a first sync stored from headers alone is counted when its
+        // body comes, so each message counts once.
+        let count = delta
+            .messages
+            .iter()
+            .filter(|message| !headers_only(message))
+            .count();
         store.apply_delta(&account.id, &delta)?;
         report.upserted += count;
-        if count > 0 || !delta.flags.is_empty() {
+        let walking = delta.progress.is_some();
+        report.progress = delta.progress;
+        if count > 0 || !delta.flags.is_empty() || walking {
             progress(&report);
         }
         Ok(())
     })?;
     Ok(report)
+}
+
+/// A row with no body yet: a first sync stores the list's rows before it
+/// fetches their bodies.
+fn headers_only(message: &crate::Message) -> bool {
+    message.parts.is_none() && message.body_text.is_none() && message.snippet.is_empty()
 }
 
 /// Fill parts for mail stored before they were kept, newest first, in up to

@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::ops::Range;
 
 use fell_core::compose::ReplyKind;
-use fell_core::{FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId};
+use fell_core::{
+    FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId,
+};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
 use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
@@ -25,6 +27,8 @@ pub enum SyncKind {
     /// Messages written so far in this pass.
     Syncing {
         stored: usize,
+        /// The first sync of a folder under way, read newest first.
+        progress: Option<fell_core::SyncProgress>,
     },
     /// Unix time the last pass finished, and how many messages it wrote.
     Synced {
@@ -32,6 +36,19 @@ pub enum SyncKind {
         stored: usize,
     },
     Failed(SyncFailure),
+}
+
+/// `31882` as `31,882`.
+fn grouped(count: u32) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,8 +75,17 @@ impl SyncKind {
             Self::FirstSync => "no account".into(),
             Self::StoreError => "mailbox error".into(),
             Self::Connecting => "connecting…".into(),
-            Self::Syncing { stored: 0 } => "syncing…".into(),
-            Self::Syncing { stored } => format!("syncing · {stored} new"),
+            Self::Syncing {
+                progress: Some(progress),
+                ..
+            } => format!(
+                "syncing {} · {} of {}",
+                progress.folder,
+                grouped(progress.done),
+                grouped(progress.total)
+            ),
+            Self::Syncing { stored: 0, .. } => "syncing…".into(),
+            Self::Syncing { stored, .. } => format!("syncing · {stored} new"),
             Self::Synced { at, .. } => {
                 let ago = now.saturating_sub(*at).max(0);
                 if ago < 60 {
@@ -196,7 +222,16 @@ fn step_index(cursor: usize, len: usize, motion: Motion) -> usize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Read, unread, or star on threads. The rows already show it; the view
+/// writes it to the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlagEdit {
+    /// Thread ids, in list order.
+    pub ids: Vec<String>,
+    pub change: FlagChange,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub reload_threads: bool,
     pub reload_messages: bool,
@@ -205,6 +240,8 @@ pub struct Step {
     pub scroll_pages: i32,
     /// Conversation lines. Positive moves down.
     pub scroll_lines: i32,
+    /// The reader expanded or folded a message, its quotes, or recipients.
+    pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
     /// `u` restores the latest local action.
@@ -228,6 +265,12 @@ pub struct Step {
     pub open_draft: bool,
     /// `r`, `R`, `f`: answer [`Session::reply_target`] in a new draft.
     pub reply: Option<ReplyKind>,
+    /// Opening a thread, `U`, or `s` changed these rows.
+    pub flags: Option<FlagEdit>,
+    /// Opened an unread thread with a read delay: mark it read once it has
+    /// stayed open that long (see [`Session::read_after_dwell`]). The
+    /// second value is the open it belongs to ([`Session::read_gen`]).
+    pub read_after: Option<(String, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +358,15 @@ pub struct Session {
     purge_ready: Option<Vec<String>>,
     /// The folder on screen has not been read from the store yet.
     pub loading: bool,
+    /// How long a thread stays open before it is marked read. 0 marks it on
+    /// the key press.
+    pub read_dwell_ms: u64,
+    /// Bumped whenever the open thread, the pane, or the folder changes, so
+    /// a read delay started by an earlier open cannot fire for this one.
+    pub read_gen: u64,
+    /// The list rows on screen, set by the view before each key. `None`:
+    /// the list is not showing, or its layout is not known yet.
+    pub rows_in_view: Option<Range<usize>>,
 }
 
 impl Session {
@@ -371,6 +423,9 @@ impl Session {
             confirm_purge: None,
             purge_ready: None,
             loading: false,
+            read_dwell_ms: 0,
+            read_gen: 0,
+            rows_in_view: None,
         }
     }
 
@@ -1184,6 +1239,15 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
+    /// Reread of the same messages in the same order. Folder and header
+    /// changes land along with bodies. The reader's open state stays put.
+    pub fn refresh_same_messages(&mut self, mut messages: Vec<ConvMessage>) {
+        for (new, old) in messages.iter_mut().zip(&self.messages) {
+            new.expanded = old.expanded;
+        }
+        self.messages = messages;
+    }
+
     /// Reread of the thread already open. A reader at the end follows when
     /// a new message arrives there. Returns whether the view should land
     /// on that new message.
@@ -1197,6 +1261,11 @@ impl Session {
         viewport_at_end: bool,
     ) -> bool {
         let at_end = viewport_at_end && self.message_cursor + 1 >= self.messages.len();
+        for new in &mut messages {
+            if let Some(old) = self.messages.iter().find(|old| old.id == new.id) {
+                new.expanded = old.expanded;
+            }
+        }
         if at_end
             && messages
                 .last()
@@ -1205,12 +1274,11 @@ impl Session {
             self.set_messages(messages);
             return true;
         }
-        for new in &mut messages {
-            if let Some(old) = self.messages.iter().find(|old| old.id == new.id) {
-                new.expanded = old.expanded;
-            }
-        }
-        let cursor = self.message_cursor;
+        let cursor = self
+            .messages
+            .get(self.message_cursor)
+            .and_then(|current| messages.iter().position(|message| message.id == current.id))
+            .unwrap_or(self.message_cursor);
         let len = messages.len();
         for set in [&mut self.quotes_open, &mut self.recipients_open] {
             set.retain(|id| messages.iter().any(|message| &message.id == id));
@@ -1266,6 +1334,27 @@ impl Session {
     }
 
     pub fn on_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        self.apply_input(|session| session.handle_key(key, page_rows))
+    }
+
+    fn apply_input(&mut self, apply: impl FnOnce(&mut Self) -> Step) -> Step {
+        let before = (self.pane, self.cursor_id.clone(), self.folder.clone());
+        let mut step = apply(self);
+        if before != (self.pane, self.cursor_id.clone(), self.folder.clone()) {
+            self.cancel_read_delay();
+        }
+        if let Some((_, generation)) = &mut step.read_after {
+            *generation = self.read_gen;
+        }
+        step
+    }
+
+    /// Invalidate the read delay after navigation or an explicit read edit.
+    pub fn cancel_read_delay(&mut self) {
+        self.read_gen = self.read_gen.wrapping_add(1);
+    }
+
+    fn handle_key(&mut self, key: KeyId, page_rows: usize) -> Step {
         if self.overlay != Overlay::None {
             return self.overlay_key(key, page_rows);
         }
@@ -1510,7 +1599,7 @@ impl Session {
     }
 
     pub fn perform(&mut self, action: Action, page_rows: usize) -> Step {
-        self.run(action, page_rows)
+        self.apply_input(|session| session.run(action, page_rows))
     }
 
     fn run(&mut self, action: Action, page_rows: usize) -> Step {
@@ -1538,8 +1627,10 @@ impl Session {
                     step.open_draft = true;
                 } else if self.pane == Pane::List {
                     self.pane = Pane::Conversation;
+                    self.opened(&mut step);
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
+                    step.message_disclosure_changed = true;
                 }
             }
             Action::Back => {
@@ -1605,6 +1696,14 @@ impl Session {
                     ..Step::default()
                 };
             }
+            Action::ToggleUnread => {
+                self.count.clear();
+                return self.toggle_flag(false);
+            }
+            Action::ToggleStar => {
+                self.count.clear();
+                return self.toggle_flag(true);
+            }
             Action::Delete | Action::Spam => {
                 self.count.clear();
                 let targets = self.action_targets();
@@ -1663,6 +1762,7 @@ impl Session {
             }
             Action::Undo => {
                 self.count.clear();
+                self.cancel_read_delay();
                 return Step {
                     undo: true,
                     ..Step::default()
@@ -1695,13 +1795,17 @@ impl Session {
             Action::FullWidth => {
                 self.count.clear();
                 self.full_width = !self.full_width;
-                if self.full_width {
+                if self.full_width && self.pane == Pane::List {
                     self.pane = Pane::Conversation;
+                    self.opened(&mut step);
                 }
             }
             Action::ToggleQuotes => {
                 self.count.clear();
-                self.toggle_open(self.message_cursor);
+                if self.messages.get(self.message_cursor).is_some() {
+                    self.toggle_open(self.message_cursor);
+                    step.message_disclosure_changed = true;
+                }
             }
             Action::Palette => {
                 self.count.clear();
@@ -1756,6 +1860,160 @@ impl Session {
     fn go_role(&mut self, role: FolderRole) -> bool {
         let folder = self.roles.name(role).to_string();
         self.go_folder(&folder)
+    }
+
+    /// The conversation pane just opened on the selected thread: an unread
+    /// one is marked read now, or after the read delay.
+    fn opened(&mut self, step: &mut Step) {
+        let Some(row) = self.cursor_thread() else {
+            return;
+        };
+        if !row.unread || row.draft.is_some() {
+            return;
+        }
+        let id = row.id.clone();
+        if self.read_dwell_ms == 0 {
+            step.flags = self.mark_rows(vec![id], FlagChange::Read);
+        } else {
+            // The open it belongs to is filled in by `on_key`.
+            step.read_after = Some((id, 0));
+        }
+    }
+
+    /// The read delay for `id` ran out. Mark it read if it is still the
+    /// thread open in the conversation pane, from the same open
+    /// (`generation`): leaving and reopening starts a new delay.
+    pub fn read_after_dwell(&mut self, id: &str, generation: u64) -> Option<FlagEdit> {
+        let open = generation == self.read_gen
+            && self.pane == Pane::Conversation
+            && self.cursor_id.as_deref() == Some(id);
+        if !open || !self.cursor_thread().is_some_and(|row| row.unread) {
+            return None;
+        }
+        self.mark_rows(vec![id.to_string()], FlagChange::Read)
+    }
+
+    /// Threads `U` and `s` act on: the visual range or picked rows plus the
+    /// cursor, in list order. Draft rows are not threads.
+    fn flag_targets(&self) -> Vec<String> {
+        let ids = self.highlighted();
+        self.threads
+            .iter()
+            .filter(|row| row.draft.is_none() && ids.contains(&row.id))
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// `U` (`star` false) or `s` on the targets. All already unread (or
+    /// starred) turns it off; otherwise every target gets it.
+    fn toggle_flag(&mut self, star: bool) -> Step {
+        let ids = self.flag_targets();
+        if ids.is_empty() {
+            let text = if self.cursor_draft().is_some() {
+                DRAFT_NOT_THREAD
+            } else {
+                "No conversation"
+            };
+            self.show_toast(text, true);
+            return Step::default();
+        }
+        let rows: Vec<&ThreadRow> = self
+            .threads
+            .iter()
+            .filter(|row| ids.contains(&row.id))
+            .collect();
+        let change = if star {
+            if rows.iter().all(|row| row.starred) {
+                FlagChange::Unstar
+            } else {
+                FlagChange::Star
+            }
+        } else if rows.iter().all(|row| row.unread) {
+            FlagChange::Read
+        } else {
+            FlagChange::Unread
+        };
+        let count = ids.len();
+        // The selection was the operand: it is used up, as in vim.
+        if count > 1 {
+            self.visual = false;
+            self.anchor_id = None;
+            self.picked.clear();
+        }
+        let what = match change {
+            FlagChange::Read => "marked read",
+            FlagChange::Unread => "marked unread",
+            FlagChange::Star => "starred",
+            FlagChange::Unstar => "unstarred",
+        };
+        // Quiet: a single row on screen with the list focused shows the
+        // change itself. Say it only when the reader cannot see it there.
+        let toast = count > 1 || !self.flag_targets_in_view(&ids);
+        let flags = self.mark_rows(ids, change);
+        if !star {
+            self.cancel_read_delay();
+        }
+        if toast {
+            // A selection counts the rows that changed, not the ones that
+            // already had it.
+            let changed = flags.as_ref().map_or(0, |edit| edit.ids.len());
+            let text = if count == 1 {
+                let mut text = what.to_string();
+                text[..1].make_ascii_uppercase();
+                text
+            } else {
+                format!("{changed} {what}")
+            };
+            self.show_toast(text, false);
+        }
+        Step {
+            flags,
+            ..Step::default()
+        }
+    }
+
+    /// The list has focus and every row in `ids` is on screen.
+    fn flag_targets_in_view(&self, ids: &[String]) -> bool {
+        let Some(range) = &self.rows_in_view else {
+            return false;
+        };
+        self.pane == Pane::List
+            && ids.iter().all(|id| {
+                self.threads
+                    .iter()
+                    .position(|row| &row.id == id)
+                    .is_some_and(|index| range.contains(&index))
+            })
+    }
+
+    /// Show `change` on the loaded rows `ids` now, in this frame, and
+    /// return the store write for the view. `None` when no row changes.
+    fn mark_rows(&mut self, ids: Vec<String>, change: FlagChange) -> Option<FlagEdit> {
+        let mut changed = Vec::new();
+        for row in self.threads.iter_mut().filter(|row| ids.contains(&row.id)) {
+            let (unread, starred) = match change {
+                FlagChange::Read => (false, row.starred),
+                FlagChange::Unread => (true, row.starred),
+                FlagChange::Star => (row.unread, true),
+                FlagChange::Unstar => (row.unread, false),
+            };
+            if unread != row.unread {
+                if unread {
+                    self.unread_count += 1;
+                } else {
+                    self.unread_count = self.unread_count.saturating_sub(1);
+                }
+            }
+            if unread != row.unread || starred != row.starred {
+                row.unread = unread;
+                row.starred = starred;
+                changed.push(row.id.clone());
+            }
+        }
+        (!changed.is_empty()).then_some(FlagEdit {
+            ids: changed,
+            change,
+        })
     }
 
     fn go_folder(&mut self, folder: &str) -> bool {
@@ -1900,7 +2158,7 @@ impl Session {
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
                 title: format!("Syncing {}", self.folder_title()),
                 hint: match &self.sync {
-                    SyncKind::Syncing { stored } if *stored > 0 => {
+                    SyncKind::Syncing { stored, .. } if *stored > 0 => {
                         format!("{stored} messages stored · conversations appear as they arrive")
                     }
                     _ => "Conversations appear as they arrive".into(),
@@ -1973,6 +2231,33 @@ mod tests {
     use crate::keymap::keymap_from_text;
     use crate::present::NameSpan;
 
+    #[test]
+    fn a_first_sync_names_its_folder_and_how_far_it_is() {
+        let syncing = SyncKind::Syncing {
+            stored: 12,
+            progress: Some(fell_core::SyncProgress {
+                folder: "Inbox".into(),
+                done: 4_210,
+                total: 31_882,
+            }),
+        };
+        assert_eq!(syncing.status_at(0), "syncing Inbox · 4,210 of 31,882");
+        let catching_up = SyncKind::Syncing {
+            stored: 3,
+            progress: None,
+        };
+        assert_eq!(catching_up.status_at(0), "syncing · 3 new");
+        assert!(!syncing.is_error());
+        for (count, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(grouped(count), text);
+        }
+    }
+
     fn row(id: &str) -> ThreadRow {
         ThreadRow {
             id: id.into(),
@@ -2011,6 +2296,62 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn a_body_filled_in_keeps_the_reader_where_they_are() {
+        let mut session = session();
+        let mut older = empty_message(true);
+        older.body_state = fell_core::BodyState::Pending;
+        let mut newest = empty_message(true);
+        newest.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![older.clone(), newest.clone()]);
+        // The reader went up to the older message, closed the newest and
+        // opened the older one's quotes.
+        session.message_cursor = 0;
+        session.messages[1].expanded = false;
+        session.quotes_open.insert(older.id.clone());
+
+        // Sync fills in the older message's body (not the latest's).
+        let mut read = vec![older.clone(), newest.clone()];
+        read[0].body_state = fell_core::BodyState::Stored;
+        read[0].body = crate::text_render::render_stored_body(Some("it came"), "it came", "");
+        read[1].expanded = true;
+        let changed = crate::present::bodies_filled(&session.messages, &read);
+        assert_eq!(changed, Some(vec![0]), "an in-place fill, of message 0");
+        session.refresh_same_messages(read);
+        assert_eq!(session.message_cursor, 0, "the cursor stays");
+        assert!(
+            !session.messages[1].expanded,
+            "what was closed stays closed"
+        );
+        assert!(session.quotes_open.contains(&older.id));
+        assert_eq!(session.messages[0].body_state, fell_core::BodyState::Stored);
+    }
+
+    #[test]
+    fn a_metadata_reread_updates_a_pending_message_without_landing() {
+        let mut session = session();
+        let mut pending = empty_message(true);
+        pending.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![pending.clone()]);
+        session.toggle_open(0);
+
+        let mut read = pending;
+        read.folders = "Inbox, Archive".into();
+        assert_eq!(
+            crate::present::bodies_filled(&session.messages, std::slice::from_ref(&read)),
+            Some(vec![])
+        );
+        session.refresh_same_messages(vec![read]);
+        assert_eq!(session.messages[0].folders, "Inbox, Archive");
+        assert_eq!(
+            session.messages[0].body_state,
+            fell_core::BodyState::Pending
+        );
+        assert!(session.is_open(0));
+        assert!(!session.refresh_messages(session.messages.clone(), true));
+        assert!(session.is_open(0));
     }
 
     #[test]
@@ -2217,6 +2558,342 @@ mod tests {
         assert!(!step.apply_move);
         assert_eq!(session.folder, folder);
         assert_eq!(session.cursor_id.as_deref(), Some("a"));
+    }
+
+    fn unread_rows(session: &Session) -> Vec<&str> {
+        session
+            .threads
+            .iter()
+            .filter(|row| row.unread)
+            .map(|row| row.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn opening_an_unread_thread_marks_it_read_in_the_same_frame() {
+        let mut session = session();
+        session.threads[0].unread = true;
+        session.threads[1].unread = true;
+        session.unread_count = 2;
+        session.cursor_id = Some("a".into());
+        let step = session.on_key(KeyId::Enter, 10);
+        assert_eq!(session.pane, Pane::Conversation);
+        assert_eq!(
+            step.flags,
+            Some(FlagEdit {
+                ids: vec!["a".into()],
+                change: FlagChange::Read,
+            })
+        );
+        assert_eq!(unread_rows(&session), vec!["b"]);
+        assert_eq!(session.unread_count, 1);
+        assert!(session.toast.is_none(), "reading is not announced");
+        // Enter again expands a message; nothing more to mark.
+        assert_eq!(session.on_key(KeyId::Enter, 10).flags, None);
+        // A read thread opens without a write.
+        session.on_key(KeyId::Escape, 10);
+        session.on_key(KeyId::Char('j'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        let step = session.on_key(KeyId::Char('o'), 10);
+        assert_eq!(step.flags, None);
+    }
+
+    #[test]
+    fn a_read_delay_marks_the_thread_only_if_it_stays_open() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.unread_count = 1;
+        session.cursor_id = Some("a".into());
+        let step = session.on_key(KeyId::Enter, 10);
+        assert_eq!(step.flags, None);
+        let (id, first) = step.read_after.unwrap();
+        assert_eq!(id, "a");
+        assert_eq!(unread_rows(&session), vec!["a"]);
+        // Left before the delay ran out: still unread.
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.read_after_dwell("a", first), None);
+        // Opened again: the first open's delay is stale even though the
+        // same thread is open now, so only the second one marks it read.
+        let (_, second) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(session.read_after_dwell("a", first), None);
+        assert_eq!(unread_rows(&session), vec!["a"]);
+        let edit = session.read_after_dwell("a", second).unwrap();
+        assert_eq!(edit.change, FlagChange::Read);
+        assert!(unread_rows(&session).is_empty());
+        assert_eq!(session.unread_count, 0);
+    }
+
+    #[test]
+    fn a_read_delay_is_cancelled_by_moving_or_changing_folder() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.cursor_id = Some("a".into());
+        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        // The pointer picks another thread and then this one again.
+        session.cancel_read_delay();
+        assert_eq!(session.read_after_dwell("a", generation), None);
+        let (_, generation) = {
+            session.on_key(KeyId::Escape, 10);
+            session.on_key(KeyId::Enter, 10).read_after.unwrap()
+        };
+        session.on_key(KeyId::Char('g'), 10);
+        session.on_key(KeyId::Char('s'), 10);
+        assert_eq!(session.read_after_dwell("a", generation), None);
+    }
+
+    #[test]
+    fn explicit_read_edits_cancel_the_dwell_of_an_open_conversation() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.cursor_id = Some("a".into());
+        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        session.on_key(KeyId::Char('U'), 10);
+        session.on_key(KeyId::Char('U'), 10);
+        assert_eq!(session.read_after_dwell("a", generation), None);
+        assert!(session.threads[0].unread);
+
+        session.on_key(KeyId::Escape, 10);
+        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        assert!(session.on_key(KeyId::Char('u'), 10).undo);
+        assert_eq!(session.read_after_dwell("a", generation), None);
+    }
+
+    #[test]
+    fn opening_from_the_palette_stamps_the_read_delay() {
+        let mut session = session();
+        session.read_dwell_ms = 800;
+        session.threads[0].unread = true;
+        session.cursor_id = Some("a".into());
+        session.cancel_read_delay();
+        let (id, generation) = session.perform(Action::Open, 10).read_after.unwrap();
+        assert_ne!(generation, 0);
+        assert_eq!(
+            session.read_after_dwell(&id, generation).unwrap().change,
+            FlagChange::Read
+        );
+    }
+
+    #[test]
+    fn a_single_row_on_screen_changes_without_a_toast() {
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        session.rows_in_view = Some(0..5);
+        session.on_key(KeyId::Char('U'), 10);
+        assert!(session.threads[1].unread);
+        assert!(session.toast.is_none(), "the row shows it");
+        session.on_key(KeyId::Char('s'), 10);
+        assert!(session.toast.is_none());
+        // Off screen: the row cannot show it, so the toast does.
+        session.rows_in_view = Some(2..5);
+        session.on_key(KeyId::Char('s'), 10);
+        assert_eq!(session.toast.as_ref().unwrap().text, "Unstarred");
+        // From the conversation pane the toast says it too.
+        session.rows_in_view = Some(0..5);
+        session.on_key(KeyId::Enter, 10);
+        session.clear_toast();
+        session.on_key(KeyId::Char('U'), 10);
+        assert_eq!(session.toast.as_ref().unwrap().text, "Marked unread");
+        // A selection says how many, even on screen.
+        session.on_key(KeyId::Escape, 10);
+        session.clear_toast();
+        session.on_key(KeyId::Char('V'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        session.on_key(KeyId::Char('s'), 10);
+        assert_eq!(session.toast.as_ref().unwrap().text, "2 starred");
+    }
+
+    #[test]
+    fn a_range_toast_counts_only_the_rows_that_changed() {
+        let mut session = session();
+        session.threads[1].unread = true;
+        session.threads[2].unread = true;
+        session.unread_count = 2;
+        session.rows_in_view = Some(0..5);
+        session.cursor_id = Some("a".into());
+        session.on_key(KeyId::Char('V'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        let edit = session.on_key(KeyId::Char('U'), 10).flags.unwrap();
+        assert_eq!(edit.ids, vec!["a"]);
+        assert_eq!(session.toast.as_ref().unwrap().text, "1 marked unread");
+    }
+
+    #[test]
+    fn shift_u_toggles_unread_and_s_toggles_the_star() {
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        let step = session.on_key(KeyId::Char('U'), 10);
+        assert_eq!(
+            step.flags,
+            Some(FlagEdit {
+                ids: vec!["b".into()],
+                change: FlagChange::Unread,
+            })
+        );
+        assert_eq!(unread_rows(&session), vec!["b"]);
+        assert_eq!(session.unread_count, 1);
+        assert_eq!(session.toast.as_ref().unwrap().text, "Marked unread");
+        let step = session.on_key(KeyId::Char('U'), 10);
+        assert_eq!(step.flags.unwrap().change, FlagChange::Read);
+        assert!(unread_rows(&session).is_empty());
+
+        let step = session.on_key(KeyId::Char('s'), 10);
+        assert_eq!(step.flags.unwrap().change, FlagChange::Star);
+        assert!(session.threads[1].starred);
+        assert_eq!(session.toast.as_ref().unwrap().text, "Starred");
+        let step = session.on_key(KeyId::Char('s'), 10);
+        assert_eq!(step.flags.unwrap().change, FlagChange::Unstar);
+        assert!(!session.threads[1].starred);
+        // Both are in the palette with their keys.
+        let palette = session.palette();
+        for (label, key) in [("Mark unread or read", "U"), ("Star or unstar", "s")] {
+            let item = palette.iter().find(|item| item.label == label).unwrap();
+            assert_eq!(item.binding, key);
+        }
+    }
+
+    #[test]
+    fn visual_range_shift_u_marks_five_threads_unread() {
+        let mut session = session();
+        session.threads[2].unread = true;
+        session.unread_count = 1;
+        session.cursor_id = Some("a".into());
+        session.on_key(KeyId::Char('V'), 10);
+        for _ in 0..4 {
+            session.on_key(KeyId::Char('j'), 10);
+        }
+        let step = session.on_key(KeyId::Char('U'), 10);
+        let edit = step.flags.unwrap();
+        assert_eq!(edit.change, FlagChange::Unread, "mixed rows all go unread");
+        assert_eq!(edit.ids, vec!["a", "b", "d", "e"], "c already was");
+        assert_eq!(unread_rows(&session).len(), 5);
+        assert_eq!(session.unread_count, 5);
+        assert_eq!(
+            session.toast.as_ref().unwrap().text,
+            "4 marked unread",
+            "c already was"
+        );
+        assert!(!session.visual, "the range was the operand");
+        // x picks work the same way, and a draft row is never a target.
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        let mut rows = vec![draft];
+        rows.extend(session.threads.clone());
+        session.set_threads(rows);
+        session.picked.insert("draft-1".into());
+        session.picked.insert("a".into());
+        session.cursor_id = Some("e".into());
+        let edit = session.on_key(KeyId::Char('s'), 10).flags.unwrap();
+        assert_eq!(edit.ids, vec!["a", "e"]);
+        assert!(session.picked.is_empty());
+    }
+
+    #[test]
+    fn flag_keys_on_a_draft_row_say_why_nothing_happened() {
+        let mut session = session();
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft]);
+        session.cursor_id = Some("draft-1".into());
+        assert_eq!(session.on_key(KeyId::Char('U'), 10).flags, None);
+        assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
+    }
+
+    /// The edits the model makes, written to a real store and undone there,
+    /// come back to the rows the list rereads.
+    #[test]
+    fn open_shift_u_and_s_round_trip_through_the_store_and_undo() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let reread = |session: &mut Session| {
+            let page = store
+                .folder_page(&account.id, "INBOX", &FolderSpan::Top { rows: 100 })
+                .unwrap();
+            let rows = crate::present::thread_rows(&page.threads, &account.email);
+            session.set_page(rows, page.more_before, page.more_after, page.unread);
+        };
+        let write = |edit: FlagEdit| {
+            let threads: Vec<ThreadId> = edit.ids.into_iter().map(ThreadId).collect();
+            store
+                .flag_threads(&account.id, &threads, "INBOX", edit.change)
+                .unwrap()
+                .unwrap();
+        };
+        let mut session = Session::new(
+            "Me",
+            &account.email,
+            SyncKind::FixtureOffline,
+            Keymap::default(),
+        );
+        reread(&mut session);
+        let unread = session
+            .threads
+            .iter()
+            .find(|row| row.unread)
+            .unwrap()
+            .id
+            .clone();
+        let before = session.unread_count;
+        session.cursor_id = Some(unread.clone());
+
+        // Open: read, on screen and in the store; undo: unread again.
+        write(session.on_key(KeyId::Enter, 10).flags.unwrap());
+        reread(&mut session);
+        assert!(!session.cursor_thread().unwrap().unread);
+        assert_eq!(session.unread_count, before - 1);
+        store.undo(&account.id).unwrap();
+        reread(&mut session);
+        assert!(session.cursor_thread().unwrap().unread);
+        assert_eq!(session.unread_count, before);
+
+        // U on a read thread, then undo.
+        session.on_key(KeyId::Escape, 10);
+        let read = session
+            .threads
+            .iter()
+            .find(|row| !row.unread)
+            .unwrap()
+            .id
+            .clone();
+        session.cursor_id = Some(read);
+        write(session.on_key(KeyId::Char('U'), 10).flags.unwrap());
+        reread(&mut session);
+        assert!(session.cursor_thread().unwrap().unread);
+        store.undo(&account.id).unwrap();
+        reread(&mut session);
+        assert!(!session.cursor_thread().unwrap().unread);
+
+        // s, then undo.
+        let was = session.cursor_thread().unwrap().starred;
+        write(session.on_key(KeyId::Char('s'), 10).flags.unwrap());
+        reread(&mut session);
+        assert_eq!(session.cursor_thread().unwrap().starred, !was);
+        store.undo(&account.id).unwrap();
+        reread(&mut session);
+        assert_eq!(session.cursor_thread().unwrap().starred, was);
+    }
+
+    #[test]
+    fn mail_that_arrives_after_reading_keeps_the_open_messages_open() {
+        let mut session = session();
+        let first = empty_message(true);
+        let second = empty_message(true);
+        session.set_messages(vec![first.clone(), second.clone()]);
+        // Reread after the thread was marked read: the store now says both
+        // are read, so they would come back closed, plus a new message.
+        let mut reread_first = first.clone();
+        reread_first.expanded = false;
+        let mut reread_second = second.clone();
+        reread_second.expanded = false;
+        let newcomer = empty_message(true);
+        assert!(session.refresh_messages(vec![reread_first, reread_second, newcomer], true));
+        assert!(session.messages.iter().all(|message| message.expanded));
+        assert_eq!(session.message_cursor, 2);
     }
 
     #[test]
@@ -3412,6 +4089,7 @@ mod tests {
             expanded,
             recipients: None,
             context: None,
+            body_state: fell_core::BodyState::Stored,
         }
     }
 }

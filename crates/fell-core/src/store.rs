@@ -24,6 +24,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
 mod copies;
+pub(crate) mod intents;
 mod roles;
 pub(crate) mod sent_bcc;
 mod summaries;
@@ -31,6 +32,7 @@ mod threads;
 mod write_lock;
 
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
+pub use intents::PendingFlags;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -479,6 +481,7 @@ impl Store {
         summaries::ensure_thread_summaries(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         conn.execute_batch(roles::ROLES_TABLE)?;
+        conn.execute_batch(intents::INTENT_SCHEMA)?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -609,6 +612,12 @@ impl Store {
         sync_cursor_on(&self.conn, account_id)
     }
 
+    /// Read and star changes made in Fell that sync has not seen the server
+    /// agree with yet. Sync keeps these values over the server's.
+    pub fn pending_flag_changes(&self, account_id: &AccountId) -> Result<Vec<PendingFlags>> {
+        intents::pending(&self.conn, account_id)
+    }
+
     /// Write one sync delta.
     ///
     /// The end of a mailbox can carry a flag for every copy and, on its first
@@ -645,12 +654,13 @@ impl Store {
             insert_message(&tx, &message)?;
         }
         let inserted = !delta.messages.is_empty();
-        // Every flag in one transaction. Committing among them would let a
-        // read or unread change land between two of them and then be
-        // overwritten with what the server said before the pass, and the
-        // stored modseq means the server would not send that flag again.
-        // Once local flag intents (#161) keep the user's state apart from
-        // the server's, the flags could be committed in slices.
+        for message_id in &delta.too_large {
+            if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
+                bodies::mark_withheld(&tx, account_id, &canonical)?;
+            }
+        }
+        // Apply every flag in one transaction. Local flag intents keep the
+        // user's read state separate from updates reported by the server.
         for flag in &delta.flags {
             #[cfg(test)]
             self.stop_among_flags()?;
@@ -685,6 +695,19 @@ impl Store {
         tx.commit()?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
+    /// returns them) has its body yet, in the same order.
+    pub fn body_states(
+        &self,
+        account_id: &AccountId,
+        messages: &[MessageId],
+    ) -> Result<Vec<crate::BodyState>> {
+        messages
+            .iter()
+            .map(|id| bodies::state(&self.conn, account_id, id.as_str()))
+            .collect()
     }
 
     /// UIDs from `low` to `high` with a stored copy in one mailbox (named as
@@ -2290,6 +2313,18 @@ fn write_kept(
         stored.reply_to_line.clone()
     };
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
+    // Read and star changes made in Fell stay until the server agrees.
+    let unread = intents::server_unread(
+        conn,
+        &message.account_id,
+        &stored.canonical_id,
+        &message.remote_id.0,
+        message.unread,
+    )?;
+    // Sync does not read `\Flagged` yet (#102): a pending local star wins,
+    // otherwise copies merge as before.
+    let starred = intents::local_star(conn, &message.account_id, &stored.canonical_id)?
+        .unwrap_or(stored.starred || message.starred);
     let from_email = if alias {
         prefer_nonempty(&stored.from_email, &message.headers.from.email)
     } else {
@@ -2387,14 +2422,14 @@ fn write_kept(
             date_unix,
             snippet,
             body_text,
-            i64::from(message.unread),
+            i64::from(unread),
             folders,
             labels,
             arrived_via,
             to_line,
             cc_line,
             bcc_line,
-            i64::from(stored.starred || message.starred),
+            i64::from(starred),
             i64::from(has_attachment),
             i64::from(stored.archived || message.archived),
             kept_snooze(stored.snooze_until, message.snooze_until),
@@ -3096,11 +3131,16 @@ fn apply_flag(
          WHERE account_id = ?2 AND message_id = ?3 AND unread != ?1",
     )?;
     for message_id in targets {
-        update.execute(params![
-            i64::from(flag.unread),
-            account_id.as_str(),
-            message_id
-        ])?;
+        // Whichever way the row was found, a read or unread set in Fell
+        // stays until every server copy of it agrees.
+        let unread = intents::server_unread(
+            conn,
+            account_id,
+            &message_id,
+            &flag.remote_id.0,
+            flag.unread,
+        )?;
+        update.execute(params![i64::from(unread), account_id.as_str(), message_id])?;
     }
     Ok(())
 }

@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     bulk_headers TEXT NOT NULL DEFAULT '',
     -- 1 once message_parts holds this message's part list (maybe none).
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    -- 1 when sync kept no body: the message is larger than it downloads.
+    withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, message_id)
 );
 
@@ -125,6 +127,11 @@ pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
         )?;
     }
+    if !has_column(conn, "message_bodies", "withheld")? {
+        conn.execute_batch(
+            "ALTER TABLE message_bodies ADD COLUMN withheld INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(())
 }
 
@@ -151,7 +158,7 @@ pub(super) fn queue_unlisted_mail(conn: &Connection) -> Result<()> {
            AND NOT EXISTS (
              SELECT 1 FROM message_bodies b
              WHERE b.account_id = m.account_id AND b.message_id = m.message_id
-               AND b.parts_listed = 1
+               AND (b.parts_listed = 1 OR b.withheld = 1)
          )",
         [],
     )?;
@@ -265,7 +272,8 @@ impl StoredParts {
                 codec = excluded.codec,
                 html = excluded.html,
                 plain = excluded.plain,
-                bulk_headers = excluded.bulk_headers"
+                bulk_headers = excluded.bulk_headers,
+                withheld = 0"
         } else {
             "ON CONFLICT(action_id, message_id) DO NOTHING"
         };
@@ -506,7 +514,8 @@ pub(super) fn write(
                 codec = excluded.codec,
                 html = excluded.html,
                 plain = excluded.plain,
-                bulk_headers = excluded.bulk_headers"
+                bulk_headers = excluded.bulk_headers,
+                withheld = 0"
         }
         // Nothing to replace with: only record a row when there is none.
         Write::Replace => {
@@ -547,12 +556,76 @@ const FILL_GAP_SQL: &str = "INSERT INTO message_bodies
         html = COALESCE(message_bodies.html, excluded.html),
         plain = COALESCE(message_bodies.plain, excluded.plain),
         bulk_headers = CASE WHEN message_bodies.bulk_headers = ''
-            THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END
+            THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END,
+        withheld = CASE WHEN excluded.html IS NOT NULL OR excluded.plain IS NOT NULL
+            THEN 0 ELSE message_bodies.withheld END
      WHERE message_bodies.codec = excluded.codec";
 
+/// Record that sync kept no body for `message_id` because it is larger than
+/// sync downloads, so later passes count the copy as read and the reader
+/// can say why there is no body. A body stored already is kept.
+pub(super) fn mark_withheld(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO message_bodies (account_id, message_id, codec, withheld)
+         VALUES (?1, ?2, ?3, 1)
+         ON CONFLICT(account_id, message_id) DO UPDATE SET withheld = 1
+         WHERE message_bodies.html IS NULL AND message_bodies.plain IS NULL",
+        params![account_id.as_str(), message_id, CODEC_DEFLATE],
+    )?;
+    conn.execute(
+        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    Ok(())
+}
+
+/// Whether a stored message has its body: see [`crate::BodyState`]. A row
+/// with no body text, no snippet and no `message_bodies` row is one a
+/// first sync listed from its headers; mail with no server copy (a local
+/// write) is never pending.
+pub(super) fn state(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<crate::BodyState> {
+    let row = conn
+        .prepare_cached(
+            "SELECT m.body_text IS NULL AND m.snippet = '',
+                    b.message_id IS NOT NULL,
+                    IFNULL(b.withheld, 0),
+                    EXISTS (
+                        SELECT 1 FROM message_copies c
+                        WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+                    )
+             FROM messages m
+             LEFT JOIN message_bodies b
+               ON b.account_id = m.account_id AND b.message_id = m.message_id
+             WHERE m.account_id = ?1 AND m.message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| {
+            Ok((
+                row.get::<_, bool>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .optional()?;
+    Ok(match row {
+        Some((true, _, 1, _)) => crate::BodyState::TooLarge,
+        Some((true, false, _, true)) => crate::BodyState::Pending,
+        _ => crate::BodyState::Stored,
+    })
+}
+
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
-/// parts it lacks from `from`, as stored. `to` leaves the backfill queue
-/// when it gains a body. Returns the part list when `to` took `from`'s.
+/// parts it lacks and carry over any size-limit marker. The kept row leaves
+/// the backfill queue when it gains a body or a size-limit marker. Returns
+/// the part list when `to` took `from`'s.
 pub(super) fn move_into(
     conn: &Connection,
     account_id: &AccountId,
@@ -560,15 +633,19 @@ pub(super) fn move_into(
     to: &str,
 ) -> Result<Option<Vec<MimePart>>> {
     let moved = conn.execute(
-        "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
-         SELECT account_id, ?3, codec, html, plain, bulk_headers FROM message_bodies
+        "INSERT INTO message_bodies
+            (account_id, message_id, codec, html, plain, bulk_headers, withheld)
+         SELECT account_id, ?3, codec, html, plain, bulk_headers, withheld FROM message_bodies
          WHERE account_id = ?1 AND message_id = ?2
-           AND (html IS NOT NULL OR plain IS NOT NULL)
+           AND (html IS NOT NULL OR plain IS NOT NULL OR withheld = 1)
          ON CONFLICT(account_id, message_id) DO UPDATE SET
             html = COALESCE(message_bodies.html, excluded.html),
             plain = COALESCE(message_bodies.plain, excluded.plain),
             bulk_headers = CASE WHEN message_bodies.bulk_headers = ''
-                THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END
+                THEN excluded.bulk_headers ELSE message_bodies.bulk_headers END,
+            withheld = CASE WHEN COALESCE(message_bodies.html, excluded.html) IS NULL
+                              AND COALESCE(message_bodies.plain, excluded.plain) IS NULL
+                THEN MAX(message_bodies.withheld, excluded.withheld) ELSE 0 END
          WHERE message_bodies.codec = excluded.codec",
         params![account_id.as_str(), from, to],
     )?;
@@ -1225,6 +1302,35 @@ mod tests {
         assert!(store.missing_bodies(&account().id, 10).unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_merge_carries_the_size_limit_marker_until_a_body_is_available() {
+        let headers = |id, uid| {
+            let mut message = newsletter(id, "INBOX", uid, "");
+            message.body_text = None;
+            message.snippet.clear();
+            message.parts = None;
+            message
+        };
+        let mut full = newsletter("full@x", "INBOX", 3, "<p>Full body</p>");
+        // Model the body store separately from the message's text fallback.
+        full.body_text = None;
+        full.snippet.clear();
+        let store = store_with(vec![headers("old@x", 1), headers("kept@x", 2), full]);
+        let account = account().id;
+        let state = |id| state(&store.conn, &account, id).unwrap();
+        assert_eq!(state("kept@x"), crate::BodyState::Pending);
+        mark_withheld(&store.conn, &account, "old@x").unwrap();
+
+        move_into(&store.conn, &account, "old@x", "kept@x").unwrap();
+        assert_eq!(state("kept@x"), crate::BodyState::TooLarge);
+
+        move_into(&store.conn, &account, "old@x", "full@x").unwrap();
+        assert_eq!(state("full@x"), crate::BodyState::Stored);
+        move_into(&store.conn, &account, "full@x", "kept@x").unwrap();
+        assert_eq!(state("kept@x"), crate::BodyState::Stored);
+        assert_eq!(body(&store, "kept@x"), body(&store, "full@x"));
     }
 
     #[test]

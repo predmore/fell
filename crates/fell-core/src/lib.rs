@@ -26,16 +26,20 @@ pub mod sync;
 pub mod test_support;
 pub mod threading;
 
+/// The largest message source sync downloads. A larger message keeps its
+/// headers and is marked [`BodyState::TooLarge`].
+pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
-pub use actions::{ActionKind, LabelChange, LocalAction};
+pub use actions::{ActionKind, FlagChange, LabelChange, LocalAction};
 pub use agent::{
     AgentGrant, AgentSummary, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft,
 };
 pub use backend::{
     BridgeBackend, FetchedBody, FixtureBackend, FolderRemoval, ImapBackend, KnownCopies,
-    MailBackend, MailboxDelta, ProtonApiBackend, RemovalKind, Settle, SyncCursor, backend_for,
-    is_demo_account,
+    MailBackend, MailboxDelta, ProtonApiBackend, RemovalKind, Settle, SyncCursor, SyncProgress,
+    backend_for, is_demo_account,
 };
 pub use embed::{
     BodyEmbedder, EMBEDDING_DIMS, EMBEDDING_MODEL, EMBEDDING_VERSION, EmbedderId, Embedding,
@@ -44,8 +48,8 @@ pub use embed::{
 pub use folders::{FolderRole, FolderRoles, RoleFolder, RoleSource};
 pub use imap::{ImapConfig, ImapSecurity, InboxWait};
 pub use message::{
-    Address, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart, PartRole,
-    RemoteId, TransferEncoding,
+    Address, BodyState, Disposition, Message, MessageHeaders, MessageId, MessageParts, MimePart,
+    PartRole, RemoteId, TransferEncoding,
 };
 pub use outbox::{DropReason, DroppedMove, OutboxEntry, OutboxKind, OutboxState, ReplayReport};
 pub use parts::{CachedPart, PartCache, PartEvent, PartFetcher, PartJob, PartRequest};
@@ -55,6 +59,7 @@ pub use send::{
     message_digest,
 };
 pub use smtp::SmtpConfig;
+pub use store::PendingFlags;
 pub use store::{
     FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, PartStamp,
     Participant, SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,

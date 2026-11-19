@@ -11,7 +11,7 @@ use super::test_server::{
     BodyForm, FixtureMailbox, FixtureMessage, TestServer, TestState, raw_message,
 };
 
-fn account(id: &str, kind: BackendKind) -> Account {
+pub(super) fn account(id: &str, kind: BackendKind) -> Account {
     Account {
         id: AccountId(id.into()),
         display_name: "Caleb".into(),
@@ -20,7 +20,7 @@ fn account(id: &str, kind: BackendKind) -> Account {
     }
 }
 
-fn config(port: u16) -> ImapConfig {
+pub(super) fn config(port: u16) -> ImapConfig {
     ImapConfig {
         host: "127.0.0.1".into(),
         port,
@@ -32,7 +32,7 @@ fn config(port: u16) -> ImapConfig {
     }
 }
 
-fn sample_state() -> TestState {
+pub(super) fn sample_state() -> TestState {
     TestState {
         username: "caleb".into(),
         password: "secret".into(),
@@ -179,7 +179,7 @@ fn sample_state() -> TestState {
     }
 }
 
-fn commands(server: &TestServer) -> Vec<String> {
+pub(super) fn commands(server: &TestServer) -> Vec<String> {
     server.state.lock().expect("state").commands.clone()
 }
 
@@ -424,7 +424,7 @@ fn condstore_updates_unread_without_a_second_copy() {
 }
 
 /// Commands that download a message body (`BODY.PEEK[]`, not headers).
-fn body_fetches(server: &TestServer) -> Vec<String> {
+pub(super) fn body_fetches(server: &TestServer) -> Vec<String> {
     commands(server)
         .into_iter()
         .filter(|line| line.contains("BODY.PEEK[]"))
@@ -1732,19 +1732,33 @@ fn fetch_batches_survive_a_dropped_connection() {
     };
     let store = Store::open_in_memory().unwrap();
     assert!(sync_once(&acct, &backend, &store).is_err());
-    let subjects: Vec<_> = store
-        .list_threads(&acct.id)
-        .unwrap()
+    // Every row showed from its headers; the bodies that arrived before the
+    // drop were each stored as they came.
+    let snippets: Vec<(String, String)> = ["one@x", "two@x", "three@x"]
         .into_iter()
-        .map(|thread| thread.subject)
+        .map(|id| {
+            let message = stored(&store, &acct, id).unwrap_or_else(|| panic!("{id} row"));
+            (message.headers.subject, message.snippet)
+        })
         .collect();
-    assert!(subjects.contains(&"One".into()), "{subjects:?}");
-    assert!(subjects.contains(&"Two".into()), "{subjects:?}");
-    assert!(!subjects.contains(&"Three".into()), "{subjects:?}");
-    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
-    assert!(
-        cursor.contains("INBOX\t4\t2\t"),
-        "the cursor advances through the persisted prefix: {cursor}"
+    assert_eq!(
+        snippets,
+        vec![
+            ("One".to_string(), "one".to_string()),
+            ("Two".to_string(), "two".to_string()),
+            ("Three".to_string(), String::new()),
+        ]
+    );
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let inbox = super::decode_cursor(cursor.as_ref())
+        .into_iter()
+        .find(|(name, _)| name == "INBOX")
+        .expect("INBOX has a checkpoint")
+        .1;
+    assert_eq!(
+        (inbox.uid, inbox.floor),
+        (3, Some(4)),
+        "the window did not finish, so the floor stays above it"
     );
     {
         let mut state = server.state.lock().expect("state");
@@ -1753,10 +1767,10 @@ fn fetch_batches_survive_a_dropped_connection() {
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
     assert_eq!(report.upserted, 1);
-    let logged = commands(&server);
+    let bodies = body_fetches(&server);
     assert!(
-        logged.iter().any(|line| line.contains("3:*")),
-        "the third message is fetched without repeating the stored prefix: {logged:?}"
+        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        "only the body that never arrived is fetched again: {bodies:?}"
     );
     assert!(
         store
@@ -1846,25 +1860,30 @@ fn untagged_flood_does_not_block_the_rest_of_the_account() {
     let store = Store::open_in_memory().unwrap();
     sync_once(&acct, &backend, &store).unwrap();
     let threads = store.list_threads(&acct.id).unwrap();
-    assert!(threads.iter().any(|thread| thread.subject == "Sent 4"));
-    assert!(!threads.iter().any(|thread| thread.subject == "Sent 5"));
     assert!(threads.iter().any(|thread| thread.subject == "Inbox kept"));
-    let cursor = store.sync_cursor(&acct.id).unwrap().unwrap().token;
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let sent = super::decode_cursor(cursor.as_ref())
+        .into_iter()
+        .find(|(name, _)| name == "Sent");
     assert!(
-        cursor.contains("Sent\t8\t4\t"),
-        "discarded replies stay below the checkpoint: {cursor}"
+        sent.as_ref()
+            .is_none_or(|(_, checkpoint)| checkpoint.floor == Some(7)),
+        "a window cut short is read again, so nothing below UIDNEXT counts as read: {sent:?}"
     );
     drop(_limit);
     sync_once(&acct, &backend, &store).unwrap();
     let threads = store.list_threads(&acct.id).unwrap();
-    assert!(threads.iter().any(|thread| thread.subject == "Sent 6"));
-    assert_eq!(
-        threads
-            .iter()
-            .filter(|thread| thread.subject == "Sent 1")
-            .count(),
-        1
-    );
+    for uid in 1..=6 {
+        let subject = format!("Sent {uid}");
+        assert_eq!(
+            threads
+                .iter()
+                .filter(|thread| thread.subject == subject)
+                .count(),
+            1,
+            "{subject}"
+        );
+    }
 }
 
 #[test]
@@ -2453,7 +2472,7 @@ fn a_server_that_ends_idle_with_bad_returns_promptly() {
 }
 
 /// The stored row for `message_id`, if any.
-fn stored(store: &Store, acct: &Account, message_id: &str) -> Option<crate::Message> {
+pub(super) fn stored(store: &Store, acct: &Account, message_id: &str) -> Option<crate::Message> {
     store
         .list_threads(&acct.id)
         .unwrap()
@@ -2492,7 +2511,7 @@ fn expunge(server: &TestServer, name: &str, uid: u32) -> FixtureMessage {
     mailbox.messages.remove(index)
 }
 
-fn empty_mailbox(name: &str, uidvalidity: u32) -> FixtureMailbox {
+pub(super) fn empty_mailbox(name: &str, uidvalidity: u32) -> FixtureMailbox {
     FixtureMailbox {
         name: name.into(),
         list_flags: String::new(),

@@ -1035,6 +1035,67 @@ mod tests {
     }
 
     #[test]
+    fn read_thread_tells_a_body_not_downloaded_from_an_empty_one() {
+        let (mut session, thread) = session_with(AgentGrant::enabled(true, false, false), "bot");
+        // Rows a first sync listed from their headers: one still waiting
+        // for its body, one whose body is too large to keep.
+        let header_row = |id: &str, uid: u32| {
+            let mut row = message("a1", id, "Re: Invoice March", "", "");
+            row.headers.in_reply_to = Some(MessageId::new("root@x"));
+            row.headers.references = vec![MessageId::new("root@x")];
+            row.headers.date_unix = 30 + i64::from(uid);
+            row.thread_id = thread.clone();
+            row.remote_id = RemoteId(format!("imap:3:{uid}:INBOX"));
+            row.body_text = None;
+            row
+        };
+        session
+            .store
+            .upsert_message(&header_row("waiting@x", 1))
+            .unwrap();
+        session
+            .store
+            .upsert_message(&header_row("huge@x", 2))
+            .unwrap();
+        session
+            .store
+            .apply_delta(
+                &session.account_id,
+                &fell_core::MailboxDelta {
+                    too_large: vec![MessageId::new("huge@x")],
+                    ..fell_core::MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        init(&mut session);
+        let read = tool_json(&call(
+            &mut session,
+            "read_thread",
+            json!({ "thread_id": thread.as_str() }),
+        ));
+        let messages = read["messages"].as_array().unwrap();
+        let by_id = |id: &str| {
+            messages
+                .iter()
+                .find(|message| message["message_id"] == id)
+                .unwrap_or_else(|| panic!("{id} in {read}"))
+                .clone()
+        };
+        let root = by_id("root@x");
+        assert_eq!(root["body_pending"], false);
+        assert_eq!(root["body_too_large"], false);
+        assert!(root["body"]["untrusted_email_content"]["text"].is_string());
+        let waiting = by_id("waiting@x");
+        assert_eq!(waiting["body_pending"], true);
+        assert_eq!(waiting["body_too_large"], false);
+        assert!(waiting["body"].is_null());
+        let huge = by_id("huge@x");
+        assert_eq!(huge["body_pending"], false);
+        assert_eq!(huge["body_too_large"], true);
+        assert!(huge["body"].is_null());
+    }
+
+    #[test]
     fn read_thread_truncates_bodies_and_draft_lists_hide_other_bcc() {
         let (mut session, thread) = session_with(AgentGrant::enabled(true, false, true), "bot");
         let long = "y".repeat(50);

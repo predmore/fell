@@ -173,7 +173,8 @@ fn map_palette(
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
         border: mix(background, foreground, 0.16),
-        star: ensure_all(star_raw, &[background, surface], TEXT_CONTRAST),
+        // The star shows on the selected row too, so it meets AA there.
+        star: ensure_all(star_raw, &[background, surface, selection], TEXT_CONTRAST),
         ui_family: fonts.ui_family.clone(),
         ui_px: fonts.ui_px,
         mono_family: fonts.mono_family.clone(),
@@ -235,6 +236,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         }
     }
     contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.star, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.error, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.foreground, theme.background)
@@ -788,7 +790,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("palette {name}"));
             assert!(
                 contrast_ok(&theme),
-                "{name} fg {:06x}/{:.2} dim {:06x}/{:.2}/{:.2} accent {:06x}/{:.2} sel {:06x}/{:.2} on {:06x}/{:.2} err {:06x}/{:.2}/sel {:.2} star {:06x}/{:.2} bg {:06x} surface {:06x}",
+                "{name} fg {:06x}/{:.2} dim {:06x}/{:.2}/{:.2} accent {:06x}/{:.2} sel {:06x}/{:.2} on {:06x}/{:.2} err {:06x}/{:.2}/sel {:.2} star {:06x}/{:.2}/sel {:.2} bg {:06x} surface {:06x}",
                 theme.foreground,
                 contrast(theme.foreground, theme.background),
                 theme.dimmed,
@@ -805,6 +807,7 @@ mod tests {
                 contrast(theme.error, theme.selection),
                 theme.star,
                 contrast(theme.star, theme.background),
+                contrast(theme.star, theme.selection),
                 theme.background,
                 theme.surface,
             );
@@ -834,6 +837,14 @@ mod tests {
         );
         assert!(contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST);
         assert!(contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST);
+        // The star on the selected row (was #945e13 on #ccd0da, 3.5:1).
+        assert!(
+            contrast(theme.star, theme.selection) >= TEXT_CONTRAST,
+            "star {:06x} on selection {:06x}: {:.2}",
+            theme.star,
+            theme.selection,
+            contrast(theme.star, theme.selection)
+        );
         assert!(luminance(theme.dimmed) > luminance(theme.foreground));
         assert!(luminance(theme.on_selection_dim) > luminance(theme.on_selection));
     }
