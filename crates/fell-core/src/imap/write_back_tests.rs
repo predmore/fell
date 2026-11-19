@@ -149,6 +149,22 @@ impl Fixture {
         replay_outbox(&self.backend.config, &self.account.id, &self.store).unwrap()
     }
 
+    /// Replay as the sync thread does, through the account file: what the
+    /// status line is given.
+    fn replay_as_window(&self) -> crate::outbox::ReplayReport {
+        let mut config = crate::AccountConfig::bridge(
+            "c@x",
+            "caleb",
+            crate::PasswordSource::Inline("secret".into()),
+        );
+        config.id = self.account.id.as_str().into();
+        config.backend = BackendKind::Imap;
+        config.port = self.server.addr.port();
+        config.security = ImapSecurity::Plain;
+        config.write_back = true;
+        config.replay_outbox(&self.store).unwrap()
+    }
+
     fn sync(&self) {
         sync_once(&self.account, &self.backend, &self.store).unwrap();
     }
@@ -775,7 +791,7 @@ fn a_server_without_move_keeps_the_change_local_and_says_so_once() {
         .archive_thread(&fx.account.id, &alpha, "INBOX")
         .unwrap();
     fx.clear_commands();
-    let report = fx.replay();
+    let report = fx.replay_as_window();
     assert_eq!(report.dropped.len(), 1);
     assert_eq!(report.dropped[0].reason, DropReason::NoMove);
     assert!(fx.writes().is_empty(), "{:?}", fx.writes());
@@ -785,7 +801,7 @@ fn a_server_without_move_keeps_the_change_local_and_says_so_once() {
     fx.store
         .archive_thread(&fx.account.id, &bravo, "INBOX")
         .unwrap();
-    let report = fx.replay();
+    let report = fx.replay_as_window();
     assert!(report.dropped.is_empty(), "{report:?}");
     assert_eq!(report.sent, 0);
     assert!(fx.writes().is_empty(), "{:?}", fx.writes());
@@ -1043,4 +1059,191 @@ fn a_move_with_no_message_id_and_no_copyuid_is_never_done() {
     assert_eq!(row.state, OutboxState::Dropped);
     // Never recorded as moved, so the copy Fell knows of is still there.
     assert!(fx.copy_recorded("INBOX", 2));
+}
+
+#[test]
+fn an_undo_while_a_sent_move_is_unsettled_still_moves_it_back() {
+    let fx = Fixture::new();
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .archive_thread(&fx.account.id, &bravo, "INBOX")
+        .unwrap();
+    // The server moves Bravo, and the reply is lost: the row stays pending
+    // and sent, with its new UID not known yet.
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
+    assert!(fx.replay().interrupted.is_some());
+    assert_eq!(fx.on_server("Archive"), vec![(1, "Bravo".to_string())]);
+    let row = &fx.store.outbox(&fx.account.id).unwrap()[0];
+    assert_eq!((row.state, row.sent), (OutboxState::Pending, true));
+
+    // Undo before the next try settles it.
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    let rows = fx.store.outbox(&fx.account.id).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].reverses, Some(rows[0].id));
+
+    // The next pass finds where Bravo went, then moves it back from there.
+    fx.make_due();
+    fx.clear_commands();
+    let report = fx.replay();
+    assert_eq!(report.sent, 2, "{report:?}");
+    assert!(report.dropped.is_empty(), "{report:?}");
+    assert!(
+        without_tags(&fx.writes()).contains(&"UID MOVE 1 \"INBOX\"".to_string()),
+        "{:?}",
+        fx.writes()
+    );
+    assert!(fx.on_server("Archive").is_empty());
+    assert_eq!(
+        fx.on_server("INBOX"),
+        vec![(1, "Alpha".to_string()), (3, "Bravo".to_string())]
+    );
+    fx.sync();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    assert!(fx.subjects("Archive").is_empty());
+}
+
+#[test]
+fn an_undo_of_a_sent_move_the_server_then_refuses_sends_no_reverse() {
+    let fx = Fixture::new();
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .archive_thread(&fx.account.id, &bravo, "INBOX")
+        .unwrap();
+    // The MOVE went out, and the connection dropped before it reached the
+    // server.
+    fx.store
+        .connection()
+        .execute("UPDATE server_outbox SET sent = 1", [])
+        .unwrap();
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.store.outbox(&fx.account.id).unwrap().len(), 2);
+
+    // Its retry is refused: the server never moved Bravo, so neither row
+    // is sent again and nothing is reported.
+    fx.server.writes.lock().unwrap().refuse = Some("[CANNOT] not now".into());
+    fx.clear_commands();
+    let report = fx.replay();
+    assert!(report.dropped.is_empty(), "{report:?}");
+    assert_eq!((report.sent, report.waiting), (0, 0), "{report:?}");
+    let rows = fx.store.outbox(&fx.account.id).unwrap();
+    assert!(
+        rows.iter().all(|row| row.state == OutboxState::Dropped),
+        "{rows:?}"
+    );
+    fx.server.writes.lock().unwrap().refuse = None;
+    fx.make_due();
+    fx.clear_commands();
+    assert_eq!(fx.replay(), Default::default());
+    assert!(fx.commands().is_empty(), "{:?}", fx.commands());
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+}
+
+#[test]
+fn an_undo_during_a_sync_pass_keeps_the_restored_folder() {
+    use crate::backend::MailBackend;
+
+    // Bravo is in Work as well, so its row keeps a folder when INBOX goes.
+    let fx = Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha"), (2, "Bravo")]),
+            mailbox("Archive", "\\Archive", 30, &[]),
+            mailbox("Work", "", 40, &[(1, "Bravo")]),
+        ]),
+    );
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .archive_thread(&fx.account.id, &bravo, "INBOX")
+        .unwrap();
+    // The server moves Bravo; the reply is lost, so the move is not settled.
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
+    assert!(fx.replay().interrupted.is_some());
+    assert_eq!(fx.on_server("INBOX"), vec![(1, "Alpha".to_string())]);
+
+    // A pass sees Bravo gone from INBOX, and the user undoes before the
+    // pass ends and settles what went.
+    let id = &fx.account.id;
+    let cursor = fx.store.sync_cursor(id).unwrap();
+    let known = |mailbox: &str, uidvalidity: u32, range: (u32, u32)| {
+        fx.store.stored_uids(id, mailbox, uidvalidity, range)
+    };
+    let mut undone = false;
+    fx.backend
+        .sync_changes(cursor.as_ref(), &known, &mut |delta| {
+            fx.store.apply_delta(id, &delta)?;
+            let left_inbox = delta
+                .removals
+                .iter()
+                .any(|removal| removal.folder == "INBOX");
+            if left_inbox && !undone {
+                assert_eq!(delta.settle, crate::backend::Settle::Later);
+                fx.store.undo(id)?;
+                undone = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(undone);
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+
+    // Another pass before the reverse is sent keeps it there too.
+    fx.sync();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+
+    fx.make_due();
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    assert!(fx.on_server("Archive").is_empty());
+    fx.sync();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    assert!(
+        fx.subjects("Archive").is_empty(),
+        "{:?}",
+        fx.subjects("Archive")
+    );
+    assert_eq!(fx.subjects("Work"), vec!["Bravo"]);
+}
+
+#[test]
+fn no_move_is_said_even_when_a_half_done_copy_is_reported_too() {
+    let fx = Fixture::new();
+    fx.server.writes.lock().unwrap().moves = false;
+    // An earlier build left Alpha's archive half done...
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.store
+        .archive_thread(&fx.account.id, &alpha, "INBOX")
+        .unwrap();
+    fx.store
+        .connection()
+        .execute("UPDATE server_outbox SET state = 'copied', sent = 1", [])
+        .unwrap();
+    // ...and Bravo's archive is due now, on a server without MOVE.
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .archive_thread(&fx.account.id, &bravo, "INBOX")
+        .unwrap();
+
+    // The status line names the first reason: each notice gets a pass.
+    let first = fx.replay_as_window();
+    assert_eq!(
+        first.dropped.first().map(|dropped| dropped.reason),
+        Some(DropReason::NoMove),
+        "{first:?}"
+    );
+    let second = fx.replay_as_window();
+    assert_eq!(
+        second.dropped.first().map(|dropped| dropped.reason),
+        Some(DropReason::Abandoned),
+        "{second:?}"
+    );
+    // Each is said once, and nothing was moved.
+    assert!(fx.replay_as_window().dropped.is_empty());
+    assert!(
+        fx.writes().iter().all(|write| !write.contains("MOVE")),
+        "{:?}",
+        fx.writes()
+    );
 }

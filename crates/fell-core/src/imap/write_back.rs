@@ -22,13 +22,18 @@
 //! after [`MAX_ATTEMPTS`]. A dropped connection ends the pass and costs the
 //! rows nothing; the next pass tries again. Rows for one message go in the
 //! order they were queued: one that waits holds back the rest.
+//!
+//! Undo's reverse of a row that was sent but not settled waits behind it,
+//! then moves the copy that row placed. If that row never reached the
+//! server (refused, or given up), the reverse is dropped without a notice.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 use crate::account::AccountId;
 use crate::outbox::{
-    self, DropReason, DroppedMove, OutboxEntry, OutboxKind, Outcome, ReplayReport,
+    self, DropReason, DroppedMove, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
+    Settled,
 };
 use crate::store::Store;
 
@@ -133,17 +138,13 @@ struct Pass<'a> {
 
 impl Pass<'_> {
     fn run(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
+        // Whether the user hears of it is up to the status line's report
+        // (`outbox::report_for_status`): that notice is said once.
         if !session.has_move() {
-            let told = outbox::note_move_missing(self.store, self.account_id, true)?;
             for index in 0..self.entries.len() {
                 if self.entries[index].retry_unix <= self.now {
                     self.drop_row(index, DropReason::NoMove, "server has no MOVE")?;
                 }
-            }
-            if told {
-                self.report
-                    .dropped
-                    .retain(|dropped| dropped.reason != DropReason::NoMove);
             }
             return Ok(());
         }
@@ -176,6 +177,23 @@ impl Pass<'_> {
     ) -> Result<(), Stop> {
         let entries = self.entries;
         let entry = &entries[index];
+        // Undo's reverse of a row that had not settled: the copy to move
+        // back is the one that row placed.
+        let reversing = match entry
+            .reverses
+            .map(|id| outbox::reversed(self.store, id))
+            .transpose()?
+        {
+            None => None,
+            Some(Reversed::Placed(uidvalidity, uid)) => Some((uidvalidity, uid)),
+            Some(Reversed::Waiting) => {
+                self.held.insert(entry.message_id.clone());
+                return Ok(());
+            }
+            Some(Reversed::Gone) => {
+                return self.drop_quietly(index, "the move it reverses never reached the server");
+            }
+        };
         let Some(source) = self.mailbox(
             session,
             entry.source_mailbox.as_deref(),
@@ -196,12 +214,12 @@ impl Pass<'_> {
             Ok(uidvalidity) => uidvalidity,
             Err(message) => return self.retry(index, DropReason::Refused, &message),
         };
-        let uid = match (entry.uidvalidity, entry.uid) {
-            (Some(queued), Some(uid)) if queued == uidvalidity => uid,
-            (Some(_), Some(_)) => {
+        let uid = match reversing.or(entry.uidvalidity.zip(entry.uid)) {
+            Some((queued, uid)) if queued == uidvalidity => uid,
+            Some(_) => {
                 return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
             }
-            _ => {
+            None => {
                 let found = outbox::find_copy(
                     self.store,
                     self.account_id,
@@ -397,7 +415,7 @@ impl Pass<'_> {
         target: &str,
         outcome: Outcome<'_>,
     ) -> Result<(), Stop> {
-        if !outbox::settle(
+        match outbox::settle(
             self.store,
             self.account_id,
             &self.entries[index],
@@ -405,9 +423,9 @@ impl Pass<'_> {
             Some(target),
             outcome,
         )? {
-            return Err(Stop::Stale);
+            Settled::Stale => Err(Stop::Stale),
+            Settled::Recorded | Settled::Retired => Ok(()),
         }
-        Ok(())
     }
 
     /// The raw name: as queued, else from the server's LIST.
@@ -485,11 +503,14 @@ impl Pass<'_> {
     ) -> Result<(), Stop> {
         let entries = self.entries;
         let entry = &entries[index];
-        if entry.attempts + 1 >= MAX_ATTEMPTS {
+        let last = entry.attempts + 1 >= MAX_ATTEMPTS;
+        // A refusal is recorded even on the last try: if undo reversed the
+        // row, it is retired there without a notice.
+        if last && !refused {
             return self.drop_row(index, reason, message);
         }
         let wait = BACKOFF_SECS[(entry.attempts as usize).min(BACKOFF_SECS.len() - 1)];
-        let live = outbox::settle(
+        let settled = outbox::settle(
             self.store,
             self.account_id,
             entry,
@@ -502,33 +523,52 @@ impl Pass<'_> {
                 refused,
             },
         )?;
-        if !live {
-            return Err(Stop::Stale);
+        match settled {
+            Settled::Stale => return Err(Stop::Stale),
+            // Undone, and the server never moved it: it and its reverse are
+            // settled, with nothing to say.
+            Settled::Retired => {
+                for (at, other) in entries.iter().enumerate() {
+                    if at == index || other.reverses == Some(entry.id) {
+                        self.settled[at] = true;
+                    }
+                }
+            }
+            Settled::Recorded if last => return self.drop_row(index, reason, message),
+            Settled::Recorded => {}
         }
         self.held.insert(entry.message_id.clone());
         Ok(())
     }
 
     fn drop_row(&mut self, index: usize, reason: DropReason, message: &str) -> Result<(), Stop> {
+        self.drop_quietly(index, message)?;
+        let entry = &self.entries[index];
+        self.report.dropped.push(DroppedMove {
+            source_folder: entry.source_folder.clone(),
+            target_folder: entry.target_folder.clone(),
+            reason,
+        });
+        Ok(())
+    }
+
+    /// Drop the row without a notice: the user has nothing to learn from it.
+    fn drop_quietly(&mut self, index: usize, message: &str) -> Result<(), Stop> {
         let entries = self.entries;
         let entry = &entries[index];
-        if !outbox::settle(
+        let settled = outbox::settle(
             self.store,
             self.account_id,
             entry,
             None,
             None,
             Outcome::Dropped { error: message },
-        )? {
+        )?;
+        if settled == Settled::Stale {
             return Err(Stop::Stale);
         }
         self.settled[index] = true;
         self.held.insert(entry.message_id.clone());
-        self.report.dropped.push(DroppedMove {
-            source_folder: entry.source_folder.clone(),
-            target_folder: entry.target_folder.clone(),
-            reason,
-        });
         Ok(())
     }
 }

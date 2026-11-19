@@ -388,14 +388,12 @@ impl AccountConfig {
     /// reports, once, a copy an earlier build of write-back left half done.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
-        let abandoned = crate::outbox::take_abandoned(store, &account_id)?;
-        let mut report = if !self.write_back || !crate::outbox::any_due(store, &account_id)? {
+        let report = if !self.write_back || !crate::outbox::any_due(store, &account_id)? {
             crate::ReplayReport::default()
         } else {
             crate::imap::replay_outbox(&self.imap_config()?, &account_id, store)?
         };
-        report.dropped.splice(0..0, abandoned);
-        Ok(report)
+        crate::outbox::report_for_status(store, &account_id, report)
     }
 
     /// Log in and log out again without reading mail. Returns the number of
