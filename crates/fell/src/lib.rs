@@ -425,7 +425,7 @@ mod tests {
         // The inbox still hears that the first one went out.
         let lines = hub.take_closed();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].starts_with("Sent"), "{lines:?}");
         assert!(lines[0].contains("Lunch"), "{lines:?}");
         // On the draft that was sent, the window closes as before.
         let backend = Counting::new(|| Ok(()));
@@ -453,7 +453,7 @@ mod tests {
         assert!(!end.sent);
         let notices = hub.take_notices();
         let (line, warn) = &notices[0];
-        assert!(line.starts_with("may have been sent"), "{notices:?}");
+        assert!(line.starts_with("May have been sent"), "{notices:?}");
         assert!(line.contains("check Sent before sending again"), "{line}");
         assert!(line.contains("Lunch"), "{line}");
         assert!(*warn, "the inbox shows it in the error colour");
@@ -515,7 +515,7 @@ mod tests {
         hub.note_shown(&id);
         hub.note_hidden(&id);
         let lines = hub.take_closed();
-        assert!(lines[0].starts_with("sent"), "{lines:?}");
+        assert!(lines[0].starts_with("Sent"), "{lines:?}");
         assert!(lines[0].contains("Lunch"), "{lines:?}");
         assert!(
             !hub.reopen_last(),
