@@ -59,7 +59,7 @@ fn simulate_v5(store: &Store) {
 }
 
 #[test]
-fn opening_a_v5_mailbox_repairs_cid_roles_and_derived_reads_only_once() {
+fn a_headless_reader_repairs_cid_roles_and_derived_reads_only_once() {
     let dir = std::env::temp_dir().join(format!(
         "fell-cid-upgrade-{}-{:?}",
         std::process::id(),
@@ -136,6 +136,7 @@ fn opening_a_v5_mailbox_repairs_cid_roles_and_derived_reads_only_once() {
     };
     for _ in 0..2 {
         let store = Store::open(&path).unwrap();
+        store.finish_cid_repair().unwrap();
         for (index, (id, html, disposition, _)) in cases.iter().enumerate() {
             let parsed = message(index as u32 + 1, &raw(id, html, "text/html", disposition));
             let (mut expected, old_body, old_kinds) = before[index].clone();
@@ -217,7 +218,7 @@ fn only_uncertain_matching_parts_are_recovered_from_the_queued_source() {
         )
         .unwrap();
     simulate_v5(&store);
-    run(&store.conn).unwrap();
+    store.finish_cid_repair().unwrap();
 
     let nested_before = stored_parts(&store, "outer@x");
     let uncertain = |id: &str| {
@@ -281,7 +282,7 @@ fn only_uncertain_matching_parts_are_recovered_from_the_queued_source() {
         Some("logo.png")
     );
     assert!(store.missing_bodies(&account.id, 200).unwrap().is_empty());
-    run(&store.conn).unwrap();
+    store.finish_cid_repair().unwrap();
     assert!(store.missing_bodies(&account.id, 200).unwrap().is_empty());
 }
 
@@ -310,8 +311,8 @@ fn a_failed_batch_leaves_completed_batches_and_retries_from_their_cursor() {
          BEGIN SELECT RAISE(ABORT, 'stop migration'); END;",
         )
         .unwrap();
-    assert!(run(&store.conn).is_err());
-    assert_eq!(cursor(&store.conn).unwrap(), Some(BATCH));
+    assert!(store.finish_cid_repair().is_err());
+    assert_eq!(cursor(&store.conn).unwrap().unwrap().after, BATCH as i64);
     assert!(store_message(&store, &format!("m{BATCH}@x")).has_attachment);
     assert!(!store_message(&store, &format!("m{}@x", BATCH + 1)).has_attachment);
     assert!(!store_message(&store, "fail@x").has_attachment);
@@ -319,7 +320,7 @@ fn a_failed_batch_leaves_completed_batches_and_retries_from_their_cursor() {
         .conn
         .execute_batch("DROP TRIGGER fail_cid_batch;")
         .unwrap();
-    run(&store.conn).unwrap();
+    store.finish_cid_repair().unwrap();
     assert_eq!(cursor(&store.conn).unwrap(), None);
     assert!(store_message(&store, "fail@x").has_attachment);
     assert_eq!(
@@ -328,6 +329,156 @@ fn a_failed_batch_leaves_completed_batches_and_retries_from_their_cursor() {
             .unwrap()
             .hits
             .len(),
-        BATCH as usize + 2
+        BATCH + 2
     );
+}
+
+#[test]
+fn filling_a_gap_keeps_a_pending_cid_refresh_until_the_list_is_replaced() {
+    use crate::store::bodies::{StoredParts, Write, write};
+
+    let store = Store::open_in_memory().unwrap();
+    let account = account();
+    store.upsert_account(&account).unwrap();
+    let parsed = message(1, &raw("kept@x", "See cid:logo@x", "text/plain", ""));
+    store
+        .upsert_message(&with_legacy_role(parsed.clone(), false, PartRole::Inline))
+        .unwrap();
+    store.finish_cid_repair().unwrap();
+    assert!(queued(&store.conn, &account.id, "kept@x").unwrap());
+    let newer = StoredParts::new(&parsed.parts.unwrap());
+    assert!(!write(&store.conn, &account.id, "kept@x", &newer, Write::FillGap).unwrap());
+    assert!(
+        !write(
+            &store.conn,
+            &account.id,
+            "kept@x",
+            &StoredParts::default(),
+            Write::Replace
+        )
+        .unwrap()
+    );
+    assert!(queued(&store.conn, &account.id, "kept@x").unwrap());
+    assert!(write(&store.conn, &account.id, "kept@x", &newer, Write::Replace).unwrap());
+    assert!(!queued(&store.conn, &account.id, "kept@x").unwrap());
+}
+
+#[test]
+fn a_merge_keeps_the_keeper_refresh_or_inherits_it_with_the_donated_list() {
+    use crate::store::{bodies, copies};
+
+    let store = Store::open_in_memory().unwrap();
+    let account = account();
+    store.upsert_account(&account).unwrap();
+    let html = "See cid:logo@x";
+    let kept = message(1, &raw("kept@x", html, "text/plain", ""));
+    let donated = message(2, &raw("donated@x", html, "text/plain", ""));
+    for msg in [&kept, &donated] {
+        store
+            .upsert_message(&with_legacy_role(msg.clone(), false, PartRole::Inline))
+            .unwrap();
+    }
+    let mut empty = message(3, &raw("empty@x", "A different copy", "text/plain", ""));
+    empty.parts = None;
+    store.upsert_message(&empty).unwrap();
+    store.finish_cid_repair().unwrap();
+    let tx = immediate_transaction(&store.conn).unwrap();
+    assert!(
+        bodies::move_into(&tx, &account.id, "donated@x", "kept@x")
+            .unwrap()
+            .is_none()
+    );
+    assert!(queued(&tx, &account.id, "kept@x").unwrap());
+    let list = bodies::move_into(&tx, &account.id, "donated@x", "empty@x")
+        .unwrap()
+        .unwrap();
+    set_attachments_from_list(&tx, &account.id, "empty@x", &list).unwrap();
+    tx.execute("DELETE FROM messages WHERE message_id = 'donated@x'", [])
+        .unwrap();
+    copies::repoint(&tx, &account.id, "donated@x", "empty@x").unwrap();
+    tx.commit().unwrap();
+    let pending = store.missing_bodies(&account.id, 10).unwrap();
+    let merged = pending
+        .iter()
+        .find(|item| item.message_id.as_str() == "empty@x")
+        .unwrap();
+    assert!(merged.copies.contains(&donated.remote_id));
+    assert!(
+        pending
+            .iter()
+            .any(|item| item.message_id.as_str() == "kept@x")
+    );
+    store
+        .store_fetched_parts(&account.id, &[(MessageId::new("empty@x"), donated.parts)])
+        .unwrap();
+    assert_eq!(
+        store_message(&store, "empty@x").attachment_names,
+        ["logo.png"]
+    );
+    assert!(!queued(&store.conn, &account.id, "empty@x").unwrap());
+    assert!(queued(&store.conn, &account.id, "kept@x").unwrap());
+}
+
+#[test]
+fn a_list_moved_behind_another_connections_cursor_is_still_repaired() {
+    let dir = std::env::temp_dir().join(format!(
+        "fell-cid-moved-list-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("mail.db");
+    let store = Store::open(&path).unwrap();
+    let other = Store::open(&path).unwrap();
+    let account = account();
+    store.upsert_account(&account).unwrap();
+    let mut empty = message(1, &raw("kept@x", "Keeper", "text/plain", ""));
+    empty.parts = None;
+    store.upsert_message(&empty).unwrap();
+    super::super::write(
+        &store.conn,
+        &account.id,
+        "kept@x",
+        &super::super::StoredParts::default(),
+        super::super::Write::FillGap,
+    )
+    .unwrap();
+    let first = store_message(&store, "kept@x");
+    for n in 0..=BATCH {
+        let id = format!("m{n}@x");
+        let mail = message(
+            n as u32 + 2,
+            &raw(&id, "<p>See src=cid:logo@x</p>", "text/html", ""),
+        );
+        store
+            .upsert_message(&with_legacy_role(mail, false, PartRole::Inline))
+            .unwrap();
+    }
+    let start = store.cid_repair_progress().unwrap();
+    assert!(!store_message(&store, "m0@x").has_attachment);
+    let batch = other.repair_cid_batch(start).unwrap();
+    assert_eq!(batch.changed_threads.len(), BATCH);
+    assert!(store_message(&store, "m0@x").has_attachment);
+    let tx = immediate_transaction(&store.conn).unwrap();
+    super::super::move_into(&tx, &account.id, &format!("m{BATCH}@x"), "kept@x")
+        .unwrap()
+        .unwrap();
+    tx.execute(
+        "DELETE FROM messages WHERE message_id = ?1",
+        [format!("m{BATCH}@x")],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let next = other.repair_cid_batch(batch.progress).unwrap();
+    assert!(next.external_progress);
+    assert_eq!(
+        next.changed_threads,
+        [(account.id.clone(), first.thread_id)]
+    );
+    assert!(store_message(&store, "kept@x").has_attachment);
+    assert!(store.missing_bodies(&account.id, 10).unwrap().is_empty());
+    drop(other);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -389,6 +389,7 @@ fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
     }
     let path = std::path::absolute(&path)?;
     let store = Store::open(&path).map_err(store_err)?;
+    store.finish_cid_repair().map_err(store_err)?;
     Ok((path, store))
 }
 

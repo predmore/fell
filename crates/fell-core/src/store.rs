@@ -356,6 +356,8 @@ pub struct ThreadSummary {
     pub unread: bool,
 }
 
+pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let requested = path.as_ref();
@@ -519,7 +521,6 @@ impl Store {
         if version < 5 {
             bodies::queue_unlisted_mail(&conn)?;
         }
-        bodies::cid_upgrade::run(&conn)?;
         crate::actions::migrate_purge_snapshots(&conn)?;
         Ok(Self {
             indexer: None,
@@ -1038,14 +1039,36 @@ impl Store {
                 (message_id, stored)
             })
             .collect();
-        let tx = immediate_transaction(&self.conn)?;
+        // A CID-only answer can require inspecting the kept HTML again.
+        // Snapshot that input before contending for the mailbox write lock.
+        let read = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let repairs = compressed
+            .iter()
+            .map(|(id, parts)| {
+                let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
+                    return Ok(None);
+                };
+                bodies::cid_upgrade::prepare_fetched(
+                    &read,
+                    account_id,
+                    canonical,
+                    parts.mime_parts(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        read.commit()?;
+        let tx = self
+            .lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for (message_id, parts) in &compressed {
+        for ((message_id, parts), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
-            if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, parts.mime_parts())?
-            {
+            if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, repair)? {
                 continue;
             }
             if parts.has_body() {

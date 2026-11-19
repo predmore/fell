@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fell_core::{
-    AccountConfig, AccountId, DropReason, DroppedWrite, FolderRole, FolderRoles, FolderSpan,
-    ListKey, MessageId, OutboxKind, ThreadId,
+    AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
+    FolderRole, FolderRoles, FolderSpan, ListKey, MessageId, OutboxKind, ThreadId,
 };
 use futures::StreamExt;
 use gpui::{
@@ -238,6 +238,8 @@ struct Inbox {
     focus: FocusHandle,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
+    /// Cursor observed before the first inbox read, consumed after it paints.
+    cid_repair: Option<futures::channel::oneshot::Receiver<fell_core::Result<CidRepairProgress>>>,
     account_id: AccountId,
     session: Session,
     theme: Theme,
@@ -373,6 +375,7 @@ impl Inbox {
                 .unwrap_or_else(|| AccountId(String::new())),
             session,
             store,
+            cid_repair: None,
             theme,
             list_scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
@@ -445,6 +448,9 @@ impl Inbox {
             self.draft_home = None;
         }
         self.session.sync = opened.sync;
+        if !store_failed {
+            self.cid_repair = Some(self.store.call(fell_core::Store::cid_repair_progress));
+        }
         // Sync opens its own connection only after this one finished opening
         // and migrating the file, so the two never race for the first lock.
         if !store_failed && let Some((config, path)) = sync_with {
@@ -454,6 +460,90 @@ impl Inbox {
         }
         self.request_threads(ReadIntent::default(), cx);
         cx.notify();
+    }
+
+    fn repair_cached_cids(
+        &self,
+        start: futures::channel::oneshot::Receiver<fell_core::Result<CidRepairProgress>>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::time::Duration;
+
+        cx.spawn(async move |this, cx| {
+            let mut progress = match start.await {
+                Ok(Ok(progress)) => progress,
+                Ok(Err(err)) => {
+                    eprintln!("fell: could not check cached CID roles: {err}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let mut retry = false;
+            while !progress.is_done() {
+                // Give folder reads and waiting writers a turn between slices.
+                let pause = if retry {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(16)
+                };
+                cx.background_executor().timer(pause).await;
+                let Ok(reply) = this.update(cx, |inbox, _| {
+                    inbox
+                        .store
+                        .call_maintenance(move |store| store.repair_cid_batch(progress))
+                }) else {
+                    return;
+                };
+                let batch = match reply.await {
+                    Ok(Ok(batch)) => batch,
+                    Ok(Err(err)) => {
+                        if !retry {
+                            eprintln!("fell: could not repair cached CID roles: {err}");
+                        }
+                        retry = true;
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                progress = batch.progress;
+                retry = false;
+                if (batch.external_progress || !batch.changed_threads.is_empty())
+                    && this
+                        .update(cx, |inbox, cx| inbox.cid_roles_changed(&batch, cx))
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn cid_roles_changed(&mut self, batch: &CidRepairBatch, cx: &mut Context<Self>) {
+        let any_changed = |id: &str| {
+            batch
+                .changed_threads
+                .iter()
+                .any(|(account, thread)| account == &self.account_id && thread.as_str() == id)
+        };
+        let refresh_open =
+            batch.external_progress || self.session.cursor_id.as_deref().is_some_and(any_changed);
+        if refresh_open
+            || self.session.threads.iter().any(|row| any_changed(&row.id))
+            || (self.read_in_flight
+                && batch
+                    .changed_threads
+                    .iter()
+                    .any(|(account, _)| account == &self.account_id))
+        {
+            self.request_threads(
+                ReadIntent {
+                    refresh_open,
+                    ..ReadIntent::default()
+                },
+                cx,
+            );
+        }
     }
 
     /// Apply sync status as soon as it arrives. The sync thread writes the
@@ -2772,6 +2862,14 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.session.loading
+            && let Some(start) = self.cid_repair.take()
+        {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |inbox, cx| inbox.repair_cached_cids(start, cx));
+            });
+        }
         self.bodies
             .release_unused_images(|image| cx.drop_image(image, Some(window)));
         let real = Instant::now();

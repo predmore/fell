@@ -499,9 +499,9 @@ pub(super) fn list(
     Ok(Some(parts))
 }
 
-/// Store `parts` for `message_id` and take it off the backfill queue. An
-/// empty `parts` (no HTML, no plain) still writes a row when there is none,
-/// recording that it was looked at, but never replaces parts with a body.
+/// Store `parts` for `message_id` and clear the regular body backfill. An
+/// empty `parts` (no HTML, no plain) still records that it was looked at.
+/// A CID refresh belongs to the existing part list until it is replaced.
 ///
 /// The part list follows the body: `Replace` with a body replaces it, and
 /// otherwise a list is written only where none was taken yet. Returns
@@ -513,10 +513,6 @@ pub(super) fn write(
     parts: &StoredParts,
     mode: Write,
 ) -> Result<bool> {
-    conn.execute(
-        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id],
-    )?;
     let sql = match mode {
         Write::Replace if parts.has_body() => {
             "INSERT INTO message_bodies (account_id, message_id, codec, html, plain, bulk_headers)
@@ -547,15 +543,20 @@ pub(super) fn write(
             parts.bulk_headers,
         ],
     )?;
-    let Some(list) = &parts.mime_parts else {
-        return Ok(false);
-    };
-    let replace = (mode == Write::Replace && parts.has_body())
-        || !parts_listed(conn, account_id, message_id)?;
-    if replace {
+    let mut replaced = false;
+    if let Some(list) = &parts.mime_parts
+        && ((mode == Write::Replace && parts.has_body())
+            || !parts_listed(conn, account_id, message_id)?)
+    {
         replace_list(conn, account_id, message_id, list)?;
+        replaced = true;
     }
-    Ok(replace)
+    conn.execute(
+        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2
+         AND (refresh_cid_roles = 0 OR ?3)",
+        params![account_id.as_str(), message_id, replaced],
+    )?;
+    Ok(replaced)
 }
 
 /// Insert a row, or fill each empty column of the stored one. Rows of
@@ -588,7 +589,8 @@ pub(super) fn mark_withheld(
         params![account_id.as_str(), message_id, CODEC_DEFLATE],
     )?;
     conn.execute(
-        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+        "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2
+         AND refresh_cid_roles = 0",
         params![account_id.as_str(), message_id],
     )?;
     Ok(())
@@ -635,8 +637,9 @@ pub(super) fn state(
 
 /// A merge is about to delete row `from` in favour of `to`: give `to` the
 /// parts it lacks and carry over any size-limit marker. The kept row leaves
-/// the backfill queue when it gains a body or a size-limit marker. Returns
-/// the part list when `to` took `from`'s.
+/// the regular backfill queue when it gains a body or a size-limit marker.
+/// A pending CID repair follows the part list it describes. Returns the
+/// part list when `to` took `from`'s.
 pub(super) fn move_into(
     conn: &Connection,
     account_id: &AccountId,
@@ -662,7 +665,8 @@ pub(super) fn move_into(
     )?;
     if moved > 0 {
         conn.execute(
-            "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2",
+            "DELETE FROM body_backfill WHERE account_id = ?1 AND message_id = ?2
+             AND refresh_cid_roles = 0",
             params![account_id.as_str(), to],
         )?;
     }
@@ -676,6 +680,14 @@ pub(super) fn move_into(
             params![account_id.as_str(), to, CODEC_DEFLATE],
         )?;
         replace_list(conn, account_id, to, &list)?;
+        cid_upgrade::inherited_list(conn, account_id, from, to)?;
+        conn.execute(
+            "INSERT INTO body_backfill (account_id, message_id, refresh_cid_roles)
+             SELECT account_id, ?3, 1 FROM body_backfill
+             WHERE account_id = ?1 AND message_id = ?2 AND refresh_cid_roles = 1
+             ON CONFLICT(account_id, message_id) DO UPDATE SET refresh_cid_roles = 1",
+            params![account_id.as_str(), from, to],
+        )?;
         return Ok(Some(list));
     }
     Ok(None)
