@@ -4131,6 +4131,33 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
 const CONVERSATION_RULE_PX: f32 = 2.;
 const CONVERSATION_PAD_PX: f32 = 20.;
 const MESSAGE_PAD_PX: f32 = 8.;
+const COLLAPSED_GAP_PX: f32 = 12.;
+const COLLAPSED_SENDER_PX: f32 = 140.;
+
+fn message_content_width(conv_width: f32) -> f32 {
+    (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.)
+}
+
+fn collapsed_column_widths(
+    conv_width: f32,
+    date_width: f32,
+    sender_ellipsis: f32,
+    snippet_ellipsis: f32,
+) -> (f32, f32, f32) {
+    let room = (message_content_width(conv_width) - 2. * COLLAPSED_GAP_PX)
+        .max(0.)
+        .floor();
+    let date = date_width.ceil().min(room);
+    let remaining = room - date;
+    // Keep a snippet when both text columns have room for an ellipsis.
+    let sender = if remaining >= sender_ellipsis.ceil() + snippet_ellipsis.ceil() {
+        remaining - snippet_ellipsis.ceil()
+    } else {
+        remaining
+    }
+    .min(COLLAPSED_SENDER_PX);
+    (sender, remaining - sender, date)
+}
 
 /// The latest reread and accepted HTML preparations for the open thread.
 #[derive(Default)]
@@ -4358,27 +4385,34 @@ fn collapsed_message(
     let date = present::relative_date(now_unix(), message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
-    let date_w = line_px_with_style(window, &style, &date, FontWeight::NORMAL);
-    // Sender column, gaps, row padding, and a little air before the date.
-    let snippet_w = (conv_width - 56.0 - 140.0 - date_w).max(24.0);
-    let missing = present::missing_body_line(message.body_state);
-    let snippet = clip_line(
-        window,
-        &style,
-        missing.as_deref().unwrap_or(&message.snippet),
-        snippet_w,
-        FontWeight::NORMAL,
+    let (sender_w, snippet_w, date_w) = collapsed_column_widths(
+        conv_width,
+        line_px_with_style(window, &style, &date, FontWeight::NORMAL),
+        line_px_with_style(window, &style, "…", FontWeight::MEDIUM),
+        line_px_with_style(window, &style, "…", FontWeight::NORMAL),
     );
+    let clip = |text: &str, width, weight| {
+        clip_shaped(window, &style, text, width, weight, None)
+            // The clipping helper can return a lone ellipsis at any width.
+            .filter(|line| line.width <= px(width))
+            .map(|line| line.text)
+    };
+    let sender = message
+        .sender
+        .contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+        .then(|| present::one_line(&message.sender));
+    let sender = sender.as_deref().unwrap_or(&message.sender);
+    let missing = present::missing_body_line(message.body_state);
     div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
         .w_full()
         .min_w(px(0.))
-        .px(px(8.))
+        .px(px(MESSAGE_PAD_PX))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.))
+        .gap(px(COLLAPSED_GAP_PX))
         .overflow_hidden()
         .rounded_md()
         .bg(rgb(motion::mix(theme.background, theme.selection, cursor)))
@@ -4403,24 +4437,34 @@ fn collapsed_message(
         })
         .child(
             div()
-                .w(px(140.))
-                .overflow_hidden()
+                .w(px(sender_w))
+                .flex_none()
                 .whitespace_nowrap()
-                .text_ellipsis()
                 .font_weight(FontWeight::MEDIUM)
-                .child(message.sender.clone()),
+                .children(clip(sender, sender_w, FontWeight::MEDIUM)),
         )
         .child(
             div()
                 .w(px(snippet_w))
                 .flex_none()
-                .overflow_hidden()
                 .whitespace_nowrap()
                 .text_color(rgb(dimmed))
                 .when(body < 1.0, |line| line.opacity(body))
-                .child(snippet),
+                .children(clip(
+                    missing.as_deref().unwrap_or(&message.snippet),
+                    snippet_w,
+                    FontWeight::NORMAL,
+                )),
         )
-        .child(div().flex_none().text_color(rgb(dimmed)).child(date))
+        .child(
+            div()
+                .w(px(date_w))
+                .flex_none()
+                .whitespace_nowrap()
+                .text_right()
+                .text_color(rgb(dimmed))
+                .children(clip(&date, date_w, FontWeight::NORMAL)),
+        )
         .into_any_element()
 }
 
@@ -4437,8 +4481,7 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let body_width =
-        (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.);
+    let body_width = message_content_width(conv_width);
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -5838,8 +5881,8 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, ctrl_letter, key_from, moved_in_list, should_follow_visible, unread_bar_dx,
-        write_back_notice,
+        LIST_BORDER_PX, collapsed_column_widths, ctrl_letter, key_from, moved_in_list,
+        should_follow_visible, unread_bar_dx, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -5856,6 +5899,30 @@ mod tests {
             key: key.into(),
             key_char: Some(key_char.into()),
         }
+    }
+
+    #[test]
+    fn collapsed_columns_share_the_pane_width_after_padding_and_gaps() {
+        assert_eq!(
+            collapsed_column_widths(559.6, 97.2, 11., 11.),
+            (140., 239., 98.)
+        );
+    }
+
+    #[test]
+    fn collapsed_columns_make_room_for_the_date_and_ellipsis_at_large_sizes() {
+        assert_eq!(
+            collapsed_column_widths(340., 144., 18.2, 17.1),
+            (96., 18., 144.)
+        );
+        assert_eq!(
+            collapsed_column_widths(250., 144., 18.2, 17.1),
+            (24., 0., 144.)
+        );
+        assert_eq!(
+            collapsed_column_widths(210., 144., 18.2, 17.1),
+            (0., 0., 128.)
+        );
     }
 
     /// After each key, whether a box left wide relaxes: only a key that
