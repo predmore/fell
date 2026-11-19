@@ -435,7 +435,21 @@ impl Inbox {
                     .flatten(),
                 _ => None,
             };
+            let mut rows = present::thread_rows(&page.threads, &me);
+            let unread = page.unread;
             let drafts = if roles.is(FolderRole::Drafts, &reading) {
+                // Synced drafts name who they are to, and none is unread.
+                let ids: Vec<ThreadId> = page
+                    .threads
+                    .iter()
+                    .map(|thread| thread.thread_id.clone())
+                    .collect();
+                let recipients = store
+                    .folder_recipients(&account, &reading, &ids)
+                    .unwrap_or_default();
+                // The header shows no count in Drafts; the folder's own
+                // count stays, so leaving Drafts never reads "0 unread".
+                present::address_draft_rows(&mut rows, &recipients, &me);
                 store
                     .unsent_compose_drafts(&account)
                     .map_err(|err| err.to_string())?
@@ -443,10 +457,10 @@ impl Inbox {
                 Vec::new()
             };
             Ok(ListRead {
-                rows: present::thread_rows(&page.threads, &me),
+                rows,
                 more_before: page.more_before,
                 more_after: page.more_after,
-                unread: page.unread,
+                unread,
                 names,
                 followed,
                 drafts,
@@ -675,7 +689,7 @@ impl Inbox {
             let messages = store.thread_messages(&account, &last.thread_id).ok()?;
             Some((
                 present::thread_rows(&page.threads, &me),
-                present::conversation(&messages, &me, &roles, &names),
+                present::conversation(&messages, &me, &roles, &names, &reading),
             ))
         });
         cx.spawn(async move |this, cx| {
@@ -1073,13 +1087,18 @@ impl Inbox {
                 .drafts
                 .iter()
                 .find(|item| item.id == draft)
-                .map(|item| present::draft_conversation(item, &self.session.account_email))
+                .map(|item| {
+                    present::draft_conversation(item, &self.session.account_email, now_unix())
+                })
                 .unwrap_or_default();
             let same = self.open_thread.as_deref() == Some(id.as_str());
             if same {
                 self.session.refresh_messages(shown, true);
             } else {
-                self.session.set_messages(shown);
+                // Fades in as a synced draft's messages do, so `j` between
+                // the two kinds never pops.
+                self.motion.show_thread(&mut self.session, shown);
+                self.scroll_conversation();
             }
             self.session.clear_query_fault(QueryFault::Message);
             self.mark_open(id);
@@ -1091,6 +1110,7 @@ impl Inbox {
         let me = self.session.account_email.clone();
         let roles = self.session.roles.clone();
         let names = self.session.folders.clone();
+        let viewing = self.session.folder.clone();
         let thread = id.clone();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
@@ -1099,7 +1119,7 @@ impl Inbox {
             Some(
                 store
                     .thread_messages(&account, &ThreadId(thread))
-                    .map(|messages| present::conversation(&messages, &me, &roles, &names))
+                    .map(|messages| present::conversation(&messages, &me, &roles, &names, &viewing))
                     .map_err(|err| err.to_string()),
             )
         });
@@ -1124,8 +1144,7 @@ impl Inbox {
                             let bottom = inbox.conversation_at_bottom();
                             inbox.session.refresh_messages(view, bottom)
                         } else {
-                            inbox.session.set_messages(view);
-                            inbox.motion.thread_arrived();
+                            inbox.motion.show_thread(&mut inbox.session, view);
                             true
                         };
                         inbox.mark_open(id);
@@ -1426,7 +1445,7 @@ impl Inbox {
         };
         // The window takes a moment to appear: say what is coming now.
         if id.is_none() {
-            self.session.show_toast("new draft", false);
+            self.session.show_toast("New draft", false);
         } else {
             let subject = self
                 .session
@@ -1434,12 +1453,13 @@ impl Inbox {
                 .map(|row| row.subject.clone())
                 .unwrap_or_default();
             self.session
-                .show_toast(format!("opening draft \u{201c}{subject}\u{201d}"), false);
+                .show_toast(format!("Opening draft \u{201c}{subject}\u{201d}"), false);
         }
+        let notice = self.session.toast_generation();
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
-            self.settle_opening_notice(cx);
+            self.settle_opening_notice(notice, cx);
             return;
         }
         let Some(home) = self.draft_home.clone() else {
@@ -1471,7 +1491,7 @@ impl Inbox {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
                         if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(cx);
+                            inbox.settle_opening_notice(notice, cx);
                         }
                     }
                     Err(err) => {
@@ -1521,6 +1541,7 @@ impl Inbox {
             return;
         };
         self.session.show_toast(reply_notice(kind, &sender), false);
+        let notice = self.session.toast_generation();
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let roles = self.session.roles.clone();
@@ -1551,7 +1572,7 @@ impl Inbox {
                 match result {
                     Ok(id) => {
                         if crate::draft_host::show_draft(&hub, &id) {
-                            inbox.settle_opening_notice(cx);
+                            inbox.settle_opening_notice(notice, cx);
                         }
                     }
                     Err(err) => {
@@ -1572,23 +1593,15 @@ impl Inbox {
     }
 
     /// The window is on its way: once it has had time to show, the inbox's
-    /// "opening" notice has done its job and goes, unless something newer
-    /// replaced it.
-    fn settle_opening_notice(&mut self, cx: &mut Context<Self>) {
+    /// "opening" notice `notice` has done its job and goes, unless something
+    /// newer replaced it, such as the notice for a second draft opened since.
+    fn settle_opening_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(700))
                 .await;
             let _ = this.update(cx, |inbox, cx| {
-                let opening = inbox.session.toast.as_ref().is_some_and(|toast| {
-                    toast.text.starts_with("opening draft")
-                        || toast.text == "new draft"
-                        || [ReplyKind::Reply, ReplyKind::ReplyAll, ReplyKind::Forward]
-                            .into_iter()
-                            .any(|kind| toast.text.starts_with(reply_notice_prefix(kind)))
-                });
-                if opening {
-                    inbox.session.clear_toast();
+                if inbox.session.clear_toast_if(notice) {
                     cx.notify();
                 }
             });
@@ -1628,6 +1641,9 @@ impl Inbox {
                 draft.subject = snap.subject;
                 draft.body = snap.body;
                 draft.from = snap.from;
+                draft.reply_context = snap.reply_context;
+                draft.forwarded = snap.forwarded;
+                draft.in_reply_to = snap.in_reply_to.filter(|id| !id.trim().is_empty());
                 Some(draft)
             })
             .collect()
@@ -1724,7 +1740,7 @@ impl Inbox {
                 .try_global::<crate::draft_host::AgentDrafts>()
                 .is_some_and(|drafts| drafts.0.reopen_last());
             if !reopened {
-                self.session.show_toast("no agent review to reopen", false);
+                self.session.show_toast("No agent review to reopen", false);
             }
         }
         if step.compose {
@@ -2357,6 +2373,7 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
 
 fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
     let unread = session.unread_threads();
+    let drafts = session.roles.is(FolderRole::Drafts, folder);
     div()
         .h(px(44.))
         .px(px(16.))
@@ -2402,20 +2419,23 @@ fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
                         .child(name)
                 })),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(if unread > 0 {
-                    theme.accent
-                } else {
-                    theme.dimmed
-                }))
-                .child(if unread == 1 {
-                    "1 unread".to_string()
-                } else {
-                    format!("{unread} unread")
-                }),
-        )
+        // Drafts are not mail to read: no count there.
+        .when(!drafts, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(if unread > 0 {
+                        theme.accent
+                    } else {
+                        theme.dimmed
+                    }))
+                    .child(if unread == 1 {
+                        "1 unread".to_string()
+                    } else {
+                        format!("{unread} unread")
+                    }),
+            )
+        })
 }
 
 fn thread_list(
@@ -2711,19 +2731,11 @@ fn thread_line_one(
         .when(row.has_attachment, |line| {
             line.child(div().text_color(rgb(dim)).child("⧉"))
         })
-        .children(row.labels.iter().take(2).enumerate().map(|(index, label)| {
-            let warn = row.warn && index == 0;
-            div()
-                .flex_shrink_0()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(if warn { theme.error } else { theme.border }))
-                .text_size(px((theme.ui_px - 2.0).max(11.0)))
-                .text_color(rgb(if warn { theme.error } else { dim }))
-                .child(label.clone())
-        }))
+        .children(
+            row.labels.iter().take(2).enumerate().map(|(index, label)| {
+                label_chip(theme, label, row.warn && index == 0, selected, dim)
+            }),
+        )
         .child(div().flex_1())
         .child(
             div()
@@ -2732,6 +2744,35 @@ fn thread_line_one(
                 .child(present::relative_date(now_unix(), row.date_unix)),
         )
 }
+
+/// A label on a row: an outline that fits inside the 22 px line, so all
+/// four of its edges show. A warning is in the error colour, which holds
+/// AA on the selection as well as on the page. On a selected row the
+/// outline is drawn from the selection, so it stays as visible there.
+fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) -> gpui::Div {
+    let size = (theme.ui_px - 2.0).max(11.0);
+    let outline = match (warn, selected) {
+        (true, _) => theme.error,
+        (false, true) => theme::mix(theme.selection, dim, 0.35),
+        (false, false) => theme.border,
+    };
+    div()
+        .flex_shrink_0()
+        .h(px(LABEL_CHIP_PX))
+        .flex()
+        .items_center()
+        .px(px(6.))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(outline))
+        .text_size(px(size))
+        .line_height(px(size + 2.0))
+        .text_color(rgb(if warn { theme.error } else { dim }))
+        .child(label.to_string())
+}
+
+/// A row chip's height, border included: under the 22 px line it sits on.
+const LABEL_CHIP_PX: f32 = 20.;
 
 fn names(
     theme: &Theme,
@@ -2973,7 +3014,8 @@ fn clip_shaped(
     let mut before = shaped.len();
     loop {
         let kept = text_cut::kept(&shaped[..cuts.fit(room, before)]);
-        let cut = shape_ui_line(window, &format!("{kept}…"), weight, color)?;
+        // No space or punctuation before the ellipsis: "Friday…".
+        let cut = shape_ui_line(window, &present::ellipsis(kept), weight, color)?;
         if kept.is_empty() || f32::from(cut.width) <= max_px {
             return Some(cut);
         }
@@ -3296,11 +3338,11 @@ fn expanded_message(
                         .child(message.email.clone()),
                 )
                 .when(!message.folders.is_empty(), |row| {
-                    // A draft that may have gone out says so as its row does.
-                    let warn = message.folders.contains("may have been sent");
+                    // A draft that may have gone out: its row's chip carries
+                    // the warning colour, so this says why once, quietly.
                     row.child(
                         div()
-                            .text_color(rgb(if warn { theme.error } else { dim }))
+                            .text_color(rgb(dim))
                             .text_size(px(theme.ui_px - 1.0))
                             .child(message.folders.clone()),
                     )
@@ -3316,6 +3358,18 @@ fn expanded_message(
             let open = session.recipients_are_open(index);
             recipient_lines(theme, line, open, index, conv_width, live, window, cx)
         }))
+        // What a draft answers, under who it goes to, as in its window.
+        .children(message.context.as_ref().map(|line| {
+            div()
+                .max_w(px(680.))
+                // Close under the recipient line, as one header block.
+                .when(message.recipients.is_some(), |line| line.mt(px(-6.)))
+                .pb(px(10.))
+                .text_size(px(theme.ui_px - 1.0))
+                .text_color(rgb(dim))
+                .truncate()
+                .child(line.clone())
+        }))
         .children({
             // `q` opens every collapsed block in the message at once, so
             // only the first one names the key.
@@ -3324,7 +3378,7 @@ fn expanded_message(
                 .body
                 .blocks
                 .iter()
-                .position(|block| !matches!(block, BodyBlock::Text(_)))
+                .position(|block| matches!(block, BodyBlock::Quote(_) | BodyBlock::Signature(_)))
                 .filter(|_| message.recipients.is_none());
             message
                 .body
@@ -3489,6 +3543,12 @@ fn body_block(
             .pb(px(8.))
             .line_height(px(theme.ui_px * 1.45))
             .child(text.clone())
+            .into_any_element(),
+        BodyBlock::Markdown { doc, agent } => div()
+            .max_w(px(680.))
+            .pb(px(8.))
+            .line_height(px(theme.ui_px * 1.45))
+            .child(crate::compose_ui::render_draft_doc(doc, *agent, theme))
             .into_any_element(),
         BodyBlock::Quote(text) | BodyBlock::Signature(text) => {
             let label = if matches!(block, BodyBlock::Quote(_)) {
