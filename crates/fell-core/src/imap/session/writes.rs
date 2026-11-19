@@ -213,7 +213,7 @@ impl WriteSession {
             "UID SEARCH",
             &format!("UID SEARCH HEADER Message-ID {value}"),
         )?;
-        Ok(search_uids(&reply.untagged))
+        Ok(search_uids(&reply.untagged).unwrap_or_default())
     }
 
     /// The `Message-ID` header of each of the UIDs in the selected mailbox,

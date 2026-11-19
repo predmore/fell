@@ -56,6 +56,75 @@ pub struct ConvMessage {
     /// A draft's "In reply to" or "Forwarding" line, as its compose window
     /// says it. `None` for mail and for a new message.
     pub context: Option<String>,
+    /// Whether sync has downloaded the body. A first sync lists rows from
+    /// their headers, then fills bodies in.
+    pub body_state: fell_core::BodyState,
+}
+
+/// What the conversation says in place of a body it does not have.
+pub fn missing_body_line(state: fell_core::BodyState) -> Option<String> {
+    match state {
+        fell_core::BodyState::Stored => None,
+        fell_core::BodyState::Pending => Some("Not downloaded yet".into()),
+        fell_core::BodyState::TooLarge => Some(format!(
+            "Too large to download (over {} MB)",
+            fell_core::MAX_MESSAGE_BYTES / (1024 * 1024)
+        )),
+    }
+}
+
+/// The open thread has a message whose body sync has not downloaded yet,
+/// whichever it is: each sync write is read again for it.
+pub fn awaiting_bodies(shown: &[ConvMessage]) -> bool {
+    shown
+        .iter()
+        .any(|message| message.body_state == fell_core::BodyState::Pending)
+}
+
+/// A reread of the open thread that only filled in bodies: the same
+/// messages in the same order. Returns the ones whose body changed, for
+/// them to fade in, or `None` when messages came or went.
+pub fn bodies_filled(shown: &[ConvMessage], read: &[ConvMessage]) -> Option<Vec<usize>> {
+    if shown.len() != read.len() || shown.iter().zip(read).any(|(old, new)| old.id != new.id) {
+        return None;
+    }
+    Some(
+        shown
+            .iter()
+            .zip(read)
+            .enumerate()
+            .filter(|(_, (old, new))| old.body != new.body || old.body_state != new.body_state)
+            .map(|(index, _)| index)
+            .collect(),
+    )
+}
+
+/// A conversation that fits before new bodies arrive can reveal the newest
+/// message after layout. In a scrollable conversation every offset is a
+/// possible reading position, including the top.
+pub fn conversation_fits(max_offset: f32) -> bool {
+    max_offset <= 1.0
+}
+
+/// Room a message's start needs on screen to count as in view.
+const START_IN_VIEW_PX: f32 = 48.0;
+
+/// The offset that shows the start of the message at `item_top` (scroll
+/// content coordinates, as GPUI lays them out), or `None` when its start
+/// is in view already and nothing should move.
+pub fn offset_to_show_start(
+    item_top: f32,
+    view_top: f32,
+    view_bottom: f32,
+    offset: f32,
+    max: f32,
+) -> Option<f32> {
+    let on_screen = item_top + offset;
+    if on_screen >= view_top - 0.5 && on_screen <= view_bottom - START_IN_VIEW_PX {
+        return None;
+    }
+    let target = (view_top - item_top).clamp(-max, 0.0);
+    ((target - offset).abs() > 0.5).then_some(target)
 }
 
 /// Who else got a message, for the lines under an expanded message's sender.
@@ -687,6 +756,7 @@ pub fn conversation(
                 expanded: message.unread || index == last,
                 recipients: recipient_line(message, me),
                 context: None,
+                body_state: fell_core::BodyState::Stored,
             }
         })
         .collect()
@@ -1079,6 +1149,97 @@ mod tests {
     use super::*;
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
+
+    fn shown_message(id: &str, state: fell_core::BodyState, body: &str) -> ConvMessage {
+        ConvMessage {
+            id: id.into(),
+            sender: "Ada".into(),
+            email: "ada@x".into(),
+            folders: "Inbox".into(),
+            date_unix: 0,
+            snippet: body.into(),
+            body: render_stored_body(Some(body).filter(|text| !text.is_empty()), body),
+            expanded: true,
+            recipients: None,
+            context: None,
+            body_state: state,
+        }
+    }
+
+    #[test]
+    fn a_reread_that_only_fills_bodies_is_told_apart_from_new_mail() {
+        use fell_core::BodyState::{Pending, Stored};
+        let shown = vec![
+            shown_message("a", Pending, ""),
+            shown_message("b", Pending, ""),
+        ];
+        // Any message, not only the latest.
+        let older = vec![
+            shown_message("a", Stored, "first"),
+            shown_message("b", Pending, ""),
+        ];
+        assert_eq!(bodies_filled(&shown, &older), Some(vec![0]));
+        assert!(awaiting_bodies(&shown));
+        assert!(awaiting_bodies(&older), "the latest still waits");
+        let latest_only = vec![
+            shown_message("a", Pending, ""),
+            shown_message("b", Stored, "second"),
+        ];
+        assert!(awaiting_bodies(&latest_only), "an older one still waits");
+        let both = vec![
+            shown_message("a", Stored, "first"),
+            shown_message("b", Stored, "second"),
+        ];
+        assert_eq!(bodies_filled(&shown, &both), Some(vec![0, 1]));
+        assert!(!awaiting_bodies(&both));
+        let too_large = vec![shown_message("a", fell_core::BodyState::TooLarge, "")];
+        assert!(!awaiting_bodies(&too_large), "nothing more will come");
+        assert_eq!(bodies_filled(&shown, &shown), Some(vec![]));
+        // A message that came or went is not a fill.
+        let more = vec![
+            shown_message("a", Pending, ""),
+            shown_message("b", Pending, ""),
+            shown_message("c", Stored, "new"),
+        ];
+        assert_eq!(bodies_filled(&shown, &more), None);
+    }
+
+    #[test]
+    fn a_body_arriving_moves_the_pane_only_to_show_the_newest_start() {
+        assert!(conversation_fits(0.0));
+        assert!(!conversation_fits(400.0), "keep any reading position");
+        // Viewport 100..700. The newest message starts in view: stay.
+        assert_eq!(offset_to_show_start(300.0, 100.0, 700.0, 0.0, 900.0), None);
+        // Older bodies pushed its start below the fold: glide to it.
+        assert_eq!(
+            offset_to_show_start(1_000.0, 100.0, 700.0, 0.0, 900.0),
+            Some(-900.0)
+        );
+        // Never past the end.
+        assert_eq!(
+            offset_to_show_start(1_000.0, 100.0, 700.0, 0.0, 600.0),
+            Some(-600.0)
+        );
+        // Its start only just peeks in at the bottom: still glide.
+        assert_eq!(
+            offset_to_show_start(680.0, 100.0, 700.0, 0.0, 900.0),
+            Some(-580.0)
+        );
+    }
+
+    #[test]
+    fn a_body_not_downloaded_says_why() {
+        use fell_core::BodyState::{Pending, Stored, TooLarge};
+        assert_eq!(missing_body_line(Stored), None);
+        assert_eq!(
+            missing_body_line(Pending).as_deref(),
+            Some("Not downloaded yet")
+        );
+        assert_eq!(
+            missing_body_line(TooLarge).as_deref(),
+            Some("Too large to download (over 32 MB)")
+        );
+    }
 
     #[test]
     fn a_card_is_as_tall_as_its_items_up_to_its_max() {

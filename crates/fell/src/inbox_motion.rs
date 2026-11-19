@@ -149,6 +149,11 @@ pub struct InboxMotion {
     /// They arrived since the last frame: the fade starts with the frame
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: bool,
+    /// Bodies sync just filled in on the open thread, by message id, and
+    /// their fade. It starts with the frame that first draws them.
+    bodies: Vec<String>,
+    bodies_in: Option<Transition>,
+    bodies_pending: bool,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -201,6 +206,9 @@ impl InboxMotion {
             last_selected: None,
             arrival: None,
             arrival_pending: false,
+            bodies: Vec::new(),
+            bodies_in: None,
+            bodies_pending: false,
             list_from: None,
             conv_from: None,
             card_to: None,
@@ -216,6 +224,9 @@ impl InboxMotion {
         let start = |duration| self.motion.start(duration, now);
         if std::mem::take(&mut self.arrival_pending) {
             self.arrival = start(motion::QUICK);
+        }
+        if std::mem::take(&mut self.bodies_pending) {
+            self.bodies_in = start(motion::FADE);
         }
         if session.toast != self.last_toast {
             match (&session.toast, self.last_toast.take()) {
@@ -388,6 +399,27 @@ impl InboxMotion {
         session.set_messages(messages);
         self.arrival = None;
         self.arrival_pending = true;
+        self.bodies.clear();
+        self.bodies_in = None;
+        self.bodies_pending = false;
+    }
+
+    /// Sync filled in the bodies of `ids` in the open thread: they fade in
+    /// where their "not downloaded" line was, and nothing else moves.
+    pub fn bodies_filled(&mut self, ids: Vec<String>) {
+        self.bodies = ids;
+        self.bodies_in = None;
+        self.bodies_pending = true;
+    }
+
+    /// Opacity of one message's body: 0 to 1 while one sync just filled
+    /// in fades in, else 1.
+    pub fn body_opacity(&self, id: &str, now: Instant) -> f32 {
+        if self.bodies.iter().any(|filled| filled == id) {
+            motion::progress(self.bodies_in.as_ref(), now)
+        } else {
+            1.0
+        }
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -415,6 +447,8 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
+        self.bodies_in = None;
+        self.bodies_pending = false;
         self.unread_out = None;
         Settled {
             list: list.map(|glide| glide.to),
@@ -474,6 +508,7 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
+        running |= keep(&mut self.bodies_in, now);
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -691,6 +726,29 @@ mod tests {
             .status(session, now)
             .notice
             .map(|(_, opacity)| opacity)
+    }
+
+    #[test]
+    fn a_body_filled_in_fades_in_and_nothing_else_does() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let session = session();
+        let now = Instant::now();
+        motion.observe(&session, (true, true), now);
+        motion.bodies_filled(vec!["b".into()]);
+        motion.observe(&session, (true, true), now);
+        assert_eq!(motion.body_opacity("b", now), 0.0);
+        assert_eq!(motion.body_opacity("a", now), 1.0, "other messages stay");
+        let mid = motion.body_opacity("b", later(now, 40));
+        assert!(mid > 0.0 && mid < 1.0, "{mid}");
+        assert!(motion.tick(later(now, 40)));
+        assert!(!motion.tick(later(now, 200)));
+        assert_eq!(motion.body_opacity("b", later(now, 200)), 1.0);
+
+        // Reduced motion: it shows at once.
+        let mut still = InboxMotion::new(Motion::new(false));
+        still.bodies_filled(vec!["b".into()]);
+        still.observe(&session, (true, true), now);
+        assert_eq!(still.body_opacity("b", now), 1.0);
     }
 
     #[test]

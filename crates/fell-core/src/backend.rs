@@ -109,6 +109,23 @@ pub struct MailboxDelta {
     /// Each role's folder, when this pass listed the server's mailboxes.
     /// Replaces the account's stored roles.
     pub roles: Option<crate::folders::FolderRoles>,
+    /// How far a first sync of one folder has come, while one runs.
+    pub progress: Option<SyncProgress>,
+    /// Messages whose body sync read and did not keep, because it is
+    /// larger than sync downloads. Their rows keep their headers and say
+    /// so ([`crate::BodyState::TooLarge`]); later passes do not ask again.
+    pub too_large: Vec<crate::MessageId>,
+}
+
+/// A first sync of one folder, which reads it newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProgress {
+    /// What the UI calls the folder: its role's label, else its own name.
+    pub folder: String,
+    /// Messages read so far, newest first.
+    pub done: u32,
+    /// Messages the folder holds.
+    pub total: u32,
 }
 
 /// Mail transport. IMAP/Proton live behind this trait; the UI never calls them directly.

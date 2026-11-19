@@ -435,10 +435,18 @@ fn handle(
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let count = mailbox.messages.len() as u32;
+                let uid_range = strip_prefix_ignore(&range, "UID ");
+                let upper = match uid_range {
+                    Some(_) => mailbox.messages.last().map_or(0, |message| message.uid),
+                    None => mailbox.messages.len() as u32,
+                };
                 let mut line = String::from("* SEARCH");
                 for (index, message) in mailbox.messages.iter().enumerate() {
-                    if uid_in_range(index as u32 + 1, &range, count) {
+                    let (number, range) = match uid_range {
+                        Some(range) => (message.uid, range),
+                        None => (index as u32 + 1, range.as_str()),
+                    };
+                    if uid_in_range(number, range, upper) {
                         line.push_str(&format!(" {}", message.uid));
                     }
                 }
@@ -551,7 +559,10 @@ fn handle(
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
-                    let revision = if guard.condstore && (condstore_enabled || selected_condstore) {
+                    let revision = if guard.condstore
+                        && (condstore_enabled || selected_condstore)
+                        && (upper_cmd.contains("MODSEQ") || changed_since.is_some())
+                    {
                         format!(" MODSEQ ({})", message.modseq)
                     } else {
                         String::new()
@@ -566,6 +577,40 @@ fn handle(
                             guard.part_write_delay,
                             guard.part_ignores_window,
                         );
+                        continue;
+                    }
+                    if upper_cmd.contains("BODY.PEEK[HEADER]") {
+                        if matches!(message.body_form, BodyForm::Omitted) {
+                            continue;
+                        }
+                        let flags = message.flags.join(" ");
+                        if matches!(message.body_form, BodyForm::Absent) {
+                            let _ = write.write_all(
+                                format!(
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision})\r\n",
+                                    message.uid
+                                )
+                                .as_bytes(),
+                            );
+                            continue;
+                        }
+                        let end = message
+                            .raw
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map_or(message.raw.len(), |at| at + 4);
+                        let header = &message.raw[..end];
+                        let _ = write.write_all(
+                            format!(
+                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}){revision} BODY[HEADER] {{{}}}\r\n",
+                                message.uid,
+                                message.raw.len(),
+                                header.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = write.write_all(header);
+                        let _ = write.write_all(b")\r\n");
                         continue;
                     }
                     if !upper_cmd.contains("BODY") {

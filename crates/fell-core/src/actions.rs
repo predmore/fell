@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS local_action_bodies (
     plain BLOB,
     bulk_headers TEXT NOT NULL DEFAULT '',
     parts_listed INTEGER NOT NULL DEFAULT 0,
+    withheld INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (action_id, message_id),
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
@@ -660,10 +661,12 @@ fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
     conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
-    if !crate::store::bodies::has_column(conn, "local_action_bodies", "parts_listed")? {
-        conn.execute_batch(
-            "ALTER TABLE local_action_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
-        )?;
+    for column in ["parts_listed", "withheld"] {
+        if !crate::store::bodies::has_column(conn, "local_action_bodies", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE local_action_bodies ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -974,7 +977,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
 
 /// Put back the parts a removed row had, replacing any a later sync wrote
 /// for the same id, as the row itself is, with its part list. A row that had
-/// none, or no list, is queued to be fetched again.
+/// no list is queued for backfill unless sync withheld it for size.
 fn restore_bodies(
     conn: &Connection,
     account_id: &AccountId,
@@ -988,10 +991,10 @@ fn restore_bodies(
     ] {
         conn.execute(sql, params![account_id.as_str(), message_id])?;
     }
-    let restored = conn.execute(
+    conn.execute(
         "INSERT INTO message_bodies
-            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed)
-         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+            (account_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
+         SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
          FROM local_action_bodies
          WHERE action_id = ?3 AND message_id = ?2",
         params![account_id.as_str(), message_id, action_id],
@@ -1005,13 +1008,14 @@ fn restore_bodies(
         ),
         params![account_id.as_str(), message_id, action_id],
     )?;
-    let listed = crate::store::bodies::parts_listed(conn, account_id, message_id)?;
-    if restored == 0 || !listed {
-        conn.execute(
-            "INSERT OR IGNORE INTO body_backfill (account_id, message_id) VALUES (?1, ?2)",
-            params![account_id.as_str(), message_id],
-        )?;
-    }
+    conn.execute(
+        "INSERT OR IGNORE INTO body_backfill (account_id, message_id)
+         SELECT ?1, ?2 WHERE NOT EXISTS (
+             SELECT 1 FROM message_bodies WHERE account_id = ?1 AND message_id = ?2
+                 AND (parts_listed = 1 OR withheld = 1)
+         )",
+        params![account_id.as_str(), message_id],
+    )?;
     Ok(())
 }
 
@@ -1460,8 +1464,8 @@ fn insert_snapshot(
         // them for undo as stored.
         conn.execute(
             "INSERT INTO local_action_bodies
-                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed)
-             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed
+                (action_id, message_id, codec, html, plain, bulk_headers, parts_listed, withheld)
+             SELECT ?1, message_id, codec, html, plain, bulk_headers, parts_listed, withheld
              FROM message_bodies
              WHERE account_id = ?2 AND message_id = ?3",
             params![action_id, account_id.as_str(), plan.before.message_id],
@@ -3222,6 +3226,40 @@ mod tests {
         store
             .delete_thread(&account("a1"), thread, FOLDER_TRASH)
             .unwrap()
+    }
+
+    #[test]
+    fn undo_of_expunge_restores_the_size_limit_marker_without_backfill() {
+        let store = open(&[("a1", "a@x")]);
+        let account = account("a1");
+        let mut note = sample("a1", "note@x", "Note", "");
+        note.remote_id = crate::RemoteId("imap:7:1:INBOX".into());
+        note.body_text = None;
+        note.snippet.clear();
+        let thread = store.upsert_message(&note).unwrap();
+        let id = note.headers.message_id;
+        let ids = [id];
+        store
+            .apply_delta(
+                &account,
+                &MailboxDelta {
+                    too_large: ids.to_vec(),
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.body_states(&account, &ids).unwrap(),
+            [crate::BodyState::TooLarge]
+        );
+
+        expunge(&store, &thread);
+        store.undo(&account).unwrap();
+        assert_eq!(
+            store.body_states(&account, &ids).unwrap(),
+            [crate::BodyState::TooLarge]
+        );
+        assert!(!queued(&store, "note@x"));
     }
 
     #[test]

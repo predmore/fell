@@ -1658,6 +1658,17 @@ fn a_seen_conflict_only_rebases_a_later_star_with_compatible_flag_evidence() {
         }
         let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
         let alpha = fx.thread("INBOX", "Alpha");
+        // An earlier local-only edit can leave the row different from a
+        // server copy. Set that up without depending on the sync order.
+        fx.store.set_write_back(&fx.account.id, false).unwrap();
+        let (unread, starred) = fx.local_flags(&alpha);
+        if !unread {
+            fx.flag(&alpha, FlagChange::Unread);
+        }
+        if starred {
+            fx.flag(&alpha, FlagChange::Unstar);
+        }
+        fx.store.set_write_back(&fx.account.id, true).unwrap();
         fx.flag(&alpha, FlagChange::Read);
         fx.flag(&alpha, FlagChange::Star);
         {

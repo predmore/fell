@@ -86,6 +86,21 @@ pub struct Message {
     pub parts: Option<MessageParts>,
 }
 
+/// Whether a stored message has its body, for a reader to tell a message
+/// still on its way from one that is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BodyState {
+    /// The body is stored (it may be empty, as sent).
+    #[default]
+    Stored,
+    /// Only the headers are stored: a first sync lists rows before it
+    /// downloads their bodies, and a later pass fetches what is missing.
+    Pending,
+    /// Sync looked and kept no body: the message is larger than sync
+    /// downloads. Its row stays, with its headers.
+    TooLarge,
+}
+
 /// What a received message shows in the conversation view: its HTML and
 /// plain-text parts, decoded and otherwise as sent, plus the few headers the
 /// renderer uses to spot bulk mail. HTML is untrusted and is sanitized when
