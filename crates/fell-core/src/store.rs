@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use crate::embed::{
     Embedding, dequeue_message, enqueue_message, invalidate_message_embedding,
     remove_message_embedding,
 };
-use crate::folders::FolderRoles;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses, is_short_reply_body,
@@ -655,7 +656,8 @@ impl Store {
             let Some(message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
-            insert_message(&tx, &message)?;
+            // A combined delta can carry the listing for these messages.
+            insert_message(&tx, &message, delta.roles.as_ref())?;
         }
         let inserted = !delta.messages.is_empty();
         for message_id in &delta.too_large {
@@ -761,7 +763,7 @@ impl Store {
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
         let tx = immediate_transaction(&self.conn)?;
-        insert_message(&tx, message)?;
+        insert_message(&tx, message, None)?;
         self.rethread_written(&tx, &message.account_id)?;
         let thread_id =
             thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
@@ -1269,10 +1271,7 @@ impl Store {
     /// (the demo mailbox, or mail stored before roles were recorded) gets
     /// [`FolderRoles::from_names`] over its stored folders.
     pub fn folder_roles(&self, account_id: &AccountId) -> Result<FolderRoles> {
-        if let Some(found) = roles::listed(&self.conn, account_id)? {
-            return Ok(found);
-        }
-        Ok(FolderRoles::from_names(&self.folder_names(account_id)?))
+        Ok(folder_roles_on(&self.conn, account_id, None, &[])?.into_owned())
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -2060,13 +2059,41 @@ fn canonical_id_on(
         .map_err(Into::into)
 }
 
-fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
-    let thread = insert_arrival(conn, message)?;
+fn folder_roles_on<'a>(
+    conn: &Connection,
+    account_id: &AccountId,
+    listing: Option<&'a FolderRoles>,
+    incoming_folders: &[String],
+) -> Result<Cow<'a, FolderRoles>> {
+    let recorded = match listing {
+        Some(found) if !found.is_empty() => return Ok(Cow::Borrowed(found)),
+        Some(_) => None,
+        None => roles::listed(conn, account_id)?,
+    };
+    if let Some(found) = recorded {
+        return Ok(Cow::Owned(found));
+    }
+    let mut names = summaries::folder_names(conn, account_id)?;
+    // The incoming copy may be the first message seen in this folder.
+    names.extend_from_slice(incoming_folders);
+    Ok(Cow::Owned(FolderRoles::from_names(&names)))
+}
+
+fn insert_message(
+    conn: &Connection,
+    message: &Message,
+    listing: Option<&FolderRoles>,
+) -> Result<ThreadId> {
+    let thread = insert_arrival(conn, message, listing)?;
     copies::record(conn, message)?;
     Ok(thread)
 }
 
-fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
+fn insert_arrival(
+    conn: &Connection,
+    message: &Message,
+    listing: Option<&FolderRoles>,
+) -> Result<ThreadId> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2079,13 +2106,14 @@ fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
                 &fingerprint,
                 Some(&stored.canonical_id),
                 false,
+                listing,
             )?
         {
             return absorb_duplicate(conn, message, &stored, &other);
         }
         return write_kept(conn, message, &stored, via_alias, &[], &[]);
     }
-    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false)? {
+    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, listing)? {
         remember_alias(conn, message, &stored.canonical_id)?;
         return write_kept(conn, message, &stored, true, &[], &[]);
     }
@@ -2618,6 +2646,7 @@ fn find_list_collapse(
     fingerprint: &str,
     exclude: Option<&str>,
     unlabeled_ok: bool,
+    listing: Option<&FolderRoles>,
 ) -> Result<Option<Arrival>> {
     if fingerprint.is_empty() {
         return Ok(None);
@@ -2631,13 +2660,34 @@ fn find_list_collapse(
         params![message.account_id.as_str(), fingerprint],
         map_arrival,
     )?;
+    let incoming_list = clean_list_id(&message.list_id).is_some();
+    let mut roles = None;
     let mut matches = Vec::new();
     for row in rows {
         let stored = row?;
-        if exclude == Some(stored.canonical_id.as_str()) {
+        let stored_list = list_is_set(&stored.list_id);
+        if exclude == Some(stored.canonical_id.as_str())
+            || (!incoming_list && !stored_list && !unlabeled_ok)
+            || !same_sender(&message.headers.from.email, &stored.from_email)
+            || !dates_within_echo_window(stored.date_unix, message.headers.date_unix)
+            || !proton_compatible(
+                &stored.proton_conversation_id,
+                &message.headers.proton_conversation_id,
+            )
+        {
             continue;
         }
-        if is_fingerprint_echo(message, &stored, unlabeled_ok) {
+        // A repeated body alone does not need a folder-role lookup.
+        let roles = match &roles {
+            Some(found) => found,
+            None => roles.insert(folder_roles_on(
+                conn,
+                &message.account_id,
+                listing,
+                &message.folders,
+            )?),
+        };
+        if is_fingerprint_echo(message, &stored, incoming_list, stored_list, roles) {
             matches.push(stored);
         }
     }
@@ -2783,8 +2833,14 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             if via_alias || alias_points_at(&tx, &message.account_id, &stored.canonical_id)? {
                 continue;
             }
-            let Some(other) =
-                find_list_collapse(&tx, message, &fingerprint, Some(&stored.canonical_id), true)?
+            let Some(other) = find_list_collapse(
+                &tx,
+                message,
+                &fingerprint,
+                Some(&stored.canonical_id),
+                true,
+                None,
+            )?
             else {
                 continue;
             };
@@ -2922,22 +2978,17 @@ fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str
     Ok(hit.is_some())
 }
 
-fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool) -> bool {
-    let incoming_list = clean_list_id(&incoming.list_id).is_some();
-    let stored_list = list_is_set(&stored.list_id);
+fn is_fingerprint_echo(
+    incoming: &Message,
+    stored: &Arrival,
+    incoming_list: bool,
+    stored_list: bool,
+    roles: &FolderRoles,
+) -> bool {
     // Old rows have no list id. Join those only when one copy is in Sent and
     // the other subject still has a list tag for the same underlying subject.
     // Two plain messages with the same body stay apart.
-    let listed =
-        incoming_list || stored_list || (unlabeled_ok && unlabeled_sent_and_list(incoming, stored));
-    if !same_sender(&incoming.headers.from.email, &stored.from_email)
-        || !dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
-        || !listed
-        || !proton_compatible(
-            &stored.proton_conversation_id,
-            &incoming.headers.proton_conversation_id,
-        )
-    {
+    if !incoming_list && !stored_list && !unlabeled_sent_and_list(incoming, stored, roles) {
         return false;
     }
     // `+1` from the same sender is not one send. A Sent copy and its echo of
@@ -2945,9 +2996,9 @@ fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool)
     // joins a Sent copy only when the subject key matches.
     match incoming.body_text.as_deref() {
         Some(body) if is_short_reply_body(body) => {
-            short_reply_is_one_post(incoming, stored, incoming_list, stored_list)
+            short_reply_is_one_post(incoming, stored, incoming_list, stored_list, roles)
         }
-        _ => list_echo_matches(incoming, stored, incoming_list, stored_list),
+        _ => list_echo_matches(incoming, stored, incoming_list, stored_list, roles),
     }
 }
 
@@ -2963,6 +3014,7 @@ fn short_reply_is_one_post(
     stored: &Arrival,
     incoming_list: bool,
     stored_list: bool,
+    roles: &FolderRoles,
 ) -> bool {
     if incoming_list && stored_list {
         return false;
@@ -2973,13 +3025,8 @@ fn short_reply_is_one_post(
     if !short_parents_match(incoming, stored) {
         return false;
     }
-    let incoming_sent = incoming
-        .folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
-    let stored_sent = split_field(&stored.folders)
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
+    let incoming_sent = copy_in_sent(&incoming.folders, roles);
+    let stored_sent = copy_in_sent(&split_field(&stored.folders), roles);
     if incoming_sent && stored_sent {
         return false;
     }
@@ -3016,9 +3063,10 @@ fn list_echo_matches(
     stored: &Arrival,
     incoming_list: bool,
     stored_list: bool,
+    roles: &FolderRoles,
 ) -> bool {
     let same_subject = subject_key(&incoming.headers.subject) == subject_key(&stored.subject);
-    if list_copy_joins_sent_copy(incoming, stored, incoming_list, stored_list) {
+    if list_copy_joins_sent_copy(incoming, stored, incoming_list, stored_list, roles) {
         return same_subject;
     }
     same_subject && parents_match(incoming, stored)
@@ -3034,12 +3082,13 @@ fn list_copy_joins_sent_copy(
     stored: &Arrival,
     incoming_list: bool,
     stored_list: bool,
+    roles: &FolderRoles,
 ) -> bool {
     if incoming_list && stored_list {
         return false;
     }
-    let incoming_sent = copy_in_sent(&incoming.folders);
-    let stored_sent = copy_in_sent(&split_field(&stored.folders));
+    let incoming_sent = copy_in_sent(&incoming.folders, roles);
+    let stored_sent = copy_in_sent(&split_field(&stored.folders), roles);
     if incoming_sent == stored_sent {
         return false;
     }
@@ -3066,15 +3115,15 @@ fn parents_match(incoming: &Message, stored: &Arrival) -> bool {
     }
 }
 
-fn copy_in_sent(folders: &[String]) -> bool {
+fn copy_in_sent(folders: &[String], roles: &FolderRoles) -> bool {
     folders
         .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"))
+        .any(|folder| roles.is(FolderRole::Sent, folder))
 }
 
-fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival) -> bool {
-    let incoming_sent = copy_in_sent(&incoming.folders);
-    let stored_sent = copy_in_sent(&split_field(&stored.folders));
+fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival, roles: &FolderRoles) -> bool {
+    let incoming_sent = copy_in_sent(&incoming.folders, roles);
+    let stored_sent = copy_in_sent(&split_field(&stored.folders), roles);
     if incoming_sent == stored_sent {
         return false;
     }
@@ -3991,6 +4040,7 @@ mod tests {
     use super::*;
     use crate::MailboxDelta;
     use crate::backend::SyncCursor;
+    use crate::folders::ListedMailbox;
 
     fn account() -> Account {
         Account {
@@ -6784,6 +6834,139 @@ mod tests {
         assert!(later.folders.iter().any(|folder| folder == "Sent"));
         assert_eq!(later.remote_id.0, "imap:sent-2");
         assert_ne!(kept.remote_id.0, "imap:sent-2");
+    }
+
+    fn gmail_sent_listing() -> ListedMailbox {
+        ListedMailbox {
+            name: "[Gmail]/Sent Mail".into(),
+            raw: "[Gmail]/Sent Mail".into(),
+            delimiter: Some('/'),
+            attributes: vec!["\\Sent".into()],
+        }
+    }
+
+    #[test]
+    fn short_list_echoes_recognize_sent_folders_in_either_arrival_order() {
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        for (folder, listing) in [
+            ("sEnT", None),
+            ("Sent Items", None),
+            ("INBOX.Sent", None),
+            ("[gmail]/Sent Mail", Some(&gmail_roles)),
+        ] {
+            for sent_first in [true, false] {
+                let store = Store::open_in_memory().unwrap();
+                store.upsert_account(&account()).unwrap();
+                if let Some(roles) = listing {
+                    store
+                        .apply_delta(
+                            &account().id,
+                            &MailboxDelta {
+                                roles: Some(roles.clone()),
+                                ..MailboxDelta::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                let mut sent = msg("sent@x", None, Some("patch@x"), "Re: Patch", "+1");
+                sent.folders = vec![folder.into()];
+                let mut echo = msg("list@x", None, Some("patch@x"), "[list] Re: Patch", "+1");
+                echo.folders = vec!["INBOX".into()];
+                echo.list_id = Some("list.example".into());
+                let (first, second) = if sent_first {
+                    (sent, echo)
+                } else {
+                    (echo, sent)
+                };
+                store.upsert_message(&first).unwrap();
+                store.upsert_message(&second).unwrap();
+
+                let rows = listed(&store);
+                assert_eq!(rows.len(), 1, "{folder}, sent first: {sent_first}");
+                assert_eq!(rows[0].headers.message_id, first.headers.message_id);
+                assert_eq!(
+                    rows[0].folders,
+                    [first.folders[0].clone(), second.folders[0].clone()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_list_echoes_require_exactly_one_copy_in_the_sent_role() {
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        for (original_folder, echo_folder) in [
+            ("Sent", "INBOX"),
+            ("[Gmail]/Sent Mail", "[Gmail]/Sent Mail"),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            store.upsert_account(&account()).unwrap();
+            let mut original = msg("sent@x", None, Some("patch@x"), "Re: Patch", "+1");
+            original.folders = vec![original_folder.into()];
+            let mut echo = msg("list@x", None, Some("patch@x"), "[list] Re: Patch", "+1");
+            echo.folders = vec![echo_folder.into()];
+            echo.list_id = Some("list.example".into());
+            store
+                .apply_delta(
+                    &account().id,
+                    &MailboxDelta {
+                        roles: Some(gmail_roles.clone()),
+                        messages: vec![original, echo],
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(listed(&store).len(), 2, "{original_folder}, {echo_folder}");
+        }
+    }
+
+    #[test]
+    fn long_list_echo_uses_the_sent_override_from_its_delta() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let roles = FolderRoles::detect(
+            &[gmail_sent_listing()],
+            &[(FolderRole::Sent, "Envoyés".into())],
+        );
+        let (mut sent, mut echo) = sent_a_and_list_b();
+        sent.folders = vec!["Envoyés".into()];
+        echo.headers.subject = "[list] Re: Patch".into();
+        store
+            .apply_delta(
+                &account().id,
+                &MailboxDelta {
+                    roles: Some(roles),
+                    messages: vec![sent, echo],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].headers.message_id.as_str(), "sent-a@x");
+        assert_eq!(rows[0].folders, ["Envoyés", "INBOX"]);
+    }
+
+    #[test]
+    fn backfill_joins_an_unlabeled_list_echo_from_sent_items() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (mut sent, mut echo) = sent_a_and_list_b();
+        sent.folders = vec!["Sent Items".into()];
+        echo.headers.subject = "[list] Re: Patch".into();
+        echo.list_id = None;
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(listed(&store).len(), 2);
+
+        merge_backfilled_duplicates(&store.conn).unwrap();
+
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].folders.contains(&"Sent Items".into()));
+        assert!(rows[0].folders.contains(&"INBOX".into()));
     }
 
     #[test]
