@@ -307,7 +307,10 @@ impl BodyLoads {
     /// needs loading. Returns the cached images' owners that were evicted.
     pub fn accept(
         &mut self,
-        BodyReads { mut stamps, prepared }: BodyReads,
+        BodyReads {
+            mut stamps,
+            prepared,
+        }: BodyReads,
         cache: &mut BodyCache,
         messages: &mut [ConvMessage],
     ) -> Vec<Arc<HtmlBody>> {

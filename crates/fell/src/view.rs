@@ -2,7 +2,7 @@
 
 mod disclosure;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1184,9 +1184,7 @@ impl Inbox {
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
                     Ok((mut view, reads)) => {
-                        let evicted = inbox
-                            .body_loads
-                            .accept(reads, &mut inbox.bodies, &mut view);
+                        let evicted = inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         Self::drop_body_images(evicted, cx);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());

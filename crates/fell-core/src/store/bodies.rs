@@ -964,7 +964,8 @@ mod tests {
         let account = account();
         let stamp = || store.stored_part_kinds(&account.id, &["n@x"]).unwrap()["n@x"].stamp;
         let sizes = || -> [i64; 3] {
-            let sql = "SELECT length(html), length(plain), length(bulk_headers) FROM message_bodies";
+            let sql =
+                "SELECT length(html), length(plain), length(bulk_headers) FROM message_bodies";
             store
                 .conn
                 .query_row(sql, [], |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]))
