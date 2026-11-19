@@ -36,6 +36,9 @@ use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
+mod flags;
+pub use flags::FlagChange;
+
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
 
@@ -160,6 +163,10 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    Read,
+    Unread,
+    Star,
+    Unstar,
 }
 
 impl ActionKind {
@@ -169,6 +176,10 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::Read => "read",
+            Self::Unread => "unread",
+            Self::Star => "star",
+            Self::Unstar => "unstar",
         }
     }
 
@@ -178,8 +189,17 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "read" => Ok(Self::Read),
+            "unread" => Ok(Self::Unread),
+            "star" => Ok(Self::Star),
+            "unstar" => Ok(Self::Unstar),
             _ => Err(Error::Action(format!("unknown action {raw}"))),
         }
+    }
+
+    /// Read, unread, or star: the thread stays in its folder.
+    pub fn is_flag(self) -> bool {
+        matches!(self, Self::Read | Self::Unread | Self::Star | Self::Unstar)
     }
 }
 
@@ -353,7 +373,8 @@ impl Store {
         })
     }
 
-    /// Restore the latest archive, move, label, or delete on this account.
+    /// Restore the latest archive, move, label, delete, read, unread, or
+    /// star on this account.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
@@ -361,12 +382,16 @@ impl Store {
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        let rows = load_snapshots(&tx, action.id)?;
-        if rows.is_empty() {
-            return Err(Error::Action("action has no messages".into()));
-        }
-        for row in &rows {
-            restore_row(&tx, account_id, row)?;
+        if action.kind.is_flag() {
+            flags::undo(&tx, account_id, action.id)?;
+        } else {
+            let rows = load_snapshots(&tx, action.id)?;
+            if rows.is_empty() {
+                return Err(Error::Action("action has no messages".into()));
+            }
+            for row in &rows {
+                restore_row(&tx, account_id, row)?;
+            }
         }
         crate::outbox::undo_action(&tx, account_id, action.id)?;
         tx.execute(
@@ -499,6 +524,7 @@ impl Store {
 
 fn ensure_action_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(ACTION_SCHEMA)?;
+    conn.execute_batch(flags::FLAG_SCHEMA)?;
     ensure_snapshot_columns(conn)?;
     if !crate::store::bodies::has_column(conn, "local_action_bodies", "parts_listed")? {
         conn.execute_batch(

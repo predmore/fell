@@ -688,6 +688,17 @@ impl crate::Store {
                 ],
             )?;
         }
+        // Sync keeps a read state an agent set until the server agrees, and
+        // a star until write-back sends it (sync does not read stars yet).
+        for (old, new) in &writes {
+            crate::store::intents::record(
+                &tx,
+                account_id,
+                &new.message_id,
+                (old.unread != new.unread).then_some(new.unread != 0),
+                (old.starred != new.starred).then_some(new.starred != 0),
+            )?;
+        }
         tx.commit()?;
         self.seal_private_files()?;
         Ok(Some(action))
@@ -1035,6 +1046,8 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> R
         saved.push(row?);
     }
     drop(stmt);
+    // Undo restores a read state and a star; sync keeps them as intents.
+    let flag_states = flag_changes(conn, account_id, action_id)?;
     for (message_id, labels, folders, unread, archived, snooze_until, starred) in saved {
         // A row logged before stars were recorded has no star to restore.
         conn.execute(
@@ -1054,7 +1067,41 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action_id: i64) -> R
             ],
         )?;
     }
+    for (message_id, unread, starred) in flag_states {
+        crate::store::intents::record(conn, account_id, &message_id, unread, starred)?;
+    }
     Ok(())
+}
+
+/// Messages whose read state or star undo of `action_id` changes, as
+/// `(id, unread, starred)`; `None` where that flag stays as it is. A row
+/// logged before stars were recorded restores no star.
+type FlagRestore = (String, Option<bool>, Option<bool>);
+
+fn flag_changes(
+    conn: &Connection,
+    account_id: &AccountId,
+    action_id: i64,
+) -> Result<Vec<FlagRestore>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.message_id,
+                CASE WHEN m.unread != s.unread THEN s.unread END,
+                CASE WHEN s.starred IS NOT NULL AND m.starred != s.starred
+                     THEN s.starred END
+         FROM agent_action_messages s
+         JOIN messages m ON m.account_id = ?2 AND m.message_id = s.message_id
+         WHERE s.action_id = ?1
+           AND (m.unread != s.unread
+                OR (s.starred IS NOT NULL AND m.starred != s.starred))",
+    )?;
+    let rows = stmt.query_map(params![action_id, account_id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?.map(|unread| unread != 0),
+            row.get::<_, Option<i64>>(2)?.map(|starred| starred != 0),
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
 fn undo_draft(conn: &Connection, account_id: &AccountId, action_id: i64) -> Result<()> {

@@ -1,6 +1,7 @@
 //! Leader chords, which-key, and the command palette index.
 //!
-//! `m` moves the thread out of the current folder. `e` archives it. `u` undoes either.
+//! `m` moves the thread out of the current folder. `e` archives it. `U` marks
+//! it read or unread and `s` stars it. `u` undoes any of these.
 
 use std::fmt::Write as _;
 
@@ -39,6 +40,8 @@ pub enum Action {
     FolderPicker,
     Move,
     Archive,
+    ToggleUnread,
+    ToggleStar,
     Undo,
     SyncNow,
     ToggleSelect,
@@ -71,6 +74,8 @@ impl Action {
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
+            Self::ToggleUnread => "Mark unread or read",
+            Self::ToggleStar => "Star or unstar",
             Self::Undo => "Undo",
             Self::SyncNow => "Sync now",
             Self::ToggleSelect => "Toggle select",
@@ -88,7 +93,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 27] = [
+const ALL_ACTIONS: [Action; 29] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -107,6 +112,8 @@ const ALL_ACTIONS: [Action; 27] = [
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
+    Action::ToggleUnread,
+    Action::ToggleStar,
     Action::Undo,
     Action::SyncNow,
     Action::ToggleSelect,
@@ -203,6 +210,8 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('f')], Action::Forward, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
+    bind(&[KeyId::Char('U')], Action::ToggleUnread, None);
+    bind(&[KeyId::Char('s')], Action::ToggleStar, None);
     bind(&[KeyId::Char('u')], Action::Undo, None);
     bind(&[KeyId::Char('x')], Action::ToggleSelect, None);
     bind(&[KeyId::Char('V')], Action::Visual, None);

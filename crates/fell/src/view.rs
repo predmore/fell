@@ -25,10 +25,11 @@ use crate::inbox_motion::{InboxMotion, PaneEntry, StatusMotion};
 use crate::keymap::KeyId;
 use crate::mailbox;
 use crate::model::{
-    DRAFT_NOT_THREAD, Fetch, Overlay, QueryFault, Session, Step, SyncKind, Toast, row_key,
+    DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, Session, Step, SyncKind, Toast, row_key,
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
-use crate::present::{self, ConvMessage, NameSpan, Pane, ThreadRow};
+use crate::present::{self, ConvMessage, Pane, ThreadRow};
+use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncHandle};
 use crate::text_cut;
@@ -202,6 +203,17 @@ struct Inbox {
     /// Threads taken out of the list whose archive or move has not landed.
     /// A read that started before the write cannot paint them back.
     pending_removals: std::collections::HashSet<String>,
+    /// Read and star shown on rows before their write lands, by thread id:
+    /// `(write, unread, starred)`. A read that started before the write
+    /// cannot paint the old state back. Only the latest write clears it.
+    pending_flags: std::collections::HashMap<String, (u64, bool, bool)>,
+    /// Bumped by every read or star write.
+    flag_gen: u64,
+    /// Names and subject widths of the rows on screen, kept so a row
+    /// marked read or unread does not move.
+    row_widths: RowWidths,
+    /// When a timer wakes the view for a subject box to relax.
+    relax_wake: Option<Instant>,
     /// Bumped by every conversation read. The store thread skips a read that
     /// is already stale, so holding `j` does not build a backlog.
     conv_gen: Arc<AtomicU64>,
@@ -261,8 +273,10 @@ impl Inbox {
         } else {
             SyncKind::LocalOffline
         };
+        let motion = Motion::from_env();
         let mut session = Session::new(name, email, initial, startup.keymap);
         session.loading = true;
+        session.read_dwell_ms = startup.read_dwell_ms;
         if let Some(error) = startup.error {
             session.record_startup_error(error);
         }
@@ -291,10 +305,14 @@ impl Inbox {
             read_gen: 0,
             read_wanted: None,
             pending_removals: std::collections::HashSet::new(),
+            pending_flags: std::collections::HashMap::new(),
+            flag_gen: 0,
+            row_widths: RowWidths::new(motion),
+            relax_wake: None,
             conv_gen: Arc::new(AtomicU64::new(0)),
             draft_home,
             drafts: Vec::new(),
-            motion: InboxMotion::new(Motion::from_env()),
+            motion: InboxMotion::new(motion),
             frame_now: Instant::now(),
             frames: FrameLog::from_env(),
             warm: None,
@@ -573,6 +591,20 @@ impl Inbox {
                 .count();
             unread = unread.saturating_sub(hidden_unread);
             rows.retain(|row| !self.pending_removals.contains(&row.id));
+            for row in &mut rows {
+                let Some(&(_, now_unread, starred)) = self.pending_flags.get(&row.id) else {
+                    continue;
+                };
+                if row.unread != now_unread {
+                    unread = if now_unread {
+                        unread + 1
+                    } else {
+                        unread.saturating_sub(1)
+                    };
+                }
+                row.unread = now_unread;
+                row.starred = starred;
+            }
         }
         // New mail moved the selected thread outside the rows read (they do
         // not reach the top of the folder). Read the rows around it, as undo
@@ -593,6 +625,7 @@ impl Inbox {
         self.list_folder = folder;
         if switched {
             self.session.forget_window();
+            self.row_widths.clear();
             if let Some(id) = &self.session.cursor_id
                 && !rows.iter().any(|row| &row.id == id)
             {
@@ -781,6 +814,7 @@ impl Inbox {
                                         index,
                                         look,
                                         text_width,
+                                        still_frame(&chunk[index], window),
                                         window,
                                         cx,
                                     )
@@ -886,6 +920,20 @@ impl Inbox {
         let start = (top / row).floor() as usize;
         let shown = (f32::from(size.item.height) / row).ceil() as usize + 1;
         let end = start.saturating_add(shown).min(self.session.threads.len());
+        (start < end).then_some(start..end)
+    }
+
+    /// Rows the list viewport shows whole: a row cut off at an edge is not
+    /// one the reader can be expected to see change.
+    fn whole_rows_in_view(&self) -> Option<std::ops::Range<usize>> {
+        let row = self.list_row_height()?;
+        let state = self.list_scroll.0.borrow();
+        let size = state.last_item_size?;
+        let top = (-f32::from(state.base_handle.offset().y)).max(0.0);
+        let bottom = top + f32::from(size.item.height);
+        // A hair of slack, so float error never drops a row that fits.
+        let start = ((top - 0.5) / row).ceil().max(0.0) as usize;
+        let end = (((bottom + 0.5) / row).floor() as usize).min(self.session.threads.len());
         (start < end).then_some(start..end)
     }
 
@@ -1056,10 +1104,35 @@ impl Inbox {
         }
     }
 
+    /// A row's subject box is waiting to ease back to its text
+    /// ([`row_widths::REST`]): wake the view when it is due. Nothing else
+    /// draws a frame while the window is idle.
+    fn wake_for_relax(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let Some(wait) = self.row_widths.next_relax(now) else {
+            return;
+        };
+        let due = Instant::now() + wait;
+        if self.relax_wake.is_some_and(|wake| wake <= due) {
+            return;
+        }
+        self.relax_wake = Some(due);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.relax_wake == Some(due) {
+                    inbox.relax_wake = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// A key arrived: jump every transition to its end state first.
     fn settle_motion(&mut self) {
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
+        self.row_widths.settle();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }
@@ -1167,10 +1240,10 @@ impl Inbox {
     }
 
     /// Run a mailbox change on the store thread, then reread the folder.
-    fn change_mailbox(
+    fn change_mailbox<T: Send + 'static>(
         &mut self,
-        change: impl FnOnce(&fell_core::Store) -> Result<(), fell_core::Error> + Send + 'static,
-        done: impl FnOnce(&mut Self, Result<(), fell_core::Error>) -> Option<ReadIntent> + 'static,
+        change: impl FnOnce(&fell_core::Store) -> Result<T, fell_core::Error> + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<T, fell_core::Error>) -> Option<ReadIntent> + 'static,
         cx: &mut Context<Self>,
     ) {
         let reply = self.store.call(change);
@@ -1248,6 +1321,7 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         if inbox.theme != next {
                             inbox.theme = next;
+                            inbox.row_widths.clear();
                             cx.notify();
                         }
                     })
@@ -1406,14 +1480,20 @@ impl Inbox {
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
         self.change_mailbox(
-            move |store| store.undo(&account).map(|_| ()),
+            move |store| store.undo(&account).map(|action| action.kind),
             |inbox, result| match result {
-                Ok(()) => {
+                Ok(kind) => {
                     inbox.session.show_toast("Undone", false);
                     inbox.send_to_server();
+                    // Read and star leave the thread where it is; the thread
+                    // `m` or `e` took away waits for its own undo.
                     Some(ReadIntent {
                         changed: true,
-                        select: inbox.moved_thread.take(),
+                        select: if kind.is_flag() {
+                            None
+                        } else {
+                            inbox.moved_thread.take()
+                        },
                         ..ReadIntent::default()
                     })
                 }
@@ -1429,6 +1509,65 @@ impl Inbox {
             },
             cx,
         );
+    }
+
+    /// Write a read, unread, or star the rows already show. A failure says
+    /// so and rereads the folder, so the rows go back to what is stored.
+    fn apply_flags(&mut self, edit: FlagEdit, cx: &mut Context<Self>) {
+        self.flag_gen += 1;
+        let generation = self.flag_gen;
+        for row in self
+            .session
+            .threads
+            .iter()
+            .filter(|row| edit.ids.contains(&row.id))
+        {
+            self.pending_flags
+                .insert(row.id.clone(), (generation, row.unread, row.starred));
+        }
+        let account = self.account_id.clone();
+        let folder = self.list_folder.clone();
+        let threads: Vec<ThreadId> = edit.ids.iter().cloned().map(ThreadId).collect();
+        let change = edit.change;
+        let ids = edit.ids;
+        self.change_mailbox(
+            move |store| {
+                store
+                    .flag_threads(&account, &threads, &folder, change)
+                    .map(|_| ())
+            },
+            move |inbox, result| {
+                inbox
+                    .pending_flags
+                    .retain(|id, (written, _, _)| !(ids.contains(id) && *written == generation));
+                if let Err(err) = result {
+                    inbox.session.show_toast(err.to_string(), true);
+                }
+                Some(ReadIntent {
+                    changed: true,
+                    ..ReadIntent::default()
+                })
+            },
+            cx,
+        );
+    }
+
+    /// Opened with a read delay: mark the thread read if it is still open
+    /// when the delay runs out.
+    fn read_after(&mut self, id: String, generation: u64, cx: &mut Context<Self>) {
+        let delay = self.session.read_dwell_ms;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(delay))
+                .await;
+            let _ = this.update(cx, |inbox, cx| {
+                if let Some(edit) = inbox.session.read_after_dwell(&id, generation) {
+                    inbox.apply_flags(edit, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// `c` (no id) or Enter on a draft row: bring the compose window up on
@@ -1710,6 +1849,15 @@ impl Inbox {
         let message_before = self.session.message_cursor;
         let thread_before = self.session.cursor_id.clone();
         let folder_before = self.session.folder.clone();
+        // `U` and `s` say what they did only when the row is not on screen.
+        let width = f32::from(window.viewport_size().width);
+        let (show_list, _) =
+            present::visible_panes(width, self.session.pane, self.session.full_width);
+        self.session.rows_in_view = if show_list {
+            self.whole_rows_in_view()
+        } else {
+            None
+        };
         self.session.clear_toast();
         let step = self.session.on_key(key, page);
         self.apply_step(step, message_before, thread_before, folder_before, cx);
@@ -1731,6 +1879,12 @@ impl Inbox {
         }
         if step.undo {
             self.apply_undo(cx);
+        }
+        if let Some(edit) = step.flags.clone() {
+            self.apply_flags(edit, cx);
+        }
+        if let Some((id, generation)) = step.read_after.clone() {
+            self.read_after(id, generation, cx);
         }
         if step.archive {
             self.archive_current(cx);
@@ -2009,6 +2163,9 @@ impl Inbox {
     fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
         self.cancel_pending_keys(cx);
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
+        if changed || self.session.pane != Pane::List {
+            self.session.cancel_read_delay();
+        }
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
         if changed {
@@ -2032,7 +2189,8 @@ impl Render for Inbox {
         self.motion
             .fit_card(card_fit(&self.session, viewport_h), now);
         self.advance_glides(now, window.scale_factor());
-        let animating = self.motion.tick(now);
+        let animating = self.motion.tick(now) | self.row_widths.running(now);
+        self.wake_for_relax(now, cx);
         if animating {
             window.request_animation_frame();
         } else {
@@ -2285,7 +2443,7 @@ fn shell(
                 .size_0(),
             )
         })
-        .child(header(&theme, session, &folder))
+        .child(header(&theme, session, &folder, motion.unread_count(now)))
         .child(
             div()
                 .relative()
@@ -2371,9 +2529,30 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
         .opacity(entry.opacity)
 }
 
-fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
+/// The header. `count_fade` is the unread count being replaced and how far
+/// the new one has faded in over it.
+fn header(
+    theme: &Theme,
+    session: &Session,
+    folder: &str,
+    count_fade: Option<(usize, f32)>,
+) -> gpui::Div {
     let unread = session.unread_threads();
     let drafts = session.roles.is(FolderRole::Drafts, folder);
+    let count = |unread: usize| {
+        div()
+            .whitespace_nowrap()
+            .text_color(rgb(if unread > 0 {
+                theme.accent
+            } else {
+                theme.dimmed
+            }))
+            .child(if unread == 1 {
+                "1 unread".to_string()
+            } else {
+                format!("{unread} unread")
+            })
+    };
     div()
         .h(px(44.))
         .px(px(16.))
@@ -2421,20 +2600,21 @@ fn header(theme: &Theme, session: &Session, folder: &str) -> gpui::Div {
         )
         // Drafts are not mail to read: no count there.
         .when(!drafts, |row| {
-            row.child(
-                div()
+            row.child(match count_fade {
+                // Right-aligned on each other, so the number changes in place.
+                Some((old, shown)) => div()
                     .flex_none()
-                    .text_color(rgb(if unread > 0 {
-                        theme.accent
-                    } else {
-                        theme.dimmed
-                    }))
-                    .child(if unread == 1 {
-                        "1 unread".to_string()
-                    } else {
-                        format!("{unread} unread")
-                    }),
-            )
+                    .relative()
+                    .child(count(unread).opacity(shown))
+                    .child(
+                        count(old)
+                            .absolute()
+                            .top(px(0.))
+                            .right(px(0.))
+                            .opacity(1.0 - shown),
+                    ),
+                None => div().flex_none().child(count(unread)),
+            })
         })
 }
 
@@ -2464,9 +2644,24 @@ fn thread_list(
                 let offset = inbox.list_offset();
                 let last = inbox.session.threads.len().saturating_sub(1);
                 let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
-                range
+                // The list also asks for row 0 alone to measure a row's
+                // height; only the rows it draws count as on screen.
+                let drawn = range.len() > 1 || inbox.session.threads.len() == 1;
+                if drawn {
+                    let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
+                    inbox.row_widths.keep_drawn(range.clone(), ids);
+                }
+                let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
+                        let frame = inbox.row_widths.frame(
+                            &row.id,
+                            &row.subject,
+                            (row.unread, row.starred),
+                            |unread| line_px(window, &row.subject, row_weight(unread)),
+                            now,
+                            drawn,
+                        );
                         let selected = highlighted.contains(&row.id);
                         let look = RowLook {
                             selected,
@@ -2477,8 +2672,16 @@ fn thread_list(
                             ghost: false,
                             bar_dx,
                         };
-                        let element =
-                            thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
+                        let element = thread_row(
+                            &theme_for_rows,
+                            &row,
+                            index,
+                            look,
+                            text_width,
+                            frame,
+                            window,
+                            cx,
+                        );
                         let Some(shift) = inbox.motion.list.as_mut() else {
                             return element;
                         };
@@ -2508,12 +2711,14 @@ fn thread_list(
                                     ghost: true,
                                     bar_dx,
                                 };
+                                let frame = still_frame(&gone, window);
                                 slot_layer(dy, opacity).child(thread_row(
                                     &theme_for_rows,
                                     &gone,
                                     index,
                                     look,
                                     text_width,
+                                    frame,
                                     window,
                                     cx,
                                 ))
@@ -2541,7 +2746,13 @@ fn thread_list(
                             )
                             .into_any_element()
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                // A row that turned read, unread or starred this frame
+                // needs the next one; render keeps asking while it moves.
+                if inbox.row_widths.running(now) {
+                    window.request_animation_frame();
+                }
+                rows
             })
         },
     )
@@ -2592,6 +2803,13 @@ fn slot_layer(dy: f32, opacity: f32) -> gpui::Div {
         .opacity(opacity)
 }
 
+/// A row drawn as it is, with nothing moving: a row that left the list,
+/// or one shaped ahead of time.
+fn still_frame(row: &ThreadRow, window: &Window) -> RowFrame {
+    let natural = line_px(window, &row.subject, row_weight(row.unread));
+    RowFrame::still(natural, row.unread, row.starred)
+}
+
 /// How a thread row is drawn.
 #[derive(Clone, Copy)]
 struct RowLook {
@@ -2622,6 +2840,7 @@ fn thread_row(
     index: usize,
     look: RowLook,
     text_width: f32,
+    frame: RowFrame,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -2636,11 +2855,6 @@ fn thread_row(
         _ if selected => theme.selection,
         Some(left) => motion::mix(theme.background, theme.selection, left),
         None => theme.background,
-    };
-    let weight = if row.unread {
-        FontWeight::BOLD
-    } else {
-        FontWeight::NORMAL
     };
     div()
         .id(element_id)
@@ -2677,7 +2891,9 @@ fn thread_row(
                 .when(look.bar_dx > 0.0, |bar| {
                     bar.relative().left(px(look.bar_dx))
                 })
-                .when(row.unread, |bar| bar.bg(rgb(theme.accent))),
+                .when(frame.unread > 0.0, |bar| {
+                    bar.bg(rgb(theme.accent)).opacity(frame.unread)
+                }),
         )
         .child(
             div()
@@ -2689,9 +2905,9 @@ fn thread_row(
                 .flex_col()
                 .justify_center()
                 .gap(px(3.))
-                .child(thread_line_one(theme, row, weight, selected))
+                .child(thread_line_one(theme, row, frame, selected, window))
                 .child(thread_line_two(
-                    theme, row, weight, selected, text_width, window,
+                    theme, row, frame, selected, text_width, window,
                 )),
         )
         .into_any_element()
@@ -2700,8 +2916,9 @@ fn thread_row(
 fn thread_line_one(
     theme: &Theme,
     row: &ThreadRow,
-    weight: FontWeight,
+    frame: RowFrame,
     selected: bool,
+    window: &Window,
 ) -> gpui::Div {
     let dim = if selected {
         theme.on_selection
@@ -2716,7 +2933,7 @@ fn thread_line_one(
         .gap(px(8.))
         .min_w(px(0.))
         .overflow_hidden()
-        .child(names(theme, &row.spans, row.extra, weight, selected))
+        .child(names(theme, row, frame.unread, selected, window))
         .when(row.message_count > 1, |line| {
             line.child(
                 div()
@@ -2724,9 +2941,6 @@ fn thread_line_one(
                     .text_size(px(theme.ui_px - 1.0))
                     .child(row.message_count.to_string()),
             )
-        })
-        .when(row.starred, |line| {
-            line.child(div().text_color(rgb(theme.star)).child("★"))
         })
         .when(row.has_attachment, |line| {
             line.child(div().text_color(rgb(dim)).child("⧉"))
@@ -2737,6 +2951,25 @@ fn thread_line_one(
             }),
         )
         .child(div().flex_1())
+        // A fixed slot every row keeps, so starring never moves the line.
+        // The star fades in as it grows to full size, and out as it shrinks.
+        .child(
+            div()
+                .flex_none()
+                .w(px(STAR_SLOT))
+                .flex()
+                .justify_center()
+                .items_center()
+                .text_color(rgb(theme.star))
+                .when(frame.star > 0.0, |slot| {
+                    slot.child(
+                        div()
+                            .opacity(frame.star)
+                            .text_size(px(theme.ui_px * frame.star_scale()))
+                            .child("★"),
+                    )
+                }),
+        )
         .child(
             div()
                 .text_color(rgb(dim))
@@ -2774,54 +3007,109 @@ fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) 
 /// A row chip's height, border included: under the 22 px line it sits on.
 const LABEL_CHIP_PX: f32 = 20.;
 
+/// Width of the star slot before the date on every row.
+const STAR_SLOT: f32 = 14.0;
+
+/// The weight a row's text takes: bold when unread.
+fn row_weight(unread: bool) -> FontWeight {
+    if unread {
+        FontWeight::BOLD
+    } else {
+        FontWeight::NORMAL
+    }
+}
+
+/// The names on line one. The span is as wide as the names in bold
+/// whatever the row's weight (a few pixels nobody sees on a read row), so
+/// marking a row read or unread never moves what follows them on the line
+/// (count, attachment, labels). While the weight changes (`unread` between
+/// 0 and 1) the two weights cross-fade.
 fn names(
     theme: &Theme,
-    spans: &[NameSpan],
-    extra: usize,
-    weight: FontWeight,
+    row: &ThreadRow,
+    unread: f32,
     selected: bool,
+    window: &Window,
 ) -> gpui::Div {
     let dim = if selected {
         theme.on_selection
     } else {
         theme.dimmed
     };
-    let mut line = div().flex().flex_row().min_w(px(0.)).overflow_hidden();
-    for (index, span) in spans.iter().enumerate() {
-        let span_weight = if weight == FontWeight::BOLD {
-            FontWeight::BOLD
-        } else if span.emphasis {
-            FontWeight::SEMIBOLD
-        } else {
-            FontWeight::NORMAL
-        };
-        let last = index + 1 == spans.len() && extra == 0;
-        let text = if last {
-            span.text.clone()
-        } else {
-            format!("{}, ", span.text)
-        };
-        line = line.child(
-            div()
-                .font_weight(span_weight)
-                .text_color(rgb(if selected {
-                    theme.on_selection
+    let spans = &row.spans;
+    let extra = row.extra;
+    let parts = |bold: bool| -> Vec<(String, FontWeight)> {
+        spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| {
+                let text = if index + 1 == spans.len() && extra == 0 {
+                    span.text.clone()
                 } else {
-                    theme.foreground
-                }))
-                .child(text),
-        );
+                    format!("{}, ", span.text)
+                };
+                let span_weight = if bold {
+                    FontWeight::BOLD
+                } else if span.emphasis {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                };
+                (text, span_weight)
+            })
+            .collect()
+    };
+    let extra_text = (extra > 0).then(|| format!("+{extra}"));
+    let width = (parts(true)
+        .iter()
+        .map(|(text, span_weight)| line_px(window, text, *span_weight))
+        .sum::<f32>()
+        + extra_text
+            .as_deref()
+            .map_or(0.0, |text| line_px(window, text, FontWeight::NORMAL)))
+    .ceil();
+    let text_color = if selected {
+        theme.on_selection
+    } else {
+        theme.foreground
+    };
+    let line = |bold: bool| {
+        let mut line = div().flex().flex_row().whitespace_nowrap();
+        for (text, span_weight) in parts(bold) {
+            line = line.child(
+                div()
+                    .flex_none()
+                    .font_weight(span_weight)
+                    .text_color(rgb(text_color))
+                    .child(text),
+            );
+        }
+        if let Some(text) = &extra_text {
+            line = line.child(div().flex_none().text_color(rgb(dim)).child(text.clone()));
+        }
+        line
+    };
+    let span = div()
+        .relative()
+        .w(px(width))
+        .min_w(px(0.))
+        .overflow_hidden();
+    if unread <= 0.0 || unread >= 1.0 {
+        return span.child(line(unread >= 1.0));
     }
-    if extra > 0 {
-        line = line.child(div().text_color(rgb(dim)).child(format!("+{extra}")));
-    }
-    line
+    span.child(line(false).opacity(1.0 - unread)).child(
+        line(true)
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .opacity(unread),
+    )
 }
 
 fn thread_line_two(
     theme: &Theme,
     row: &ThreadRow,
-    weight: FontWeight,
+    frame: RowFrame,
     selected: bool,
     text_width: f32,
     window: &Window,
@@ -2831,22 +3119,28 @@ fn thread_line_two(
     } else {
         theme.dimmed
     };
-    let subject_w = line_px(window, &row.subject, weight).min(280.0);
-    let snippet_w = (text_width - subject_w - 8.0).max(24.0);
-    // Shaped once here and drawn from that shaping: a row that comes into
-    // view shapes each of its two texts at most twice.
     let subject_color = if selected {
         theme.on_selection
     } else {
         theme.foreground
     };
-    let subject = clip_shaped(
-        window,
-        &row.subject,
-        subject_w.min(text_width),
-        weight,
-        Some(subject_color),
-    );
+    // The box is drawn where it is now (it eases while it grows or
+    // relaxes); its text and the snippet are cut where it is going, so
+    // they do not change from frame to frame.
+    let (box_w, _) = row_widths::line_two(frame.subject_w, text_width);
+    let (room, rest_x) = row_widths::line_two(frame.subject_room, text_width);
+    let snippet_w = (text_width - rest_x).max(24.0);
+    // Shaped once here and drawn from that shaping: a row that comes into
+    // view shapes each of its two texts at most twice.
+    let subject = |unread: bool| {
+        clip_shaped(
+            window,
+            &row.subject,
+            room,
+            row_weight(unread),
+            Some(subject_color),
+        )
+    };
     let snippet = clip_shaped(
         window,
         &row.snippet,
@@ -2854,17 +3148,40 @@ fn thread_line_two(
         FontWeight::NORMAL,
         Some(snippet_color),
     );
+    // Read and unread cross-fade while the weight changes.
+    let subject = (!row.subject.is_empty()).then(|| {
+        let layer = |unread: bool, opacity: f32| {
+            div()
+                .flex_none()
+                .opacity(opacity)
+                .children(subject(unread).map(|line| shaped_text(line, window)))
+        };
+        let mut box_ = div().relative().flex_none().w(px(box_w)).overflow_hidden();
+        if frame.unread < 1.0 {
+            box_ = box_.child(layer(false, 1.0 - frame.unread));
+        }
+        if frame.unread > 0.0 {
+            let bold = layer(true, frame.unread);
+            box_ = box_.child(if frame.unread < 1.0 {
+                bold.absolute().top(px(0.)).left(px(0.))
+            } else {
+                bold
+            });
+        }
+        box_
+    });
     div()
         .w(px(text_width))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.))
+        .gap(px(row_widths::SUBJECT_GAP))
         .overflow_hidden()
-        .children(subject.map(|line| shaped_text(line, window)))
+        .children(subject)
         .children(snippet.map(|line| {
             div()
-                .w(px(snippet_w))
+                .flex_none()
+                .w(px((text_width - box_w - row_widths::SUBJECT_GAP).max(24.0)))
                 .overflow_hidden()
                 .child(shaped_text(line, window))
         }))
