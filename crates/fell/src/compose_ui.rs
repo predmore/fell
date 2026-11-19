@@ -13,7 +13,7 @@ use fell_core::compose::{
 use fell_core::{AccountId, MailBackend};
 use gpui::{
     Context, FocusHandle, FontWeight, KeyDownEvent, RenderImage, SharedString,
-    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb, rgba,
+    StatefulInteractiveElement, Window, deferred, div, img, prelude::*, px, rgb, rgba,
 };
 use image::Frame;
 use smallvec::SmallVec;
@@ -553,8 +553,16 @@ impl ComposeView {
             .as_deref()
             .map(agent_label)
             .unwrap_or_else(|| "the agent".into());
-        let what = match (new.len(), order_hunk(&snap, &order, at)) {
-            (1, Some(hunk)) => format!("changed {}", edit_name(&snap, hunk)),
+        // The bar shows the edit now, so the status line says only what
+        // happened.
+        let what = match (
+            new.len(),
+            order_hunk(&snap, &order, at).map(|hunk| hunk.kind),
+        ) {
+            (1, Some(HunkKind::Recipients)) => "changed the recipients".to_string(),
+            (1, Some(HunkKind::Subject)) => "changed the subject".to_string(),
+            (1, Some(HunkKind::Attachments)) => "changed the attachments".to_string(),
+            (1, _) => "made an edit".to_string(),
             (count, _) => format!("made {count} edits"),
         };
         self.status = format!("{who} {what}").into();
@@ -952,7 +960,7 @@ impl ComposeView {
             let returned = snap.as_ref().and_then(|snap| {
                 let order = ordered_hunks(snap);
                 let at = order.iter().position(|(hunk, _)| !before.contains(hunk))?;
-                let name = edit_name(snap, order_hunk(snap, &order, at)?);
+                let name = edit_name(order_hunk(snap, &order, at)?);
                 Some((order, at, name))
             });
             match returned {
@@ -980,7 +988,7 @@ impl ComposeView {
             return;
         };
         let name = order_hunk(&snap, &order, at)
-            .map(|hunk| edit_name(&snap, hunk))
+            .map(edit_name)
             .unwrap_or_else(|| "the edit".into());
         self.hub.with_session(&id, |session| {
             if keep {
@@ -1577,20 +1585,44 @@ impl Render for ComposeView {
             .text_color(rgb(colors.fg))
             .text_size(px(16.))
             .font_weight(FontWeight(400.))
-            .font_family(ui_family)
+            .font_family(ui_family.clone())
             .child(header(&snap, colors).flex_shrink_0())
+            // Everything between the header and the Attachments divider:
+            // the HTML preview panel covers exactly this, so it never ends
+            // partway into a row below.
             .child(
-                self.fields_view(&snap, colors, wide, window)
-                    .flex_shrink_0(),
-            )
-            .child(self.body_view(&snap, colors))
-            .children(
-                self.quote_view(&snap, colors)
-                    .map(|quote| quote.flex_shrink_0()),
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(
+                        self.fields_view(&snap, colors, wide, window, &ui_family)
+                            .flex_shrink_0(),
+                    )
+                    .child(self.body_view(&snap, colors, window, &ui_family))
+                    .children(
+                        self.quote_view(&snap, colors)
+                            .map(|quote| quote.flex_shrink_0()),
+                    )
+                    .children(self.preview.then(|| preview_panel(&snap, colors))),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
             .child(
-                status_bar(mode, &hint, &snap, self.send_tried, colors, wide, mono).flex_shrink_0(),
+                status_bar(
+                    mode,
+                    &hint,
+                    &snap,
+                    self.send_tried,
+                    colors,
+                    f32::from(window.viewport_size().width),
+                    &|text, size| {
+                        text_px(window, text, size, mono.as_deref().unwrap_or(&ui_family))
+                    },
+                )
+                .flex_shrink_0()
+                .when_some(mono.clone(), |bar, family| bar.font_family(family)),
             )
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
@@ -1598,7 +1630,7 @@ impl Render for ComposeView {
                     .as_ref()
                     .map(|query| palette_view(query, colors)),
             )
-            .children(self.preview.then(|| preview_layer(&snap, colors)))
+            .children(self.preview.then(|| preview_scrim(colors)))
     }
 }
 
@@ -1609,6 +1641,7 @@ impl ComposeView {
         colors: Palette,
         wide: bool,
         window: &Window,
+        family: &str,
     ) -> gpui::Div {
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         let redirects = redirects(snap);
@@ -1618,8 +1651,9 @@ impl ComposeView {
         // margin, since the shaped width runs a little under the painted.
         let row_px = f32::from(window.viewport_size().width) - 32.0 - 10.0 - LABEL_PX - 12.0 - 24.0;
         let fit = |who: &str, what: &str, when: &str| {
-            let room = row_px - text_px(window, who, 16.0) - text_px(window, when, 16.0);
-            fit_px(what, room, &|text| text_px(window, text, 16.0))
+            let room =
+                row_px - text_px(window, who, 16.0, family) - text_px(window, when, 16.0, family);
+            fit_px(what, room, &|text| text_px(window, text, 16.0, family))
         };
         let none = HashSet::new();
         // An empty To says what it needs, in the error colour while it
@@ -1699,21 +1733,12 @@ impl ComposeView {
                 context_row("Forwarding", &who, &what, when, colors)
             }))
             .children(if !snap.hunks.is_empty() {
-                // Room for the edit's words: the row, less the keys beside
-                // them on a wide window.
-                let width = f32::from(window.viewport_size().width) - 64.0;
-                let keys = if wide {
-                    text_px(
-                        window,
-                        "  ·  ]h [h move  ·  space a k keep  ·  space a x reject",
-                        16.0,
-                    )
-                } else {
-                    0.0
-                };
-                let room = width - keys;
-                let fits = |label: &str| text_px(window, label, 16.0) <= room;
-                Some(hunk_banner(snap, self.focused_hunk, colors, wide, &fits))
+                // The row, less the fields' padding, the bar's own padding
+                // and rule, and a margin for the shaped width running
+                // under the painted.
+                let room = f32::from(window.viewport_size().width) - 32.0 - 8.0 - 2.0 - 6.0;
+                let measure = |text: &str| text_px(window, text, 16.0, family);
+                Some(hunk_banner(snap, self.focused_hunk, colors, room, &measure))
             } else if snap.send_requested_by.is_some() {
                 // The row stays, so an edit arriving later does not push the
                 // message down under the reader.
@@ -1732,7 +1757,19 @@ impl ComposeView {
             })
     }
 
-    fn body_view(&self, snap: &Snapshot, colors: Palette) -> gpui::Div {
+    fn body_view(
+        &self,
+        snap: &Snapshot,
+        colors: Palette,
+        window: &Window,
+        family: &str,
+    ) -> gpui::Div {
+        // Room for an agent edit's "was" text: the body, less its padding,
+        // the "was" label and its gap, and a margin for the shaped width
+        // running under the painted.
+        let measure = |text: &str| text_px(window, text, 16.0, family);
+        let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
+        let was_lines = |text: &str| break_lines(text, was_room, &measure);
         let body = div()
             .id("compose-body")
             .flex_1()
@@ -1750,6 +1787,7 @@ impl ComposeView {
                     self.focused_hunk,
                     draft_links(snap),
                     colors,
+                    &was_lines,
                 )
             });
         let mut column = div()
@@ -2489,71 +2527,119 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The agent-edit bar: one line at every width. What the edit is and where
+/// it sits, then the keys, joined by dots. The keys never wrap or cut:
+/// the words give way first (fewer of them, then none, then the name),
+/// and only a window too narrow even for that drops the move keys.
 fn hunk_banner(
     snap: &Snapshot,
     focused: Option<u64>,
     colors: Palette,
-    wide: bool,
-    fits: &dyn Fn(&str) -> bool,
+    room: f32,
+    measure: &dyn Fn(&str) -> f32,
 ) -> gpui::Div {
-    let order = ordered_hunks(snap);
-    let at = focused
-        .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
-        .unwrap_or(0);
-    let hunk = order
-        .get(at)
-        .and_then(|(id, _)| snap.hunks.iter().find(|hunk| hunk.id == *id));
-    let what = hunk
-        .map(|hunk| match hunk.kind {
-            HunkKind::Recipients => "agent changed recipients".to_string(),
-            HunkKind::Subject => "agent changed the subject".to_string(),
-            HunkKind::Attachments => "agent changed attachments".to_string(),
-            HunkKind::Body => {
-                // As many words as the row has room for.
-                let count = format!(" · {} of {}", at + 1, order.len().max(1));
-                (1..=12)
-                    .rev()
-                    .filter_map(|words| edit_preview_words(snap, hunk, words))
-                    .map(|words| format!("agent edit \u{201c}{words}\u{201d}"))
-                    .find(|label| fits(&format!("{label}{count}")))
-                    .or_else(|| {
-                        edit_preview_words(snap, hunk, 1)
-                            .map(|words| format!("agent edit \u{201c}{words}\u{201d}"))
-                    })
-                    .unwrap_or_else(|| "agent edit".to_string())
-            }
-        })
-        .unwrap_or_else(|| "agent edit".into());
-    let label = format!("{what} · {} of {}", at + 1, order.len().max(1));
-    // Parts wrap as units, so a narrow window never cuts a key in half.
-    let parts = [
-        label,
-        "]h [h move".to_string(),
-        "space a k keep".to_string(),
-        "space a x reject".to_string(),
-    ];
-    let last = parts.len() - 1;
-    div()
+    let parts = hunk_banner_parts(snap, focused, room, measure);
+    let mut row = div()
         .flex()
-        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .overflow_hidden()
+        .whitespace_nowrap()
         .px_1()
         .py_1()
         .border_l(px(2.))
         .border_color(rgb(colors.rule))
         .bg(rgb(colors.hunk))
         .text_size(px(16.))
-        .text_color(rgb(colors.fg))
-        // Wide: one line with dots. Narrow: parts wrap as units with space
-        // between them, so no line ends on a dot.
-        .gap_x(px(if wide { 0. } else { 18. }))
-        .children(parts.into_iter().enumerate().map(|(index, part)| {
-            div().flex_shrink_0().child(if wide && index < last {
-                format!("{part}  ·  ")
-            } else {
-                part
-            })
-        }))
+        .text_color(rgb(colors.fg));
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            row = row.child(div().flex_shrink_0().text_color(rgb(colors.dim)).child("·"));
+        }
+        row = row.child(div().flex_shrink_0().child(part));
+    }
+    row
 }
+
+/// The bar's parts, the longest set that fits `room` as `measure` lays
+/// them out: each part's width plus a dot and 8px either side between.
+fn hunk_banner_parts(
+    snap: &Snapshot,
+    focused: Option<u64>,
+    room: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> Vec<String> {
+    let order = ordered_hunks(snap);
+    let at = focused
+        .and_then(|focused| order.iter().position(|(hunk, _)| *hunk == focused))
+        .unwrap_or(0);
+    let hunk = order_hunk(snap, &order, at);
+    let count = format!("{} of {}", at + 1, order.len().max(1));
+    // Moving between edits needs two of them.
+    let keys: &[&str] = if order.len() > 1 {
+        &["]h [h move", "space a k keep", "space a x reject"]
+    } else {
+        &["space a k keep", "space a x reject"]
+    };
+    // The edit's names, longest first: its first plain words, then what it
+    // changed in two words.
+    let mut names: Vec<String> = Vec::new();
+    match hunk.map(|hunk| hunk.kind) {
+        Some(HunkKind::Recipients) => names.push("agent changed recipients".into()),
+        Some(HunkKind::Subject) => names.push("agent changed the subject".into()),
+        Some(HunkKind::Attachments) => names.push("agent changed attachments".into()),
+        Some(HunkKind::Body) => {
+            let hunk = hunk.expect("a body hunk");
+            let mut last = None;
+            for words in (1..=BANNER_WORDS).rev() {
+                let Some(words) = edit_preview_words(snap, hunk, words) else {
+                    continue;
+                };
+                // Fewer words can give the same text (a short edit).
+                if last.as_ref() != Some(&words) {
+                    names.push(format!("agent edit \u{201c}{words}\u{201d}"));
+                }
+                last = Some(words);
+            }
+        }
+        None => {}
+    }
+    names.push("agent edit".into());
+    let dot = measure("·") + 16.;
+    let width = |parts: &[String]| -> f32 {
+        parts.iter().map(|part| measure(part)).sum::<f32>()
+            + parts.len().saturating_sub(1) as f32 * dot
+    };
+    let with_keys = |lead: &[&str], keys: &[&str]| -> Vec<String> {
+        lead.iter()
+            .chain(keys)
+            .map(|part| part.to_string())
+            .collect()
+    };
+    let review = &keys[keys.len() - 2..];
+    let mut candidates: Vec<Vec<String>> = names
+        .iter()
+        .map(|name| with_keys(&[name, &count], keys))
+        .collect();
+    // "1 of 1" says less than what the edit is: it goes first.
+    if order.len() <= 1 {
+        candidates.extend(names.iter().map(|name| with_keys(&[name], keys)));
+    }
+    if order.len() > 1 {
+        candidates.push(with_keys(&[&count], keys));
+        candidates.push(with_keys(&[&count], review));
+    }
+    candidates.push(with_keys(&[], review));
+    let fallback = candidates.last().cloned().unwrap_or_default();
+    candidates
+        .into_iter()
+        .find(|parts| width(parts) <= room)
+        .unwrap_or(fallback)
+}
+
+/// At most this many of an edit's words in the bar: enough to tell edits
+/// apart; the tinted block below gives the whole text.
+const BANNER_WORDS: usize = 5;
 
 /// The body line (from 1) where a body hunk starts, as the editor counts it.
 fn body_edit_line(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<usize> {
@@ -2601,17 +2687,14 @@ fn ordered_hunks(snap: &Snapshot) -> Vec<(u64, Option<usize>)> {
     header
 }
 
-/// The first few words of a body edit's new text, for the edit bar.
-fn edit_preview(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> Option<String> {
-    edit_preview_words(snap, hunk, 4)
-}
-
-/// The width of one line of text at `size` pixels, in the window's font.
-fn text_px(window: &Window, text: &str, size: f32) -> f32 {
+/// The width of one line of text at `size` pixels in `family`, the face
+/// the row paints in (the window's own default face is a different one).
+fn text_px(window: &Window, text: &str, size: f32, family: &str) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
-    let style = window.text_style();
+    let mut style = window.text_style();
+    style.font_family = SharedString::from(family.to_string());
     let run = style.to_run(text.len());
     let line = window.text_system().shape_line(
         SharedString::from(text.to_string()),
@@ -2622,7 +2705,8 @@ fn text_px(window: &Window, text: &str, size: f32) -> f32 {
     f32::from(line.width)
 }
 
-/// The edit's first words, at most `limit`, with an ellipsis when cut.
+/// The edit's first words, at most `limit`, with an ellipsis when cut: as
+/// plain text, with markdown marks, link destinations and bare URLs gone.
 fn edit_preview_words(
     snap: &Snapshot,
     hunk: &fell_core::compose::HunkView,
@@ -2631,17 +2715,58 @@ fn edit_preview_words(
     let slice = snap.text.get(hunk.start..hunk.end)?;
     let line = slice
         .lines()
-        .map(plain_markdown)
+        .map(plain_words)
         .find(|line| !line.is_empty())?;
-    let mut words: Vec<&str> = line.split_whitespace().take(limit).collect();
-    let more = line.split_whitespace().count() > words.len();
+    let words: Vec<&str> = line.split_whitespace().take(limit).collect();
     if words.is_empty() {
         return None;
     }
+    let more = line.split_whitespace().count() > words.len();
+    let mut text = words.join(" ");
     if more {
-        words.push("…");
+        // "attached…", not "attached,…".
+        text = text
+            .trim_end_matches([',', ';', ':', '.', '-', '\u{2014}', '\u{2013}'])
+            .to_string();
+        text.push('…');
     }
-    Some(words.join(" "))
+    Some(text)
+}
+
+/// A markdown line as a reader says it: a link as its label, no bare URLs,
+/// no list, heading or emphasis marks.
+fn plain_words(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find("](") else {
+            break;
+        };
+        let target = &after[close + 2..];
+        let Some(end) = target.find(')') else {
+            break;
+        };
+        // An image's `!` goes with its link.
+        out.push_str(rest[..open].strip_suffix('!').unwrap_or(&rest[..open]));
+        out.push_str(&after[..close]);
+        rest = &target[end + 1..];
+    }
+    out.push_str(rest);
+    let words: Vec<&str> = out
+        .split_whitespace()
+        .filter(|word| !looks_like_url(word))
+        .collect();
+    plain_markdown(&words.join(" "))
+}
+
+/// A word that is a web or mail address written out: `https://…`,
+/// `www.…`, `mailto:…`, or one in angle brackets.
+fn looks_like_url(word: &str) -> bool {
+    let word = word.trim_start_matches(['<', '(']).to_ascii_lowercase();
+    ["http://", "https://", "www.", "mailto:"]
+        .iter()
+        .any(|scheme| word.starts_with(scheme))
 }
 
 fn order_hunk<'a>(
@@ -2653,15 +2778,15 @@ fn order_hunk<'a>(
     snap.hunks.iter().find(|hunk| hunk.id == *id)
 }
 
-/// How the status line names an edit: its first words, or what it changed.
-fn edit_name(snap: &Snapshot, hunk: &fell_core::compose::HunkView) -> String {
+/// How the status line names an edit: what it changed. Never its words:
+/// the agent-edit bar and the tinted block already give them, and on a
+/// narrow window they would push out the key that matters (`u undo`).
+fn edit_name(hunk: &fell_core::compose::HunkView) -> String {
     match hunk.kind {
         HunkKind::Recipients => "the recipient change".into(),
         HunkKind::Subject => "the subject change".into(),
         HunkKind::Attachments => "the attachment change".into(),
-        HunkKind::Body => edit_preview(snap, hunk)
-            .map(|words| format!("\u{201c}{words}\u{201d}"))
-            .unwrap_or_else(|| "the edit".into()),
+        HunkKind::Body => "the edit".into(),
     }
 }
 
@@ -2758,6 +2883,7 @@ fn styled_body(
     focused: Option<u64>,
     links: Links,
     colors: Palette,
+    was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let text = editor.text();
     let doc = markdown_to_doc(&text);
@@ -2789,7 +2915,9 @@ fn styled_body(
                     })
                     .unwrap_or_default();
                 let painted = if raw || !edits.is_empty() {
-                    raw_source_block(block, &text, editor, &edits, focused, links, colors)
+                    raw_source_block(
+                        block, &text, editor, &edits, focused, links, colors, was_lines,
+                    )
                 } else {
                     render_block(block, folder, links, colors)
                 };
@@ -2900,6 +3028,7 @@ fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
     column
 }
 
+#[allow(clippy::too_many_arguments)]
 fn raw_source_block(
     block: &fell_core::compose::Block,
     text: &str,
@@ -2908,6 +3037,7 @@ fn raw_source_block(
     focused: Option<u64>,
     links: Links,
     colors: Palette,
+    was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let Some((start, end)) = block.source else {
         return render_block(block, Path::new(""), links, colors);
@@ -2990,7 +3120,18 @@ fn raw_source_block(
                         .gap_2()
                         .text_color(rgb(colors.dim))
                         .child(div().flex_shrink_0().child("was"))
-                        .child(div().min_w(px(0.)).line_through().child(previous)),
+                        // Broken into lines here, not by the text layout,
+                        // so a line's strike ends at its last word, never
+                        // through the space where it wrapped.
+                        .child(div().flex().flex_col().min_w(px(0.)).children(
+                            was_lines(&previous).into_iter().map(|line| {
+                                div()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .line_through()
+                                    .child(line)
+                            }),
+                        )),
                 );
             }
         }
@@ -3977,15 +4118,19 @@ fn idle_status(status: &str) -> bool {
 
 /// One line, in the inbox's style: mode and hints on the left, send on
 /// the right, `key action` pairs separated by ` · `, in the mono face.
+/// `measure` gives a text's width at a size, in the bar's face, so a long
+/// message is cut at a word with `…` and keeps 16px clear of the right.
 fn status_bar(
     mode: &str,
     status: &SharedString,
     snap: &Snapshot,
     send_tried: bool,
     colors: Palette,
-    wide: bool,
-    mono: Option<String>,
+    width: f32,
+    measure: &dyn Fn(&str, f32) -> f32,
 ) -> gpui::Div {
+    let wide = width > 640.;
+    let size = if wide { 14. } else { 13. };
     let fresh = snap
         .to
         .iter()
@@ -3993,150 +4138,252 @@ fn status_bar(
         .chain(&snap.bcc)
         .filter(|item| item.fresh)
         .count();
+    let idle = idle_status(status);
+    // The header tags each first-time address; the count only fills an
+    // idle bar, so it never crowds out a message or reads as a count of
+    // edits. Narrow: short enough to sit beside the mode and send.
     let fresh_label = match fresh {
+        _ if !idle => None,
         0 => None,
+        count if !wide => Some(format!("first-time: {count}")),
         1 => Some("1 first-time recipient".to_string()),
         count => Some(format!("{count} first-time recipients")),
     };
+    let right = status_right(snap, status, send_tried, wide);
+    let gap = 8.;
+    let dot_px = measure("·", size);
+    let parts_px = |parts: &[(String, Tone, bool)]| -> f32 {
+        let texts: f32 = parts.iter().map(|(text, _, _)| measure(text, size)).sum();
+        let joins = parts.len().saturating_sub(1) as f32;
+        texts + joins * (dot_px + 2. * gap)
+    };
+    // The room the message has: the row, less its padding, the right
+    // group, the 16px between the groups, the mode and its dot, and a
+    // little for the shaped width running under the painted.
+    let mode_px = if mode.is_empty() {
+        0.
+    } else {
+        measure(mode, size) + dot_px + 2. * gap
+    };
+    let room = width - 32. - parts_px(&right) - 16. - mode_px - 4.;
+    let message = if idle {
+        String::new()
+    } else {
+        fit_words(status, room, &|text| measure(text, size))
+    };
     let dot = || div().text_color(rgb(colors.dim)).child("·");
-    // A narrow window keeps one line: the mode, its key hint, the
-    // first-time count, send and the unreviewed count stay; the close hint
-    // goes first.
-    // Clipped, so a long message never draws under the send keys.
     let mut left = div()
         .flex()
         .flex_1()
         .gap_2()
         .min_w(px(0.))
         .overflow_hidden();
-    let idle = idle_status(status);
-    if wide {
-        left = left
-            .child(div().text_color(rgb(colors.dim)).child(mode.to_string()))
-            // The message gives way first, so it never runs under send.
-            .when(!idle, |left| {
-                left.child(dot()).child(
-                    div()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_color(rgb(colors.fg))
-                        .child(status.to_string()),
-                )
-            });
-        // The header tags each first-time address; the count only fills
-        // an idle bar, so it never crowds out a message.
-        if let Some(label) = fresh_label.filter(|_| idle) {
-            left = left.child(dot()).child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(colors.fg))
-                    .child(label),
-            );
-        }
-    } else {
-        // Narrow: the mode always shows; a message (an edit position, an
-        // error) beats the hints and gives way first.
-        if !mode.is_empty() {
-            left = left
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(rgb(colors.dim))
-                        .child(mode.to_string()),
-                )
-                .when(!idle, |left| left.child(dot()));
-        }
-        if !idle {
-            left = left.child(
-                div()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_color(rgb(colors.fg))
-                    .child(status.to_string()),
-            );
-        }
-        // The header tags each first-time address; the count fills an idle
-        // bar only, so it is never read as a count of edits.
-        if fresh > 0 && idle {
-            left = left.child(dot()).child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(colors.fg))
-                    // Short enough to sit beside the mode and send, in the
-                    // words the header and a wide bar use.
-                    .child(format!("first-time: {fresh}")),
-            );
-        }
-    }
-    let right = match shown_send_block(snap, send_tried) {
-        // The message on the left already says why: one message at a time.
-        Some(reason) if repeats_block(status, reason) => div(),
-        // Gone out: say so plainly, not as a block.
-        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => div()
-            .flex_shrink_0()
-            .text_color(rgb(colors.accent))
-            .font_weight(FontWeight(600.))
-            .child("sent"),
-        // Narrow: the reason alone says send is blocked, and leaves the
-        // message on the left its room.
-        // May have gone out: the warning the inbox gives, in its colour.
-        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => div()
-            .flex_shrink_0()
-            .text_color(rgb(colors.error))
-            .child(MAYBE_SENT_WARNING),
-        // Narrow: a missing recipient says so in two words, so "send
-        // blocked" stays and reads as a block, not advice.
-        Some(reason) => div()
-            .flex()
-            .flex_shrink_0()
-            .gap_2()
-            .when(wide || reason.as_str() == NO_RECIPIENT, |right| {
-                right
-                    .child(div().text_color(rgb(colors.dim)).child("send blocked"))
-                    .child(dot())
-            })
-            .child(div().text_color(rgb(colors.fg)).child(
-                if !wide && reason.as_str() == NO_RECIPIENT {
-                    "no recipient".to_string()
-                } else {
-                    reason.clone()
-                },
-            )),
-        None => {
-            let mut right = div()
-                .flex()
+    if !mode.is_empty() {
+        left = left.child(
+            div()
                 .flex_shrink_0()
-                .gap_2()
-                .child(div().text_color(rgb(colors.fg)).child("space m s send"));
-            if snap.unreviewed > 0 {
-                // Sending accepts these, so they stand out.
-                right = right.child(dot()).child(
-                    div()
-                        .text_color(rgb(colors.accent))
-                        .font_weight(FontWeight(600.))
-                        .child(format!("{} unreviewed", snap.unreviewed)),
-                );
-            }
-            right
+                .text_color(rgb(colors.dim))
+                .child(mode.to_string()),
+        );
+    }
+    if !message.is_empty() {
+        if !mode.is_empty() {
+            left = left.child(dot());
         }
-    };
-    let bar = div()
+        left = left.child(
+            div()
+                .min_w(px(0.))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_color(rgb(colors.fg))
+                .child(message),
+        );
+    }
+    if let Some(label) = fresh_label {
+        if !mode.is_empty() {
+            left = left.child(dot());
+        }
+        left = left.child(
+            div()
+                .flex_shrink_0()
+                .text_color(rgb(colors.fg))
+                .child(label),
+        );
+    }
+    let mut right_group = div().flex().flex_shrink_0().gap_2();
+    for (index, (text, tone, bold)) in right.into_iter().enumerate() {
+        if index > 0 {
+            right_group = right_group.child(dot());
+        }
+        let part = div().text_color(rgb(tone.of(colors))).child(text);
+        right_group = right_group.child(if bold {
+            part.font_weight(FontWeight(600.))
+        } else {
+            part
+        });
+    }
+    div()
         .flex()
         .items_center()
         .justify_between()
-        .gap_x(px(if wide { 16. } else { 10. }))
+        .gap_x(px(16.))
         .px(px(16.))
         .py(px(6.))
         .bg(rgb(colors.panel))
         .border_t_1()
         .border_color(rgb(colors.rule))
-        .text_size(px(if wide { 14. } else { 13. }))
+        .text_size(px(size))
         .child(left)
-        .child(right);
-    match mono {
-        Some(family) => bar.font_family(family),
-        None => bar,
+        .child(right_group)
+}
+
+/// Which palette colour a status part takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Fg,
+    Dim,
+    Accent,
+    Error,
+}
+
+impl Tone {
+    fn of(self, colors: Palette) -> u32 {
+        match self {
+            Tone::Fg => colors.fg,
+            Tone::Dim => colors.dim,
+            Tone::Accent => colors.accent,
+            Tone::Error => colors.error,
+        }
     }
+}
+
+/// The status bar's right group, as (text, colour, bold) parts joined by
+/// dots: send and the unreviewed count, or why send is blocked.
+fn status_right(
+    snap: &Snapshot,
+    status: &str,
+    send_tried: bool,
+    wide: bool,
+) -> Vec<(String, Tone, bool)> {
+    match shown_send_block(snap, send_tried) {
+        // The message on the left already says why: one message at a time.
+        Some(reason) if repeats_block(status, reason) => Vec::new(),
+        // Gone out: say so plainly, not as a block.
+        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => {
+            vec![("sent".into(), Tone::Accent, true)]
+        }
+        // May have gone out: the warning the inbox gives, in its colour.
+        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => {
+            vec![(MAYBE_SENT_WARNING.into(), Tone::Error, false)]
+        }
+        // Narrow: the reason alone says send is blocked, and leaves the
+        // message on the left its room. A missing recipient says so in two
+        // words, so "send blocked" stays and reads as a block, not advice.
+        Some(reason) => {
+            let mut parts = Vec::new();
+            if wide || reason.as_str() == NO_RECIPIENT {
+                parts.push(("send blocked".into(), Tone::Dim, false));
+            }
+            parts.push((
+                if !wide && reason.as_str() == NO_RECIPIENT {
+                    "no recipient".to_string()
+                } else {
+                    reason.clone()
+                },
+                Tone::Fg,
+                false,
+            ));
+            parts
+        }
+        None => {
+            let mut parts = vec![("space m s send".to_string(), Tone::Fg, false)];
+            if snap.unreviewed > 0 {
+                // Sending accepts these, so they stand out.
+                parts.push((
+                    format!("{} unreviewed", snap.unreviewed),
+                    Tone::Accent,
+                    true,
+                ));
+            }
+            parts
+        }
+    }
+}
+
+/// `text` broken into lines no wider than `max_px`, at spaces, with no
+/// space kept at either end of a line. A word wider than a line is broken
+/// inside itself.
+fn break_lines(text: &str, max_px: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let joined = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if measure(&joined) <= max_px {
+            line = joined;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        // A word too wide for a line of its own: as many characters as fit
+        // on each line, at least one.
+        let mut rest = word;
+        while measure(rest) > max_px {
+            let chars: Vec<(usize, char)> = rest.char_indices().collect();
+            let cut = (1..chars.len())
+                .rev()
+                .map(|count| chars[count].0)
+                .find(|at| measure(&rest[..*at]) <= max_px)
+                .unwrap_or_else(|| chars.get(1).map_or(rest.len(), |(at, _)| *at));
+            lines.push(rest[..cut].to_string());
+            rest = &rest[cut..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+        line = rest.to_string();
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// `text` cut to `max_px` at a word, with `…`: never mid-glyph, never
+/// ending on a separator. A single word too long for the room is cut
+/// inside itself.
+fn fit_words(text: &str, max_px: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    if measure(text) <= max_px {
+        return text.to_string();
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for keep in (1..words.len()).rev() {
+        let mut kept = words[..keep].to_vec();
+        while kept
+            .last()
+            .is_some_and(|word| !word.chars().any(char::is_alphanumeric))
+        {
+            kept.pop();
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        let joined = kept.join(" ");
+        // A word already cut ("is…”") says the text goes on.
+        let candidate = if joined.trim_end_matches(['\u{201d}', '"']).ends_with('…') {
+            joined
+        } else {
+            format!("{joined}…")
+        };
+        if measure(&candidate) <= max_px {
+            return candidate;
+        }
+    }
+    fit_px(text, max_px, measure)
 }
 
 fn which_key(colors: Palette) -> gpui::Div {
@@ -4178,13 +4425,9 @@ fn palette_view(query: &str, colors: Palette) -> gpui::Div {
         )
 }
 
-fn preview_layer(snap: &Snapshot, colors: Palette) -> impl IntoElement {
-    let doc = markdown_to_doc(&snap.body);
-    // A scrim of page colour over the whole window, so the draft behind
-    // the panel recedes. The panel takes the width inside the body's
-    // margin and starts under the header, so no cut-off words or half
-    // rows show around it.
-    let side = 12.;
+/// A scrim of page colour over the whole window, so the draft behind the
+/// HTML preview recedes. The panel itself paints above it.
+fn preview_scrim(colors: Palette) -> gpui::Div {
     div()
         .absolute()
         .top_0()
@@ -4192,33 +4435,48 @@ fn preview_layer(snap: &Snapshot, colors: Palette) -> impl IntoElement {
         .left_0()
         .right_0()
         .bg(rgba((colors.bg << 8) | SCRIM_ALPHA))
-        .child(
-            div()
-                .absolute()
-                // Under the window's header, over the whole of the fields.
-                .top(px(PREVIEW_TOP))
-                .bottom(px(64.))
-                .left(px(side))
-                .right(px(side))
-                .bg(rgb(colors.bg))
-                .border_1()
-                .border_color(rgb(colors.accent))
-                .id("html-preview")
-                .p_4()
-                .overflow_y_scroll()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(colors.dim))
-                        .child("HTML preview"),
-                )
-                .child(render_doc(&doc, Path::new(""), Links::Target, colors)),
-        )
 }
 
-/// Where the preview panel starts: just under the compose header, so no
-/// field row shows cut in half above it.
-const PREVIEW_TOP: f32 = 44.;
+/// The HTML preview before send. It covers the fields and the body, from
+/// under the header to the Attachments divider, 12px in from the sides and
+/// the bottom, so no cut-off words or half rows show around it. Deferred,
+/// so it paints over the scrim that dims the rest of the window.
+fn preview_panel(snap: &Snapshot, colors: Palette) -> impl IntoElement {
+    let doc = markdown_to_doc(&snap.body);
+    deferred(
+        div()
+            .absolute()
+            .top(px(PREVIEW_INSET.top))
+            .bottom(px(PREVIEW_INSET.side))
+            .left(px(PREVIEW_INSET.side))
+            .right(px(PREVIEW_INSET.side))
+            .bg(rgb(colors.bg))
+            .border_1()
+            .border_color(rgb(colors.accent))
+            .id("html-preview")
+            .p_4()
+            .overflow_y_scroll()
+            // 4px over the line leading: an 8px gap to the first line.
+            .child(
+                div()
+                    .mb_1()
+                    .text_sm()
+                    .text_color(rgb(colors.dim))
+                    .child("HTML preview"),
+            )
+            .child(render_doc(&doc, Path::new(""), Links::Target, colors)),
+    )
+}
+
+/// Where the preview panel sits inside the area it covers: just under the
+/// compose header, and 12px in from each side and from the Attachments
+/// divider.
+struct PreviewInset {
+    top: f32,
+    side: f32,
+}
+
+const PREVIEW_INSET: PreviewInset = PreviewInset { top: 2., side: 12. };
 
 /// How much of the page colour the scrim behind an overlay lays down.
 const SCRIM_ALPHA: u32 = 0x99;
@@ -4764,7 +5022,7 @@ mod tests {
             vec![(9, None), (3, Some(1)), (7, Some(3))]
         );
         assert_eq!(
-            super::edit_preview(&snap, &snap.hunks[0]).as_deref(),
+            super::edit_preview_words(&snap, &snap.hunks[0], 4).as_deref(),
             Some("three")
         );
     }
@@ -5746,5 +6004,183 @@ mod tests {
         let mut twice = Editor::from_body("two\nx\ntwo\n");
         twice.row = 1;
         assert!(!twice.follow_line("two"));
+    }
+
+    /// A stand-in for shaped widths: 8px a character.
+    fn eight_px(text: &str) -> f32 {
+        text.chars().count() as f32 * 8.0
+    }
+
+    fn one_body_edit(body: &str, edited: &str) -> super::Snapshot {
+        let mut snap = super::empty_snapshot("d");
+        snap.body = body.into();
+        snap.text = format!("---\nto: []\n---\n{body}");
+        let start = snap.text.find(edited).unwrap();
+        snap.hunks = vec![fell_core::compose::HunkView {
+            id: 1,
+            kind: super::HunkKind::Body,
+            start,
+            end: start + edited.len(),
+            label: String::new(),
+            previous: String::new(),
+        }];
+        snap
+    }
+
+    #[test]
+    fn the_edit_bar_quotes_plain_words_without_links() {
+        assert_eq!(
+            super::plain_words(
+                "- The **[March plan](https://files.example/plan-v2)** is at https://files.example/x now"
+            ),
+            "The March plan is at now"
+        );
+        assert_eq!(
+            super::plain_words("![logo](https://a.example/l.png) hi"),
+            "logo hi"
+        );
+        assert_eq!(
+            super::plain_words("<https://a.example> and www.b.example"),
+            "and"
+        );
+        let line =
+            "The [March plan](https://files.example/plan-v2) is attached, with the lodge booking.";
+        let snap = one_body_edit(&format!("Hi Ada,\n\n{line}\n"), line);
+        // The ellipsis sits on the last word, and no URL shows.
+        assert_eq!(
+            super::edit_preview_words(&snap, &snap.hunks[0], 4).as_deref(),
+            Some("The March plan is…")
+        );
+    }
+
+    #[test]
+    fn the_edit_bar_is_one_line_and_its_keys_never_go() {
+        let line =
+            "The [March plan](https://files.example/plan-v2) is attached, with the lodge booking.";
+        let mut snap = one_body_edit(&format!("Hi Ada,\n\n{line}\n\nThanks\n"), line);
+        let keys = ["]h [h move", "space a k keep", "space a x reject"];
+        let width = |parts: &[String]| {
+            parts.iter().map(|part| eight_px(part)).sum::<f32>()
+                + parts.len().saturating_sub(1) as f32 * (eight_px("·") + 16.0)
+        };
+        let sweep = |snap: &super::Snapshot| {
+            let mut seen = Vec::new();
+            for room in (100..1400).step_by(10).map(|room| room as f32) {
+                let parts = super::hunk_banner_parts(snap, Some(1), room, &eight_px);
+                // Whatever is shown fits the row, unless even the two
+                // review keys alone do not.
+                if parts.len() > 2 {
+                    assert!(width(&parts) <= room, "{parts:?} in {room}");
+                }
+                // The keep and reject keys always show, whole and last.
+                assert_eq!(&parts[parts.len() - 2..], &keys[1..], "{parts:?}");
+                for part in &parts {
+                    assert!(!part.contains("https://") && !part.contains("]("), "{part}");
+                }
+                seen.push(parts);
+            }
+            seen
+        };
+        // One edit: nothing to move between, so no move keys.
+        let seen = sweep(&snap);
+        assert!(
+            seen.iter()
+                .all(|parts| !parts.contains(&keys[0].to_string()))
+        );
+        assert_eq!(
+            seen.last().unwrap(),
+            &vec![
+                "agent edit \u{201c}The March plan is attached\u{2026}\u{201d}".to_string(),
+                "1 of 1".into(),
+                keys[1].into(),
+                keys[2].into(),
+            ]
+        );
+        // Narrower windows shorten the words first, then drop them.
+        assert!(
+            seen.iter()
+                .any(|parts| parts[0] == "agent edit \u{201c}The\u{2026}\u{201d}")
+        );
+        assert!(seen.iter().any(|parts| parts[0] == "agent edit"));
+        // The count goes before the name does.
+        assert!(
+            seen.iter()
+                .any(|parts| parts == &["agent edit", keys[1], keys[2]])
+        );
+        assert!(seen.iter().all(|parts| parts[0] != "1 of 1"));
+        // Two edits: the move keys show, and go only after every word.
+        let thanks = snap.text.find("Thanks").unwrap();
+        snap.hunks.push(fell_core::compose::HunkView {
+            id: 2,
+            kind: super::HunkKind::Body,
+            start: thanks,
+            end: thanks + "Thanks".len(),
+            label: String::new(),
+            previous: String::new(),
+        });
+        let seen = sweep(&snap);
+        assert_eq!(
+            seen.last().unwrap()[1..],
+            ["1 of 2", keys[0], keys[1], keys[2]]
+        );
+        for parts in &seen {
+            if !parts.contains(&keys[0].to_string()) {
+                assert!(!parts[0].starts_with("agent edit"), "{parts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_status_line_does_not_quote_an_edit_the_bar_shows() {
+        let line = "The [March plan](https://files.example/plan-v2) is attached.";
+        let snap = one_body_edit(&format!("{line}\n"), line);
+        assert_eq!(super::edit_name(&snap.hunks[0]), "the edit");
+    }
+
+    #[test]
+    fn a_long_status_is_cut_at_a_word() {
+        let status = "the agent changed the subject · u undo";
+        assert_eq!(super::fit_words(status, 1000.0, &eight_px), status);
+        // Never mid-word, never ending on a dot.
+        let cut = super::fit_words(
+            status,
+            eight_px("the agent changed the subject ·…"),
+            &eight_px,
+        );
+        assert_eq!(cut, "the agent changed the subject…");
+        let cut = super::fit_words(status, eight_px("the agent chang"), &eight_px);
+        assert_eq!(cut, "the agent…");
+        assert!(eight_px(&cut) <= eight_px("the agent chang"));
+        // A word already cut keeps its one ellipsis.
+        let quoted = "kept \u{201c}The plan is\u{2026}\u{201d} · u undo";
+        let cut = super::fit_words(
+            quoted,
+            eight_px("kept \u{201c}The plan is\u{2026}\u{201d} ·"),
+            &eight_px,
+        );
+        assert_eq!(cut, "kept \u{201c}The plan is\u{2026}\u{201d}");
+    }
+
+    #[test]
+    fn a_struck_line_ends_at_its_last_word() {
+        let text =
+            "The [March plan](https://files.example/plan) is attached, with the lodge booking";
+        let lines = super::break_lines(text, 48.0 * 8.0, &eight_px);
+        assert_eq!(lines.join(" "), text);
+        for line in &lines {
+            assert_eq!(line.trim(), line);
+            assert!(eight_px(line) <= 48.0 * 8.0);
+        }
+        // A word wider than the line breaks inside itself.
+        let lines = super::break_lines(
+            "see https://files.example/a-very-long-path ok",
+            10.0 * 8.0,
+            &eight_px,
+        );
+        assert!(lines.iter().all(|line| eight_px(line) <= 80.0), "{lines:?}");
+        assert_eq!(
+            lines.concat().replace(' ', ""),
+            "seehttps://files.example/a-very-long-pathok"
+        );
     }
 }
