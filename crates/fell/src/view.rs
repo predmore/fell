@@ -3047,8 +3047,7 @@ fn row_weight(unread: bool) -> FontWeight {
 /// The names on line one. The span is as wide as the names in bold
 /// whatever the row's weight (a few pixels nobody sees on a read row), so
 /// marking a row read or unread never moves what follows them on the line
-/// (count, attachment, labels). While the weight changes, it fades
-/// through: the old weight out, then the new one in.
+/// (count, attachment, labels).
 fn names(
     theme: &Theme,
     row: &ThreadRow,
@@ -3098,44 +3097,25 @@ fn names(
     } else {
         theme.foreground
     };
-    let line = |bold: bool| {
-        let mut line = div().flex().flex_row().whitespace_nowrap();
-        for (text, span_weight) in parts(bold) {
-            line = line.child(
-                div()
-                    .flex_none()
-                    .font_weight(span_weight)
-                    .text_color(rgb(text_color))
-                    .child(text),
-            );
-        }
-        if let Some(text) = &extra_text {
-            line = line.child(div().flex_none().text_color(rgb(dim)).child(text.clone()));
-        }
-        line
-    };
-    let span = div()
+    let mut line = div().flex().flex_row().whitespace_nowrap();
+    for (text, span_weight) in parts(frame.bold) {
+        line = line.child(
+            div()
+                .flex_none()
+                .font_weight(span_weight)
+                .text_color(rgb(text_color))
+                .child(text),
+        );
+    }
+    if let Some(text) = extra_text {
+        line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
+    }
+    div()
         .relative()
         .w(px(width))
         .min_w(px(0.))
-        .overflow_hidden();
-    weight_layer(span, frame, |bold, opacity| line(bold).opacity(opacity))
-}
-
-/// `into` holds the row text at the weight that shows this frame
-/// ([`RowFrame::regular`], [`RowFrame::bold`]). The fade-through never
-/// shows both, so there is one layer, and it keeps the box's height.
-fn weight_layer(
-    into: gpui::Div,
-    frame: RowFrame,
-    layer: impl Fn(bool, f32) -> gpui::Div,
-) -> gpui::Div {
-    let (bold, opacity) = if frame.bold > 0.0 {
-        (true, frame.bold)
-    } else {
-        (false, frame.regular)
-    };
-    into.child(layer(bold, opacity))
+        .overflow_hidden()
+        .child(line)
 }
 
 /// Line two: the subject and the snippet. `background` is the row's fill
@@ -3166,15 +3146,6 @@ fn thread_line_two(
     let snippet_w = (text_width - rest_x).max(24.0);
     // Shaped once here and drawn from that shaping: a row that comes into
     // view shapes each of its two texts at most twice.
-    let subject = |unread: bool| {
-        clip_shaped(
-            window,
-            &row.subject,
-            room,
-            row_weight(unread),
-            Some(subject_color),
-        )
-    };
     let snippet = clip_shaped(
         window,
         &row.snippet,
@@ -3182,15 +3153,20 @@ fn thread_line_two(
         FontWeight::NORMAL,
         Some(snippet_color),
     );
-    // The weight fades through while it changes.
     let subject = (!row.subject.is_empty()).then(|| {
-        let box_ = div().relative().flex_none().w(px(box_w)).overflow_hidden();
-        weight_layer(box_, frame, |unread, opacity| {
-            div()
-                .flex_none()
-                .opacity(opacity)
-                .children(subject(unread).map(|line| shaped_text(line, window)))
-        })
+        let shaped = clip_shaped(
+            window,
+            &row.subject,
+            room,
+            row_weight(frame.bold),
+            Some(subject_color),
+        );
+        div()
+            .relative()
+            .flex_none()
+            .w(px(box_w))
+            .overflow_hidden()
+            .children(shaped.map(|line| shaped_text(line, window)))
     });
     // A relaxing box carries the snippet, cut for where it is going, past
     // the end of the line: its last pixels fade into the row instead of

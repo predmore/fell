@@ -8,10 +8,8 @@
 //! from what the last frame drew, as [`crate::inbox_motion`] does, so
 //! open, `U`, `s`, undo, an agent and sync all move a row the same way, and
 //! every row a `V` range changes moves together:
-//! - the weight fades through: the old weight fades out over the first
-//!   [`WEIGHT_OUT`] of [`motion::FADE`], then the new one fades in, so the
-//!   two widths are never drawn over each other; the unread bar
-//!   cross-fades over the whole [`motion::FADE`];
+//! - the unread bar fades over [`motion::FADE`]. The text stays legible
+//!   at one weight throughout and changes weight once the box has settled;
 //! - a read row marked unread grows its subject box to fit the bold text,
 //!   and the snippet slides there ([`motion::SLIDE`]) instead of the
 //!   subject being cut short;
@@ -47,10 +45,6 @@ pub const STAR_FROM: f32 = 0.8;
 /// pane slide or list glide of the key that starts it.
 pub const RELAX: Duration = motion::PANE;
 
-/// The share of [`motion::FADE`] the old weight takes to fade out, before
-/// the new one fades in: 40 of 120 ms.
-pub const WEIGHT_OUT: f32 = 1.0 / 3.0;
-
 /// How wide the fade is that softens the snippet's right edge while a
 /// relaxing box carries it past the end of the line.
 pub const EDGE_FADE: f32 = 16.0;
@@ -64,11 +58,8 @@ pub struct RowFrame {
     pub subject_room: f32,
     /// How much of the unread bar shows: 0 read, 1 unread.
     pub unread: f32,
-    /// The opacity of the regular-weight text, and of the bold text. At
-    /// rest one is 1 and the other 0; while the weight changes the old one
-    /// fades out before the new one fades in.
-    pub regular: f32,
-    pub bold: f32,
+    /// The weight of the sender and subject text in this frame.
+    pub bold: bool,
     /// How much of the star shows (its opacity; its scale follows).
     pub star: f32,
 }
@@ -77,12 +68,10 @@ impl RowFrame {
     /// A row drawn as it is, with nothing moving: `subject_w` wide.
     pub fn still(subject_w: f32, unread: bool, starred: bool) -> Self {
         let subject_w = subject_w.ceil();
-        let unread = f32::from(u8::from(unread));
         Self {
             subject_w,
             subject_room: subject_w,
-            unread,
-            regular: 1.0 - unread,
+            unread: f32::from(u8::from(unread)),
             bold: unread,
             star: f32::from(u8::from(starred)),
         }
@@ -113,8 +102,8 @@ struct Kept {
     slide: Option<(f32, Transition)>,
     unread: bool,
     starred: bool,
-    /// The weight cross-fading into `unread`'s.
-    weight: Option<Transition>,
+    /// Starting unread accent and text weight while the accent eases.
+    unread_transition: Option<(f32, bool, Transition)>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
     /// The reader moved in the list: ease back to the text on the next
@@ -132,27 +121,18 @@ impl Kept {
             let t = motion::progress(transition, now);
             if on { t } else { 1.0 - t }
         };
-        // Fade-through: the old weight leaves, then the new one comes.
-        let (leaving, coming) = match &self.weight {
-            Some(weight) => {
-                let t = weight.linear(now);
-                (
-                    motion::fade_out(t / WEIGHT_OUT),
-                    motion::ease_out((t - WEIGHT_OUT) / (1.0 - WEIGHT_OUT)),
-                )
-            }
-            None => (0.0, 1.0),
-        };
-        let (regular, bold) = if self.unread {
-            (leaving, coming)
-        } else {
-            (coming, leaving)
+        let unread_target = f32::from(u8::from(self.unread));
+        let (unread, bold) = match self.unread_transition {
+            Some((from, bold, transition)) if transition.running(now) => (
+                motion::lerp(from, unread_target, transition.progress(now)),
+                bold,
+            ),
+            _ => (unread_target, self.unread),
         };
         RowFrame {
             subject_w,
             subject_room: self.width,
-            unread: toward(self.unread, self.weight.as_ref()),
-            regular,
+            unread,
             bold,
             star: toward(self.starred, self.star.as_ref()),
         }
@@ -160,7 +140,9 @@ impl Kept {
 
     fn running(&self, now: Instant) -> bool {
         self.slide.is_some_and(|(_, t)| t.running(now))
-            || self.weight.is_some_and(|t| t.running(now))
+            || self
+                .unread_transition
+                .is_some_and(|(_, _, t)| t.running(now))
             || self.star.is_some_and(|t| t.running(now))
     }
 
@@ -232,7 +214,7 @@ impl RowWidths {
                         slide: None,
                         unread,
                         starred,
-                        weight: None,
+                        unread_transition: None,
                         star: None,
                         relax: false,
                     },
@@ -246,23 +228,30 @@ impl RowWidths {
         if kept.slide.is_some_and(|(_, t)| !t.running(now)) {
             kept.slide = None;
         }
-        if kept.weight.is_some_and(|t| !t.running(now)) {
-            kept.weight = None;
+        if kept
+            .unread_transition
+            .is_some_and(|(_, _, t)| !t.running(now))
+        {
+            kept.unread_transition = None;
         }
         if kept.star.is_some_and(|t| !t.running(now)) {
             kept.star = None;
         }
         if unread != kept.unread {
-            let drawn = kept.frame(now).subject_w;
+            let drawn = kept.frame(now);
             kept.unread = unread;
-            kept.weight = motion.start(motion::FADE, now);
+            kept.unread_transition = motion
+                .start(motion::FADE, now)
+                .map(|transition| (drawn.unread, drawn.bold, transition));
             kept.natural = natural(unread).ceil();
             // Grow to fit rather than cut the text short (a read row marked
             // unread). A box that is wider stays for now, so a row that
             // turns read does not move under the reader.
             if kept.natural > kept.width {
                 kept.width = kept.natural;
-                kept.slide = motion.start(motion::SLIDE, now).map(|slide| (drawn, slide));
+                kept.slide = motion
+                    .start(motion::SLIDE, now)
+                    .map(|slide| (drawn.subject_w, slide));
             }
         }
         if starred != kept.starred {
@@ -293,7 +282,7 @@ impl RowWidths {
     pub fn settle(&mut self) {
         for kept in self.rows.values_mut() {
             kept.slide = None;
-            kept.weight = None;
+            kept.unread_transition = None;
             kept.star = None;
         }
     }
@@ -338,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_unread_row_moves_nothing_and_fades_the_weight() {
+    fn opening_an_unread_row_moves_nothing_and_fades_the_accent() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         let before = draw(&mut widths, "t1", true, t0);
@@ -496,36 +485,20 @@ mod tests {
     }
 
     #[test]
-    fn the_weight_fades_through_without_drawing_both() {
+    fn text_keeps_one_weight_through_the_accent_fade() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         draw(&mut widths, "t1", true, t0);
         let key = at(t0, 16);
-        let first = draw(&mut widths, "t1", false, key);
-        assert_eq!((first.bold, first.regular), (1.0, 0.0));
-        // Never both weights at once, so their widths never smear: bold
-        // leaves over the first 40 ms, then regular comes.
-        let frames: Vec<(u64, RowFrame)> = (0..=120)
-            .step_by(4)
-            .map(|ms| (ms, draw(&mut widths, "t1", false, at(key, ms))))
-            .collect();
-        for (ms, frame) in &frames {
-            if *ms < 40 {
-                assert_eq!(frame.regular, 0.0, "{ms} ms: {frame:?}");
-            } else {
-                assert_eq!(frame.bold, 0.0, "{ms} ms: {frame:?}");
-            }
-        }
-        let at_ms = |wanted: u64| frames.iter().find(|(ms, _)| *ms == wanted).unwrap().1;
-        let mid_out = at_ms(20);
-        assert!(mid_out.bold > 0.0 && mid_out.bold < 1.0, "{mid_out:?}");
-        let mid_in = at_ms(80);
-        assert!(mid_in.regular > 0.0 && mid_in.regular < 1.0, "{mid_in:?}");
-        let done = at_ms(120);
-        assert_eq!((done.bold, done.regular), (0.0, 1.0));
-        // The bar cross-fades over the whole fade.
-        assert!(mid_in.unread > 0.0);
-        assert_eq!(done.unread, 0.0);
+        assert!(draw(&mut widths, "t1", false, key).bold);
+        let mid = draw(&mut widths, "t1", false, at(key, 60));
+        assert!(mid.bold && mid.unread > 0.0 && mid.unread < 1.0);
+        let reversed = draw(&mut widths, "t1", true, at(key, 60));
+        assert_eq!(reversed, mid, "a second update starts from the drawn state");
+        assert!(draw(&mut widths, "t1", true, at(key, 180)).bold);
+        let second = at(key, 220);
+        assert!(draw(&mut widths, "t1", false, second).bold);
+        assert!(!draw(&mut widths, "t1", false, at(second, 120)).bold);
     }
 
     #[test]
