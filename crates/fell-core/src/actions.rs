@@ -42,9 +42,6 @@ use crate::{Error, Result};
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
 
-/// Legacy error text for permanent-delete undo.
-pub const UNDO_PURGE: &str = "a permanent delete can't be undone";
-
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
     in_reply_to, references_header, from_name, from_email, subject,
     date_unix, snippet, body_text, unread, folders, labels, arrived_via,

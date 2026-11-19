@@ -28,7 +28,7 @@ pub mod threading;
 
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
-pub use actions::{ActionKind, LabelChange, LocalAction, UNDO_PURGE};
+pub use actions::{ActionKind, LabelChange, LocalAction};
 pub use agent::{
     AgentGrant, AgentSummary, RecordedAction, ReviewDraft, ReviewDraftInput, SavedDraft,
 };

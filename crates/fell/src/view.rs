@@ -1511,10 +1511,6 @@ impl Inbox {
                     let raw = err.to_string();
                     if raw == "nothing to undo" {
                         inbox.session.show_toast("Nothing to undo", false);
-                    } else if raw == fell_core::UNDO_PURGE {
-                        inbox
-                            .session
-                            .show_toast("A permanent delete can't be undone", false);
                     } else {
                         inbox.session.show_toast(raw, true);
                     }
