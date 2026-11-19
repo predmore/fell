@@ -579,7 +579,7 @@ fn write_back_off_queues_nothing_and_turning_it_off_clears_the_queue() {
 }
 
 #[test]
-fn labels_and_delete_stay_local() {
+fn labels_stay_local() {
     let fx = Fixture::new();
     let alpha = fx.thread("INBOX", "Alpha");
     fx.store
@@ -589,13 +589,127 @@ fn labels_and_delete_stay_local() {
             crate::LabelChange::Add("work".into()),
         )
         .unwrap();
+    assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
+    fx.store.undo(&fx.account.id).unwrap();
+    assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
+}
+
+/// INBOX with Alpha and Bravo; Trash and Junk named as this server names
+/// them, found by SPECIAL-USE.
+fn with_trash_and_junk() -> Fixture {
+    Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha"), (2, "Bravo")]),
+            mailbox("Deleted Items", "\\Trash", 50, &[]),
+            mailbox("Bulk", "\\Junk", 60, &[]),
+        ]),
+    )
+}
+
+#[test]
+fn delete_and_spam_of_a_selection_are_server_moves_and_undo_reverses_them() {
+    let fx = with_trash_and_junk();
+    let both = [fx.thread("INBOX", "Alpha"), fx.thread("INBOX", "Bravo")];
     fx.store
-        .delete_thread(&fx.account.id, &alpha, "INBOX")
+        .delete_threads(&fx.account.id, &both, "INBOX")
+        .unwrap();
+    let rows = fx.store.outbox(&fx.account.id).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.target_folder == "Deleted Items"
+        && row.source_mailbox.as_deref() == Some("INBOX")));
+
+    fx.clear_commands();
+    assert_eq!(fx.replay().sent, 2);
+    let writes = without_tags(&fx.writes());
+    assert!(
+        writes
+            .iter()
+            .all(|command| !command.contains("STORE") && !command.contains("EXPUNGE")),
+        "{writes:?}"
+    );
+    assert!(fx.on_server("INBOX").is_empty());
+    assert_eq!(fx.on_server("Deleted Items").len(), 2);
+
+    // One undo puts both back, on the server too.
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.subjects("INBOX"), vec!["Alpha", "Bravo"]);
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+    assert!(fx.on_server("Deleted Items").is_empty());
+    fx.sync();
+
+    // Spam goes to the server's Junk; from there, not spam goes to INBOX.
+    let bravo = fx.thread("INBOX", "Bravo");
+    let one = std::slice::from_ref(&bravo);
+    fx.store.spam_threads(&fx.account.id, one, "INBOX").unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.on_server("Bulk").len(), 1);
+    fx.sync();
+    assert_eq!(fx.subjects("Bulk"), vec!["Bravo"]);
+    let rescued = fx.store.spam_threads(&fx.account.id, one, "Bulk").unwrap();
+    assert_eq!(rescued.kind, crate::ActionKind::NotSpam);
+    let last = fx.store.outbox(&fx.account.id).unwrap().pop().unwrap();
+    assert_eq!(
+        (last.source_folder.as_str(), last.target_folder.as_str()),
+        ("Bulk", "INBOX")
+    );
+    assert_eq!(fx.replay().sent, 1);
+    assert!(fx.on_server("Bulk").is_empty());
+    assert_eq!(fx.on_server("INBOX").len(), 2);
+}
+
+#[test]
+fn permanent_delete_never_reaches_the_server() {
+    let fx = with_trash_and_junk();
+    let alpha = fx.thread("INBOX", "Alpha");
+    let one = std::slice::from_ref(&alpha);
+    fx.store
+        .delete_threads(&fx.account.id, one, "INBOX")
+        .unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    fx.sync();
+    let queued = fx.store.outbox(&fx.account.id).unwrap().len();
+
+    fx.store
+        .purge_threads(&fx.account.id, one, "Deleted Items")
+        .unwrap();
+    assert_eq!(fx.store.outbox(&fx.account.id).unwrap().len(), queued);
+    fx.clear_commands();
+    fx.replay();
+    fx.sync();
+    assert!(fx.writes().iter().all(|command| !command.contains("MOVE")
+        && !command.contains("STORE")
+        && !command.contains("EXPUNGE")));
+    // The server keeps its copy in its Trash; Fell does not show it again.
+    assert_eq!(fx.on_server("Deleted Items").len(), 1);
+    assert!(fx.subjects("Deleted Items").is_empty());
+}
+
+#[test]
+fn delete_and_spam_queue_nothing_with_write_back_off() {
+    let fx = with_trash_and_junk();
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    let alpha = fx.thread("INBOX", "Alpha");
+    let bravo = fx.thread("INBOX", "Bravo");
+    fx.store
+        .delete_threads(&fx.account.id, std::slice::from_ref(&alpha), "INBOX")
+        .unwrap();
+    fx.store
+        .spam_threads(&fx.account.id, std::slice::from_ref(&bravo), "INBOX")
+        .unwrap();
+    fx.store
+        .purge_threads(
+            &fx.account.id,
+            std::slice::from_ref(&alpha),
+            "Deleted Items",
+        )
         .unwrap();
     assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
-    fx.store.undo(&fx.account.id).unwrap();
-    fx.store.undo(&fx.account.id).unwrap();
-    assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
+    assert_eq!(fx.subjects("Bulk"), vec!["Bravo"]);
+    fx.clear_commands();
+    assert_eq!(fx.replay(), Default::default());
+    assert!(fx.commands().is_empty());
 }
 
 #[test]

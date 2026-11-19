@@ -5,14 +5,17 @@
 //! labels on that account's undo stack. [`Store::undo`] restores the latest
 //! entry and leaves every other account as it was.
 //!
-//! Archive and delete change one folder on the messages in a thread. Any
-//! other folder on the same row, such as Sent, stays. Labels are a second
-//! list, not folders. Archive and Trash are the account's folders for those
-//! roles ([`Store::folder_roles`]), not fixed names.
+//! Archive, delete, and spam change one folder on the messages in a thread
+//! (or in every thread of a selection). Any other folder on the same row,
+//! such as Sent, stays. Labels are a second list, not folders. Archive,
+//! Trash, Junk, and the inbox are the account's folders for those roles
+//! ([`Store::folder_roles`]), not fixed names.
 //!
 //! With write-back on for the account (`write_back` in `account.toml`),
-//! archive and move also queue the server move in the same transaction, and
-//! undo takes it back (see [`crate::outbox`]). Labels and delete stay local.
+//! archive, move, delete to Trash, spam, and not spam also queue the server
+//! move in the same transaction, and undo takes it back (see
+//! [`crate::outbox`]). Labels stay local, and so does a permanent delete from
+//! Trash ([`Store::purge_threads`]): the server keeps its copy in Trash.
 //!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
@@ -38,6 +41,9 @@ use crate::{Error, Result};
 
 /// IMAP inbox (RFC 3501 fixes this name). Matching a folder ignores ASCII case.
 pub const FOLDER_INBOX: &str = "INBOX";
+
+/// What [`Store::undo`] says when the latest action is a permanent delete.
+pub const UNDO_PURGE: &str = "a permanent delete can't be undone";
 
 const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversation_id,
     in_reply_to, references_header, from_name, from_email, subject,
@@ -160,6 +166,12 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    /// Moved into the account's Junk folder.
+    Spam,
+    /// Moved out of Junk back to the inbox.
+    NotSpam,
+    /// Removed from Trash for good. Never undone: see [`Store::purge_threads`].
+    Purge,
 }
 
 impl ActionKind {
@@ -169,6 +181,9 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::Spam => "spam",
+            Self::NotSpam => "not_spam",
+            Self::Purge => "purge",
         }
     }
 
@@ -178,6 +193,9 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "spam" => Ok(Self::Spam),
+            "not_spam" => Ok(Self::NotSpam),
+            "purge" => Ok(Self::Purge),
             _ => Err(Error::Action(format!("unknown action {raw}"))),
         }
     }
@@ -329,7 +347,8 @@ impl Store {
     /// thread that have it.
     ///
     /// When `from_folder` is Trash, that folder is dropped. A row whose last
-    /// folder was Trash is deleted, and undo inserts it again.
+    /// folder was Trash is deleted, and undo inserts it again. The app's `#`
+    /// in Trash uses [`Store::purge_threads`] instead, which is never undone.
     pub fn delete_thread(
         &self,
         account_id: &AccountId,
@@ -338,17 +357,116 @@ impl Store {
     ) -> Result<LocalAction> {
         let from_folder = canonical_folder(from_folder)?;
         let roles = self.folder_roles(account_id)?;
+        if !roles.is(FolderRole::Trash, &from_folder) {
+            return self.delete_threads(account_id, std::slice::from_ref(thread_id), &from_folder);
+        }
+        self.apply_threads(
+            account_id,
+            std::slice::from_ref(thread_id),
+            ActionKind::Delete,
+            None,
+            |rows| {
+                let plans = plan_expunge(rows, &from_folder);
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {from_folder}")));
+                }
+                let summary = format!("deleted {} from {from_folder}", plans.len());
+                Ok((summary, plans))
+            },
+        )
+    }
+
+    /// Move `from_folder` to the account's Trash folder on the messages in
+    /// `threads` that have it, as one undo entry. Other folders on those rows
+    /// stay, so a Sent copy is left in Sent.
+    ///
+    /// With write-back on, the server moves are queued with the change, as
+    /// archive and move queue theirs. In Trash this fails: emptying it is
+    /// [`Store::purge_threads`].
+    pub fn delete_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        from_folder: &str,
+    ) -> Result<LocalAction> {
+        let from_folder = canonical_folder(from_folder)?;
+        let roles = self.folder_roles(account_id)?;
+        if roles.is(FolderRole::Trash, &from_folder) {
+            return Err(Error::Action("already in Trash".into()));
+        }
         let trash = roles.name(FolderRole::Trash).to_string();
-        self.apply_thread(account_id, thread_id, ActionKind::Delete, None, |rows| {
-            let plans = if from_folder.eq_ignore_ascii_case(&trash) {
-                plan_expunge(rows, &from_folder)
-            } else {
-                plan_relocate(rows, &from_folder, &trash)
-            };
+        let server = Some((from_folder.as_str(), trash.as_str(), &roles));
+        self.apply_threads(account_id, threads, ActionKind::Delete, server, |rows| {
+            let plans = plan_relocate(rows, &from_folder, &trash);
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
             }
             let summary = format!("deleted {} from {from_folder}", plans.len());
+            Ok((summary, plans))
+        })
+    }
+
+    /// `!`: move `from_folder` to the account's Junk folder on the messages
+    /// in `threads` that have it. From Junk itself it is "not spam": they
+    /// move to the inbox instead. One undo entry, with the server moves
+    /// queued as [`Store::delete_threads`] queues its own.
+    pub fn spam_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        from_folder: &str,
+    ) -> Result<LocalAction> {
+        let from_folder = canonical_folder(from_folder)?;
+        let roles = self.folder_roles(account_id)?;
+        let (kind, to) = if roles.is(FolderRole::Junk, &from_folder) {
+            (
+                ActionKind::NotSpam,
+                roles.name(FolderRole::Inbox).to_string(),
+            )
+        } else {
+            (ActionKind::Spam, roles.name(FolderRole::Junk).to_string())
+        };
+        let server = Some((from_folder.as_str(), to.as_str(), &roles));
+        self.apply_threads(account_id, threads, kind, server, |rows| {
+            let plans = plan_relocate(rows, &from_folder, &to);
+            if plans.is_empty() {
+                return Err(Error::Action(format!("no messages in {from_folder}")));
+            }
+            let summary = format!("moved {} from {from_folder} to {to}", plans.len());
+            Ok((summary, plans))
+        })
+    }
+
+    /// Delete the messages in `threads` from Trash for good, in Fell only.
+    ///
+    /// Trash is dropped from those rows; a row it was the last folder of is
+    /// deleted with its body. Nothing is queued for the server: its copy
+    /// stays in its Trash, and the tombstone this records keeps a later sync
+    /// from bringing it back here.
+    ///
+    /// This is never undone: [`Store::undo`] stops at it with
+    /// [`UNDO_PURGE`], and nothing recorded before it can be undone either.
+    /// The entry is recorded as a delete from Trash is, so a sync treats the
+    /// removed rows the same way.
+    pub fn purge_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        trash_folder: &str,
+    ) -> Result<LocalAction> {
+        let trash_folder = canonical_folder(trash_folder)?;
+        let roles = self.folder_roles(account_id)?;
+        if !roles.is(FolderRole::Trash, &trash_folder) {
+            return Err(Error::Action(
+                "permanent delete only removes mail from Trash".into(),
+            ));
+        }
+        self.apply_threads(account_id, threads, ActionKind::Purge, None, |rows| {
+            let plans = plan_expunge(rows, &trash_folder);
+            if plans.is_empty() {
+                return Err(Error::Action(format!("no messages in {trash_folder}")));
+            }
+            let summary = format!("deleted {} from {trash_folder} for good", plans.len());
             Ok((summary, plans))
         })
     }
@@ -361,6 +479,9 @@ impl Store {
         let Some(action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
+        if action.kind == ActionKind::Purge {
+            return Err(Error::Action(UNDO_PURGE.into()));
+        }
         let rows = load_snapshots(&tx, action.id)?;
         if rows.is_empty() {
             return Err(Error::Action("action has no messages".into()));
@@ -473,10 +594,36 @@ impl Store {
         server: Option<(&str, &str, &crate::folders::FolderRoles)>,
         plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
+        self.apply_threads(
+            account_id,
+            std::slice::from_ref(thread_id),
+            kind,
+            server,
+            plans_for,
+        )
+    }
+
+    /// One action over every message of `threads`. A thread that is gone
+    /// (a sync merged or removed it) adds nothing; the call fails only when
+    /// none of them has messages.
+    fn apply_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        kind: ActionKind,
+        server: Option<(&str, &str, &crate::folders::FolderRoles)>,
+        plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
+    ) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
-        let rows = load_thread(&tx, account_id, thread_id)?;
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for thread_id in threads {
+            if seen.insert(thread_id.as_str()) {
+                rows.extend(load_thread(&tx, account_id, thread_id)?);
+            }
+        }
         if rows.is_empty() {
             return Err(Error::Action("no such thread".into()));
         }
@@ -2094,6 +2241,240 @@ mod tests {
 
         store.undo(&account("a1")).unwrap();
         assert_eq!(messages(&store, "a1", &note_thread), baseline);
+    }
+
+    fn folders_of(store: &Store, thread: &ThreadId) -> Vec<Vec<String>> {
+        messages(store, "a1", thread)
+            .into_iter()
+            .map(|message| message.folders)
+            .collect()
+    }
+
+    /// Two threads in the inbox, the first with a Sent reply.
+    fn two_in_inbox(store: &Store) -> (ThreadId, ThreadId) {
+        let mut root = sample("a1", "root@x", "Hello", "root body");
+        root.headers.date_unix = 10;
+        let first = store.upsert_message(&root).unwrap();
+        let mut reply = sample("a1", "reply@x", "Re: Hello", "reply body");
+        reply.folders = vec![FOLDER_SENT.into()];
+        reply.headers.date_unix = 20;
+        reply.headers.in_reply_to = Some(MessageId::new("root@x"));
+        reply.headers.references = vec![MessageId::new("root@x")];
+        assert_eq!(store.upsert_message(&reply).unwrap(), first);
+        let second = store
+            .upsert_message(&sample("a1", "other@x", "Other", "other body"))
+            .unwrap();
+        (first, second)
+    }
+
+    #[test]
+    fn delete_of_a_selection_is_one_undo() {
+        let store = open(&[("a1", "a@x")]);
+        let (first, second) = two_in_inbox(&store);
+        let both = [first.clone(), second.clone()];
+
+        let deleted = store
+            .delete_threads(&account("a1"), &both, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(deleted.kind, ActionKind::Delete);
+        assert_eq!(deleted.summary, "deleted 2 from INBOX");
+        // The Sent reply stays in Sent.
+        assert_eq!(
+            folders_of(&store, &first),
+            vec![
+                vec![FOLDER_TRASH.to_string()],
+                vec![FOLDER_SENT.to_string()]
+            ]
+        );
+        assert_eq!(
+            folders_of(&store, &second),
+            vec![vec![FOLDER_TRASH.to_string()]]
+        );
+        assert!(
+            store
+                .threads_in_folder(&account("a1"), FOLDER_INBOX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            text(store.delete_threads(&account("a1"), &both, FOLDER_TRASH)),
+            "already in Trash"
+        );
+
+        assert_eq!(store.undo(&account("a1")).unwrap().id, deleted.id);
+        assert_eq!(
+            folders_of(&store, &first),
+            vec![
+                vec![FOLDER_INBOX.to_string()],
+                vec![FOLDER_SENT.to_string()]
+            ]
+        );
+        assert_eq!(
+            folders_of(&store, &second),
+            vec![vec![FOLDER_INBOX.to_string()]]
+        );
+        assert_eq!(text(store.undo(&account("a1"))), "nothing to undo");
+    }
+
+    #[test]
+    fn spam_goes_to_junk_and_not_spam_comes_back_to_the_inbox() {
+        let store = open(&[("a1", "a@x")]);
+        let (first, second) = two_in_inbox(&store);
+        let both = [first.clone(), second.clone()];
+
+        let spam = store
+            .spam_threads(&account("a1"), &both, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(spam.kind, ActionKind::Spam);
+        assert_eq!(spam.summary, "moved 2 from INBOX to Spam");
+        assert_eq!(folders_of(&store, &second), vec![vec!["Spam".to_string()]]);
+        assert_eq!(folders_of(&store, &first)[1], vec![FOLDER_SENT.to_string()]);
+        assert_eq!(
+            store
+                .threads_in_folder(&account("a1"), "Spam")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // From Junk, the same call is "not spam".
+        let rescued = store
+            .spam_threads(&account("a1"), std::slice::from_ref(&second), "spam")
+            .unwrap();
+        assert_eq!(rescued.kind, ActionKind::NotSpam);
+        assert_eq!(
+            folders_of(&store, &second),
+            vec![vec![FOLDER_INBOX.to_string()]]
+        );
+
+        // Each is its own undo, newest first.
+        assert_eq!(store.undo(&account("a1")).unwrap().id, rescued.id);
+        assert_eq!(folders_of(&store, &second), vec![vec!["Spam".to_string()]]);
+        assert_eq!(store.undo(&account("a1")).unwrap().id, spam.id);
+        assert_eq!(
+            folders_of(&store, &first),
+            vec![
+                vec![FOLDER_INBOX.to_string()],
+                vec![FOLDER_SENT.to_string()]
+            ]
+        );
+        assert_eq!(
+            folders_of(&store, &second),
+            vec![vec![FOLDER_INBOX.to_string()]]
+        );
+    }
+
+    #[test]
+    fn spam_and_delete_use_the_folders_the_server_marked() {
+        let store = open(&[("a1", "a@x")]);
+        let (first, _) = two_in_inbox(&store);
+        let roles = crate::FolderRoles::new(vec![
+            crate::RoleFolder {
+                role: FolderRole::Junk,
+                name: "Bulk".into(),
+                raw: "Bulk".into(),
+                source: crate::RoleSource::Server,
+            },
+            crate::RoleFolder {
+                role: FolderRole::Trash,
+                name: "Deleted Items".into(),
+                raw: "Deleted Items".into(),
+                source: crate::RoleSource::Server,
+            },
+        ]);
+        store
+            .apply_delta(
+                &account("a1"),
+                &MailboxDelta {
+                    roles: Some(roles),
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        let one = std::slice::from_ref(&first);
+        store
+            .spam_threads(&account("a1"), one, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(folders_of(&store, &first)[0], vec!["Bulk".to_string()]);
+        let back = store.spam_threads(&account("a1"), one, "bulk").unwrap();
+        assert_eq!(back.kind, ActionKind::NotSpam);
+        store
+            .delete_threads(&account("a1"), one, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(
+            folders_of(&store, &first)[0],
+            vec!["Deleted Items".to_string()]
+        );
+        // "Trash" is only a folder name on this account, not its Trash.
+        assert!(
+            store
+                .purge_threads(&account("a1"), one, FOLDER_TRASH)
+                .is_err()
+        );
+        store
+            .purge_threads(&account("a1"), one, "Deleted Items")
+            .unwrap();
+        assert_eq!(
+            folders_of(&store, &first),
+            vec![vec![FOLDER_SENT.to_string()]]
+        );
+    }
+
+    #[test]
+    fn permanent_delete_removes_trash_rows_and_is_never_undone() {
+        let store = open(&[("a1", "a@x")]);
+        let (first, second) = two_in_inbox(&store);
+        let both = [first.clone(), second.clone()];
+        let trashed = store
+            .delete_threads(&account("a1"), &both, FOLDER_INBOX)
+            .unwrap();
+        assert_eq!(
+            text(store.purge_threads(&account("a1"), &both, FOLDER_INBOX)),
+            "permanent delete only removes mail from Trash"
+        );
+
+        let purged = store.purge_threads(&account("a1"), &both, "trash").unwrap();
+        assert_eq!(purged.kind, ActionKind::Purge);
+        assert_eq!(purged.summary, "deleted 2 from trash for good");
+        // The Sent reply is not in Trash and stays; the rest is gone.
+        assert_eq!(
+            folders_of(&store, &first),
+            vec![vec![FOLDER_SENT.to_string()]]
+        );
+        assert!(messages(&store, "a1", &second).is_empty());
+        assert!(subjects(&store, "a1", "Other").is_empty());
+        assert!(
+            store
+                .threads_in_folder(&account("a1"), FOLDER_TRASH)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Undo stops at it: neither it nor the delete before it comes back.
+        assert_eq!(text(store.undo(&account("a1"))), UNDO_PURGE);
+        assert!(messages(&store, "a1", &second).is_empty());
+        assert_ne!(trashed.id, purged.id);
+
+        // A later action still undoes, then undo stops at the purge again.
+        let archived = store
+            .archive_thread(&account("a1"), &first, FOLDER_SENT)
+            .unwrap();
+        assert_eq!(store.undo(&account("a1")).unwrap().id, archived.id);
+        assert_eq!(text(store.undo(&account("a1"))), UNDO_PURGE);
+    }
+
+    #[test]
+    fn a_sync_does_not_bring_back_a_permanently_deleted_message() {
+        let store = open(&[("a1", "a@x")]);
+        let mut gone = sample("a1", "gone@x", "Gone", "gone body");
+        gone.folders = vec![FOLDER_TRASH.into()];
+        let thread = store.upsert_message(&gone).unwrap();
+        store
+            .purge_threads(&account("a1"), std::slice::from_ref(&thread), FOLDER_TRASH)
+            .unwrap();
+        // The server still has its copy in Trash: write-back never expunges.
+        apply(&store, gone);
+        assert!(messages(&store, "a1", &thread).is_empty());
     }
 
     #[test]

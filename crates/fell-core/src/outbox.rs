@@ -1,9 +1,10 @@
 //! Server actions waiting to be sent: the durable write-back outbox.
 //!
-//! Archive and move change the local store at once. When the account has
-//! `write_back = true` in `account.toml`, the same [`WriteTx`] also writes
-//! one outbox row per server copy the change moved (from `message_copies`),
-//! so the window stays instant and a queued action survives a restart. The
+//! Archive, move, delete to Trash, and spam change the local store at once.
+//! When the account has `write_back = true` in `account.toml`, the same
+//! [`WriteTx`] also writes one outbox row per server copy the change moved
+//! (from `message_copies`), so the window stays instant and a queued action
+//! survives a restart. The
 //! sync thread replays the rows on its own `SELECT` session
 //! ([`crate::AccountConfig::replay_outbox`]); the read-only sync session
 //! never sends a write.
@@ -32,9 +33,11 @@
 //! reversed, even when write-back is turned on again or a command on the
 //! wire when it went off is answered late.
 //!
-//! Only moves exist so far. [`OutboxKind`] names what a row asks for, and
-//! replay dispatches on it, so flags (#104), delete to Trash (#105), labels
-//! (#106), and Drafts or Sent `APPEND` (#116, #117) add a kind each.
+//! Only moves exist so far: archive, move, delete to Trash, spam, and not
+//! spam are all one. A permanent delete from Trash is never queued, since it
+//! would need `\Deleted` and `EXPUNGE`. [`OutboxKind`] names what a row asks
+//! for, and replay dispatches on it, so flags (#104), labels (#106), and
+//! Drafts or Sent `APPEND` (#116, #117) add a kind each.
 //!
 //! [`WriteTx`]: crate::store::WriteTx
 
@@ -118,7 +121,8 @@ const KEEP_SETTLED_SECS: i64 = 30 * 24 * 60 * 60;
 /// What an outbox row asks the server to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxKind {
-    /// Move one copy from `source` to `target` (archive and move).
+    /// Move one copy from `source` to `target` (archive, move, delete to
+    /// Trash, spam, and not spam).
     Move,
 }
 

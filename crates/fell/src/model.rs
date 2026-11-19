@@ -204,6 +204,13 @@ pub struct Step {
     pub undo: bool,
     /// `e` archives the open thread out of the folder on screen.
     pub archive: bool,
+    /// `#` outside Trash: move [`Session::action_targets`] to Trash.
+    pub delete: bool,
+    /// `!`: move [`Session::action_targets`] to Spam, or out of it.
+    pub spam: bool,
+    /// `y` answered the permanent-delete question: delete
+    /// [`Session::take_purge`] from Trash for good.
+    pub purge: bool,
     /// Start a sync pass now instead of waiting for the next one.
     pub sync_now: bool,
     /// Bring back the agent review window that closed last.
@@ -292,6 +299,13 @@ pub struct Session {
     toast_generation: u64,
     /// Destination chosen by `m`, consumed when the view applies the move.
     pub pending_move: Option<String>,
+    /// `#` in Trash asked "Delete permanently?" about these threads, in the
+    /// notice of this generation. The next key answers: `y` deletes them,
+    /// anything else lets it go. A notice that replaced the question
+    /// withdraws it, so `y` never answers a question no longer on screen.
+    pub confirm_purge: Option<(Vec<String>, u64)>,
+    /// The threads `y` confirmed, consumed when the view deletes them.
+    purge_ready: Option<Vec<String>>,
     /// The folder on screen has not been read from the store yet.
     pub loading: bool,
 }
@@ -347,6 +361,8 @@ impl Session {
             toast: None,
             toast_generation: 0,
             pending_move: None,
+            confirm_purge: None,
+            purge_ready: None,
             loading: false,
         }
     }
@@ -594,6 +610,27 @@ impl Session {
             ids.insert(thread.id.clone());
         }
         ids
+    }
+
+    /// What `#` and `!` act on: the picked rows and the visual range when
+    /// there are any, else the selected row. In list order.
+    pub fn action_targets(&self) -> Vec<String> {
+        let marked = self.highlighted();
+        self.threads
+            .iter()
+            .filter(|thread| marked.contains(&thread.id))
+            .map(|thread| thread.id.clone())
+            .collect()
+    }
+
+    /// The threads `y` confirmed for a permanent delete, once.
+    pub fn take_purge(&mut self) -> Option<Vec<String>> {
+        self.purge_ready.take()
+    }
+
+    /// The folder on screen is the account's Trash.
+    pub fn in_trash(&self) -> bool {
+        self.roles.is(FolderRole::Trash, &self.folder)
     }
 
     /// Select `id` when that thread is in the current list.
@@ -1188,6 +1225,27 @@ impl Session {
         if self.overlay != Overlay::None {
             return self.overlay_key(key, page_rows);
         }
+        // The question is asked once: any key answers it. `y` deletes;
+        // Escape and `n` only let it go; any other key does what it does.
+        if let Some((ids, asked)) = self.confirm_purge.take()
+            && asked == self.toast_generation
+        {
+            match key {
+                KeyId::Char('y') => {
+                    self.count.clear();
+                    self.purge_ready = Some(ids);
+                    return Step {
+                        purge: true,
+                        ..Step::default()
+                    };
+                }
+                KeyId::Escape | KeyId::Char('n') => {
+                    self.count.clear();
+                    return Step::default();
+                }
+                _ => {}
+            }
+        }
         let mut step = Step::default();
         if self.chord.is_empty() && self.pane == Pane::Conversation {
             match key {
@@ -1502,6 +1560,41 @@ impl Session {
                     ..Step::default()
                 };
             }
+            Action::Delete | Action::Spam => {
+                self.count.clear();
+                let targets = self.action_targets();
+                if targets.is_empty() {
+                    self.show_toast("No conversation", true);
+                    return Step::default();
+                }
+                if targets.iter().any(|id| {
+                    self.threads
+                        .iter()
+                        .any(|row| &row.id == id && row.draft.is_some())
+                }) {
+                    self.show_toast(DRAFT_NOT_THREAD, true);
+                    return Step::default();
+                }
+                if action == Action::Spam {
+                    return Step {
+                        spam: true,
+                        ..Step::default()
+                    };
+                }
+                if !self.in_trash() {
+                    return Step {
+                        delete: true,
+                        ..Step::default()
+                    };
+                }
+                // Destructive and not undoable: ask, and show the answer key.
+                let question = match targets.len() {
+                    1 => "Delete permanently? It can't be undone · y".to_string(),
+                    n => format!("Delete {n} permanently? They can't be undone · y"),
+                };
+                self.show_toast(question, false);
+                self.confirm_purge = Some((targets, self.toast_generation));
+            }
             Action::Undo => {
                 self.count.clear();
                 return Step {
@@ -1677,6 +1770,7 @@ impl Session {
     /// Drop a typed count, an unfinished chord, and a cursor move waiting
     /// for rows. Mouse selection calls this so the next key does not finish
     /// the prefix, and a late page does not move the row just clicked.
+    /// A permanent-delete question waiting for `y` is withdrawn too.
     ///
     /// The place of a row just archived is kept while nothing is selected:
     /// it is where the cursor stands, not a key. Selecting a row ends it.
@@ -1691,6 +1785,10 @@ impl Session {
         self.count.clear();
         self.chord.clear();
         self.note_chord();
+        // A click withdraws the permanent-delete question, and it leaves.
+        if let Some((_, asked)) = self.confirm_purge.take() {
+            self.clear_toast_if(asked);
+        }
     }
 
     fn clear_chord(&mut self) {
@@ -1790,7 +1888,7 @@ impl Session {
     }
 }
 
-/// Archive and move act on threads. A draft row is not one.
+/// Archive, move, delete, and spam act on threads. A draft row is not one.
 pub const DRAFT_NOT_THREAD: &str = "That is a draft · enter opens it in the editor";
 
 /// Where `row` sits in its folder list.
@@ -2055,6 +2153,154 @@ mod tests {
         assert!(!step.apply_move);
         assert_eq!(session.folder, folder);
         assert_eq!(session.cursor_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn hash_deletes_and_bang_marks_spam_on_the_selected_row() {
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        let step = session.on_key(KeyId::Char('#'), 4);
+        assert!(step.delete && !step.purge && !step.spam);
+        assert_eq!(session.action_targets(), vec!["b".to_string()]);
+        assert!(session.confirm_purge.is_none());
+        let step = session.on_key(KeyId::Char('!'), 4);
+        assert!(step.spam && !step.delete);
+        // In Spam, `!` is "not spam": the same step, the view picks the inbox.
+        session.folder = "Spam".into();
+        assert!(session.on_key(KeyId::Char('!'), 4).spam);
+    }
+
+    #[test]
+    fn delete_and_spam_take_the_picked_rows_or_the_visual_range() {
+        let mut picked = session();
+        picked.cursor_id = Some("a".into());
+        picked.on_key(KeyId::Char('x'), 4);
+        picked.cursor_id = Some("c".into());
+        picked.on_key(KeyId::Char('x'), 4);
+        picked.cursor_id = Some("e".into());
+        assert_eq!(picked.action_targets(), vec!["a", "c", "e"]);
+        assert!(picked.on_key(KeyId::Char('#'), 4).delete);
+
+        let mut session = session();
+        session.cursor_id = Some("b".into());
+        session.on_key(KeyId::Char('V'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.action_targets(), vec!["b", "c", "d"]);
+        assert!(session.on_key(KeyId::Char('!'), 4).spam);
+
+        // The rows leave together; the row after them is selected.
+        for id in session.action_targets() {
+            session.remove_thread(&id);
+        }
+        assert_eq!(session.cursor_id.as_deref(), Some("e"));
+        assert!(!session.visual);
+    }
+
+    #[test]
+    fn delete_and_spam_explain_a_draft_row_and_an_empty_list() {
+        let mut session = session();
+        let mut draft = row("draft-1");
+        draft.draft = Some("c1".into());
+        session.set_threads(vec![draft, row("a")]);
+        session.cursor_id = Some("draft-1".into());
+        for key in ['#', '!'] {
+            let step = session.on_key(KeyId::Char(key), 4);
+            assert!(!step.delete && !step.spam);
+            assert_eq!(
+                session.toast.as_ref().map(|toast| toast.text.as_str()),
+                Some(DRAFT_NOT_THREAD)
+            );
+        }
+        session.set_threads(Vec::new());
+        session.cursor_id = None;
+        assert!(!session.on_key(KeyId::Char('#'), 4).delete);
+        assert_eq!(
+            session.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("No conversation")
+        );
+    }
+
+    #[test]
+    fn hash_in_trash_asks_once_and_y_confirms() {
+        let mut session = session();
+        session.folder = "Trash".into();
+        session.cursor_id = Some("a".into());
+        session.on_key(KeyId::Char('x'), 4);
+        session.cursor_id = Some("b".into());
+        let step = session.on_key(KeyId::Char('#'), 4);
+        assert!(!step.delete && !step.purge, "nothing happens before y");
+        assert_eq!(
+            session.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Delete 2 permanently? They can't be undone · y")
+        );
+        // The view clears the notice before every key, as it does here.
+        session.clear_toast();
+        let step = session.on_key(KeyId::Char('y'), 4);
+        assert!(step.purge && !step.delete);
+        assert_eq!(session.take_purge(), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(session.take_purge(), None);
+        // `y` again answers nothing.
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        // One row says so in the singular.
+        session.picked.clear();
+        session.on_key(KeyId::Char('#'), 4);
+        assert_eq!(
+            session.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Delete permanently? It can't be undone · y")
+        );
+    }
+
+    #[test]
+    fn any_other_answer_lets_the_permanent_delete_go() {
+        let mut session = session();
+        session.folder = "Trash".into();
+        session.cursor_id = Some("a".into());
+
+        // Escape and n only withdraw it.
+        for key in [KeyId::Escape, KeyId::Char('n')] {
+            session.on_key(KeyId::Char('#'), 4);
+            session.clear_toast();
+            let step = session.on_key(key, 4);
+            assert_eq!(step, Step::default());
+            assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+        }
+
+        // Another key withdraws it and still does what it does.
+        session.on_key(KeyId::Char('#'), 4);
+        session.clear_toast();
+        session.on_key(KeyId::Char('j'), 4);
+        assert_eq!(session.cursor_id.as_deref(), Some("b"));
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        // A notice that replaced the question withdraws it.
+        session.on_key(KeyId::Char('#'), 4);
+        session.show_toast("Synced", false);
+        session.clear_toast();
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+
+        // So does a click, and the question leaves with it.
+        session.on_key(KeyId::Char('#'), 4);
+        session.cancel_pending_keys();
+        assert!(session.toast.is_none());
+        assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+    }
+
+    #[test]
+    fn the_palette_runs_delete_and_spam() {
+        let mut session = session();
+        session.cursor_id = Some("a".into());
+        session.on_key(KeyId::Char(':'), 4);
+        for ch in "spam".chars() {
+            session.on_key(KeyId::Char(ch), 4);
+        }
+        assert!(session.on_key(KeyId::Enter, 4).spam);
+        session.on_key(KeyId::Char(':'), 4);
+        for ch in "delete".chars() {
+            session.on_key(KeyId::Char(ch), 4);
+        }
+        assert!(session.on_key(KeyId::Enter, 4).delete);
     }
 
     #[test]
