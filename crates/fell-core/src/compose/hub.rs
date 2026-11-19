@@ -39,7 +39,7 @@ type Listener = Box<dyn Fn() -> bool + Send>;
 
 /// The inbox notice for a draft that may have gone out, worded as its row
 /// and preview are.
-pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent before sending again";
+pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent";
 
 /// `text` with its first letter upper case.
 fn sentence_case(text: &str) -> String {

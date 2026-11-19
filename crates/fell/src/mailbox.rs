@@ -94,45 +94,95 @@ fn load_account_config() -> Result<Option<AccountConfig>, String> {
     let Some(path) = account_config_path() else {
         return Ok(None);
     };
-    read_account_config(&path)
+    read_account_config(&path).map_err(|err| err.to_string())
 }
 
-fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountConfigError {
+    pub(crate) detail: String,
+    pub(crate) recovery: &'static str,
+}
+
+impl AccountConfigError {
+    fn new(detail: impl Into<String>, recovery: &'static str) -> Self {
+        Self {
+            detail: detail.into(),
+            recovery,
+        }
+    }
+}
+
+impl std::fmt::Display for AccountConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+fn read_account_config(path: &Path) -> Result<Option<AccountConfig>, AccountConfigError> {
     let shown = path.display();
+    let unreadable = |err: std::io::Error| {
+        AccountConfigError::new(
+            format!("{shown}: {err}"),
+            "Restore read access to account.toml.",
+        )
+    };
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("{shown}: {err}")),
+        Err(err) => return Err(unreadable(err)),
     };
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
-        return Err(format!(
-            "{shown} is open to other users (mode {:o}); run chmod 600 on it",
-            mode & 0o777
+        return Err(AccountConfigError::new(
+            format!(
+                "{shown} is open to other users (mode {:o}); run chmod 600 on it",
+                mode & 0o777
+            ),
+            "Set account.toml permissions to 600.",
         ));
     }
-    let text = fs::read_to_string(path).map_err(|err| format!("{shown}: {err}"))?;
-    AccountConfig::parse(&text)
-        .map(Some)
-        .map_err(|err| format!("{shown}: {err}"))
+    let text = fs::read_to_string(path).map_err(unreadable)?;
+    AccountConfig::parse(&text).map(Some).map_err(|err| {
+        AccountConfigError::new(
+            format!("{shown}: {err}"),
+            "Fix the settings in account.toml.",
+        )
+    })
 }
 
 /// The account file a send from `account` takes its login and SMTP settings
 /// from, read now with the same mode check as at startup. Never the draft
 /// folder or anything an agent can write. The demo mailbox needs none.
-pub fn send_account_config(account: &AccountId) -> Result<Option<AccountConfig>, String> {
+pub(crate) fn send_account_config(
+    account: &AccountId,
+) -> Result<Option<AccountConfig>, AccountConfigError> {
     if fell_core::is_demo_account(account) {
         return Ok(None);
     }
-    load_account_config()?
-        .filter(|config| config.id == account.as_str())
-        .map(Some)
-        .ok_or_else(|| {
+    let path = account_config_path().ok_or_else(|| {
+        AccountConfigError::new("no config directory", "Set HOME or XDG_CONFIG_HOME.")
+    })?;
+    send_config_at(&path, account).map(Some)
+}
+
+fn send_config_at(path: &Path, account: &AccountId) -> Result<AccountConfig, AccountConfigError> {
+    let config = read_account_config(path)?.ok_or_else(|| {
+        AccountConfigError::new(
+            format!("{} does not exist", path.display()),
+            "Run fell account setup.",
+        )
+    })?;
+    if config.id != account.as_str() {
+        return Err(AccountConfigError::new(
             format!(
-                "unknown account {}: no account file entry for it; run fell account setup",
+                "{} has no entry for account {}",
+                path.display(),
                 account.as_str()
-            )
-        })
+            ),
+            "Restore this draft’s account ID in account.toml.",
+        ));
+    }
+    Ok(config)
 }
 
 /// The account file for `fell account show|check`, with the same mode check
@@ -140,7 +190,7 @@ pub fn send_account_config(account: &AccountId) -> Result<Option<AccountConfig>,
 pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
     let path = account_config_path()
         .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    match read_account_config(&path)? {
+    match read_account_config(&path).map_err(|err| err.to_string())? {
         Some(config) => Ok((path, config)),
         None => Err(format!(
             "{} does not exist; run fell account setup",
@@ -396,20 +446,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("account.toml");
+        let account = AccountId("mail".into());
         assert_eq!(read_account_config(&path).unwrap(), None);
+        let missing = send_config_at(&path, &account).unwrap_err();
+        assert_eq!(missing.recovery, "Run fell account setup.");
 
         fs::write(&path, "email = \"a@b\"\npassword = \"x\"\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        let err = read_account_config(&path).unwrap_err();
-        assert!(err.contains("chmod 600"), "{err}");
+        let err = send_config_at(&path, &account).unwrap_err();
+        assert!(err.detail.contains("chmod 600"), "{err}");
+        assert_eq!(err.recovery, "Set account.toml permissions to 600.");
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let config = read_account_config(&path).unwrap().unwrap();
+        let config = send_config_at(&path, &account).unwrap();
         assert_eq!(config.email, "a@b");
+        let mismatch = send_config_at(&path, &AccountId("other".into())).unwrap_err();
+        assert_eq!(
+            mismatch.recovery,
+            "Restore this draft’s account ID in account.toml."
+        );
 
         fs::write(&path, "email = \"a@b\"\n").unwrap();
-        let err = read_account_config(&path).unwrap_err();
-        assert!(err.contains("password"), "{err}");
+        let err = send_config_at(&path, &account).unwrap_err();
+        assert!(err.detail.contains("password"), "{err}");
+        assert_eq!(err.recovery, "Fix the settings in account.toml.");
         let _ = fs::remove_dir_all(&dir);
     }
 

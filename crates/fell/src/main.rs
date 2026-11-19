@@ -220,12 +220,12 @@ fn compose_preview(preview: ComposePreview) {
                 show: true,
                 ..Default::default()
             },
-            move |_window, cx| {
+            move |window, cx| {
                 cx.new(|cx| {
                     let mut compose =
                         ComposeView::new(hub.clone(), draft_id.clone(), folder.clone(), cx);
                     compose.set_theme(theme);
-                    compose.watch_live(cx);
+                    compose.watch_live(window, cx);
                     if play {
                         compose.play_edit(cx);
                     }

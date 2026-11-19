@@ -19,6 +19,7 @@ use image::Frame;
 use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
+use crate::mailbox::AccountConfigError;
 use crate::present::display_safe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,13 @@ enum Field {
     Bcc,
     Subject,
     Body,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendPanel {
+    Summary,
+    Details,
+    ConfirmUnlock,
 }
 
 struct Editor {
@@ -309,8 +317,11 @@ pub struct ComposeView {
     known_hunks: Vec<u64>,
     /// Send was tried: a missing recipient now says it blocks send.
     send_tried: bool,
-    send_unavailable: bool,
+    send_unavailable: Option<AccountConfigError>,
     send_check: Option<gpui::Task<()>>,
+    send_failure: Option<SendFailure>,
+    send_panel: SendPanel,
+    send_detail_scroll: gpui::ScrollHandle,
 }
 
 impl ComposeView {
@@ -365,34 +376,62 @@ impl ComposeView {
             touched: false,
             known_hunks: Vec::new(),
             send_tried: false,
-            send_unavailable: false,
+            send_unavailable: None,
             send_check: None,
+            send_failure: None,
+            send_panel: SendPanel::Summary,
+            send_detail_scroll: gpui::ScrollHandle::new(),
         };
-        view.check_send_availability(cx);
+        view.refresh_send_availability(cx);
         view
     }
 
-    /// Check the local account file without running the password command or
-    /// contacting the server. An attempted send reads the file again.
-    fn check_send_availability(&mut self, cx: &mut Context<Self>) {
+    /// Check the small local account file while this draft is open. Polling
+    /// also sees file replacements, permission changes, and a newly created
+    /// config directory. An attempted send reads it again independently.
+    fn refresh_send_availability(&mut self, cx: &mut Context<Self>) {
         let Some(account) = self.hub.with_session(self.draft_id.as_ref(), |session| {
             session.account_id().clone()
         }) else {
             return;
         };
+        // Replacing the task on activation or a draft switch drops any
+        // outstanding result before it can repaint the window.
         self.send_check = Some(cx.spawn(async move |this, cx| {
-            let unavailable = cx
-                .background_executor()
-                .spawn(async move { crate::mailbox::send_account_config(&account).is_err() })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.send_unavailable = unavailable;
-                cx.notify();
-            });
+            if fell_core::is_demo_account(&account) {
+                return;
+            }
+            loop {
+                let account = account.clone();
+                let unavailable = cx
+                    .background_executor()
+                    .spawn(async move { crate::mailbox::send_account_config(&account).err() })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.send_unavailable != unavailable {
+                            this.send_unavailable = unavailable;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+            }
         }));
     }
 
-    pub fn watch_live(&self, cx: &mut Context<Self>) {
+    pub fn watch_live(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && !this.closing {
+                this.refresh_send_availability(cx);
+            }
+        })
+        .detach();
         // An async channel: waiting for the hub holds no thread, and once
         // the window is gone the next change drops this subscription.
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -724,8 +763,13 @@ impl ComposeView {
         self.subject_line = snap.subject.clone();
         self.sent = false;
         self.send_tried = false;
-        self.send_unavailable = false;
+        self.send_unavailable = None;
         self.send_check = None;
+        self.send_failure = None;
+        self.send_panel = SendPanel::Summary;
+        self.palette = None;
+        self.leader = false;
+        self.which_visible = false;
         self.quote_open = false;
         self.status = "".into();
         self.start_on_recipients_if_empty(&snap);
@@ -898,16 +942,13 @@ impl ComposeView {
         let id = self.draft_id.to_string();
         self.send_tried = true;
         if self.sending.as_deref() == Some(id.as_str()) {
-            self.status = "Sending…".into();
             return;
         }
-        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
-            self.status = lock.reason().into();
-            return;
-        }
-        if self.send_unavailable {
-            self.status = "".into();
-            self.check_send_availability(cx);
+        if self
+            .hub
+            .with_session(&id, |session| session.send_lock().is_some())
+            == Some(true)
+        {
             return;
         }
         if self.field != Field::Body && !self.commit_field(self.field) {
@@ -917,10 +958,15 @@ impl ComposeView {
             self.status = "the draft changed; it is on screen before send".into();
             return;
         }
+        self.send_failure = None;
         self.flush_now();
         let prepared = self.hub.with_session(&id, prepare_from_editor);
         let prepared = match prepared {
             Some(Ok(prepared)) => prepared,
+            Some(Err(SendFailure::Locked(_))) => {
+                self.status = "".into();
+                return;
+            }
             Some(Err(err)) => {
                 self.status = err.to_string().into();
                 return;
@@ -931,7 +977,8 @@ impl ComposeView {
             }
         };
         self.sending = Some(id.clone());
-        self.status = "Sending…".into();
+        self.preview = false;
+        self.status = "".into();
         let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
             let sent_id = id.clone();
@@ -955,10 +1002,18 @@ impl ComposeView {
                 );
                 if let Some(status) = end.status {
                     this.sent = end.sent;
-                    this.status = status.into();
-                    if matches!(outcome, Err(SendFailure::NotSent(_))) {
-                        this.check_send_availability(cx);
-                    }
+                    this.status = match outcome {
+                        Err(SendFailure::Unavailable(ref error)) => {
+                            this.send_unavailable = Some(error.clone());
+                            this.refresh_send_availability(cx);
+                            "".into()
+                        }
+                        Err(ref error @ (SendFailure::NotSent(_) | SendFailure::MaybeSent(_))) => {
+                            this.send_failure = Some(error.clone());
+                            "".into()
+                        }
+                        _ => status.into(),
+                    };
                 }
                 if end.close {
                     this.closing = true;
@@ -1073,12 +1128,16 @@ impl ComposeView {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.touched = true;
+        let key = compose_key(&event.keystroke);
+        let key = key.as_str();
+        if self.send_panel != SendPanel::Summary {
+            self.send_panel_key(key, &event.keystroke.modifiers, cx);
+            return;
+        }
         if self.field == Field::Body && !self.pull_if_stale() {
             self.status = "the draft changed under the cursor; the key was not applied".into();
             return;
         }
-        let key = compose_key(&event.keystroke);
-        let key = key.as_str();
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
@@ -1189,19 +1248,16 @@ impl ComposeView {
             return;
         }
         match action {
-            "unlock" => {
-                let released = self
-                    .hub
-                    .with_session(self.draft_id.as_ref(), |session| {
-                        session.release_maybe_sent()
-                    })
-                    .unwrap_or_else(|| Err("this draft is not open".into()));
-                self.status = match released {
-                    // The bar's right side already offers send.
-                    Ok(()) => "unlocked".into(),
-                    Err(err) => err.into(),
-                };
-                cx.notify();
+            "unlock" if locked == Some(SendLock::MaybeSent) => {
+                self.status = "".into();
+                self.send_panel = SendPanel::ConfirmUnlock;
+            }
+            "details"
+                if send_feedback(locked, &self.send_unavailable, &self.send_failure)
+                    .is_some_and(|feedback| feedback.detail().is_some()) =>
+            {
+                self.send_detail_scroll = gpui::ScrollHandle::new();
+                self.send_panel = SendPanel::Details;
             }
             "send" => self.send(cx),
             "preview" => {
@@ -1235,6 +1291,42 @@ impl ComposeView {
                 // From now on a request_send must wait for a new window.
                 self.hub.note_hidden(self.draft_id.as_ref());
                 cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn send_panel_key(&mut self, key: &str, modifiers: &gpui::Modifiers, cx: &mut Context<Self>) {
+        if key == "escape" {
+            self.send_panel = SendPanel::Summary;
+            return;
+        }
+        match self.send_panel {
+            SendPanel::ConfirmUnlock if key == "y" && !modifiers.modified() => {
+                self.send_panel = SendPanel::Summary;
+                let result = self.hub.with_session(self.draft_id.as_ref(), |session| {
+                    session.release_maybe_sent()
+                });
+                self.status = match result {
+                    Some(Ok(())) => {
+                        self.send_failure = None;
+                        "Draft unlocked".into()
+                    }
+                    Some(Err(err)) => err.into(),
+                    None => "draft is not open".into(),
+                };
+                cx.notify();
+            }
+            SendPanel::Details if matches!(key, "j" | "k" | "down" | "up") => {
+                let delta = if matches!(key, "j" | "down") {
+                    -42.
+                } else {
+                    42.
+                };
+                let mut offset = self.send_detail_scroll.offset();
+                offset.y = (offset.y + px(delta))
+                    .clamp(-self.send_detail_scroll.max_offset().height, px(0.));
+                self.send_detail_scroll.set_offset(offset);
             }
             _ => {}
         }
@@ -1539,13 +1631,12 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.editor.caret_hidden = self.field != Field::Body;
         if self.closing {
             window.remove_window();
         }
         self.sync_from_hub();
         if self.send_check.is_none() {
-            self.check_send_availability(cx);
+            self.refresh_send_availability(cx);
         }
         if self.leader && !self.which_visible {
             let ready = self
@@ -1572,11 +1663,13 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let mut snap = self
+        let (mut snap, lock) = self
             .hub
-            .with_session(self.draft_id.as_ref(), |session| session.snapshot())
-            .unwrap_or_else(|| empty_snapshot(self.draft_id.as_ref()));
-        if self.send_unavailable && snap.send_lock_reason().is_none() {
+            .with_session(self.draft_id.as_ref(), |session| {
+                (session.snapshot(), session.send_lock())
+            })
+            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None));
+        if self.send_unavailable.is_some() && lock.is_none() {
             snap.send_block = Some(SEND_UNAVAILABLE.into());
         }
         let colors = self.colors();
@@ -1586,14 +1679,34 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
-        let lock = self
-            .hub
-            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
-            .flatten();
+        let feedback = send_feedback(lock, &self.send_unavailable, &self.send_failure);
+        if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
+            || (self.send_panel == SendPanel::Details
+                && feedback
+                    .as_ref()
+                    .is_none_or(|feedback| feedback.detail().is_none()))
+        {
+            self.send_panel = SendPanel::Summary;
+        }
+        self.editor.caret_hidden =
+            self.field != Field::Body || lock.is_some() || self.send_panel != SendPanel::Summary;
+        let show_status = self.send_panel == SendPanel::Summary
+            && (lock != Some(SendLock::MaybeSent) || !idle_status(&self.status));
+        let palette_help = match (
+            lock,
+            feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.detail().is_some()),
+        ) {
+            (Some(SendLock::MaybeSent), true) => "details · unlock · q close",
+            (Some(SendLock::MaybeSent), false) => "unlock · q close",
+            (Some(_), _) => "q close",
+            (None, true) => "details · send · preview · raw · quote · theme · keep · reject · undo",
+            (None, false) => "send · preview · raw · quote · theme · keep · reject · undo",
+        };
         let mode = match self.editor.mode {
-            // Nothing to type into: a narrow bar gives the mode's room to
-            // the way forward and the warning.
-            _ if lock.is_some() && !wide => "",
+            // A locked draft has no editing mode.
+            _ if lock.is_some() => "",
             // A header field takes typing as insert mode does.
             _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
@@ -1602,9 +1715,8 @@ impl Render for ComposeView {
         };
         // The mode word says it all; how to change mode is not news.
         let hint: SharedString = match (idle_status(&self.status), lock) {
-            // Nothing to type into: the way out is the hint.
-            (true, Some(lock)) => locked_hint(lock, wide).into(),
-            (true, None) => "".into(),
+            (true, Some(SendLock::Sent)) if wide => "read-only".into(),
+            (true, _) => "".into(),
             (false, _) => self.status.clone(),
         };
         let mono = self
@@ -1652,7 +1764,10 @@ impl Render for ComposeView {
                     .children(self.preview.then(|| preview_panel(&snap, colors))),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
-            .child(
+            .children(feedback.map(|feedback| {
+                send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
+            }))
+            .children(show_status.then(|| {
                 status_bar(
                     mode,
                     &hint,
@@ -1665,13 +1780,13 @@ impl Render for ComposeView {
                     },
                 )
                 .flex_shrink_0()
-                .when_some(mono.clone(), |bar, family| bar.font_family(family)),
-            )
+                .when_some(mono, |bar, family| bar.font_family(family))
+            }))
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
                     .as_ref()
-                    .map(|query| palette_view(query, colors)),
+                    .map(|query| palette_view(query, palette_help, colors)),
             )
             .children(self.preview.then(|| preview_scrim(colors)))
     }
@@ -1926,6 +2041,8 @@ pub enum SendFailure {
     Locked(SendLock),
     /// Nothing was transmitted. The draft can be sent again.
     NotSent(String),
+    /// The local account settings need attention before this draft can send.
+    Unavailable(AccountConfigError),
     /// The connection failed after the server had the whole message. The
     /// draft stays locked so it is not sent twice.
     MaybeSent(String),
@@ -1945,10 +2062,11 @@ impl std::fmt::Display for SendFailure {
         match self {
             Self::Locked(lock) => f.write_str(lock.reason()),
             Self::NotSent(detail) => write!(f, "Not sent: {detail}"),
+            Self::Unavailable(error) => write!(f, "Not sent. {error}. {}", error.recovery),
             Self::MaybeSent(detail) => {
                 write!(
                     f,
-                    "May have been sent: {detail}. Check Sent before sending again"
+                    "May have been sent. {detail}. Check Sent for a matching copy. A missing copy leaves delivery unknown."
                 )
             }
         }
@@ -2047,6 +2165,7 @@ fn send_failure_line(
         Ok(_) => None,
         Err(SendFailure::MaybeSent(_)) => Some(fell_core::compose::MAYBE_SENT_NOTICE.into()),
         Err(SendFailure::NotSent(detail)) => Some(format!("not sent  ·  {detail}")),
+        Err(SendFailure::Unavailable(error)) => Some(format!("not sent  ·  {}", error.recovery)),
         Err(SendFailure::Locked(lock)) => Some(lock.reason().into()),
     }
 }
@@ -2058,7 +2177,7 @@ fn lock_after(result: &Result<fell_core::SentMessage, SendFailure>) -> Option<Se
         Err(SendFailure::MaybeSent(_)) => Some(SendLock::MaybeSent),
         // A refused claim leaves the other send's lock in place.
         Err(SendFailure::Locked(lock)) => Some(*lock),
-        Err(SendFailure::NotSent(_)) => None,
+        Err(SendFailure::NotSent(_) | SendFailure::Unavailable(_)) => None,
     }
 }
 
@@ -2127,7 +2246,7 @@ pub fn prepare_from_editor(
 /// file's login and SMTP settings for this account id. Runs
 /// `password_command`, so call it off the UI thread.
 fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure> {
-    let config = crate::mailbox::send_account_config(account).map_err(SendFailure::NotSent)?;
+    let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
     fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)
 }
 
@@ -4246,6 +4365,115 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
     }))
 }
 
+enum SendFeedback<'a> {
+    Unavailable(&'a AccountConfigError),
+    NotSent(&'a str),
+    Uncertain(Option<&'a str>),
+}
+
+impl<'a> SendFeedback<'a> {
+    fn detail(&self) -> Option<&'a str> {
+        match self {
+            Self::Unavailable(error) => Some(&error.detail),
+            Self::NotSent(detail) => Some(detail),
+            Self::Uncertain(detail) => *detail,
+        }
+    }
+}
+
+fn send_feedback<'a>(
+    lock: Option<SendLock>,
+    unavailable: &'a Option<AccountConfigError>,
+    failure: &'a Option<SendFailure>,
+) -> Option<SendFeedback<'a>> {
+    match (lock, unavailable, failure) {
+        (Some(SendLock::MaybeSent), _, Some(SendFailure::MaybeSent(detail))) => {
+            Some(SendFeedback::Uncertain(Some(detail)))
+        }
+        (Some(SendLock::MaybeSent), _, _) => Some(SendFeedback::Uncertain(None)),
+        (None, Some(error), _) => Some(SendFeedback::Unavailable(error)),
+        (None, None, Some(SendFailure::NotSent(detail))) => Some(SendFeedback::NotSent(detail)),
+        _ => None,
+    }
+}
+
+/// Delivery feedback wraps independently of the editor's one-line key hints.
+fn send_feedback_view(
+    feedback: SendFeedback<'_>,
+    state: SendPanel,
+    scroll: &gpui::ScrollHandle,
+    colors: Palette,
+) -> gpui::Div {
+    let (title, guidance, sent_help, actions) = match (&feedback, state) {
+        (_, SendPanel::ConfirmUnlock) => (
+            "Unlock this draft?",
+            "Sending again may deliver a duplicate. Unlocking only restores editing and Send.",
+            None,
+            "y unlock  ·  Esc cancel",
+        ),
+        (SendFeedback::Unavailable(error), _) => {
+            ("Send unavailable", error.recovery, None, ":details")
+        }
+        (SendFeedback::NotSent(_), _) => (
+            "Not sent",
+            "Edit the draft and try again.",
+            None,
+            ":details",
+        ),
+        (SendFeedback::Uncertain(detail), _) => (
+            "Delivery uncertain",
+            "Check Sent for a matching copy (:q, then g s).",
+            Some("A match confirms the send. A missing copy leaves delivery unknown."),
+            if detail.is_some() {
+                ":details  ·  :unlock"
+            } else {
+                ":unlock"
+            },
+        ),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap_1()
+        .px_4()
+        .py_2()
+        .border_t_1()
+        .border_color(rgb(colors.rule))
+        .bg(rgb(colors.panel))
+        .text_size(px(14.))
+        .child(
+            div()
+                .text_color(rgb(colors.error))
+                .font_weight(FontWeight(600.))
+                .child(title),
+        )
+        .child(guidance)
+        .children(sent_help.map(|line| div().child(line)))
+        .children(if state == SendPanel::Details {
+            feedback.detail().map(|detail| {
+                div()
+                    .id("send-details")
+                    .max_h(px(170.))
+                    .overflow_y_scroll()
+                    .track_scroll(scroll)
+                    .text_color(rgb(colors.fg))
+                    .child(display_safe(detail))
+            })
+        } else {
+            None
+        })
+        .child(
+            div()
+                .text_color(rgb(colors.accent))
+                .child(if state == SendPanel::Details {
+                    "Esc close  ·  j/k scroll"
+                } else {
+                    actions
+                }),
+        )
+}
+
 /// Why send is blocked, as the status bar says it. A new draft has nobody
 /// to send to yet: that is a block only once the person tries to send it.
 fn shown_send_block(snap: &Snapshot, send_tried: bool) -> Option<&String> {
@@ -4392,7 +4620,6 @@ enum Tone {
     Fg,
     Dim,
     Accent,
-    Error,
 }
 
 impl Tone {
@@ -4401,7 +4628,6 @@ impl Tone {
             Tone::Fg => colors.fg,
             Tone::Dim => colors.dim,
             Tone::Accent => colors.accent,
-            Tone::Error => colors.error,
         }
     }
 }
@@ -4421,11 +4647,13 @@ fn status_right(
         Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => {
             vec![("sent".into(), Tone::Accent, true)]
         }
-        // May have gone out: the warning the inbox gives, in its colour.
-        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => {
-            vec![(MAYBE_SENT_WARNING.into(), Tone::Error, false)]
+        Some(reason) if reason.as_str() == SendLock::InFlight.reason() => {
+            vec![("Sending…".into(), Tone::Fg, false)]
         }
-        Some(reason) if reason == SEND_UNAVAILABLE => vec![(reason.clone(), Tone::Error, false)],
+        // The delivery panel already supplies the outcome and recovery.
+        Some(reason) if reason == SendLock::MaybeSent.reason() || reason == SEND_UNAVAILABLE => {
+            Vec::new()
+        }
         // Narrow: the reason alone says send is blocked, and leaves the
         // message on the left its room. A missing recipient says so in two
         // words, so "send blocked" stays and reads as a block, not advice.
@@ -4556,7 +4784,7 @@ fn which_key(colors: Palette) -> gpui::Div {
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
 }
 
-fn palette_view(query: &str, colors: Palette) -> gpui::Div {
+fn palette_view(query: &str, commands: &'static str, colors: Palette) -> gpui::Div {
     div()
         .absolute()
         .top(px(80.))
@@ -4567,12 +4795,7 @@ fn palette_view(query: &str, colors: Palette) -> gpui::Div {
         .border_color(rgb(colors.accent))
         .p_3()
         .child(format!(":{query}"))
-        .child(
-            div()
-                .text_sm()
-                .text_color(rgb(colors.dim))
-                .child("send · preview · raw · quote · theme · keep · reject · undo"),
-        )
+        .child(div().text_sm().text_color(rgb(colors.dim)).child(commands))
 }
 
 /// A scrim of page colour over the whole window, so the draft behind the
@@ -4943,21 +5166,6 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
-/// What a locked draft's bar offers. A draft that may have gone out can be
-/// unlocked, once Sent has been checked; one that went out only closes.
-fn locked_hint(lock: SendLock, wide: bool) -> &'static str {
-    match (lock, wide) {
-        (SendLock::MaybeSent, true) => "read-only · :unlock if not in Sent",
-        (SendLock::MaybeSent, false) => ":unlock",
-        (_, true) => "read-only",
-        (_, false) => "",
-    }
-}
-
-/// The window's warning for a draft that may have gone out, at any width:
-/// the person checks Sent before unlocking or sending again.
-const MAYBE_SENT_WARNING: &str = "may have been sent · check Sent";
-
 fn palette_action(query: &str) -> Option<&'static str> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -4971,6 +5179,9 @@ fn palette_action(query: &str) -> Option<&'static str> {
     // again.
     if query == "unlock" {
         return Some("unlock");
+    }
+    if query == "details" {
+        return Some("details");
     }
     let mut found = None;
     for name in [
@@ -5104,21 +5315,23 @@ mod tests {
     }
 
     #[test]
-    fn a_maybe_sent_draft_says_check_sent_at_every_width() {
-        use fell_core::compose::SendLock;
-        assert!(super::MAYBE_SENT_WARNING.contains("check Sent"));
+    fn an_uncertain_send_uses_the_feedback_panel_after_reopening() {
+        use super::{SendFailure, SendFeedback, SendLock, send_feedback};
+        let failure = Some(SendFailure::MaybeSent("SMTP connection closed".into()));
+        let lock = Some(SendLock::MaybeSent);
+        assert_eq!(
+            send_feedback(lock, &None, &failure).unwrap().detail(),
+            Some("SMTP connection closed"),
+        );
+        assert!(matches!(
+            send_feedback(lock, &None, &None),
+            Some(SendFeedback::Uncertain(None)),
+        ));
+        let mut snap = super::empty_snapshot("d");
+        snap.send_block = Some(SendLock::MaybeSent.reason().into());
         for wide in [true, false] {
-            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":unlock"));
-            // Closing is `:q`, as everywhere: not news.
-            assert!(!super::locked_hint(SendLock::MaybeSent, wide).contains(":q"));
-            assert!(!super::locked_hint(SendLock::Sent, wide).contains(":unlock"));
+            assert!(super::status_right(&snap, "", false, wide).is_empty());
         }
-        // Narrow, both sides share 460 px with room to spare.
-        let narrow = super::locked_hint(SendLock::MaybeSent, false)
-            .chars()
-            .count()
-            + super::MAYBE_SENT_WARNING.chars().count();
-        assert!(narrow <= 50, "{narrow}");
     }
 
     #[test]
@@ -5417,6 +5630,9 @@ mod tests {
         assert_eq!(super::palette_action("quit"), Some("close"));
         assert_eq!(super::palette_action("qu"), Some("quote"));
         assert_eq!(super::palette_action("cl"), Some("close"));
+        assert_eq!(super::palette_action("details"), Some("details"));
+        assert_eq!(super::palette_action("unl"), None);
+        assert_eq!(super::palette_action("unlock"), Some("unlock"));
     }
 
     #[test]
@@ -6146,14 +6362,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_account_explains_why_before_send_is_tried() {
+    fn an_unavailable_account_uses_the_feedback_panel_instead_of_the_send_hint() {
         let mut snap = super::empty_snapshot("d");
         snap.send_block = Some(super::SEND_UNAVAILABLE.into());
         for wide in [false, true] {
-            assert_eq!(
-                super::status_right(&snap, "insert", false, wide),
-                vec![(super::SEND_UNAVAILABLE.into(), super::Tone::Error, false)],
-            );
+            assert!(super::status_right(&snap, "insert", false, wide).is_empty());
         }
     }
 

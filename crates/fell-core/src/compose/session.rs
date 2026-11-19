@@ -1240,8 +1240,8 @@ impl DraftSession {
     ///
     /// The mailbox records the claim as "may have been sent" before anything
     /// is transmitted: if Fell stops mid-send, the next start must not send
-    /// the draft again without the person checking Sent. A send that cannot
-    /// leave that record does not start.
+    /// the draft again without the person choosing to unlock it. A send
+    /// that cannot leave that record does not start.
     pub fn begin_send(&mut self) -> Result<(), String> {
         if let Some(lock) = self.send_lock {
             return Err(lock.reason().into());
@@ -1267,9 +1267,9 @@ impl DraftSession {
         }
     }
 
-    /// The person checked Sent and the mail is not there: a draft that
-    /// "may have been sent" becomes editable and sendable again. Only that
-    /// lock is released, in the mailbox first; a recorded send never is.
+    /// The person accepted the risk of a duplicate: make an uncertain draft
+    /// editable and sendable again. Only that lock is released, in the
+    /// mailbox first; a recorded send never is.
     pub fn release_maybe_sent(&mut self) -> Result<(), String> {
         if self.send_lock != Some(SendLock::MaybeSent) {
             return Err(match self.send_lock {
