@@ -17,7 +17,8 @@ use crate::message::{
     encode_addresses, is_short_reply_body,
 };
 use crate::search::{
-    IndexedText, SearchHit, SearchResults, fts5_phrase, sync_terms, terms_for_indexed,
+    IndexedText, SearchHit, SearchOptions, SearchResults, fts5_phrase, sync_terms,
+    terms_for_indexed,
 };
 use crate::threading::{ThreadId, resolve_thread_id};
 
@@ -309,6 +310,8 @@ pub struct Store {
     /// File-backed stores fill body vectors here. In-memory stores leave this
     /// empty so tests can index on the calling thread.
     indexer: Option<crate::embed::Indexer>,
+    /// Query model and vector matrix for hybrid search, loaded on first use.
+    semantic: std::cell::RefCell<crate::search::semantic::Semantic>,
     pub(crate) conn: Connection,
     path: Option<std::path::PathBuf>,
     /// This connection's busy handler, shared with the file's other stores
@@ -511,6 +514,9 @@ impl Store {
         }
         Ok(Self {
             indexer: None,
+            semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
+                crate::embed::EmbedderSource::from_env(),
+            )),
             conn,
             path: None,
             lock_wait,
@@ -523,6 +529,12 @@ impl Store {
             #[cfg(unix)]
             _mailbox_lock: None,
         })
+    }
+
+    /// Tests: rows, matrix bytes, and key bytes of the search vector matrix.
+    #[cfg(test)]
+    pub(crate) fn testing_vector_sizes(&self) -> Option<(usize, usize, usize)> {
+        self.semantic.borrow_mut().sizes(&self.conn)
     }
 
     #[cfg(test)]
@@ -1021,14 +1033,78 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Search one account in the local store: [`Store::search_with`] with
+    /// the default options, so hybrid when a local model is installed.
+    pub fn search(&self, account_id: &AccountId, query: &str) -> Result<SearchResults> {
+        self.search_with(account_id, query, SearchOptions::default())
+    }
+
     /// Search one account in the local store.
     ///
-    /// This reads SQLite only. It never calls a backend, so the hits change
-    /// only after a local write. One hit per thread, best BM25 message first.
-    /// When the typed query misses and a trigram correction hits, `did_you_mean`
-    /// is set and `hits` are the corrected results.
-    pub fn search(&self, account_id: &AccountId, query: &str) -> Result<SearchResults> {
-        crate::search::execute(&self.conn, account_id, query)
+    /// This reads SQLite only. It never calls a backend or a network, so the
+    /// hits change only after a local write, and it never waits for one. One
+    /// hit per thread. Keyword hits are ranked by their best BM25 message.
+    /// When the typed query misses and a trigram correction hits,
+    /// `did_you_mean` is set and the keyword hits are the corrected results.
+    ///
+    /// With `options.semantic` and an installed sentence model, the query's
+    /// words are also embedded and matched against the stored body vectors,
+    /// and the two thread rankings are fused (see [`crate::search`]). The
+    /// first such search loads the model and the vectors unless
+    /// [`Store::warm_search`] already did. Without a model this is keyword
+    /// search and embeds nothing.
+    pub fn search_with(
+        &self,
+        account_id: &AccountId,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<SearchResults> {
+        if !options.semantic {
+            return crate::search::execute(&self.conn, account_id, query, None);
+        }
+        let mut semantic = self.semantic.borrow_mut();
+        let ready = semantic.ready(&self.conn);
+        crate::search::execute(&self.conn, account_id, query, ready)
+    }
+
+    /// Start loading the query model and the stored vectors on a background
+    /// thread, so the first hybrid search does not wait for them. Does
+    /// nothing when no model is installed, for an in-memory store, or when
+    /// they are already loading or loaded.
+    pub fn warm_search(&self) {
+        self.semantic.borrow_mut().warm(self.path.as_deref());
+    }
+
+    /// Tests in other crates: fill every missing or outdated body vector
+    /// with `embedder` on this thread. Returns the rows written.
+    #[doc(hidden)]
+    pub fn testing_index_embeddings(&self, embedder: &dyn crate::BodyEmbedder) -> Result<usize> {
+        let mut total = 0;
+        loop {
+            let wrote = crate::embed::index_embeddings_with(&self.conn, 256, embedder)?;
+            if wrote == 0 {
+                return Ok(total);
+            }
+            total += wrote;
+        }
+    }
+
+    /// Tests in other crates: rank searches with `embedder`, as if it were
+    /// the installed model, over the vectors it stored.
+    #[doc(hidden)]
+    pub fn testing_search_embedder(
+        &self,
+        embedder: Box<dyn crate::BodyEmbedder + Send>,
+    ) -> Result<()> {
+        self.semantic
+            .borrow_mut()
+            .use_embedder(embedder, &self.conn)
+    }
+
+    /// `true` when [`Store::search`] ranks with a local sentence model as
+    /// well as the words. Waits for the model to load when it has not yet.
+    pub fn semantic_search_active(&self) -> bool {
+        self.semantic.borrow_mut().ready(&self.conn).is_some()
     }
 
     /// Connection for [`crate::actions`]. The UI does not call this.
@@ -1296,6 +1372,7 @@ fn search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
         snippet: row.get(3)?,
         sender_email: row.get(4)?,
         date_unix: row.get(5)?,
+        semantic_only: false,
     })
 }
 

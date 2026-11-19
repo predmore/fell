@@ -20,9 +20,13 @@
 //! Vectors store the embedder's model id and version. The background indexer
 //! replaces rows whose id, version, or length differs, recent mail first, in
 //! small batches on a background thread. Switching models therefore rewrites
-//! the whole index there. Opening the store, listing threads, and
-//! [`crate::Store::search`] do not compute vectors, and search stays keyword
-//! search: nothing reads these vectors to rank results yet.
+//! the whole index there. Opening the store and listing threads do not
+//! compute vectors.
+//!
+//! Every write to `message_embeddings` also appends the message's key to
+//! `embedding_changes` (a trigger). Search keeps the vectors in memory and
+//! reads that log to follow the indexer, in this process or another one
+//! (see `search::semantic`). The indexer trims the log as it writes.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -138,10 +142,16 @@ impl LocalHashV1 {
 pub(crate) struct EmbedderSource {
     models_root: Option<std::path::PathBuf>,
     model: &'static LocalModel,
+    /// Tests: use this embedder instead of anything on disk.
+    #[cfg(test)]
+    fixed: Option<fn() -> SendEmbedder>,
 }
 
+/// An embedder that can be built on one thread and used on another.
+pub(crate) type SendEmbedder = Box<dyn BodyEmbedder + Send>;
+
 impl EmbedderSource {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         #[cfg(test)]
         if let Some(source) = TEST_SOURCE.with(|cell| cell.borrow().clone()) {
             return source;
@@ -149,18 +159,45 @@ impl EmbedderSource {
         Self {
             models_root: default_models_dir(),
             model: &MINILM_L6_V2_INT8,
+            #[cfg(test)]
+            fixed: TEST_FIXED.with(Cell::get),
         }
     }
 
     /// What to index with. `Err` means the installed files are there but
     /// the model did not load: index nothing, change nothing, and try again
     /// later. Never fetches.
-    fn load(&self) -> std::result::Result<Box<dyn BodyEmbedder>, ModelError> {
+    pub(crate) fn load(&self) -> std::result::Result<SendEmbedder, ModelError> {
+        #[cfg(test)]
+        if let Some(fixed) = self.fixed {
+            return Ok(fixed());
+        }
         match load_local_embedder(self.model, self.models_root.as_deref()) {
             LocalEmbedder::Model(embedder) => Ok(Box::new(embedder)),
             LocalEmbedder::Placeholder(_) => Ok(Box::new(LocalHashV1)),
             LocalEmbedder::Unavailable(err) => Err(err),
         }
+    }
+
+    /// The model search should embed queries with: `Ok(None)` when the
+    /// indexer would run the placeholder, which is not semantic. Hashes and
+    /// loads the files like [`EmbedderSource::load`]. Never fetches.
+    pub(crate) fn load_semantic(&self) -> std::result::Result<Option<SendEmbedder>, ModelError> {
+        let embedder = self.load()?;
+        Ok((embedder.id() != LocalHashV1.id()).then_some(embedder))
+    }
+
+    /// `false` when no model files are installed, so there is nothing for
+    /// [`EmbedderSource::load_semantic`] to load. Only stats the files.
+    pub(crate) fn may_be_semantic(&self) -> bool {
+        #[cfg(test)]
+        if self.fixed.is_some() {
+            return true;
+        }
+        self.models_root
+            .as_deref()
+            .and_then(|root| installed_model_dir(self.model, root))
+            .is_some()
     }
 }
 
@@ -212,8 +249,21 @@ pub(crate) fn testing_model_source(source: Option<(std::path::PathBuf, &'static 
         *cell.borrow_mut() = source.map(|(root, model)| EmbedderSource {
             models_root: Some(root),
             model,
+            fixed: None,
         });
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FIXED: Cell<Option<fn() -> SendEmbedder>> = const { Cell::new(None) };
+}
+
+/// Stores opened next on this thread index and search with `make()`'s
+/// embedder, whatever is on disk. `None` goes back to the default.
+#[cfg(test)]
+pub(crate) fn testing_embedder(make: Option<fn() -> SendEmbedder>) {
+    TEST_FIXED.with(|cell| cell.set(make));
 }
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -241,6 +291,33 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
     vector BLOB NOT NULL,
     PRIMARY KEY (account_id, message_id)
 );
+
+CREATE TABLE IF NOT EXISTS embedding_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS message_embeddings_logged_insert
+AFTER INSERT ON message_embeddings BEGIN
+    INSERT INTO embedding_changes (account_id, message_id)
+    VALUES (new.account_id, new.message_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_embeddings_logged_update
+AFTER UPDATE ON message_embeddings BEGIN
+    INSERT INTO embedding_changes (account_id, message_id)
+    VALUES (new.account_id, new.message_id);
+    INSERT INTO embedding_changes (account_id, message_id)
+    SELECT old.account_id, old.message_id
+    WHERE old.account_id != new.account_id OR old.message_id != new.message_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_embeddings_logged_delete
+AFTER DELETE ON message_embeddings BEGIN
+    INSERT INTO embedding_changes (account_id, message_id)
+    VALUES (old.account_id, old.message_id);
+END;
 
 CREATE TABLE IF NOT EXISTS embedding_queue (
     account_id TEXT NOT NULL,
@@ -639,7 +716,6 @@ pub(crate) fn index_embeddings(conn: &Connection, limit: usize) -> Result<usize>
 }
 
 /// [`index_embeddings`] with a given embedder.
-#[cfg(test)]
 pub(crate) fn index_embeddings_with(
     conn: &Connection,
     limit: usize,
@@ -1101,7 +1177,8 @@ fn write_batch(
         conn.execute_batch("ROLLBACK")?;
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let wrote = store_prepared(conn, &prepared, embedder.id());
+    let wrote = store_prepared(conn, &prepared, embedder.id())
+        .and_then(|wrote| prune_changes(conn).map(|()| wrote));
     match wrote {
         Ok(n) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(n),
@@ -1144,6 +1221,21 @@ fn store_prepared(conn: &Connection, rows: &[Prepared], id: EmbedderId) -> Resul
         wrote += 1;
     }
     Ok(wrote)
+}
+
+/// Changes the log keeps behind its newest entry. A search that falls
+/// further behind than this loads every vector again instead.
+pub(crate) const CHANGES_KEPT: i64 = 8_192;
+
+/// Drop log entries older than the newest [`CHANGES_KEPT`]. Runs inside the
+/// indexer's batch transaction, so readers never write.
+fn prune_changes(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM embedding_changes
+         WHERE seq <= (SELECT MAX(seq) FROM embedding_changes) - ?1",
+        params![CHANGES_KEPT],
+    )?;
+    Ok(())
 }
 
 fn message_body(conn: &Connection, account_id: &str, message_id: &str) -> Result<Option<String>> {
@@ -2811,6 +2903,7 @@ mod tests {
         let source = EmbedderSource {
             models_root: Some(root.clone()),
             model: &MINILM_L6_V2_INT8,
+            fixed: None,
         };
         assert_eq!(source.load().unwrap().id(), LocalHashV1.id());
         assert!(
@@ -2820,6 +2913,7 @@ mod tests {
         let none = EmbedderSource {
             models_root: None,
             model: &MINILM_L6_V2_INT8,
+            fixed: None,
         };
         assert_eq!(none.load().unwrap().id(), LocalHashV1.id());
         // Inside these tests the default never points at a real model.
@@ -2835,6 +2929,7 @@ mod tests {
         let source = EmbedderSource {
             models_root: Some(root.clone()),
             model,
+            fixed: None,
         };
         assert_eq!(source.load().unwrap().id(), TINY_ID);
         let mut bytes = std::fs::read(model_dir.join("model.onnx")).unwrap();
@@ -2896,6 +2991,7 @@ mod tests {
         let source = EmbedderSource {
             models_root: Some(root.clone()),
             model,
+            fixed: None,
         };
         assert!(matches!(source.load(), Err(ModelError::Load(_))));
         // Absent and tampered files are still the placeholder.
