@@ -13,7 +13,7 @@ use fell_core::compose::{
 use fell_core::{AccountId, MailBackend};
 use gpui::{
     Context, FocusHandle, FontWeight, KeyDownEvent, RenderImage, SharedString,
-    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb,
+    StatefulInteractiveElement, Window, div, img, prelude::*, px, rgb, rgba,
 };
 use image::Frame;
 use smallvec::SmallVec;
@@ -1705,7 +1705,7 @@ impl ComposeView {
                 let keys = if wide {
                     text_px(
                         window,
-                        "  ·  ]h [h move  ·  u undo  ·  space a k keep  ·  space a x reject",
+                        "  ·  ]h [h move  ·  space a k keep  ·  space a x reject",
                         16.0,
                     )
                 } else {
@@ -2529,7 +2529,6 @@ fn hunk_banner(
     let parts = [
         label,
         "]h [h move".to_string(),
-        "u undo".to_string(),
         "space a k keep".to_string(),
         "space a x reject".to_string(),
     ];
@@ -2918,7 +2917,9 @@ fn raw_source_block(
     let base_line = text[..start].chars().filter(|ch| *ch == '\n').count();
     let mut line_start = start;
     let mut announced = Vec::new();
-    let mut previous_tinted = false;
+    // The agent edit being painted: its lines and what they replaced share
+    // one tinted block, so no seam of page colour shows between them.
+    let mut tint: Option<(gpui::Div, bool)> = None;
     for (offset, line) in slice.trim_end_matches('\n').split('\n').enumerate() {
         let row = base_line + offset;
         let line_end = line_start + line.len();
@@ -2941,7 +2942,7 @@ fn raw_source_block(
             (None, true) => Urls::Bare,
             (None, false) => Urls::Fold(links),
         };
-        let mut painted = raw_line(
+        let painted = raw_line(
             line,
             cursor,
             cursor.is_some(),
@@ -2950,70 +2951,73 @@ fn raw_source_block(
             tinted,
             colors,
         );
-        if !touching.is_empty() {
-            // A new edit right under another one starts its own block.
-            let mut gap =
-                previous_tinted && touching.iter().any(|index| !announced.contains(index));
-            for index in &touching {
-                if announced.contains(index) {
-                    continue;
-                }
-                announced.push(*index);
-                let previous = plain_markdown(&edits[*index].2);
-                let is_focused = Some(edits[*index].3) == focused;
-                if !previous.is_empty() {
-                    column = column.child(
-                        div()
-                            .when(gap, |row| row.mt(px(6.)))
-                            .ml(px(-3.))
-                            .flex()
-                            .gap_2()
-                            .bg(rgb(if is_focused {
-                                colors.hunk_focus
-                            } else {
-                                colors.hunk
-                            }))
-                            .border_l(px(3.))
-                            .border_color(rgb(if is_focused {
-                                colors.accent
-                            } else {
-                                colors.hunk
-                            }))
-                            .text_color(rgb(colors.dim))
-                            .child(div().flex_shrink_0().child("was"))
-                            .child(div().line_through().child(previous)),
-                    );
-                    gap = false;
-                }
+        if !tinted {
+            if let Some((block, _)) = tint.take() {
+                column = column.child(block);
             }
-            // The focused edit carries an accent bar, so the body shows
-            // which one the bar, keep and reject are about.
-            let is_focused = touching
-                .iter()
-                .any(|index| Some(edits[*index].3) == focused);
-            // The 3px bar sits in the margin, so the text lines up with the
-            // lines around the block.
-            painted = div()
-                .when(gap, |row| row.mt(px(6.)))
-                .ml(px(-3.))
-                .bg(rgb(if is_focused {
-                    colors.hunk_focus
-                } else {
-                    colors.hunk
-                }))
-                .border_l(px(3.))
-                .border_color(rgb(if is_focused {
-                    colors.accent
-                } else {
-                    colors.hunk
-                }))
-                .child(painted);
+            column = column.child(painted);
+            line_start = line_end + 1;
+            continue;
         }
-        previous_tinted = !touching.is_empty();
-        column = column.child(painted);
+        // The focused edit carries an accent bar, so the body shows which
+        // one the bar, keep and reject are about.
+        let is_focused = touching
+            .iter()
+            .any(|index| Some(edits[*index].3) == focused);
+        // A new edit right under another one starts its own block.
+        let fresh = touching.iter().any(|index| !announced.contains(index));
+        let (mut block, gap) = match tint.take() {
+            Some((block, was_focused)) if !fresh && was_focused == is_focused => (block, false),
+            Some((block, _)) => {
+                column = column.child(block);
+                (hunk_block(is_focused, colors), fresh)
+            }
+            None => (hunk_block(is_focused, colors), false),
+        };
+        if gap {
+            block = block.mt(px(6.));
+        }
+        for index in &touching {
+            if announced.contains(index) {
+                continue;
+            }
+            announced.push(*index);
+            let previous = plain_markdown(&edits[*index].2);
+            if !previous.is_empty() {
+                block = block.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .text_color(rgb(colors.dim))
+                        .child(div().flex_shrink_0().child("was"))
+                        .child(div().min_w(px(0.)).line_through().child(previous)),
+                );
+            }
+        }
+        tint = Some((block.child(painted), is_focused));
         line_start = line_end + 1;
     }
+    if let Some((block, _)) = tint {
+        column = column.child(block);
+    }
     column
+}
+
+/// The tinted block an agent edit's lines sit in. Its 3px bar sits in the
+/// margin, so the text lines up with the lines around the block.
+fn hunk_block(focused: bool, colors: Palette) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .ml(px(-3.))
+        .bg(rgb(if focused {
+            colors.hunk_focus
+        } else {
+            colors.hunk
+        }))
+        .border_l(px(3.))
+        .border_color(rgb(if focused { colors.accent } else { colors.hunk }))
 }
 
 /// How a source line shows a link's `](url)`.
@@ -3074,6 +3078,26 @@ fn raw_line(
     tinted: bool,
     colors: Palette,
 ) -> gpui::Div {
+    let row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .w_full()
+        .min_h(px(24.))
+        .items_center();
+    source_pieces(line, cursor, show_markers, urls, mode, tinted, colors).into_row(row, colors)
+}
+
+/// What a source line shows, piece by piece.
+fn source_pieces(
+    line: &str,
+    cursor: Option<usize>,
+    show_markers: bool,
+    urls: Urls,
+    mode: Mode,
+    tinted: bool,
+    colors: Palette,
+) -> Pieces {
     let quiet = if tinted { colors.fg } else { colors.muted };
     let line_chars = line.chars().count();
     let cursor = match (mode, cursor) {
@@ -3082,23 +3106,20 @@ fn raw_line(
         (_, col) => col,
     };
     let styles = line_styles(line);
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .w_full()
-        .min_h(px(24.))
-        .items_center();
     if styles.is_empty() {
+        let mut pieces = Pieces::default();
         if cursor.is_some() {
-            row = row.child(caret(colors, mode));
+            pieces.push(Piece::Caret(mode));
         }
-        return row;
+        return pieces;
     }
     let cursor_byte = cursor.map(|col| byte_index(line, col));
+    let mut pieces = Pieces::default();
     let mut label = "";
     for span in styles {
-        let slice = &line[span.start.min(line.len())..span.end.min(line.len())];
+        let span_start = span.start.min(line.len());
+        let span_end = span.end.min(line.len());
+        let slice = &line[span_start..span_end];
         if span.kind == StyleKind::LinkText {
             label = slice;
         }
@@ -3107,10 +3128,10 @@ fn raw_line(
             .flatten();
         if folds(span.kind, show_markers, urls) {
             if span.start == 0 && span.kind == StyleKind::Marker {
-                row = row.child(folded_marker(line, colors));
+                pieces.drawn(folded_marker(line, colors));
             }
             if let Some(note) = note {
-                row = row.child(note_span(note, quiet));
+                pieces.note(note, quiet);
             }
             continue;
         }
@@ -3118,7 +3139,7 @@ fn raw_line(
             && span.kind == StyleKind::Marker
             && matches!(slice, "- " | "-" | "* " | "*")
         {
-            row = row.child(
+            pieces.drawn(
                 div()
                     .text_size(px(16.))
                     .font_weight(FontWeight(400.))
@@ -3128,54 +3149,279 @@ fn raw_line(
             );
             continue;
         }
-        let color = match span.kind {
-            StyleKind::Marker => colors.marker,
-            StyleKind::LinkUrl => quiet,
-            StyleKind::LinkText => colors.accent,
-            _ => colors.fg,
-        };
         let weight = match span.kind {
             StyleKind::Strong => FontWeight(700.),
             _ => FontWeight(400.),
         };
-        if let Some(cursor_byte) = cursor_byte
-            && cursor_byte >= span.start
-            && cursor_byte < span.end
-        {
-            let at = cursor_byte - span.start;
-            let (left, right) = split_at_char_boundary(slice, at);
-            if !left.is_empty() {
-                row = row.child(styled_span(left, color, weight, span.kind, colors.code));
-            }
-            if mode != Mode::Insert
-                && let Some(ch) = right.chars().next()
-            {
-                let split = ch.len_utf8();
-                let (glyph, rest) = right.split_at(split);
-                row = row.child(inverted_span(glyph, weight, span.kind, colors));
-                if !rest.is_empty() {
-                    row = row.child(styled_span(rest, color, weight, span.kind, colors.code));
-                }
-            } else {
-                row = row.child(caret(colors, mode));
-                if !right.is_empty() {
-                    row = row.child(styled_span(right, color, weight, span.kind, colors.code));
-                }
-            }
-            if let Some(note) = note {
-                row = row.child(note_span(note, quiet));
-            }
-            continue;
+        let source = Source {
+            line,
+            cursor: cursor_byte,
+            mode,
+        };
+        if span.kind == StyleKind::LinkUrl && slice.starts_with(']') {
+            // `]` is a marker like the `[` before the label, so both
+            // brackets take the same colour.
+            source.paint(
+                &mut pieces,
+                (span_start, span_start + 1),
+                colors.marker,
+                weight,
+                StyleKind::Marker,
+            );
+            source.paint(
+                &mut pieces,
+                (span_start + 1, span_end),
+                quiet,
+                weight,
+                span.kind,
+            );
+        } else {
+            let color = match span.kind {
+                StyleKind::Marker => colors.marker,
+                StyleKind::LinkUrl => quiet,
+                StyleKind::LinkText => colors.accent,
+                _ => colors.fg,
+            };
+            source.paint(
+                &mut pieces,
+                (span_start, span_end),
+                color,
+                weight,
+                span.kind,
+            );
         }
-        row = row.child(styled_span(slice, color, weight, span.kind, colors.code));
         if let Some(note) = note {
-            row = row.child(note_span(note, quiet));
+            pieces.note(note, quiet);
         }
     }
     if cursor_byte.is_some_and(|at| at >= line.len()) {
-        row = row.child(caret(colors, mode));
+        pieces.push(Piece::Caret(mode));
     }
-    row
+    pieces
+}
+
+/// The pieces of a wrapping line of text. The spaces between two pieces
+/// join the end of the first one, so a piece the row wraps onto a new
+/// line starts at the margin, not a space in.
+#[derive(Default)]
+struct Pieces(Vec<Piece>);
+
+enum Piece {
+    /// Text in one style.
+    Span {
+        text: String,
+        color: u32,
+        weight: FontWeight,
+        kind: StyleKind,
+    },
+    /// The glyph under the normal-mode cursor.
+    Glyph {
+        text: String,
+        weight: FontWeight,
+        kind: StyleKind,
+    },
+    Caret(Mode),
+    /// Text in the style around it.
+    Words(String),
+    /// A link's label in the weight around it.
+    Link(String),
+    /// Anything else, drawn already.
+    Drawn(Box<gpui::Div>),
+    /// A piece and the spaces after it, which stay on its line.
+    Spaced(Box<Piece>, String),
+}
+
+impl Piece {
+    /// The piece as row items, word by word, each with whether the row may
+    /// break after it: only after a space, as in running text.
+    fn render_into(self, out: &mut Vec<(gpui::Div, bool)>, colors: Palette) {
+        match self {
+            Piece::Span {
+                text,
+                color,
+                weight,
+                kind,
+            } => {
+                for word in words(&text) {
+                    let item = styled_span(word, color, weight, kind, colors.code);
+                    out.push((item.min_w(px(0.)), word.ends_with(' ')));
+                }
+            }
+            Piece::Words(text) => {
+                for word in words(&text) {
+                    let item = div().min_w(px(0.)).child(word.to_string());
+                    out.push((item, word.ends_with(' ')));
+                }
+            }
+            Piece::Link(text) => {
+                for word in words(&text) {
+                    let item = div()
+                        .min_w(px(0.))
+                        .text_color(rgb(colors.accent))
+                        .underline()
+                        .child(word.to_string());
+                    out.push((item, word.ends_with(' ')));
+                }
+            }
+            Piece::Glyph { text, weight, kind } => {
+                let breaks = text == " ";
+                out.push((inverted_span(&text, weight, kind, colors), breaks));
+            }
+            Piece::Caret(mode) => out.push((caret(colors, mode), false)),
+            Piece::Drawn(div) => out.push((*div, false)),
+            Piece::Spaced(piece, spaces) => {
+                piece.render_into(out, colors);
+                let gap = div().flex_shrink_0().child(spaces);
+                match out.pop() {
+                    Some((last, _)) => {
+                        out.push((div().flex().min_w(px(0.)).child(last).child(gap), true))
+                    }
+                    None => out.push((gap, true)),
+                }
+            }
+        }
+    }
+}
+
+/// A run of text cut after each run of spaces: "is attached, " gives
+/// "is ", "attached, ". A leading indent stays with the first word.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let lead = rest.len() - rest.trim_start_matches(' ').len();
+        let word = rest[lead..].find(' ').map_or(rest.len(), |at| lead + at);
+        let end = word + (rest[word..].len() - rest[word..].trim_start_matches(' ').len());
+        let (head, tail) = rest.split_at(end);
+        rest = tail;
+        Some(head)
+    })
+}
+
+impl Pieces {
+    fn push(&mut self, piece: Piece) {
+        self.0.push(piece);
+    }
+
+    fn drawn(&mut self, piece: gpui::Div) {
+        self.push(Piece::Drawn(Box::new(piece)));
+    }
+
+    /// Spaces after the last piece, wherever the row breaks.
+    fn space(&mut self, spaces: &str) {
+        if spaces.is_empty() {
+            return;
+        }
+        match self.0.pop() {
+            Some(Piece::Spaced(piece, mut more)) => {
+                more.push_str(spaces);
+                self.push(Piece::Spaced(piece, more));
+            }
+            Some(last) => self.push(Piece::Spaced(Box::new(last), spaces.to_string())),
+            None => self.push(Piece::Words(spaces.to_string())),
+        }
+    }
+
+    /// A note after a link, a space away from it.
+    fn note(&mut self, note: String, color: u32) {
+        self.space(" ");
+        self.push(Piece::Span {
+            text: display_safe(&note),
+            color,
+            weight: FontWeight(400.),
+            kind: StyleKind::Plain,
+        });
+    }
+
+    /// Text whose leading spaces join the piece before it. A line's own
+    /// indent stays where it is.
+    fn text(&mut self, text: &str, paint: impl FnOnce(String) -> Piece) {
+        let rest = text.trim_start_matches(' ');
+        if self.0.is_empty() || rest.len() == text.len() {
+            if !text.is_empty() {
+                self.push(paint(text.to_string()));
+            }
+            return;
+        }
+        self.space(&text[..text.len() - rest.len()]);
+        if !rest.is_empty() {
+            self.push(paint(rest.to_string()));
+        }
+    }
+
+    /// The row, flowing like running text: it breaks only after a space,
+    /// so a word split by the cursor or by a style change (`plan](url)`)
+    /// stays whole, and a word wider than the row breaks inside itself.
+    fn into_row(self, row: gpui::Div, colors: Palette) -> gpui::Div {
+        let mut items = Vec::new();
+        for piece in self.0 {
+            piece.render_into(&mut items, colors);
+        }
+        let mut row = row;
+        let mut word: Vec<gpui::Div> = Vec::new();
+        let flush = |row: gpui::Div, word: &mut Vec<gpui::Div>| match word.len() {
+            0 => row,
+            1 => row.children(word.drain(..)),
+            _ => row.child(div().flex().min_w(px(0.)).children(word.drain(..))),
+        };
+        for (item, breaks) in items {
+            word.push(item);
+            if breaks {
+                row = flush(row, &mut word);
+            }
+        }
+        flush(row, &mut word)
+    }
+}
+
+/// A source line being painted, with the cursor in it if it has one.
+struct Source<'a> {
+    line: &'a str,
+    cursor: Option<usize>,
+    mode: Mode,
+}
+
+impl Source<'_> {
+    /// Bytes `start..end` of the line in one style, split where the cursor
+    /// sits in them.
+    fn paint(
+        &self,
+        pieces: &mut Pieces,
+        (start, end): (usize, usize),
+        color: u32,
+        weight: FontWeight,
+        kind: StyleKind,
+    ) {
+        let slice = &self.line[start..end];
+        let span = |text: String| Piece::Span {
+            text,
+            color,
+            weight,
+            kind,
+        };
+        let Some(at) = self.cursor.filter(|at| *at >= start && *at < end) else {
+            pieces.text(slice, span);
+            return;
+        };
+        let (left, right) = split_at_char_boundary(slice, at - start);
+        pieces.text(left, span);
+        if self.mode != Mode::Insert
+            && let Some(ch) = right.chars().next()
+        {
+            let (glyph, rest) = right.split_at(ch.len_utf8());
+            pieces.push(Piece::Glyph {
+                text: glyph.to_string(),
+                weight,
+                kind,
+            });
+            pieces.text(rest, span);
+        } else {
+            pieces.push(Piece::Caret(self.mode));
+            pieces.text(right, span);
+        }
+    }
 }
 
 fn folded_marker(line: &str, colors: Palette) -> gpui::Div {
@@ -3287,17 +3533,6 @@ enum Links {
 }
 
 /// Where a link goes, muted after its label.
-fn link_note(note: String, colors: Palette) -> gpui::Div {
-    note_span(note, colors.muted)
-}
-
-fn note_span(note: String, color: u32) -> gpui::Div {
-    div()
-        .pl(px(4.))
-        .text_color(rgb(color))
-        .child(display_safe(&note))
-}
-
 fn render_block(
     block: &fell_core::compose::Block,
     folder: &Path,
@@ -3381,20 +3616,26 @@ fn render_inlines(
     links: Links,
     colors: Palette,
 ) -> gpui::Div {
-    let mut row = div().flex().flex_row().flex_wrap();
+    inline_pieces(inlines, links, colors).into_row(div().flex().flex_row().flex_wrap(), colors)
+}
+
+fn inline_pieces(inlines: &[fell_core::compose::Inline], links: Links, colors: Palette) -> Pieces {
+    let mut pieces = Pieces::default();
     for inline in inlines {
-        row = match inline {
-            fell_core::compose::Inline::Text(text) => row.child(div().child(text.clone())),
-            fell_core::compose::Inline::Strong(inner) => row.child(
+        match inline {
+            fell_core::compose::Inline::Text(text) => {
+                pieces.text(text, Piece::Words);
+            }
+            fell_core::compose::Inline::Strong(inner) => pieces.drawn(
                 div()
                     .font_weight(FontWeight(700.))
                     .font_family("Liberation Sans")
                     .child(render_inlines(inner, links, colors)),
             ),
             fell_core::compose::Inline::Em(inner) => {
-                row.child(div().italic().child(render_inlines(inner, links, colors)))
+                pieces.drawn(div().italic().child(render_inlines(inner, links, colors)));
             }
-            fell_core::compose::Inline::Code(text) => row.child(
+            fell_core::compose::Inline::Code(text) => pieces.drawn(
                 div()
                     .font_family("monospace")
                     .bg(rgb(colors.code))
@@ -3402,18 +3643,18 @@ fn render_inlines(
                     .rounded_sm()
                     .child(text.clone()),
             ),
-            fell_core::compose::Inline::Link { text, href } => row
-                .child(
-                    div()
-                        .text_color(rgb(colors.accent))
-                        .underline()
-                        .child(text.clone()),
-                )
-                .children(shown_target(text, href, links).map(|target| link_note(target, colors))),
-            fell_core::compose::Inline::Image { alt, .. } => row.child(div().child(alt.clone())),
-        };
+            fell_core::compose::Inline::Link { text, href } => {
+                pieces.push(Piece::Link(text.clone()));
+                if let Some(target) = shown_target(text, href, links) {
+                    pieces.note(target, colors.muted);
+                }
+            }
+            fell_core::compose::Inline::Image { alt, .. } => {
+                pieces.drawn(div().child(alt.clone()));
+            }
+        }
     }
-    row
+    pieces
 }
 
 fn image_block(alt: &str, src: &str, folder: &Path, colors: Palette) -> gpui::Div {
@@ -3939,26 +4180,48 @@ fn palette_view(query: &str, colors: Palette) -> gpui::Div {
 
 fn preview_layer(snap: &Snapshot, colors: Palette) -> impl IntoElement {
     let doc = markdown_to_doc(&snap.body);
+    // A scrim of page colour over the whole window, so the draft behind
+    // the panel recedes. The panel takes the width inside the body's
+    // margin and starts under the header, so no cut-off words or half
+    // rows show around it.
+    let side = 12.;
     div()
         .absolute()
-        .top(px(64.))
-        .bottom(px(64.))
-        .left(px(48.))
-        .right(px(48.))
-        .bg(rgb(colors.bg))
-        .border_1()
-        .border_color(rgb(colors.accent))
-        .id("html-preview")
-        .p_4()
-        .overflow_y_scroll()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .bg(rgba((colors.bg << 8) | SCRIM_ALPHA))
         .child(
             div()
-                .text_sm()
-                .text_color(rgb(colors.dim))
-                .child("HTML preview"),
+                .absolute()
+                // Under the window's header, over the whole of the fields.
+                .top(px(PREVIEW_TOP))
+                .bottom(px(64.))
+                .left(px(side))
+                .right(px(side))
+                .bg(rgb(colors.bg))
+                .border_1()
+                .border_color(rgb(colors.accent))
+                .id("html-preview")
+                .p_4()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(colors.dim))
+                        .child("HTML preview"),
+                )
+                .child(render_doc(&doc, Path::new(""), Links::Target, colors)),
         )
-        .child(render_doc(&doc, Path::new(""), Links::Target, colors))
 }
+
+/// Where the preview panel starts: just under the compose header, so no
+/// field row shows cut in half above it.
+const PREVIEW_TOP: f32 = 44.;
+
+/// How much of the page colour the scrim behind an overlay lays down.
+const SCRIM_ALPHA: u32 = 0x99;
 
 fn join_addrs(addresses: &[fell_core::compose::AddressView]) -> String {
     addresses
@@ -4977,26 +5240,165 @@ mod tests {
     }
 
     /// The text a source line shows with these fold settings, a link's
-    /// note after it with a space, as `raw_line` paints them.
+    /// note after it with a space, as `raw_line` paints it.
     fn shown(line: &str, show_markers: bool, urls: super::Urls) -> String {
-        let mut out = String::new();
-        let mut label = "";
-        for span in fell_core::compose::line_styles(line) {
-            let slice = &line[span.start..span.end];
-            if span.kind == super::StyleKind::LinkText {
-                label = slice;
-            }
-            if !super::folds(span.kind, show_markers, urls) {
-                out.push_str(slice);
-            }
-            if span.kind == super::StyleKind::LinkUrl
-                && let Some(note) = super::url_note(label, slice, urls)
-            {
-                out.push(' ');
-                out.push_str(&note);
+        let colors = super::palette(super::ThemeKind::Dark);
+        let pieces = super::source_pieces(
+            line,
+            None,
+            show_markers,
+            urls,
+            super::Mode::Normal,
+            false,
+            colors,
+        );
+        pieces.0.iter().map(piece_text).collect()
+    }
+
+    /// The words of one piece of a row; a drawn marker shows as nothing.
+    fn piece_text(piece: &super::Piece) -> String {
+        match piece {
+            super::Piece::Span { text, .. }
+            | super::Piece::Glyph { text, .. }
+            | super::Piece::Words(text)
+            | super::Piece::Link(text) => text.clone(),
+            super::Piece::Caret(_) | super::Piece::Drawn(_) => String::new(),
+            super::Piece::Spaced(piece, spaces) => format!("{}{spaces}", piece_text(piece)),
+        }
+    }
+
+    /// The colour each run of text is painted in.
+    fn piece_colors(pieces: &super::Pieces) -> Vec<(String, u32)> {
+        fn walk(piece: &super::Piece, out: &mut Vec<(String, u32)>) {
+            match piece {
+                super::Piece::Span { text, color, .. } => out.push((text.clone(), *color)),
+                super::Piece::Spaced(piece, _) => walk(piece, out),
+                _ => {}
             }
         }
+        let mut out = Vec::new();
+        for piece in &pieces.0 {
+            walk(piece, &mut out);
+        }
         out
+    }
+
+    #[test]
+    fn both_brackets_of_a_link_take_the_marker_colour() {
+        use super::{Mode, Urls};
+        // Round 4: on the cursor line "[" was the marker colour and "]"
+        // the URL's.
+        let line = "The [March plan](https://files.example/plan) is attached.";
+        for kind in [super::ThemeKind::Dark, super::ThemeKind::Light] {
+            let colors = super::palette(kind);
+            for tinted in [false, true] {
+                let pieces = super::source_pieces(
+                    line,
+                    Some(0),
+                    true,
+                    Urls::Source,
+                    Mode::Insert,
+                    tinted,
+                    colors,
+                );
+                let runs = piece_colors(&pieces);
+                let color_of = |text: &str| {
+                    runs.iter()
+                        .find(|(run, _)| run == text)
+                        .map(|(_, color)| *color)
+                        .unwrap_or_else(|| panic!("no {text:?} in {runs:?}"))
+                };
+                assert_eq!(color_of("["), colors.marker);
+                assert_eq!(color_of("]"), colors.marker);
+                // The URL keeps its own, quieter colour.
+                let url = if tinted { colors.fg } else { colors.muted };
+                assert_eq!(color_of("(https://files.example/plan)"), url);
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_breaks_only_after_a_space() {
+        fn cut(text: &str) -> Vec<&str> {
+            super::words(text).collect()
+        }
+        assert_eq!(cut("is attached, with"), ["is ", "attached, ", "with"]);
+        assert_eq!(cut("  indented  twice "), ["  indented  ", "twice "]);
+        assert_eq!(
+            cut("(https://files.example/plan)"),
+            ["(https://files.example/plan)"]
+        );
+        assert!(cut("").is_empty());
+        // Nothing is dropped.
+        let text = " a  b c ";
+        assert_eq!(cut(text).concat(), text);
+    }
+
+    #[test]
+    fn a_piece_the_row_wraps_starts_at_the_margin() {
+        use super::{Links, Mode, Urls};
+        // Round 4: at 460 px, " is attached." wrapped to a new line one
+        // space in. The spaces between pieces stay on the line before.
+        let colors = super::palette(super::ThemeKind::Dark);
+        let lines = [
+            "The [March plan](https://files.example/plan) is attached.",
+            "Call **Ada** about `deploy` and *then* the [notes](https://notes.example/).",
+            "- [files.example](https://elsewhere.example/) is   where it lives",
+        ];
+        let check = |pieces: &super::Pieces, what: &str| {
+            for piece in pieces.0.iter().skip(1) {
+                // A drawn piece (a link, a bullet) is not a space.
+                let text = match piece {
+                    super::Piece::Spaced(inner, spaces)
+                        if matches!(**inner, super::Piece::Drawn(_)) =>
+                    {
+                        format!("x{spaces}")
+                    }
+                    piece => piece_text(piece),
+                };
+                assert!(
+                    !text.starts_with(' '),
+                    "{what}: piece {text:?} starts with a space"
+                );
+            }
+        };
+        for line in lines {
+            for (cursor, markers, urls) in [
+                (None, false, Urls::Fold(Links::Label)),
+                (None, false, Urls::Bare),
+                (Some(2), true, Urls::Source),
+            ] {
+                for mode in [Mode::Normal, Mode::Insert] {
+                    let pieces =
+                        super::source_pieces(line, cursor, markers, urls, mode, false, colors);
+                    check(&pieces, line);
+                    // Nothing is lost: the line reads as before.
+                    if cursor.is_none() {
+                        assert_eq!(
+                            pieces.0.iter().map(piece_text).collect::<String>(),
+                            shown(line, markers, urls)
+                        );
+                    }
+                }
+            }
+            let doc = fell_core::compose::markdown_to_doc(line);
+            for block in &doc.blocks {
+                if let super::BlockBody::Paragraph { inlines } = &block.body {
+                    check(&super::inline_pieces(inlines, Links::Target, colors), line);
+                }
+            }
+        }
+        // A line's own indent stays.
+        let pieces = super::source_pieces(
+            "  indented",
+            None,
+            false,
+            Urls::Bare,
+            Mode::Normal,
+            false,
+            colors,
+        );
+        assert_eq!(piece_text(&pieces.0[0]), "  indented");
     }
 
     #[test]
