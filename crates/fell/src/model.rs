@@ -9,7 +9,7 @@ use fell_core::compose::ReplyKind;
 use fell_core::{FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId};
 
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
-use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, merge_folders};
+use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
@@ -592,6 +592,11 @@ impl Session {
     }
 
     pub fn highlighted(&self) -> HashSet<String> {
+        if let Some(prompt) = &self.confirm_purge
+            && prompt.notice == self.toast_generation
+        {
+            return prompt.ids.iter().cloned().collect();
+        }
         if let Some(rows) = self.visual_rows() {
             return rows.iter().map(|row| row.id.clone()).collect();
         }
@@ -1625,11 +1630,28 @@ impl Session {
                     };
                 }
                 // Destructive and not undoable: ask, and show the answer key.
-                let question = match targets.len() {
-                    1 => format!("Remove from Fell only?{NOTICE_DOT}No undo{NOTICE_DOT}y"),
-                    n => format!("Remove {n} from Fell only?{NOTICE_DOT}No undo{NOTICE_DOT}y"),
+                let target = match targets.as_slice() {
+                    [id] => {
+                        let subject = self
+                            .threads
+                            .iter()
+                            .find(|row| &row.id == id)
+                            .map_or("", |row| &row.subject);
+                        let subject = display_safe(subject).replace(['“', '”'], "'");
+                        if subject.trim().is_empty() {
+                            "“(no subject)”".to_string()
+                        } else {
+                            format!("“{subject}”")
+                        }
+                    }
+                    ids => format!("{} marked", ids.len()),
                 };
-                self.show_toast(question, true);
+                self.show_toast(
+                    format!(
+                        "Remove from Fell only?{NOTICE_DOT}{target}{NOTICE_DOT}No undo{NOTICE_DOT}y"
+                    ),
+                    true,
+                );
                 self.confirm_purge = Some(PurgePrompt {
                     ids: targets,
                     folder: self.folder.clone(),
@@ -2272,9 +2294,10 @@ mod tests {
         assert!(!step.delete && !step.purge, "nothing happens before y");
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Remove from Fell only?  ·  No undo  ·  y")
+            Some("Remove from Fell only?  ·  “a”  ·  No undo  ·  y")
         );
         assert!(session.toast.as_ref().unwrap().alert);
+        assert_eq!(session.highlighted(), HashSet::from(["a".to_string()]));
         // The view clears the notice before every key, as it does here.
         session.clear_toast();
         let step = session.on_key(KeyId::Char('y'), 4);
@@ -2289,7 +2312,7 @@ mod tests {
         session.on_key(KeyId::Char('#'), 4);
         assert_eq!(
             session.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("Remove 2 from Fell only?  ·  No undo  ·  y")
+            Some("Remove from Fell only?  ·  2 marked  ·  No undo  ·  y")
         );
     }
 
