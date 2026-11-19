@@ -20,6 +20,8 @@ pub struct SyncCursor {
 pub struct FlagUpdate {
     pub remote_id: crate::RemoteId,
     pub unread: bool,
+    /// The revision of this copy's flags, when the server supports CONDSTORE.
+    pub modseq: Option<u64>,
 }
 
 /// Server copies that one mailbox no longer holds.

@@ -1,17 +1,17 @@
-//! The write-back session: `SELECT` and the one command that moves mail.
+//! The write-back session: `SELECT`, `UID MOVE` and single-flag `UID STORE`.
 //!
 //! Sync never holds one of these. It reads with a plain [`Session`], whose
 //! commands are all read-only (`EXAMINE`, `BODY.PEEK`). A [`WriteSession`]
-//! is opened only to replay the outbox, on its own connection, and moves
-//! mail only with `UID MOVE` (RFC 6851). It has no `COPY`, `STORE`, or
-//! `EXPUNGE` of any form, so it cannot flag or remove a message: a server
-//! without MOVE keeps the change in Fell.
+//! is opened only to replay the outbox, on its own connection. A server
+//! without MOVE can still receive read and star writes.
 
 use crate::Error;
+use crate::outbox::OutboxKind;
 
 use super::super::ImapConfig;
 use super::{
-    Listed, Reply, Session, bracket_u32, number_after, parse_fetch, quote_imap, search_uids,
+    Listed, Reply, Session, bracket_u32, fetch_modseq, number_after, parse_fetch, parse_flags,
+    quote_imap, search_uids,
 };
 
 /// How a write command failed.
@@ -36,12 +36,19 @@ pub(in crate::imap) struct Placed {
 
 pub(in crate::imap) struct WriteSession {
     session: Session,
+    conditional: bool,
+}
+
+pub(in crate::imap) enum FlagReply {
+    Stored(Option<u64>),
+    Modified,
 }
 
 impl WriteSession {
     pub(in crate::imap) fn open(config: &ImapConfig) -> Result<Self, Error> {
         Ok(Self {
             session: Session::open(config)?,
+            conditional: false,
         })
     }
 
@@ -57,12 +64,94 @@ impl WriteSession {
     /// `SELECT` the mailbox read-write and return its UIDVALIDITY.
     pub(in crate::imap) fn select(&mut self, mailbox: &str) -> Result<u32, WriteError> {
         let name = quote_imap(mailbox).map_err(|err| WriteError::Refused(err.to_string()))?;
-        let reply = self.run("SELECT", &format!("SELECT {name}"))?;
+        let modifier = if self.session.condstore {
+            " (CONDSTORE)"
+        } else {
+            ""
+        };
+        let reply = self.run("SELECT", &format!("SELECT {name}{modifier}"))?;
+        self.conditional = self.session.condstore
+            && !reply
+                .untagged
+                .iter()
+                .any(|line| has_code(&line.text, "NOMODSEQ"));
         reply
             .untagged
             .iter()
             .find_map(|line| bracket_u32(&line.text, "UIDVALIDITY"))
             .ok_or_else(|| WriteError::Refused(format!("SELECT {mailbox} returned no UIDVALIDITY")))
+    }
+
+    pub(in crate::imap) fn conditional(&self) -> bool {
+        self.conditional
+    }
+
+    /// The selected copy's current flag and revision, if the UID still exists.
+    pub(in crate::imap) fn uid_flag(
+        &mut self,
+        uid: u32,
+        flag: &str,
+    ) -> Result<Option<(bool, Option<u64>)>, WriteError> {
+        let items = if self.conditional {
+            "UID FLAGS MODSEQ"
+        } else {
+            "UID FLAGS"
+        };
+        let reply = self.run("UID FETCH", &format!("UID FETCH {uid} ({items})"))?;
+        Ok(reply
+            .untagged
+            .iter()
+            .filter_map(|line| parse_flags(&line.text))
+            .rfind(|item| item.uid == uid)
+            .map(|item| {
+                (
+                    item.flags
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(flag)),
+                    item.modseq,
+                )
+            }))
+    }
+
+    pub(in crate::imap) fn uid_store_flag(
+        &mut self,
+        uid: u32,
+        kind: OutboxKind,
+        value: bool,
+        modseq: Option<u64>,
+    ) -> Result<FlagReply, WriteError> {
+        let flag = kind
+            .flag_name()
+            .ok_or_else(|| WriteError::Refused("expected a system flag".into()))?;
+        let modifier = modseq
+            .map(|modseq| format!(" (UNCHANGEDSINCE {modseq})"))
+            .unwrap_or_default();
+        let sign = if value { '+' } else { '-' };
+        let reply = match self.run(
+            "UID STORE",
+            &format!("UID STORE {uid}{modifier} {sign}FLAGS.SILENT ({flag})"),
+        ) {
+            Ok(reply) => reply,
+            Err(WriteError::Refused(text))
+                if modseq.is_some()
+                    && text
+                        .strip_prefix("imap: UID STORE failed: ")
+                        .is_some_and(|status| has_code(status, "MODIFIED")) =>
+            {
+                return Ok(FlagReply::Modified);
+            }
+            Err(err) => return Err(err),
+        };
+        if modseq.is_some() && has_code(&reply.ok, "MODIFIED") {
+            return Ok(FlagReply::Modified);
+        }
+        let revision = reply.untagged.iter().find_map(|line| {
+            let upper = line.text.to_ascii_uppercase();
+            (super::uid_in_fetch_text(&upper) == Some(uid))
+                .then(|| fetch_modseq(&upper))
+                .flatten()
+        });
+        Ok(FlagReply::Stored(revision))
     }
 
     /// `UID MOVE` the UIDs into `target`. UIDs the mailbox no longer has are
@@ -151,6 +240,24 @@ impl WriteSession {
             Err(err) => Err(WriteError::Connection(err)),
         }
     }
+}
+
+/// Match only the response code immediately after the status atom.
+fn has_code(text: &str, name: &str) -> bool {
+    let mut words = text.split_ascii_whitespace();
+    let Some(mut status) = words.next() else {
+        return false;
+    };
+    if status == "*" {
+        status = words.next().unwrap_or_default();
+    }
+    ["OK", "NO"]
+        .iter()
+        .any(|valid| status.eq_ignore_ascii_case(valid))
+        && words
+            .next()
+            .and_then(|word| word.strip_prefix('['))
+            .is_some_and(|word| word.trim_end_matches(']').eq_ignore_ascii_case(name))
 }
 
 /// `1,3,5:7` for the UIDs, ascending.

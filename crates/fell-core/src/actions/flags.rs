@@ -369,6 +369,7 @@ mod tests {
             flags: vec![FlagUpdate {
                 remote_id: RemoteId(format!("r:{id}")),
                 unread,
+                modseq: None,
             }],
             ..MailboxDelta::default()
         }
@@ -821,6 +822,7 @@ mod tests {
             flags: vec![FlagUpdate {
                 remote_id: RemoteId(remote.into()),
                 unread,
+                modseq: None,
             }],
             ..MailboxDelta::default()
         }

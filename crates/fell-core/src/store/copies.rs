@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS message_copies (
     uid INTEGER NOT NULL,
     message_id TEXT NOT NULL,
     folder TEXT NOT NULL,
+    -- Big-endian u64, so SQLite orders the full unsigned MODSEQ range.
+    modseq BLOB,
     PRIMARY KEY (account_id, mailbox, uidvalidity, uid)
 );
 
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS copy_orphans (
 /// Create the tables. The first time, record the one copy each row and alias
 /// already names, so mail synced before this table existed can still go.
 pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
-    if table_exists(conn, "message_copies")? {
+    if has_modseq(conn)? {
         return conn.execute_batch(COPIES_SCHEMA).map_err(Into::into);
     }
     // One transaction: a large mailbox is not one commit per row, and a
@@ -60,11 +62,46 @@ pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let existed = table_exists(&tx, "message_copies")?;
     tx.execute_batch(COPIES_SCHEMA)?;
+    if !has_modseq(&tx)? {
+        tx.execute_batch("ALTER TABLE message_copies ADD COLUMN modseq BLOB")?;
+    }
     if !existed {
         backfill(&tx)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+fn has_modseq(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('message_copies') WHERE name = 'modseq')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Record an observation from sync or STORE. An older or equal revision
+/// cannot bring any new flag information from this copy.
+pub(crate) fn observe_modseq(
+    conn: &Connection,
+    account_id: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+    modseq: u64,
+) -> Result<bool> {
+    let updated = conn
+        .prepare_cached(
+            "UPDATE message_copies SET modseq = ?5
+         WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4
+           AND (modseq IS NULL OR modseq < ?5)",
+        )?
+        .execute(params![
+            account_id.as_str(),
+            copy.mailbox,
+            copy.uidvalidity,
+            copy.uid,
+            modseq.to_be_bytes(),
+        ])?;
+    Ok(updated != 0 || row_of(conn, account_id, copy)?.is_none())
 }
 
 fn backfill(conn: &Connection) -> Result<()> {
@@ -691,7 +728,7 @@ fn moving_into(
     let hit: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM server_outbox
-             WHERE account_id = ?1 AND message_id = ?2 AND state = 'pending'
+             WHERE account_id = ?1 AND message_id = ?2 AND kind = 'move' AND state = 'pending'
                AND target_folder = ?3 COLLATE NOCASE
              LIMIT 1",
             params![account_id.as_str(), message_id, folder],

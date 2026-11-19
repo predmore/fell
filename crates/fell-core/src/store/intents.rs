@@ -7,14 +7,14 @@
 //! intent is dropped only once every copy recorded for the row has reported
 //! the new value since it was set. After that, later server changes win again.
 //!
-//! Stars are recorded too, so write-back (#104) can send them, but sync does
-//! not read `\Flagged` yet (#102): it never compares or clears a star intent,
-//! and a star change stays pending until write-back or #102 settles it.
+//! The write-back outbox settles both flags. Read-only sync only observes
+//! `\Seen`, so it can also settle a local read intent when no write is queued.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
 use crate::account::AccountId;
+use crate::outbox::{self, OutboxKind};
 
 pub(super) const INTENT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_flag_intents (
@@ -75,7 +75,7 @@ pub(crate) fn record(
             params![account_id.as_str(), message_id],
         )?;
     }
-    Ok(())
+    outbox::flags::queue(conn, account_id, message_id, unread, starred)
 }
 
 /// The unread value the server copy `remote_id` may write to `message_id`:
@@ -91,23 +91,57 @@ pub(crate) fn server_unread(
     remote_id: &str,
     server: bool,
 ) -> Result<bool> {
-    let pending: Option<Option<i64>> = conn
-        .query_row(
-            "SELECT unread FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id.as_str(), message_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(local) = pending.flatten().map(|value| value != 0) else {
+    let Some(local) = pending_unread(conn, account_id, message_id)? else {
         return Ok(server);
     };
+    if !outbox::flags::pending_seen(conn, account_id, message_id)? {
+        observe_unread(conn, account_id, message_id, remote_id, server, local)?;
+    }
+    Ok(local)
+}
+
+fn pending_unread(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<Option<bool>> {
+    let pending: Option<Option<i64>> = conn
+        .prepare_cached(
+            "SELECT unread FROM local_flag_intents WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .query_row(params![account_id.as_str(), message_id], |row| row.get(0))
+        .optional()?;
+    Ok(pending.flatten().map(|value| value != 0))
+}
+
+pub(crate) fn acknowledge_unread(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    remote_id: &str,
+    server: bool,
+) -> Result<()> {
+    if let Some(local) = pending_unread(conn, account_id, message_id)? {
+        observe_unread(conn, account_id, message_id, remote_id, server, local)?;
+    }
+    Ok(())
+}
+
+fn observe_unread(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    remote_id: &str,
+    server: bool,
+    local: bool,
+) -> Result<()> {
     if local != server {
         conn.execute(
             "DELETE FROM local_flag_intent_copies
              WHERE account_id = ?1 AND message_id = ?2 AND remote_id = ?3",
             params![account_id.as_str(), message_id, remote_id],
         )?;
-        return Ok(local);
+        return Ok(());
     }
     conn.execute(
         "INSERT OR IGNORE INTO local_flag_intent_copies (account_id, message_id, remote_id)
@@ -126,15 +160,25 @@ pub(crate) fn server_unread(
         |row| row.get(0),
     )?;
     if waiting == 0 {
-        settle_unread(conn, account_id, message_id)?;
+        clear_flag(conn, account_id, message_id, OutboxKind::Seen)?;
     }
-    Ok(server)
+    Ok(())
 }
 
-/// Every copy agrees: the read state is the server's again.
-fn settle_unread(conn: &Connection, account_id: &AccountId, message_id: &str) -> Result<()> {
+/// Write-back settled a flag, or every server copy agreed on the read state.
+pub(crate) fn clear_flag(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    kind: OutboxKind,
+) -> Result<()> {
+    let column = match kind {
+        OutboxKind::Seen => "unread",
+        OutboxKind::Flagged => "starred",
+        OutboxKind::Move => return Err(crate::Error::Action("move has no flag intent".into())),
+    };
     conn.execute(
-        "UPDATE local_flag_intents SET unread = NULL WHERE account_id = ?1 AND message_id = ?2",
+        &format!("UPDATE local_flag_intents SET {column} = NULL WHERE account_id = ?1 AND message_id = ?2"),
         params![account_id.as_str(), message_id],
     )?;
     conn.execute(
@@ -142,10 +186,12 @@ fn settle_unread(conn: &Connection, account_id: &AccountId, message_id: &str) ->
          WHERE account_id = ?1 AND message_id = ?2 AND unread IS NULL AND starred IS NULL",
         params![account_id.as_str(), message_id],
     )?;
-    conn.execute(
-        "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
-        params![account_id.as_str(), message_id],
-    )?;
+    if kind == OutboxKind::Seen {
+        conn.execute(
+            "DELETE FROM local_flag_intent_copies WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id],
+        )?;
+    }
     Ok(())
 }
 

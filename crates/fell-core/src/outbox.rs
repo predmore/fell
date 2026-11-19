@@ -33,11 +33,8 @@
 //! reversed, even when write-back is turned on again or a command on the
 //! wire when it went off is answered late.
 //!
-//! Only moves exist so far: archive, move, delete to Trash, spam, and not
-//! spam are all one. A permanent delete from Trash is never queued, since it
-//! would need `\Deleted` and `EXPUNGE`. [`OutboxKind`] names what a row asks
-//! for, and replay dispatches on it, so flags (#104), labels (#106), and
-//! Drafts or Sent `APPEND` (#116, #117) add a kind each.
+//! Read and star intents share the queue, with one pending value per copy
+//! and flag. A permanent delete from Trash is never queued.
 //!
 //! [`WriteTx`]: crate::store::WriteTx
 
@@ -47,6 +44,8 @@ use crate::account::AccountId;
 use crate::folders::FolderRoles;
 use crate::store::Store;
 use crate::{Error, Result};
+
+pub(crate) mod flags;
 
 const OUTBOX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS write_back_accounts (
@@ -95,7 +94,12 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     target_uidnext INTEGER NOT NULL DEFAULT 0,
     -- Undo's reverse of a row that was sent but not settled: that row's
     -- id. The reverse moves the copy that row places. 0 otherwise.
-    reverses INTEGER NOT NULL DEFAULT 0
+    reverses INTEGER NOT NULL DEFAULT 0,
+    flag_value INTEGER,
+    flag_modseq BLOB,
+    -- An earlier flag write may have reached the server. Recover its result
+    -- before replaying the replacement, without sending the old value again.
+    flag_superseded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -104,14 +108,37 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 ";
 
 /// Columns added after the tables first shipped on a branch build.
-const ADDED_COLUMNS: [(&str, &str); 7] = [
-    ("write_back_accounts", "generation"),
-    ("write_back_accounts", "move_missing"),
-    ("server_outbox", "generation"),
-    ("server_outbox", "sent"),
-    ("server_outbox", "target_uidvalidity"),
-    ("server_outbox", "target_uidnext"),
-    ("server_outbox", "reverses"),
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "write_back_accounts",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "write_back_accounts",
+        "move_missing",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("server_outbox", "generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("server_outbox", "sent", "INTEGER NOT NULL DEFAULT 0"),
+    (
+        "server_outbox",
+        "target_uidvalidity",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "server_outbox",
+        "target_uidnext",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("server_outbox", "reverses", "INTEGER NOT NULL DEFAULT 0"),
+    ("server_outbox", "flag_value", "INTEGER"),
+    ("server_outbox", "flag_modseq", "BLOB"),
+    (
+        "server_outbox",
+        "flag_superseded",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 /// Sent and dropped rows are kept this long, so undo can still reverse a
@@ -124,19 +151,33 @@ pub enum OutboxKind {
     /// Move one copy from `source` to `target` (archive, move, delete to
     /// Trash, spam, and not spam).
     Move,
+    Seen,
+    Flagged,
 }
 
 impl OutboxKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Move => "move",
+            Self::Seen => "seen",
+            Self::Flagged => "flagged",
         }
     }
 
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "move" => Ok(Self::Move),
+            "seen" => Ok(Self::Seen),
+            "flagged" => Ok(Self::Flagged),
             other => Err(Error::Action(format!("unknown outbox action {other}"))),
+        }
+    }
+
+    pub(crate) fn flag_name(self) -> Option<&'static str> {
+        match self {
+            Self::Move => None,
+            Self::Seen => Some("\\Seen"),
+            Self::Flagged => Some("\\Flagged"),
         }
     }
 }
@@ -179,7 +220,7 @@ impl OutboxState {
     }
 }
 
-/// One server copy an action asked to move.
+/// One server copy an action affects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntry {
     pub id: i64,
@@ -205,6 +246,10 @@ pub struct OutboxEntry {
     /// Undo's reverse of the row with this id, which was sent but not yet
     /// settled: this row moves the copy that one places.
     pub reverses: Option<i64>,
+    /// Desired presence of the system flag, for Seen and Flagged rows.
+    pub flag_value: Option<bool>,
+    pub(crate) flag_modseq: Option<u64>,
+    pub(crate) flag_superseded: bool,
 }
 
 /// What one replay pass did ([`crate::AccountConfig::replay_outbox`]).
@@ -216,14 +261,17 @@ pub struct ReplayReport {
     /// not due yet.
     pub waiting: usize,
     /// Rows given up on. The local change stays; the server never got it.
-    pub dropped: Vec<DroppedMove>,
+    pub dropped: Vec<DroppedWrite>,
+    /// Replay applied a conflicting server value to the local store.
+    pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
     pub interrupted: Option<String>,
 }
 
-/// A move the server will not get.
+/// An action the server will not get.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DroppedMove {
+pub struct DroppedWrite {
+    pub kind: OutboxKind,
     pub source_folder: String,
     pub target_folder: String,
     pub reason: DropReason,
@@ -248,7 +296,8 @@ pub enum DropReason {
 
 const ENTRY_COLS: &str = "id, kind, state, action_id, message_id, source_folder, source_mailbox,
     uidvalidity, uid, target_folder, target_mailbox, placed_uidvalidity, placed_uid,
-    attempts, retry_unix, error, generation, sent, reverses";
+    attempts, retry_unix, error, generation, sent, reverses,
+    flag_value, flag_modseq, flag_superseded";
 
 impl Store {
     /// Turn write-back on or off for the account (`write_back` in
@@ -282,7 +331,7 @@ impl Store {
         tx.commit()
     }
 
-    /// Whether archive and move are queued for the server on this account.
+    /// Whether local moves and flags are queued for the server on this account.
     pub fn write_back(&self, account_id: &AccountId) -> Result<bool> {
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_schema(&tx)?;
@@ -307,7 +356,7 @@ impl Store {
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(OUTBOX_SCHEMA)?;
-    for (table, column) in ADDED_COLUMNS {
+    for (table, column, definition) in ADDED_COLUMNS {
         let present: Option<i64> = conn
             .query_row(
                 &format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"),
@@ -317,7 +366,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             .optional()?;
         if present.is_none() {
             conn.execute_batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
             ))?;
         }
     }
@@ -453,7 +502,7 @@ pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: 
     conn.execute(
         &format!(
             "DELETE FROM server_outbox
-             WHERE account_id = ?1 AND action_id = ?2 AND state = 'pending' AND sent = 0
+             WHERE account_id = ?1 AND action_id = ?2 AND kind = 'move' AND state = 'pending' AND sent = 0
                AND {undoable}"
         ),
         params![account_id.as_str(), action_id],
@@ -468,7 +517,7 @@ pub(crate) fn undo_action(conn: &Connection, account_id: &AccountId, action_id: 
         conn,
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
-             WHERE account_id = ?1 AND action_id = {action_id}
+             WHERE account_id = ?1 AND action_id = {action_id} AND kind = 'move'
                AND state IN ('done', 'pending') AND generation = {generation}
                AND {undoable}
              ORDER BY id"
@@ -637,7 +686,7 @@ fn claimed(conn: &Connection, account_id: &AccountId, copy: &(String, u32, u32))
         .query_row(
             "SELECT 1 FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending'
-               AND source_mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4
+               AND kind = 'move' AND source_mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4
              LIMIT 1",
             params![account_id.as_str(), copy.0, copy.1, copy.2],
             |row| row.get(0),
@@ -657,7 +706,7 @@ fn inbound(
     let found: Option<(String, String, bool)> = conn
         .query_row(
             "SELECT target_folder, state, placed_uid IS NOT NULL FROM server_outbox
-             WHERE account_id = ?1 AND message_id = ?2 AND generation = ?3
+             WHERE account_id = ?1 AND message_id = ?2 AND generation = ?3 AND kind = 'move'
                AND state IN ('pending', 'done')
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str(), message_id, generation],
@@ -697,6 +746,9 @@ fn select_entries(
                 row.get::<_, i64>(16)?,
                 row.get::<_, bool>(17)?,
                 row.get::<_, i64>(18)?,
+                row.get::<_, Option<bool>>(19)?,
+                row.get::<_, Option<[u8; 8]>>(20)?.map(u64::from_be_bytes),
+                row.get::<_, bool>(21)?,
             ),
         ))
     })?;
@@ -723,6 +775,9 @@ fn select_entries(
                 generation,
                 sent,
                 reverses,
+                flag_value,
+                flag_modseq,
+                flag_superseded,
             ),
         ) = row?;
         out.push(OutboxEntry {
@@ -745,6 +800,9 @@ fn select_entries(
             generation,
             sent,
             reverses: (reverses != 0).then_some(reverses),
+            flag_value,
+            flag_modseq,
+            flag_superseded,
         });
     }
     Ok(out)
@@ -948,7 +1006,7 @@ pub(crate) fn note_move_missing(
 /// Half-done copies an earlier build left (see [`OutboxState::Abandoned`]),
 /// each reported once. Opens no connection, so it runs with write-back off
 /// too.
-pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Vec<DroppedMove>> {
+pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Vec<DroppedWrite>> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let abandoned = select_entries(
@@ -966,7 +1024,8 @@ pub(crate) fn take_abandoned(store: &Store, account_id: &AccountId) -> Result<Ve
     tx.commit()?;
     Ok(abandoned
         .into_iter()
-        .map(|entry| DroppedMove {
+        .map(|entry| DroppedWrite {
+            kind: entry.kind,
             source_folder: entry.source_folder,
             target_folder: entry.target_folder,
             reason: DropReason::Abandoned,
@@ -1003,9 +1062,8 @@ pub(crate) enum Outcome<'a> {
 pub(crate) enum Settled {
     /// Recorded as asked.
     Recorded,
-    /// The server refused a row undo had already reversed: it never moved
-    /// the message, so the row and its reverse are retired, with nothing
-    /// to tell the user.
+    /// A superseded flag or a refused move that undo had already reversed.
+    /// Neither needs another attempt or a notice.
     Retired,
     /// The row is from an earlier write-back generation (write-back was
     /// turned off while it was on the wire) and is left as it is. The pass
@@ -1031,19 +1089,29 @@ pub(crate) fn settle(
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let now = now_unix();
-    let live: Option<i64> = tx
+    let live: Option<(i64, bool)> = tx
         .query_row(
-            "SELECT generation FROM server_outbox WHERE id = ?1",
+            "SELECT generation, flag_superseded FROM server_outbox
+             WHERE id = ?1 AND (kind = 'move' OR state = 'pending')",
             params![entry.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     let current = enabled(&tx, account_id)?
         .then(|| generation(&tx, account_id))
         .transpose()?;
-    if live.or(Some(entry.generation)) != current {
+    if Some(live.map_or(entry.generation, |(generation, _)| generation)) != current {
         tx.commit()?;
         return Ok(Settled::Stale);
+    }
+    if entry.kind != OutboxKind::Move && live.is_none_or(|(_, superseded)| superseded) {
+        tx.execute(
+            "UPDATE server_outbox SET state = 'dropped', error = 'superseded', settled_unix = ?2
+             WHERE id = ?1 AND state = 'pending'",
+            params![entry.id, now],
+        )?;
+        tx.commit()?;
+        return Ok(Settled::Retired);
     }
     let placed = match outcome {
         Outcome::Done { placed } => placed,
@@ -1262,6 +1330,7 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             crate::imap::folder_name(target),
         ],
     )?;
+    flags::follow_move(conn, account_id, sent)?;
     Ok(())
 }
 

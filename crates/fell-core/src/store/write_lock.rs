@@ -393,6 +393,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread: false,
+                    modseq: None,
                 })
                 .collect(),
             removals: vec![crate::backend::FolderRemoval {
@@ -470,6 +471,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread,
+                    modseq: None,
                 })
                 .collect(),
             removals: vec![crate::backend::FolderRemoval {
@@ -823,6 +825,7 @@ mod tests {
                 .map(|uid| crate::backend::FlagUpdate {
                     remote_id: RemoteId(format!("imap:1:{uid}:INBOX")),
                     unread: uid % 3 == 0,
+                    modseq: None,
                 })
                 .collect(),
             removals: vec![crate::backend::FolderRemoval {

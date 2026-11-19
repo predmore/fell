@@ -17,7 +17,7 @@
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
-//! # write_back = true           # send archive, move, delete, spam to the server (off by default)
+//! # write_back = true           # send moves and flag changes to the server (off by default)
 //! ```
 //!
 //! Sync learns which folder is Sent, Drafts, Trash and so on from the
@@ -26,9 +26,8 @@
 //! `archive_folder`, `all_mail_folder`, and `flagged_folder` name the folder
 //! for that role and win over both.
 //!
-//! Archive and move change only Fell's copy of the mailbox unless
-//! `write_back = true`: then they are queued and the sync thread moves the
-//! mail on the server too (see [`crate::outbox`]).
+//! With `write_back = true`, Fell queues server moves and read and star
+//! changes for the sync thread (see [`crate::outbox`]).
 //!
 //! Sending uses only this file's username and password, never anything in a
 //! draft folder. `smtp_security = "starttls"` (the default) refuses a server
@@ -78,8 +77,7 @@ pub struct AccountConfig {
     pub smtp_security: Option<ImapSecurity>,
     /// `sent_folder = "..."` and the like, in [`FolderRole::ALL`] order.
     pub folders: Vec<(FolderRole, String)>,
-    /// `write_back = true`: archive, move, delete to Trash, and spam are
-    /// sent to the server too. A permanent delete never is.
+    /// `write_back = true` sends moves and read and star changes to the server.
     pub write_back: bool,
 }
 
@@ -383,7 +381,7 @@ impl AccountConfig {
         })
     }
 
-    /// Send the archive and move rows queued for this account on a separate
+    /// Send the writes queued for this account on a separate
     /// `SELECT` session. Run it on the sync thread; it connects only when a
     /// row is due. Sends nothing while `write_back` is off, but still
     /// reports, once, a copy an earlier build of write-back left half done.

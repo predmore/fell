@@ -23,7 +23,7 @@ use crate::search::{
 use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
-mod copies;
+pub(crate) mod copies;
 pub(crate) mod intents;
 mod roles;
 pub(crate) mod sent_bcc;
@@ -482,6 +482,10 @@ impl Store {
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         conn.execute_batch(roles::ROLES_TABLE)?;
         conn.execute_batch(intents::INTENT_SCHEMA)?;
+        let outbox_tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        crate::outbox::ensure_schema(&outbox_tx)?;
+        outbox_tx.commit()?;
         threads::ensure_thread_schema(&conn)?;
         // Version 3 is stamped only after the fingerprint backfill finishes.
         // Batches commit on their own so a large mailbox is not one transaction.
@@ -3066,6 +3070,11 @@ fn apply_flag(
     flag: &crate::backend::FlagUpdate,
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
+    if let (Some(copy), Some(modseq)) = (&copy, flag.modseq)
+        && !copies::observe_modseq(conn, account_id, copy, modseq)?
+    {
+        return Ok(());
+    }
     let targets: Vec<String> = {
         let mut stmt = conn.prepare_cached(FLAG_TARGETS)?;
         stmt.query_map(
@@ -6960,6 +6969,7 @@ mod tests {
                     flags: vec![crate::backend::FlagUpdate {
                         remote_id: RemoteId("imap:sent".into()),
                         unread: false,
+                        modseq: None,
                     }],
                     cursor: None,
                     ..MailboxDelta::default()

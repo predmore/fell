@@ -2,10 +2,8 @@
 //!
 //! One pass loads the rows not yet applied and, only if there are any,
 //! logs in on a [`WriteSession`] (never the read-only sync session). For
-//! each source mailbox it sends `SELECT`, checks UIDVALIDITY, and moves the
-//! queued UIDs with one `UID MOVE` per target. A server without MOVE keeps
-//! the change in Fell: nothing is copied, flagged, or expunged, and the
-//! user is told once.
+//! each source mailbox it sends `SELECT` and checks UIDVALIDITY. It sends
+//! `UID MOVE` for moves and `UID STORE` for read and star changes.
 //!
 //! Before a row's first `UID MOVE`, replay records the target's UIDVALIDITY
 //! and UIDNEXT (`STATUS`), then marks the row sent. When the reply is lost
@@ -32,14 +30,14 @@ use std::collections::{HashMap, HashSet};
 use crate::Error;
 use crate::account::AccountId;
 use crate::outbox::{
-    self, DropReason, DroppedMove, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
-    Settled,
+    self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
+    Settled, flags,
 };
 use crate::store::Store;
 
 use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_uid_message_id};
-use super::session::{Placed, WriteError, WriteSession};
+use super::session::{FlagReply, Placed, WriteError, WriteSession};
 
 /// Refusals (or "not on the server yet") before a row is dropped.
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
@@ -140,18 +138,21 @@ impl Pass<'_> {
     fn run(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
         // Whether the user hears of it is up to the status line's report
         // (`outbox::report_for_status`): that notice is said once.
-        if !session.has_move() {
-            for index in 0..self.entries.len() {
-                if self.entries[index].retry_unix <= self.now {
+        let mut visited = vec![false; self.entries.len()];
+        let has_move = session.has_move();
+        if has_move {
+            outbox::note_move_missing(self.store, self.account_id, false)?;
+        } else {
+            for (index, entry) in self.entries.iter().enumerate() {
+                if entry.kind == OutboxKind::Move && entry.retry_unix <= self.now {
                     self.drop_row(index, DropReason::NoMove, "server has no MOVE")?;
+                    visited[index] = true;
                 }
             }
-            return Ok(());
+            self.held.clear();
         }
-        outbox::note_move_missing(self.store, self.account_id, false)?;
-        let mut visited = vec![false; self.entries.len()];
         for index in 0..self.entries.len() {
-            if visited[index] {
+            if visited[index] || (!has_move && self.entries[index].kind == OutboxKind::Move) {
                 continue;
             }
             visited[index] = true;
@@ -162,8 +163,135 @@ impl Pass<'_> {
             }
             match entry.kind {
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
+                OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
             }
         }
+        Ok(())
+    }
+
+    fn replay_flag(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
+        let Some(mut entry) = flags::pending(self.store, self.account_id, self.entries[index].id)?
+        else {
+            self.settled[index] = true;
+            return Ok(());
+        };
+        let (Some(mailbox), Some(validity), Some(uid), Some(value), Some(flag)) = (
+            &entry.source_mailbox,
+            entry.uidvalidity,
+            entry.uid,
+            entry.flag_value,
+            entry.kind.flag_name(),
+        ) else {
+            return Err(Error::Action("invalid flag write in outbox".into()).into());
+        };
+        match self.select(session, mailbox)? {
+            Ok(current) if current != validity => {
+                return self.drop_row(index, DropReason::FolderReset, "UIDVALIDITY changed");
+            }
+            Err(message) => return self.retry(index, DropReason::Refused, &message),
+            Ok(_) => {}
+        }
+        if !session.conditional() {
+            entry.flag_modseq = None;
+        }
+        if entry.sent || (session.conditional() && entry.flag_modseq.is_none()) {
+            let Some((server, modseq)) = self.read_flag(session, index, uid, flag)? else {
+                return Ok(());
+            };
+            if entry.sent && server == value {
+                return self.finish_flag(
+                    index,
+                    &entry,
+                    flags::Observed::Applied {
+                        modseq,
+                        from_store: false,
+                    },
+                );
+            }
+            if entry.flag_superseded {
+                return self.finish_flag(index, &entry, flags::Observed::Superseded);
+            }
+            entry.flag_modseq = entry.flag_modseq.or(modseq);
+        }
+
+        (self.before_send)();
+        if !flags::mark_sent(self.store, self.account_id, &entry, entry.flag_modseq)? {
+            return Ok(());
+        }
+        let observed = match session.uid_store_flag(uid, entry.kind, value, entry.flag_modseq) {
+            Ok(FlagReply::Stored(modseq)) if modseq.is_some() || !session.conditional() => {
+                flags::Observed::Applied {
+                    modseq,
+                    from_store: true,
+                }
+            }
+            // A conditional STORE reports MODSEQ even with .SILENT. If it
+            // did not, check whether the UID still exists and what it holds.
+            Ok(_) => {
+                let Some((server, Some(modseq))) = self.read_flag(session, index, uid, flag)?
+                else {
+                    return Ok(());
+                };
+                if server == value {
+                    flags::Observed::Applied {
+                        modseq: Some(modseq),
+                        from_store: false,
+                    }
+                } else {
+                    flags::Observed::Conflict {
+                        value: server,
+                        modseq,
+                    }
+                }
+            }
+            Err(WriteError::Refused(message)) => {
+                return self.retry_as(index, DropReason::Refused, &message, true);
+            }
+            Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+        };
+        self.finish_flag(index, &entry, observed)
+    }
+
+    fn read_flag(
+        &mut self,
+        session: &mut WriteSession,
+        index: usize,
+        uid: u32,
+        flag: &str,
+    ) -> Result<Option<(bool, Option<u64>)>, Stop> {
+        match session.uid_flag(uid, flag) {
+            Ok(Some((_, None))) if session.conditional() => {
+                self.retry(
+                    index,
+                    DropReason::Refused,
+                    "server did not report the flag's MODSEQ",
+                )?;
+            }
+            Ok(Some(current)) => return Ok(Some(current)),
+            Ok(None) => {
+                self.drop_row(index, DropReason::NotFound, "message is not on the server")?
+            }
+            Err(WriteError::Refused(message)) => {
+                self.retry(index, DropReason::Refused, &message)?
+            }
+            Err(WriteError::Connection(err)) => return Err(Stop::Connection(err)),
+        }
+        Ok(None)
+    }
+
+    fn finish_flag(
+        &mut self,
+        index: usize,
+        entry: &OutboxEntry,
+        observed: flags::Observed,
+    ) -> Result<(), Stop> {
+        match flags::finish(self.store, self.account_id, entry, observed)? {
+            flags::Finished::Stale => return Err(Stop::Stale),
+            flags::Finished::Superseded => {}
+            flags::Finished::Applied => self.report.sent += 1,
+            flags::Finished::Conflict { changed } => self.report.flags_changed |= changed,
+        }
+        self.settled[index] = true;
         Ok(())
     }
 
@@ -191,7 +319,8 @@ impl Pass<'_> {
                 return Ok(());
             }
             Some(Reversed::Gone) => {
-                return self.drop_quietly(index, "the move it reverses never reached the server");
+                self.drop_quietly(index, "the move it reverses never reached the server")?;
+                return Ok(());
             }
         };
         let Some(source) = self.mailbox(
@@ -533,6 +662,9 @@ impl Pass<'_> {
                         self.settled[at] = true;
                     }
                 }
+                if entry.kind != OutboxKind::Move {
+                    return Ok(());
+                }
             }
             Settled::Recorded if last => return self.drop_row(index, reason, message),
             Settled::Recorded => {}
@@ -542,9 +674,12 @@ impl Pass<'_> {
     }
 
     fn drop_row(&mut self, index: usize, reason: DropReason, message: &str) -> Result<(), Stop> {
-        self.drop_quietly(index, message)?;
+        if self.drop_quietly(index, message)? == Settled::Retired {
+            return Ok(());
+        }
         let entry = &self.entries[index];
-        self.report.dropped.push(DroppedMove {
+        self.report.dropped.push(DroppedWrite {
+            kind: entry.kind,
             source_folder: entry.source_folder.clone(),
             target_folder: entry.target_folder.clone(),
             reason,
@@ -553,7 +688,7 @@ impl Pass<'_> {
     }
 
     /// Drop the row without a notice: the user has nothing to learn from it.
-    fn drop_quietly(&mut self, index: usize, message: &str) -> Result<(), Stop> {
+    fn drop_quietly(&mut self, index: usize, message: &str) -> Result<Settled, Stop> {
         let entries = self.entries;
         let entry = &entries[index];
         let settled = outbox::settle(
@@ -568,8 +703,10 @@ impl Pass<'_> {
             return Err(Stop::Stale);
         }
         self.settled[index] = true;
-        self.held.insert(entry.message_id.clone());
-        Ok(())
+        if entry.kind == OutboxKind::Move {
+            self.held.insert(entry.message_id.clone());
+        }
+        Ok(settled)
     }
 }
 

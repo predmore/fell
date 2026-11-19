@@ -126,10 +126,21 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
-/// One line for moves the server will never get. The change stays in Fell,
+/// One line for writes the server will never get. The change stays in Fell,
 /// and no key would fix it, so none is shown.
 fn not_sent_notice(session: &Session, not_sent: &sync_worker::NotSent) -> String {
     let folder = session.folder_text(&not_sent.folder);
+    if not_sent.kind != fell_core::OutboxKind::Move {
+        return match not_sent.reason {
+            DropReason::FolderReset => {
+                format!("{folder} was reset on the server. Read or star changes stayed in Fell")
+            }
+            DropReason::NotFound => {
+                format!("Mail with read or star changes was missing from {folder} on the server")
+            }
+            _ => "The server refused to update read or star flags".to_string(),
+        };
+    }
     let messages = if not_sent.count == 1 {
         "1 message".to_string()
     } else {
@@ -375,6 +386,10 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             sync_worker::SyncEvent::Status(kind) => kind,
+                            sync_worker::SyncEvent::FlagsChanged => {
+                                inbox.request_threads(ReadIntent::default(), cx);
+                                return;
+                            }
                             sync_worker::SyncEvent::NotSent(not_sent) => {
                                 let text = not_sent_notice(&inbox.session, &not_sent);
                                 inbox.session.show_toast(text, true);
@@ -1417,7 +1432,7 @@ impl Inbox {
         );
     }
 
-    /// Archive, move, and undo may have queued a server move: send it now
+    /// Local actions may have queued a server write: send it now
     /// rather than at the next pass.
     fn send_to_server(&self) {
         if let Some(sync) = &self.sync {
@@ -1594,17 +1609,15 @@ impl Inbox {
         let change = edit.change;
         let ids = edit.ids;
         self.change_mailbox(
-            move |store| {
-                store
-                    .flag_threads(&account, &threads, &folder, change)
-                    .map(|_| ())
-            },
+            move |store| store.flag_threads(&account, &threads, &folder, change),
             move |inbox, result| {
                 inbox
                     .pending_flags
                     .retain(|id, (written, _, _)| !(ids.contains(id) && *written == generation));
-                if let Err(err) = result {
-                    inbox.session.show_toast(err.to_string(), true);
+                match result {
+                    Ok(Some(_)) => inbox.send_to_server(),
+                    Ok(None) => {}
+                    Err(err) => inbox.session.show_toast(err.to_string(), true),
                 }
                 Some(ReadIntent {
                     changed: true,
@@ -5020,6 +5033,7 @@ mod tests {
                 &session,
                 &NotSent {
                     reason,
+                    kind: fell_core::OutboxKind::Move,
                     folder: "INBOX".into(),
                     count,
                 },

@@ -9,9 +9,9 @@
 //! on its own store thread.
 //!
 //! With `write_back = true` in `account.toml`, each pass first sends the
-//! archive and move rows the window queued, on a separate `SELECT` session
+//! server actions the window queued, on a separate `SELECT` session
 //! ([`AccountConfig::replay_outbox`]). The window asks for that right after
-//! an archive, move, or undo. A move the server will never get is reported
+//! a local edit. An action the server will never get is reported
 //! once, for the status bar.
 
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DropReason, InboxWait, ReplayReport, Store,
+    Account, AccountConfig, BackendKind, DropReason, InboxWait, OutboxKind, ReplayReport, Store,
     SyncFailureKind, classify_sync_error, fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -54,15 +54,18 @@ pub enum SyncEvent {
     /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean
     /// the store has new rows.
     Status(SyncKind),
-    /// Moves the server will never get. The change stays in Fell.
+    /// A conflict during replay changed a local flag.
+    FlagsChanged,
+    /// Actions the server will never get. The change stays in Fell.
     NotSent(NotSent),
 }
 
-/// The first reason in a replay's dropped moves, and how many rows it
+/// The first reason in a replay's dropped writes, and how many rows it
 /// covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotSent {
     pub reason: DropReason,
+    pub kind: OutboxKind,
     /// The folder the messages were to leave on the server.
     pub folder: String,
     pub count: usize,
@@ -74,10 +77,14 @@ impl NotSent {
         let count = report
             .dropped
             .iter()
-            .filter(|dropped| dropped.reason == first.reason)
+            .filter(|dropped| {
+                dropped.reason == first.reason
+                    && (dropped.kind == OutboxKind::Move) == (first.kind == OutboxKind::Move)
+            })
             .count();
         Some(Self {
             reason: first.reason,
+            kind: first.kind,
             folder: first.source_folder.clone(),
             count,
         })
@@ -89,8 +96,7 @@ impl NotSent {
 enum Ask {
     /// `space s`: a pass now, shown as connecting.
     Sync,
-    /// Archive, move, or undo was queued for the server: send it now,
-    /// quietly.
+    /// A local edit was queued for the server: send it now, quietly.
     WriteBack,
 }
 
@@ -106,7 +112,7 @@ impl SyncHandle {
         let _ = self.wake.send(Ask::Sync);
     }
 
-    /// Send queued archive and move rows now, then run a pass, without
+    /// Send queued writes now, then run a pass, without
     /// showing "connecting". Nothing is queued while write-back is off.
     pub fn write_back_now(&self) {
         if self.write_back {
@@ -181,11 +187,15 @@ fn run(
     loop {
         // Moves go first, so the pass that follows sees where they landed.
         // A failure here is a connection problem the pass reports.
-        if let Ok(report) = config.replay_outbox(&store)
-            && let Some(not_sent) = NotSent::from_report(&report)
-            && events.unbounded_send(SyncEvent::NotSent(not_sent)).is_err()
-        {
-            return;
+        if let Ok(report) = config.replay_outbox(&store) {
+            if report.flags_changed && events.unbounded_send(SyncEvent::FlagsChanged).is_err() {
+                return;
+            }
+            if let Some(not_sent) = NotSent::from_report(&report)
+                && events.unbounded_send(SyncEvent::NotSent(not_sent)).is_err()
+            {
+                return;
+            }
         }
         let mut alive = true;
         let mut last_progress: Option<Instant> = None;

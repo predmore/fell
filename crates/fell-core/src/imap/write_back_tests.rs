@@ -1,9 +1,10 @@
 //! Write-back against the in-process IMAP server: the outbox rows archive
 //! and move queue, what replay sends for them, and undo.
 
+use crate::FlagChange;
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::ImapBackend;
-use crate::outbox::{DropReason, OutboxState};
+use crate::outbox::{DropReason, OutboxKind, OutboxState};
 use crate::store::Store;
 use crate::sync::sync_once;
 use crate::threading::ThreadId;
@@ -249,7 +250,7 @@ impl Fixture {
     }
 
     /// Replay until the rows are dropped, as many tries as it takes.
-    fn replay_until_dropped(&self) -> Vec<crate::outbox::DroppedMove> {
+    fn replay_until_dropped(&self) -> Vec<crate::outbox::DroppedWrite> {
         let mut dropped = Vec::new();
         for _ in 0..super::write_back::MAX_ATTEMPTS {
             self.make_due();
@@ -1410,5 +1411,355 @@ fn no_move_is_said_even_when_a_half_done_copy_is_reported_too() {
         fx.writes().iter().all(|write| !write.contains("MOVE")),
         "{:?}",
         fx.writes()
+    );
+}
+
+const ESCAPED_FOLDER: &str = "Work \"quotes\" \\ project";
+
+fn flag_state(condstore: bool) -> TestState {
+    let mut state = state_with(vec![
+        mailbox("INBOX", "", 7, &[(4, "Alpha")]),
+        mailbox(ESCAPED_FOLDER, "", 21, &[(9, "Alpha"), (12, "Alpha")]),
+    ]);
+    state.condstore = condstore;
+    for message in state
+        .mailboxes
+        .iter_mut()
+        .flat_map(|folder| &mut folder.messages)
+    {
+        message.flags = vec!["\\Answered".into()];
+        message.modseq = u64::from(message.uid);
+    }
+    state
+}
+
+impl Fixture {
+    fn flag(&self, thread: &ThreadId, change: FlagChange) {
+        self.store
+            .flag_threads(
+                &self.account.id,
+                std::slice::from_ref(thread),
+                "INBOX",
+                change,
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    fn local_flags(&self, thread: &ThreadId) -> (bool, bool) {
+        let messages = self
+            .store
+            .thread_messages(&self.account.id, thread)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        (messages[0].unread, messages[0].starred)
+    }
+
+    fn stores(&self) -> Vec<String> {
+        without_tags(&self.commands())
+            .into_iter()
+            .filter(|command| command.starts_with("UID STORE "))
+            .collect()
+    }
+}
+
+#[test]
+fn open_marks_each_server_copy_once_and_sync_stays_read_only() {
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
+    // Flag write-back works even on a server without MOVE.
+    fx.server.writes.lock().unwrap().moves = false;
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Read);
+    assert_eq!(fx.store.outbox(&fx.account.id).unwrap().len(), 3);
+
+    fx.clear_commands();
+    fx.sync();
+    assert!(fx.writes().is_empty(), "{:?}", fx.commands());
+    assert!(fx.commands().iter().any(|cmd| cmd.contains(" EXAMINE ")));
+    assert_eq!(fx.local_flags(&alpha), (false, false));
+    assert_eq!(fx.replay_as_window().sent, 3);
+    assert_eq!(
+        fx.stores(),
+        [
+            "UID STORE 4 (UNCHANGEDSINCE 4) +FLAGS.SILENT (\\Seen)",
+            "UID STORE 9 (UNCHANGEDSINCE 9) +FLAGS.SILENT (\\Seen)",
+            "UID STORE 12 (UNCHANGEDSINCE 12) +FLAGS.SILENT (\\Seen)",
+        ]
+    );
+    assert!(
+        without_tags(&fx.writes())
+            .contains(&"SELECT \"Work \\\"quotes\\\" \\\\ project\" (CONDSTORE)".into())
+    );
+    for (folder, uid) in [("INBOX", 4), (ESCAPED_FOLDER, 9), (ESCAPED_FOLDER, 12)] {
+        assert_eq!(fx.flags(folder, uid), ["\\Answered", "\\Seen"]);
+    }
+    assert!(
+        fx.store
+            .pending_flag_changes(&fx.account.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    fx.clear_commands();
+    fx.sync();
+    assert!(fx.writes().is_empty(), "{:?}", fx.commands());
+    assert_eq!(fx.local_flags(&alpha), (false, false));
+}
+
+#[test]
+fn ten_star_toggles_coalesce_for_each_copy_and_keep_the_seen_edit() {
+    let mut state = flag_state(true);
+    for message in state
+        .mailboxes
+        .iter_mut()
+        .flat_map(|folder| &mut folder.messages)
+    {
+        message.flags.push("\\Flagged".into());
+    }
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
+    let alpha = fx.thread("INBOX", "Alpha");
+    for _ in 0..5 {
+        fx.flag(&alpha, FlagChange::Star);
+        fx.flag(&alpha, FlagChange::Unstar);
+    }
+    fx.flag(&alpha, FlagChange::Read);
+    assert_eq!(fx.store.outbox(&fx.account.id).unwrap().len(), 6);
+    assert_eq!(fx.replay().sent, 6);
+    let stores = fx.stores();
+    assert_eq!(
+        stores
+            .iter()
+            .filter(|cmd| cmd.ends_with("-FLAGS.SILENT (\\Flagged)"))
+            .count(),
+        3
+    );
+    for (folder, uid) in [("INBOX", 4), (ESCAPED_FOLDER, 9), (ESCAPED_FOLDER, 12)] {
+        assert_eq!(fx.flags(folder, uid), ["\\Answered", "\\Seen"]);
+    }
+    assert!(
+        fx.store
+            .pending_flag_changes(&fx.account.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn uidvalidity_reset_drops_only_that_folders_flag_writes_with_a_notice() {
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Star);
+    fx.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+    let report = fx.replay_as_window();
+    assert_eq!((report.sent, report.waiting), (1, 0));
+    assert_eq!(report.dropped.len(), 2);
+    assert!(
+        report
+            .dropped
+            .iter()
+            .all(|drop| drop.kind == OutboxKind::Flagged
+                && drop.source_folder == ESCAPED_FOLDER
+                && drop.reason == DropReason::FolderReset)
+    );
+    assert_eq!(
+        fx.stores(),
+        ["UID STORE 4 (UNCHANGEDSINCE 4) +FLAGS.SILENT (\\Flagged)"]
+    );
+    assert!(fx.replay_as_window().dropped.is_empty());
+    assert_eq!(fx.local_flags(&alpha), (true, true));
+}
+
+fn flag_db(label: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("fell-flags-{label}-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    dir.join("mail.db")
+}
+
+#[test]
+fn flag_queue_recovers_a_lost_reply_on_restart_without_repeating_store() {
+    for condstore in [false, true] {
+        let path = flag_db("restart");
+        let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(condstore));
+        let alpha = fx.thread("INBOX", "Alpha");
+        fx.flag(&alpha, FlagChange::Read);
+        fx.server.writes.lock().unwrap().lose_reply_to = Some("STORE");
+        assert!(fx.replay().interrupted.is_some());
+        assert_eq!(fx.stores().len(), 1);
+
+        drop(fx.store);
+        fx.store = Store::open(&path).unwrap();
+        assert_eq!(fx.replay().waiting, 0);
+        assert_eq!(fx.replay().sent, 0);
+        let stores = fx.stores();
+        assert_eq!(stores.len(), 3, "{stores:?}");
+        for (folder, uid) in [("INBOX", 4), (ESCAPED_FOLDER, 9), (ESCAPED_FOLDER, 12)] {
+            assert_eq!(fx.flags(folder, uid), ["\\Answered", "\\Seen"]);
+        }
+        drop(fx);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn condstore_conflict_applies_the_server_value_and_keeps_other_flags() {
+    for modified_no in [false, true] {
+        let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
+        fx.server.writes.lock().unwrap().modified_no = modified_no;
+        let alpha = fx.thread("INBOX", "Alpha");
+        fx.flag(&alpha, FlagChange::Read);
+        {
+            let mut state = fx.server.state.lock().unwrap();
+            let copy = &mut state.mailboxes[1].messages[0];
+            // Another client changed and then cleared Seen while Fell's
+            // local read was queued. The server's last value is unread.
+            copy.modseq = 14;
+            copy.flags.push("\\Flagged".into());
+        }
+        let report = fx.replay();
+        assert!(report.flags_changed, "{report:?}, {:?}", fx.commands());
+        assert_eq!((report.sent, report.waiting), (1, 0));
+        assert_eq!(fx.stores().len(), 2);
+        assert_eq!(fx.local_flags(&alpha), (true, false));
+        assert_eq!(fx.flags(ESCAPED_FOLDER, 9), ["\\Answered", "\\Flagged"]);
+        assert_eq!(fx.flags(ESCAPED_FOLDER, 12), ["\\Answered"]);
+        assert!(
+            fx.store
+                .pending_flag_changes(&fx.account.id)
+                .unwrap()
+                .is_empty()
+        );
+        fx.sync();
+        assert_eq!(fx.local_flags(&alpha), (true, false));
+    }
+}
+
+#[test]
+fn a_conflict_in_flight_keeps_a_newer_local_intent_even_with_the_same_value() {
+    let server_state = flag_state(true);
+    let path = flag_db("in-flight");
+    let fx = Fixture::with(Store::open(&path).unwrap(), server_state);
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Read);
+    fx.server.state.lock().unwrap().mailboxes[0].messages[0].modseq = 15;
+    let action_path = path.clone();
+    let account = fx.account.id.clone();
+    let thread = alpha.clone();
+    fx.server.writes.lock().unwrap().before_store = Some(Box::new(move || {
+        let store = Store::open(action_path).unwrap();
+        for edit in [FlagChange::Unread, FlagChange::Read] {
+            store
+                .flag_threads(&account, std::slice::from_ref(&thread), "INBOX", edit)
+                .unwrap()
+                .unwrap();
+        }
+    }));
+    assert!(!fx.replay().flags_changed);
+    assert_eq!(fx.local_flags(&alpha), (false, false));
+    assert_eq!(fx.replay().sent, 3);
+    assert!(
+        fx.stores()
+            .contains(&"UID STORE 4 (UNCHANGEDSINCE 15) +FLAGS.SILENT (\\Seen)".into())
+    );
+    assert_eq!(fx.flags("INBOX", 4), ["\\Answered", "\\Seen"]);
+    drop(fx);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_copy_from_an_older_store_fetches_its_revision_before_writing() {
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
+    fx.store
+        .connection()
+        .execute("UPDATE message_copies SET modseq = NULL", [])
+        .unwrap();
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Star);
+    let report =
+        super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
+            fx.server.state.lock().unwrap().mailboxes[0].messages[0].modseq = 15
+        })
+        .unwrap();
+    assert!(report.flags_changed);
+    assert_eq!(fx.local_flags(&alpha), (true, false));
+    assert_eq!(
+        fx.stores(),
+        ["UID STORE 4 (UNCHANGEDSINCE 4) +FLAGS.SILENT (\\Flagged)"]
+    );
+    assert_eq!(fx.flags("INBOX", 4), ["\\Answered"]);
+}
+
+#[test]
+fn an_unstar_survives_a_restart_after_the_older_star_reply_is_lost() {
+    let path = flag_db("superseded");
+    let mut fx = Fixture::with(Store::open(&path).unwrap(), flag_state(true));
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.flag(&alpha, FlagChange::Star);
+    fx.server.writes.lock().unwrap().lose_reply_to = Some("STORE");
+    assert!(fx.replay().interrupted.is_some());
+    fx.flag(&alpha, FlagChange::Unstar);
+    drop(fx.store);
+    fx.store = Store::open(&path).unwrap();
+    assert_eq!(fx.replay().sent, 3);
+    assert_eq!(fx.stores().len(), 4, "{:?}", fx.stores());
+    assert!(
+        fx.stores()
+            .contains(&"UID STORE 4 (UNCHANGEDSINCE 5) -FLAGS.SILENT (\\Flagged)".into())
+    );
+    assert_eq!(fx.flags("INBOX", 4), ["\\Answered"]);
+    assert_eq!(fx.local_flags(&alpha), (true, false));
+    drop(fx);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn flags_follow_a_queued_move_and_undo_uses_the_same_queue() {
+    let fx = Fixture::new();
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.store
+        .archive_thread(&fx.account.id, &alpha, "INBOX")
+        .unwrap();
+    fx.flag(&alpha, FlagChange::Unread);
+    assert_eq!(fx.replay().sent, 2);
+    assert_eq!(fx.on_server("Archive"), [(1, "Alpha".into())]);
+    assert!(fx.flags("Archive", 1).is_empty());
+    fx.store.undo(&fx.account.id).unwrap();
+    assert_eq!(fx.replay().sent, 1);
+    assert_eq!(fx.flags("Archive", 1), ["\\Seen"]);
+    assert_eq!(
+        fx.stores(),
+        [
+            "UID STORE 1 -FLAGS.SILENT (\\Seen)",
+            "UID STORE 1 +FLAGS.SILENT (\\Seen)"
+        ]
+    );
+}
+
+#[test]
+fn the_write_back_switch_gates_flags_and_nomodseq_uses_plain_store() {
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
+    let alpha = fx.thread("INBOX", "Alpha");
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    fx.flag(&alpha, FlagChange::Star);
+    assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
+    fx.store.set_write_back(&fx.account.id, true).unwrap();
+    fx.flag(&alpha, FlagChange::Unstar);
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
+    assert_eq!(fx.replay_as_window().sent, 0);
+    fx.store.set_write_back(&fx.account.id, true).unwrap();
+    assert_eq!(fx.replay_as_window().sent, 0);
+    assert!(fx.stores().is_empty());
+
+    fx.server.writes.lock().unwrap().nomodseq = true;
+    fx.flag(&alpha, FlagChange::Star);
+    assert_eq!(fx.replay_as_window().sent, 3);
+    assert!(
+        fx.stores()
+            .iter()
+            .all(|cmd| !cmd.contains("UNCHANGEDSINCE"))
     );
 }

@@ -323,11 +323,12 @@ pub(crate) fn fetch_imap(
         };
         let stop = stream_bodies(&mut session, &plan, &copies, |streamed| {
             let item = match streamed {
-                Streamed::Stored { uid, flags } => {
+                Streamed::Stored(item) => {
+                    let uid = item.uid;
                     if seen_through.is_none_or(|floor| uid > floor) {
                         stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                     }
-                    pending_flags.push(flag_update(uidvalidity, uid, &escaped, &flags));
+                    pending_flags.push(flag_update(uidvalidity, &escaped, &item));
                     if pending_flags.len() >= BATCH_FLAGS {
                         flush_batch(
                             &mut batch,
@@ -358,6 +359,9 @@ pub(crate) fn fetch_imap(
                 return Ok(());
             }
             let raw_len = item.body.len();
+            if item.modseq.is_some() {
+                pending_flags.push(flag_update(uidvalidity, &escaped, &item));
+            }
             batch.push(rfc822::to_message(
                 account_id,
                 &mailbox.raw,
@@ -424,8 +428,8 @@ pub(crate) fn fetch_imap(
         if needs_baseline {
             match session.uid_flags("1:*") {
                 Ok(rows) => {
-                    for (uid, flag_names) in rows {
-                        flags.push(flag_update(uidvalidity, uid, &escaped, &flag_names));
+                    for item in rows {
+                        flags.push(flag_update(uidvalidity, &escaped, &item));
                     }
                 }
                 Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
@@ -744,7 +748,7 @@ enum Streamed {
     /// Not stored yet: fetched with its body.
     Fetched(session::Fetched),
     /// Stored already: only its flags were fetched.
-    Stored { uid: u32, flags: Vec<String> },
+    Stored(session::Fetched),
     /// Not stored and flagged `\Deleted`: dropped either way, so its body
     /// was not fetched.
     Deleted { uid: u32 },
@@ -800,7 +804,7 @@ fn flags_then_bodies(
     copies: &Copies<'_>,
     mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
 ) -> Result<session::FetchStop, Error> {
-    let mut rows: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut rows = Vec::new();
     let listed = session.uid_fetch_each(
         &format!("{start}:*"),
         changed_since,
@@ -808,7 +812,7 @@ fn flags_then_bodies(
         |item| {
             // `n:*` names the highest UID even when it is below `n`.
             if item.uid >= start {
-                rows.push((item.uid, item.flags));
+                rows.push(item);
             }
             Ok(())
         },
@@ -818,17 +822,18 @@ fn flags_then_bodies(
         session::FetchStop::Refused => return Ok(session::FetchStop::Refused),
         session::FetchStop::Truncated { min_skipped_uid } => Some(min_skipped_uid),
     };
-    rows.sort_by_key(|(uid, _)| *uid);
-    rows.dedup_by_key(|(uid, _)| *uid);
+    rows.sort_by_key(|item| (item.uid, std::cmp::Reverse(item.modseq)));
+    rows.dedup_by_key(|item| item.uid);
     let stored = match (rows.first(), rows.last()) {
-        (Some((low, _)), Some((high, _))) => copies.stored(*low, *high)?,
+        (Some(low), Some(high)) => copies.stored(low.uid, high.uid)?,
         _ => Vec::new(),
     };
     let mut wanted = Vec::new();
-    for (uid, flags) in rows {
+    for item in rows {
+        let uid = item.uid;
         if stored.binary_search(&uid).is_ok() {
-            on_fetched(Streamed::Stored { uid, flags })?;
-        } else if rfc822::is_deleted(&flags) {
+            on_fetched(Streamed::Stored(item))?;
+        } else if rfc822::is_deleted(&item.flags) {
             // Not stored either way, so its body is not worth the bytes.
             on_fetched(Streamed::Deleted { uid })?;
         } else {
@@ -893,10 +898,15 @@ fn uid_set(uids: &[u32]) -> String {
 }
 
 /// The unread state of one stored copy, from its flags.
-fn flag_update(uidvalidity: u32, uid: u32, escaped: &str, flags: &[String]) -> FlagUpdate {
+fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> FlagUpdate {
+    let uid = item.uid;
     FlagUpdate {
         remote_id: RemoteId(format!("imap:{uidvalidity}:{uid}:{escaped}")),
-        unread: !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        unread: !item
+            .flags
+            .iter()
+            .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        modseq: item.modseq,
     }
 }
 
