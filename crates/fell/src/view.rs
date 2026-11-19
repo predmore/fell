@@ -1217,25 +1217,22 @@ impl Inbox {
                             None
                         };
                         let follow = if let Some(changed) = filled {
-                            inbox.body_refresh = if changed.is_empty() {
-                                None
-                            } else {
-                                let ids = changed.iter().map(|at| view[*at].id.clone()).collect();
-                                // If a short pane's reveal is already pending,
-                                // measure it after this batch has laid out too.
-                                if inbox.reveal != Reveal::No
+                            // An unchanged body can still come with new folder
+                            // or header information. Apply that read as well.
+                            if !changed.is_empty()
+                                && (inbox.reveal != Reveal::No
                                     || (inbox.conv_layout_current
                                         && present::conversation_fits(f32::from(
                                             inbox.conv_scroll.max_offset().height,
-                                        )))
-                                {
-                                    inbox.reveal = Reveal::Laying;
-                                }
-                                Some(BodyRefresh {
-                                    messages: view,
-                                    ids,
-                                })
-                            };
+                                        ))))
+                            {
+                                inbox.reveal = Reveal::Laying;
+                            }
+                            let ids = changed.iter().map(|at| view[*at].id.clone()).collect();
+                            inbox.body_refresh = Some(BodyRefresh {
+                                messages: view,
+                                ids,
+                            });
                             false
                         } else if same {
                             let bottom = inbox.conversation_at_bottom();
@@ -2163,7 +2160,9 @@ impl Inbox {
             None
         };
         self.session.fill_bodies(refresh.messages);
-        self.motion.bodies_filled(refresh.ids);
+        if !refresh.ids.is_empty() {
+            self.motion.bodies_filled(refresh.ids);
+        }
         anchor
     }
 

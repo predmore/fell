@@ -1237,10 +1237,8 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
-    /// Reread of the thread already open that only filled in bodies
-    /// ([`crate::present::bodies_filled`]). Everything the reader set
-    /// stays: the message cursor, which messages are open, opened quotes
-    /// and recipient lists.
+    /// Reread of the same messages in the same order. Folder and header
+    /// changes land along with bodies. The reader's open state stays put.
     pub fn fill_bodies(&mut self, mut messages: Vec<ConvMessage>) {
         for (new, old) in messages.iter_mut().zip(&self.messages) {
             new.expanded = old.expanded;
@@ -1269,11 +1267,19 @@ impl Session {
                 new.expanded = old.expanded;
             }
         }
-        if at_end {
+        if at_end
+            && messages
+                .last()
+                .is_some_and(|last| self.messages.iter().all(|old| old.id != last.id))
+        {
             self.set_messages(messages);
             return true;
         }
-        let cursor = self.message_cursor;
+        let cursor = self
+            .messages
+            .get(self.message_cursor)
+            .and_then(|current| messages.iter().position(|message| message.id == current.id))
+            .unwrap_or(self.message_cursor);
         let len = messages.len();
         for set in [&mut self.quotes_open, &mut self.recipients_open] {
             set.retain(|id| messages.iter().any(|message| &message.id == id));
@@ -2318,6 +2324,31 @@ mod tests {
         );
         assert!(session.quotes_open.contains(&older.id));
         assert_eq!(session.messages[0].body_state, fell_core::BodyState::Stored);
+    }
+
+    #[test]
+    fn a_metadata_reread_updates_a_pending_message_without_landing() {
+        let mut session = session();
+        let mut pending = empty_message(true);
+        pending.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![pending.clone()]);
+        session.toggle_open(0);
+
+        let mut read = pending;
+        read.folders = "Inbox, Archive".into();
+        assert_eq!(
+            crate::present::bodies_filled(&session.messages, std::slice::from_ref(&read)),
+            Some(vec![])
+        );
+        session.fill_bodies(vec![read]);
+        assert_eq!(session.messages[0].folders, "Inbox, Archive");
+        assert_eq!(
+            session.messages[0].body_state,
+            fell_core::BodyState::Pending
+        );
+        assert!(session.is_open(0));
+        assert!(!session.refresh_messages(session.messages.clone(), true));
+        assert!(session.is_open(0));
     }
 
     #[test]
