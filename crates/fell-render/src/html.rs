@@ -164,8 +164,7 @@ pub(crate) fn parse_html(html: &str) -> Html {
 }
 
 pub fn html_to_document(html: &str) -> StyledDocument {
-    let dom = parse_html(html);
-    let blocks = split_blank_lines(children_blocks(dom.root_element(), 0));
+    let blocks = split_blank_lines(native_blocks(html, 0));
     let mut blocks: Vec<Block> = quote_marked_lines(blocks)
         .into_iter()
         .filter(|block| !block_is_empty(block))
@@ -216,8 +215,14 @@ pub fn plain_to_document(body: &str) -> StyledDocument {
     StyledDocument { blocks }
 }
 
-fn children_blocks(node: scraper::ElementRef<'_>, depth: u32) -> Vec<Block> {
-    children_of(*node, depth)
+fn native_blocks(html: &str, depth: u32) -> Vec<Block> {
+    let mut dom = parse_html(html);
+    prune_hidden(&mut dom);
+    dom.tree
+        .root()
+        .children()
+        .find(|node| node.value().is_element())
+        .map_or_else(Vec::new, |root| children_of(root, depth))
 }
 
 fn node_blocks(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
@@ -257,9 +262,6 @@ fn element_blocks(node: ego_tree::NodeRef<'_, Node>, name: &str, depth: u32) -> 
     let Some(element) = node.value().as_element() else {
         return Vec::new();
     };
-    if is_hidden(element) {
-        return Vec::new();
-    }
     let blocks = visible_element_blocks(node, name, depth);
     styled_blocks(node, element, blocks)
 }
@@ -446,8 +448,7 @@ fn iframe_fallback(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> 
     if fallback.is_empty() {
         return Vec::new();
     }
-    let dom = parse_html(&fallback);
-    children_blocks(dom.root_element(), depth)
+    native_blocks(&fallback, depth)
 }
 
 fn children_or_paragraph(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Block> {
@@ -585,9 +586,6 @@ fn line_kind(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> LineKind {
     if depth >= MAX_HTML_DEPTH {
         return LineKind::Block;
     }
-    if is_hidden(element) {
-        return LineKind::Nothing;
-    }
     let name = element.name();
     if !matches!(name, "div" | "p")
         || crate::history::marker(element).is_some()
@@ -632,7 +630,6 @@ fn has_break_or_nbsp(node: ego_tree::NodeRef<'_, Node>, depth: u32) -> bool {
     node.children().any(|child| match child.value() {
         Node::Text(text) => text.contains('\u{a0}'),
         Node::Element(element) if element.name() == "br" => true,
-        Node::Element(element) if is_hidden(element) => false,
         Node::Element(_) => has_break_or_nbsp(child, depth + 1),
         _ => false,
     })
@@ -1094,9 +1091,6 @@ fn table_rows<'a>(
         let Some(element) = child.value().as_element() else {
             continue;
         };
-        if is_hidden(element) {
-            continue;
-        }
         match element.name() {
             "table" if !root => continue,
             "table" => {}
@@ -1248,10 +1242,7 @@ fn data_table(rows: Vec<Vec<Cell>>) -> Vec<Block> {
 }
 
 fn cell_align(element: &scraper::node::Element) -> Option<Align> {
-    let styled = style_declarations(element)
-        .into_iter()
-        .rfind(|(name, _)| name == "text-align")
-        .map(|(_, value)| value);
+    let styled = style_value(element, "text-align");
     let value = styled.or_else(|| {
         element
             .attr("align")
@@ -1273,11 +1264,7 @@ fn row_cells(row: ego_tree::NodeRef<'_, Node>, depth: u32) -> Vec<Cell> {
             if name != "td" && name != "th" {
                 return None;
             }
-            let blocks = if is_hidden(element) {
-                Vec::new()
-            } else {
-                styled_blocks(cell, element, cell_blocks(cell, depth))
-            };
+            let blocks = styled_blocks(cell, element, cell_blocks(cell, depth));
             Some(Cell {
                 blocks,
                 align: cell_align(element),
@@ -1402,7 +1389,6 @@ fn push_inline(node: ego_tree::NodeRef<'_, Node>, depth: u32, out: &mut Vec<Inli
                 out.push(Inline::Text(text));
             }
         }
-        Node::Element(element) if is_hidden(element) => {}
         Node::Element(element) => match element.name() {
             "script" | "style" | "input" | "button" | "textarea" | "head" | "meta" | "link"
             | "title" | "embed" => {}
@@ -1731,9 +1717,14 @@ fn visible(text: &str) -> String {
     text.chars().filter(|ch| !is_invisible(*ch)).collect()
 }
 
-/// `style` declarations as lowercase `(property, value)` pairs, without
-/// `!important`.
-fn style_declarations(element: &scraper::node::Element) -> Vec<(String, String)> {
+struct Declaration {
+    name: String,
+    value: String,
+    important: bool,
+}
+
+/// Inline declarations only, in source order.
+fn style_declarations(element: &scraper::node::Element) -> Vec<Declaration> {
     let Some(style) = element.attr("style") else {
         return Vec::new();
     };
@@ -1742,8 +1733,16 @@ fn style_declarations(element: &scraper::node::Element) -> Vec<(String, String)>
         .filter_map(|declaration| {
             let (name, value) = declaration.split_once(':')?;
             let value = value.trim().to_ascii_lowercase();
-            let value = value.trim_end_matches("!important").trim().to_string();
-            Some((name.trim().to_ascii_lowercase(), value))
+            let priority = value
+                .rsplit_once('!')
+                .filter(|(_, marker)| marker.trim() == "important");
+            Some(Declaration {
+                name: name.trim().to_ascii_lowercase(),
+                value: priority
+                    .map_or(value.as_str(), |(value, _)| value.trim())
+                    .to_string(),
+                important: priority.is_some(),
+            })
         })
         .collect()
 }
@@ -1754,28 +1753,89 @@ fn is_zero_length(value: &str) -> bool {
     number.parse::<f32>().is_ok_and(|n| n == 0.0)
 }
 
-/// Hidden from a reader in every mail client: a preheader, an
-/// Outlook-only block, a desktop-hidden mobile block.
-fn is_hidden(element: &scraper::node::Element) -> bool {
-    if element.attr("hidden").is_some() {
-        return true;
+/// Prune once before the native walk, including text used by code blocks
+/// and the depth fallback. Zero font size hides inherited text but can
+/// leave images and explicitly sized descendants visible.
+fn prune_hidden(dom: &mut Html) {
+    let mut todo = vec![(*dom.root_element(), false)];
+    let mut remove = Vec::new();
+    while let Some((node, inherited_zero)) = todo.pop() {
+        match node.value() {
+            Node::Element(element) => {
+                let style = style_declarations(element);
+                let zero = has_zero_font_size(element, &style, inherited_zero);
+                if is_hidden(element, &style) || (zero && element.name() == "br") {
+                    if matches!(element.name(), "td" | "th") {
+                        // The table reader keeps an empty slot for hidden cells.
+                        remove.extend(node.children().map(|child| child.id()));
+                    } else {
+                        remove.push(node.id());
+                    }
+                } else if element.name() != "iframe" {
+                    // Iframe fallback is raw HTML and is pruned after parsing it.
+                    todo.extend(node.children().map(|child| (child, zero)));
+                }
+            }
+            Node::Text(_) if inherited_zero => remove.push(node.id()),
+            _ => {}
+        }
     }
-    style_declarations(element)
+    for id in remove {
+        dom.tree.get_mut(id).unwrap().detach();
+    }
+}
+
+fn is_hidden(element: &scraper::node::Element, style: &[Declaration]) -> bool {
+    // mso-hide is Outlook-specific. Its ordinary HTML fallback is visible here.
+    element.attr("hidden").is_some()
+        || declared_value(style, "display") == Some("none")
+        || declared_value(style, "visibility") == Some("hidden")
+        || (declared_value(style, "max-height").is_some_and(is_zero_length)
+            && style
+                .iter()
+                .filter_map(|declaration| {
+                    let value = match declaration.name.as_str() {
+                        "overflow-y" => declaration.value.as_str(),
+                        "overflow" => declaration.value.split_ascii_whitespace().next_back()?,
+                        _ => return None,
+                    };
+                    Some((declaration.important, value))
+                })
+                .max_by_key(|(important, _)| *important)
+                .is_some_and(|(_, value)| matches!(value, "hidden" | "clip")))
+}
+
+fn has_zero_font_size(
+    element: &scraper::node::Element,
+    style: &[Declaration],
+    inherited: bool,
+) -> bool {
+    let Some(size) = declared_value(style, "font-size") else {
+        // Legacy HTML can set an absolute font size without a style.
+        let absolute = element.name() == "font"
+            && element
+                .attr("size")
+                .is_some_and(|size| matches!(size.trim(), "1" | "2" | "3" | "4" | "5" | "6" | "7"));
+        return inherited && !absolute;
+    };
+    is_zero_length(size)
+        || (inherited
+            && (matches!(size, "inherit" | "unset" | "smaller" | "larger")
+                || size.ends_with('%')
+                || size.ends_with("em") && !size.ends_with("rem")))
+}
+
+fn declared_value<'a>(style: &'a [Declaration], property: &str) -> Option<&'a str> {
+    style
         .iter()
-        .any(|(name, value)| match name.as_str() {
-            "display" => value == "none",
-            "visibility" => value == "hidden",
-            "max-height" | "font-size" => is_zero_length(value),
-            "mso-hide" => value == "all",
-            _ => false,
-        })
+        .filter(|declaration| declaration.name == property)
+        .max_by_key(|declaration| declaration.important)
+        .map(|declaration| declaration.value.as_str())
 }
 
 /// A font size in CSS pixels, from `px` or `pt`.
 fn font_px(element: &scraper::node::Element) -> Option<f32> {
-    let (_, value) = style_declarations(element)
-        .into_iter()
-        .rfind(|(name, _)| name == "font-size")?;
+    let value = style_value(element, "font-size")?;
     if let Some(number) = value.strip_suffix("px") {
         return number.trim().parse().ok();
     }
@@ -1812,10 +1872,7 @@ fn is_fine_print(element: &scraper::node::Element) -> bool {
 }
 
 fn style_value(element: &scraper::node::Element, property: &str) -> Option<String> {
-    style_declarations(element)
-        .into_iter()
-        .rfind(|(name, _)| name == property)
-        .map(|(_, value)| value)
+    declared_value(&style_declarations(element), property).map(str::to_owned)
 }
 
 fn is_bold(element: &scraper::node::Element) -> bool {
@@ -1878,10 +1935,8 @@ fn is_tracking_pixel(element: &scraper::node::Element) -> bool {
             .and_then(|value| value.trim().trim_end_matches("px").parse::<f32>().ok())
     };
     let styled = |name: &str| {
-        style_declarations(element)
-            .into_iter()
-            .find(|(property, _)| property == name)
-            .and_then(|(_, value)| value.strip_suffix("px")?.trim().parse::<f32>().ok())
+        style_value(element, name)
+            .and_then(|value| value.strip_suffix("px")?.trim().parse::<f32>().ok())
     };
     let width = attr("width").or_else(|| styled("width"));
     let height = attr("height").or_else(|| styled("height"));
@@ -1890,21 +1945,14 @@ fn is_tracking_pixel(element: &scraper::node::Element) -> bool {
 
 fn raw_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     let mut out = String::new();
-    append_raw(node, &mut out);
-    out
-}
-
-fn append_raw(node: ego_tree::NodeRef<'_, Node>, out: &mut String) {
-    match node.value() {
-        Node::Text(text) => out.push_str(text.deref()),
-        Node::Element(element) if element.name() == "br" => out.push('\n'),
-        Node::Element(_) => {
-            for child in node.children() {
-                append_raw(child, out);
-            }
+    for node in node.descendants() {
+        match node.value() {
+            Node::Text(text) => out.push_str(text.deref()),
+            Node::Element(element) if element.name() == "br" => out.push('\n'),
+            _ => {}
         }
-        _ => {}
     }
+    out
 }
 
 fn is_ascii_html_ws(ch: char) -> bool {
@@ -2337,7 +2385,7 @@ mod tests {
             "<div style=\"display: none !important\">Preheader two</div>",
             "<div style=\"max-height:0px;overflow:hidden\">Preheader three</div>",
             "<div style=\"font-size:0\">Preheader four</div>",
-            "<div style=\"mso-hide:all\">Preheader five</div>",
+            "<div style=\"mso-hide:all;display:none\">Preheader five</div>",
             "<div style=\"visibility:hidden\">Preheader six</div>",
             "<div hidden>Preheader seven</div>",
             "<p>The week the river slowed.&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;Next.</p>",

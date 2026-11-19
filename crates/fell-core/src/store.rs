@@ -860,8 +860,8 @@ impl Store {
     /// and the folder reads leave [`Message::parts`] empty). `None` means
     /// sync has not stored parts for this message yet (mail synced before they
     /// were kept, or a local write). Parts with neither `html` nor `plain`
-    /// mean no server copy had one to give. In both cases show `body_text`,
-    /// and ask the sync thread with [`crate::sync::fetch_message_body`].
+    /// mean no server copy had one to give. In both cases show `body_text`.
+    /// If there is no row, ask sync with [`crate::sync::fetch_message_body`].
     pub fn message_body(
         &self,
         account_id: &AccountId,

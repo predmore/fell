@@ -42,6 +42,7 @@ const CORPUS: &[Embedded] = corpus!(
     "esp-marketing",
     "esp-receipt",
     "esp-digest",
+    "esp-visibility",
     "data-table",
     "pre-code",
     "rtl-reply",

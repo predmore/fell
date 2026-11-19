@@ -19,11 +19,12 @@
 //! body is prepared again.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use fell_core::{AccountId, PartStamp, Store};
 use fell_render::{FoldedDocument, MailHeaders, fold_history, prepare};
+use gpui::RenderImage;
 
 use crate::present::{ConvMessage, Rich};
 use crate::render::{ImageGallery, Palette};
@@ -75,10 +76,15 @@ impl PreparedBody {
 impl BodyJob {
     pub fn prepare(self) -> PreparedBody {
         let body = prepare_html(&self.html, &self.headers);
+        let subject = self
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Subject"))
+            .map_or("", |(_, subject)| subject.as_str());
         let fallback = self
             .plain
             .filter(|plain| body.folded.document.is_empty() && !plain.trim().is_empty())
-            .map(|plain| Arc::new(render_stored_body(Some(&plain), "")));
+            .map(|plain| Arc::new(render_stored_body(Some(&plain), "", subject)));
         PreparedBody {
             body: Arc::new(body),
             fallback,
@@ -151,43 +157,87 @@ pub const STORE_PREPARE_BYTES: u64 = 32 * 1024;
 pub struct BodyCache {
     entries: HashMap<String, (PartStamp, Rich)>,
     order: VecDeque<String>,
+    retired: HashMap<String, Vec<RetiredBody>>,
+}
+
+struct RetiredBody {
+    stamp: PartStamp,
+    body: Weak<HtmlBody>,
+    images: Vec<Arc<RenderImage>>,
 }
 
 impl BodyCache {
     /// Which bodies were already prepared when a store read started.
     pub fn stamps(&self) -> HashMap<String, PartStamp> {
-        self.entries
-            .iter()
-            .map(|(id, (stamp, _))| (id.clone(), *stamp))
-            .collect()
+        let mut stamps = HashMap::new();
+        for (id, revisions) in &self.retired {
+            if let Some(live) = revisions
+                .iter()
+                .rev()
+                .find(|rev| rev.body.strong_count() > 0)
+            {
+                stamps.insert(id.clone(), live.stamp);
+            }
+        }
+        stamps.extend(
+            self.entries
+                .iter()
+                .map(|(id, (stamp, _))| (id.clone(), *stamp)),
+        );
+        stamps
     }
 
-    /// Cache a prepared body. Returns what fell out, whose images the
-    /// caller removes from the sprite atlas.
-    pub fn insert(&mut self, prepared: &PreparedBody) -> Vec<Arc<HtmlBody>> {
+    pub fn insert(&mut self, prepared: &PreparedBody) {
         let id = prepared.id.clone();
         let rich = prepared.rich();
-        let mut evicted = Vec::new();
-        if let Some((_, old)) = self
+        if let Some((stamp, old)) = self
             .entries
             .insert(id.clone(), (prepared.stamp, rich.clone()))
         {
             if old != rich
                 && let Rich::Html(old) = old
             {
-                evicted.push(old);
+                self.retire(id.clone(), stamp, &old);
             }
             self.order.retain(|known| known != &id);
         }
         self.order.push_back(id);
         while self.order.len() > CACHED_BODIES {
             if let Some(oldest) = self.order.pop_front()
-                && let Some((_, Rich::Html(old))) = self.entries.remove(&oldest)
+                && let Some((stamp, Rich::Html(old))) = self.entries.remove(&oldest)
             {
-                evicted.push(old);
+                self.retire(oldest, stamp, &old);
             }
         }
-        evicted
+    }
+
+    fn retire(&mut self, id: String, stamp: PartStamp, body: &Arc<HtmlBody>) {
+        self.retired.entry(id).or_default().push(RetiredBody {
+            stamp,
+            body: Arc::downgrade(body),
+            images: body.gallery.images().cloned().collect(),
+        });
+    }
+
+    /// A reread can still reuse an evicted body that the conversation owns.
+    fn live_evicted(&self, id: &str, stamp: PartStamp) -> Option<Arc<HtmlBody>> {
+        self.retired
+            .get(id)?
+            .iter()
+            .rev()
+            .filter(|rev| rev.stamp == stamp)
+            .find_map(|rev| rev.body.upgrade())
+    }
+
+    /// The open conversation can outlive cache eviction. Hold only the
+    /// images needed for atlas removal until that body has been released.
+    pub fn release_unused_images(&mut self, mut release: impl FnMut(Arc<RenderImage>)) {
+        self.retired.retain(|_, revisions| {
+            for retired in revisions.extract_if(.., |rev| rev.body.strong_count() == 0) {
+                retired.images.into_iter().for_each(&mut release);
+            }
+            !revisions.is_empty()
+        });
     }
 
     #[cfg(test)]
@@ -245,8 +295,9 @@ pub fn read_bodies(
                     }
                 }
             }
-            Some(kinds) if kinds.plain => message.rich = Rich::Plain,
-            _ => message.rich = Rich::Missing,
+            // A stored row with no parts is a settled result as well.
+            Some(_) => message.rich = Rich::Plain,
+            None => message.rich = Rich::Missing,
         }
     }
     reads
@@ -304,7 +355,7 @@ pub struct BodyLoads {
 
 impl BodyLoads {
     /// Install the accepted conversation's bodies and remember what still
-    /// needs loading. Returns the cached images' owners that were evicted.
+    /// needs loading.
     pub fn accept(
         &mut self,
         BodyReads {
@@ -313,32 +364,35 @@ impl BodyLoads {
         }: BodyReads,
         cache: &mut BodyCache,
         messages: &mut [ConvMessage],
-    ) -> Vec<Arc<HtmlBody>> {
+    ) {
         for message in messages.iter_mut() {
             let Some(wanted) = stamps.get(&message.id) else {
                 continue;
             };
-            if let Some((stamp, rich)) = cache.entries.get(&message.id) {
-                if stamp == wanted {
-                    message.rich = rich.clone();
-                    stamps.remove(&message.id);
-                } else if message.expanded {
-                    message.rich = rich.clone();
-                }
+            let cached = cache.entries.get(&message.id);
+            let ready = cached
+                .filter(|(stamp, _)| stamp == wanted)
+                .map(|(_, rich)| rich.clone())
+                .or_else(|| cache.live_evicted(&message.id, *wanted).map(Rich::Html));
+            if let Some(rich) = ready {
+                message.rich = rich;
+                stamps.remove(&message.id);
+            } else if message.expanded
+                && let Some((_, rich)) = cached
+            {
+                message.rich = rich.clone();
             }
         }
         // Resolve the live cache before inserting anything. Cache eviction
         // must not take a ready body away from this conversation.
-        let mut evicted = Vec::new();
         for (index, body) in prepared {
             if stamps.get(&body.id) == Some(&body.stamp) {
                 stamps.remove(&body.id);
                 messages[index].rich = body.rich();
-                evicted.extend(cache.insert(&body));
+                cache.insert(&body);
             }
         }
         self.wanted = stamps;
-        evicted
     }
 
     pub fn clear(&mut self) {
@@ -708,13 +762,35 @@ mod tests {
     }
 
     #[test]
-    fn a_message_with_no_parts_paints_its_stored_text() {
-        let only = mail("a@fell.test", "a@fell.test", 0, None);
-        let store = store_with(&[only]);
-        let mut view = open(&store, "a@fell.test");
-        let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
-        assert_eq!(view[0].rich, Rich::Missing);
-        assert!(reads.stamps.is_empty() && reads.prepared.is_empty());
+    fn only_the_absent_parts_row_needs_an_on_demand_fetch() {
+        let id = "a@fell.test";
+        let legacy = mail(id, id, 0, None);
+        let store = store_with(std::slice::from_ref(&legacy));
+        for state in [Rich::Missing, Rich::Plain] {
+            let mut view = open(&store, id);
+            let reads = read_bodies(&store, &account().id, &mut view, &HashMap::new());
+            assert!(view[0].expanded);
+            assert_eq!(view[0].rich, state);
+            assert!(reads.stamps.is_empty() && reads.prepared.is_empty());
+            assert_eq!(
+                view[0].body.blocks,
+                [crate::text_render::BodyBlock::Text("stored text".into())]
+            );
+            if state == Rich::Missing {
+                // A completed backfill with no server body records an empty row.
+                store
+                    .store_fetched_parts(&account().id, &[(MessageId::new(id), None)])
+                    .unwrap();
+                let kinds = store.stored_part_kinds(&account().id, &[id]).unwrap();
+                assert!(!kinds[id].html && !kinds[id].plain);
+            }
+        }
+        let mut filled = legacy;
+        filled.parts = Some(html_parts("<p>Appeared on another copy.</p>", &[]));
+        store.upsert_message(&filled).unwrap();
+        let mut view = open(&store, id);
+        read_bodies(&store, &account().id, &mut view, &HashMap::new());
+        assert_eq!(view[0].rich, Rich::Pending);
     }
 
     #[test]
@@ -748,18 +824,14 @@ mod tests {
     #[test]
     fn the_cache_drops_the_oldest_body_first() {
         let mut cache = BodyCache::default();
-        let body = Arc::new(prepare_html("<p>x</p>", &[]));
-        let entry = |id: String, body: &Arc<HtmlBody>| PreparedBody {
-            id,
-            stamp: PartStamp::default(),
-            body: Arc::clone(body),
-            fallback: None,
-        };
-        let mut evicted = 0;
         for index in 0..CACHED_BODIES + 3 {
-            evicted += cache.insert(&entry(format!("m{index}"), &body)).len();
+            cache.insert(&PreparedBody {
+                id: format!("m{index}"),
+                stamp: PartStamp::default(),
+                body: Arc::new(prepare_html("<p>x</p>", &[])),
+                fallback: None,
+            });
         }
-        assert_eq!(evicted, 3);
         assert_eq!(cache.len(), CACHED_BODIES);
         assert!(!cache.stamps().contains_key("m0"));
         assert!(
@@ -767,11 +839,60 @@ mod tests {
                 .stamps()
                 .contains_key(&format!("m{}", CACHED_BODIES + 2))
         );
-        // Replacing an entry hands back the old one, unless it is the same.
-        let other = Arc::new(prepare_html("<p>y</p>", &[]));
-        let last = format!("m{}", CACHED_BODIES + 2);
-        assert_eq!(cache.insert(&entry(last.clone(), &body)).len(), 0);
-        assert_eq!(cache.insert(&entry(last, &other)).len(), 1);
+    }
+
+    #[test]
+    fn evicted_and_replaced_images_wait_for_the_open_body_to_be_released() {
+        let id = "image@fell.test";
+        let fixture = fell_render::fixture("native-personal-reply").unwrap();
+        let make = |id: String, html: &str| PreparedBody {
+            id,
+            stamp: PartStamp::default(),
+            body: Arc::new(prepare_html(html, &[])),
+            fallback: None,
+        };
+        for replace in [false, true] {
+            let mut cache = BodyCache::default();
+            let store = store_with(&[mail(id, id, 0, Some(html_parts(&fixture.html, &[])))]);
+            let mut view = open(&store, id);
+            let image = read_job(&store, &account().id, id, &view[0].mail_headers)
+                .unwrap()
+                .prepare();
+            let expected: Vec<_> = image.body.gallery.images().cloned().collect();
+            assert!(!expected.is_empty());
+            view[0].rich = image.rich();
+            cache.insert(&image);
+            drop(image);
+
+            if replace {
+                cache.insert(&make(id.into(), "<p>Updated</p>"));
+            } else {
+                for index in 0..CACHED_BODIES {
+                    cache.insert(&make(format!("m{index}"), "<p>Other</p>"));
+                }
+                assert_eq!(cache.len(), CACHED_BODIES);
+                assert!(!cache.entries.contains_key(id));
+                let mut reread = open(&store, id);
+                let reads = read_bodies(&store, &account().id, &mut reread, &cache.stamps());
+                let mut loads = BodyLoads::default();
+                loads.accept(reads, &mut cache, &mut reread);
+                assert_eq!(reread[0].rich, view[0].rich);
+                assert!(loads.begin(id).is_none());
+                view = reread;
+            }
+            cache.release_unused_images(|_| panic!("the open body still needs its images"));
+            view.clear();
+            let mut released = Vec::new();
+            cache.release_unused_images(|image| released.push(image));
+            assert_eq!(released.len(), expected.len());
+            assert!(
+                released
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| Arc::ptr_eq(a, b))
+            );
+            cache.release_unused_images(|_| panic!("the images have already been released"));
+        }
     }
 
     #[test]
@@ -860,6 +981,32 @@ mod tests {
                 (other, _) => panic!("unexpected fallback: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn plain_forwards_stay_open_in_storage_and_as_the_empty_html_fallback() {
+        use crate::text_render::BodyBlock;
+
+        let id = "a@fell.test";
+        let plain = "FYI\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: Plans\n\nThe plan.";
+        let mut mail = mail(id, id, 0, None);
+        mail.headers.subject = "WG: Plans".into();
+        mail.body_text = Some(plain.into());
+        let store = store_with(std::slice::from_ref(&mail));
+        let view = open(&store, id);
+        assert_eq!(view[0].body.blocks, [BodyBlock::Text(plain.into())]);
+
+        let mut parts = html_parts("<p hidden>Empty alternative</p>", &[]);
+        parts.plain = Some(plain.into());
+        mail.parts = Some(parts);
+        store.upsert_message(&mail).unwrap();
+        let prepared = read_job(&store, &account().id, &view[0].id, &view[0].mail_headers)
+            .unwrap()
+            .prepare();
+        let Rich::PlainPart(body) = prepared.rich() else {
+            panic!("expected the plain alternative");
+        };
+        assert_eq!(body.blocks, [BodyBlock::Text(plain.into())]);
     }
 
     #[test]

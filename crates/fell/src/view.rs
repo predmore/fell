@@ -1184,15 +1184,14 @@ impl Inbox {
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
                     Ok((mut view, reads)) => {
-                        let evicted = inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
-                        Self::drop_body_images(evicted, cx);
+                        inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
                         if same {
                             inbox.keep_shown_text(&mut view);
                         }
-                        // Sync adding to the thread being read must not pull a
-                        // reader who scrolled up back to the bottom.
+                        // Follow a newly appended message only when the
+                        // reader was already at the end of this thread.
                         let follow = if same {
                             let bottom = inbox.conversation_at_bottom();
                             inbox.session.refresh_messages(view, bottom)
@@ -1261,7 +1260,7 @@ impl Inbox {
             let prepared = task.await;
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.body_loads.finish(&prepared.id, load) {
-                    inbox.body_ready(prepared, cx);
+                    inbox.body_ready(prepared);
                 }
                 // A stale completion has freed the slot for a newer revision.
                 cx.notify();
@@ -1270,8 +1269,8 @@ impl Inbox {
         .detach();
     }
 
-    fn body_ready(&mut self, prepared: PreparedBody, cx: &mut Context<Self>) {
-        Self::drop_body_images(self.bodies.insert(&prepared), cx);
+    fn body_ready(&mut self, prepared: PreparedBody) {
+        self.bodies.insert(&prepared);
         let rich = prepared.rich();
         let id = prepared.id;
         let mut above_reader = false;
@@ -1313,14 +1312,6 @@ impl Inbox {
         let viewport = self.conv_scroll.bounds();
         let offset = self.conv_scroll.offset().y;
         (f32::from(cursor.top() + offset) - f32::from(viewport.top())).abs() < 1.0
-    }
-
-    fn drop_body_images(evicted: Vec<Arc<HtmlBody>>, cx: &mut Context<Self>) {
-        for old in evicted {
-            for image in old.gallery.images() {
-                cx.drop_image(Arc::clone(image), None);
-            }
-        }
     }
 
     /// Show the stored text for `id` from now on.
@@ -2450,6 +2441,8 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.bodies
+            .release_unused_images(|image| cx.drop_image(image, Some(window)));
         let real = Instant::now();
         // Motion time: a frame the compositor held back moves what is
         // moving one step on, not to its end.

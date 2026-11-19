@@ -733,7 +733,11 @@ pub fn conversation(
                     .join(" · "),
                 date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
-                body: render_stored_body(message.body_text.as_deref(), &message.snippet),
+                body: render_stored_body(
+                    message.body_text.as_deref(),
+                    &message.snippet,
+                    &message.headers.subject,
+                ),
                 rich: Rich::Plain,
                 expanded: message.unread || index == last,
                 recipients: recipient_line(message, me),

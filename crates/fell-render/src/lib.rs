@@ -21,7 +21,9 @@ pub use document::{
     Align, Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument,
 };
 pub use fixtures::{Fixture, fixture, fixtures};
-pub use history::{Fold, FoldedDocument, Section, fold_history, is_quoted_from_line};
+pub use history::{
+    Fold, FoldedDocument, Section, fold_history, is_forward_subject, is_quoted_from_line,
+};
 pub use html::{document_from_body, html_to_document, looks_like_html, plain_to_document};
 pub use markdown::markdown_to_document;
 pub use webview_html::{

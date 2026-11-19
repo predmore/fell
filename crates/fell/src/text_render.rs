@@ -1,10 +1,9 @@
 //! Stored-body render seam.
 //!
-//! The conversation view paints [`RenderedBody`] and does not look at MIME
-//! or HTML. [`render_stored_body`] turns the store's plain `body_text` into
-//! that model. The HTML milestone replaces this function; the inbox should
-//! keep consuming [`RenderedBody`].
+//! The conversation view paints [`RenderedBody`] for stored plain text and
+//! for the plain alternative when native HTML has no visible content.
 
+use fell_render::is_forward_subject;
 use gpui::SharedString;
 
 /// A message body the conversation view can paint.
@@ -37,18 +36,20 @@ fn shared(text: &str) -> SharedString {
 }
 
 /// Turn stored plain text into blocks. Markup is not interpreted.
-pub fn render_stored_body(body_text: Option<&str>, snippet: &str) -> RenderedBody {
+pub fn render_stored_body(body_text: Option<&str>, snippet: &str, subject: &str) -> RenderedBody {
     let raw = body_text.unwrap_or(snippet).replace("\r\n", "\n");
     if raw.trim().is_empty() {
         return RenderedBody {
             blocks: vec![BodyBlock::Text(shared(snippet.trim()))],
         };
     }
-    let (head, history) = split_outlook_history(&raw);
-    let mut blocks = split_blocks(head);
-    if let Some(history) = history {
-        blocks.push(BodyBlock::Quote(shared(history.trim())));
-    }
+    let (head, history) = split_outlook_history(&raw, subject);
+    let mut blocks = if head.is_empty() {
+        Vec::new()
+    } else {
+        split_blocks(head)
+    };
+    blocks.extend(history);
     RenderedBody { blocks }
 }
 
@@ -56,9 +57,13 @@ pub fn render_stored_body(body_text: Option<&str>, snippet: &str) -> RenderedBod
 /// `Subject:` header (or `-----Original Message-----`) and then the earlier
 /// mail. Everything from that header on is history. The `From:` line must
 /// name an address, as a reply header's does, so a sender's own template
-/// lines stay; a forward (`Subject: FW:`) stays open. Nothing is split off
+/// lines stay. A forward stays open. Nothing is split off
 /// when no reply text would be left above it, or no quoted text under it.
-fn split_outlook_history(raw: &str) -> (&str, Option<&str>) {
+fn split_outlook_history<'a>(raw: &'a str, subject: &str) -> (&'a str, Option<BodyBlock>) {
+    let open_forward = || ("", Some(BodyBlock::Text(shared(raw.trim()))));
+    if is_forward_subject(subject) {
+        return open_forward();
+    }
     let lines: Vec<(usize, &str)> = raw
         .split_inclusive('\n')
         .scan(0, |at, line| {
@@ -68,30 +73,28 @@ fn split_outlook_history(raw: &str) -> (&str, Option<&str>) {
         })
         .collect();
     for (index, (start, line)) in lines.iter().enumerate() {
-        let line = line.trim();
-        let header_end = if line.starts_with("-----Original Message-----") {
-            Some(index + 1)
-        } else if fell_render::is_quoted_from_line(line) {
-            let next = &lines[index..(index + 6).min(lines.len())];
+        let delimiter = line.trim().starts_with("-----Original Message-----");
+        let header_start = index + usize::from(delimiter);
+        let next = &lines[header_start..(header_start + 6).min(lines.len())];
+        let mut header_end = delimiter.then_some(header_start);
+        if next
+            .first()
+            .is_some_and(|(_, line)| fell_render::is_quoted_from_line(line))
+        {
             let has = |prefix: &str| next.iter().any(|(_, l)| l.trim().starts_with(prefix));
             let subject = next
                 .iter()
-                .position(|(_, l)| l.trim().starts_with("Subject:"));
-            match subject {
-                Some(at) if has("Sent:") || has("Date:") => {
-                    let value = next[at].1.trim()["Subject:".len()..]
-                        .trim()
-                        .to_ascii_lowercase();
-                    if value.starts_with("fw:") || value.starts_with("fwd:") {
-                        return (raw, None);
-                    }
-                    Some(index + at + 1)
+                .enumerate()
+                .find_map(|(at, (_, line))| Some((at, line.trim().strip_prefix("Subject:")?)));
+            if let Some((at, value)) = subject
+                && (has("Sent:") || has("Date:"))
+            {
+                if is_forward_subject(value) {
+                    return open_forward();
                 }
-                _ => None,
+                header_end = Some(header_start + at + 1);
             }
-        } else {
-            None
-        };
+        }
         let Some(header_end) = header_end else {
             continue;
         };
@@ -102,7 +105,7 @@ fn split_outlook_history(raw: &str) -> (&str, Option<&str>) {
         if head.trim().is_empty() || !quoted {
             return (raw, None);
         }
-        return (head, Some(&raw[*start..]));
+        return (head, Some(BodyBlock::Quote(shared(raw[*start..].trim()))));
     }
     (raw, None)
 }
@@ -219,7 +222,7 @@ mod tests {
 
     #[test]
     fn plain_text_is_not_parsed_as_html() {
-        let rendered = render_stored_body(Some("Hello <b>there</b>"), "snippet");
+        let rendered = render_stored_body(Some("Hello <b>there</b>"), "snippet", "");
         match &rendered.blocks[..] {
             [BodyBlock::Text(text)] => {
                 assert!(text.contains("<b>there</b>"));
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn quotes_and_signature_are_separate_blocks() {
         let body = "Thanks.\n\n-- \nCaleb\nFell\nfell.test\n\n> older line\n> second";
-        let rendered = render_stored_body(Some(body), "");
+        let rendered = render_stored_body(Some(body), "", "");
         assert!(matches!(rendered.blocks[0], BodyBlock::Text(_)));
         assert!(
             rendered
@@ -249,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_short_signature_shows_in_place() {
-        let rendered = render_stored_body(Some("Thanks.\n\n-- \nCaleb\nFell"), "");
+        let rendered = render_stored_body(Some("Thanks.\n\n-- \nCaleb\nFell"), "", "");
         assert!(
             rendered
                 .blocks
@@ -266,7 +269,7 @@ mod tests {
     #[test]
     fn nested_quotes_keep_one_level() {
         let body = "Thanks.\n\n>> earlier reply\n> > still nested\n> top level\n>  two spaces";
-        let rendered = render_stored_body(Some(body), "");
+        let rendered = render_stored_body(Some(body), "", "");
         let quote = rendered
             .blocks
             .iter()
@@ -283,7 +286,7 @@ mod tests {
 
     #[test]
     fn plain_dashes_do_not_hide_the_rest() {
-        let rendered = render_stored_body(Some("diff\n--\nstill visible"), "");
+        let rendered = render_stored_body(Some("diff\n--\nstill visible"), "", "");
         assert!(
             rendered
                 .blocks
@@ -299,7 +302,7 @@ mod tests {
             })
             .unwrap();
         assert!(text.contains("still visible"));
-        let signed = render_stored_body(Some("Thanks.\n-- \nCaleb\nFell\nfell.test"), "");
+        let signed = render_stored_body(Some("Thanks.\n-- \nCaleb\nFell\nfell.test"), "", "");
         assert!(
             signed
                 .blocks
@@ -311,19 +314,20 @@ mod tests {
     #[test]
     fn an_outlook_header_folds_the_rest() {
         let body = "Amen\n\nGet Outlook for Android\n\nFrom: Ada <ada@example.test>\nSent: Monday, January 5, 2026 9:00 AM\nTo: Jon\nSubject: Re: Plans\n\nEarlier text\n\nFrom: Jon\nSent: Sunday\nSubject: Plans\n\nEven earlier";
-        let rendered = render_stored_body(Some(body), "");
+        let rendered = render_stored_body(Some(body), "", "");
         assert_eq!(rendered.blocks.len(), 2, "{:?}", rendered.blocks);
         assert!(matches!(&rendered.blocks[0], BodyBlock::Text(text) if text.starts_with("Amen")));
         assert!(matches!(&rendered.blocks[1], BodyBlock::Quote(text)
             if text.starts_with("From: Ada") && text.ends_with("Even earlier")));
         // A From: line that is not a header stays.
-        let note = render_stored_body(Some("From: the team, thanks.\nSee you."), "");
+        let note = render_stored_body(Some("From: the team, thanks.\nSee you."), "", "");
         assert!(matches!(&note.blocks[..], [BodyBlock::Text(_)]));
         // Header lines a sender typed, with no address, stay.
         let template = render_stored_body(
             Some(
                 "Use this:\n\nFrom: Support\nSent: daily\nSubject: Your ticket\n\nThen attach the log.",
             ),
+            "",
             "",
         );
         assert!(
@@ -334,6 +338,7 @@ mod tests {
         // A header over nothing quotes nothing.
         let empty = render_stored_body(
             Some("Notes.\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: x\n"),
+            "",
             "",
         );
         assert!(
@@ -347,6 +352,7 @@ mod tests {
                 "See below.\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: FW: Plans\n\nThe plan.",
             ),
             "",
+            "",
         );
         assert!(
             matches!(&forward.blocks[..], [BodyBlock::Text(_)]),
@@ -354,13 +360,32 @@ mod tests {
             forward.blocks
         );
         // Nothing above the header: nothing is folded.
-        let bare = render_stored_body(Some("From: Ada\nSent: Mon\nSubject: x\n\nHi"), "");
+        let bare = render_stored_body(Some("From: Ada\nSent: Mon\nSubject: x\n\nHi"), "", "");
         assert!(matches!(&bare.blocks[..], [BodyBlock::Text(_)]));
     }
 
     #[test]
+    fn plain_forwards_keep_the_forwarded_text_open() {
+        let body = "FYI\n\nFrom: Ada <ada@example.test>\nSent: Mon\nSubject: Plans\n\n> The plan.";
+        for prefix in ["FW", "Fwd", "WG", "TR", "RV"] {
+            let subject = format!("[Harbor] {prefix}: Plans");
+            let outer = render_stored_body(Some(body), "", &subject);
+            assert_eq!(outer.blocks, [BodyBlock::Text(shared(body))], "{subject}");
+
+            let inner = body.replace("Subject: Plans", &format!("Subject: {subject}"));
+            let inner = inner.replace("\nFrom:", "\n-----Original Message-----\nFrom:");
+            let rendered = render_stored_body(Some(&inner), "", "Re: Plans");
+            assert_eq!(
+                rendered.blocks,
+                [BodyBlock::Text(shared(&inner))],
+                "{subject}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_body_uses_the_snippet() {
-        let rendered = render_stored_body(None, "just the snippet");
+        let rendered = render_stored_body(None, "just the snippet", "");
         assert_eq!(
             rendered.blocks,
             vec![BodyBlock::Text("just the snippet".into())]

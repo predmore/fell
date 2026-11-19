@@ -1184,10 +1184,9 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
-    /// Reread of the thread already open (sync added or dropped a message).
-    /// A reader on the last message follows to the new last one. A reader
-    /// further up keeps their message and opened quotes. Returns whether the
-    /// cursor moved to the end.
+    /// Reread of the thread already open. A reader at the end follows when
+    /// a new message arrives there. Returns whether the view should land
+    /// on that new message.
     ///
     /// `viewport_at_end` is whether the conversation is scrolled to its
     /// bottom: a reader who scrolled up with the wheel is not following.
@@ -1198,7 +1197,11 @@ impl Session {
         viewport_at_end: bool,
     ) -> bool {
         let at_end = viewport_at_end && self.message_cursor + 1 >= self.messages.len();
-        if at_end {
+        if at_end
+            && messages
+                .last()
+                .is_some_and(|last| self.messages.iter().all(|old| old.id != last.id))
+        {
             self.set_messages(messages);
             return true;
         }
@@ -2686,6 +2689,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reread_at_the_bottom_lands_only_when_a_new_last_message_arrives() {
+        let mut session = session();
+        let first = empty_message(true);
+        let last = empty_message(true);
+        session.set_messages(vec![first.clone(), last.clone()]);
+        session.toggle_open(1);
+        session.messages[0].expanded = false;
+
+        // An account-wide sync reread must not drive a landing or reset
+        // disclosures while the reader is at the bottom of the same message.
+        assert!(!session.refresh_messages(vec![first.clone(), last.clone()], true));
+        assert_eq!(session.message_cursor, 1);
+        assert!(session.is_open(1));
+        assert!(session.recipients_are_open(1));
+        assert!(!session.messages[0].expanded);
+
+        let reply = empty_message(true);
+        assert!(session.refresh_messages(vec![first.clone(), last, reply.clone()], true));
+        assert_eq!(session.message_cursor, 2);
+        assert_eq!(session.messages[2].id, reply.id);
+        assert!(!session.refresh_messages(vec![first, reply.clone()], true));
+
+        // The previous message is visible at the bottom of the list but
+        // the reader scrolled up, so another reply does not drive a landing.
+        let newer = empty_message(true);
+        assert!(!session.refresh_messages(vec![reply, newer], false));
+    }
+
+    #[test]
     fn open_parts_stay_with_their_message_when_a_reread_shifts_rows() {
         let mut session =
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
@@ -3375,7 +3407,7 @@ mod tests {
             folders: "Inbox".into(),
             date_unix: 0,
             snippet: "snip".into(),
-            body: crate::text_render::render_stored_body(Some("body"), "snip"),
+            body: crate::text_render::render_stored_body(Some("body"), "snip", ""),
             rich: crate::present::Rich::Plain,
             expanded,
             recipients: None,
