@@ -691,6 +691,33 @@ mod tests {
         assert!(unread_of(&store, 2_050));
     }
 
+    #[test]
+    fn a_message_committed_before_a_split_delta_error_is_already_stored_on_retry() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let total = u32::try_from(super::super::SPLIT_DELTA_AT).unwrap();
+        let mut end = end_of_inbox(1..=total, total, false, "modseq-1");
+        let message = inbox_message(1);
+        let id = message.headers.message_id.clone();
+        end.messages.push(message);
+
+        *store.on_sync_commit.borrow_mut() = Some(Box::new(|| {
+            Err(crate::Error::Backend(
+                "stopped after messages and flags".into(),
+            ))
+        }));
+        assert!(store.apply_sync_delta(&account.id, &end).is_err());
+        assert!(store.message(&account.id, &id).unwrap().is_some());
+        assert_eq!(token(&store), None);
+
+        store.on_sync_commit.borrow_mut().take();
+        let retry = store.apply_sync_delta(&account.id, &end).unwrap();
+        assert!(retry.changed);
+        assert_eq!(retry.new_messages, 0);
+        assert_eq!(token(&store).as_deref(), Some("modseq-1"));
+    }
+
     /// A store opened through a symlink or a second hard link shares the
     /// turn of one opened by the file's own name.
     #[cfg(unix)]

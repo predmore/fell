@@ -637,6 +637,57 @@ fn sync_counts_new_messages_once_across_folders_and_list_aliases() {
 }
 
 #[test]
+fn catch_up_reports_an_archive_copy_before_an_all_mail_arrival() {
+    let make_mail = |id| raw_message(id, None, id, "Ann <ann@x>", "test body", "");
+    let old = make_mail("old@x");
+    let archived = make_mail("archived@x");
+    let mut inbox = empty_mailbox("INBOX", 20);
+    inbox.messages.extend([
+        literal(1, &[], 1, old.clone()),
+        literal(2, &[], 1, archived.clone()),
+    ]);
+    let mut archive = empty_mailbox("Archive", 30);
+    archive.list_flags = "\\Archive".into();
+    archive.messages.push(literal(1, &[], 1, old.clone()));
+    let mut all_mail = empty_mailbox("All Mail", 40);
+    all_mail.list_flags = "\\All".into();
+    all_mail.messages.push(literal(1, &[], 1, old));
+    let mut state = sample_state();
+    state.mailboxes = vec![inbox, archive, all_mail];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+
+    {
+        let mut state = server.state.lock().unwrap();
+        mailbox(&mut state, "Archive")
+            .messages
+            .push(literal(2, &[], 2, archived.clone()));
+        mailbox(&mut state, "All Mail").messages.extend([
+            literal(2, &[], 2, archived),
+            literal(3, &[], 2, make_mail("new@x")),
+        ]);
+    }
+    let mut seen = Vec::new();
+    let report = sync_with_progress(&acct, &backend, &store, &mut |report| {
+        let archive_copy = store.stored_uids(&acct.id, "Archive", 30, (2, 2)).unwrap() == [2];
+        let all_mail_arrival = stored(&store, &acct, "new@x").is_some();
+        seen.push((report.new_messages, archive_copy, all_mail_arrival));
+    })
+    .unwrap();
+
+    assert_eq!(seen.first(), Some(&(Some(0), true, false)), "{seen:?}");
+    assert_eq!(seen.last(), Some(&(Some(1), true, true)), "{seen:?}");
+    assert_eq!(report.new_messages, Some(1));
+    assert!(report.changed);
+}
+
+#[test]
 fn without_uidnext_only_new_uids_are_downloaded() {
     let mut state = sample_state();
     state.mailboxes = vec![FixtureMailbox {

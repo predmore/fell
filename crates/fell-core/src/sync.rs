@@ -9,15 +9,15 @@ const BODY_BATCH: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
-    /// Distinct messages added in this pass. A staged folder walk can write
-    /// provisional rows that later merge when their bodies arrive, so once
-    /// a walk starts the pass reports folder progress instead.
+    /// Distinct messages added by catch-up deltas in this pass. A staged
+    /// folder walk can write provisional rows that later merge when their
+    /// bodies arrive. If a walk ran, zero confirmed arrivals is reported as
+    /// `None`, while positive catch-up counts are still reported.
     pub new_messages: Option<usize>,
     /// Mail may have changed since the beginning of the pass, including
     /// updates to messages that were already stored.
     pub changed: bool,
-    /// The first sync of a folder under way, as of the last delta. `None`
-    /// while the pass only catches folders up.
+    /// The most recent first-sync folder progress in this pass, if any.
     pub progress: Option<crate::backend::SyncProgress>,
 }
 
@@ -40,8 +40,11 @@ pub fn sync_once(
     sync_with_progress(account, backend, store, &mut |_| {})
 }
 
-/// [`sync_once`], reporting progress after a committed delta changes mail
-/// or advances a folder walk.
+/// [`sync_once`], reporting progress after a delta successfully changes
+/// mail or advances a folder walk. A delta with a large flag sweep can
+/// commit its messages and flags before its copy and cursor transaction.
+/// A failure after the first commit returns the error without reporting
+/// that delta. Its committed messages are already stored on retry.
 pub fn sync_with_progress(
     account: &Account,
     backend: &dyn MailBackend,
@@ -57,13 +60,16 @@ pub fn sync_with_progress(
     backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
         let writes = store.apply_sync_delta(&account.id, &delta)?;
         report.changed |= writes.changed;
-        report.progress = delta.progress;
-        if report.progress.is_some() {
-            report.new_messages = None;
-        } else if let Some(count) = &mut report.new_messages {
-            *count += writes.new_messages;
+        let advances_walk = delta.progress.is_some();
+        if let Some(folder_progress) = delta.progress {
+            report.progress = Some(folder_progress);
+            if report.new_messages == Some(0) {
+                report.new_messages = None;
+            }
+        } else if writes.new_messages > 0 {
+            *report.new_messages.get_or_insert(0) += writes.new_messages;
         }
-        if writes.changed || report.progress.is_some() {
+        if writes.changed || advances_walk {
             progress(&report);
         }
         Ok(())

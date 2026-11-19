@@ -370,6 +370,88 @@ fn progress_reaches_the_report_while_a_first_sync_runs() {
             .as_ref()
             .is_some_and(|progress| progress.done == 10)
     }));
+    assert_eq!(report.progress.unwrap().done, 80);
+}
+
+#[test]
+fn a_folder_walk_keeps_confirmed_arrivals_before_and_after_it() {
+    let _sizes = set_windows(SMALL);
+    for inbox_arrival in [false, true] {
+        let server = TestServer::spawn(state_with(vec![
+            folder("INBOX", "", 3, "In", 1),
+            folder("All Mail", "\\All", 4, "All", 1),
+        ]));
+        let backend = backend_for(&server);
+        let store = Store::open_in_memory().unwrap();
+        let acct = account("a1", BackendKind::Imap);
+        sync_once(&acct, &backend, &store).unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            if inbox_arrival {
+                state.mailboxes[0] = folder("INBOX", "", 3, "In", 2);
+            }
+            state.mailboxes[1] = folder("All Mail", "\\All", 4, "All", 2);
+            state
+                .mailboxes
+                .push(folder("Archive", "\\Archive", 5, "Old", 2));
+        }
+
+        let mut reports = Vec::new();
+        let result = sync_with_progress(&acct, &backend, &store, &mut |report| {
+            reports.push(report.clone());
+        })
+        .unwrap();
+        let from_walk = reports
+            .iter()
+            .skip_while(|report| report.progress.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(from_walk[0].new_messages, inbox_arrival.then_some(1));
+        assert!(from_walk.iter().all(|report| report.progress.is_some()));
+        let complete = SyncProgress {
+            folder: "Archive".into(),
+            done: 2,
+            total: 2,
+        };
+        let count = 1 + usize::from(inbox_arrival);
+        assert_eq!(from_walk.last().unwrap().new_messages, Some(count));
+        assert_eq!(from_walk.last().unwrap().progress, Some(complete.clone()));
+        assert_eq!(result.new_messages, Some(count));
+        assert_eq!(result.progress, Some(complete));
+        assert!(stored(&store, &acct, "Old2@x").is_some());
+        assert!(stored(&store, &acct, "All2@x").is_some());
+    }
+}
+
+#[test]
+fn a_progressless_body_retry_for_a_staged_row_reports_zero_new() {
+    let _sizes = set_windows(SMALL);
+    let mut inbox = folder("INBOX", "", 3, "In", 2);
+    inbox.messages[0].body_form = BodyForm::HeadersOnly;
+    let server = TestServer::spawn(state_with(vec![inbox]));
+    let backend = backend_for(&server);
+    let store = Store::open_in_memory().unwrap();
+    let acct = account("a1", BackendKind::Imap);
+    let initial = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(initial.new_messages, None);
+    assert!(initial.progress.is_some());
+    assert!(headers_only(&stored(&store, &acct, "In1@x").unwrap()));
+
+    server.state.lock().unwrap().mailboxes[0].messages[0].body_form = BodyForm::Literal;
+    let mut reports = Vec::new();
+    let retry = sync_with_progress(&acct, &backend, &store, &mut |report| {
+        reports.push(report.clone());
+    })
+    .unwrap();
+    assert!(!reports.is_empty());
+    assert!(
+        reports
+            .iter()
+            .all(|report| { report.progress.is_none() && report.new_messages == Some(0) })
+    );
+    assert_eq!(retry.progress, None);
+    assert_eq!(retry.new_messages, Some(0));
+    assert!(retry.changed);
+    assert!(!headers_only(&stored(&store, &acct, "In1@x").unwrap()));
 }
 
 #[test]
@@ -403,11 +485,7 @@ fn on_demand_body_fetch_during_first_sync_does_not_report_new_mail() {
     })
     .unwrap();
     assert_eq!(resumed.new_messages, None);
-    assert!(
-        reports
-            .iter()
-            .all(|report| report.new_messages.unwrap_or(0) == 0)
-    );
+    assert!(reports.iter().all(|report| report.new_messages.is_none()));
     assert!(
         reports
             .iter()

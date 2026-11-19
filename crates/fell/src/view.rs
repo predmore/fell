@@ -502,7 +502,7 @@ impl Inbox {
                             // while it was not can go now.
                             inbox.bodies_asked.retry_failed();
                         }
-                        inbox.session.sync = kind;
+                        inbox.session.apply_sync_status(kind);
                         if wrote {
                             inbox.request_threads(
                                 ReadIntent {
@@ -2372,7 +2372,7 @@ impl Inbox {
             match &self.sync {
                 Some(handle) => {
                     handle.sync_now();
-                    self.session.show_toast("Syncing…", false);
+                    self.session.show_sync_requested();
                 }
                 None => self
                     .session

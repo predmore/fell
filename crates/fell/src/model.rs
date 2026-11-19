@@ -34,6 +34,8 @@ pub enum SyncKind {
     Synced {
         at: i64,
         changed: bool,
+        /// The final count for this pass, if known.
+        new_messages: Option<usize>,
     },
     Failed(SyncFailure),
 }
@@ -76,23 +78,34 @@ impl SyncKind {
             Self::StoreError => "mailbox error".into(),
             Self::Connecting => "connecting…".into(),
             Self::Syncing {
-                progress: Some(progress),
-                ..
-            } => format!(
-                "syncing {} · {} of {}",
-                progress.folder,
-                grouped(progress.done),
-                grouped(progress.total)
-            ),
-            Self::Syncing {
-                new_messages: Some(count),
-                ..
-            } if *count > 0 => format!("syncing · {count} new"),
-            Self::Syncing { .. } => "syncing…".into(),
-            Self::Synced { at, .. } => {
+                progress,
+                new_messages,
+            } => {
+                let mut status = "syncing".to_string();
+                if let Some(progress) = progress {
+                    status.push_str(&format!(
+                        " {} · {} of {}",
+                        progress.folder,
+                        grouped(progress.done),
+                        grouped(progress.total)
+                    ));
+                }
+                if let Some(count) = new_messages.filter(|count| *count > 0) {
+                    status.push_str(&format!(" · {count} new"));
+                } else if progress.is_none() {
+                    status.push('…');
+                }
+                status
+            }
+            Self::Synced {
+                at, new_messages, ..
+            } => {
                 let ago = now.saturating_sub(*at).max(0);
                 if ago < 60 {
-                    "synced just now".into()
+                    match new_messages {
+                        Some(count) if *count > 0 => format!("synced just now · {count} new"),
+                        _ => "synced just now".into(),
+                    }
                 } else if ago < 3600 {
                     format!("synced {}m ago", ago / 60)
                 } else {
@@ -350,6 +363,8 @@ pub struct Session {
     pub toast: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
     toast_generation: u64,
+    /// The manual sync acknowledgement, until the worker sends status.
+    sync_notice: Option<u64>,
     /// Destination chosen by `m`, consumed when the view applies the move.
     pub pending_move: Option<String>,
     /// `#` in Trash asked to remove these threads from Fell, in the
@@ -422,6 +437,7 @@ impl Session {
             folder_intent: FolderIntent::Go,
             toast: None,
             toast_generation: 0,
+            sync_notice: None,
             pending_move: None,
             confirm_purge: None,
             purge_ready: None,
@@ -442,6 +458,18 @@ impl Session {
 
     pub fn clear_toast(&mut self) {
         self.toast = None;
+    }
+
+    pub fn show_sync_requested(&mut self) {
+        self.show_toast("Syncing…", false);
+        self.sync_notice = Some(self.toast_generation);
+    }
+
+    pub fn apply_sync_status(&mut self, status: SyncKind) {
+        if let Some(notice) = self.sync_notice.take() {
+            self.clear_toast_if(notice);
+        }
+        self.sync = status;
     }
 
     /// Which notice is on screen: every `show_toast` makes a new one, even
@@ -2239,16 +2267,22 @@ mod tests {
 
     #[test]
     fn a_first_sync_names_its_folder_and_how_far_it_is() {
-        let syncing = SyncKind::Syncing {
-            new_messages: None,
-            progress: Some(fell_core::SyncProgress {
-                folder: "Inbox".into(),
-                done: 4_210,
-                total: 31_882,
-            }),
+        let progress = fell_core::SyncProgress {
+            folder: "Inbox".into(),
+            done: 4_210,
+            total: 31_882,
         };
-        assert_eq!(syncing.status_at(0), "syncing Inbox · 4,210 of 31,882");
-        assert!(!syncing.is_error());
+        for (new_messages, expected) in [
+            (None, "syncing Inbox · 4,210 of 31,882"),
+            (Some(2), "syncing Inbox · 4,210 of 31,882 · 2 new"),
+        ] {
+            let syncing = SyncKind::Syncing {
+                new_messages,
+                progress: Some(progress.clone()),
+            };
+            assert_eq!(syncing.status_at(0), expected);
+            assert!(!syncing.is_error());
+        }
         for (count, text) in [
             (0, "0"),
             (999, "999"),
@@ -2272,6 +2306,57 @@ mod tests {
             };
             assert_eq!(status.status_at(0), expected);
         }
+    }
+
+    #[test]
+    fn catch_up_keeps_the_final_total_even_if_the_last_batch_was_throttled() {
+        let mut session = session();
+        for (count, label) in [(0, "syncing…"), (1, "syncing · 1 new")] {
+            session.apply_sync_status(SyncKind::Syncing {
+                new_messages: Some(count),
+                progress: None,
+            });
+            assert_eq!(session.sync.status_at(100), label);
+        }
+
+        session.apply_sync_status(SyncKind::Synced {
+            at: 100,
+            changed: true,
+            new_messages: Some(3),
+        });
+        assert_eq!(session.sync.status_at(100), "synced just now · 3 new");
+        assert_eq!(session.sync.status_at(159), "synced just now · 3 new");
+        assert_eq!(session.sync.status_at(160), "synced 1m ago");
+
+        for new_messages in [Some(0), None] {
+            session.apply_sync_status(SyncKind::Synced {
+                at: 101,
+                changed: false,
+                new_messages,
+            });
+            assert_eq!(session.sync.status_at(101), "synced just now");
+        }
+    }
+
+    #[test]
+    fn worker_status_replaces_only_the_manual_sync_acknowledgement() {
+        let mut session = session();
+        session.show_sync_requested();
+        assert_eq!(session.toast.as_ref().unwrap().text, "Syncing…");
+        session.apply_sync_status(SyncKind::Connecting);
+        assert!(session.toast.is_none());
+
+        session.show_sync_requested();
+        session.show_toast("Read/star sync delayed. Retrying", true);
+        session.apply_sync_status(SyncKind::Failed(SyncFailure {
+            kind: SyncFailureKind::Unreachable,
+            bridge: false,
+            detail: "test timeout".into(),
+        }));
+        assert_eq!(session.sync.status_at(0), "offline · server unreachable");
+        let notice = session.toast.unwrap();
+        assert_eq!(notice.text, "Read/star sync delayed. Retrying");
+        assert!(notice.alert);
     }
 
     fn row(id: &str) -> ThreadRow {
