@@ -539,7 +539,8 @@ impl Inbox {
             self.request_threads(merged, cx);
             return;
         }
-        self.show_threads(folder, result, intent, cx);
+        let follow_up_pending = wanted.is_some();
+        self.show_threads(folder, result, intent, follow_up_pending, cx);
         // Only sync wrote while that read ran. Show it first, then read once
         // more, so a fast sync cannot starve the list.
         if let Some(next) = wanted {
@@ -552,6 +553,7 @@ impl Inbox {
         folder: String,
         result: ThreadsResult,
         intent: ReadIntent,
+        follow_up_pending: bool,
         cx: &mut Context<Self>,
     ) {
         self.session.loading = false;
@@ -697,8 +699,15 @@ impl Inbox {
         }
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
-        // A draft's preview follows its edits.
-        if open_changed || grew || waiting || self.session.cursor_draft().is_some() {
+        // A new selection and draft edits load immediately. Give a queued
+        // folder refresh the opportunity to resolve the open thread's key
+        // before starting another body-only read.
+        let new_selection = open_changed && self.session.cursor_id.is_some();
+        let refresh_open = open_changed || grew || waiting;
+        if new_selection
+            || self.session.cursor_draft().is_some()
+            || (refresh_open && !follow_up_pending)
+        {
             self.request_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
@@ -1206,6 +1215,14 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
+                    Ok(view) if view.is_empty() && !inbox.session.messages.is_empty() => {
+                        // The open thread key can disappear between the folder
+                        // and message reads. Keep the conversation until a
+                        // folder read confirms where its messages belong.
+                        if !inbox.read_in_flight {
+                            inbox.request_threads(ReadIntent::default(), cx);
+                        }
+                    }
                     Ok(view) => {
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
