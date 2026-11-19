@@ -5263,13 +5263,31 @@ fn literal_ip_host(word: &str) -> Option<String> {
         return Some(url::Host::<String>::Ipv6(ip).to_string());
     }
     let name = without_port(name);
-    // Require four parts for bare IPv4 so decimals and version numbers
-    // like `3.5` do not pass as shorthand addresses.
-    if !(name.starts_with('[') || name.strip_suffix('.').unwrap_or(name).split('.').count() == 4) {
+    if !name.starts_with('[')
+        && !name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_numeric() || ch == '%')
+    {
         return None;
     }
     match url::Host::parse(name).ok()? {
-        ip @ (url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Some(ip.to_string()),
+        url::Host::Ipv4(ip) => {
+            let label = name.strip_suffix('.').unwrap_or(name);
+            let mut fields = label.rsplit('.');
+            let tail = fields.next()?;
+            // A short decimal or version label is ordinary text. Retain
+            // shorthand when the last field actually packs multiple octets,
+            // and let the URL parser normalize hexadecimal and escapes.
+            let ordinary_number = label.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && match fields.count() {
+                    0 => ip.octets()[0] == 0,
+                    1 | 2 => tail.parse::<u8>().is_ok(),
+                    _ => false,
+                };
+            (!ordinary_number).then(|| ip.to_string())
+        }
+        ip @ url::Host::Ipv6(_) => Some(ip.to_string()),
         url::Host::Domain(_) => None,
     }
 }
@@ -6437,6 +6455,16 @@ mod tests {
                 "https://[::ffff:c000:207]/",
                 "[::ffff:c000:207]",
             ),
+            (
+                "[::ffff:192.0.2.7]",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+            ("192%2e0%2e2%2e7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192%2e0.2.7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192.0.519", "https://192.0.2.7/", "192.0.2.7"),
+            ("3221225991", "https://192.0.2.7/", "192.0.2.7"),
+            ("0xc0000207", "https://192.0.2.7/", "192.0.2.7"),
         ] {
             assert_eq!(shown_target(label, href, Links::Label), None, "{label}");
             assert_eq!(
@@ -6450,7 +6478,14 @@ mod tests {
                 "{label}"
             );
         }
-        for label in ["3.5 stars", "v1.2.3.4 notes", "192.0.2.999", "2001:db8:7"] {
+        for label in [
+            "3.5 stars",
+            "42 results",
+            "1.2.3 notes",
+            "v1.2.3.4 notes",
+            "192.0.2.999",
+            "2001:db8:7",
+        ] {
             assert_eq!(
                 shown_target(label, "https://docs.example/", Links::Label),
                 None,
