@@ -1017,7 +1017,7 @@ struct Reply {
 
 /// Largest RFC 822 payload this client will store. A bigger literal is discarded
 /// and that message is skipped; the rest of the response is still read.
-const MAX_LITERAL: usize = 32 * 1024 * 1024;
+const MAX_LITERAL: usize = crate::MAX_MESSAGE_BYTES;
 const DISCARD_CHUNK: usize = 64 * 1024;
 /// Protocol text before a newline, not including a `{n}` literal that follows.
 const MAX_LINE: usize = 1024 * 1024;

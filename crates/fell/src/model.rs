@@ -1130,6 +1130,17 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
+    /// Reread of the thread already open that only filled in bodies
+    /// ([`crate::present::bodies_filled`]). Everything the reader set
+    /// stays: the message cursor, which messages are open, opened quotes
+    /// and recipient lists.
+    pub fn fill_bodies(&mut self, mut messages: Vec<ConvMessage>) {
+        for (new, old) in messages.iter_mut().zip(&self.messages) {
+            new.expanded = old.expanded;
+        }
+        self.messages = messages;
+    }
+
     /// Reread of the thread already open (sync added or dropped a message).
     /// A reader on the last message follows to the new last one. A reader
     /// further up keeps their message and opened quotes. Returns whether the
@@ -1900,6 +1911,37 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn a_body_filled_in_keeps_the_reader_where_they_are() {
+        let mut session = session();
+        let mut older = empty_message(true);
+        older.body_state = fell_core::BodyState::Pending;
+        let mut newest = empty_message(true);
+        newest.body_state = fell_core::BodyState::Pending;
+        session.set_messages(vec![older.clone(), newest.clone()]);
+        // The reader went up to the older message, closed the newest and
+        // opened the older one's quotes.
+        session.message_cursor = 0;
+        session.messages[1].expanded = false;
+        session.quotes_open.insert(older.id.clone());
+
+        // Sync fills in the older message's body (not the latest's).
+        let mut read = vec![older.clone(), newest.clone()];
+        read[0].body_state = fell_core::BodyState::Stored;
+        read[0].body = crate::text_render::render_stored_body(Some("it came"), "it came");
+        read[1].expanded = true;
+        let changed = crate::present::bodies_filled(&session.messages, &read);
+        assert_eq!(changed, Some(vec![0]), "an in-place fill, of message 0");
+        session.fill_bodies(read);
+        assert_eq!(session.message_cursor, 0, "the cursor stays");
+        assert!(
+            !session.messages[1].expanded,
+            "what was closed stays closed"
+        );
+        assert!(session.quotes_open.contains(&older.id));
+        assert_eq!(session.messages[0].body_state, fell_core::BodyState::Stored);
     }
 
     #[test]
@@ -3104,6 +3146,7 @@ mod tests {
             expanded,
             recipients: None,
             context: None,
+            body_state: fell_core::BodyState::Stored,
         }
     }
 }

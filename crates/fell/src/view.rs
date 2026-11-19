@@ -183,6 +183,9 @@ struct Inbox {
     /// The open thread's subject when its messages arrived, for when its
     /// row has left the list (an archive) before the next thread's arrive.
     open_subject: String,
+    /// Bodies just filled in on a conversation the reader has not moved:
+    /// bring the newest message's start into view once they are laid out.
+    reveal: Reveal,
     /// Thread `m` just moved. `u` selects it again when it returns to this folder.
     moved_thread: Option<ListKey>,
     /// Background sync for the account file. `None` for the demo mailbox.
@@ -283,6 +286,7 @@ impl Inbox {
             dragging: false,
             open_thread: None,
             open_subject: String::new(),
+            reveal: Reveal::No,
             moved_thread: None,
             sync: None,
             list_folder: FolderRole::Inbox.default_name().into(),
@@ -612,20 +616,11 @@ impl Inbox {
                 .find(|row| &row.id == id)
                 .map(|row| row.message_count)
         });
-        // A first sync stores a row from its headers, then its body. When
-        // the body of the open conversation lands, it opens again as if
-        // just chosen, at its top: a pane with no body yet is not a reader
-        // who scrolled to the end.
-        let snippet_of = |rows: &[ThreadRow], id: &String| {
-            rows.iter()
-                .find(|row| &row.id == id)
-                .map(|row| row.snippet.clone())
-        };
-        let filled = self.open_thread.as_ref().is_some_and(|id| {
-            let before = snippet_of(&self.session.threads, id);
-            let after = snippet_of(&rows, id);
-            before.as_deref() == Some("") && after.is_some_and(|snippet| !snippet.is_empty())
-        });
+        // A first sync stores rows from their headers, then their bodies.
+        // While the open thread has a message whose body has not come,
+        // each write is read again for it, whichever message it fills.
+        let waiting =
+            self.open_thread.is_some() && present::awaiting_bodies(&self.session.messages);
         self.session.set_page(rows, more_before, more_after, unread);
         if let Some(key) = &intent.select {
             self.session.select_if_present(&key.thread_id.0);
@@ -666,7 +661,7 @@ impl Inbox {
         let open_changed = self.open_thread != self.session.cursor_id;
         let grew = open_count.is_some_and(|count| count != self.session.messages.len());
         // A draft's preview follows its edits.
-        if open_changed || grew || filled || self.session.cursor_draft().is_some() {
+        if open_changed || grew || waiting || self.session.cursor_draft().is_some() {
             self.request_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
@@ -700,11 +695,14 @@ impl Inbox {
                 .folder_page(&account, &reading, &FolderSpan::Bottom { rows: reach })
                 .ok()?;
             let last = page.threads.last()?;
-            let messages = store.thread_messages(&account, &last.thread_id).ok()?;
-            Some((
-                present::thread_rows(&page.threads, &me),
-                present::conversation(&messages, &me, &roles, &names, &reading),
-            ))
+            let messages = read_conversation(
+                store,
+                &account,
+                &last.thread_id,
+                (&me, &roles, &names, &reading),
+            )
+            .ok()?;
+            Some((present::thread_rows(&page.threads, &me), messages))
         });
         cx.spawn(async move |this, cx| {
             let Ok(Some((rows, messages))) = reply.await else {
@@ -1072,6 +1070,7 @@ impl Inbox {
 
     /// A key arrived: jump every transition to its end state first.
     fn settle_motion(&mut self) {
+        self.reveal = Reveal::No;
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         if let Some(y) = settled.list {
@@ -1131,10 +1130,13 @@ impl Inbox {
                 return None;
             }
             Some(
-                store
-                    .thread_messages(&account, &ThreadId(thread))
-                    .map(|messages| present::conversation(&messages, &me, &roles, &names, &viewing))
-                    .map_err(|err| err.to_string()),
+                read_conversation(
+                    store,
+                    &account,
+                    &ThreadId(thread),
+                    (&me, &roles, &names, &viewing),
+                )
+                .map_err(|err| err.to_string()),
             )
         });
         cx.spawn(async move |this, cx| {
@@ -1154,10 +1156,30 @@ impl Inbox {
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
                         // Sync adding to the thread being read must not pull a
                         // reader who scrolled up back to the bottom.
-                        let follow = if same {
+                        let filled = if same {
+                            present::bodies_filled(&inbox.session.messages, &view)
+                        } else {
+                            None
+                        };
+                        let follow = if let Some(changed) = filled {
+                            // Bodies came in where the reader is: in place,
+                            // fading in. A reader who has not moved the
+                            // pane is shown the newest message's start once
+                            // it is laid out; one who scrolled stays put.
+                            if !changed.is_empty() {
+                                let ids = changed.iter().map(|at| view[*at].id.clone()).collect();
+                                if inbox.conversation_untouched() {
+                                    inbox.reveal = Reveal::Laying;
+                                }
+                                inbox.session.fill_bodies(view);
+                                inbox.motion.bodies_filled(ids);
+                            }
+                            false
+                        } else if same {
                             let bottom = inbox.conversation_at_bottom();
                             inbox.session.refresh_messages(view, bottom)
                         } else {
+                            inbox.reveal = Reveal::No;
                             inbox.motion.show_thread(&mut inbox.session, view);
                             true
                         };
@@ -1853,6 +1875,47 @@ impl Inbox {
         max <= 1.0 || offset <= -max + 24.0
     }
 
+    /// The reader has not moved the conversation ([`present::conversation_untouched`]).
+    fn conversation_untouched(&self) -> bool {
+        present::conversation_untouched(
+            f32::from(self.conv_scroll.offset().y),
+            f32::from(self.conv_scroll.max_offset().height),
+        )
+    }
+
+    /// The frame after bodies were filled in laid them out: glide to the
+    /// newest message's start if it is out of view. Nothing moves when it
+    /// shows already.
+    fn reveal_newest(&mut self, window: &mut Window) {
+        match self.reveal {
+            Reveal::No => {}
+            Reveal::Laying => {
+                self.reveal = Reveal::Ready;
+                window.request_animation_frame();
+            }
+            Reveal::Ready => {
+                self.reveal = Reveal::No;
+                let last = self.session.messages.len().saturating_sub(1);
+                let Some(item) = self.conv_scroll.bounds_for_item(last) else {
+                    return;
+                };
+                let view = self.conv_scroll.bounds();
+                let offset = f32::from(self.conv_scroll.offset().y);
+                let max = f32::from(self.conv_scroll.max_offset().height);
+                if let Some(to) = present::offset_to_show_start(
+                    f32::from(item.top()),
+                    f32::from(view.top()),
+                    f32::from(view.bottom()),
+                    offset,
+                    max,
+                ) {
+                    self.glide_conversation(offset, to);
+                    window.request_animation_frame();
+                }
+            }
+        }
+    }
+
     fn scroll_conversation(&mut self) {
         if !self.session.messages.is_empty() {
             self.motion.conv_glide = None;
@@ -2045,6 +2108,7 @@ impl Render for Inbox {
         let viewport_h = f32::from(window.viewport_size().height);
         self.motion
             .fit_card(card_fit(&self.session, viewport_h), now);
+        self.reveal_newest(window);
         self.advance_glides(now, window.scale_factor());
         let animating = self.motion.tick(now);
         if animating {
@@ -2256,6 +2320,7 @@ fn shell(
         // The wheel takes over from a glide where the viewport is.
         .on_scroll_wheel(cx.listener(|inbox, _: &gpui::ScrollWheelEvent, _, _| {
             inbox.motion.cancel_glides();
+            inbox.reveal = Reveal::No;
         }))
         .on_mouse_move(cx.listener(|inbox, event: &MouseMoveEvent, window, cx| {
             if !inbox.dragging {
@@ -3127,6 +3192,39 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
         .child(div().w(px(1.)).h_full().bg(rgb(theme.border)))
 }
 
+/// Where [`Inbox::reveal_newest`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reveal {
+    No,
+    /// Bodies were filled in; the next frame lays them out.
+    Laying,
+    /// They are laid out: their bounds can be read.
+    Ready,
+}
+
+/// One thread's messages as the conversation shows them, with whether
+/// each has its body yet. `shown`: the account address, its folder roles
+/// and names, and the folder the list shows ([`present::conversation`]).
+fn read_conversation(
+    store: &fell_core::Store,
+    account: &AccountId,
+    thread: &ThreadId,
+    shown: (&str, &FolderRoles, &[String], &str),
+) -> Result<Vec<ConvMessage>, fell_core::Error> {
+    let (me, roles, names, viewing) = shown;
+    let messages = store.thread_messages(account, thread)?;
+    let ids: Vec<_> = messages
+        .iter()
+        .map(|message| message.headers.message_id.clone())
+        .collect();
+    let states = store.body_states(account, &ids)?;
+    let mut view = present::conversation(&messages, me, roles, names, viewing);
+    for (message, state) in view.iter_mut().zip(states) {
+        message.body_state = state;
+    }
+    Ok(view)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn conversation(
     theme: &Theme,
@@ -3155,8 +3253,17 @@ fn conversation(
             } else {
                 0.0
             };
+            let body = motion.body_opacity(&message.id, now);
             message_block(
-                theme, session, message, index, cursor, conv_width, live, window, cx,
+                theme,
+                session,
+                message,
+                index,
+                (cursor, body),
+                conv_width,
+                live,
+                window,
+                cx,
             )
         })
         .collect();
@@ -3208,14 +3315,15 @@ fn conversation(
         )
 }
 
-/// `cursor`: how much the card shows the message cursor, 0 to 1.
+/// `shown`: how much the card shows the message cursor, and how much its
+/// body shows (a body sync just filled in fades in), each 0 to 1.
 #[allow(clippy::too_many_arguments)]
 fn message_block(
     theme: &Theme,
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    cursor: f32,
+    shown: (f32, f32),
     conv_width: f32,
     live: Live,
     window: &Window,
@@ -3223,10 +3331,10 @@ fn message_block(
 ) -> gpui::AnyElement {
     if message.expanded {
         expanded_message(
-            theme, session, message, index, cursor, conv_width, live, window, cx,
+            theme, session, message, index, shown, conv_width, live, window, cx,
         )
     } else {
-        collapsed_message(theme, message, index, cursor, conv_width, live, window, cx)
+        collapsed_message(theme, message, index, shown, conv_width, live, window, cx)
     }
 }
 
@@ -3235,7 +3343,7 @@ fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
-    cursor: f32,
+    (cursor, body): (f32, f32),
     conv_width: f32,
     live: Live,
     window: &Window,
@@ -3246,7 +3354,13 @@ fn collapsed_message(
     let date_w = line_px(window, &date, FontWeight::NORMAL);
     // Sender column, gaps, row padding, and a little air before the date.
     let snippet_w = (conv_width - 56.0 - 140.0 - date_w).max(24.0);
-    let snippet = clip_line(window, &message.snippet, snippet_w, FontWeight::NORMAL);
+    let missing = present::missing_body_line(message.body_state);
+    let snippet = clip_line(
+        window,
+        missing.as_deref().unwrap_or(&message.snippet),
+        snippet_w,
+        FontWeight::NORMAL,
+    );
     div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
@@ -3296,6 +3410,7 @@ fn collapsed_message(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_color(rgb(dimmed))
+                .when(body < 1.0, |line| line.opacity(body))
                 .child(snippet),
         )
         .child(div().flex_none().text_color(rgb(dimmed)).child(date))
@@ -3308,7 +3423,7 @@ fn expanded_message(
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    cursor: f32,
+    (cursor, body): (f32, f32),
     conv_width: f32,
     live: Live,
     window: &Window,
@@ -3387,34 +3502,51 @@ fn expanded_message(
                 .truncate()
                 .child(line.clone())
         }))
-        .children({
-            // `q` opens every collapsed block in the message at once, so
-            // only the first one names the key.
-            // The recipient line comes first and names the key itself.
-            let first_hidden = message
-                .body
-                .blocks
-                .iter()
-                .position(|block| matches!(block, BodyBlock::Quote(_) | BodyBlock::Signature(_)))
-                .filter(|_| message.recipients.is_none());
-            message
-                .body
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(at, block)| {
-                    body_block(
-                        theme,
-                        block,
-                        quotes,
-                        Some(at) == first_hidden,
-                        index,
-                        live,
-                        cx,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
+        .children(present::missing_body_line(message.body_state).map(|line| {
+            // Body text's place and height, dimmed, so the body that comes
+            // fades in over the same spot.
+            div()
+                .max_w(px(680.))
+                .pb(px(8.))
+                .line_height(px(theme.ui_px * 1.45))
+                .text_color(rgb(dim))
+                .child(line)
+        }))
+        // Always wrapped, so a fade starting or ending moves nothing.
+        .child(
+            div()
+                .when(body < 1.0, |blocks| blocks.opacity(body))
+                .children({
+                    // `q` opens every collapsed block in the message at once, so
+                    // only the first one names the key.
+                    // The recipient line comes first and names the key itself.
+                    let first_hidden = message
+                        .body
+                        .blocks
+                        .iter()
+                        .position(|block| {
+                            matches!(block, BodyBlock::Quote(_) | BodyBlock::Signature(_))
+                        })
+                        .filter(|_| message.recipients.is_none());
+                    message
+                        .body
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(at, block)| {
+                            body_block(
+                                theme,
+                                block,
+                                quotes,
+                                Some(at) == first_hidden,
+                                index,
+                                live,
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+        )
         .into_any_element()
 }
 

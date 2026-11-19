@@ -26,6 +26,10 @@ pub mod sync;
 pub mod test_support;
 pub mod threading;
 
+/// The largest message source sync downloads. A larger message keeps its
+/// headers and is marked [`BodyState::TooLarge`].
+pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
 pub use account::{Account, AccountId, BackendKind};
 pub use account_config::{AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error};
 pub use actions::{ActionKind, LabelChange, LocalAction};
