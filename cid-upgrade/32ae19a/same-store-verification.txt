@@ -1,0 +1,53 @@
+Same synthetic database file on every phase (see narrow capture log).
+Columns are subject, message attachment flag, names, part role, filename, disposition, thread attachment flag.
+
+baseline
+Literal CID example|0||1|logo.png|0|0
+Embedded logo|0||1|logo.png|0|0
+Attached logo|1|logo.png|0|logo.png|2|1
+
+pr-head
+Literal CID example|0||1|logo.png|0|0
+Embedded logo|0||1|logo.png|0|0
+Attached logo|1|logo.png|0|logo.png|2|1
+
+revised
+Literal CID example|1|logo.png|0|logo.png|0|1
+Embedded logo|0||1|logo.png|0|0
+Attached logo|1|logo.png|0|logo.png|2|1
+
+reopened
+Literal CID example|1|logo.png|0|logo.png|0|1
+Embedded logo|0||1|logo.png|0|0
+Attached logo|1|logo.png|0|logo.png|2|1
+
+post-keyboard
+Literal CID example|1|logo.png|0|logo.png|0|1
+Embedded logo|0||1|logo.png|0|0
+Attached logo|1|logo.png|0|logo.png|2|1
+
+Revised startup IMAP commands
+LOGIN 
+CAPABILITY 
+LIST  *
+EXAMINE INBOX
+LOGOUT 
+LOGIN 
+CAPABILITY 
+LOGOUT 
+
+Store search
+before has:attachment returned Attached logo
+after has:attachment returned Attached logo, Literal CID example
+
+MCP parity
+baseline list_threads paperclips: Attached logo
+baseline keyword search for logo: Attached logo, Embedded logo, Literal CID example
+baseline read_thread Literal CID example: []
+baseline read_thread Embedded logo: []
+baseline read_thread Attached logo: ['logo.png']
+revised list_threads paperclips: Attached logo, Literal CID example
+revised keyword search for logo: Attached logo, Embedded logo, Literal CID example
+revised read_thread Literal CID example: ['logo.png']
+revised read_thread Embedded logo: []
+revised read_thread Attached logo: ['logo.png']
