@@ -27,6 +27,10 @@ pub enum Block {
     },
     Code {
         text: String,
+        /// Set at 20 px or more in the mail: a confirmation or one-time
+        /// code the reader copies. Painted a step larger, in a box that
+        /// fits it.
+        large: bool,
     },
     /// Cells are blocks, so a paragraph break, list marker, or quote inside a
     /// cell survives. Flattening a cell to inlines glues `<p>Hello</p><p>World</p>`
@@ -34,12 +38,35 @@ pub enum Block {
     Table {
         header: Vec<Vec<Block>>,
         rows: Vec<Vec<Vec<Block>>>,
+        /// How each column's cells line up. Start unless the mail says
+        /// otherwise with `align` or `text-align`.
+        align: Vec<Align>,
     },
     Image {
         source: ImageSource,
         alt: String,
     },
     ThematicBreak,
+    /// Fine print the sender set at 12 px or less (a newsletter footer).
+    /// Painted small and dimmed.
+    Small {
+        blocks: Vec<Block>,
+    },
+    /// Outlook's `From:` / `Sent:` / `Subject:` block over the message it
+    /// answers (`#divRplyFwdMsg`). Painted as its blocks; quoted history
+    /// starts here.
+    ReplyHeader {
+        blocks: Vec<Block>,
+    },
+}
+
+/// A table column's alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    Start,
+    Center,
+    End,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +79,17 @@ pub enum Inline {
     Text(String),
     Emphasis(Vec<Inline>),
     Strong(Vec<Inline>),
+    /// `<s>`, `<del>`, `<strike>`: a struck-through price, an edit.
+    Strike(Vec<Inline>),
     Code(String),
-    Link { href: String, children: Vec<Inline> },
-    Image { source: ImageSource, alt: String },
+    Link {
+        href: String,
+        children: Vec<Inline>,
+    },
+    Image {
+        source: ImageSource,
+        alt: String,
+    },
     LineBreak,
 }
 
@@ -103,11 +138,12 @@ fn push_block(out: &mut String, block: &Block) {
                 push_block(out, child);
             }
         }
-        Block::Code { text } => {
+        Block::Code { text, .. } => {
             out.push_str(text);
             out.push('\n');
         }
-        Block::Table { header, rows } => {
+        Block::Small { blocks } | Block::ReplyHeader { blocks } => push_blocks(out, blocks),
+        Block::Table { header, rows, .. } => {
             if !header.is_empty() {
                 for cell in header {
                     push_blocks(out, cell);
@@ -145,6 +181,7 @@ fn push_inlines(out: &mut String, inlines: &[Inline]) {
             Inline::Text(text) | Inline::Code(text) => out.push_str(text),
             Inline::Emphasis(children)
             | Inline::Strong(children)
+            | Inline::Strike(children)
             | Inline::Link { children, .. } => {
                 push_inlines(out, children);
             }

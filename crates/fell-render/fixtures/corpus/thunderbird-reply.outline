@@ -1,0 +1,16 @@
+## open
+p Hi Oskar,
+p I ran the backup script again last night and it finished in 14 minutes, so the new disk is clearly faster. The log is attached.
+p One thing: the cron line still points at the old mount. Can you change it to `/mnt/archive` when you get a minute?
+p Thanks,
+  | Hanne
+## fold quote and signature
+p On 17/11/2026 08:51, Oskar Lind wrote:
+quote
+  p Did the backup finish? The old one took most of the night.
+  p -- 
+    | Oskar Lind
+    | Systems, example.com
+p Hanne Berg
+  | Reading room and archives
+  | library.example.org

@@ -1,0 +1,10 @@
+## open
+p Hi Ada,
+p Thursday at 14:00 works for the site visit. Please sign in at the gate on Mill Lane; parking is behind building C.
+p Kind regards,
+  | Pia
+## fold signature
+table [start, start]
+  td ![Works logo](cid) | p **Pia Lund**   | Facilities coordinator   | Works Example Ltd   | +44 20 7946 0100 · [works.example.com](https://works.example.com)
+small
+  p This message is for the named person only. If you got it by mistake, please tell the sender and delete it.

@@ -19,10 +19,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DropReason, InboxWait, OutboxKind, ReplayReport, Store,
-    SyncFailureKind, classify_sync_error, fetch_missing_bodies, sync_with_progress,
+    Account, AccountConfig, BackendKind, DropReason, InboxWait, MessageId, MessageParts,
+    OutboxKind, ReplayReport, Store, SyncFailureKind, classify_sync_error, fetch_message_bodies,
+    fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::oneshot;
 
 use crate::model::{SyncFailure, SyncKind};
 
@@ -48,6 +50,13 @@ const OPEN_RETRIES_BEFORE_ERROR: usize = 3;
 /// after a pass. A request for a pass is checked between batches.
 const BODY_BATCHES_AFTER_PASS: usize = 5;
 
+/// Body asks served in one backend call, so a conversation of old mail is
+/// one login.
+const BODIES_PER_BATCH: usize = 16;
+/// Body asks served between two passes. The rest wait for the next gap, so
+/// opening a long thread of old mail cannot hold up the next pass.
+const BODIES_BETWEEN_PASSES: usize = 48;
+
 /// What the sync thread tells the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
@@ -58,6 +67,9 @@ pub enum SyncEvent {
     FlagsChanged,
     /// Actions the server will never get. The change stays in Fell.
     NotSent(NotSent),
+    /// Parts were stored for mail that had none (the backfill after a
+    /// pass). An open thread may have HTML to show now.
+    BodiesStored,
 }
 
 /// The first reason in a replay's dropped writes, and how many rows it
@@ -91,7 +103,7 @@ impl NotSent {
     }
 }
 
-/// Why the window woke the sync thread.
+/// Why the window woke the sync thread for a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ask {
     /// `space s`: a pass now, shown as connecting.
@@ -100,8 +112,11 @@ enum Ask {
     WriteBack,
 }
 
+/// Whether the fetch left a stored HTML part, or why it did not finish.
+pub type BodyReply = Result<bool, String>;
+
 pub struct SyncHandle {
-    wake: Sender<Ask>,
+    wake: Sender<Request>,
     /// `write_back` in the account file.
     write_back: bool,
 }
@@ -109,16 +124,113 @@ pub struct SyncHandle {
 impl SyncHandle {
     /// Start the next pass now. A pass already running finishes first.
     pub fn sync_now(&self) {
-        let _ = self.wake.send(Ask::Sync);
+        let _ = self.wake.send(Request::Ask(Ask::Sync));
     }
 
     /// Send queued writes now, then run a pass, without
     /// showing "connecting". Nothing is queued while write-back is off.
     pub fn write_back_now(&self) {
         if self.write_back {
-            let _ = self.wake.send(Ask::WriteBack);
+            let _ = self.wake.send(Request::Ask(Ask::WriteBack));
         }
     }
+
+    /// Fetch one message's parts from the server and store them, for a
+    /// conversation that opened on mail stored before parts were kept. It
+    /// runs between passes, ahead of the backfill and the wait for mail.
+    pub fn fetch_body(&self, message_id: MessageId) -> oneshot::Receiver<BodyReply> {
+        let (reply, answer) = oneshot::channel();
+        let _ = self.wake.send(Request::Body(BodyAsk { message_id, reply }));
+        answer
+    }
+}
+
+/// What the window asks of the sync thread.
+enum Request {
+    /// A pass now.
+    Ask(Ask),
+    Body(BodyAsk),
+}
+
+struct BodyAsk {
+    message_id: MessageId,
+    reply: oneshot::Sender<BodyReply>,
+}
+
+/// Body asks waiting for the sync thread, served a batch per backend call
+/// and at most [`BODIES_BETWEEN_PASSES`] between two passes.
+#[derive(Default)]
+struct BodyQueue {
+    waiting: Vec<BodyAsk>,
+    served: usize,
+}
+
+impl BodyQueue {
+    fn push(&mut self, ask: BodyAsk) {
+        self.waiting.push(ask);
+    }
+
+    /// A pass finished: the next gap has its full allowance.
+    fn new_gap(&mut self) {
+        self.served = 0;
+    }
+
+    /// The next batch this gap may still serve. Asks the window stopped
+    /// waiting for are dropped, and cost nothing.
+    fn take_batch(&mut self) -> Vec<BodyAsk> {
+        self.waiting.retain(|ask| !ask.reply.is_canceled());
+        let room = BODIES_BETWEEN_PASSES
+            .saturating_sub(self.served)
+            .min(BODIES_PER_BATCH)
+            .min(self.waiting.len());
+        self.served += room;
+        self.waiting.drain(..room).collect()
+    }
+
+    /// Serve what this gap allows, one backend call per batch.
+    fn serve(&mut self, config: &AccountConfig, store: &Store, account: &Account) {
+        loop {
+            let batch = self.take_batch();
+            if batch.is_empty() {
+                return;
+            }
+            let ids: Vec<MessageId> = batch.iter().map(|ask| ask.message_id.clone()).collect();
+            let answers = config
+                .backend()
+                .and_then(|backend| {
+                    fetch_message_bodies(&account.id, backend.as_ref(), store, &ids)
+                })
+                .map_err(|err| err.to_string());
+            match answers {
+                Ok(answers) => {
+                    for (ask, parts) in batch.into_iter().zip(answers) {
+                        let _ = ask.reply.send(body_answer(parts));
+                    }
+                }
+                Err(err) => {
+                    for ask in batch {
+                        let _ = ask.reply.send(Err(err.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The window only needs to know whether to reread for HTML. A fetch
+/// that stopped short of this message can be asked for again later.
+fn body_answer(parts: Option<MessageParts>) -> BodyReply {
+    match parts {
+        None => Err("not fetched yet".to_string()),
+        Some(parts) => Ok(parts.html.is_some()),
+    }
+}
+
+/// The mailbox is not open yet: nothing can be fetched.
+fn refuse_body(ask: BodyAsk) {
+    let _ = ask
+        .reply
+        .send(Err("the mailbox is not open yet".to_string()));
 }
 
 pub fn start(
@@ -139,10 +251,13 @@ fn run(
     config: AccountConfig,
     store_path: PathBuf,
     events: UnboundedSender<SyncEvent>,
-    wake: Receiver<Ask>,
+    wake: Receiver<Request>,
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
+    let bodies_stored = || {
+        let _ = events.unbounded_send(SyncEvent::BodiesStored);
+    };
     let failed = |kind: SyncFailureKind, detail: String| {
         SyncKind::Failed(SyncFailure {
             kind,
@@ -174,7 +289,8 @@ fn run(
                     return;
                 }
                 match wake.recv_timeout(delay) {
-                    Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+                    Ok(Request::Body(ask)) => refuse_body(ask),
+                    Ok(Request::Ask(_)) | Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -184,8 +300,9 @@ fn run(
     failures = 0;
     // Cleared for good once the server says it has no IDLE.
     let mut idle = true;
+    let mut bodies = BodyQueue::default();
     loop {
-        // Moves go first, so the pass that follows sees where they landed.
+        // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
         if let Ok(report) = config.replay_outbox(&store) {
             if report.flags_changed && events.unbounded_send(SyncEvent::FlagsChanged).is_err() {
@@ -241,24 +358,64 @@ fn run(
                 delay
             }
         };
-        let woke = match synced.then(|| fill_old_bodies(&config, &store, &account, &wake)) {
-            Some(Some(woke)) => woke,
-            _ if synced && idle => {
-                wait_on_inbox(&config, &store, &account, delay, &wake, &mut idle)
+        // A body asked for on open is served at once, then the wait goes on
+        // for the rest of the delay. Asks left over from the last gap go
+        // first.
+        bodies.new_gap();
+        bodies.serve(&config, &store, &account);
+        let until = Instant::now() + delay;
+        let mut pending = if synced {
+            fill_old_bodies(
+                &config,
+                &store,
+                &account,
+                &wake,
+                &mut bodies,
+                &bodies_stored,
+            )
+        } else {
+            None
+        };
+        let woke = loop {
+            match pending.take() {
+                Some(Woke::Body(ask)) => {
+                    bodies.push(ask);
+                    // The asks a conversation sends together go in one batch.
+                    if let Some(woke) = queue_bodies(&wake, &mut bodies) {
+                        break woke;
+                    }
+                    bodies.serve(&config, &store, &account);
+                }
+                Some(woke) => break woke,
+                None => {}
             }
-            _ => wait_on_timer(&wake, delay),
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Woke::Timer;
+            }
+            pending = Some(if synced && idle {
+                wait_on_inbox(&config, &store, &account, left, &wake, &mut idle)
+            } else {
+                wait_on_timer(&wake, left)
+            });
         };
         match woke {
             Woke::Asked(ask) => {
+                // Later asks for a pass fold into this one; a body ask
+                // waiting behind them is answered before the pass starts.
                 let mut shown = ask == Ask::Sync;
-                while let Ok(more) = wake.try_recv() {
-                    shown |= more == Ask::Sync;
+                while let Ok(request) = wake.try_recv() {
+                    match request {
+                        Request::Body(ask) => bodies.push(ask),
+                        Request::Ask(more) => shown |= more == Ask::Sync,
+                    }
                 }
+                bodies.serve(&config, &store, &account);
                 if shown && !send(SyncKind::Connecting) {
                     return;
                 }
             }
-            Woke::Mail | Woke::Timer => {}
+            Woke::Mail | Woke::Timer | Woke::Body(_) => {}
             Woke::Closed => return,
         }
     }
@@ -271,30 +428,45 @@ fn fill_old_bodies(
     config: &AccountConfig,
     store: &Store,
     account: &Account,
-    wake: &Receiver<Ask>,
+    wake: &Receiver<Request>,
+    bodies: &mut BodyQueue,
+    stored: &dyn Fn(),
 ) -> Option<Woke> {
     let Ok(backend) = config.backend() else {
         return None;
     };
     for _ in 0..BODY_BATCHES_AFTER_PASS {
-        match wake.try_recv() {
-            Ok(ask) => return Some(Woke::Asked(ask)),
-            Err(TryRecvError::Disconnected) => return Some(Woke::Closed),
-            Err(TryRecvError::Empty) => {}
+        if let Some(woke) = queue_bodies(wake, bodies) {
+            return Some(woke);
         }
+        bodies.serve(config, store, account);
         match fetch_missing_bodies(&account.id, backend.as_ref(), store, 1) {
             Ok(0) | Err(_) => break,
-            Ok(_) => {}
+            Ok(_) => stored(),
         }
     }
     None
 }
 
+/// Queue every body ask already sent. `Some` when a pass was asked for or
+/// the window closed meanwhile; body asks before it are queued.
+fn queue_bodies(wake: &Receiver<Request>, bodies: &mut BodyQueue) -> Option<Woke> {
+    loop {
+        match wake.try_recv() {
+            Ok(Request::Ask(ask)) => return Some(Woke::Asked(ask)),
+            Ok(Request::Body(ask)) => bodies.push(ask),
+            Err(TryRecvError::Disconnected) => return Some(Woke::Closed),
+            Err(TryRecvError::Empty) => return None,
+        }
+    }
+}
+
 /// Why the wait between passes ended.
-#[derive(Debug, PartialEq, Eq)]
 enum Woke {
     /// The window asked for a pass now.
     Asked(Ask),
+    /// The window asked for one message's parts.
+    Body(BodyAsk),
     /// IDLE saw INBOX change.
     Mail,
     Timer,
@@ -302,9 +474,10 @@ enum Woke {
     Closed,
 }
 
-fn wait_on_timer(wake: &Receiver<Ask>, delay: Duration) -> Woke {
+fn wait_on_timer(wake: &Receiver<Request>, delay: Duration) -> Woke {
     match wake.recv_timeout(delay) {
-        Ok(ask) => Woke::Asked(ask),
+        Ok(Request::Ask(ask)) => Woke::Asked(ask),
+        Ok(Request::Body(ask)) => Woke::Body(ask),
         Err(RecvTimeoutError::Timeout) => Woke::Timer,
         Err(RecvTimeoutError::Disconnected) => Woke::Closed,
     }
@@ -318,17 +491,22 @@ fn wait_on_inbox(
     store: &Store,
     account: &Account,
     delay: Duration,
-    wake: &Receiver<Ask>,
+    wake: &Receiver<Request>,
     idle: &mut bool,
 ) -> Woke {
     let started = Instant::now();
     let cursor = store.sync_cursor(&account.id).ok().flatten();
     let mut asked = None;
+    let mut body = None;
     let mut closed = false;
     let outcome = config.backend().and_then(|backend| {
         backend.wait_for_change(cursor.as_ref(), delay, &mut || match wake.try_recv() {
-            Ok(ask) => {
+            Ok(Request::Ask(ask)) => {
                 asked = Some(ask);
+                true
+            }
+            Ok(Request::Body(ask)) => {
+                body = Some(ask);
                 true
             }
             Err(TryRecvError::Disconnected) => {
@@ -343,6 +521,9 @@ fn wait_on_inbox(
     }
     if let Some(ask) = asked {
         return Woke::Asked(ask);
+    }
+    if let Some(ask) = body {
+        return Woke::Body(ask);
     }
     match outcome {
         Ok(InboxWait::Changed) => Woke::Mail,
@@ -360,4 +541,81 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod body_queue_tests {
+    use super::*;
+
+    fn ask(id: &str) -> (BodyAsk, oneshot::Receiver<BodyReply>) {
+        let (reply, answer) = oneshot::channel();
+        (
+            BodyAsk {
+                message_id: MessageId::new(id),
+                reply,
+            },
+            answer,
+        )
+    }
+
+    #[test]
+    fn asks_go_in_batches_and_a_gap_serves_only_so_many() {
+        let mut queue = BodyQueue::default();
+        let mut answers = Vec::new();
+        for index in 0..BODIES_BETWEEN_PASSES + 5 {
+            let (body, answer) = ask(&format!("m{index}@x"));
+            queue.push(body);
+            answers.push(answer);
+        }
+        let mut sizes = Vec::new();
+        loop {
+            let batch = queue.take_batch();
+            if batch.is_empty() {
+                break;
+            }
+            sizes.push(batch.len());
+        }
+        assert!(
+            sizes.iter().all(|size| *size <= BODIES_PER_BATCH),
+            "{sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), BODIES_BETWEEN_PASSES);
+        // The rest wait for the next gap.
+        assert_eq!(queue.waiting.len(), 5);
+        queue.new_gap();
+        assert_eq!(queue.take_batch().len(), 5);
+    }
+
+    #[test]
+    fn an_ask_nobody_waits_for_is_dropped() {
+        let mut queue = BodyQueue::default();
+        let (gone, answer) = ask("gone@x");
+        drop(answer);
+        let (kept, _answer) = ask("kept@x");
+        queue.push(gone);
+        queue.push(kept);
+        let batch = queue.take_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].message_id, MessageId::new("kept@x"));
+    }
+
+    #[test]
+    fn only_a_real_answer_is_final() {
+        assert!(body_answer(None).is_err());
+        assert_eq!(body_answer(Some(MessageParts::default())), Ok(false));
+        assert_eq!(
+            body_answer(Some(MessageParts {
+                plain: Some("plain".into()),
+                ..MessageParts::default()
+            })),
+            Ok(false)
+        );
+        let parts = MessageParts {
+            html: Some("<p>x</p>".into()),
+            plain: None,
+            bulk_headers: Vec::new(),
+            mime_parts: Vec::new(),
+        };
+        assert_eq!(body_answer(Some(parts)), Ok(true));
+    }
 }

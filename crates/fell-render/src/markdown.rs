@@ -48,6 +48,7 @@ pub fn markdown_to_document(markdown: &str) -> StyledDocument {
                         &mut stack,
                         Block::Code {
                             text: text.trim_end_matches('\n').to_string(),
+                            large: false,
                         },
                     );
                 }

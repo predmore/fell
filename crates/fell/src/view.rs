@@ -1,12 +1,16 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod disclosure;
+
+use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fell_core::{
-    AccountConfig, AccountId, DropReason, FolderRole, FolderRoles, FolderSpan, ListKey, ThreadId,
+    AccountConfig, AccountId, DropReason, FolderRole, FolderRoles, FolderSpan, ListKey, MessageId,
+    ThreadId,
 };
 use futures::StreamExt;
 use gpui::{
@@ -21,23 +25,28 @@ use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
-use crate::inbox_motion::{InboxMotion, PaneEntry, StatusMotion};
+use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
 use crate::keymap::KeyId;
+use crate::mail_body::{
+    self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
+};
 use crate::mailbox;
 use crate::model::{
     DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, Session, Step, SyncKind, Toast, row_key,
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
-use crate::present::{self, ConvMessage, Pane, ThreadRow};
+use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
     LandingHold, LayoutProbe, LayoutSlot, Reveal, RevealPhase, ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
-use crate::sync_worker::{self, SyncHandle};
+use crate::sync_worker::{self, SyncEvent, SyncHandle};
 use crate::text_cut;
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
+
+use self::disclosure::disclosure;
 
 pub fn run() {
     Application::new().run(|cx: &mut App| {
@@ -78,6 +87,8 @@ struct ReadIntent {
     /// The folder on screen changed. A failure goes back to `list_folder`; a
     /// selected thread missing from the new folder gives way to the first row.
     switch: bool,
+    /// Sync changed a body. Read it after the list resolves the thread key.
+    refresh_open: bool,
     /// Archive, move, or undo wrote to the store. Scroll to the selection
     /// instead of holding the viewport still.
     changed: bool,
@@ -91,6 +102,7 @@ struct ReadIntent {
 impl ReadIntent {
     fn merge(mut self, later: ReadIntent) -> ReadIntent {
         self.switch |= later.switch;
+        self.refresh_open |= later.refresh_open;
         self.changed |= later.changed;
         self.select = later.select.or(self.select);
         self.fetch = self.fetch.merge(later.fetch);
@@ -202,7 +214,7 @@ struct Inbox {
     /// once the new bodies are laid out.
     reveal: Reveal,
     /// Latest body-only read, applied together with its scroll correction.
-    body_refresh: Option<BodyRefresh>,
+    body_refresh: BodyRefresh,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
     /// Thread `m` just moved. `u` selects it again when it returns to this folder.
@@ -251,7 +263,20 @@ struct Inbox {
     warm: Option<Warm>,
     /// The folder the last rows were read ahead for.
     warmed_folder: Option<String>,
+    /// Prepared HTML bodies by message id, so reopening prepares nothing.
+    bodies: BodyCache,
+    /// Body revisions to load for the current conversation and work in flight.
+    body_loads: BodyLoads,
+    /// Messages whose parts were asked of sync, and what came back.
+    bodies_asked: BodyAsks,
+    /// The reader's message to hold at the top of the conversation until
+    /// they scroll it. See [`Inbox::hold_landing`].
+    landing: Option<String>,
 }
+
+/// Room kept for a body that is still being prepared: a short paragraph, so
+/// a reply does not leave a hole and a newsletter grows only downward.
+const PENDING_BODY_PX: f32 = 66.0;
 
 /// What a `G` will show, read ahead: the folder's last rows and the
 /// conversation of the last one.
@@ -317,7 +342,7 @@ impl Inbox {
             open_thread: None,
             open_subject: String::new(),
             reveal: Reveal::Waiting,
-            body_refresh: None,
+            body_refresh: BodyRefresh::default(),
             conv_layout_current: false,
             moved_thread: None,
             sync: None,
@@ -338,6 +363,10 @@ impl Inbox {
             frames: FrameLog::from_env(),
             warm: None,
             warmed_folder: None,
+            bodies: BodyCache::default(),
+            body_loads: BodyLoads::default(),
+            bodies_asked: BodyAsks::default(),
+            landing: None,
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -398,23 +427,42 @@ impl Inbox {
                 let alive = this
                     .update(cx, |inbox, cx| {
                         let kind = match event {
-                            sync_worker::SyncEvent::Status(kind) => kind,
-                            sync_worker::SyncEvent::FlagsChanged => {
-                                inbox.request_threads(ReadIntent::default(), cx);
-                                return;
-                            }
-                            sync_worker::SyncEvent::NotSent(not_sent) => {
+                            SyncEvent::Status(kind) => kind,
+                            SyncEvent::NotSent(not_sent) => {
                                 let text = not_sent_notice(&inbox.session, &not_sent);
                                 inbox.session.show_toast(text, true);
                                 cx.notify();
                                 return;
                             }
+                            // Refresh the open thread when either its parts
+                            // or its read and star state may have changed.
+                            SyncEvent::BodiesStored | SyncEvent::FlagsChanged => {
+                                inbox.request_threads(
+                                    ReadIntent {
+                                        refresh_open: true,
+                                        ..ReadIntent::default()
+                                    },
+                                    cx,
+                                );
+                                return;
+                            }
                         };
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
                             || matches!(kind, SyncKind::Synced { stored, .. } if stored > 0);
+                        if matches!(kind, SyncKind::Synced { .. }) {
+                            // Sync is answering again: asks that failed
+                            // while it was not can go now.
+                            inbox.bodies_asked.retry_failed();
+                        }
                         inbox.session.sync = kind;
                         if wrote {
-                            inbox.request_threads(ReadIntent::default(), cx);
+                            inbox.request_threads(
+                                ReadIntent {
+                                    refresh_open: true,
+                                    ..ReadIntent::default()
+                                },
+                                cx,
+                            );
                         }
                         cx.notify();
                     })
@@ -430,7 +478,7 @@ impl Inbox {
     /// Reread the folder on screen on the store thread. While one read is in
     /// flight, further requests merge into a single follow-up, so a burst of
     /// sync batches is one read and never a queue.
-    fn request_threads(&mut self, intent: ReadIntent, cx: &mut Context<Self>) {
+    fn request_threads(&mut self, mut intent: ReadIntent, cx: &mut Context<Self>) {
         // A sync refresh in flight does not make the reader wait: their read
         // starts now on the interactive lane, and the refresh is dropped
         // when it lands. This read sees everything the refresh would have.
@@ -442,6 +490,8 @@ impl Inbox {
             });
             return;
         }
+        // An interactive read that replaces a refresh picks up its body reread.
+        intent.refresh_open |= supersede;
         self.read_in_flight = true;
         self.refresh_in_flight = intent.is_refresh();
         self.read_gen += 1;
@@ -557,6 +607,10 @@ impl Inbox {
             return;
         }
         let follow_up_pending = wanted.is_some();
+        let wanted = wanted.map(|mut next| {
+            next.refresh_open |= intent.refresh_open;
+            next
+        });
         self.show_threads(folder, result, intent, follow_up_pending, cx);
         // Only sync wrote while that read ran. Show it first, then read once
         // more, so a fast sync cannot starve the list.
@@ -720,7 +774,7 @@ impl Inbox {
         // folder refresh the opportunity to resolve the open thread's key
         // before starting another body-only read.
         let new_selection = open_changed && self.session.cursor_id.is_some();
-        let refresh_open = open_changed || grew || waiting;
+        let refresh_open = open_changed || grew || waiting || intent.refresh_open;
         if new_selection
             || self.session.cursor_draft().is_some()
             || (refresh_open && !follow_up_pending)
@@ -875,7 +929,7 @@ impl Inbox {
             }
             Some(mut warm) => {
                 let conv_width = if show_list && show_conv {
-                    (width - list_width(width, self.split)).max(120.0)
+                    width - list_width(width, self.split) - SPLITTER_PX
                 } else {
                     width
                 };
@@ -1176,6 +1230,7 @@ impl Inbox {
         if let Some(draft) = self.session.cursor_draft() {
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
+            self.body_loads.clear();
             let shown = self
                 .drafts
                 .iter()
@@ -1207,6 +1262,7 @@ impl Inbox {
         let names = self.session.folders.clone();
         let viewing = self.session.folder.clone();
         let thread = id.clone();
+        let cached = self.bodies.stamps();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
                 return None;
@@ -1218,6 +1274,10 @@ impl Inbox {
                     &ThreadId(thread),
                     (&me, &roles, &names, &viewing),
                 )
+                .map(|mut view| {
+                    let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
+                    (view, reads)
+                })
                 .map_err(|err| err.to_string()),
             )
         });
@@ -1233,7 +1293,7 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok(view) if view.is_empty() && !inbox.session.messages.is_empty() => {
+                    Ok((view, _)) if view.is_empty() && !inbox.session.messages.is_empty() => {
                         // The open thread key can disappear between the folder
                         // and message reads. Keep the conversation until a
                         // folder read confirms where its messages belong.
@@ -1241,34 +1301,20 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                     }
-                    Ok(view) => {
+                    Ok((mut view, reads)) => {
+                        inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
-                        // Sync can rekey the thread as bodies arrive. An
-                        // ordered match of its messages is still an in-place read.
-                        let filled = if same || !view.is_empty() {
-                            present::bodies_filled(&inbox.session.messages, &view)
-                        } else {
-                            None
-                        };
-                        let follow = if let Some(changed) = filled {
-                            // An unchanged body can still come with new folder
-                            // or header information. Apply that read as well.
-                            if !changed.is_empty() {
-                                inbox.reveal.body_changed(
-                                    inbox.conv_layout_current
-                                        && present::conversation_fits(f32::from(
-                                            inbox.conv_scroll.max_offset().height,
-                                        )),
-                                );
-                            }
-                            let ids = changed.iter().map(|at| view[*at].id.clone()).collect();
-                            inbox.body_refresh = Some(BodyRefresh {
-                                messages: view,
-                                ids,
-                            });
+                        // Sync may rekey the thread as its bodies arrive.
+                        // A read of the same messages still belongs to the reader.
+                        let in_place = (same || !view.is_empty())
+                            && present::same_messages(&inbox.session.messages, &view);
+                        let follow = if in_place {
+                            inbox.keep_shown_text(&mut view);
+                            inbox.queue_conversation_refresh(view);
                             false
                         } else if same {
+                            inbox.keep_shown_text(&mut view);
                             let bottom = inbox.conversation_at_bottom();
                             inbox.invalidate_conversation_layout();
                             inbox.session.refresh_messages(view, bottom)
@@ -1276,7 +1322,12 @@ impl Inbox {
                             inbox.invalidate_conversation_layout();
                             inbox.reveal = Reveal::Waiting;
                             inbox.motion.show_thread(&mut inbox.session, view);
-                            true
+                            // A new thread starts at the top of the reader's
+                            // message. Scrolling only far enough to show its
+                            // end would cut the row above it, or its header
+                            // when it is tall. A thread that fits stays put.
+                            inbox.land_on_reader();
+                            false
                         };
                         inbox.mark_open(id);
                         if follow {
@@ -1295,6 +1346,197 @@ impl Inbox {
             });
         })
         .detach();
+    }
+
+    /// Keep an existing body visible while its stored HTML is prepared.
+    fn keep_shown_text(&self, view: &mut [ConvMessage]) {
+        for message in view.iter_mut().filter(|m| m.rich == Rich::Pending) {
+            if let Some(old) = self
+                .session
+                .messages
+                .iter()
+                .find(|old| old.id == message.id)
+                && old.body_state == fell_core::BodyState::Stored
+                && message.body_state == fell_core::BodyState::Stored
+                && old.rich != Rich::Pending
+            {
+                message.rich = old.rich.clone();
+            }
+        }
+    }
+
+    fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>) {
+        // Newly downloaded bodies can push the latest message below a short
+        // pane. An already scrollable pane keeps the reader where they are.
+        let downloaded = self
+            .session
+            .messages
+            .iter()
+            .zip(&messages)
+            .any(|(old, new)| {
+                old.body_state == fell_core::BodyState::Pending && old.body_state != new.body_state
+            });
+        if downloaded {
+            self.reveal.body_changed(
+                self.conv_layout_current
+                    && present::conversation_fits(f32::from(self.conv_scroll.max_offset().height)),
+            );
+        }
+        self.body_refresh.messages = Some(messages);
+        // The new store read already consulted the cache at its accepted revision.
+        self.body_refresh.rich.clear();
+    }
+
+    /// Prepare one body on the background executor. It lands in the cache
+    /// and, if its thread is still open, fades in under its header.
+    fn prepare_body(&mut self, job: BodyJob, load: BodyLoad, cx: &mut Context<Self>) {
+        let task = cx.background_executor().spawn(async move { job.prepare() });
+        cx.spawn(async move |this, cx| {
+            let prepared = task.await;
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.body_loads.finish(&prepared.id, load) {
+                    inbox.body_ready(prepared);
+                }
+                // A stale completion has freed the slot for a newer revision.
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn body_ready(&mut self, prepared: PreparedBody) {
+        let rich = prepared.rich();
+        self.bodies.insert(&prepared);
+        self.body_refresh.rich.insert(prepared.id, rich);
+    }
+
+    /// Show the stored text for `id` from now on if it has no prepared body.
+    fn body_is_plain(&mut self, id: &str) {
+        let messages = self
+            .body_refresh
+            .messages
+            .as_deref()
+            .unwrap_or(&self.session.messages);
+        if messages.iter().any(|message| {
+            message.id == id && matches!(message.rich, Rich::Pending | Rich::Missing)
+        }) {
+            self.body_refresh.rich.insert(id.to_owned(), Rich::Plain);
+        }
+    }
+
+    /// Read and prepare the body of every open message that still needs it,
+    /// and ask sync for parts that were never stored. Runs before each frame
+    /// is built, so any way of opening a message (a key, a click, a reread
+    /// that keeps it open) starts its body.
+    fn want_bodies(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut read = Vec::new();
+        let mut fetch = Vec::new();
+        for message in self.session.messages.iter().filter(|m| m.expanded) {
+            if let Some(load) = self.body_loads.begin(&message.id) {
+                read.push((message.id.clone(), load, message.mail_headers.clone()));
+            } else if message.rich == Rich::Missing
+                && message.body_state == fell_core::BodyState::Stored
+                && self.sync.is_some()
+                && self.bodies_asked.should_ask(&message.id, now)
+            {
+                fetch.push(message.id.clone());
+            }
+        }
+        for id in fetch {
+            self.fetch_body(id, cx);
+        }
+        if read.is_empty() {
+            return;
+        }
+        let pending: Vec<_> = read
+            .iter()
+            .map(|(id, load, _)| (id.clone(), *load))
+            .collect();
+        let account = self.account_id.clone();
+        let reply = self.store.call(move |store| {
+            read.into_iter()
+                .map(|(id, load, headers)| {
+                    mail_body::read_job_at_stamp(store, &account, &id, load.stamp, &headers)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let mut jobs = reply.await.unwrap_or_default().into_iter();
+            let _ = this.update(cx, |inbox, cx| {
+                let mut reread = false;
+                for (id, load) in pending {
+                    match jobs.next() {
+                        Some(Ok(Some(job))) if inbox.body_loads.is_wanted(&id, load) => {
+                            inbox.prepare_body(job, load, cx);
+                        }
+                        result if inbox.body_loads.finish(&id, load) => {
+                            inbox.body_is_plain(&id);
+                            reread |= matches!(result, Some(Ok(None)));
+                        }
+                        _ => {}
+                    }
+                }
+                if reread {
+                    inbox.reread_open_thread(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask the sync thread for one message's parts. Until they come the
+    /// stored text shows. A real answer is kept for the session; an error
+    /// (sync not started, no connection) is asked again after a while.
+    /// Parts that come are stored, so the open thread is read again and
+    /// their HTML fades in over the text.
+    fn fetch_body(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(sync) = &self.sync else {
+            return;
+        };
+        self.bodies_asked.asking(&id);
+        let answer = sync.fetch_body(MessageId(id.clone()));
+        cx.spawn(async move |this, cx| {
+            let reply = answer.await;
+            let _ = this.update(cx, |inbox, cx| {
+                match reply {
+                    Ok(Ok(has_html)) => {
+                        inbox.bodies_asked.answered(&id);
+                        if has_html {
+                            inbox.reread_open_thread(cx);
+                        } else {
+                            for message in &mut inbox.session.messages {
+                                if message.id == id && message.rich == Rich::Missing {
+                                    message.rich = Rich::Plain;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        inbox.bodies_asked.failed(&id, Instant::now());
+                        // Ask again once the wait is over, even if nothing
+                        // else redraws the window by then.
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(mail_body::ASK_AGAIN_AFTER)
+                                .await;
+                            let _ = this.update(cx, |_, cx| cx.notify());
+                        })
+                        .detach();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read the open thread again, for parts that were written since.
+    fn reread_open_thread(&mut self, cx: &mut Context<Self>) {
+        if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
+            self.request_messages(true, cx);
+        }
     }
 
     /// Run a mailbox change on the store thread, then reread the folder.
@@ -1935,6 +2177,7 @@ impl Inbox {
     }
 
     fn clear_open_message(&mut self) {
+        self.body_loads.clear();
         self.invalidate_conversation_layout();
         self.session.messages.clear();
         self.open_thread = None;
@@ -2192,32 +2435,35 @@ impl Inbox {
 
     fn reader_took_over(&mut self, selected: bool) {
         self.reveal = Reveal::Reading { selected };
+        self.release_landing();
     }
 
     fn invalidate_conversation_layout(&mut self) {
-        self.body_refresh = None;
+        self.body_refresh = BodyRefresh::default();
+        self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
     }
 
-    fn apply_body_refresh(&mut self) -> Option<ScrollAnchor> {
-        // Let a keyboard glide finish in the geometry it was calculated
-        // from. Capture from its landing offset, or from the latest wheel
-        // or key position if the reader took over before this frame.
-        if self.motion.conv_glide.is_some() {
+    fn apply_body_refresh(&mut self, now: Instant) -> Option<ScrollAnchor> {
+        // Let a keyboard glide finish in the geometry it was calculated from.
+        if self.motion.conv_glide.is_some() || self.body_refresh.is_empty() {
             return None;
         }
-        let refresh = self.body_refresh.take()?;
+        let refresh = std::mem::take(&mut self.body_refresh);
+        if self.reveal.pending() || !refresh.rich.is_empty() {
+            self.reveal.body_changed(false);
+        }
+        if self.reveal.pending() {
+            self.release_landing();
+        }
         let anchor = if self.conv_layout_current {
             self.reveal
                 .body_anchor(&self.conv_scroll, self.session.message_cursor)
         } else {
             None
         };
-        self.session.fill_bodies(refresh.messages);
-        if !refresh.ids.is_empty() {
-            self.motion.bodies_filled(refresh.ids);
-        }
+        refresh.apply(&mut self.session, &mut self.motion, now);
         anchor
     }
 
@@ -2254,12 +2500,47 @@ impl Inbox {
         }
     }
 
+    /// Bring the reader's message to the top of the viewport. Scrolling
+    /// only far enough to show it would pin a tall message by its end and
+    /// hide its header.
     fn scroll_conversation(&mut self) {
         self.conv_layout_current = false;
         if !self.session.messages.is_empty() {
             self.motion.conv_glide = None;
-            self.conv_scroll.scroll_to_item(self.session.message_cursor);
+            self.land_on_reader();
         }
+    }
+
+    /// Put the reader's message at the top of the viewport and keep it
+    /// there while the conversation lays out: [`LandingHold`] sets the
+    /// offset from each frame's own layout, before it paints.
+    fn land_on_reader(&mut self) {
+        self.landing = self
+            .session
+            .messages
+            .get(self.session.message_cursor)
+            .map(|message| message.id.clone());
+    }
+
+    /// Hold this message until the reader scrolls or moves to another one.
+    fn hold_landing(&mut self) -> Option<ScrollAnchor> {
+        let index = self.session.message_cursor;
+        let current = self
+            .session
+            .messages
+            .get(index)
+            .map(|message| message.id.as_str());
+        if self.landing.as_deref() != current {
+            self.release_landing();
+        }
+        self.landing
+            .as_ref()
+            .map(|_| ScrollAnchor { index, y: px(0.) })
+    }
+
+    /// The reader took over: stop holding their message in place.
+    fn release_landing(&mut self) {
+        self.landing = None;
     }
 
     /// `j`/`k` in the conversation: glide to the message, by the rule
@@ -2277,7 +2558,9 @@ impl Inbox {
         let target = if top + offset < f32::from(view.top()) {
             f32::from(view.top()) - top
         } else if bottom + offset > f32::from(view.bottom()) {
-            f32::from(view.bottom()) - bottom
+            // Show its end, but never scroll its header off the top: a
+            // message taller than the viewport is read from its start.
+            (f32::from(view.bottom()) - bottom).max(f32::from(view.top()) - top)
         } else {
             offset
         };
@@ -2441,6 +2724,8 @@ impl Inbox {
 
 impl Render for Inbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.bodies
+            .release_unused_images(|image| cx.drop_image(image, Some(window)));
         let real = Instant::now();
         // Motion time: a frame the compositor held back moves what is
         // moving one step on, not to its end.
@@ -2449,14 +2734,21 @@ impl Render for Inbox {
         let width = f32::from(window.viewport_size().width);
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
         self.advance_glides(now, window.scale_factor());
-        let anchor = self.apply_body_refresh();
+        let anchor = self.apply_body_refresh(now);
+        self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
         let viewport_h = f32::from(window.viewport_size().height);
         self.motion
             .fit_card(card_fit(&self.session, viewport_h), now);
-        if self.body_refresh.is_none() {
+        if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
+        let conv = ConvFrame {
+            alphas: self.motion.body_alphas(now),
+            disclosures: self.motion.disclosures(&self.session, now),
+            anchor: self.hold_landing().or(anchor),
+            frames: self.frames.clone(),
+        };
         self.conv_layout_current = panes.1;
         let animating = self.motion.tick(now) | self.row_widths.running(now);
         if animating {
@@ -2518,8 +2810,7 @@ impl Render for Inbox {
                 leaving,
                 warm,
                 card,
-                anchor,
-                frames: frames.clone(),
+                conv,
             },
             width,
             split,
@@ -2570,6 +2861,17 @@ struct Shown {
     /// The folder the rows on screen come from. The header names it, so
     /// after `gs` its name and count change in the frame the rows do.
     folder: String,
+    /// What the conversation's bodies animate this frame.
+    conv: ConvFrame,
+}
+
+/// What the conversation's bodies show this frame beyond the session.
+#[derive(Default)]
+struct ConvFrame {
+    /// Bodies fading in, by message id: their opacity.
+    alphas: HashMap<String, f32>,
+    disclosures: Disclosures,
+    /// The message held at its previous viewport position, or at the top on open.
     anchor: Option<ScrollAnchor>,
     frames: Option<SharedFrameLog>,
 }
@@ -2638,13 +2940,9 @@ fn shell(
         leaving,
         warm,
         card,
-        anchor,
-        frames,
+        conv,
     } = shown;
-    let conv_frame = ConvFrame {
-        anchor,
-        frames: frames.as_ref(),
-    };
+    let frames = conv.frames.clone();
     let mut subject = Some(subject);
     // A narrow window's pane that a key just swapped out stays beneath the
     // one coming in, where it was, full width. The incoming pane is drawn
@@ -2668,7 +2966,7 @@ fn shell(
                 width,
                 // Paint only: the shield over it takes the pointer too.
                 Live(false),
-                &conv_frame,
+                &conv,
                 window,
                 cx,
             ),
@@ -2787,7 +3085,7 @@ fn shell(
                 })
                 .when(show_conv, |row| {
                     let conv_width = if show_list {
-                        (width - list_width).max(120.0)
+                        width - list_width - SPLITTER_PX
                     } else {
                         width
                     };
@@ -2801,7 +3099,7 @@ fn shell(
                             Some(conv_scroll),
                             conv_width,
                             Live(true),
-                            &conv_frame,
+                            &conv,
                             window,
                             cx,
                         ),
@@ -3743,10 +4041,12 @@ fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
         )
 }
 
+const SPLITTER_PX: f32 = 7.;
+
 fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
     div()
         .id("split")
-        .w(px(7.))
+        .w(px(SPLITTER_PX))
         .h_full()
         .flex_none()
         .flex()
@@ -3765,15 +4065,49 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
         .child(div().w(px(1.)).h_full().bg(rgb(theme.border)))
 }
 
+const CONVERSATION_RULE_PX: f32 = 2.;
+const CONVERSATION_PAD_PX: f32 = 20.;
+const MESSAGE_PAD_PX: f32 = 8.;
+
+/// The latest reread and accepted HTML preparations for the open thread.
+#[derive(Default)]
 struct BodyRefresh {
-    messages: Vec<ConvMessage>,
-    ids: Vec<String>,
+    messages: Option<Vec<ConvMessage>>,
+    rich: HashMap<String, Rich>,
 }
 
-#[derive(Default)]
-struct ConvFrame<'a> {
-    anchor: Option<ScrollAnchor>,
-    frames: Option<&'a SharedFrameLog>,
+impl BodyRefresh {
+    fn is_empty(&self) -> bool {
+        self.messages.is_none() && self.rich.is_empty()
+    }
+
+    fn apply(self, session: &mut Session, motion: &mut InboxMotion, now: Instant) {
+        let mut rich = self.rich;
+        if let Some(mut messages) = self.messages {
+            for message in &mut messages {
+                if let Some(ready) = rich.remove(&message.id) {
+                    message.rich = ready;
+                }
+            }
+            let changed = present::bodies_filled(&session.messages, &messages)
+                .expect("a queued reread keeps the same message order");
+            for index in changed {
+                motion.body_arrived(&messages[index].id, now);
+            }
+            session.refresh_same_messages(messages);
+        } else {
+            for message in &mut session.messages {
+                if let Some(ready) = rich.remove(&message.id)
+                    && ready != message.rich
+                {
+                    if message.expanded {
+                        motion.body_arrived(&message.id, now);
+                    }
+                    message.rich = ready;
+                }
+            }
+        }
+    }
 }
 
 /// One thread's messages as the conversation shows them, with whether
@@ -3810,7 +4144,7 @@ fn conversation(
     scroll: Option<ScrollHandle>,
     conv_width: f32,
     live: Live,
-    frame: &ConvFrame<'_>,
+    frame: &ConvFrame,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -3829,17 +4163,8 @@ fn conversation(
             } else {
                 0.0
             };
-            let body = motion.body_opacity(&message.id, now);
             let block = message_block(
-                theme,
-                session,
-                message,
-                index,
-                (cursor, body),
-                conv_width,
-                live,
-                window,
-                cx,
+                theme, session, message, index, cursor, conv_width, live, frame, window, cx,
             );
             if let Some((anchor, probe)) = &hold
                 && anchor.index == index
@@ -3862,7 +4187,7 @@ fn conversation(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .border_l(px(2.))
+        .border_l(px(CONVERSATION_RULE_PX))
         .border_color(rgb(motion::mix(
             theme.background,
             theme.accent,
@@ -3895,7 +4220,7 @@ fn conversation(
                     Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
                     None => body.overflow_hidden(),
                 })
-                .px(px(20.))
+                .px(px(CONVERSATION_PAD_PX))
                 .pb(px(28.))
                 .when(arrival < 1.0, |body| body.opacity(arrival))
                 .children(messages)
@@ -3906,7 +4231,7 @@ fn conversation(
                     probe,
                     scroll,
                     y: anchor.y,
-                    frames: frame.frames.cloned(),
+                    frames: frame.frames.clone(),
                 }
                 .into_any_element(),
                 _ => body,
@@ -3914,26 +4239,35 @@ fn conversation(
         })
 }
 
-/// `shown`: how much the card shows the message cursor, and how much its
-/// body shows (a body sync just filled in fades in), each 0 to 1.
 #[allow(clippy::too_many_arguments)]
 fn message_block(
     theme: &Theme,
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    shown: (f32, f32),
+    cursor: f32,
     conv_width: f32,
     live: Live,
+    frame: &ConvFrame,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     if message.expanded {
         expanded_message(
-            theme, session, message, index, shown, conv_width, live, window, cx,
+            theme, session, message, index, cursor, conv_width, live, frame, window, cx,
         )
     } else {
-        collapsed_message(theme, message, index, shown, conv_width, live, window, cx)
+        let body = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
+        collapsed_message(
+            theme,
+            message,
+            index,
+            (cursor, body),
+            conv_width,
+            live,
+            window,
+            cx,
+        )
     }
 }
 
@@ -4021,17 +4355,19 @@ fn expanded_message(
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    (cursor, body): (f32, f32),
+    cursor: f32,
     conv_width: f32,
     live: Live,
+    frame: &ConvFrame,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let quotes = session.is_open(index);
+    let body_width =
+        (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.);
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
-        .px(px(8.))
+        .px(px(MESSAGE_PAD_PX))
         .py(px(10.))
         .mb(px(8.))
         .rounded_md()
@@ -4084,8 +4420,17 @@ fn expanded_message(
                 ),
         )
         .children(message.recipients.as_ref().map(|line| {
-            let open = session.recipients_are_open(index);
-            recipient_lines(theme, line, open, index, conv_width, live, window, cx)
+            recipient_lines(
+                theme,
+                line,
+                session.recipients_are_open(index),
+                frame.disclosures.recipients.get(&message.id).copied(),
+                index,
+                body_width.min(680.),
+                live,
+                window,
+                cx,
+            )
         }))
         // What a draft answers, under who it goes to, as in its window.
         .children(message.context.as_ref().map(|line| {
@@ -4099,51 +4444,429 @@ fn expanded_message(
                 .truncate()
                 .child(line.clone())
         }))
-        .children(present::missing_body_line(message.body_state).map(|line| {
-            // Body text's place and height, dimmed, so the body that comes
-            // fades in over the same spot.
-            div()
-                .max_w(px(680.))
-                .pb(px(8.))
-                .line_height(px(theme.ui_px * 1.45))
-                .text_color(rgb(dim))
-                .child(line)
-        }))
-        // Always wrapped, so a fade starting or ending moves nothing.
-        .child(
-            div()
-                .when(body < 1.0, |blocks| blocks.opacity(body))
-                .children({
-                    // `q` opens every collapsed block in the message at once, so
-                    // only the first one names the key.
-                    // The recipient line comes first and names the key itself.
-                    let first_hidden = message
-                        .body
-                        .blocks
-                        .iter()
-                        .position(|block| {
-                            matches!(block, BodyBlock::Quote(_) | BodyBlock::Signature(_))
+        // `q` opens every collapsed block in the message at once, so only
+        // the first fold of the reader's message names the key.
+        .child(message_body(
+            theme,
+            message,
+            FoldView {
+                open: session.is_open(index),
+                width: body_width,
+                name_key: index == session.message_cursor,
+                focused: cursor,
+                index,
+                live: live.0,
+            },
+            frame,
+            cx,
+        ))
+        .into_any_element()
+}
+
+/// How one message's folds paint.
+#[derive(Clone, Copy)]
+struct FoldView {
+    /// `q` has opened them.
+    open: bool,
+    width: f32,
+    /// The first fold names `q`: this is the reader's message.
+    name_key: bool,
+    /// How much the message shows the cursor in the focused
+    /// conversation, 0 to 1: the fold `q` acts on takes the accent with it.
+    focused: f32,
+    index: usize,
+    /// Drawn on screen, not as an unseen copy: a click opens the fold.
+    live: bool,
+}
+
+/// Height a folded line takes, its margin included.
+const FOLD_ROW_PX: f32 = 34.0;
+const FOLD_GAP_PX: f32 = 6.0;
+
+/// The body under an expanded message's header: prepared HTML, the stored
+/// text, or the room kept while the HTML is prepared.
+fn message_body(
+    theme: &Theme,
+    message: &ConvMessage,
+    folds: FoldView,
+    frame: &ConvFrame,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let alpha = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
+    if let Some(line) = present::missing_body_line(message.body_state) {
+        return div()
+            .pb(px(8.))
+            .line_height(px(theme.ui_px * 1.45))
+            .text_color(rgb(theme.dimmed))
+            .opacity(alpha)
+            .child(line)
+            .into_any_element();
+    }
+    let reveal = frame.disclosures.quotes.get(&message.id).copied();
+    let blocks: Vec<gpui::AnyElement> = match &message.rich {
+        Rich::Html(body) => html_sections(theme, body, folds, reveal, cx),
+        Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
+        Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
+            // A signature and the quote next to it fold as one, as in HTML.
+            // A draft's markdown is painted as its compose window shows it.
+            let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
+            let mut drafts: HashMap<usize, gpui::AnyElement> = HashMap::new();
+            let body = match &message.rich {
+                Rich::PlainPart(plain) => plain,
+                _ => &message.body,
+            };
+            for (at, block) in body.blocks.iter().enumerate() {
+                let (kind, text) = match block {
+                    BodyBlock::Text(text) => (None, text.as_str()),
+                    BodyBlock::Markdown { doc, agent } => {
+                        drafts.insert(
+                            at,
+                            crate::compose_ui::render_draft_doc(doc, *agent, theme)
+                                .into_any_element(),
+                        );
+                        runs.push((at, None, Vec::new()));
+                        continue;
+                    }
+                    BodyBlock::Quote(text) => (Some(fell_render::Fold::Quote), text.as_str()),
+                    BodyBlock::Signature(text) => {
+                        (Some(fell_render::Fold::Signature), text.as_str())
+                    }
+                };
+                match (runs.last_mut(), kind) {
+                    (Some((_, Some(above), texts)), Some(next)) => {
+                        *above = joined_fold(*above, next);
+                        texts.push(text);
+                    }
+                    _ => runs.push((at, kind, vec![text])),
+                }
+            }
+            let first_hidden = runs
+                .iter()
+                .position(|(_, kind, _)| kind.is_some())
+                .filter(|_| folds.name_key);
+            runs.into_iter()
+                .enumerate()
+                .map(|(run, (at, kind, texts))| match kind {
+                    None => div()
+                        .max_w(px(READING_MEASURE_PX))
+                        .pb(px(8.))
+                        .line_height(px(theme.ui_px * 1.45))
+                        .map(|text| match drafts.remove(&at) {
+                            Some(draft) => text.child(draft),
+                            None => text.child(texts.concat()),
                         })
-                        .filter(|_| message.recipients.is_none());
-                    message
-                        .body
-                        .blocks
-                        .iter()
-                        .enumerate()
-                        .map(|(at, block)| {
-                            body_block(
-                                theme,
-                                block,
-                                quotes,
-                                Some(at) == first_hidden,
-                                index,
-                                live,
-                                cx,
+                        .into_any_element(),
+                    Some(kind) => {
+                        let text = texts.join("\n\n");
+                        let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+                        let line_height = px(theme.ui_px * 1.4);
+                        fold_section(
+                            theme,
+                            FoldLabel {
+                                kind,
+                                lines,
+                                show_key: Some(run) == first_hidden,
+                                rtl: crate::render::is_right_to_left(&text),
+                            },
+                            folds,
+                            reveal,
+                            move || {
+                                div()
+                                    .max_w(px(READING_MEASURE_PX - HISTORY_INDENT_PX))
+                                    .line_height(line_height)
+                                    .child(text)
+                                    .into_any_element()
+                            },
+                            cx,
+                        )
+                    }
+                })
+                .collect()
+        }
+    };
+    div().opacity(alpha).children(blocks).into_any_element()
+}
+
+/// Longest line of mail text, about 72 characters: past it the eye loses
+/// its place going back to the next line.
+const READING_MEASURE_PX: f32 = 600.;
+
+/// A prepared HTML body, one section at a time: what the sender wrote is
+/// painted; quoted history and the signature fold to one line until `q`.
+fn html_sections(
+    theme: &Theme,
+    body: &HtmlBody,
+    folds: FoldView,
+    reveal: Option<f32>,
+    cx: &mut Context<Inbox>,
+) -> Vec<gpui::AnyElement> {
+    let palette = mail_body::palette(theme);
+    let quiet = mail_body::history_palette(theme);
+    let line = px(theme.ui_px * 1.45);
+    let folded = &body.folded;
+    let first_fold = folded
+        .sections
+        .iter()
+        .position(|section| section.fold.is_some())
+        .filter(|_| folds.name_key);
+    folded
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(at, section)| {
+            let rtl = body.rtl.get(at).copied().unwrap_or(false);
+            let width = if rtl {
+                folds.width.min(READING_MEASURE_PX)
+            } else {
+                folds.width
+            };
+            match section.fold {
+                // A quote the sender answers under it: open, under the
+                // history rule, in the dimmed colour.
+                // A quote the sender answers sits a step apart from the
+                // answers around it, closer than two paragraphs.
+                None if section.quoted => div()
+                    .pt(px(8.))
+                    .pb(px(16.))
+                    .when(rtl, |quote| quote.max_w(px(READING_MEASURE_PX)))
+                    .child(
+                        history_rule(div(), rtl, crate::theme::strong_border(theme))
+                            .text_color(rgb(theme.dimmed))
+                            .child(history_blocks(
+                                folded.blocks(section),
+                                None,
+                                &quiet,
+                                &body.gallery,
+                                (theme, rtl, width),
+                            )),
+                    )
+                    .into_any_element(),
+                // A short signature shown in place ("Sent from my iPhone")
+                // is the dimmed colour, as history is.
+                None => div()
+                    .pb(px(8.))
+                    .when(rtl, |open| open.max_w(px(READING_MEASURE_PX)))
+                    // A paragraph's gap above it, and the dimmed colour.
+                    .when(section.quiet, |quiet| {
+                        quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
+                    })
+                    .child(
+                        crate::render::blocks_column_spaced(
+                            folded.blocks(section),
+                            if section.quiet { &quiet } else { &palette },
+                            false,
+                            &body.gallery,
+                            width,
+                            crate::render::BLOCK_GAP,
+                            (!rtl).then_some(READING_MEASURE_PX),
+                        )
+                        .line_height(line),
+                    )
+                    .into_any_element(),
+                Some(kind) => {
+                    let history = mail_body::history_palette(theme);
+                    fold_section(
+                        theme,
+                        FoldLabel {
+                            kind,
+                            lines: body.fold_lines.get(at).copied().unwrap_or(0),
+                            show_key: Some(at) == first_fold,
+                            rtl,
+                        },
+                        folds,
+                        reveal,
+                        || {
+                            history_blocks(
+                                body.folded.blocks(section),
+                                Some(kind),
+                                &history,
+                                &body.gallery,
+                                (theme, rtl, width),
                             )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-        )
+                        },
+                        cx,
+                    )
+                }
+            }
+        })
+        .collect()
+}
+
+/// Space between a history rule and the text it marks.
+const HISTORY_INDENT_PX: f32 = 12.0;
+
+/// The 2 px rule history hangs off, with its 10 px indent: on the left, or
+/// on the right of text written right to left.
+fn history_rule(block: gpui::Div, rtl: bool, color: u32) -> gpui::Div {
+    let block = block.border_color(rgb(color));
+    if rtl {
+        block.pr(px(10.)).border_r(px(2.))
+    } else {
+        block.pl(px(10.)).border_l(px(2.))
+    }
+}
+
+/// History under its rule. A quote's own rule is the section's, so it is
+/// not drawn again, except where a signature shares the fold: there the
+/// quote keeps a rule of its own inside, so the sender's signature and the
+/// mail it answers read as two things. History reads as a block: lines
+/// closer than the sender's own paragraphs.
+fn history_blocks(
+    blocks: &[fell_render::Block],
+    kind: Option<fell_render::Fold>,
+    history: &crate::render::Palette,
+    gallery: &crate::render::ImageGallery,
+    (theme, rtl, width): (&Theme, bool, f32),
+) -> gpui::AnyElement {
+    use fell_render::{Block, Fold};
+    let nested = matches!(
+        kind,
+        Some(Fold::SignatureAndQuote | Fold::QuoteAndSignature)
+    );
+    let line_height = px(theme.ui_px * 1.4);
+    let measure = (!rtl).then_some(READING_MEASURE_PX - HISTORY_INDENT_PX);
+    let width = (width - HISTORY_INDENT_PX).max(0.);
+    let column = |run: &[Block], width: f32, measure: Option<f32>| {
+        crate::render::blocks_column_spaced(run, history, false, gallery, width, 8., measure)
+            .line_height(line_height)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .children(blocks.iter().map(|block| {
+            match block {
+                Block::Quote { blocks } if nested => {
+                    history_rule(div(), rtl, crate::theme::strong_border(theme))
+                        .child(column(
+                            blocks,
+                            (width - HISTORY_INDENT_PX).max(0.),
+                            measure.map(|measure| measure - HISTORY_INDENT_PX),
+                        ))
+                        .into_any_element()
+                }
+                Block::Quote { blocks } => column(blocks, width, measure).into_any_element(),
+                other => column(std::slice::from_ref(other), width, measure).into_any_element(),
+            }
+        }))
+        .into_any_element()
+}
+
+/// The fold a run of two kinds of history makes.
+fn joined_fold(above: fell_render::Fold, next: fell_render::Fold) -> fell_render::Fold {
+    use fell_render::Fold;
+    match (above, next) {
+        (Fold::Signature, Fold::Signature) => Fold::Signature,
+        (Fold::Quote, Fold::Quote) => Fold::Quote,
+        (Fold::Signature | Fold::SignatureAndQuote, _) => Fold::SignatureAndQuote,
+        (Fold::Quote | Fold::QuoteAndSignature, _) => Fold::QuoteAndSignature,
+    }
+}
+
+/// What a folded line says.
+struct FoldLabel {
+    kind: fell_render::Fold,
+    lines: usize,
+    show_key: bool,
+    /// The history is written right to left: the rule is on the right and
+    /// the line is set flush right, as the text it stands for.
+    rtl: bool,
+}
+
+impl FoldLabel {
+    /// `··· Quoted text · 12 lines`, and ` · q` on the first fold of the
+    /// reader's message.
+    fn text(&self) -> String {
+        let name = match self.kind {
+            fell_render::Fold::Quote => "Quoted text",
+            fell_render::Fold::Signature => "Signature",
+            fell_render::Fold::SignatureAndQuote => "Signature and quoted text",
+            fell_render::Fold::QuoteAndSignature => "Quoted text and signature",
+        };
+        let mut text = format!("\u{b7}\u{b7}\u{b7} {name}");
+        match self.lines {
+            0 => {}
+            1 => text.push_str(" \u{b7} 1 line"),
+            lines => text.push_str(&format!(" \u{b7} {lines} lines")),
+        }
+        if self.show_key {
+            text.push_str(" \u{b7} q");
+        }
+        text
+    }
+}
+
+/// A fold's summary and details share an edge. The disclosure keeps both
+/// at their natural heights while it moves the blocks below.
+fn fold_section(
+    theme: &Theme,
+    label: FoldLabel,
+    folds: FoldView,
+    reveal: Option<f32>,
+    opened: impl FnOnce() -> gpui::AnyElement,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    disclosure(
+        folds.width,
+        folds.open,
+        reveal,
+        || folded_line(theme, &label, folds, cx),
+        || {
+            div()
+                .min_h(px(FOLD_ROW_PX))
+                .pb(px(8.))
+                .when(label.rtl, |content| content.max_w(px(READING_MEASURE_PX)))
+                .child(
+                    history_rule(div(), label.rtl, crate::theme::strong_border(theme))
+                        .text_color(rgb(theme.dimmed))
+                        .child(opened()),
+                )
+                .into_any_element()
+        },
+    )
+}
+
+/// The one line a folded quote or signature shows. A click opens it, as
+/// `q` does. It hangs off the same rule as the opened history, and the rule
+/// and text take the accent under the pointer, or when the message is the
+/// one `q` acts on.
+fn folded_line(
+    theme: &Theme,
+    label: &FoldLabel,
+    folds: FoldView,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
+    let index = folds.index;
+    let rule = if label.show_key {
+        motion::mix(theme.border, theme.accent, folds.focused)
+    } else {
+        theme.border
+    };
+    let accent = theme.accent;
+    history_rule(div(), label.rtl, rule)
+        .h(px(FOLD_ROW_PX - FOLD_GAP_PX))
+        .mb(px(FOLD_GAP_PX))
+        .flex()
+        .items_center()
+        .when(label.rtl, |line| {
+            line.max_w(px(READING_MEASURE_PX)).justify_end()
+        })
+        .text_color(rgb(theme.dimmed))
+        .child(label.text())
+        .when(folds.live, |line| {
+            line.cursor_pointer()
+                .hover(move |style| style.text_color(rgb(accent)).border_color(rgb(accent)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |inbox, _, window, cx| {
+                        window.focus(&inbox.focus);
+                        inbox.cancel_pending_keys(cx);
+                        inbox.focus_message(index);
+                        inbox.session.toggle_quotes(index);
+                        cx.notify();
+                    }),
+                )
+        })
         .into_any_element()
 }
 
@@ -4155,8 +4878,9 @@ fn recipient_lines(
     theme: &Theme,
     line: &present::RecipientLine,
     open: bool,
+    reveal: Option<f32>,
     index: usize,
-    conv_width: f32,
+    width: f32,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -4169,13 +4893,12 @@ fn recipient_lines(
         cx.notify();
     });
     let size = px(theme.ui_px - 1.0);
-    let body = if open {
+    let details = || {
         div()
             .flex()
             .flex_col()
             .gap(px(2.))
-            .children(line.groups.iter().enumerate().map(|(row, group)| {
-                let last_row = row + 1 == line.groups.len();
+            .children(line.groups.iter().map(|group| {
                 div()
                     .flex()
                     .gap(px(10.))
@@ -4217,15 +4940,10 @@ fn recipient_lines(
                                             .child(format!("{address}{comma}")),
                                     )
                             }))
-                            // One dim note ends the row, so its separators
-                            // space evenly: "only you · q to hide".
+                            // One dim note ends the row. The line closes the
+                            // way it opened, so it names no key.
                             .children({
-                                let note = match (group.only_you, last_row) {
-                                    (true, true) => Some("only you · q to hide"),
-                                    (true, false) => Some("only you"),
-                                    (false, true) => Some("· q to hide"),
-                                    (false, false) => None,
-                                };
+                                let note = group.only_you.then_some("only you");
                                 note.map(|note| {
                                     div()
                                         .whitespace_nowrap()
@@ -4235,20 +4953,21 @@ fn recipient_lines(
                             })
                     })
             }))
-    } else {
+            .into_any_element()
+    };
+    let summary = || {
         // Whole people only, measured like the thread list, so the count
         // always matches the names on screen; the Bcc and key always show.
         // Only a single name too long for the pane is cut, with an ellipsis.
         // The text takes the box's colour, so hover reaches it.
-        let room = (conv_width - 48.0).min(680.0);
         let (names, tail, _) = present::fit_recipients(line, |names, tail| {
             line_px(window, names, FontWeight::NORMAL) + line_px(window, tail, FontWeight::NORMAL)
-                <= room
+                <= width
         });
         let names = clip_line(
             window,
             &names,
-            (room - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
+            (width - line_px(window, &tail, FontWeight::NORMAL)).max(40.0),
             FontWeight::NORMAL,
         );
         div()
@@ -4260,86 +4979,22 @@ fn recipient_lines(
             })
             .child(div().whitespace_nowrap().child(names))
             .child(div().flex_shrink_0().whitespace_nowrap().child(tail))
+            .into_any_element()
     };
     div()
         .id(gpui::ElementId::named_usize("recipients", index))
         .max_w(px(680.))
         .pb(px(10.))
         .text_size(size)
-        .child(body.when(live.0, |body| {
-            body.cursor_pointer()
-                .on_mouse_down(MouseButton::Left, toggle)
-        }))
+        .child(
+            div()
+                .when(live.0, |body| {
+                    body.cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, toggle)
+                })
+                .child(disclosure(width, open, reveal, summary, details)),
+        )
         .into_any_element()
-}
-
-fn body_block(
-    theme: &Theme,
-    block: &BodyBlock,
-    quotes_open: bool,
-    show_key: bool,
-    index: usize,
-    live: Live,
-    cx: &mut Context<Inbox>,
-) -> gpui::AnyElement {
-    match block {
-        BodyBlock::Text(text) => div()
-            .max_w(px(680.))
-            .pb(px(8.))
-            .line_height(px(theme.ui_px * 1.45))
-            .child(text.clone())
-            .into_any_element(),
-        BodyBlock::Markdown { doc, agent } => div()
-            .max_w(px(680.))
-            .pb(px(8.))
-            .line_height(px(theme.ui_px * 1.45))
-            .child(crate::compose_ui::render_draft_doc(doc, *agent, theme))
-            .into_any_element(),
-        BodyBlock::Quote(text) | BodyBlock::Signature(text) => {
-            let label = if matches!(block, BodyBlock::Quote(_)) {
-                "Quoted text"
-            } else {
-                "Signature"
-            };
-            if quotes_open {
-                div()
-                    .max_w(px(680.))
-                    .pl(px(10.))
-                    .mb(px(8.))
-                    .border_l(px(2.))
-                    .border_color(rgb(theme.border))
-                    .text_color(rgb(theme.dimmed))
-                    .line_height(px(theme.ui_px * 1.4))
-                    .child(text.clone())
-                    .into_any_element()
-            } else {
-                div()
-                    .h(px(28.))
-                    .mb(px(6.))
-                    .flex()
-                    .items_center()
-                    .text_color(rgb(theme.dimmed))
-                    .child(if show_key {
-                        format!("{label} · q")
-                    } else {
-                        label.to_string()
-                    })
-                    .when(live.0, |label| {
-                        label.on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |inbox, _, window, cx| {
-                                window.focus(&inbox.focus);
-                                inbox.cancel_pending_keys(cx);
-                                inbox.focus_message(index);
-                                inbox.session.toggle_quotes(index);
-                                cx.notify();
-                            }),
-                        )
-                    })
-                    .into_any_element()
-            }
-        }
-    }
 }
 
 /// Mode, sync state and one notice. At rest there are no key hints

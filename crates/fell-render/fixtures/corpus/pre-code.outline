@@ -1,0 +1,14 @@
+## open
+p The relay deploy failed again at 22:14. Here is the tail of the log:
+code
+   | 2026-11-17T22:14:03Z INFO  relay: starting with 4 workers
+   | 2026-11-17T22:14:03Z ERROR worker[3]: connection to queue.internal.example:5671 failed after 3 retries (timeout 30s); falling back to the local spool at /var/spool/relay/outbound
+   | 2026-11-17T22:14:04Z WARN  relay: spool is 91% full
+p And the config it is running with:
+code
+   | [relay]
+   | host    = "queue.internal.example"
+   | port    = 5671
+   | retries = 3
+p I think the timeout is too short for the new region. Could someone try `retries = 5` on staging before we change production?
+p Kai

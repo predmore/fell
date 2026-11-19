@@ -47,6 +47,33 @@ CREATE TABLE IF NOT EXISTS message_bodies (
     PRIMARY KEY (account_id, message_id)
 );
 
+-- Revisions live apart from the blobs so updating one need not rewrite the body.
+CREATE TABLE IF NOT EXISTS message_body_stamps (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    stamp BLOB NOT NULL,
+    PRIMARY KEY (account_id, message_id)
+) WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS message_body_stamps_ai AFTER INSERT ON message_bodies BEGIN
+    INSERT INTO message_body_stamps VALUES (new.account_id, new.message_id, randomblob(16))
+    ON CONFLICT(account_id, message_id) DO UPDATE SET stamp = excluded.stamp;
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_body_stamps_au
+AFTER UPDATE OF codec, html, plain, bulk_headers ON message_bodies
+WHEN old.codec IS NOT new.codec OR old.html IS NOT new.html
+  OR old.plain IS NOT new.plain OR old.bulk_headers IS NOT new.bulk_headers
+BEGIN
+    INSERT INTO message_body_stamps VALUES (new.account_id, new.message_id, randomblob(16))
+    ON CONFLICT(account_id, message_id) DO UPDATE SET stamp = excluded.stamp;
+END;
+
+CREATE TRIGGER IF NOT EXISTS message_body_stamps_ad AFTER DELETE ON message_bodies BEGIN
+    DELETE FROM message_body_stamps
+    WHERE account_id = old.account_id AND message_id = old.message_id;
+END;
+
 -- The non-body MIME parts of a message: metadata, never bytes.
 CREATE TABLE IF NOT EXISTS message_parts (
     account_id TEXT NOT NULL,
@@ -649,20 +676,50 @@ pub(super) fn read(
     account_id: &AccountId,
     message_id: &str,
 ) -> Result<Option<MessageParts>> {
+    let mut parts = read_text(
+        conn,
+        "SELECT codec, html, plain, bulk_headers FROM message_bodies
+         WHERE account_id = ?1 AND message_id = ?2",
+        params![account_id.as_str(), message_id],
+    )?;
+    if let Some(parts) = &mut parts {
+        parts.mime_parts = list(conn, account_id, message_id)?.unwrap_or_default();
+    }
+    Ok(parts)
+}
+
+/// The text parts only, with the stamp checked in the same SQLite read.
+pub(super) fn read_at_stamp(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    stamp: PartStamp,
+) -> Result<Option<MessageParts>> {
+    read_text(
+        conn,
+        "SELECT b.codec, b.html, b.plain, b.bulk_headers
+         FROM message_bodies b LEFT JOIN message_body_stamps s USING (account_id, message_id)
+         WHERE b.account_id = ?1 AND b.message_id = ?2
+           AND coalesce(s.stamp, zeroblob(16)) = ?3",
+        params![account_id.as_str(), message_id, stamp.0.as_slice()],
+    )
+}
+
+fn read_text(
+    conn: &Connection,
+    sql: &str,
+    args: impl rusqlite::Params,
+) -> Result<Option<MessageParts>> {
     let row = conn
-        .query_row(
-            "SELECT codec, html, plain, bulk_headers FROM message_bodies
-             WHERE account_id = ?1 AND message_id = ?2",
-            params![account_id.as_str(), message_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
+        .prepare_cached(sql)?
+        .query_row(args, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
         .optional()?;
     let Some((codec, html, plain, headers)) = row else {
         return Ok(None);
@@ -676,8 +733,61 @@ pub(super) fn read(
         html: html.as_deref().map(decompress).transpose()?,
         plain: plain.as_deref().map(decompress).transpose()?,
         bulk_headers: decode_headers(&headers),
-        mime_parts: list(conn, account_id, message_id)?.unwrap_or_default(),
+        mime_parts: Vec::new(),
     }))
+}
+
+/// Revision of one stored body. Legacy rows start at zero, and the first
+/// change, including deletion and reinsertion, assigns a fresh revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PartStamp([u8; 16]);
+
+/// Which parts one stored row has. A row with neither records that no
+/// server copy had a body to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PartKinds {
+    pub html: bool,
+    pub plain: bool,
+    /// Bytes of compressed HTML as stored, for a caller deciding where to
+    /// prepare it. 0 without HTML.
+    pub html_bytes: u64,
+    /// Changes when the stored parts change: a resync that replaces them,
+    /// or a backfill that fills HTML into a plain row. A cache of prepared
+    /// bodies keys on it as well as on the message id.
+    pub stamp: PartStamp,
+}
+
+/// The stored rows among `message_ids`, by primary key. The blobs are not
+/// read: SQLite answers `length()` of a column from the record header.
+pub(super) fn kinds(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_ids: &[&str],
+) -> Result<std::collections::HashMap<String, PartKinds>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.html IS NOT NULL, b.plain IS NOT NULL, coalesce(length(b.html), 0),
+                coalesce(s.stamp, zeroblob(16))
+         FROM message_bodies b LEFT JOIN message_body_stamps s USING (account_id, message_id)
+         WHERE b.account_id = ?1 AND b.message_id = ?2",
+    )?;
+    let mut out = std::collections::HashMap::new();
+    for id in message_ids {
+        let found = stmt
+            .query_row(params![account_id.as_str(), id], |row| {
+                let html_bytes: i64 = row.get(2)?;
+                Ok(PartKinds {
+                    html: row.get(0)?,
+                    plain: row.get(1)?,
+                    html_bytes: html_bytes.max(0) as u64,
+                    stamp: PartStamp(row.get(3)?),
+                })
+            })
+            .optional()?;
+        if let Some(kinds) = found {
+            out.insert((*id).to_string(), kinds);
+        }
+    }
+    Ok(out)
 }
 
 /// CROSS JOIN keeps the queue as the outer loop. Otherwise SQLite walks every
@@ -897,6 +1007,159 @@ mod tests {
             body(&store, "n1@x").unwrap().html.as_deref().map(str::trim),
             Some("<p>second</p>")
         );
+    }
+
+    #[test]
+    fn part_kinds_name_what_each_row_has_without_reading_it() {
+        let html = newsletter("h@x", "INBOX", 1, "<p>x</p>");
+        let mut plain = newsletter("p@x", "INBOX", 2, "<p>y</p>");
+        plain.parts.as_mut().unwrap().html = None;
+        let mut empty = newsletter("e@x", "INBOX", 3, "<p>z</p>");
+        empty.parts = Some(MessageParts::default());
+        let mut bare = newsletter("b@x", "INBOX", 4, "<p>w</p>");
+        bare.parts = None;
+        let store = store_with(vec![html, plain, empty, bare]);
+        let found = store
+            .stored_part_kinds(&account().id, &["h@x", "p@x", "e@x", "b@x", "gone@x"])
+            .unwrap();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found["h@x"].html && found["h@x"].plain);
+        assert!(found["h@x"].html_bytes > 0);
+        assert!(!found["p@x"].html && found["p@x"].plain);
+        assert_eq!(found["p@x"].html_bytes, 0);
+        assert!(!found["e@x"].html && !found["e@x"].plain);
+    }
+
+    #[test]
+    fn the_part_stamp_changes_when_the_parts_do() {
+        let mut first = newsletter("n@x", "INBOX", 1, "<p>x</p>");
+        let parts = first.parts.as_mut().unwrap();
+        parts.html = Some("<p>before A after</p>".into());
+        parts.plain = Some("before A after".into());
+        parts.bulk_headers = vec![("List-Unsubscribe".into(), "<https://x.test/A>".into())];
+        let store = store_with(vec![first.clone()]);
+        let account = account();
+        let stamp = || store.stored_part_kinds(&account.id, &["n@x"]).unwrap()["n@x"].stamp;
+        let sizes = || -> [i64; 3] {
+            let sql =
+                "SELECT length(html), length(plain), length(bulk_headers) FROM message_bodies";
+            store
+                .conn
+                .query_row(sql, [], |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]))
+                .unwrap()
+        };
+        let mut before = stamp();
+        let original_sizes = sizes();
+        // The same parts again: the same stamp.
+        store.upsert_message(&first).unwrap();
+        assert_eq!(stamp(), before);
+        let mut changed = first;
+        // Each resync replaces one part with content of the same stored size.
+        for edit in [
+            |parts: &mut MessageParts| parts.html = Some("<p>before B after</p>".into()),
+            |parts: &mut MessageParts| parts.plain = Some("before B after".into()),
+            |parts: &mut MessageParts| parts.bulk_headers[0].1 = "<https://x.test/B>".into(),
+        ] {
+            edit(changed.parts.as_mut().unwrap());
+            store.upsert_message(&changed).unwrap();
+            assert_eq!(sizes(), original_sizes);
+            assert_ne!(stamp(), before);
+            assert!(
+                store
+                    .message_body_at_stamp(&account.id, "n@x", before)
+                    .unwrap()
+                    .is_none()
+            );
+            before = stamp();
+            assert!(
+                store
+                    .message_body_at_stamp(&account.id, "n@x", before)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn filling_a_gap_changes_the_stamp() {
+        // A backfill filling HTML into a row that had only plain text.
+        let mut plain = newsletter("p@x", "INBOX", 2, "<p>y</p>");
+        plain.parts.as_mut().unwrap().html = None;
+        let store = store_with(vec![plain.clone()]);
+        let plain_only = store.stored_part_kinds(&account().id, &["p@x"]).unwrap()["p@x"];
+        store
+            .store_fetched_parts(
+                &account().id,
+                &[(
+                    MessageId::new("p@x"),
+                    Some(MessageParts {
+                        html: Some("<p>now with html</p>".into()),
+                        plain: Some("now".into()),
+                        bulk_headers: Vec::new(),
+                        mime_parts: Vec::new(),
+                    }),
+                )],
+            )
+            .unwrap();
+        let filled = store.stored_part_kinds(&account().id, &["p@x"]).unwrap()["p@x"];
+        assert!(filled.html);
+        assert_ne!(filled.stamp, plain_only.stamp);
+    }
+
+    #[test]
+    fn legacy_bodies_keep_their_parts_and_reinsertions_get_a_new_stamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "fell-body-stamp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let account = account();
+        let message = newsletter("n@x", "INBOX", 1, "<p>x</p>");
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account).unwrap();
+            store.upsert_message(&message).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TRIGGER message_body_stamps_ai;
+                 DROP TRIGGER message_body_stamps_au;
+                 DROP TRIGGER message_body_stamps_ad;
+                 DROP TABLE message_body_stamps;",
+                )
+                .unwrap();
+        }
+        let read_stamp =
+            |store: &Store| store.stored_part_kinds(&account.id, &["n@x"]).unwrap()["n@x"].stamp;
+        let reinserted = {
+            let store = Store::open(&path).unwrap();
+            let legacy = read_stamp(&store);
+            assert_eq!(legacy, PartStamp::default());
+            assert_eq!(body(&store, "n@x"), message.parts);
+            assert!(
+                store
+                    .message_body_at_stamp(&account.id, "n@x", legacy)
+                    .unwrap()
+                    .is_some()
+            );
+            store
+                .delete_message(&account.id, &MessageId::new("n@x"))
+                .unwrap();
+            store.upsert_message(&message).unwrap();
+            let reinserted = read_stamp(&store);
+            assert_ne!(reinserted, legacy);
+            store
+                .delete_message(&account.id, &MessageId::new("n@x"))
+                .unwrap();
+            store.upsert_message(&message).unwrap();
+            assert_ne!(read_stamp(&store), reinserted);
+            read_stamp(&store)
+        };
+        assert_eq!(read_stamp(&Store::open(&path).unwrap()), reinserted);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
