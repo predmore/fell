@@ -655,6 +655,17 @@ mod tests {
             json!({ "query": "invoice", "mode": "hybrid" }),
         ));
         assert_eq!(words["hits"][0]["related"], false);
+        assert!(words["did_you_mean"].is_null(), "{words}");
+        // A misspelling: the hits are for the correction, and say so.
+        let typo = tool_json(&call(
+            &mut session,
+            "search",
+            json!({ "query": "invioce", "mode": "hybrid" }),
+        ));
+        assert_eq!(typo["mode"], "hybrid");
+        assert_eq!(typo["did_you_mean"], "invoice", "{typo}");
+        assert_eq!(typo["hits"][0]["thread_id"], thread.as_str());
+        assert_eq!(typo["hits"][0]["related"], false);
         // keyword mode is word matching only.
         let keyword = tool_json(&call(
             &mut session,

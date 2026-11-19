@@ -343,7 +343,9 @@ pub(crate) fn execute(
     if query.is_empty() {
         return Ok(keyword);
     }
-    let parsed = parse_query(query)?;
+    // When the keyword side corrected the query, its hits are for the
+    // correction, so the semantic side embeds and filters that too.
+    let parsed = parse_query(keyword.did_you_mean.as_deref().unwrap_or(query))?;
     if no_match_possible(&parsed) || parsed.text_phrases.is_empty() {
         return Ok(keyword);
     }

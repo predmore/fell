@@ -1334,3 +1334,29 @@ fn semantic_rows_apply_the_operators_again() {
     assert!(rows("money from:brightline in:inbox").is_empty());
     drop(reset);
 }
+
+#[test]
+fn a_corrected_query_is_the_one_the_semantic_side_embeds() {
+    let (store, _reset) = concept_store();
+    let typo = hybrid(&store, "invioce leak");
+    assert_eq!(typo.did_you_mean.as_deref(), Some("invoice leak"));
+    let corrected = hybrid(&store, "invoice leak");
+    assert_eq!(corrected.did_you_mean, None);
+    assert_eq!(typo.hits, corrected.hits);
+    let first = &typo.hits[0];
+    assert_eq!(first.message_id.as_str(), "plumber-invoice@corpus.test");
+    assert!(!first.semantic_only);
+    // The correction's operators filter the semantic side too.
+    let filtered = hybrid(&store, "invioce leak from:brightline");
+    assert_eq!(
+        filtered.did_you_mean.as_deref(),
+        Some("invoice leak from:brightline")
+    );
+    assert!(
+        filtered
+            .hits
+            .iter()
+            .all(|hit| hit.sender_email.ends_with("@brightline-plumbing.test")),
+        "{filtered:?}"
+    );
+}
