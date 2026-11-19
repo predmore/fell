@@ -2,6 +2,7 @@
 
 mod disclosure;
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -4139,6 +4140,44 @@ fn message_content_width(conv_width: f32) -> f32 {
     (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.)
 }
 
+struct CollapsedRows {
+    style: TextStyle,
+    align_senders: bool,
+    gap: f32,
+    room: f32,
+    sender_ellipsis: f32,
+    snippet_ellipsis: f32,
+    snippet_preview: f32,
+}
+
+impl CollapsedRows {
+    fn new(window: &Window, theme: &Theme, conv_width: f32) -> Self {
+        let style = conversation_line_style(window, theme, px(theme.ui_px));
+        let measure = |text, weight| line_px_with_style(window, &style, text, weight).ceil();
+        let snippet_preview = measure("mmm…", FontWeight::NORMAL);
+        // Use a full date as the width reference for the pane, so a shorter
+        // date or an empty preview cannot switch one row's layout.
+        let date_width = measure("May 28, 2000", FontWeight::NORMAL);
+        let content_width = message_content_width(conv_width);
+        let align_senders = content_width
+            >= COLLAPSED_SENDER_PX + snippet_preview + date_width + 2. * COLLAPSED_GAP_PX;
+        let gap = if align_senders {
+            COLLAPSED_GAP_PX
+        } else {
+            COLLAPSED_NARROW_GAP_PX
+        };
+        Self {
+            align_senders,
+            gap,
+            room: (content_width - 2. * gap).max(0.).floor(),
+            sender_ellipsis: measure("…", FontWeight::MEDIUM),
+            snippet_ellipsis: measure("…", FontWeight::NORMAL),
+            snippet_preview,
+            style,
+        }
+    }
+}
+
 fn collapsed_sender_budget(
     remaining: f32,
     sender_ellipsis: f32,
@@ -4242,6 +4281,7 @@ fn conversation(
     let focus = motion.focus_edge(session.pane, now);
     let arrival = motion.arrival(now);
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
+    let collapsed_rows = OnceCell::new();
     let messages: Vec<_> = session
         .messages
         .iter()
@@ -4252,9 +4292,23 @@ fn conversation(
             } else {
                 0.0
             };
-            let block = message_block(
-                theme, session, message, index, cursor, conv_width, live, frame, window, cx,
-            );
+            let block = if message.expanded {
+                expanded_message(
+                    theme, session, message, index, cursor, conv_width, live, frame, window, cx,
+                )
+            } else {
+                let body = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
+                collapsed_message(
+                    theme,
+                    message,
+                    index,
+                    (cursor, body),
+                    collapsed_rows.get_or_init(|| CollapsedRows::new(window, theme, conv_width)),
+                    live,
+                    window,
+                    cx,
+                )
+            };
             if let Some((anchor, probe)) = &hold
                 && anchor.index == index
             {
@@ -4328,38 +4382,6 @@ fn conversation(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn message_block(
-    theme: &Theme,
-    session: &Session,
-    message: &ConvMessage,
-    index: usize,
-    cursor: f32,
-    conv_width: f32,
-    live: Live,
-    frame: &ConvFrame,
-    window: &Window,
-    cx: &mut Context<Inbox>,
-) -> gpui::AnyElement {
-    if message.expanded {
-        expanded_message(
-            theme, session, message, index, cursor, conv_width, live, frame, window, cx,
-        )
-    } else {
-        let body = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
-        collapsed_message(
-            theme,
-            message,
-            index,
-            (cursor, body),
-            conv_width,
-            live,
-            window,
-            cx,
-        )
-    }
-}
-
 /// Conversation elements measure during render, before the root's font is active.
 fn conversation_line_style(window: &Window, theme: &Theme, size: gpui::Pixels) -> TextStyle {
     let mut style = window.text_style();
@@ -4376,7 +4398,7 @@ fn collapsed_message(
     message: &ConvMessage,
     index: usize,
     (cursor, body): (f32, f32),
-    conv_width: f32,
+    rows: &CollapsedRows,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -4384,43 +4406,43 @@ fn collapsed_message(
     let now = now_unix();
     let mut date = present::relative_date(now, message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
-    let style = conversation_line_style(window, theme, px(theme.ui_px));
-    let content_width = message_content_width(conv_width);
     let missing = present::missing_body_line(message.body_state);
     let snippet = missing.as_deref().unwrap_or(&message.snippet);
-    let measure = |text: &str, weight| line_px_with_style(window, &style, text, weight).ceil();
+    let measure =
+        |text: &str| line_px_with_style(window, &rows.style, text, FontWeight::NORMAL).ceil();
     let snippet_preview = if snippet.is_empty() {
         0.
     } else {
-        measure("mmm…", FontWeight::NORMAL)
+        rows.snippet_preview
     };
-    let mut date_w = measure(&date, FontWeight::NORMAL);
-    let align_senders =
-        content_width >= COLLAPSED_SENDER_PX + snippet_preview + date_w + 2. * COLLAPSED_GAP_PX;
-    let gap = if align_senders {
-        COLLAPSED_GAP_PX
+    let mut date_w = measure(&date);
+    let date_limit = if rows.align_senders {
+        (rows.room - COLLAPSED_SENDER_PX - snippet_preview).max(0.)
     } else {
-        COLLAPSED_NARROW_GAP_PX
+        rows.room
     };
-    let room = (content_width - 2. * gap).max(0.).floor();
-    if !align_senders {
+    if !rows.align_senders || date_w > date_limit {
         let compact = present::compact_relative_date(now, message.date_unix);
-        let width = measure(&compact, FontWeight::NORMAL);
+        let width = measure(&compact);
         if width < date_w {
             date = compact;
             date_w = width;
         }
     }
-    let date_w = date_w.min(room);
-    let remaining = room - date_w;
-    let sender_budget = collapsed_sender_budget(
-        remaining,
-        measure("…", FontWeight::MEDIUM),
-        measure("…", FontWeight::NORMAL),
-        snippet_preview,
-    );
+    let date_w = date_w.min(date_limit);
+    let remaining = rows.room - date_w;
+    let sender_budget = if rows.align_senders {
+        COLLAPSED_SENDER_PX
+    } else {
+        collapsed_sender_budget(
+            remaining,
+            rows.sender_ellipsis,
+            rows.snippet_ellipsis,
+            snippet_preview,
+        )
+    };
     let clip = |text: &str, width, weight| {
-        clip_shaped(window, &style, text, width, weight, None)
+        clip_shaped(window, &rows.style, text, width, weight, None)
             // The clipping helper can return a lone ellipsis at any width.
             .filter(|line| line.width <= px(width))
     };
@@ -4435,7 +4457,7 @@ fn collapsed_message(
     );
     // Keep the aligned column in wide panes. In narrow ones, let a short
     // sender give its unused pixels to the preview.
-    let sender_w = if align_senders {
+    let sender_w = if rows.align_senders {
         sender_budget
     } else {
         sender
@@ -4452,7 +4474,7 @@ fn collapsed_message(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(gap))
+        .gap(px(rows.gap))
         .overflow_hidden()
         .rounded_md()
         .bg(rgb(motion::mix(theme.background, theme.selection, cursor)))
