@@ -1,0 +1,4 @@
+date, reader title: 152 frames; 2593 to 2610 text pixels
+date, result excerpt: 152 frames; 1294 to 1299 text pixels
+quote, reader title: 122 frames; 2593 to 2610 text pixels
+quote, result excerpt: 122 frames; 1294 to 1424 text pixels
