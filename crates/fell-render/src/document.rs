@@ -111,8 +111,12 @@ impl StyledDocument {
     }
 
     pub fn plain_text(&self) -> String {
+        Self::blocks_text(&self.blocks)
+    }
+
+    pub fn blocks_text(blocks: &[Block]) -> String {
         let mut out = String::new();
-        for block in &self.blocks {
+        for block in blocks {
             push_block(&mut out, block);
         }
         out.trim_matches(|ch: char| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}'))

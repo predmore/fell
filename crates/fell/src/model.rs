@@ -708,11 +708,14 @@ impl Session {
     pub fn folder_choices(&self) -> Vec<String> {
         let all = merge_folders(&self.roles, &self.folders);
         let query = self.folder_query.trim();
+        let from = self
+            .cursor_id
+            .as_deref()
+            .and_then(|id| self.search_source(id))
+            .unwrap_or(&self.folder);
         all.into_iter()
             .filter(|name| {
-                if self.folder_intent == FolderIntent::Move
-                    && name.eq_ignore_ascii_case(&self.folder)
-                {
+                if self.folder_intent == FolderIntent::Move && name.eq_ignore_ascii_case(from) {
                     return false;
                 }
                 if query.is_empty() {
@@ -1513,11 +1516,15 @@ impl Session {
         if self.search_editing() && key != KeyId::CtrlShiftP {
             return self.search_key(key);
         }
+        if key == KeyId::Tab && self.search.is_some() {
+            return self.accept_search_suggestion();
+        }
         // The question is asked once: any key answers it. `y` deletes;
         // Escape and `n` only let it go; any other key does what it does.
         if let Some(prompt) = self.confirm_purge.take()
             && prompt.notice == self.toast_generation
             && prompt.folder == self.folder
+            && self.search_results_current()
         {
             match key {
                 KeyId::Char('y') => {
@@ -1788,20 +1795,51 @@ impl Session {
             self.recent.truncate(8);
         }
         let mut step = Step::default();
-        if self.search.is_some()
-            && matches!(
+        if !self.search_results_current()
+            && !matches!(
                 action,
-                Action::Move
-                    | Action::Archive
-                    | Action::Delete
-                    | Action::Spam
-                    | Action::ToggleUnread
-                    | Action::ToggleStar
+                Action::Search
+                    | Action::Back
+                    | Action::Inbox
+                    | Action::Sent
+                    | Action::Drafts
+                    | Action::FolderPicker
+                    | Action::Palette
+                    | Action::Help
+                    | Action::About
+                    | Action::Compose
+                    | Action::SyncNow
                     | Action::Undo
+                    | Action::ReopenReview
             )
         {
             self.count.clear();
-            self.show_toast("Open a folder to change mail", false);
+            return step;
+        }
+        if self.pane == Pane::Conversation
+            && self
+                .search
+                .as_ref()
+                .is_some_and(|search| !search.matches_thread(self.cursor_id.as_deref()))
+            && matches!(
+                action,
+                Action::Open
+                    | Action::Next
+                    | Action::Prev
+                    | Action::First
+                    | Action::Last
+                    | Action::FocusAttachments
+                    | Action::OpenAttachment
+                    | Action::SaveAttachment
+                    | Action::SaveAllAttachments
+                    | Action::RetryAttachment
+                    | Action::ToggleQuotes
+                    | Action::Reply
+                    | Action::ReplyAll
+                    | Action::Forward
+            )
+        {
+            self.count.clear();
             return step;
         }
         match action {
@@ -1886,6 +1924,15 @@ impl Session {
                     self.show_toast(DRAFT_NOT_THREAD, true);
                     return Step::default();
                 }
+                if self
+                    .cursor_id
+                    .as_deref()
+                    .and_then(|id| self.search_source(id))
+                    .is_none()
+                {
+                    self.show_toast("No folder for this match", true);
+                    return step;
+                }
                 self.folder_intent = FolderIntent::Move;
                 self.overlay = Overlay::Folders;
                 self.folder_query.clear();
@@ -1931,7 +1978,24 @@ impl Session {
                         ..Step::default()
                     };
                 }
-                if !self.in_trash() {
+                let trash = if self.search.is_some() {
+                    let Some(scopes) = self.search_scopes(&targets) else {
+                        self.show_toast("No folder for a selected match", true);
+                        return step;
+                    };
+                    let trash = scopes
+                        .iter()
+                        .filter(|(_, folder)| self.roles.is(FolderRole::Trash, folder))
+                        .count();
+                    if trash != 0 && trash != scopes.len() {
+                        self.show_toast("Select Trash results separately to remove them", true);
+                        return step;
+                    }
+                    trash != 0
+                } else {
+                    self.in_trash()
+                };
+                if !trash {
                     return Step {
                         delete: true,
                         ..Step::default()
@@ -2160,7 +2224,7 @@ impl Session {
         let Some(row) = self.cursor_thread() else {
             return;
         };
-        if !row.unread || row.draft.is_some() {
+        if !row.unread || row.draft.is_some() || self.search_source(&row.id).is_none() {
             return;
         }
         let id = row.id.clone();
@@ -2178,7 +2242,8 @@ impl Session {
     pub fn read_after_dwell(&mut self, id: &str, generation: u64) -> Option<FlagEdit> {
         let open = generation == self.read_gen
             && self.pane == Pane::Conversation
-            && self.cursor_id.as_deref() == Some(id);
+            && self.cursor_id.as_deref() == Some(id)
+            && self.search_results_current();
         if !open || !self.cursor_thread().is_some_and(|row| row.unread) {
             return None;
         }
@@ -2207,6 +2272,10 @@ impl Session {
                 "No conversation"
             };
             self.show_toast(text, true);
+            return Step::default();
+        }
+        if self.search.is_some() && self.search_scopes(&ids).is_none() {
+            self.show_toast("No folder for a selected match", true);
             return Step::default();
         }
         let rows: Vec<&ThreadRow> = self
@@ -2289,7 +2358,7 @@ impl Session {
                 FlagChange::Star => (row.unread, true),
                 FlagChange::Unstar => (row.unread, false),
             };
-            if unread != row.unread {
+            if self.search.is_none() && unread != row.unread {
                 if unread {
                     self.unread_count += 1;
                 } else {

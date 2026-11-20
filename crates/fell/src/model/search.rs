@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use fell_core::{MessageId, SearchField, SearchHit, SearchPreview};
+use fell_core::{MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, SearchPreview};
 
 use super::{Fetch, Pending, Session, Step};
 use crate::keymap::KeyId;
-use crate::present::{NameSpan, Pane, ThreadRow, one_line};
+use crate::present::{ConvMessage, NameSpan, Pane, Rich, ThreadRow, one_line};
+use crate::text_render::BodyBlock;
 
 #[derive(Clone, Debug)]
 pub(super) struct FolderList {
@@ -21,6 +22,7 @@ pub(super) struct FolderList {
     pending: Option<Pending>,
     more_before: bool,
     more_after: bool,
+    unread: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,8 +35,13 @@ pub struct Search {
     pub correction: Option<String>,
     pub suggestions: Vec<String>,
     pub suggestion_index: usize,
+    completion_key: Option<(CompletionField, String)>,
     pub hits: HashMap<String, Hit>,
-    pub matches: Vec<MessageId>,
+    requested: String,
+    accepted: Option<(u64, String)>,
+    dirty: bool,
+    pub matches: Vec<SearchMatch>,
+    matches_for: Option<(u64, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,21 +50,21 @@ pub struct Hit {
     pub related: bool,
     /// An answered preview can still have no highlighted text.
     pub preview: Option<SearchPreview>,
+    pub folder: Option<String>,
 }
 
 pub struct SearchReply {
     pub rows: Vec<ThreadRow>,
     pub hits: HashMap<String, Hit>,
     pub correction: Option<String>,
-    pub suggestions: Vec<String>,
     pub error: Option<String>,
 }
 
 impl SearchReply {
     pub fn new(
         results: fell_core::Result<fell_core::SearchResults>,
-        suggestions: Vec<String>,
         mut previews: HashMap<MessageId, SearchPreview>,
+        mut locations: HashMap<MessageId, SearchLocation>,
     ) -> Self {
         let (mut rows, mut hits, mut correction, mut error) =
             (Vec::new(), HashMap::new(), None, None);
@@ -75,6 +82,7 @@ impl SearchReply {
                     semantic_only,
                 } in results.hits
                 {
+                    let location = locations.remove(&message_id);
                     rows.push(ThreadRow {
                         id: thread_id.0.clone(),
                         spans: vec![NameSpan {
@@ -83,14 +91,14 @@ impl SearchReply {
                         }],
                         extra: 0,
                         message_count: 1,
-                        starred: false,
+                        starred: location.as_ref().is_some_and(|hit| hit.starred),
                         has_attachment: false,
                         date_unix,
                         subject: one_line(&subject),
                         snippet: one_line(&snippet),
                         labels: Vec::new(),
                         warn: false,
-                        unread: false,
+                        unread: location.as_ref().is_some_and(|hit| hit.unread),
                         draft: None,
                     });
                     hits.insert(
@@ -99,6 +107,7 @@ impl SearchReply {
                             preview: previews.remove(&message_id),
                             message: message_id,
                             related: semantic_only,
+                            folder: location.and_then(|hit| hit.folder),
                         },
                     );
                 }
@@ -111,13 +120,12 @@ impl SearchReply {
             rows,
             hits,
             correction,
-            suggestions,
             error,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionField {
     Mailbox(SearchField),
     Flag(&'static str),
@@ -166,13 +174,62 @@ pub fn completion(query: &str, caret: usize) -> Option<Completion<'_>> {
 }
 
 impl Search {
-    pub fn effective_query(&self) -> &str {
-        self.correction.as_deref().unwrap_or(&self.query)
+    pub fn request(&self) -> &str {
+        &self.requested
     }
+
+    pub fn accepted_generation(&self) -> Option<u64> {
+        self.accepted.as_ref().map(|(generation, _)| *generation)
+    }
+
+    pub fn mailbox_changed(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn effective_query(&self) -> &str {
+        self.correction
+            .as_deref()
+            .or_else(|| self.accepted.as_ref().map(|(_, query)| query.as_str()))
+            .unwrap_or("")
+    }
+
+    pub fn matches_thread(&self, thread: Option<&str>) -> bool {
+        !self.pending
+            && self.matches_for.as_ref().is_some_and(|(generation, id)| {
+                self.accepted_generation() == Some(*generation) && Some(id.as_str()) == thread
+            })
+    }
+
+    pub fn completion_key(&self) -> Option<&(CompletionField, String)> {
+        self.completion_key.as_ref()
+    }
+}
+
+/// Whitespace outside quoted phrases separates search tokens. Keep bytes
+/// inside quotes, including escaped quotes, exactly as the reader typed them.
+fn query_key(input: &str) -> String {
+    let mut key = String::with_capacity(input.len());
+    let mut quoted = false;
+    let mut separator = false;
+    for ch in input.trim().chars() {
+        if !quoted && ch.is_ascii_whitespace() {
+            separator = true;
+            continue;
+        }
+        if std::mem::take(&mut separator) {
+            key.push(' ');
+        }
+        key.push(ch);
+        if ch == '"' {
+            quoted = !quoted;
+        }
+    }
+    key
 }
 
 impl Session {
     pub(super) fn start_search(&mut self, query: Option<String>) -> Step {
+        self.withdraw_purge();
         if self.search.is_none() {
             self.folder_list = Some(std::sync::Arc::new(FolderList {
                 rows: std::mem::take(&mut self.threads),
@@ -185,6 +242,7 @@ impl Session {
                 pending: self.pending.take(),
                 more_before: self.more_before,
                 more_after: self.more_after,
+                unread: self.unread_count,
             }));
             self.visual = false;
             self.more_before = false;
@@ -222,6 +280,7 @@ impl Session {
         self.pending = folder.pending;
         self.more_before = folder.more_before;
         self.more_after = folder.more_after;
+        self.unread_count = folder.unread;
         self.pane = Pane::List;
         true
     }
@@ -230,8 +289,9 @@ impl Session {
         let Some(search) = self.search.as_mut().filter(|search| search.editing) else {
             return Step::default();
         };
-        let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let typed = if text.chars().any(|ch| ch.is_control()) {
+        let line;
+        let typed = if text.chars().any(char::is_control) {
+            line = text.split_whitespace().collect::<Vec<_>>().join(" ");
             &line
         } else {
             text
@@ -244,7 +304,7 @@ impl Session {
         self.search_changed()
     }
 
-    pub(super) fn search_key(&mut self, key: KeyId) -> Step {
+    pub(crate) fn search_key(&mut self, key: KeyId) -> Step {
         let search = self.search.as_mut().unwrap();
         match key {
             KeyId::Escape => {
@@ -295,30 +355,138 @@ impl Session {
     }
 
     fn search_changed(&mut self) -> Step {
-        self.search_generation = self.search_generation.wrapping_add(1);
         let search = self.search.as_mut().unwrap();
-        search.pending = !search.query.trim().is_empty();
-        search.error = None;
-        search.correction = None;
-        search.suggestions.clear();
-        search.suggestion_index = 0;
-        search.hits.clear();
-        search.matches.clear();
-        self.threads.clear();
-        self.cursor_id = None;
-        self.picked.clear();
-        self.anchor_id = None;
-        self.visual = false;
-        Step {
-            search_request: search.pending,
-            ..Step::default()
+        let query = query_key(&search.query);
+        if query != search.requested {
+            self.search_generation = self.search_generation.wrapping_add(1);
+            search.requested = query;
+            search.pending = !search.requested.is_empty()
+                && (search.dirty
+                    || search
+                        .accepted
+                        .as_ref()
+                        .is_none_or(|(_, accepted)| *accepted != search.requested));
+            if search.requested.is_empty() {
+                search.dirty = false;
+                search.error = None;
+                search.correction = None;
+                search.accepted = None;
+                search.hits.clear();
+                search.matches.clear();
+                search.matches_for = None;
+                self.threads.clear();
+                self.cursor_id = None;
+                self.picked.clear();
+                self.anchor_id = None;
+                self.visual = false;
+            }
+            let mut step = self.update_search_completion();
+            step.search_request = self.search.as_ref().unwrap().pending;
+            return step;
+        }
+        self.update_search_completion()
+    }
+
+    pub fn refresh_search(&mut self) -> bool {
+        let Some(search) = self
+            .search
+            .as_mut()
+            .filter(|search| !search.requested.is_empty())
+        else {
+            return false;
+        };
+        self.search_generation = self.search_generation.wrapping_add(1);
+        search.pending = true;
+        search.dirty = true;
+        true
+    }
+
+    pub fn search_results_current(&self) -> bool {
+        self.search.as_ref().is_none_or(|search| !search.pending)
+    }
+
+    pub fn search_source(&self, id: &str) -> Option<&str> {
+        match &self.search {
+            Some(search) if !search.pending => search.hits.get(id)?.folder.as_deref(),
+            Some(_) => None,
+            None => Some(&self.folder),
         }
     }
 
-    fn update_search_completion(&mut self) -> Step {
-        let Some(search) = self.search.as_mut() else {
-            return Step::default();
+    pub fn search_scopes(&self, ids: &[String]) -> Option<Vec<(fell_core::ThreadId, String)>> {
+        ids.iter()
+            .map(|id| {
+                Some((
+                    fell_core::ThreadId(id.clone()),
+                    self.search_source(id)?.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn saved_folder_span(&self) -> Option<fell_core::FolderSpan> {
+        let saved = self.folder_list.as_ref()?;
+        let mut rows = saved.rows.iter().filter(|row| row.draft.is_none());
+        let first = rows.next();
+        let last = rows.next_back().or(first);
+        Some(match last {
+            Some(last) => fell_core::FolderSpan::Window {
+                first: first.filter(|_| saved.more_before).map(super::row_key),
+                last: super::row_key(last),
+                before: 0,
+                after: self.margin,
+            },
+            None => fell_core::FolderSpan::Top {
+                rows: self.load_rows,
+            },
+        })
+    }
+
+    pub fn refresh_saved_folder(
+        &mut self,
+        threads: Vec<ThreadRow>,
+        page: &fell_core::FolderPage,
+        select: Option<&str>,
+    ) {
+        let Some(saved) = self.folder_list.as_mut() else {
+            return;
         };
+        let saved = std::sync::Arc::make_mut(saved);
+        let old_index = saved
+            .rows
+            .iter()
+            .position(|row| Some(&row.id) == saved.cursor.as_ref())
+            .unwrap_or(0);
+        saved.rows.retain(|row| row.draft.is_some());
+        saved.rows.extend(threads);
+        let present = |id: &str| saved.rows.iter().any(|row| row.id == id);
+        saved.cursor = select
+            .filter(|id| present(id))
+            .map(str::to_owned)
+            .or_else(|| saved.cursor.take().filter(|id| present(id)))
+            .or_else(|| {
+                saved
+                    .rows
+                    .get(old_index.min(saved.rows.len().saturating_sub(1)))
+                    .map(|row| row.id.clone())
+            });
+        saved.picked.retain(|id| present(id));
+        if saved.anchor.as_ref().is_some_and(|id| !present(id)) {
+            saved.anchor = None;
+            saved.visual = false;
+        }
+        saved.more_before = page.more_before;
+        saved.more_after = page.more_after;
+        saved.unread = page.unread;
+    }
+
+    fn update_search_completion(&mut self) -> Step {
+        let search = self.search.as_mut().unwrap();
+        let key = completion(&search.query, search.caret).map(|c| (c.field, c.prefix.to_owned()));
+        if key == search.completion_key {
+            return Step::default();
+        }
+        search.completion_key = key;
         search.suggestions.clear();
         search.suggestion_index = 0;
         Step {
@@ -328,13 +496,20 @@ impl Session {
     }
 
     pub fn accept_search_suggestion(&mut self) -> Step {
-        let Some(search) = self.search.as_mut().filter(|search| search.editing) else {
+        let Some(search) = self.search.as_mut() else {
             return Step::default();
         };
-        if let Some(corrected) = search.correction.take() {
+        if !search.pending
+            && let Some(corrected) = search.correction.take()
+        {
+            // The store has already run this correction and supplied its hits.
+            if let Some((_, accepted)) = search.accepted.as_mut() {
+                *accepted = query_key(&corrected);
+            }
             search.query = corrected;
             search.caret = search.query.len();
-        } else if let Some(suggestion) = search.suggestions.get(search.suggestion_index)
+        } else if search.editing
+            && let Some(suggestion) = search.suggestions.get(search.suggestion_index)
             && let Some(completion) = completion(&search.query, search.caret)
         {
             let value = if suggestion
@@ -356,32 +531,46 @@ impl Session {
         } else {
             return Step::default();
         }
-        self.search_changed()
+        let submitted = !search.editing;
+        let step = self.search_changed();
+        if submitted {
+            self.remember_search();
+        }
+        step
     }
 
-    pub fn apply_search_reply(
-        &mut self,
-        generation: u64,
-        caret: usize,
-        reply: SearchReply,
-    ) -> bool {
-        let Some(search) = self
-            .search
-            .as_mut()
-            .filter(|_| self.search_generation == generation)
-        else {
+    /// Swap out the old data so the view can release large result sets off
+    /// the UI thread. A rejected reply is left intact for the same reason.
+    pub fn apply_search_reply(&mut self, generation: u64, reply: &mut SearchReply) -> bool {
+        if self.search_generation != generation
+            || self.search.as_ref().is_none_or(|search| !search.pending)
+        {
             return false;
-        };
-        self.threads = reply.rows;
-        self.cursor_id = self.threads.first().map(|row| row.id.clone());
-        search.pending = false;
-        search.error = reply.error;
-        search.correction = reply.correction;
-        search.hits = reply.hits;
-        if search.caret == caret {
-            search.suggestions = reply.suggestions;
-            search.suggestion_index = 0;
         }
+        if self.visual {
+            self.set_threads(std::mem::take(&mut reply.rows));
+        } else {
+            std::mem::swap(&mut self.threads, &mut reply.rows);
+            if self
+                .cursor_id
+                .as_ref()
+                .is_none_or(|id| !reply.hits.contains_key(id))
+            {
+                self.cursor_id = self.threads.first().map(|row| row.id.clone());
+            }
+            self.picked.retain(|id| reply.hits.contains_key(id));
+        }
+        if self.threads.is_empty() {
+            self.pane = Pane::List;
+            self.full_width = false;
+        }
+        let search = self.search.as_mut().unwrap();
+        search.pending = false;
+        search.dirty = false;
+        search.error = reply.error.take();
+        search.correction = reply.correction.take();
+        std::mem::swap(&mut search.hits, &mut reply.hits);
+        search.accepted = Some((generation, search.requested.clone()));
         true
     }
 
@@ -398,18 +587,38 @@ impl Session {
         }
     }
 
-    pub fn set_search_matches(&mut self, thread: &str, matches: Vec<MessageId>) {
-        let Some(search) = self.search.as_mut() else {
-            return;
+    pub fn set_search_matches(
+        &mut self,
+        generation: u64,
+        thread: &str,
+        matches: Vec<SearchMatch>,
+        land: bool,
+    ) -> bool {
+        let Some(search) = self
+            .search
+            .as_mut()
+            .filter(|s| s.accepted_generation() == Some(generation))
+        else {
+            return false;
         };
         let Some(hit) = search.hits.get(thread) else {
-            return;
+            return false;
         };
+        search.matches_for = Some((generation, thread.to_owned()));
         search.matches = if matches.is_empty() {
-            vec![hit.message.clone()]
+            vec![SearchMatch {
+                message: hit.message.clone(),
+                preview: None,
+            }]
         } else {
             matches
         };
+        if !land
+            && let Some(message) = self.messages.get(self.message_cursor)
+            && search.matches.iter().any(|hit| hit.message.0 == message.id)
+        {
+            return self.reveal_matching_quote(self.message_cursor);
+        }
         if let Some(index) = self
             .messages
             .iter()
@@ -417,22 +626,48 @@ impl Session {
         {
             self.message_cursor = index;
             self.messages[index].expanded = true;
+            self.reveal_matching_quote(index);
+            return true;
         }
+        false
     }
 
-    pub(super) fn move_search_hit(&mut self, forward: bool, count: usize) -> Step {
+    /// The selected result may live in quoted history rather than the reply.
+    pub fn reveal_matching_quote(&mut self, index: usize) -> bool {
         let Some(search) = self
             .search
             .as_ref()
-            .filter(|_| self.pane == Pane::Conversation)
+            .filter(|s| s.matches_thread(self.cursor_id.as_deref()))
         else {
+            return false;
+        };
+        let Some(message) = self.messages.get(index) else {
+            return false;
+        };
+        if self.quotes_open.contains(&message.id) {
+            return false;
+        }
+        let preview = search
+            .matches
+            .iter()
+            .find(|hit| hit.message.0 == message.id)
+            .and_then(|hit| hit.preview.as_ref());
+        preview.is_some_and(|preview| {
+            folded_match(message, preview) && self.quotes_open.insert(message.id.clone())
+        })
+    }
+
+    pub(super) fn move_search_hit(&mut self, forward: bool, count: usize) -> Step {
+        let Some(search) = self.search.as_ref().filter(|search| {
+            self.pane == Pane::Conversation && search.matches_thread(self.cursor_id.as_deref())
+        }) else {
             return Step::default();
         };
         let hits: Vec<usize> = self
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, message)| search.matches.iter().any(|hit| hit.0 == message.id))
+            .filter(|(_, message)| search.matches.iter().any(|hit| hit.message.0 == message.id))
             .map(|(index, _)| index)
             .collect();
         let len = hits.len();
@@ -452,12 +687,66 @@ impl Session {
         self.message_cursor = hits[index];
         let changed = !self.messages[self.message_cursor].expanded;
         self.messages[self.message_cursor].expanded = true;
+        let revealed = self.reveal_matching_quote(self.message_cursor);
         Step {
-            message_disclosure_changed: changed,
+            message_disclosure_changed: changed || revealed,
             reveal_search_hit: true,
             ..Step::default()
         }
     }
+}
+
+fn folded_match(message: &ConvMessage, preview: &SearchPreview) -> bool {
+    if preview.highlights.is_empty() {
+        return false;
+    }
+    let mut visible = String::new();
+    let mut folded = String::new();
+    let mut include = |hidden: bool, text: &str| {
+        let target = if hidden { &mut folded } else { &mut visible };
+        target.push(' ');
+        target.push_str(&one_line(text).to_lowercase());
+    };
+    match &message.rich {
+        Rich::Html(html) => {
+            for section in &html.folded.sections {
+                include(
+                    section.fold.is_some(),
+                    &fell_render::StyledDocument::blocks_text(html.folded.blocks(section)),
+                );
+            }
+        }
+        rich => {
+            let body = if let Rich::PlainPart(body) = rich {
+                body
+            } else {
+                &message.body
+            };
+            for block in &body.blocks {
+                match block {
+                    BodyBlock::Text(text) => include(false, text),
+                    BodyBlock::Quote(text) | BodyBlock::Signature(text) => include(true, text),
+                    BodyBlock::Markdown { .. } => {}
+                }
+            }
+        }
+    }
+    preview.highlights.iter().any(|range| {
+        let word = preview.text[range.clone()].to_lowercase();
+        let contains_word = |text: &str| {
+            text.match_indices(&word).any(|(at, found)| {
+                !text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                    && !text[at + found.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric)
+            })
+        };
+        contains_word(&folded) && !contains_word(&visible)
+    })
 }
 
 fn previous(query: &str, caret: usize) -> usize {
@@ -498,24 +787,37 @@ mod tests {
         }
     }
 
-    fn reply(
-        hits: Vec<SearchHit>,
-        correction: Option<&str>,
-        suggestions: Vec<&str>,
-    ) -> SearchReply {
+    fn reply(hits: Vec<SearchHit>, correction: Option<&str>) -> SearchReply {
+        let locations = hits
+            .iter()
+            .map(|hit| {
+                let folder = if hit.thread_id.0 == "two" {
+                    "Sent"
+                } else {
+                    "INBOX"
+                };
+                (
+                    hit.message_id.clone(),
+                    SearchLocation {
+                        folder: Some(folder.into()),
+                        unread: false,
+                        starred: false,
+                    },
+                )
+            })
+            .collect();
         SearchReply::new(
             Ok(fell_core::SearchResults {
                 hits,
                 did_you_mean: correction.map(str::to_owned),
             }),
-            suggestions.into_iter().map(str::to_owned).collect(),
             HashMap::new(),
+            locations,
         )
     }
 
-    fn land(session: &mut Session, reply: SearchReply) {
-        let caret = session.search.as_ref().unwrap().caret;
-        assert!(session.apply_search_reply(session.search_generation, caret, reply));
+    fn land(session: &mut Session, mut reply: SearchReply) {
+        assert!(session.apply_search_reply(session.search_generation, &mut reply));
     }
 
     #[test]
@@ -531,11 +833,7 @@ mod tests {
         assert_eq!(session.mode_label(), "normal");
         land(
             &mut session,
-            reply(
-                vec![row_hit("one", "m1"), row_hit("two", "m2")],
-                None,
-                vec![],
-            ),
+            reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None),
         );
         assert_eq!(session.pane, Pane::List);
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
@@ -557,10 +855,9 @@ mod tests {
             CompletionField::Mailbox(SearchField::Folder)
         ));
         assert_eq!(value.prefix, "Ar");
-        land(
-            &mut session,
-            reply(vec![], None, vec!["Archive", "Archive 2025"]),
-        );
+        land(&mut session, reply(vec![], None));
+        session.search.as_mut().unwrap().suggestions =
+            vec!["Archive".into(), "Archive 2025".into()];
         session.on_key(KeyId::Down, 10);
         assert!(session.on_key(KeyId::Tab, 10).search_request);
         assert_eq!(
@@ -577,17 +874,18 @@ mod tests {
         session.type_search("invioce");
         land(
             &mut session,
-            reply(vec![row_hit("one", "m1")], Some("invoice"), vec![]),
+            reply(vec![row_hit("one", "m1")], Some("invoice")),
         );
         assert_eq!(session.threads.len(), 1);
         assert_eq!(
             session.search.as_ref().unwrap().effective_query(),
             "invoice"
         );
-        assert!(session.on_key(KeyId::Tab, 10).search_request);
-        assert!(session.threads.is_empty());
-        assert_eq!(session.search.as_ref().unwrap().query, "invoice");
         session.on_key(KeyId::Enter, 10);
+        assert!(!session.on_key(KeyId::Tab, 10).search_request);
+        assert_eq!(session.threads.len(), 1);
+        assert_eq!(session.search.as_ref().unwrap().query, "invoice");
+        assert!(!session.search_editing());
         session.on_key(KeyId::Escape, 10);
         session.on_key(KeyId::Char(':'), 10);
         assert_eq!(session.palette()[0].search.as_deref(), Some("invoice"));
@@ -600,7 +898,7 @@ mod tests {
     fn escape_restores_the_folder_window_after_stale_results() {
         let mut session = session();
         session.folder = "Archive".into();
-        let initial = reply(vec![row_hit("a", "m1"), row_hit("b", "m2")], None, vec![]);
+        let initial = reply(vec![row_hit("a", "m1"), row_hit("b", "m2")], None);
         session.set_threads(initial.rows);
         session.select_if_present("b");
         session.more_after = true;
@@ -610,18 +908,11 @@ mod tests {
         let old = session.search_generation;
         session.type_search("er");
         let recent = session.search_generation;
-        land(
-            &mut session,
-            reply(vec![row_hit("new", "m3")], None, vec![]),
-        );
-        assert!(!session.apply_search_reply(
-            old,
-            3,
-            reply(vec![row_hit("stale", "m4")], None, vec![])
-        ));
+        land(&mut session, reply(vec![row_hit("new", "m3")], None));
+        assert!(!session.apply_search_reply(old, &mut reply(vec![row_hit("stale", "m4")], None)));
         assert_eq!(session.cursor_id.as_deref(), Some("new"));
         session.on_key(KeyId::Escape, 10);
-        assert!(!session.apply_search_reply(recent, 5, reply(vec![], None, vec![])));
+        assert!(!session.apply_search_reply(recent, &mut reply(vec![], None)));
         assert_eq!(session.folder, "Archive");
         assert_eq!(session.cursor_id.as_deref(), Some("b"));
         assert!(session.more_after);
@@ -651,7 +942,7 @@ mod tests {
             .thread_messages(&account.id, &hit.thread_id)
             .unwrap();
         let thread = hit.thread_id.0.clone();
-        land(&mut session, reply(vec![hit], None, vec![]));
+        land(&mut session, reply(vec![hit], None));
         session.on_key(KeyId::Enter, 10);
         session.set_messages(crate::present::conversation(
             &messages,
@@ -661,17 +952,135 @@ mod tests {
             "Inbox",
         ));
         assert!(matches.len() > 1);
-        session.set_search_matches(&thread, matches.clone());
+        session.set_search_matches(session.search_generation, &thread, matches.clone(), true);
         let representative = session.message_cursor;
         session.on_key(KeyId::Char('n'), 10);
         assert_ne!(session.message_cursor, representative);
         assert!(
             matches
                 .iter()
-                .any(|id| id.0 == session.messages[session.message_cursor].id)
+                .any(|hit| hit.message.0 == session.messages[session.message_cursor].id)
         );
         assert!(session.messages[session.message_cursor].expanded);
+        assert!(
+            session.messages[session.message_cursor]
+                .id
+                .contains("venue-2@fell.test")
+        );
+        assert!(
+            session.is_open(session.message_cursor),
+            "the only hall match here is folded"
+        );
         session.on_key(KeyId::Char('N'), 10);
         assert_eq!(session.message_cursor, representative);
+    }
+
+    #[test]
+    fn edits_retain_accepted_rows_and_preview_and_do_not_requery_equivalent_text() {
+        let mut session = session();
+        session.perform(Action::Search, 10);
+        session.type_search("hall");
+        let accepted = session.search_generation;
+        land(
+            &mut session,
+            reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None),
+        );
+        session.select_if_present("two");
+        session.picked.insert("one".into());
+        let mut messages = Vec::new();
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let thread = store
+            .search(&account.id, "hall")
+            .unwrap()
+            .hits
+            .remove(0)
+            .thread_id;
+        messages.extend(crate::present::conversation(
+            &store.thread_messages(&account.id, &thread).unwrap(),
+            &account.email,
+            &session.roles,
+            &[],
+            "Inbox",
+        ));
+        session.set_messages(messages.clone());
+        assert!(!session.type_search(" ").search_request);
+        assert_eq!(session.search_generation, accepted);
+        assert_eq!(session.cursor_id.as_deref(), Some("two"));
+        assert!(session.type_search("lane").search_request);
+        let stale = session.search_generation;
+        assert!(session.search.as_ref().unwrap().pending);
+        assert_eq!(session.threads.len(), 2);
+        assert_eq!(session.messages, messages);
+        assert_eq!(session.perform(Action::Archive, 10), Step::default());
+        assert_eq!(session.perform(Action::Next, 10), Step::default());
+        for _ in 0..4 {
+            session.on_key(KeyId::Backspace, 10);
+        }
+        let search = session.search.as_ref().unwrap();
+        assert!(!search.pending);
+        assert_eq!(search.accepted_generation(), Some(accepted));
+        assert!(!session.apply_search_reply(stale, &mut reply(vec![], None)));
+        assert_eq!(session.cursor_id.as_deref(), Some("two"));
+        assert!(session.picked.contains("one"));
+        assert_eq!(
+            query_key(r#"subject:"a  b"   hall  "#),
+            r#"subject:"a  b" hall"#
+        );
+    }
+
+    #[test]
+    fn confirmed_results_use_the_hit_folder_and_restore_the_refreshed_folder() {
+        let mut session = session();
+        session.set_threads(
+            reply(
+                vec![row_hit("removed", "old"), row_hit("still", "same")],
+                None,
+            )
+            .rows,
+        );
+        session.perform(Action::Search, 10);
+        session.type_search("hall");
+        land(
+            &mut session,
+            reply(vec![row_hit("one", "m1"), row_hit("two", "m2")], None),
+        );
+        session.on_key(KeyId::Enter, 10);
+        session.picked.insert("one".into());
+        session.picked.insert("two".into());
+        let targets = session.action_targets();
+        assert_eq!(
+            session
+                .search_scopes(&targets)
+                .unwrap()
+                .iter()
+                .map(|(_, folder)| folder.as_str())
+                .collect::<Vec<_>>(),
+            ["INBOX", "Sent"]
+        );
+        assert!(session.perform(Action::Delete, 10).delete);
+        session.picked.clear();
+        session.select_if_present("two");
+        assert!(session.perform(Action::Archive, 10).archive);
+        assert_eq!(session.search_source("two"), Some("Sent"));
+        assert!(session.perform(Action::ToggleStar, 10).flags.is_some());
+        assert!(session.perform(Action::Undo, 10).undo);
+
+        let page = fell_core::FolderPage {
+            threads: vec![],
+            more_before: false,
+            more_after: false,
+            unread: 2,
+        };
+        session.refresh_saved_folder(
+            reply(vec![row_hit("still", "same")], None).rows,
+            &page,
+            None,
+        );
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.cursor_id.as_deref(), Some("still"));
+        assert_eq!(session.unread_count, 2);
+        assert_eq!(session.threads.len(), 1);
     }
 }

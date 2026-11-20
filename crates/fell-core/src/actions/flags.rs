@@ -87,13 +87,42 @@ impl Store {
         folder: &str,
         change: FlagChange,
     ) -> Result<Option<LocalAction>> {
+        self.apply_flags(
+            account_id,
+            threads.iter().map(|thread| (thread, folder)),
+            change,
+        )
+    }
+
+    /// Apply one undoable edit to ranked results, using each hit's source folder.
+    pub fn flag_scoped_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[(ThreadId, String)],
+        change: FlagChange,
+    ) -> Result<Option<LocalAction>> {
+        self.apply_flags(
+            account_id,
+            threads
+                .iter()
+                .map(|(thread, folder)| (thread, folder.as_str())),
+            change,
+        )
+    }
+
+    fn apply_flags<'a>(
+        &self,
+        account_id: &AccountId,
+        threads: impl IntoIterator<Item = (&'a ThreadId, &'a str)>,
+        change: FlagChange,
+    ) -> Result<Option<LocalAction>> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         super::ensure_action_schema(&tx)?;
         let mut writes: Vec<(Row, bool, bool)> = Vec::new();
         let mut touched = 0;
         let mut found = false;
-        for thread in threads {
+        for (thread, folder) in threads {
             let rows = load_flags(&tx, account_id, thread)?;
             found |= !rows.is_empty();
             let before = writes.len();

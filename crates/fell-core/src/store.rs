@@ -1168,14 +1168,33 @@ impl Store {
         crate::search::previews(&self.conn, account, query, messages)
     }
 
-    /// Message IDs matching the effective keyword query inside one result.
+    /// Messages and excerpts matching the effective keyword query inside one result.
     pub fn search_thread_matches(
         &self,
         account: &AccountId,
         query: &str,
         thread: &ThreadId,
-    ) -> Result<Vec<MessageId>> {
+    ) -> Result<Vec<crate::SearchMatch>> {
         crate::search::thread_matches(&self.conn, account, query, thread)
+    }
+
+    /// Folders and flags for ranked rows. An explicit folder filter wins,
+    /// then the folder the reader came from, then Inbox or the hit's first folder.
+    pub fn search_locations(
+        &self,
+        account: &AccountId,
+        query: &str,
+        folder: &str,
+        hits: &[SearchHit],
+    ) -> Result<std::collections::HashMap<MessageId, crate::SearchLocation>> {
+        crate::search::locations(
+            &self.conn,
+            account,
+            query,
+            folder,
+            &self.folder_roles(account)?,
+            hits,
+        )
     }
 
     /// Values for a search operator, drawn from this account's local mail.
@@ -1192,7 +1211,7 @@ impl Store {
         use crate::SearchField::*;
         let names = match field {
             Folder => self.folder_names(account)?,
-            Label => self.list_labels(account)?,
+            Label => return crate::search::label_suggestions(&self.conn, account, prefix, limit),
             Sender | Recipient => {
                 return crate::search::address_suggestions(
                     &self.conn, account, field, prefix, limit,
@@ -5062,11 +5081,14 @@ mod tests {
         let filtered = store
             .search_thread_matches(&account, "invoice is:unread", &thread)
             .unwrap();
-        assert_eq!(filtered, vec![MessageId::new("ada@msg")]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message, MessageId::new("ada@msg"));
         let operator_only = store
             .search_thread_matches(&account, "label:work", &thread)
             .unwrap();
-        assert_eq!(operator_only, filtered);
+        assert_eq!(operator_only.len(), 1);
+        assert_eq!(operator_only[0].message, filtered[0].message);
+        assert!(operator_only[0].preview.is_none());
     }
 
     #[test]

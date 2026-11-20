@@ -74,6 +74,87 @@ pub struct SearchPreview {
     pub highlights: Vec<std::ops::Range<usize>>,
 }
 
+/// Scope of a ranked result's normal conversation actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchLocation {
+    pub folder: Option<String>,
+    pub unread: bool,
+    pub starred: bool,
+}
+
+/// One message that matches the effective query inside a ranked thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub message: MessageId,
+    pub preview: Option<SearchPreview>,
+}
+
+const EXCERPT: &str = "snippet(messages_fts, -1, char(1), char(2), '…', 18)";
+const COMPLETION_MESSAGES: i64 = 4096;
+
+pub(crate) fn locations(
+    conn: &Connection,
+    account: &AccountId,
+    query: &str,
+    current_folder: &str,
+    roles: &crate::FolderRoles,
+    hits: &[SearchHit],
+) -> Result<HashMap<MessageId, SearchLocation>> {
+    let filters = parse_query(query)?.folders;
+    let mut locations = HashMap::with_capacity(hits.len());
+    for chunk in hits.chunks(128) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT m.message_id, m.folders, m.archived, m.unread,
+                    COALESCE(s.starred, m.starred),
+                    (SELECT group_concat(f.folder_key, char(30)) FROM thread_folders f
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.unread = 1)
+             FROM messages m LEFT JOIN thread_summary s
+              ON s.account_id = m.account_id AND s.thread_id = m.thread_id
+             WHERE m.account_id = ? AND m.message_id IN ({marks})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let params = std::iter::once(account.as_str())
+            .chain(chunk.iter().map(|hit| hit.message_id.as_str()));
+        let mut rows = stmt.query(params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            let mut folders = crate::store::split_field(&row.get::<_, String>(1)?);
+            if folders.is_empty() && !row.get::<_, bool>(2)? {
+                folders.push(roles.name(crate::FolderRole::Inbox).to_owned());
+            }
+            let folder = filters
+                .iter()
+                .map(String::as_str)
+                .chain([current_folder, roles.name(crate::FolderRole::Inbox)])
+                .find_map(|preferred| {
+                    folders
+                        .iter()
+                        .find(|name| name.eq_ignore_ascii_case(preferred))
+                })
+                .or_else(|| folders.first())
+                .cloned();
+            let unread_folders = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            let unread = match &folder {
+                Some(folder) => unread_folders
+                    .split('\u{1e}')
+                    .any(|name| name.eq_ignore_ascii_case(folder)),
+                None => row.get(3)?,
+            };
+            locations.insert(
+                MessageId(row.get(0)?),
+                SearchLocation {
+                    folder,
+                    unread,
+                    starred: row.get(4)?,
+                },
+            );
+        }
+    }
+    Ok(locations)
+}
+
 /// The search values available for autocomplete from the local mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchField {
@@ -93,8 +174,7 @@ pub(crate) fn previews(
     let Some(fts) = fts_match(&parsed).filter(|_| !messages.is_empty()) else {
         return Ok(HashMap::new());
     };
-    let mut sql =
-        String::from("SELECT m.message_id, snippet(messages_fts, -1, char(1), char(2), '…', 18)");
+    let mut sql = format!("SELECT m.message_id, {EXCERPT}");
     let mut params = matching_rows(&mut sql, account, &parsed, Some(&fts));
     sql.push_str(" AND m.message_id IN (");
     for (index, message) in messages.iter().enumerate() {
@@ -139,18 +219,29 @@ pub(crate) fn thread_matches(
     account: &AccountId,
     query: &str,
     thread: &ThreadId,
-) -> Result<Vec<MessageId>> {
+) -> Result<Vec<SearchMatch>> {
     let parsed = parse_query(query)?;
     if query.trim().is_empty() || no_match_possible(&parsed) {
         return Ok(Vec::new());
     }
-    let mut sql = String::from("SELECT m.message_id");
     let fts = fts_match(&parsed);
+    let mut sql = format!(
+        "SELECT m.message_id, {}",
+        if fts.is_some() { EXCERPT } else { "NULL" }
+    );
     let mut params = matching_rows(&mut sql, account, &parsed, fts.as_deref());
     sql.push_str(" AND m.thread_id = ?");
     params.push(Value::Text(thread.0.clone()));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| Ok(MessageId(row.get(0)?)))?;
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok(SearchMatch {
+            message: MessageId(row.get(0)?),
+            preview: row
+                .get::<_, Option<String>>(1)?
+                .as_deref()
+                .map(preview_from_marked),
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -201,14 +292,9 @@ pub(crate) fn address_suggestions(
         SearchField::Sender => {
             let mut stmt = conn.prepare_cached(
                 "SELECT from_email, from_name FROM messages
-                 WHERE account_id = ?1 AND (instr(lower(from_email), ?2) = 1
-                    OR instr(lower(from_name), ?2) = 1 OR ?3)",
+                 WHERE account_id = ?1 ORDER BY date_unix DESC LIMIT ?2",
             )?;
-            let mut rows = stmt.query(rusqlite::params![
-                account.as_str(),
-                prefix,
-                !prefix.is_ascii()
-            ])?;
+            let mut rows = stmt.query(rusqlite::params![account.as_str(), COMPLETION_MESSAGES])?;
             while let Some(row) = rows.next()? {
                 if add(row.get(0)?, row.get(1)?) {
                     break;
@@ -217,15 +303,10 @@ pub(crate) fn address_suggestions(
         }
         SearchField::Recipient => {
             let mut stmt = conn.prepare_cached(
-                "SELECT to_line, cc_line, bcc_line FROM messages WHERE account_id = ?1
-                 AND (instr(lower(to_line), ?2) > 0 OR instr(lower(cc_line), ?2) > 0
-                       OR instr(lower(bcc_line), ?2) > 0 OR ?3)",
+                "SELECT to_line, cc_line, bcc_line FROM messages
+                 WHERE account_id = ?1 ORDER BY date_unix DESC LIMIT ?2",
             )?;
-            let mut rows = stmt.query(rusqlite::params![
-                account.as_str(),
-                prefix,
-                !prefix.is_ascii()
-            ])?;
+            let mut rows = stmt.query(rusqlite::params![account.as_str(), COMPLETION_MESSAGES])?;
             'messages: while let Some(row) = rows.next()? {
                 for column in 0..3 {
                     let encoded: String = row.get(column)?;
@@ -240,6 +321,28 @@ pub(crate) fn address_suggestions(
         _ => unreachable!("address completions require a sender or recipient"),
     }
     Ok(values)
+}
+
+pub(crate) fn label_suggestions(
+    conn: &Connection,
+    account: &AccountId,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT labels FROM messages WHERE account_id = ?1 ORDER BY date_unix DESC LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![account.as_str(), COMPLETION_MESSAGES])?;
+    let prefix = prefix.to_lowercase();
+    let mut values = std::collections::BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        for label in crate::store::split_field(&row.get::<_, String>(0)?) {
+            if label.to_lowercase().starts_with(&prefix) {
+                values.insert(label);
+            }
+        }
+    }
+    Ok(values.into_iter().take(limit).collect())
 }
 
 /// How [`crate::Store::search_with`] searches.
@@ -1614,6 +1717,29 @@ fn damerau_levenshtein(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_recipient_completion_checks_only_the_newest_messages() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (account_id TEXT, date_unix INTEGER, to_line TEXT, cc_line TEXT, bcc_line TEXT);
+             CREATE INDEX by_date ON messages(account_id, date_unix DESC);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4096)
+             INSERT INTO messages SELECT 'a', i, '', '', '' FROM n;
+             INSERT INTO messages VALUES ('a', 0, 'Àlost' || char(31) || 'old@example.test', '', '');
+             INSERT INTO messages VALUES ('a', 4097, '', 'Élodie' || char(31) || 'new@example.test', '');"
+        ).unwrap();
+        let account = AccountId("a".into());
+        assert_eq!(
+            address_suggestions(&conn, &account, SearchField::Recipient, "Él", 4).unwrap(),
+            ["new@example.test"]
+        );
+        assert!(
+            address_suggestions(&conn, &account, SearchField::Recipient, "Àl", 4)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn escapes_quotes() {

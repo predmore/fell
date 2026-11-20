@@ -107,7 +107,8 @@ pub(super) fn row(
                                     cx.listener(
                                         move |inbox, event: &gpui::MouseDownEvent, window, cx| {
                                             cx.stop_propagation();
-                                            if inbox.open_thread != inbox.session.cursor_id
+                                            if !inbox.search_conversation_live()
+                                                || inbox.open_thread != inbox.session.cursor_id
                                                 || !inbox.session.messages.get(index).is_some_and(
                                                     |message| {
                                                         message.id == id
