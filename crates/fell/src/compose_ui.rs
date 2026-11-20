@@ -317,9 +317,8 @@ pub struct ComposeView {
     known_hunks: Vec<u64>,
     /// Send was tried: a missing recipient now says it blocks send.
     send_tried: bool,
-    send_unavailable: Option<AccountConfigError>,
+    send_feedback: SendFeedbackState,
     send_check: Option<gpui::Task<()>>,
-    send_failure: Option<SendFailure>,
     send_panel: SendPanel,
     send_detail_scroll: gpui::ScrollHandle,
 }
@@ -336,6 +335,12 @@ impl ComposeView {
             .with_session(&draft_id, |session| session.snapshot())
             .unwrap_or_else(|| empty_snapshot(&draft_id));
         let editor = Editor::from_body(&snap.body);
+        cx.default_global::<SendAttempts>();
+        cx.observe_global::<SendAttempts>(|this, cx| {
+            this.send_feedback.invalidate_readiness();
+            cx.notify();
+        })
+        .detach();
         // A closed window no longer counts as showing its draft.
         cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
             .detach();
@@ -376,9 +381,8 @@ impl ComposeView {
             touched: false,
             known_hunks: Vec::new(),
             send_tried: false,
-            send_unavailable: None,
+            send_feedback: SendFeedbackState::default(),
             send_check: None,
-            send_failure: None,
             send_panel: SendPanel::Summary,
             send_detail_scroll: gpui::ScrollHandle::new(),
         };
@@ -402,6 +406,10 @@ impl ComposeView {
                 return;
             }
             loop {
+                let Ok(generation) = this.update(cx, |this, _| this.send_feedback.generation)
+                else {
+                    break;
+                };
                 let account = account.clone();
                 let unavailable = cx
                     .background_executor()
@@ -409,8 +417,7 @@ impl ComposeView {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.send_unavailable != unavailable {
-                            this.send_unavailable = unavailable;
+                        if this.send_feedback.update_readiness(generation, unavailable) {
                             cx.notify();
                         }
                     })
@@ -763,9 +770,8 @@ impl ComposeView {
         self.subject_line = snap.subject.clone();
         self.sent = false;
         self.send_tried = false;
-        self.send_unavailable = None;
+        self.send_feedback.switch_draft();
         self.send_check = None;
-        self.send_failure = None;
         self.send_panel = SendPanel::Summary;
         self.palette = None;
         self.leader = false;
@@ -951,6 +957,8 @@ impl ComposeView {
         {
             return;
         }
+        self.send_feedback.invalidate_readiness();
+        cx.global_mut::<SendAttempts>().clear(&id);
         if self.field != Field::Body && !self.commit_field(self.field) {
             return;
         }
@@ -958,7 +966,6 @@ impl ComposeView {
             self.status = "the draft changed; it is on screen before send".into();
             return;
         }
-        self.send_failure = None;
         self.flush_now();
         let prepared = self.hub.with_session(&id, prepare_from_editor);
         let prepared = match prepared {
@@ -977,6 +984,7 @@ impl ComposeView {
             }
         };
         self.sending = Some(id.clone());
+        let attempt = cx.global_mut::<SendAttempts>().start(&id);
         self.preview = false;
         self.status = "".into();
         let hub = self.hub.clone();
@@ -989,6 +997,14 @@ impl ComposeView {
                     async move { transmit_from_hub(&hub, &id, prepared, account_backend) }
                 })
                 .await;
+            let current = cx
+                .update_global::<SendAttempts, _>(|attempts, _| {
+                    attempts.finish(&sent_id, attempt, outcome.as_ref().err().cloned())
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
             let shown = this.update(cx, |this, cx| {
                 if this.sending.as_deref() == Some(sent_id.as_str()) {
                     this.sending = None;
@@ -1002,17 +1018,9 @@ impl ComposeView {
                 );
                 if let Some(status) = end.status {
                     this.sent = end.sent;
-                    this.status = match outcome {
-                        Err(SendFailure::Unavailable(ref error)) => {
-                            this.send_unavailable = Some(error.clone());
-                            this.refresh_send_availability(cx);
-                            "".into()
-                        }
-                        Err(ref error @ (SendFailure::NotSent(_) | SendFailure::MaybeSent(_))) => {
-                            this.send_failure = Some(error.clone());
-                            "".into()
-                        }
-                        _ => status.into(),
+                    this.status = match &outcome {
+                        Err(SendFailure::Locked(_)) | Ok(_) => status.into(),
+                        Err(_) => "".into(),
                     };
                 }
                 if end.close {
@@ -1253,11 +1261,20 @@ impl ComposeView {
                 self.send_panel = SendPanel::ConfirmUnlock;
             }
             "details"
-                if send_feedback(locked, &self.send_unavailable, &self.send_failure)
+                if self
+                    .send_feedback
+                    .feedback(
+                        locked,
+                        cx.global::<SendAttempts>().failure(self.draft_id.as_ref()),
+                    )
                     .is_some_and(|feedback| feedback.detail().is_some()) =>
             {
                 self.send_detail_scroll = gpui::ScrollHandle::new();
                 self.send_panel = SendPanel::Details;
+            }
+            "dismiss" if locked.is_none() => {
+                cx.global_mut::<SendAttempts>()
+                    .clear(self.draft_id.as_ref());
             }
             "send" => self.send(cx),
             "preview" => {
@@ -1309,7 +1326,8 @@ impl ComposeView {
                 });
                 self.status = match result {
                     Some(Ok(())) => {
-                        self.send_failure = None;
+                        cx.global_mut::<SendAttempts>()
+                            .clear(self.draft_id.as_ref());
                         "Draft unlocked".into()
                     }
                     Some(Err(err)) => err.into(),
@@ -1635,6 +1653,10 @@ impl Render for ComposeView {
             window.remove_window();
         }
         self.sync_from_hub();
+        let attempt = cx
+            .global::<SendAttempts>()
+            .failure(self.draft_id.as_ref())
+            .cloned();
         if self.send_check.is_none() {
             self.refresh_send_availability(cx);
         }
@@ -1669,7 +1691,7 @@ impl Render for ComposeView {
                 (session.snapshot(), session.send_lock())
             })
             .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None));
-        if self.send_unavailable.is_some() && lock.is_none() {
+        if self.send_feedback.readiness.is_some() && lock.is_none() {
             snap.send_block = Some(SEND_UNAVAILABLE.into());
         }
         let colors = self.colors();
@@ -1679,7 +1701,7 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
-        let feedback = send_feedback(lock, &self.send_unavailable, &self.send_failure);
+        let feedback = self.send_feedback.feedback(lock, attempt.as_ref());
         if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
             || (self.send_panel == SendPanel::Details
                 && feedback
@@ -1691,7 +1713,8 @@ impl Render for ComposeView {
         self.editor.caret_hidden =
             self.field != Field::Body || lock.is_some() || self.send_panel != SendPanel::Summary;
         let show_status = self.send_panel == SendPanel::Summary
-            && (lock != Some(SendLock::MaybeSent) || !idle_status(&self.status));
+            && (!matches!(lock, Some(SendLock::MaybeSent | SendLock::Sent))
+                || !idle_status(&self.status));
         let palette_help = match (
             lock,
             feedback
@@ -1701,6 +1724,7 @@ impl Render for ComposeView {
             (Some(SendLock::MaybeSent), true) => "details · unlock · q close",
             (Some(SendLock::MaybeSent), false) => "unlock · q close",
             (Some(_), _) => "q close",
+            (None, true) if attempt.is_some() => "details · dismiss · send · q close",
             (None, true) => "details · send · preview · raw · quote · theme · keep · reject · undo",
             (None, false) => "send · preview · raw · quote · theme · keep · reject · undo",
         };
@@ -1714,10 +1738,10 @@ impl Render for ComposeView {
             Mode::Visual => "visual",
         };
         // The mode word says it all; how to change mode is not news.
-        let hint: SharedString = match (idle_status(&self.status), lock) {
-            (true, Some(SendLock::Sent)) if wide => "read-only".into(),
-            (true, _) => "".into(),
-            (false, _) => self.status.clone(),
+        let hint: SharedString = if idle_status(&self.status) {
+            "".into()
+        } else {
+            self.status.clone()
         };
         let mono = self
             .look
@@ -2041,6 +2065,8 @@ pub enum SendFailure {
     Locked(SendLock),
     /// Nothing was transmitted. The draft can be sent again.
     NotSent(String),
+    /// SMTP authentication rejected the configured credentials.
+    CredentialsRejected(String),
     /// The local account settings need attention before this draft can send.
     Unavailable(AccountConfigError),
     /// The connection failed after the server had the whole message. The
@@ -2052,6 +2078,7 @@ impl SendFailure {
     fn from_core(err: fell_core::Error) -> Self {
         match err {
             fell_core::Error::SendUncertain(detail) => Self::MaybeSent(detail),
+            fell_core::Error::SmtpCredentialsRejected(detail) => Self::CredentialsRejected(detail),
             other => Self::NotSent(other.to_string()),
         }
     }
@@ -2062,6 +2089,7 @@ impl std::fmt::Display for SendFailure {
         match self {
             Self::Locked(lock) => f.write_str(lock.reason()),
             Self::NotSent(detail) => write!(f, "Not sent: {detail}"),
+            Self::CredentialsRejected(_) => write!(f, "SMTP sign-in failed. {SMTP_AUTH_RECOVERY}"),
             Self::Unavailable(error) => write!(f, "Not sent. {error}. {}", error.recovery),
             Self::MaybeSent(detail) => {
                 write!(
@@ -2088,6 +2116,8 @@ pub(crate) struct SendEnd {
 /// Said when a send went out but the mailbox could not record it.
 const SENT_UNRECORDED: &str =
     "Sent; the mailbox did not record it, so this draft will read as possibly sent";
+
+const SMTP_AUTH_RECOVERY: &str = "Update the password in account.toml or fix password_command. Run fell account check before retrying.";
 
 /// The window is one, and `c`, Enter or an agent's `request_send` can move
 /// it to another draft while a send is still in flight. Only the draft that
@@ -2163,9 +2193,18 @@ fn send_failure_line(
             "sent  ·  the mailbox did not record it, so this draft reads as possibly sent".into(),
         ),
         Ok(_) => None,
+        Err(_)
+            if hub.with_session(id, |session| session.send_lock())
+                == Some(Some(SendLock::Sent)) =>
+        {
+            None
+        }
         Err(SendFailure::MaybeSent(_)) => Some(fell_core::compose::MAYBE_SENT_NOTICE.into()),
         Err(SendFailure::NotSent(detail)) => Some(format!("not sent  ·  {detail}")),
         Err(SendFailure::Unavailable(error)) => Some(format!("not sent  ·  {}", error.recovery)),
+        Err(SendFailure::CredentialsRejected(_)) => {
+            Some(format!("SMTP sign-in failed  ·  {SMTP_AUTH_RECOVERY}"))
+        }
         Err(SendFailure::Locked(lock)) => Some(lock.reason().into()),
     }
 }
@@ -2177,7 +2216,11 @@ fn lock_after(result: &Result<fell_core::SentMessage, SendFailure>) -> Option<Se
         Err(SendFailure::MaybeSent(_)) => Some(SendLock::MaybeSent),
         // A refused claim leaves the other send's lock in place.
         Err(SendFailure::Locked(lock)) => Some(*lock),
-        Err(SendFailure::NotSent(_) | SendFailure::Unavailable(_)) => None,
+        Err(
+            SendFailure::NotSent(_)
+            | SendFailure::CredentialsRejected(_)
+            | SendFailure::Unavailable(_),
+        ) => None,
     }
 }
 
@@ -2226,7 +2269,7 @@ pub fn prepare_from_editor(
         })
         .collect();
     let sent_bcc = session.sent_bcc(&outgoing);
-    if let Err(err) = session.begin_send() {
+    if let Err(err) = session.begin_send(&outgoing.message_id) {
         // A lock only the mailbox knew of stays a lock; anything else (the
         // claim could not be recorded) sent nothing.
         return Err(match session.send_lock() {
@@ -4365,35 +4408,124 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
     }))
 }
 
+/// Outcomes are kept in memory for each draft, including sends whose editor
+/// was closed or switched to another draft before SMTP answered.
+#[derive(Default)]
+struct SendAttempts {
+    next: u64,
+    by_draft: HashMap<String, (u64, Option<SendFailure>)>,
+}
+
+impl gpui::Global for SendAttempts {}
+
+impl SendAttempts {
+    fn start(&mut self, id: &str) -> u64 {
+        self.next += 1;
+        self.by_draft.insert(id.to_string(), (self.next, None));
+        self.next
+    }
+
+    fn finish(&mut self, id: &str, generation: u64, failure: Option<SendFailure>) -> bool {
+        let Some((current, seen)) = self.by_draft.get_mut(id) else {
+            return false;
+        };
+        if *current != generation {
+            return false;
+        }
+        if failure.is_some() {
+            *seen = failure;
+        } else {
+            self.clear(id);
+        }
+        true
+    }
+
+    fn failure(&self, id: &str) -> Option<&SendFailure> {
+        self.by_draft
+            .get(id)
+            .and_then(|(_, failure)| failure.as_ref())
+    }
+
+    fn clear(&mut self, id: &str) {
+        self.by_draft.remove(id);
+    }
+}
+
+#[derive(Default)]
+struct SendFeedbackState {
+    /// Changes with the draft or an explicit send, invalidating older reads.
+    generation: u64,
+    readiness: Option<AccountConfigError>,
+}
+
+impl SendFeedbackState {
+    fn invalidate_readiness(&mut self) {
+        self.generation += 1;
+    }
+
+    fn switch_draft(&mut self) {
+        self.invalidate_readiness();
+        self.readiness = None;
+    }
+
+    fn update_readiness(&mut self, generation: u64, readiness: Option<AccountConfigError>) -> bool {
+        if generation != self.generation || self.readiness == readiness {
+            return false;
+        }
+        self.readiness = readiness;
+        true
+    }
+
+    fn feedback<'a>(
+        &'a self,
+        lock: Option<SendLock>,
+        attempt: Option<&'a SendFailure>,
+    ) -> Option<SendFeedback<'a>> {
+        match (lock, attempt) {
+            (Some(SendLock::Sent), _) => Some(SendFeedback::Confirmed),
+            (Some(SendLock::MaybeSent), Some(SendFailure::MaybeSent(detail))) => {
+                Some(SendFeedback::Uncertain(Some(detail)))
+            }
+            (Some(SendLock::MaybeSent), _) => Some(SendFeedback::Uncertain(None)),
+            (None, Some(SendFailure::Unavailable(error))) => Some(SendFeedback::Unavailable {
+                error,
+                attempted: true,
+            }),
+            (None, Some(SendFailure::NotSent(detail))) => Some(SendFeedback::NotSent(detail)),
+            (None, Some(SendFailure::CredentialsRejected(detail))) => {
+                Some(SendFeedback::CredentialsRejected(detail))
+            }
+            (None, _) => self
+                .readiness
+                .as_ref()
+                .map(|error| SendFeedback::Unavailable {
+                    error,
+                    attempted: false,
+                }),
+            _ => None,
+        }
+    }
+}
+
 enum SendFeedback<'a> {
-    Unavailable(&'a AccountConfigError),
+    Unavailable {
+        error: &'a AccountConfigError,
+        attempted: bool,
+    },
     NotSent(&'a str),
+    CredentialsRejected(&'a str),
     Uncertain(Option<&'a str>),
+    Confirmed,
 }
 
 impl<'a> SendFeedback<'a> {
     fn detail(&self) -> Option<&'a str> {
         match self {
-            Self::Unavailable(error) => Some(&error.detail),
-            Self::NotSent(detail) => Some(detail),
+            Self::Unavailable { error, .. } => Some(&error.detail),
+            Self::NotSent(detail) | Self::CredentialsRejected(detail) => Some(detail),
             Self::Uncertain(detail) => *detail,
+            Self::Confirmed => None,
         }
-    }
-}
-
-fn send_feedback<'a>(
-    lock: Option<SendLock>,
-    unavailable: &'a Option<AccountConfigError>,
-    failure: &'a Option<SendFailure>,
-) -> Option<SendFeedback<'a>> {
-    match (lock, unavailable, failure) {
-        (Some(SendLock::MaybeSent), _, Some(SendFailure::MaybeSent(detail))) => {
-            Some(SendFeedback::Uncertain(Some(detail)))
-        }
-        (Some(SendLock::MaybeSent), _, _) => Some(SendFeedback::Uncertain(None)),
-        (None, Some(error), _) => Some(SendFeedback::Unavailable(error)),
-        (None, None, Some(SendFailure::NotSent(detail))) => Some(SendFeedback::NotSent(detail)),
-        _ => None,
     }
 }
 
@@ -4411,24 +4543,47 @@ fn send_feedback_view(
             None,
             "y unlock  ·  Esc cancel",
         ),
-        (SendFeedback::Unavailable(error), _) => {
-            ("Send unavailable", error.recovery, None, ":details")
-        }
+        (
+            SendFeedback::Unavailable {
+                error,
+                attempted: true,
+            },
+            _,
+        ) => ("Not sent", error.recovery, None, ":details  ·  :dismiss"),
+        (
+            SendFeedback::Unavailable {
+                error,
+                attempted: false,
+            },
+            _,
+        ) => ("Send unavailable", error.recovery, None, ":details"),
         (SendFeedback::NotSent(_), _) => (
             "Not sent",
             "Edit the draft and try again.",
             None,
-            ":details",
+            ":details  ·  :dismiss",
+        ),
+        (SendFeedback::CredentialsRejected(_), _) => (
+            "Not sent · SMTP sign-in failed",
+            SMTP_AUTH_RECOVERY,
+            None,
+            ":details  ·  :dismiss",
         ),
         (SendFeedback::Uncertain(detail), _) => (
             "Delivery uncertain",
-            "Check Sent for a matching copy (:q, then g s).",
-            Some("A match confirms the send. A missing copy leaves delivery unknown."),
+            "Close with :q, open Sent with g s, then sync with Space s.",
+            Some("A matching copy confirms the send. Until then, delivery is unknown."),
             if detail.is_some() {
                 ":details  ·  :unlock"
             } else {
                 ":unlock"
             },
+        ),
+        (SendFeedback::Confirmed, _) => (
+            "Send confirmed",
+            "This draft is read-only. Open Sent with g s in the inbox.",
+            None,
+            ":q close",
         ),
     };
     div()
@@ -4444,7 +4599,11 @@ fn send_feedback_view(
         .text_size(px(14.))
         .child(
             div()
-                .text_color(rgb(colors.error))
+                .text_color(rgb(if matches!(feedback, SendFeedback::Confirmed) {
+                    colors.accent
+                } else {
+                    colors.error
+                }))
                 .font_weight(FontWeight(600.))
                 .child(title),
         )
@@ -4458,7 +4617,13 @@ fn send_feedback_view(
                     .overflow_y_scroll()
                     .track_scroll(scroll)
                     .text_color(rgb(colors.fg))
-                    .child(display_safe(detail))
+                    .child(
+                        detail
+                            .lines()
+                            .map(display_safe)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
             })
         } else {
             None
@@ -4643,10 +4808,8 @@ fn status_right(
     match shown_send_block(snap, send_tried) {
         // The message on the left already says why: one message at a time.
         Some(reason) if repeats_block(status, reason) => Vec::new(),
-        // Gone out: say so plainly, not as a block.
-        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => {
-            vec![("sent".into(), Tone::Accent, true)]
-        }
+        // The confirmation panel already says the draft went out.
+        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => Vec::new(),
         Some(reason) if reason.as_str() == SendLock::InFlight.reason() => {
             vec![("Sending…".into(), Tone::Fg, false)]
         }
@@ -5180,8 +5343,10 @@ fn palette_action(query: &str) -> Option<&'static str> {
     if query == "unlock" {
         return Some("unlock");
     }
-    if query == "details" {
-        return Some("details");
+    match query.as_str() {
+        "details" => return Some("details"),
+        "dismiss" => return Some("dismiss"),
+        _ => {}
     }
     let mut found = None;
     for name in [
@@ -5316,15 +5481,20 @@ mod tests {
 
     #[test]
     fn an_uncertain_send_uses_the_feedback_panel_after_reopening() {
-        use super::{SendFailure, SendFeedback, SendLock, send_feedback};
-        let failure = Some(SendFailure::MaybeSent("SMTP connection closed".into()));
+        use super::{SendFailure, SendFeedback, SendFeedbackState, SendLock};
+        let state = SendFeedbackState::default();
         let lock = Some(SendLock::MaybeSent);
+        let failure = SendFailure::MaybeSent("SMTP connection closed".into());
         assert_eq!(
-            send_feedback(lock, &None, &failure).unwrap().detail(),
+            state.feedback(lock, Some(&failure)).unwrap().detail(),
             Some("SMTP connection closed"),
         );
         assert!(matches!(
-            send_feedback(lock, &None, &None),
+            state.feedback(Some(SendLock::Sent), Some(&failure)),
+            Some(SendFeedback::Confirmed),
+        ));
+        assert!(matches!(
+            state.feedback(lock, None),
             Some(SendFeedback::Uncertain(None)),
         ));
         let mut snap = super::empty_snapshot("d");
@@ -5332,6 +5502,93 @@ mod tests {
         for wide in [true, false] {
             assert!(super::status_right(&snap, "", false, wide).is_empty());
         }
+    }
+
+    #[test]
+    fn stale_readiness_cannot_replace_a_confirmed_attempts_smtp_rejection() {
+        use super::{
+            AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
+        };
+        let missing = AccountConfigError {
+            detail: "account.toml does not exist".into(),
+            recovery: "Run fell account setup.",
+        };
+        let mut state = SendFeedbackState::default();
+        let mut attempts = SendAttempts::default();
+        let before_send = state.generation;
+        assert!(state.update_readiness(before_send, Some(missing.clone())));
+
+        // The file was restored and the user sent against the restored
+        // settings, but the displayed readiness is still stale.
+        state.invalidate_readiness();
+        let attempt = attempts.start("draft");
+        let during_send = state.generation;
+        assert!(attempts.finish(
+            "draft",
+            attempt,
+            Some(SendFailure::NotSent("554 submission refused".into()))
+        ));
+        state.invalidate_readiness();
+        assert!(!state.update_readiness(before_send, None));
+        assert!(!state.update_readiness(during_send, None));
+        assert!(matches!(
+            state.feedback(None, attempts.failure("draft")),
+            Some(SendFeedback::NotSent("554 submission refused")),
+        ));
+        assert!(state.update_readiness(state.generation, None));
+        assert_eq!(
+            state
+                .feedback(None, attempts.failure("draft"))
+                .unwrap()
+                .detail(),
+            Some("554 submission refused")
+        );
+    }
+
+    #[test]
+    fn a_send_time_config_failure_survives_restored_readiness_until_the_next_send() {
+        use super::{
+            AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
+        };
+        let missing = AccountConfigError {
+            detail: "account.toml does not exist".into(),
+            recovery: "Run fell account setup.",
+        };
+        let mut state = SendFeedbackState::default();
+        let mut attempts = SendAttempts::default();
+        state.invalidate_readiness();
+        let attempt = attempts.start("draft");
+        assert!(attempts.finish(
+            "draft",
+            attempt,
+            Some(SendFailure::Unavailable(missing.clone()))
+        ));
+        state.invalidate_readiness();
+        assert!(state.update_readiness(state.generation, Some(missing.clone())));
+        assert!(state.update_readiness(state.generation, None));
+        assert!(matches!(
+            state.feedback(None, attempts.failure("draft")),
+            Some(SendFeedback::Unavailable { error, attempted: true }) if error == &missing,
+        ));
+        let before_switch = state.generation;
+        state.switch_draft();
+        assert!(!state.update_readiness(before_switch, Some(missing.clone())));
+        assert!(
+            state
+                .feedback(None, attempts.failure("other draft"))
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .feedback(None, attempts.failure("draft"))
+                .unwrap()
+                .detail(),
+            Some(missing.detail.as_str())
+        );
+
+        attempts.start("draft");
+        assert!(!attempts.finish("draft", attempt, Some(SendFailure::Unavailable(missing))));
+        assert!(state.feedback(None, attempts.failure("draft")).is_none());
     }
 
     #[test]

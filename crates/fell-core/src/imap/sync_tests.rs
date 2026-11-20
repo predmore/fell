@@ -624,6 +624,115 @@ fn literal(uid: u32, flags: &[&str], modseq: u64, raw: Vec<u8>) -> FixtureMessag
 }
 
 #[test]
+fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
+    use crate::compose::{DraftFields, SendLock, StoredCompose};
+
+    let exact = "submitted@compose.fell";
+    let copy = |uid, id| {
+        literal(
+            uid,
+            &["\\Seen"],
+            u64::from(uid),
+            raw_message(id, None, "Same subject", "Caleb <c@x>", "Same body", ""),
+        )
+    };
+    let mut state = sample_state();
+    state.mailboxes = vec![
+        empty_mailbox("INBOX", 1),
+        FixtureMailbox {
+            messages: vec![copy(1, exact)],
+            ..empty_mailbox("Sent", 2)
+        },
+        FixtureMailbox {
+            list_flags: "\\Sent".into(),
+            messages: vec![copy(1, "SUBMITTED@compose.fell")],
+            ..empty_mailbox("Filed", 3)
+        },
+    ];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let other = account("a2", BackendKind::Imap);
+    let backend = |acct: &Account| ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    store.upsert_account(&acct).unwrap();
+    for (id, message_id) in [("uncertain", Some(exact)), ("legacy", None)] {
+        store
+            .save_compose(&StoredCompose {
+                id: id.into(),
+                account_id: acct.id.clone(),
+                fields: DraftFields {
+                    from: "c@x".into(),
+                    subject: "Same subject".into(),
+                    ..DraftFields::default()
+                },
+                body: "Same body\n".into(),
+                files: Vec::new(),
+                identities: vec!["c@x".into()],
+                owner: String::new(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        store.claim_compose_send(&acct.id, id, message_id).unwrap();
+    }
+    assert!(
+        sync_once(&acct, &backend(&acct), &store)
+            .unwrap()
+            .confirmed_drafts
+            .is_empty()
+    );
+    assert_eq!(
+        store.folder_roles(&acct.id).unwrap().name(FolderRole::Sent),
+        "Filed"
+    );
+    assert_eq!(
+        store.load_compose_send(&acct.id, "uncertain").unwrap(),
+        Some(SendLock::MaybeSent)
+    );
+
+    mailbox(&mut server.state.lock().unwrap(), "Filed")
+        .messages
+        .push(copy(2, exact));
+    assert!(
+        sync_once(&other, &backend(&other), &store)
+            .unwrap()
+            .confirmed_drafts
+            .is_empty()
+    );
+    assert_eq!(
+        store.load_compose_send(&acct.id, "uncertain").unwrap(),
+        Some(SendLock::MaybeSent)
+    );
+
+    let mut confirmations = Vec::new();
+    let report = crate::sync_with_progress(&acct, &backend(&acct), &store, &mut |report| {
+        if !report.confirmed_drafts.is_empty() {
+            confirmations = report.confirmed_drafts.clone();
+        }
+    })
+    .unwrap();
+    assert_eq!(confirmations, ["uncertain"]);
+    assert_eq!(report.confirmed_drafts, confirmations);
+    assert_eq!(
+        store.load_compose_send(&acct.id, "uncertain").unwrap(),
+        Some(SendLock::Sent)
+    );
+    let listed = store.unsent_compose_drafts(&acct.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "legacy");
+    assert!(listed[0].maybe_sent);
+    assert!(
+        sync_once(&acct, &backend(&acct), &store)
+            .unwrap()
+            .confirmed_drafts
+            .is_empty()
+    );
+}
+
+#[test]
 fn an_unread_change_on_the_other_copy_of_one_message_id_reaches_the_row() {
     // INBOX and Sent (or All Mail) hold the same Message-ID. The row names
     // the copy written last; the flag changes on the other one.

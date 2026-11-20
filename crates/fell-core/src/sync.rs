@@ -10,6 +10,8 @@ const BODY_BATCH: usize = 200;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncReport {
     pub upserted: usize,
+    /// Uncertain local drafts confirmed by exact Message-IDs in Sent.
+    pub confirmed_drafts: Vec<String>,
     /// The first sync of a folder under way, as of the last delta. `None`
     /// while the pass only catches folders up.
     pub progress: Option<crate::backend::SyncProgress>,
@@ -46,11 +48,13 @@ pub fn sync_with_progress(
             .iter()
             .filter(|message| !headers_only(message))
             .count();
-        store.apply_delta(&account.id, &delta)?;
+        let confirmed = store.apply_delta_with_send_confirmations(&account.id, &delta)?;
+        let sent = !confirmed.is_empty();
+        report.confirmed_drafts.extend(confirmed);
         report.upserted += count;
         let walking = delta.progress.is_some();
         report.progress = delta.progress;
-        if count > 0 || !delta.flags.is_empty() || walking {
+        if count > 0 || !delta.flags.is_empty() || walking || sent {
             progress(&report);
         }
         Ok(())

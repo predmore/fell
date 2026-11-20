@@ -482,6 +482,9 @@ pub enum SyncFailureKind {
 }
 
 pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
+    if matches!(err, Error::SmtpCredentialsRejected(_)) {
+        return SyncFailureKind::LoginRejected;
+    }
     let Error::Backend(message) = err else {
         return SyncFailureKind::Other;
     };
@@ -495,10 +498,6 @@ pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
     {
         // A NO to LOGIN without a response code is a refused credential on
         // the servers we know; UNAVAILABLE or SERVERBUG is the server's fault.
-        SyncFailureKind::LoginRejected
-    } else if message.starts_with("smtp: AUTH rejected: 535") {
-        // 535 is "authentication credentials invalid" (RFC 4954); a 454 or
-        // other code is the server's trouble, not the password.
         SyncFailureKind::LoginRejected
     } else if [
         "imap: connect ",
@@ -898,10 +897,6 @@ mod tests {
                 SyncFailureKind::Unreachable,
             ),
             (
-                "smtp: AUTH rejected: 535 5.7.8 Authentication failed",
-                SyncFailureKind::LoginRejected,
-            ),
-            (
                 "smtp: AUTH rejected: 454 4.7.0 Temporary failure",
                 SyncFailureKind::Other,
             ),
@@ -913,6 +908,12 @@ mod tests {
         for (message, kind) in cases {
             assert_eq!(classify_sync_error(&Error::Backend(message.into())), kind);
         }
+        assert_eq!(
+            classify_sync_error(&Error::SmtpCredentialsRejected(
+                "smtp: AUTH rejected: 535 5.7.8 Authentication failed".into()
+            )),
+            SyncFailureKind::LoginRejected
+        );
     }
 
     #[test]

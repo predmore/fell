@@ -499,12 +499,48 @@ fn authenticate(pipe: &mut Pipe, hello: &Reply, endpoint: &Endpoint) -> Result<(
     token.extend(username.as_bytes());
     token.push(0);
     token.extend(password.as_bytes());
-    expect(
-        command(pipe, &format!("AUTH PLAIN {}", b64(&token)))?,
-        235,
-        "AUTH",
-    )?;
-    Ok(())
+    let encoded = b64(&token);
+    let reply = command(pipe, &format!("AUTH PLAIN {encoded}"))?;
+    if reply.code == 235 {
+        return Ok(());
+    }
+    let detail = auth_rejection(&reply, &encoded, username, password);
+    if matches!(reply.code, 534 | 535) {
+        Err(Error::SmtpCredentialsRejected(detail))
+    } else {
+        Err(smtp_err(detail))
+    }
+}
+
+/// An AUTH reply can echo the exchange. Keep each diagnostic line, with
+/// literal credentials and their wire encodings removed from the reply text.
+fn auth_rejection(reply: &Reply, token: &str, username: &str, password: &str) -> String {
+    let user_b64 = b64(username.as_bytes());
+    let pass_b64 = b64(password.as_bytes());
+    let mut secrets = [token, &user_b64, &pass_b64, username, password]
+        .into_iter()
+        .flat_map(|secret| [secret, secret.trim_end_matches('=')])
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let mut detail = String::from("smtp: AUTH rejected: ");
+    for (i, line) in reply.lines.iter().enumerate() {
+        if i > 0 {
+            detail.push('\n');
+        }
+        let prefix = if matches!(line.as_bytes().get(3), Some(b' ' | b'-')) {
+            4
+        } else {
+            3
+        };
+        let mut text = line[prefix..].to_owned();
+        for secret in &secrets {
+            text = text.replace(secret, "[redacted]");
+        }
+        detail.push_str(&line[..prefix]);
+        detail.push_str(&text);
+    }
+    detail
 }
 
 fn forbidden(value: &str) -> bool {
@@ -782,6 +818,22 @@ Bcc: this is body text\r\n"
     }
 
     #[test]
+    fn credential_refusal_preserves_diagnostics_and_redacts_authentication_data() {
+        let (result, got) = attempt(Wire::Clear, ImapSecurity::Plain, AfterData::RejectAuth);
+        let Error::SmtpCredentialsRejected(detail) = result.unwrap_err() else {
+            panic!("535 must be a credential rejection");
+        };
+        assert_eq!(
+            detail,
+            "smtp: AUTH rejected: 535-5.7.8 Authentication failed for [redacted]\n\
+             535 5.7.8 Rejected [redacted] [redacted] [redacted]; check account settings"
+        );
+        assert!(!got.auth.is_empty());
+        assert!(got.quit);
+        assert!(got.from.is_empty() && got.rcpt.is_empty() && got.data.is_empty());
+    }
+
+    #[test]
     fn starttls_hides_the_password_and_still_delivers() {
         let (sent, got) = exchange(Wire::StartTls, ImapSecurity::StartTls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
@@ -1013,7 +1065,14 @@ Bcc: this is body text\r\n"
             } else if let Some(token) = line.strip_prefix("AUTH PLAIN ") {
                 captured.auth = token.to_string();
                 if after == AfterData::RejectAuth {
-                    write_reply(&mut sock, "535 5.7.8 Authentication failed\r\n");
+                    write_reply(
+                        &mut sock,
+                        &format!(
+                            "535-5.7.8 Authentication failed for bridge-user\r\n\
+                             535 5.7.8 Rejected bridge-secret {token} {}; check account settings\r\n",
+                            b64(b"bridge-secret").trim_end_matches('=')
+                        ),
+                    );
                 } else {
                     write_reply(&mut sock, "235 ok\r\n");
                 }

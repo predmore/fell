@@ -204,8 +204,11 @@ impl DraftHome {
             return Err("the draft is no longer in the mailbox".into());
         }
         let session = DraftSession::open_with_store(&folder, account.clone(), &store)?;
-        drop(store);
-        if !hub.insert_new(session) {
+        if hub.insert_new(session) {
+            // The sync notification could have arrived after the lock was
+            // read and before the session became visible to the hub.
+            hub.with_session(id, |live| live.refresh_send_confirmation(&store));
+        } else {
             // The socket made it live meanwhile, and the copy read here has
             // just saved over its folder. Put the live text back.
             hub.with_session(id, |live| live.flush()).transpose()?;

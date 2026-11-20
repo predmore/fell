@@ -200,6 +200,8 @@ CREATE TABLE IF NOT EXISTS compose_send (
     updated_unix INTEGER NOT NULL,
     PRIMARY KEY (account_id, draft_id)
 );
+CREATE INDEX IF NOT EXISTS idx_compose_send_message
+ON compose_send(account_id, state, message_id);
 "#;
 
 const FTS_TABLE: &str = r#"
@@ -655,8 +657,18 @@ impl Store {
     /// listing found, so an action reading them in between (an archive
     /// queueing the UIDs to move) never sees half a listing. The cursor is
     /// written only in the second part, so a pass cut short after the first
-    /// is done again by the next. Any other delta is one transaction.
+    /// is done again by the next. A delta that confirms a send is also one
+    /// transaction so the copy and confirmed claim become visible together.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
+        self.apply_delta_with_send_confirmations(account_id, delta)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_delta_with_send_confirmations(
+        &self,
+        account_id: &AccountId,
+        delta: &MailboxDelta,
+    ) -> Result<Vec<String>> {
         let mut tx = self.begin_sync_write()?;
         for message in &delta.messages {
             if &message.account_id != account_id {
@@ -688,7 +700,8 @@ impl Store {
         let copy_work = delta.roles.is_some()
             || !delta.removals.is_empty()
             || delta.settle != crate::backend::Settle::Later;
-        let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT;
+        let confirmed = crate::compose::confirm_synced_sends(&tx, account_id, delta)?;
+        let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT && confirmed.is_empty();
         if split {
             if inserted {
                 self.rethread_written(&tx, account_id)?;
@@ -713,7 +726,7 @@ impl Store {
         }
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(())
+        Ok(confirmed)
     }
 
     /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]

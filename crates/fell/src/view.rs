@@ -469,6 +469,14 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
+                            SyncEvent::SendsConfirmed(ids) => {
+                                if let Some(drafts) =
+                                    cx.try_global::<crate::draft_host::AgentDrafts>()
+                                {
+                                    drafts.0.confirm_synced_sends(&inbox.account_id, &ids);
+                                }
+                                return;
+                            }
                             SyncEvent::WriteBackNotice {
                                 dropped,
                                 flag_recovery_delayed,

@@ -85,6 +85,9 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    /// The SMTP AUTH exchange rejected the configured credentials.
+    #[error("{0}")]
+    SmtpCredentialsRejected(String),
     /// The server had the whole message before the failure, so it may have
     /// been delivered. Every other send error means nothing went out.
     #[error("{0}")]

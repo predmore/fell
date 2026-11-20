@@ -206,14 +206,37 @@ impl DraftHub {
     ) -> Option<T> {
         let mut sessions = self.sessions.lock().expect("sessions");
         let session = sessions.get_mut(id)?;
-        let before = session.paint_generation();
+        let before = (session.paint_generation(), session.send_lock());
         let value = body(session);
-        let changed = session.paint_generation() != before;
+        let changed = (session.paint_generation(), session.send_lock()) != before;
         drop(sessions);
         if changed {
             self.emit();
         }
         Some(value)
+    }
+
+    pub fn confirm_synced_sends(&self, account: &crate::AccountId, ids: &[String]) {
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let mut closed = Vec::new();
+        for id in ids {
+            if let Some(session) = sessions.get_mut(id)
+                && session.account_id() == account
+                && session.send_lock() == Some(SendLock::MaybeSent)
+            {
+                session.confirm_uncertain_send();
+                if !session.is_open() {
+                    closed.push((id, quoted_subject(&session.fields().subject)));
+                }
+            }
+        }
+        drop(sessions);
+        for (id, subject) in closed {
+            self.push_closed(id, format!("Confirmed in Sent{subject}"), true, false);
+        }
+        // The Drafts list must reread the mailbox even if none of these
+        // drafts are live in the hub.
+        self.emit();
     }
 
     /// Queue every save still waiting on the editor's debounce, then wait
@@ -1000,7 +1023,9 @@ mod tests {
         let hub = DraftHub::new();
         hub.insert(open());
         hub.with_session("d1", |session| {
-            session.begin_send().unwrap();
+            session
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .unwrap();
             session.end_send(Some(super::super::SendLock::Sent));
         });
         hub.insert(open());
