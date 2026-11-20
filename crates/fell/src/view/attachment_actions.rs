@@ -43,6 +43,7 @@ impl Inbox {
         }
         self.attachment_busy = true;
         self.attachment_retry = None;
+        self.session.attachment_error = None;
         let notice = match &request {
             Request::Open(target) => format!("Opening “{}”…", target.name()),
             Request::Save(targets) => match targets.as_slice() {
@@ -86,13 +87,9 @@ impl Inbox {
     fn attachment_failed(&mut self, line: String, detail: String, retry: Request) {
         let key = keymap::binding_text(&self.session.keymap, Action::RetryAttachment);
         self.attachment_retry = Some(retry);
-        self.session.show_toast(
-            format!(
-                "{line}{NOTICE_DOT}{}{NOTICE_DOT}{key} retry",
-                display_safe(&detail)
-            ),
-            true,
-        );
+        self.session.attachment_error = Some(format!("{line}\n{}", display_safe(&detail)));
+        self.session
+            .show_toast(format!("{line}{NOTICE_DOT}{key} retry"), true);
     }
 
     // Some xdg-open implementations wait for the viewer to exit. Reap the

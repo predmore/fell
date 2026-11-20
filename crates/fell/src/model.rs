@@ -361,6 +361,8 @@ pub struct Session {
     /// Failure from the latest folder or message read.
     pub error: Option<String>,
     pub error_fault: Option<QueryFault>,
+    /// Details for the last attachment failure, until another attempt starts.
+    pub attachment_error: Option<String>,
     pub recent: Vec<Action>,
     pub palette_query: String,
     pub palette_index: usize,
@@ -438,6 +440,7 @@ impl Session {
             startup_error: None,
             error: None,
             error_fault: None,
+            attachment_error: None,
             recent: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
@@ -528,10 +531,15 @@ impl Session {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        let lines: Vec<&str> = [self.startup_error.as_deref(), self.error.as_deref(), sync]
-            .into_iter()
-            .flatten()
-            .collect();
+        let lines: Vec<&str> = [
+            self.startup_error.as_deref(),
+            self.error.as_deref(),
+            sync,
+            self.attachment_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if lines.is_empty() {
             None
         } else {
@@ -3716,6 +3724,21 @@ mod tests {
         without.remove(1);
         session.set_threads(without);
         assert_eq!(session.cursor_id.as_deref(), Some(rows[2].id.as_str()));
+    }
+
+    #[test]
+    fn attachment_error_details_survive_opening_help() {
+        let mut session = session();
+        let cause = "Couldn't open attachment\nIMAP server refused part 2";
+        session.attachment_error = Some(cause.into());
+        session.show_toast("Couldn't open attachment · space a R retry", true);
+
+        session.on_key(KeyId::Char('?'), 10);
+        assert_eq!(session.overlay, Overlay::Help);
+        assert_eq!(session.detail_text().as_deref(), Some(cause));
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.overlay, Overlay::None);
+        assert_eq!(session.detail_text().as_deref(), Some(cause));
     }
 
     #[test]

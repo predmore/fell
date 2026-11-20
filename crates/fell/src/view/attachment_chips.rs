@@ -9,7 +9,6 @@ use gpui::{
 use super::{ConvFrame, Inbox, LayoutProbe, LayoutSlot, Live, conversation_line_style};
 use crate::attachments::{self, Request, Target};
 use crate::model::Session;
-use crate::motion;
 use crate::present::ConvMessage;
 
 use crate::theme::Theme;
@@ -101,9 +100,7 @@ pub(super) fn row(
                             let id = message.id.clone();
                             chip.cursor_pointer()
                                 .when(!focused, |chip| {
-                                    chip.hover(|style| {
-                                        style.bg(rgb(motion::mix(surface, theme.selection, 0.45)))
-                                    })
+                                    chip.hover(|style| style.border_color(rgb(theme.accent)))
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
