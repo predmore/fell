@@ -28,6 +28,7 @@ pub(super) struct SearchView {
     pub(super) folder_revision: u64,
     pub(super) prefer: Option<String>,
     preview_key: Option<PreviewKey>,
+    preview_revision: u64,
     arrival: Option<motion::Transition>,
 }
 
@@ -107,8 +108,7 @@ impl Inbox {
         panes: (bool, bool),
         animating: bool,
         subject: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyView> {
+    ) -> Option<(u64, gpui::AnyView)> {
         if panes != (true, true)
             || animating
             || self.session.pane != Pane::List
@@ -127,10 +127,15 @@ impl Inbox {
         };
         if self.search_view.preview_key.as_ref() != Some(&key) {
             self.search_view.preview_key = Some(key);
-            self.search_preview.update(cx, |_, cx| cx.notify());
+            // GPUI reuses a cached scene by element identity during paint.
+            // Change that identity in the frame that takes the new state.
+            self.search_view.preview_revision = self.search_view.preview_revision.wrapping_add(1);
         }
         let mut box_style = div().flex_1().min_h_0().min_w_0();
-        Some(gpui::AnyView::from(self.search_preview.clone()).cached(box_style.style().clone()))
+        Some((
+            self.search_view.preview_revision,
+            gpui::AnyView::from(self.search_preview.clone()).cached(box_style.style().clone()),
+        ))
     }
 
     pub(super) fn search_store_ready(&mut self, cx: &mut Context<Self>) {

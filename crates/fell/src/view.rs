@@ -3346,8 +3346,7 @@ impl Render for Inbox {
         }
         let warm = self.warm_layer(width, panes, animating, window, cx);
         let subject = self.shown_subject();
-        let cached_preview =
-            self.search_preview_for(panes, animating || refreshing_body, &subject, cx);
+        let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
         let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
             let selected = self.session.reply_target().filter(|_| {
                 self.open_thread.is_some() && self.open_thread == self.session.cursor_id
@@ -3420,7 +3419,7 @@ struct Shown {
     folder: String,
     /// What the conversation's bodies animate this frame.
     conv: ConvFrame,
-    cached_preview: Option<gpui::AnyView>,
+    cached_preview: Option<(u64, gpui::AnyView)>,
     reply_check: Option<ReplyCheck>,
 }
 
@@ -3651,9 +3650,9 @@ fn shell(
                     } else {
                         width
                     };
-                    if let Some(preview) = cached_preview {
+                    if let Some((revision, preview)) = cached_preview {
                         let pane = div()
-                            .id("cached-search-conversation")
+                            .id(("cached-search-conversation", revision))
                             .relative()
                             .flex_1()
                             .min_w_0()
