@@ -618,6 +618,7 @@ pub(crate) mod tests {
 
         let check = |hub: &DraftHub, id: &str| {
             hub.with_session(id, |session| {
+                session.mark_seen();
                 let snap = session.snapshot();
                 assert!(snap.to.is_empty());
                 assert!(snap.reply_to_unverified);
