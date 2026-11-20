@@ -870,10 +870,9 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
         store.load_compose_send(&acct.id, "uncertain").unwrap(),
         Some(SendLock::Sent)
     );
-    assert_eq!(
-        store.undo(&acct.id).unwrap().kind,
-        crate::ActionKind::DiscardDrafts
-    );
+    let undo = store.undo(&acct.id).unwrap();
+    assert_eq!(undo.kind, crate::ActionKind::DiscardDrafts);
+    assert_eq!(undo.summary, "Confirmed in Sent");
     assert_eq!(
         store
             .claim_compose_send(&acct.id, "uncertain", Some("retry@compose.fell"))

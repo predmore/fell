@@ -517,20 +517,24 @@ impl Store {
         Ok(action)
     }
 
-    /// Restore the latest reversible local action on this account.
+    /// Restore the latest reversible local action on this account. For a
+    /// draft discard, the returned summary describes the restore outcome.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
-        let Some(action) = latest_open_action(&tx, account_id)? else {
+        let Some(mut action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
         if action.kind == ActionKind::DiscardDrafts {
-            tx.execute(
-                "UPDATE compose_drafts SET discarded_action_id = NULL
-                 WHERE account_id = ?1 AND discarded_action_id = ?2",
-                params![account_id.as_str(), action.id],
-            )?;
+            let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;
+            action.summary = match (restored, confirmed) {
+                (1, 0) => "Draft restored".into(),
+                (n, 0) => format!("{n} drafts restored"),
+                (0, 1) => "Confirmed in Sent".into(),
+                (0, n) => format!("{n} confirmed in Sent"),
+                (restored, confirmed) => format!("{restored} restored · {confirmed} in Sent"),
+            };
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else {

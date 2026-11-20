@@ -2017,22 +2017,23 @@ impl Inbox {
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
         self.change_mailbox(
-            move |store| store.undo(&account).map(|action| action.kind),
+            move |store| store.undo(&account),
             |inbox, result| match result {
-                Ok(kind) => {
-                    inbox.session.show_toast("Undone", false);
-                    if kind == fell_core::ActionKind::DiscardDrafts {
+                Ok(action) => {
+                    if action.kind == fell_core::ActionKind::DiscardDrafts {
+                        inbox.session.show_toast(action.summary, false);
                         return Some(ReadIntent {
                             changed: true,
                             ..ReadIntent::default()
                         });
                     }
+                    inbox.session.show_toast("Undone", false);
                     inbox.send_to_server();
                     // Read and star leave the thread where it is; the thread
                     // `m` or `e` took away waits for its own undo.
                     Some(ReadIntent {
                         changed: true,
-                        select: if kind.is_flag() {
+                        select: if action.kind.is_flag() {
                             None
                         } else {
                             inbox.moved_thread.take()

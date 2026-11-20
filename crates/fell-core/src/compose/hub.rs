@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::persist::SEND_IN_PROGRESS;
 use super::session::{DraftSession, SendLock};
 use super::workspace::{self, draft_socket_path};
 
@@ -248,9 +249,16 @@ impl DraftHub {
                             "Draft belongs to another account".into(),
                         ));
                     }
-                    if let Some(lock @ (SendLock::InFlight | SendLock::Sent)) = session.send_lock()
-                    {
-                        return Err(crate::Error::Action(sentence_case(lock.reason())));
+                    match session.send_lock() {
+                        Some(SendLock::InFlight) => {
+                            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
+                        }
+                        Some(SendLock::Sent) => {
+                            return Err(crate::Error::Action(sentence_case(
+                                SendLock::Sent.reason(),
+                            )));
+                        }
+                        _ => {}
                     }
                     let waiter = session.save_for_discard().map_err(crate::Error::Action)?;
                     saves.push((id, session.paint_generation(), waiter));

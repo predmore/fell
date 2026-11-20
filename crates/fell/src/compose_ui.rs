@@ -5384,12 +5384,15 @@ fn which_key(colors: Palette) -> gpui::Div {
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
 }
 
+const DISCARD_DRAFT_LABEL: &str = "Discard draft";
+
 fn palette_view(
     query: &str,
     commands: &'static str,
     can_discard: bool,
     colors: Palette,
 ) -> gpui::Div {
+    let discard_selected = palette_action(query) == Some("discard");
     div()
         .absolute()
         .top(px(80.))
@@ -5402,7 +5405,7 @@ fn palette_view(
         .child(format!(":{query}"))
         .child(div().text_sm().text_color(rgb(colors.dim)).child(commands))
         .when(
-            can_discard && discard_query(&query.trim().to_ascii_lowercase()),
+            can_discard && (query.trim().is_empty() || discard_selected),
             |panel| {
                 panel.child(
                     div()
@@ -5411,8 +5414,12 @@ fn palette_view(
                         .items_center()
                         .justify_between()
                         .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
                         .text_sm()
-                        .child("Discard draft")
+                        .when(discard_selected, |row| row.bg(rgb(colors.selection)))
+                        .child(DISCARD_DRAFT_LABEL)
                         .child(div().text_color(rgb(colors.dim)).child("Space m d")),
                 )
             },
@@ -5826,10 +5833,6 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
-fn discard_query(query: &str) -> bool {
-    "discard draft".starts_with(query)
-}
-
 fn palette_action(query: &str) -> Option<&'static str> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -5849,9 +5852,6 @@ fn palette_action(query: &str) -> Option<&'static str> {
         "dismiss" => return Some("dismiss"),
         _ => {}
     }
-    if query.starts_with("disc") && discard_query(&query) {
-        return Some("discard");
-    }
     let mut found = None;
     for name in [
         "send", "preview", "raw", "quote", "theme", "keep", "reject", "undo", "close",
@@ -5863,7 +5863,11 @@ fn palette_action(query: &str) -> Option<&'static str> {
             found = Some(name);
         }
     }
-    found
+    found.or_else(|| {
+        (query == "d"
+            || (query.len() > 1 && crate::keymap::fuzzy(&query, DISCARD_DRAFT_LABEL).is_some()))
+        .then_some("discard")
+    })
 }
 
 /// The key as the compose window matches it. GPUI names keys ("space",
@@ -6376,7 +6380,10 @@ mod tests {
 
     #[test]
     fn a_substring_of_send_is_not_a_send_command() {
-        assert_eq!(super::palette_action("d"), None);
+        assert_eq!(super::palette_action("d"), Some("discard"));
+        assert_eq!(super::palette_action("draft"), Some("discard"));
+        assert_eq!(super::palette_action("dscrd"), Some("discard"));
+        assert_eq!(super::palette_action("a"), None);
         assert_eq!(super::palette_action("e"), None);
         assert_eq!(super::palette_action("n"), None);
         assert_eq!(super::palette_action("end"), None);

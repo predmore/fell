@@ -471,7 +471,7 @@ fn parse_leader(value: &str) -> Result<(KeyId, String), String> {
     }
 }
 
-fn fuzzy(query: &str, label: &str) -> Option<i32> {
+pub(crate) fn fuzzy(query: &str, label: &str) -> Option<i32> {
     let query: Vec<char> = query.chars().flat_map(|ch| ch.to_lowercase()).collect();
     if query.is_empty() {
         return Some(0);

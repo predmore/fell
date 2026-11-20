@@ -34,7 +34,7 @@ pub use persist::{
     DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
-pub(crate) use persist::{confirm_synced_sends, mark_discarded};
+pub(crate) use persist::{confirm_synced_sends, mark_discarded, undo_discard};
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
     forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,

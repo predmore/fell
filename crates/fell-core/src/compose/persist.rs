@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS compose_review (
 const SEND_MAYBE_SENT: &str = "maybe-sent";
 const SEND_SENT: &str = "sent";
 const SEND_CLEAR: &str = "clear";
+pub(super) const SEND_IN_PROGRESS: &str = "Sending draft · retry when done";
 
 pub(crate) fn mark_discarded(
     conn: &rusqlite::Connection,
@@ -108,6 +109,30 @@ pub(crate) fn mark_discarded(
         params![account.as_str(), id, action_id, SEND_SENT],
     )?;
     Ok(changed == 1)
+}
+
+/// Decide what is visible in Drafts under the same write lock that restores
+/// the batch. A Sent match arriving during the discard keeps its send lock.
+pub(crate) fn undo_discard(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    action_id: i64,
+) -> Result<(i64, i64)> {
+    let (restored, confirmed) = conn.query_row(
+        "SELECT COUNT(*) - COUNT(s.draft_id), COUNT(s.draft_id)
+         FROM compose_drafts d
+         LEFT JOIN compose_send s ON s.account_id = d.account_id
+             AND s.draft_id = d.id AND s.state = ?3
+         WHERE d.account_id = ?1 AND d.discarded_action_id = ?2",
+        params![account.as_str(), action_id, SEND_SENT],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    conn.execute(
+        "UPDATE compose_drafts SET discarded_action_id = NULL
+         WHERE account_id = ?1 AND discarded_action_id = ?2",
+        params![account.as_str(), action_id],
+    )?;
+    Ok((restored, confirmed))
 }
 
 /// Confirm only the exact id observed on an IMAP copy in the account's
@@ -340,9 +365,7 @@ impl Store {
             .mode(0o600)
             .open(directory.join(id))?;
         if !FileExt::try_lock_exclusive(&file)? {
-            return Err(crate::Error::Action(
-                "A draft is being sent · try again when it finishes".into(),
-            ));
+            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
         }
         Ok(Some(file))
     }

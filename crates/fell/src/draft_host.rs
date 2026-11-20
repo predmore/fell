@@ -551,10 +551,9 @@ pub(crate) mod tests {
         // Undo works even if the runtime directory went away.
         std::fs::remove_dir_all(&home.root).unwrap();
         let hub = DraftHub::new();
-        assert_eq!(
-            store.undo(&account.id).unwrap().kind,
-            fell_core::ActionKind::DiscardDrafts
-        );
+        let undo = store.undo(&account.id).unwrap();
+        assert_eq!(undo.kind, fell_core::ActionKind::DiscardDrafts);
+        assert_eq!(undo.summary, "2 drafts restored");
         assert!(store.undo(&account.id).is_err());
         assert_eq!(store.unsent_compose_drafts(&account.id).unwrap().len(), 2);
         assert_eq!(store.list_review_drafts(&account.id).unwrap().len(), 1);
@@ -593,7 +592,7 @@ pub(crate) mod tests {
         let other_hub = DraftHub::new();
         for trying in [&hub, &other_hub] {
             let err = trying.discard(&store, &account.id, &selection).unwrap_err();
-            assert!(err.to_string().contains("being sent"), "{err}");
+            assert_eq!(err.to_string(), "Sending draft · retry when done");
             assert!(store.load_compose(&other).unwrap().is_some());
         }
         hub.with_session(&id, |session| session.end_send(Some(SendLock::MaybeSent)));
