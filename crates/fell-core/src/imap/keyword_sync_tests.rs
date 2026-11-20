@@ -350,6 +350,116 @@ fn local_label_undo_restores_a_keyword_only_while_a_copy_supports_it() {
 }
 
 #[test]
+fn local_undo_readd_preserves_a_fresh_server_keyword() {
+    undo_readd_preserves_a_fresh_server_keyword(false, "triage");
+}
+
+#[test]
+fn agent_undo_readd_preserves_a_fresh_server_keyword() {
+    undo_readd_preserves_a_fresh_server_keyword(true, "TrIaGe");
+}
+
+fn undo_readd_preserves_a_fresh_server_keyword(agent: bool, local_spelling: &str) {
+    let mut state = keyword_state(true);
+    for mailbox in &mut state.mailboxes {
+        let keyword = if mailbox.name == "INBOX" {
+            "triage"
+        } else {
+            "TRIAGE"
+        };
+        mailbox.messages[0].flags = vec![keyword.into()];
+    }
+    let server = TestServer::spawn(state);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let id = MessageId::new("root@x");
+    let message = || store.message(&acct.id, &id).unwrap().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["triage"]);
+    let thread = message().thread_id;
+    let readd = || {
+        if agent {
+            store
+                .remove_thread_label(&acct.id, &thread, "triage", "agent:bot")
+                .unwrap()
+                .unwrap();
+            store
+                .add_thread_label(&acct.id, &thread, local_spelling, "agent:bot")
+                .unwrap()
+                .unwrap();
+        } else {
+            store
+                .label_thread(&acct.id, &thread, LabelChange::Remove("triage".into()))
+                .unwrap();
+            store
+                .label_thread(&acct.id, &thread, LabelChange::Add(local_spelling.into()))
+                .unwrap();
+        }
+    };
+    let undo = || {
+        if agent {
+            store.undo_actor(&acct.id, "agent:bot").unwrap();
+        } else {
+            store.undo(&acct.id).unwrap();
+        }
+    };
+    let sync_flags = |mailbox, revision, flags: &[&str]| {
+        set_flags(&server, mailbox, revision, flags);
+        assert_eq!(
+            sync_once(&acct, &backend, &store).unwrap().new_messages,
+            Some(0)
+        );
+        assert_flag_only(&server);
+    };
+
+    readd();
+    sync_flags("INBOX", 2, &[]);
+    sync_flags("INBOX", 3, &["TRIAGE"]);
+    undo();
+    assert!(
+        message().labels.is_empty(),
+        "Sent always carried the keyword"
+    );
+    undo();
+    assert_eq!(message().labels, ["triage"]);
+
+    readd();
+    sync_flags("INBOX", 4, &[]);
+    sync_flags("Sent", 2, &[]);
+    assert_eq!(message().labels, [local_spelling]);
+    sync_flags("INBOX", 5, &["TRIAGE"]);
+    sync_flags("INBOX", 6, &[]);
+    assert_eq!(
+        message().labels,
+        [local_spelling],
+        "the active local add owns the label"
+    );
+
+    sync_flags("Sent", 3, &["tRiAgE"]);
+    undo();
+    assert_eq!(
+        message().labels,
+        [local_spelling],
+        "the fresh server assertion remains visible"
+    );
+    sync_flags("Sent", 4, &[]);
+    assert!(
+        message().labels.is_empty(),
+        "undo returned ownership to sync"
+    );
+    undo();
+    assert!(
+        message().labels.is_empty(),
+        "the original remove still recorded a server label"
+    );
+}
+
+#[test]
 fn legacy_label_actions_undo_only_their_own_edits_after_reopening() {
     let mut state = keyword_state(false);
     state.mailboxes[0].messages[0].flags = vec!["triage".into(), "review".into()];

@@ -53,6 +53,9 @@ pub(super) fn observe(
         .into_iter()
         .filter(|keyword| !contains(&before, keyword))
         .collect();
+    if !added.is_empty() {
+        expire_readd_suppression(conn, account_id, &message_id, &added)?;
+    }
     conn.prepare_cached(
         "UPDATE message_copies SET keywords = ?5
          WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
@@ -239,6 +242,45 @@ impl LabelHistory {
     }
 }
 
+/// While a local re-add is visible it owns the label. A fresh server assertion
+/// ends the old suppression, so undo can hand the label back to the server.
+/// Check all copies before recording the new FLAGS snapshot.
+fn expire_readd_suppression(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+    added: &[String],
+) -> Result<()> {
+    let added = join_tokens(added).to_ascii_lowercase();
+    for history in [LabelHistory::Local, LabelHistory::Agent] {
+        let (actions, snapshots, _) = history.tables();
+        if !super::copies::table_exists(conn, snapshots)? {
+            continue;
+        }
+        conn.prepare_cached(&format!(
+            "UPDATE {snapshots} AS s SET label_was_keyword = 0
+             FROM {actions} AS a
+             WHERE a.id = s.action_id AND a.account_id = ?1 AND a.undone = 0
+               AND a.kind = 'label' AND s.label_was_keyword = 1
+               AND (s.message_id = ?2 OR EXISTS (
+                   SELECT 1 FROM message_aliases
+                   WHERE account_id = ?1 AND message_id = s.message_id AND canonical_message_id = ?2
+               ))
+               AND substr(a.summary, 1, length(?3)) = ?3
+               AND instr(char(30) || ?4 || char(30),
+                         char(30) || lower(substr(a.summary, length(?3) + 1)) || char(30)) > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_copies AS c
+                   WHERE c.account_id = ?1 AND c.message_id = ?2
+                     AND instr(char(30) || lower(c.keywords) || char(30),
+                               char(30) || lower(substr(a.summary, length(?3) + 1)) || char(30)) > 0
+               )"
+        ))?
+        .execute(params![account_id.as_str(), message_id, ADDED_LABEL, added])?;
+    }
+    Ok(())
+}
+
 /// Keep the remaining ownership evidence for removals logged before the
 /// snapshot stored it. With no evidence, old labels keep their local meaning.
 pub(super) fn upgrade_undo_schema(conn: &Connection) -> Result<()> {
@@ -349,7 +391,7 @@ fn undo_edit(
                     label,
                 );
             // Adding locally can have overridden an earlier local removal.
-            // Undo restores that hidden state while the copies still support it.
+            // Undo restores that hidden state while support is continuous.
             if !keep_managed || (was_keyword == Some(true) && !is_managed) {
                 visible.retain(|item| item != label);
             }

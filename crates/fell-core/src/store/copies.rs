@@ -809,13 +809,10 @@ fn moving_into(
     Ok(hit.is_some())
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+pub(super) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let hit: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .query_row(params![name], |row| row.get(0))
         .optional()?;
     Ok(hit.is_some())
 }
