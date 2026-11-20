@@ -58,6 +58,8 @@ pub struct ConvMessage {
     /// The message's HTML, once read from the store and prepared.
     pub rich: Rich,
     pub expanded: bool,
+    /// Only parts with the stored Attachment role, in MIME order.
+    pub attachments: Vec<fell_core::MimePart>,
     /// Who else got the message. `None` when nothing is stored.
     pub recipients: Option<RecipientLine>,
     /// A draft's "In reply to" or "Forwarding" line, as its compose window
@@ -816,6 +818,7 @@ pub fn conversation(
                 ),
                 rich: Rich::Plain,
                 expanded: message.unread || index == last,
+                attachments: Vec::new(),
                 recipients: recipient_line(message, me),
                 context: None,
                 body_state: fell_core::BodyState::Stored,
@@ -1242,6 +1245,7 @@ mod tests {
             body: render_stored_body(Some(body).filter(|text| !text.is_empty()), body, ""),
             rich: Rich::Plain,
             expanded: true,
+            attachments: Vec::new(),
             recipients: None,
             context: None,
             body_state: state,

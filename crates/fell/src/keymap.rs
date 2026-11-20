@@ -38,6 +38,13 @@ pub enum Action {
     Reply,
     ReplyAll,
     Forward,
+    FocusAttachments,
+    PreviousAttachment,
+    NextAttachment,
+    OpenAttachment,
+    SaveAttachment,
+    SaveAllAttachments,
+    RetryAttachment,
     FolderPicker,
     Move,
     Archive,
@@ -75,6 +82,13 @@ impl Action {
             Self::Reply => "Reply",
             Self::ReplyAll => "Reply all",
             Self::Forward => "Forward",
+            Self::FocusAttachments => "Focus attachments",
+            Self::PreviousAttachment => "Previous attachment",
+            Self::NextAttachment => "Next attachment",
+            Self::OpenAttachment => "Open attachment",
+            Self::SaveAttachment => "Save attachment",
+            Self::SaveAllAttachments => "Save all attachments",
+            Self::RetryAttachment => "Retry attachment action",
             Self::FolderPicker => "Choose folder",
             Self::Move => "Move",
             Self::Archive => "Archive",
@@ -100,7 +114,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 32] = [
+const ALL_ACTIONS: [Action; 39] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -116,6 +130,13 @@ const ALL_ACTIONS: [Action; 32] = [
     Action::Reply,
     Action::ReplyAll,
     Action::Forward,
+    Action::FocusAttachments,
+    Action::PreviousAttachment,
+    Action::NextAttachment,
+    Action::OpenAttachment,
+    Action::SaveAttachment,
+    Action::SaveAllAttachments,
+    Action::RetryAttachment,
     Action::FolderPicker,
     Action::Move,
     Action::Archive,
@@ -148,6 +169,8 @@ pub struct Keymap {
     pub leader_name: String,
     pub which_key_ms: u64,
     pub bindings: Vec<Binding>,
+    // These single keys take precedence while a chip is focused.
+    attachment_bindings: [(KeyId, Action); 4],
 }
 
 impl Default for Keymap {
@@ -164,7 +187,19 @@ impl Keymap {
             leader_name: leader_name.into(),
             which_key_ms,
             bindings,
+            attachment_bindings: [
+                (KeyId::Char('h'), Action::PreviousAttachment),
+                (KeyId::Char('l'), Action::NextAttachment),
+                (KeyId::Enter, Action::OpenAttachment),
+                (KeyId::Char('o'), Action::OpenAttachment),
+            ],
         }
+    }
+
+    pub fn attachment_action(&self, key: KeyId) -> Option<Action> {
+        self.attachment_bindings
+            .iter()
+            .find_map(|&(binding, action)| (binding == key).then_some(action))
     }
 
     pub fn bindings_for(&self, action: Action) -> Vec<&Binding> {
@@ -218,6 +253,8 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('r')], Action::Reply, None);
     bind(&[KeyId::Char('R')], Action::ReplyAll, None);
     bind(&[KeyId::Char('f')], Action::Forward, None);
+    bind(&[KeyId::Char('a')], Action::FocusAttachments, None);
+    bind(&[KeyId::Char('S')], Action::SaveAttachment, None);
     bind(&[KeyId::Char('m')], Action::Move, None);
     bind(&[KeyId::Char('e')], Action::Archive, None);
     bind(&[KeyId::Char('U')], Action::ToggleUnread, None);
@@ -268,6 +305,16 @@ fn default_bindings() -> Vec<Binding> {
         Some("folders"),
     );
     bind(&[KeyId::Leader, KeyId::Char('s')], Action::SyncNow, None);
+    bind(
+        &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('s')],
+        Action::SaveAllAttachments,
+        Some("attachments / agents"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('R')],
+        Action::RetryAttachment,
+        Some("attachments / agents"),
+    );
     bind(
         &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('r')],
         Action::ReopenReview,
@@ -405,6 +452,13 @@ pub fn binding_text(keymap: &Keymap, action: Action) -> String {
                 .collect::<Vec<_>>()
                 .join(" ")
         })
+        .chain(
+            keymap
+                .attachment_bindings
+                .iter()
+                .filter(|(_, found)| *found == action)
+                .map(|(key, _)| key_label(*key, &keymap.leader_name)),
+        )
         .collect::<Vec<_>>()
         .join(" · ")
 }

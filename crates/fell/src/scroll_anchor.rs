@@ -112,6 +112,18 @@ fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixe
     (y - (item.top() - view.top())).min(px(0.))
 }
 
+fn offset_to_reveal(view: Bounds<Pixels>, item: Bounds<Pixels>, offset: Pixels) -> Pixels {
+    let top = view.top() + px(8.);
+    let bottom = view.bottom() - px(8.);
+    if item.top() + offset < top {
+        (top - item.top()).min(px(0.))
+    } else if item.bottom() + offset > bottom {
+        bottom - item.bottom()
+    } else {
+        offset
+    }
+}
+
 pub(super) type LayoutSlot = Rc<Cell<Option<LayoutId>>>;
 
 /// Apply the offset before the scroll div prepaints its children. GPUI's
@@ -122,7 +134,9 @@ pub(super) struct LandingHold {
     /// The layout of the reader's message, from [`LayoutProbe`].
     pub probe: LayoutSlot,
     pub scroll: ScrollHandle,
-    pub y: Pixels,
+    /// Relative viewport position to hold. None reveals a focused chip
+    /// with the smallest scroll that brings its bounds into view.
+    pub y: Option<Pixels>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
 }
@@ -172,7 +186,10 @@ impl gpui::Element for LandingHold {
             // The scroll div clamps the result against its new content height.
             let item = window.layout_bounds(item);
             let mut offset = before;
-            offset.y = offset_to_hold(bounds, item, self.y);
+            offset.y = match self.y {
+                Some(y) => offset_to_hold(bounds, item, y),
+                None => offset_to_reveal(bounds, item, before.y),
+            };
             self.scroll.set_offset(offset);
         }
         self.inner.prepaint(window, cx);
@@ -333,5 +350,16 @@ mod tests {
         let first = vertical_bounds(50., 200.);
         assert_eq!(offset_to_hold(view, first, px(0.)), px(0.));
         assert_eq!(offset_to_hold(view, first, px(20.)), px(0.));
+    }
+
+    #[test]
+    fn revealing_a_chip_scrolls_only_when_it_needs_room() {
+        let view = vertical_bounds(50., 300.);
+        let visible = vertical_bounds(200., 32.);
+        let below = vertical_bounds(420., 32.);
+        let above = vertical_bounds(100., 32.);
+        assert_eq!(offset_to_reveal(view, visible, px(-60.)), px(-60.));
+        assert_eq!(offset_to_reveal(view, below, px(-60.)), px(-110.));
+        assert_eq!(offset_to_reveal(view, above, px(-60.)), px(-42.));
     }
 }

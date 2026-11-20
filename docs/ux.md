@@ -49,6 +49,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Quoted history and signatures collapsed by default with a key to expand.
 - Native styled text by default; a key toggles to the web view for complex HTML; remote images blocked with a one-line, per-sender allow prompt.
 - `j`/`k` move between messages when the conversation has focus; `Ctrl-d`/`Ctrl-u` page (Space is the leader).
+- Attachments wrap beneath each expanded message. `a` focuses its files, `h`/`l` move between them, and `Esc` returns to the message. `Enter` or `o` opens the focused file in the desktop's default app. `S` saves it to Downloads, and `Space a s` saves all files on the current message. `Space a R` retries a failed attachment action.
 
 ## Theme: follow Omarchy
 - Read the active Omarchy theme and map its palette (background, foreground, accent, selection, dimmed, error) to Fell's tokens.
@@ -81,7 +82,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Markdown markers (`**`, `#`, `>`, link URLs) stay editable: they show dimmed on the line the cursor is on and fold away elsewhere. Cursor movement, selection, undo and vim motions behave exactly as in plain text.
 - Inline images render in place, at a sensible max width. Paste or drag an image (or attach with a key) and it inserts a markdown image reference that displays as the image; deleting the reference removes the image. Images go out as inline CID parts, not links to anywhere.
 - Replies and forwards show the quoted original styled and collapsed below the draft, expandable, and keep its inline images.
-- `r` replies, `R` replies all, and `f` forwards. In the conversation they answer the message under the cursor; from the list, the latest message. A reply goes to the sender, or to Reply-To when the message has one; reply all adds the other To and Cc recipients. Your own address is never added. The subject gets one `Re:` or `Fwd:`, never a second. A reply starts in the body; a forward starts on the empty To line. The quoted original is sent after what you write. A forward names the original's attachments in its header block; Fell does not keep attachment files yet, so they are not attached.
+- `r` replies, `R` replies all, and `f` forwards. In the conversation they answer the message under the cursor; from the list, the latest message. A reply goes to the sender, or to Reply-To when the message has one; reply all adds the other To and Cc recipients. Your own address is never added. The subject gets one `Re:` or `Fwd:`, never a second. A reply starts in the body; a forward starts on the empty To line. The quoted original is sent after what you write. A forward carries the original's attachments within the compose limits and names any omitted files in the editor and quoted header.
 - A key toggles raw source view (no styling) for anyone who wants it; styled is the default.
 - Sending produces multipart/alternative: an HTML part rendered from the markdown with a small, conservative stylesheet that looks right in Gmail, Outlook and Proton, plus a text/plain part that is the markdown itself. Inline images go in multipart/related. A preview key shows the rendered HTML before send.
 - The rendering path is shared with the conversation view's native renderer so composed and received mail look consistent.
