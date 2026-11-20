@@ -108,31 +108,36 @@ pub(crate) fn locations(
             (name, folded)
         })
         .collect();
+    let inbox = roles.name(crate::FolderRole::Inbox);
     let mut locations = HashMap::with_capacity(hits.len());
     for chunk in hits.chunks(128) {
         let marks = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT m.message_id, m.folders, m.archived, m.unread,
-                    COALESCE(s.starred, m.starred),
+            "SELECT m.message_id, m.folders, m.archived, m.unread, m.starred,
                     (SELECT group_concat(f.folder_key, char(30)) FROM thread_folders f
-                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.unread = 1)
-             FROM messages m LEFT JOIN thread_summary s
-              ON s.account_id = m.account_id AND s.thread_id = m.thread_id
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.unread = 1),
+                    (SELECT group_concat(
+                        CASE WHEN f.folders = '' AND f.archived = 0 THEN ? ELSE f.folders END,
+                        char(30))
+                     FROM messages f
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.starred = 1)
+             FROM messages m
              WHERE m.account_id = ? AND m.message_id IN ({marks})"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let params = std::iter::once(account.as_str())
+        let params = [inbox, account.as_str()]
+            .into_iter()
             .chain(chunk.iter().map(|hit| hit.message_id.as_str()));
         let mut rows = stmt.query(params_from_iter(params))?;
         while let Some(row) = rows.next()? {
             let mut folders = crate::store::split_field(&row.get::<_, String>(1)?);
             if folders.is_empty() && !row.get::<_, bool>(2)? {
-                folders.push(roles.name(crate::FolderRole::Inbox).to_owned());
+                folders.push(inbox.to_owned());
             }
             let folder = if filters.is_empty() {
-                [current_folder, roles.name(crate::FolderRole::Inbox)]
+                [current_folder, inbox]
                     .into_iter()
                     .find_map(|preferred| {
                         folders
@@ -151,19 +156,24 @@ pub(crate) fn locations(
                 })
             }
             .cloned();
-            let unread_folders = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-            let unread = match &folder {
-                Some(folder) => unread_folders
-                    .split('\u{1e}')
-                    .any(|name| name.eq_ignore_ascii_case(folder)),
-                None => row.get(3)?,
+            let (unread, starred) = if let Some(folder) = &folder {
+                let includes_folder = |tokens: Option<String>| {
+                    tokens.is_some_and(|tokens| {
+                        tokens
+                            .split('\u{1e}')
+                            .any(|name| name.eq_ignore_ascii_case(folder))
+                    })
+                };
+                (includes_folder(row.get(5)?), includes_folder(row.get(6)?))
+            } else {
+                (row.get(3)?, row.get(4)?)
             };
             locations.insert(
                 MessageId(row.get(0)?),
                 SearchLocation {
                     folder,
                     unread,
-                    starred: row.get(4)?,
+                    starred,
                 },
             );
         }

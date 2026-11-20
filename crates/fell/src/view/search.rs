@@ -607,6 +607,11 @@ impl Inbox {
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.open_thread.as_deref() == Some(&id)
                     && inbox.session.cursor_id.as_deref() == Some(&id)
+                    && inbox
+                        .session
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.accepted_generation() == Some(accepted))
                 {
                     if inbox
                         .session
@@ -614,6 +619,9 @@ impl Inbox {
                     {
                         inbox.land_on_reader();
                     }
+                    // The cached scene also depends on matches and quote
+                    // folds, even when the thread and scroll have not moved.
+                    inbox.conversation_revision = inbox.conversation_revision.wrapping_add(1);
                     cx.notify();
                 }
             });
@@ -634,8 +642,8 @@ impl Inbox {
             return;
         };
         let account = self.account_id.clone();
-        // This lane does not hold up ranked results or conversation reads.
-        let reply = self.store.call_maintenance(move |store| {
+        // Prefer background work. The mailbox may only have one connection.
+        let reply = self.store.call_background(move |store| {
             if latest.load(Ordering::Relaxed) == revision {
                 search_suggestions(store, &account, field, &prefix)
             } else {

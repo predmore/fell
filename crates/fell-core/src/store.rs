@@ -5318,6 +5318,80 @@ mod tests {
     }
 
     #[test]
+    fn search_stars_follow_the_result_folder() {
+        use crate::FlagChange;
+
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut inbox = msg("inbox@msg", None, None, "Trip", "The original message");
+        inbox.folders = vec!["INBOX".into()];
+        inbox.starred = true;
+        let thread = store.upsert_message(&inbox).unwrap();
+        let mut archive = msg(
+            "archive@msg",
+            None,
+            Some("inbox@msg"),
+            "Re: Trip",
+            "The reply",
+        );
+        archive.folders = vec!["Archive".into()];
+        store.upsert_message(&archive).unwrap();
+        let mut other = msg(
+            "other@msg",
+            None,
+            Some("inbox@msg"),
+            "Re: Trip",
+            "Another reply",
+        );
+        other.folders = vec!["Archived".into()];
+        other.starred = true;
+        store.upsert_message(&other).unwrap();
+
+        let location = |folder: &str| {
+            let query = format!("in:{folder}");
+            let hits = store.search(&account.id, &query).unwrap().hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].thread_id, thread);
+            let mut locations = store
+                .search_locations(&account.id, &query, "INBOX", &hits)
+                .unwrap();
+            locations.remove(&hits[0].message_id).unwrap()
+        };
+        let archive = location("Archive");
+        assert!(!archive.starred);
+        let target = [(thread.clone(), archive.folder.unwrap())];
+        store
+            .flag_scoped_threads(&account.id, &target, FlagChange::Star)
+            .unwrap()
+            .unwrap();
+        assert!(location("Archive").starred);
+
+        let unstar = store
+            .flag_scoped_threads(&account.id, &target, FlagChange::Unstar)
+            .unwrap()
+            .unwrap();
+        assert!(!location("Archive").starred);
+        assert!(location("INBOX").starred);
+        assert!(location("Archived").starred);
+        assert_eq!(store.undo(&account.id).unwrap().id, unstar.id);
+        assert!(location("Archive").starred);
+
+        assert!(
+            store
+                .flag_scoped_threads(
+                    &account.id,
+                    &[(thread.clone(), "Missing".into())],
+                    FlagChange::Unstar
+                )
+                .is_err()
+        );
+        assert!(location("Archive").starred);
+        assert!(location("INBOX").starred);
+        assert!(location("Archived").starred);
+    }
+
+    #[test]
     fn search_operator_suggestions_read_actual_account_values() {
         use crate::SearchField::*;
         let store = seed_search();

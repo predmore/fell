@@ -224,6 +224,24 @@ mod tests {
     }
 
     #[test]
+    fn search_completion_works_with_one_connection() {
+        let (client, ready) = StoreClient::spawn(|| {
+            let store = Store::open_in_memory().unwrap();
+            let account = crate::fixtures::fixture_account();
+            crate::fixtures::seed_if_empty(&store, &account).unwrap();
+            (store, account.id)
+        });
+        let account = futures::executor::block_on(ready).unwrap();
+        let reply = client.call_background(move |store| {
+            store.search_suggestions(&account, fell_core::SearchField::Folder, "in", 4)
+        });
+        assert_eq!(
+            futures::executor::block_on(reply).unwrap().unwrap(),
+            ["INBOX"]
+        );
+    }
+
+    #[test]
     fn a_slow_search_does_not_hold_up_the_reader() {
         let dir = std::env::temp_dir().join(format!(
             "fell-lanes-{}-{}",
