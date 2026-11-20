@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
+cssparser = "0.34"
 ego-tree = "0.10"
 html5ever = "0.29"
 pulldown-cmark = "0.13"

@@ -61,8 +61,9 @@ pub use send::{
 pub use smtp::SmtpConfig;
 pub use store::PendingFlags;
 pub use store::{
-    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, PartStamp,
-    Participant, SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,
+    CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,
+    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, ThreadList, ThreadSummary,
+    folder_aliases,
 };
 pub use sync::{
     SyncReport, fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once,
@@ -85,6 +86,9 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    /// The SMTP AUTH exchange rejected the configured credentials.
+    #[error("{0}")]
+    SmtpCredentialsRejected(String),
     /// The server had the whole message before the failure, so it may have
     /// been delivered. Every other send error means nothing went out.
     #[error("{0}")]

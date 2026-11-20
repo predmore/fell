@@ -7,12 +7,31 @@ use crate::store::{BodyRequest, Store};
 /// Messages per backfill batch. Each batch is one fetch and one commit.
 const BODY_BATCH: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
-    pub upserted: usize,
-    /// The first sync of a folder under way, as of the last delta. `None`
-    /// while the pass only catches folders up.
+    /// Distinct messages added by catch-up deltas in this pass. A staged
+    /// folder walk can write provisional rows that later merge when their
+    /// bodies arrive. If a walk ran, zero confirmed arrivals is reported as
+    /// `None`, while positive catch-up counts are still reported.
+    pub new_messages: Option<usize>,
+    /// Mail may have changed since the beginning of the pass, including
+    /// updates to messages that were already stored.
+    pub changed: bool,
+    /// Uncertain local drafts confirmed by exact Message-IDs in Sent.
+    pub confirmed_drafts: Vec<String>,
+    /// The most recent first-sync folder progress in this pass, if any.
     pub progress: Option<crate::backend::SyncProgress>,
+}
+
+impl Default for SyncReport {
+    fn default() -> Self {
+        Self {
+            new_messages: Some(0),
+            changed: false,
+            confirmed_drafts: Vec::new(),
+            progress: None,
+        }
+    }
 }
 
 /// Pull a backend delta into the local store. The UI should call this off the frame path.
@@ -24,8 +43,11 @@ pub fn sync_once(
     sync_with_progress(account, backend, store, &mut |_| {})
 }
 
-/// [`sync_once`], calling `progress` after each delta is committed with the
-/// running count of messages written so far.
+/// [`sync_once`], reporting progress after a delta successfully changes
+/// mail or advances a folder walk. A delta with a large flag sweep can
+/// commit its messages and flags before its copy and cursor transaction.
+/// A failure after the first commit returns the error without reporting
+/// that delta. Its committed messages are already stored on retry.
 pub fn sync_with_progress(
     account: &Account,
     backend: &dyn MailBackend,
@@ -39,29 +61,25 @@ pub fn sync_with_progress(
         store.stored_uids(&account.id, mailbox, uidvalidity, range)
     };
     backend.sync_changes(cursor.as_ref(), &known, &mut |delta| {
-        // A row a first sync stored from headers alone is counted when its
-        // body comes, so each message counts once.
-        let count = delta
-            .messages
-            .iter()
-            .filter(|message| !headers_only(message))
-            .count();
-        store.apply_delta(&account.id, &delta)?;
-        report.upserted += count;
-        let walking = delta.progress.is_some();
-        report.progress = delta.progress;
-        if count > 0 || !delta.flags.is_empty() || walking {
+        let writes = store.apply_sync_delta(&account.id, &delta)?;
+        report.changed |= writes.changed;
+        let advances_walk = delta.progress.is_some();
+        if let Some(folder_progress) = delta.progress {
+            report.progress = Some(folder_progress);
+            if report.new_messages == Some(0) {
+                report.new_messages = None;
+            }
+        } else if writes.new_messages > 0 {
+            *report.new_messages.get_or_insert(0) += writes.new_messages;
+        }
+        let confirmed_send = !writes.confirmed_drafts.is_empty();
+        report.confirmed_drafts.extend(writes.confirmed_drafts);
+        if writes.changed || advances_walk || confirmed_send {
             progress(&report);
         }
         Ok(())
     })?;
     Ok(report)
-}
-
-/// A row with no body yet: a first sync stores the list's rows before it
-/// fetches their bodies.
-fn headers_only(message: &crate::Message) -> bool {
-    message.parts.is_none() && message.body_text.is_none() && message.snippet.is_empty()
 }
 
 /// Fill parts for mail stored before they were kept, newest first, in up to
@@ -259,7 +277,7 @@ mod tests {
         };
         let store = Store::open_in_memory().unwrap();
         let report = sync_once(&account, &backend, &store).unwrap();
-        assert_eq!(report.upserted, 1);
+        assert_eq!(report.new_messages, Some(1));
         assert_eq!(store.list_threads(&account.id).unwrap().len(), 1);
     }
 }

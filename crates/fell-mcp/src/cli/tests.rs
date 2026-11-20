@@ -8,6 +8,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const NOW: i64 = 1_800_000_000;
 const EXE: &str = "/opt/fell/fell-mcp";
 
+#[test]
+fn version_works_without_a_mailbox() {
+    let ctx = Ctx::empty();
+    let ran = ctx.run(&["fell-mcp", "--version"], "", false);
+    assert!(ran.result.is_ok());
+    assert_eq!(ran.out, format!("{}\n", fell_version::VERSION));
+    assert!(ran.err.is_empty());
+    assert!(!ctx.store().exists());
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {

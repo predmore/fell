@@ -7,7 +7,7 @@ name: Linux artifacts
 # (libwebkit2gtk in DT_NEEDED via wry), so the distro package is required
 # to launch. This job apt-installs libwebkit2gtk-4.1-dev to compile that
 # link. https://github.com/predmore/fell/issues/8
-# linuxdeploy still excludes libwebkit2gtk and libjavascriptcoregtk.
+# The AppImage uses the host GTK and WebKitGTK libraries.
 # cargo-deny still rejects LGPL in the crate graph.
 # The AppImage uses the static type2 runtime, so it does not need libfuse2.
 
@@ -39,7 +39,7 @@ jobs:
             libx11-xcb-dev libxcb1-dev \
             libvulkan-dev libvulkan1 \
             libwebkit2gtk-4.1-dev \
-            wget squashfs-tools
+            curl squashfs-tools
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked -p fell

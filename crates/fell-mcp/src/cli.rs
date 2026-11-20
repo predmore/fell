@@ -22,6 +22,7 @@ Usage:
   fell-mcp revoke AGENT [--account ID]
   fell-mcp grant  AGENT --read [--triage] [--draft] [--account ID]
   fell-mcp serve  --account ID --agent ID [--store PATH]
+  fell-mcp --version
 
 Harnesses: claude-code, codex, gemini, opencode, goose.
 
@@ -173,6 +174,7 @@ fn inside_appimage(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Help,
+    Version,
     Add,
     List,
     Grant,
@@ -206,6 +208,7 @@ pub(crate) fn run(args: &[OsString], io: &mut Io<'_>) -> Result<(), CliError> {
             writeln!(io.out, "{HELP}")?;
             Ok(())
         }
+        Command::Version => Ok(writeln!(io.out, "{}", fell_version::VERSION)?),
         Command::Add => add(&opts, io),
         Command::List => list(&opts, io),
         Command::Grant => grant(&opts, io),
@@ -214,7 +217,7 @@ pub(crate) fn run(args: &[OsString], io: &mut Io<'_>) -> Result<(), CliError> {
     }
 }
 
-const COMMANDS: &str = "add, list, revoke, grant, serve, or --help";
+const COMMANDS: &str = "add, list, revoke, grant, serve, --version, or --help";
 
 fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
     let Some(first) = args.first() else {
@@ -222,6 +225,7 @@ fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
     };
     let command = match arg_str(first)? {
         "--help" | "-h" | "help" => return Ok((Command::Help, Opts::default())),
+        "--version" | "-V" => return Ok((Command::Version, Opts::default())),
         "add" => Command::Add,
         "list" => Command::List,
         "grant" => Command::Grant,
@@ -317,7 +321,7 @@ fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
                 return Err(CliError::new("missing --agent"));
             }
         }
-        Command::Help => {}
+        Command::Help | Command::Version => {}
     }
     if let Some(agent) = &opts.agent {
         check_agent_id(agent)?;
@@ -383,6 +387,7 @@ fn open_store(opts: &Opts, io: &Io<'_>) -> Result<(PathBuf, Store), CliError> {
     }
     let path = std::path::absolute(&path)?;
     let store = Store::open(&path).map_err(store_err)?;
+    store.finish_cid_repair().map_err(store_err)?;
     Ok((path, store))
 }
 
@@ -809,7 +814,8 @@ fn serve(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
         Session::new(store, AccountId(account.clone()), agent.clone()).map_err(CliError::new)?;
     writeln!(
         io.err,
-        "fell-mcp: serving account {account} for agent {agent} (no send tool)"
+        "{}: fell-mcp serving account {account} for agent {agent} (no send tool)",
+        fell_version::VERSION
     )?;
     // `cli_main` already holds the stdin lock in `io.input`; std's stdin
     // lock is not reentrant, so serve over the same handles.

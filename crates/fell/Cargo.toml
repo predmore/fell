@@ -20,6 +20,7 @@ required-features = ["bench-store"]
 fell-confirm.workspace = true
 fell-core = { workspace = true, features = ["ui-confirm"] }
 fell-render.workspace = true
+fell-version.workspace = true
 gpui.workspace = true
 futures = "0.3"
 gtk = "0.18"
@@ -32,6 +33,7 @@ notify = { version = "=8.2.2", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 smallvec = "1"
+tempfile = "3"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider"] }
 url = "2.5"
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
@@ -46,5 +48,4 @@ rusqlite.workspace = true
 serde_json.workspace = true
 sha2 = { version = "0.10.9", default-features = false }
 serde = { version = "1", features = ["derive"] }
-tempfile = "3"
 toml = "1"

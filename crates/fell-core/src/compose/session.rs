@@ -1240,17 +1240,15 @@ impl DraftSession {
     ///
     /// The mailbox records the claim as "may have been sent" before anything
     /// is transmitted: if Fell stops mid-send, the next start must not send
-    /// the draft again without the person checking Sent. A send that cannot
-    /// leave that record does not start.
-    pub fn begin_send(&mut self) -> Result<(), String> {
+    /// the draft again without the person choosing to unlock it. A send
+    /// that cannot leave that record does not start.
+    pub fn begin_send(&mut self, message_id: &crate::MessageId) -> Result<(), String> {
         if let Some(lock) = self.send_lock {
             return Err(lock.reason().into());
         }
-        // The outgoing Message-ID is not known here yet; the column stays
-        // empty until the message carries one.
         let claimed = self.send_store().and_then(|store| {
             store
-                .claim_compose_send(&self.account_id, &self.id, None)
+                .claim_compose_send(&self.account_id, &self.id, Some(message_id.as_str()))
                 .map_err(|err| err.to_string())
         });
         match claimed {
@@ -1267,9 +1265,9 @@ impl DraftSession {
         }
     }
 
-    /// The person checked Sent and the mail is not there: a draft that
-    /// "may have been sent" becomes editable and sendable again. Only that
-    /// lock is released, in the mailbox first; a recorded send never is.
+    /// The person accepted the risk of a duplicate: make an uncertain draft
+    /// editable and sendable again. Only that lock is released, in the
+    /// mailbox first; a recorded send never is.
     pub fn release_maybe_sent(&mut self) -> Result<(), String> {
         if self.send_lock != Some(SendLock::MaybeSent) {
             return Err(match self.send_lock {
@@ -1302,22 +1300,50 @@ impl DraftSession {
     pub fn end_send(&mut self, lock: Option<SendLock>) {
         debug_assert_ne!(lock, Some(SendLock::InFlight));
         self.send_lock = lock;
-        if lock == Some(SendLock::MaybeSent) {
-            // What the claim already recorded.
-            return;
-        }
         let recorded = self.send_store().and_then(|store| {
-            store
-                .finish_compose_send(&self.account_id, &self.id, lock)
-                .map_err(|err| err.to_string())
+            if lock != Some(SendLock::MaybeSent) {
+                store
+                    .finish_compose_send(&self.account_id, &self.id, lock)
+                    .map_err(|err| err.to_string())?;
+            }
+            // Sync may have found the copy while SMTP was still waiting.
+            // An in-flight editor is left alone until its transfer ends.
+            if lock != Some(SendLock::Sent) && self.has_send_confirmation(&store) {
+                self.send_lock = Some(SendLock::Sent);
+            }
+            Ok(())
         });
-        if let Err(err) = recorded {
+        if let Err(err) = recorded
+            && lock != Some(SendLock::MaybeSent)
+        {
             // The claim stays in the mailbox, which errs toward "may have
             // been sent".
             self.notices.push(format!(
                 "could not record how this send ended ({err}); after a restart this draft will read as possibly sent"
             ));
         }
+    }
+
+    /// Apply confirmation of a recorded uncertain send. A live transfer
+    /// still owns its editor until the SMTP worker ends it.
+    pub(crate) fn confirm_uncertain_send(&mut self) {
+        if self.send_lock == Some(SendLock::MaybeSent) {
+            self.send_lock = Some(SendLock::Sent);
+        }
+    }
+
+    /// Catch a confirmation that committed while this session was opening.
+    pub fn refresh_send_confirmation(&mut self, store: &crate::Store) {
+        if self.send_lock == Some(SendLock::MaybeSent) && self.has_send_confirmation(store) {
+            self.confirm_uncertain_send();
+        }
+    }
+
+    fn has_send_confirmation(&self, store: &crate::Store) -> bool {
+        matches!(
+            store.load_compose_send(&self.account_id, &self.id),
+            Ok(Some(SendLock::Sent))
+        )
     }
 
     /// The mailbox this draft's send record lives in. Opened for one write,
@@ -1334,9 +1360,11 @@ impl DraftSession {
 
     /// Keep the lock of the session this one replaces in the hub.
     pub(crate) fn inherit_send_lock(&mut self, previous: &DraftSession) {
-        // The live session's lock wins over the record on disk: a send in
-        // flight there must still find its claim here.
-        if previous.send_lock.is_some() {
+        // Keep a live transfer, and never replace a recorded confirmation
+        // with an older uncertain lock.
+        if previous.send_lock == Some(SendLock::InFlight)
+            || (self.send_lock != Some(SendLock::Sent) && previous.send_lock.is_some())
+        {
             self.send_lock = previous.send_lock;
         }
     }
@@ -2291,8 +2319,15 @@ mod tests {
         let (_root, _store, mut session) = stored_session("body\n");
         session.mark_seen();
         assert!(session.prepare_send().is_ok());
-        session.begin_send().unwrap();
-        assert!(session.begin_send().unwrap_err().contains("being sent"));
+        session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
+        assert!(
+            session
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .unwrap_err()
+                .contains("being sent")
+        );
         assert!(session.prepare_send().unwrap_err().contains("being sent"));
         session.end_send(None);
         assert!(session.prepare_send().is_ok());
@@ -2303,10 +2338,17 @@ mod tests {
             // A recorded send is never cleared, so each case is a new draft.
             let (_root, _store, mut session) = stored_session("body\n");
             session.mark_seen();
-            session.begin_send().unwrap();
+            session
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .unwrap();
             session.end_send(Some(lock));
             assert!(session.prepare_send().unwrap_err().contains(needle));
-            assert!(session.begin_send().unwrap_err().contains(needle));
+            assert!(
+                session
+                    .begin_send(&crate::MessageId::new("test@compose.fell"))
+                    .unwrap_err()
+                    .contains(needle)
+            );
             assert_eq!(
                 session.snapshot().send_block.as_deref(),
                 Some(lock.reason())
@@ -2897,7 +2939,9 @@ mod tests {
     #[test]
     fn a_draft_cannot_change_while_it_is_sent() {
         let (root, _store, mut session) = stored_session("body\n");
-        session.begin_send().unwrap();
+        session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         let before = session.serialize();
         session.set_body_from_user("typed during send\n".into());
         session.set_subject_from_user("changed".into());
@@ -2925,7 +2969,9 @@ mod tests {
     fn a_claim_without_end_send_reopens_as_maybe_sent() {
         let (root, store, mut session) = stored_session("body\n");
         session.mark_seen();
-        session.begin_send().unwrap();
+        session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         // Fell stops mid-send: end_send never runs.
         let reopened = reopen(session, &store);
         assert_eq!(reopened.send_lock(), Some(SendLock::MaybeSent));
@@ -2942,7 +2988,9 @@ mod tests {
     fn deleting_the_control_folder_does_not_unlock_a_sent_draft() {
         let (root, store, mut session) = stored_session("body\n");
         session.mark_seen();
-        session.begin_send().unwrap();
+        session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         session.end_send(Some(SendLock::Sent));
         let folder = session.folder().to_path_buf();
         let control = workspace::control_dir(&folder);
@@ -2954,31 +3002,46 @@ mod tests {
             DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
         reopened.mark_seen();
-        assert!(reopened.begin_send().unwrap_err().contains("was sent"));
+        assert!(
+            reopened
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .unwrap_err()
+                .contains("was sent")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_send_that_transmitted_nothing_reopens_unlocked() {
         let (root, store, mut session) = stored_session("body\n");
-        session.begin_send().unwrap();
+        session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         session.end_send(None);
         let mut reopened = reopen(session, &store);
         assert_eq!(reopened.send_lock(), None);
-        reopened.begin_send().unwrap();
+        reopened
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_draft_with_no_mailbox_is_not_claimed() {
         let (root, mut session) = temp_session("body\n");
-        let err = session.begin_send().unwrap_err();
+        let err = session
+            .begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap_err();
         assert!(err.contains("could not record this send"), "{err}");
         assert_eq!(session.send_lock(), None);
         // A mailbox path that is gone is not created by the claim.
         let missing = root.join("gone.db");
         session.bind_store(&missing);
-        assert!(session.begin_send().is_err());
+        assert!(
+            session
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .is_err()
+        );
         assert!(!missing.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -2990,7 +3053,12 @@ mod tests {
             .finish_compose_send(&AccountId("local".into()), "d1", Some(SendLock::Sent))
             .unwrap();
         // This session was opened before the record was written.
-        assert!(session.begin_send().unwrap_err().contains("was sent"));
+        assert!(
+            session
+                .begin_send(&crate::MessageId::new("test@compose.fell"))
+                .unwrap_err()
+                .contains("was sent")
+        );
         assert_eq!(session.send_lock(), Some(SendLock::Sent));
         let _ = fs::remove_dir_all(root);
     }
@@ -3115,7 +3183,8 @@ mod tests {
     fn a_reopen_during_a_send_keeps_the_live_claim() {
         let (root, store, mut live) = stored_session("body\n");
         let folder = live.folder().to_path_buf();
-        live.begin_send().unwrap();
+        live.begin_send(&crate::MessageId::new("test@compose.fell"))
+            .unwrap();
         let mut reopened =
             DraftSession::open_with_store(&folder, AccountId("local".into()), &store).unwrap();
         assert_eq!(
@@ -3125,6 +3194,50 @@ mod tests {
         );
         reopened.inherit_send_lock(&live);
         assert_eq!(reopened.send_lock(), Some(SendLock::InFlight));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_sent_confirmation_wins_over_an_open_unlock_dialog_and_a_lost_smtp_reply() {
+        let (root, store, mut live) = stored_session("body\n");
+        let id = crate::MessageId::new("submitted@compose.fell");
+        live.begin_send(&id).unwrap();
+        let account = live.account_id().clone();
+        let mut reopened =
+            DraftSession::open_with_store(live.folder(), account.clone(), &store).unwrap();
+        assert_eq!(reopened.send_lock(), Some(SendLock::MaybeSent));
+        store
+            .apply_delta(
+                &account,
+                &crate::MailboxDelta {
+                    roles: Some(crate::FolderRoles::from_names(&["Sent".into()])),
+                    removals: vec![crate::FolderRemoval {
+                        mailbox: "Sent".into(),
+                        folder: "Sent".into(),
+                        kind: crate::RemovalKind::Listing {
+                            uidvalidity: 1,
+                            present: vec![7],
+                            through: 7,
+                            found: vec![(7, id)],
+                            sweep: false,
+                        },
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(live.send_lock(), Some(SendLock::InFlight));
+        live.end_send(Some(SendLock::MaybeSent));
+        assert_eq!(live.send_lock(), Some(SendLock::Sent));
+
+        assert!(
+            reopened
+                .release_maybe_sent()
+                .unwrap_err()
+                .contains("was sent")
+        );
+        assert_eq!(reopened.send_lock(), Some(SendLock::Sent));
+        assert_eq!(reopen(live, &store).send_lock(), Some(SendLock::Sent));
         let _ = fs::remove_dir_all(root);
     }
 }

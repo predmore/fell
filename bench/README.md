@@ -16,7 +16,7 @@ Keyword search runs all five query shapes with hybrid ranking disabled. If pinne
 
 Use p95 for each latency budget and decimal MB for RSS. The gate checks each timed shape or checkpoint against 120% of its baseline. Store open is informational because the 300 ms product budget also covers app startup and rendering. The job publishes the table before returning a failure when a budget is exceeded. [`budgets.toml`](budgets.toml)
 
-The calibration uses the slowest measured p95 or largest RSS snapshot for each row on `ubuntu-latest` (Ubuntu 26.04 x64), commit `422d92a`. The configured baselines give the measured values roughly 25–35% room for runner variance, before the gate adds its 20% tolerance. The published product maxima still apply. Hybrid uses the 150 ms product maximum as its enforced limit pending runner calibration with the pinned MiniLM model. [Calibration job](https://github.com/predmore/fell/actions/runs/44645540660/job/135987038248) · [Issue #125](https://github.com/predmore/fell/issues/125) · [Product scope](../docs/scope.md)
+The calibration uses the slowest measured p95 or largest RSS snapshot for each row on `ubuntu-latest` (Ubuntu 26.04 x64), commit `422d92a`. The configured baselines give the measured values roughly 25–35% room for runner variance, before the gate adds its 20% tolerance. The published product maxima still apply. Hybrid uses the 150 ms product maximum as its enforced limit. The first model-backed hosted run measured 106.841 ms p95. [Calibration job](https://github.com/predmore/fell/actions/runs/44645540660/job/135987038248) · [Model-backed job](https://github.com/predmore/fell/actions/runs/44654557591/job/136017472591) · [Issue #125](https://github.com/predmore/fell/issues/125) · [Product scope](../docs/scope.md)
 
 | Metric | Measured Ubuntu maximum | Configured baseline | CI limit (+20%) | Product maximum |
 | --- | ---: | ---: | ---: | ---: |
@@ -24,7 +24,7 @@ The calibration uses the slowest measured p95 or largest RSS snapshot for each r
 | 50-message thread p95 | 2.404 ms | 3.00 ms | 3.60 ms | 16 ms |
 | Keyword search p95 | 19.285 ms | 25.00 ms | 30.00 ms | 50 ms |
 | RSS | 13.365 MB | 18.00 MB | 21.60 MB | 250 MB |
-| Hybrid search p95 | Model absent on initial run | 125 ms | 150 ms | 150 ms |
+| Hybrid search p95 | 106.841 ms | 125 ms | 150 ms | 150 ms |
 
 The calibration job took 9m54s, including 62s to save an 848 MB cache, 1m24s to build, and 279s to seed the mailbox. The budget job now restores the release cache from the Linux artifacts workflow on `main` and installs the required build packages without their recommendations. Skipping the cache save alone would have left about 68s under the timeout in that run. Recheck the hosted duration and the baselines across subsequent runs.
 

@@ -1,0 +1,166 @@
+name: Linux release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'packaging/linux/package.sh'
+      - 'packaging/linux/release.sh'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to simulate
+        required: true
+        default: v0.1.0-rc.1
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        name: Validate tag and workspace version
+        env:
+          TAG: ${{ github.event_name == 'pull_request' && '--candidate' || inputs.tag || github.ref_name }}
+        run: packaging/linux/release.sh plan "$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and test ${{ matrix.arch }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            arch_image: archlinux:base
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            arch_image: menci/archlinuxarm:base
+    runs-on: ${{ matrix.runner }}
+    env:
+      FELL_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      NATIVE_ARCH: ${{ matrix.arch }}
+      ARCH_IMAGE: ${{ matrix.arch_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check runner architecture
+        run: test "$(uname -m)" = "$NATIVE_ARCH"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang cmake pkg-config \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libvulkan1 \
+            libwebkit2gtk-4.1-dev \
+            curl squashfs-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --locked --workspace --all-features
+      - name: Build release binaries
+        # Separate invocations keep fell's UI confirmation feature out of fell-mcp.
+        run: |
+          cargo build --release --locked -p fell
+          cargo build --release --locked -p fell-mcp
+      - name: Package and smoke test
+        run: MCP_BIN="$PWD/target/release/fell-mcp" packaging/linux/package.sh
+      - name: Smoke test on clean Arch
+        run: |
+          expected=$(target/release/fell --version)
+          docker run --rm --volume "$PWD/dist:/dist:ro" \
+            -e FELL_RELEASE_VERSION -e NATIVE_ARCH -e EXPECTED="$expected" \
+            "$ARCH_IMAGE" bash -euc '
+              test "$(uname -m)" = "$NATIVE_ARCH"
+              # The container can block the nested Landlock ruleset. Keep
+              # the download user and syscall filter and use Docker for filesystem isolation.
+              pacman -Syu --noconfirm --needed --disable-sandbox-filesystem webkit2gtk-4.1
+              name=fell-$FELL_RELEASE_VERSION-$NATIVE_ARCH
+              cd "$(mktemp -d)"
+              tar -xzf "/dist/$name-linux.tar.gz"
+              for program in fell fell-mcp; do
+                test "$("./$name-linux/$program" --version)" = "$EXPECTED"
+              done
+              export APPIMAGE_EXTRACT_AND_RUN=1
+              test "$("/dist/$name.AppImage" --version)" = "$EXPECTED"
+              test "$("/dist/$name.AppImage" mcp --version)" = "$EXPECTED"
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/fell-${{ env.FELL_RELEASE_VERSION }}-${{ matrix.arch }}-linux.tar.gz
+            dist/fell-${{ env.FELL_RELEASE_VERSION }}-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  assemble:
+    name: Verify both architectures and create checksums
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    env:
+      FELL_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: release-assets
+          merge-multiple: true
+      - run: packaging/linux/release.sh assemble "$FELL_RELEASE_VERSION" release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fell-${{ env.FELL_RELEASE_VERSION }}-release
+          path: release-assets/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [plan, assemble]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: fell-${{ needs.plan.outputs.version }}-release
+          path: release-assets
+      - name: Publish release with generated PR notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          (cd release-assets && sha256sum -c SHA256SUMS)
+          args=(--verify-tag --generate-notes --title "$TAG" --target "$(git rev-parse HEAD)")
+          if previous=$(git describe --first-parent --abbrev=0 --tags --match 'v[0-9]*' HEAD^ 2>/dev/null); then
+            args+=(--notes-start-tag "$previous")
+          fi
+          if [[ $PRERELEASE == true ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG" "${args[@]}" release-assets/*

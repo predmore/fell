@@ -30,6 +30,7 @@ pub use markdown::{
 };
 pub use merge::HunkKind;
 pub use mime::{Outgoing, ResolvedFile};
+pub(crate) use persist::confirm_synced_sends;
 pub use persist::{
     DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
@@ -43,8 +44,8 @@ pub use session::{
     AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
 };
 pub use workspace::{
-    draft_file_is_symlink, draft_folder, draft_root, draft_socket_path, image_file, materialize_in,
-    materialize_workspace, read_account, read_owner, require_owner, resolve_inside, write_owner,
-    write_store_link,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, draft_file_is_symlink, draft_folder, draft_root,
+    draft_socket_path, image_file, materialize_in, materialize_workspace, read_account, read_owner,
+    require_owner, resolve_inside, write_owner, write_store_link,
 };
 pub use writer::SaveWaiter;

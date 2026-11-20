@@ -202,6 +202,8 @@ CREATE TABLE IF NOT EXISTS compose_send (
     updated_unix INTEGER NOT NULL,
     PRIMARY KEY (account_id, draft_id)
 );
+CREATE INDEX IF NOT EXISTS idx_compose_send_message
+ON compose_send(account_id, state, message_id);
 "#;
 
 const FTS_TABLE: &str = r#"
@@ -372,6 +374,8 @@ pub struct ThreadSummary {
     pub message_count: usize,
     pub unread: bool,
 }
+
+pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -658,10 +662,20 @@ impl Store {
     /// action reading them in between (an archive queueing the UIDs to move)
     /// never sees half a listing. The cursor is written only in the second
     /// part, so a pass cut short after the first is done again by the next.
-    /// Any other delta is one transaction.
+    /// Any other delta is one transaction, including deltas that confirm
+    /// a send so the Sent copy and confirmed claim become visible together.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
+        self.apply_sync_delta(account_id, delta).map(|_| ())
+    }
+
+    pub(crate) fn apply_sync_delta(
+        &self,
+        account_id: &AccountId,
+        delta: &MailboxDelta,
+    ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
+        let mut new_messages = 0;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -675,9 +689,9 @@ impl Store {
                 continue;
             };
             // A combined delta can carry the listing for these messages.
-            insert_message(&tx, &message, &mut merge_roles)?;
+            new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
         }
-        let inserted = !delta.messages.is_empty();
+        let has_arrivals = !delta.messages.is_empty();
         for message_id in &delta.too_large {
             if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
                 bodies::mark_withheld(&tx, account_id, &canonical)?;
@@ -693,9 +707,10 @@ impl Store {
         let copy_work = delta.roles.is_some()
             || !delta.removals.is_empty()
             || delta.settle != crate::backend::Settle::Later;
-        let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT;
+        let confirmed = crate::compose::confirm_synced_sends(&tx, account_id, delta)?;
+        let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT && confirmed.is_empty();
         if split {
-            if inserted {
+            if has_arrivals {
                 self.rethread_written(&tx, account_id)?;
             }
             tx.commit()?;
@@ -713,7 +728,7 @@ impl Store {
         };
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if (inserted && !split) || repaired || took_over || settled {
+        if (has_arrivals && !split) || repaired || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -721,7 +736,16 @@ impl Store {
         }
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(())
+        Ok(DeltaWrites {
+            new_messages,
+            changed: has_arrivals
+                || !delta.flags.is_empty()
+                || !delta.too_large.is_empty()
+                || repaired
+                || took_over
+                || settled,
+            confirmed_drafts: confirmed,
+        })
     }
 
     /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
@@ -1033,7 +1057,8 @@ impl Store {
     /// Store parts fetched again for messages that had none. `None` parts
     /// record that no copy could be fetched, so the backfill stops asking;
     /// a later sync of the message still fills them. Parts already stored
-    /// are kept. Returns how many messages gained a body.
+    /// are kept, with unresolved CID roles refreshed for the upgrade queue.
+    /// Returns how many messages gained a body.
     pub fn store_fetched_parts(
         &self,
         account_id: &AccountId,
@@ -1050,12 +1075,38 @@ impl Store {
                 (message_id, stored)
             })
             .collect();
-        let tx = immediate_transaction(&self.conn)?;
+        // A CID-only answer can require inspecting the kept HTML again.
+        // Snapshot that input before contending for the mailbox write lock.
+        let read = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let repairs = compressed
+            .iter()
+            .map(|(id, parts)| {
+                let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
+                    return Ok(None);
+                };
+                bodies::cid_upgrade::prepare_fetched(
+                    &read,
+                    account_id,
+                    canonical,
+                    parts.mime_parts(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        read.commit()?;
+        let tx = self
+            .lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for (message_id, parts) in &compressed {
+        for ((message_id, parts), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
+            if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, repair)? {
+                continue;
+            }
             if parts.has_body() {
                 filled += 1;
             }
@@ -2113,21 +2164,30 @@ impl<'a> MergeRoles<'a> {
     }
 }
 
+pub(crate) struct DeltaWrites {
+    pub new_messages: usize,
+    /// The caller should refresh its view of the stored mail.
+    pub changed: bool,
+    pub confirmed_drafts: Vec<String>,
+}
+
+/// Returns whether the arrival made a new row. Every accepted arrival still
+/// records its remote copy, including arrivals folded into a stored row.
 fn insert_message(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<ThreadId> {
-    let thread = insert_arrival(conn, message, roles)?;
+) -> Result<bool> {
+    let inserted = insert_arrival(conn, message, roles)?;
     copies::record(conn, message)?;
-    Ok(thread)
+    Ok(inserted)
 }
 
 fn insert_arrival(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<ThreadId> {
+) -> Result<bool> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2143,15 +2203,19 @@ fn insert_arrival(
                 roles,
             )?
         {
-            return absorb_duplicate(conn, message, &stored, &other);
+            absorb_duplicate(conn, message, &stored, &other)?;
+        } else {
+            write_kept(conn, message, &stored, via_alias, &[], &[])?;
         }
-        return write_kept(conn, message, &stored, via_alias, &[], &[]);
+        return Ok(false);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        return write_kept(conn, message, &stored, true, &[], &[]);
+        write_kept(conn, message, &stored, true, &[], &[])?;
+        return Ok(false);
     }
-    insert_new(conn, message, &fingerprint)
+    insert_new(conn, message, &fingerprint)?;
+    Ok(true)
 }
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {

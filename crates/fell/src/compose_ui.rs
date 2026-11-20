@@ -2,13 +2,15 @@
 //! text, through the same document model the conversation renderer uses.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv6Addr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fell_core::compose::{
-    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyledDoc, html_to_doc,
-    line_styles, markdown_to_doc,
+    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyleSpan, StyledDoc,
+    html_to_doc, line_styles, markdown_to_doc,
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
@@ -19,6 +21,7 @@ use image::Frame;
 use smallvec::SmallVec;
 
 use crate::confirmation_from_ui;
+use crate::mailbox::AccountConfigError;
 use crate::present::display_safe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +142,13 @@ enum Field {
     Bcc,
     Subject,
     Body,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendPanel {
+    Summary,
+    Details,
+    ConfirmUnlock,
 }
 
 struct Editor {
@@ -309,6 +319,10 @@ pub struct ComposeView {
     known_hunks: Vec<u64>,
     /// Send was tried: a missing recipient now says it blocks send.
     send_tried: bool,
+    send_feedback: SendFeedbackState,
+    send_check: Option<gpui::Task<()>>,
+    send_panel: SendPanel,
+    send_detail_scroll: gpui::ScrollHandle,
 }
 
 impl ComposeView {
@@ -323,10 +337,16 @@ impl ComposeView {
             .with_session(&draft_id, |session| session.snapshot())
             .unwrap_or_else(|| empty_snapshot(&draft_id));
         let editor = Editor::from_body(&snap.body);
+        cx.default_global::<SendAttempts>();
+        cx.observe_global::<SendAttempts>(|this, cx| {
+            this.send_feedback.invalidate_readiness();
+            cx.notify();
+        })
+        .detach();
         // A closed window no longer counts as showing its draft.
         cx.on_release(|this: &mut Self, _| this.hub.note_hidden(this.draft_id.as_ref()))
             .detach();
-        Self {
+        let mut view = Self {
             hub,
             draft_id: draft_id.into(),
             folder,
@@ -363,10 +383,64 @@ impl ComposeView {
             touched: false,
             known_hunks: Vec::new(),
             send_tried: false,
-        }
+            send_feedback: SendFeedbackState::default(),
+            send_check: None,
+            send_panel: SendPanel::Summary,
+            send_detail_scroll: gpui::ScrollHandle::new(),
+        };
+        view.refresh_send_availability(cx);
+        view
     }
 
-    pub fn watch_live(&self, cx: &mut Context<Self>) {
+    /// Check the small local account file while this draft is open. Polling
+    /// also sees file replacements, permission changes, and a newly created
+    /// config directory. An attempted send reads it again independently.
+    fn refresh_send_availability(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.hub.with_session(self.draft_id.as_ref(), |session| {
+            session.account_id().clone()
+        }) else {
+            return;
+        };
+        // Replacing the task on activation or a draft switch drops any
+        // outstanding result before it can repaint the window.
+        self.send_check = Some(cx.spawn(async move |this, cx| {
+            if fell_core::is_demo_account(&account) {
+                return;
+            }
+            loop {
+                let Ok(generation) = this.update(cx, |this, _| this.send_feedback.generation)
+                else {
+                    break;
+                };
+                let account = account.clone();
+                let unavailable = cx
+                    .background_executor()
+                    .spawn(async move { crate::mailbox::send_account_config(&account).err() })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.send_feedback.update_readiness(generation, unavailable) {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+            }
+        }));
+    }
+
+    pub fn watch_live(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && !this.closing {
+                this.refresh_send_availability(cx);
+            }
+        })
+        .detach();
         // An async channel: waiting for the hub holds no thread, and once
         // the window is gone the next change drops this subscription.
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -698,6 +772,12 @@ impl ComposeView {
         self.subject_line = snap.subject.clone();
         self.sent = false;
         self.send_tried = false;
+        self.send_feedback.switch_draft();
+        self.send_check = None;
+        self.send_panel = SendPanel::Summary;
+        self.palette = None;
+        self.leader = false;
+        self.which_visible = false;
         self.quote_open = false;
         self.status = "".into();
         self.start_on_recipients_if_empty(&snap);
@@ -863,20 +943,24 @@ impl ComposeView {
     }
 
     /// Check and build the message under the draft lock, then talk to SMTP
-    /// on a background thread. The window keeps painting while Bridge
+    /// on a background thread. The window keeps painting while the server
     /// answers. The draft is claimed for the send before it starts, so a
     /// second press, here or in a reopened window, never sends it again.
     fn send(&mut self, cx: &mut Context<Self>) {
         let id = self.draft_id.to_string();
         self.send_tried = true;
         if self.sending.as_deref() == Some(id.as_str()) {
-            self.status = "Sending…".into();
             return;
         }
-        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock()) {
-            self.status = lock.reason().into();
+        if self
+            .hub
+            .with_session(&id, |session| session.send_lock().is_some())
+            == Some(true)
+        {
             return;
         }
+        self.send_feedback.invalidate_readiness();
+        cx.global_mut::<SendAttempts>().clear(&id);
         if self.field != Field::Body && !self.commit_field(self.field) {
             return;
         }
@@ -888,6 +972,10 @@ impl ComposeView {
         let prepared = self.hub.with_session(&id, prepare_from_editor);
         let prepared = match prepared {
             Some(Ok(prepared)) => prepared,
+            Some(Err(SendFailure::Locked(_))) => {
+                self.status = "".into();
+                return;
+            }
             Some(Err(err)) => {
                 self.status = err.to_string().into();
                 return;
@@ -898,7 +986,9 @@ impl ComposeView {
             }
         };
         self.sending = Some(id.clone());
-        self.status = "Sending…".into();
+        let attempt = cx.global_mut::<SendAttempts>().start(&id);
+        self.preview = false;
+        self.status = "".into();
         let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
             let sent_id = id.clone();
@@ -909,6 +999,14 @@ impl ComposeView {
                     async move { transmit_from_hub(&hub, &id, prepared, account_backend) }
                 })
                 .await;
+            let current = cx
+                .update_global::<SendAttempts, _>(|attempts, _| {
+                    attempts.finish(&sent_id, attempt, outcome.as_ref().err().cloned())
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
             let shown = this.update(cx, |this, cx| {
                 if this.sending.as_deref() == Some(sent_id.as_str()) {
                     this.sending = None;
@@ -922,7 +1020,10 @@ impl ComposeView {
                 );
                 if let Some(status) = end.status {
                     this.sent = end.sent;
-                    this.status = status.into();
+                    this.status = match &outcome {
+                        Err(SendFailure::Locked(_)) | Ok(_) => status.into(),
+                        Err(_) => "".into(),
+                    };
                 }
                 if end.close {
                     this.closing = true;
@@ -1034,15 +1135,38 @@ impl ComposeView {
         }
     }
 
+    fn place_link_cursor(&mut self, row: usize, line: &str, col: usize, cx: &mut Context<Self>) {
+        if self.field != Field::Body
+            || self.preview
+            || self.palette.is_some()
+            || self.leader
+            || self.editor.row != row
+            || !self.pull_if_stale()
+            || self.editor.lines.get(self.editor.row).map(String::as_str) != Some(line)
+        {
+            return;
+        }
+        self.editor.col = col.min(line.chars().count());
+        self.editor.preferred = self.editor.col;
+        self.editor.count = 0;
+        self.bracket = None;
+        self.touched = true;
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.touched = true;
+        let key = compose_key(&event.keystroke);
+        let key = key.as_str();
+        if self.send_panel != SendPanel::Summary {
+            self.send_panel_key(key, &event.keystroke.modifiers, cx);
+            return;
+        }
         if self.field == Field::Body && !self.pull_if_stale() {
             self.status = "the draft changed under the cursor; the key was not applied".into();
             return;
         }
-        let key = compose_key(&event.keystroke);
-        let key = key.as_str();
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
@@ -1153,19 +1277,25 @@ impl ComposeView {
             return;
         }
         match action {
-            "unlock" => {
-                let released = self
-                    .hub
-                    .with_session(self.draft_id.as_ref(), |session| {
-                        session.release_maybe_sent()
-                    })
-                    .unwrap_or_else(|| Err("this draft is not open".into()));
-                self.status = match released {
-                    // The bar's right side already offers send.
-                    Ok(()) => "unlocked".into(),
-                    Err(err) => err.into(),
-                };
-                cx.notify();
+            "unlock" if locked == Some(SendLock::MaybeSent) => {
+                self.status = "".into();
+                self.send_panel = SendPanel::ConfirmUnlock;
+            }
+            "details"
+                if self
+                    .send_feedback
+                    .feedback(
+                        locked,
+                        cx.global::<SendAttempts>().failure(self.draft_id.as_ref()),
+                    )
+                    .is_some_and(|feedback| feedback.detail().is_some()) =>
+            {
+                self.send_detail_scroll = gpui::ScrollHandle::new();
+                self.send_panel = SendPanel::Details;
+            }
+            "dismiss" if locked.is_none() => {
+                cx.global_mut::<SendAttempts>()
+                    .clear(self.draft_id.as_ref());
             }
             "send" => self.send(cx),
             "preview" => {
@@ -1199,6 +1329,43 @@ impl ComposeView {
                 // From now on a request_send must wait for a new window.
                 self.hub.note_hidden(self.draft_id.as_ref());
                 cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn send_panel_key(&mut self, key: &str, modifiers: &gpui::Modifiers, cx: &mut Context<Self>) {
+        if key == "escape" {
+            self.send_panel = SendPanel::Summary;
+            return;
+        }
+        match self.send_panel {
+            SendPanel::ConfirmUnlock if key == "y" && !modifiers.modified() => {
+                self.send_panel = SendPanel::Summary;
+                let result = self.hub.with_session(self.draft_id.as_ref(), |session| {
+                    session.release_maybe_sent()
+                });
+                self.status = match result {
+                    Some(Ok(())) => {
+                        cx.global_mut::<SendAttempts>()
+                            .clear(self.draft_id.as_ref());
+                        "Draft unlocked".into()
+                    }
+                    Some(Err(err)) => err.into(),
+                    None => "draft is not open".into(),
+                };
+                cx.notify();
+            }
+            SendPanel::Details if matches!(key, "j" | "k" | "down" | "up") => {
+                let delta = if matches!(key, "j" | "down") {
+                    -42.
+                } else {
+                    42.
+                };
+                let mut offset = self.send_detail_scroll.offset();
+                offset.y = (offset.y + px(delta))
+                    .clamp(-self.send_detail_scroll.max_offset().height, px(0.));
+                self.send_detail_scroll.set_offset(offset);
             }
             _ => {}
         }
@@ -1503,11 +1670,17 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.editor.caret_hidden = self.field != Field::Body;
         if self.closing {
             window.remove_window();
         }
         self.sync_from_hub();
+        let attempt = cx
+            .global::<SendAttempts>()
+            .failure(self.draft_id.as_ref())
+            .cloned();
+        if self.send_check.is_none() {
+            self.refresh_send_availability(cx);
+        }
         if self.leader && !self.which_visible {
             let ready = self
                 .leader_at
@@ -1533,10 +1706,15 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let snap = self
+        let (mut snap, lock) = self
             .hub
-            .with_session(self.draft_id.as_ref(), |session| session.snapshot())
-            .unwrap_or_else(|| empty_snapshot(self.draft_id.as_ref()));
+            .with_session(self.draft_id.as_ref(), |session| {
+                (session.snapshot(), session.send_lock())
+            })
+            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None));
+        if self.send_feedback.readiness.is_some() && lock.is_none() {
+            snap.send_block = Some(SEND_UNAVAILABLE.into());
+        }
         let colors = self.colors();
         let ui_family = self
             .look
@@ -1544,14 +1722,36 @@ impl Render for ComposeView {
             .and_then(|theme| theme.ui_family.clone())
             .unwrap_or_else(|| "Liberation Sans".into());
         let wide = window.viewport_size().width > px(640.);
-        let lock = self
-            .hub
-            .with_session(self.draft_id.as_ref(), |session| session.send_lock())
-            .flatten();
+        let feedback = self.send_feedback.feedback(lock, attempt.as_ref());
+        if (self.send_panel == SendPanel::ConfirmUnlock && lock != Some(SendLock::MaybeSent))
+            || (self.send_panel == SendPanel::Details
+                && feedback
+                    .as_ref()
+                    .is_none_or(|feedback| feedback.detail().is_none()))
+        {
+            self.send_panel = SendPanel::Summary;
+        }
+        self.editor.caret_hidden =
+            self.field != Field::Body || lock.is_some() || self.send_panel != SendPanel::Summary;
+        let show_status = self.send_panel == SendPanel::Summary
+            && (!matches!(lock, Some(SendLock::MaybeSent | SendLock::Sent))
+                || !idle_status(&self.status));
+        let palette_help = match (
+            lock,
+            feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.detail().is_some()),
+        ) {
+            (Some(SendLock::MaybeSent), true) => "details · unlock · q close",
+            (Some(SendLock::MaybeSent), false) => "unlock · q close",
+            (Some(_), _) => "q close",
+            (None, true) if attempt.is_some() => "details · dismiss · send · q close",
+            (None, true) => "details · send · preview · raw · quote · theme · keep · reject · undo",
+            (None, false) => "send · preview · raw · quote · theme · keep · reject · undo",
+        };
         let mode = match self.editor.mode {
-            // Nothing to type into: a narrow bar gives the mode's room to
-            // the way forward and the warning.
-            _ if lock.is_some() && !wide => "",
+            // A locked draft has no editing mode.
+            _ if lock.is_some() => "",
             // A header field takes typing as insert mode does.
             _ if self.field != Field::Body => "insert",
             Mode::Normal => "normal",
@@ -1559,11 +1759,10 @@ impl Render for ComposeView {
             Mode::Visual => "visual",
         };
         // The mode word says it all; how to change mode is not news.
-        let hint: SharedString = match (idle_status(&self.status), lock) {
-            // Nothing to type into: the way out is the hint.
-            (true, Some(lock)) => locked_hint(lock, wide).into(),
-            (true, None) => "".into(),
-            (false, _) => self.status.clone(),
+        let hint: SharedString = if idle_status(&self.status) {
+            "".into()
+        } else {
+            self.status.clone()
         };
         let mono = self
             .look
@@ -1602,7 +1801,7 @@ impl Render for ComposeView {
                         self.fields_view(&snap, colors, wide, window, &ui_family)
                             .flex_shrink_0(),
                     )
-                    .child(self.body_view(&snap, colors, window, &ui_family))
+                    .child(self.body_view(&snap, colors, window, &ui_family, cx))
                     .children(
                         self.quote_view(&snap, colors)
                             .map(|quote| quote.flex_shrink_0()),
@@ -1610,7 +1809,10 @@ impl Render for ComposeView {
                     .children(self.preview.then(|| preview_panel(&snap, colors))),
             )
             .child(attachment_row(&snap, colors, wide).flex_shrink_0())
-            .child(
+            .children(feedback.map(|feedback| {
+                send_feedback_view(feedback, self.send_panel, &self.send_detail_scroll, colors)
+            }))
+            .children(show_status.then(|| {
                 status_bar(
                     mode,
                     &hint,
@@ -1623,13 +1825,13 @@ impl Render for ComposeView {
                     },
                 )
                 .flex_shrink_0()
-                .when_some(mono.clone(), |bar, family| bar.font_family(family)),
-            )
+                .when_some(mono, |bar, family| bar.font_family(family))
+            }))
             .children(self.which_visible.then(|| which_key(colors)))
             .children(
                 self.palette
                     .as_ref()
-                    .map(|query| palette_view(query, colors)),
+                    .map(|query| palette_view(query, palette_help, colors)),
             )
             .children(self.preview.then(|| preview_scrim(colors)))
     }
@@ -1764,6 +1966,7 @@ impl ComposeView {
         colors: Palette,
         window: &Window,
         family: &str,
+        cx: &Context<Self>,
     ) -> gpui::Div {
         // Room for an agent edit's "was" text: the body, less its padding,
         // the "was" label and its gap, and a margin for the shaped width
@@ -1771,6 +1974,13 @@ impl ComposeView {
         let measure = |text: &str| text_px(window, text, 16.0, family);
         let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
         let was_lines = |text: &str| break_lines(text, was_room, &measure);
+        let paint = SourcePaint {
+            colors,
+            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
+            view: cx.weak_entity(),
+            row: self.editor.row,
+            window,
+        };
         let body = div()
             .id("compose-body")
             .flex_1()
@@ -1779,7 +1989,7 @@ impl ComposeView {
             .px_5()
             .py_2()
             .child(if self.raw {
-                raw_body(&self.editor, colors)
+                raw_body(&self.editor, &paint)
             } else {
                 styled_body(
                     &self.editor,
@@ -1787,7 +1997,7 @@ impl ComposeView {
                     &body_edit_ranges(snap),
                     self.focused_hunk,
                     draft_links(snap),
-                    colors,
+                    &paint,
                     &was_lines,
                 )
             });
@@ -1884,6 +2094,10 @@ pub enum SendFailure {
     Locked(SendLock),
     /// Nothing was transmitted. The draft can be sent again.
     NotSent(String),
+    /// SMTP authentication rejected the configured credentials.
+    CredentialsRejected(String),
+    /// The local account settings need attention before this draft can send.
+    Unavailable(AccountConfigError),
     /// The connection failed after the server had the whole message. The
     /// draft stays locked so it is not sent twice.
     MaybeSent(String),
@@ -1893,6 +2107,7 @@ impl SendFailure {
     fn from_core(err: fell_core::Error) -> Self {
         match err {
             fell_core::Error::SendUncertain(detail) => Self::MaybeSent(detail),
+            fell_core::Error::SmtpCredentialsRejected(detail) => Self::CredentialsRejected(detail),
             other => Self::NotSent(other.to_string()),
         }
     }
@@ -1903,10 +2118,12 @@ impl std::fmt::Display for SendFailure {
         match self {
             Self::Locked(lock) => f.write_str(lock.reason()),
             Self::NotSent(detail) => write!(f, "Not sent: {detail}"),
+            Self::CredentialsRejected(_) => write!(f, "SMTP sign-in failed. {SMTP_AUTH_RECOVERY}"),
+            Self::Unavailable(error) => write!(f, "Not sent. {error}. {}", error.recovery),
             Self::MaybeSent(detail) => {
                 write!(
                     f,
-                    "May have been sent: {detail}. Check Sent before sending again"
+                    "May have been sent. {detail}. Check Sent for a matching copy. A missing copy leaves delivery unknown."
                 )
             }
         }
@@ -1928,6 +2145,8 @@ pub(crate) struct SendEnd {
 /// Said when a send went out but the mailbox could not record it.
 const SENT_UNRECORDED: &str =
     "Sent; the mailbox did not record it, so this draft will read as possibly sent";
+
+const SMTP_AUTH_RECOVERY: &str = "Update the password in account.toml or fix password_command. Run fell account check before retrying.";
 
 /// The window is one, and `c`, Enter or an agent's `request_send` can move
 /// it to another draft while a send is still in flight. Only the draft that
@@ -2003,8 +2222,18 @@ fn send_failure_line(
             "sent  ·  the mailbox did not record it, so this draft reads as possibly sent".into(),
         ),
         Ok(_) => None,
+        Err(_)
+            if hub.with_session(id, |session| session.send_lock())
+                == Some(Some(SendLock::Sent)) =>
+        {
+            None
+        }
         Err(SendFailure::MaybeSent(_)) => Some(fell_core::compose::MAYBE_SENT_NOTICE.into()),
         Err(SendFailure::NotSent(detail)) => Some(format!("not sent  ·  {detail}")),
+        Err(SendFailure::Unavailable(error)) => Some(format!("not sent  ·  {}", error.recovery)),
+        Err(SendFailure::CredentialsRejected(_)) => {
+            Some(format!("SMTP sign-in failed  ·  {SMTP_AUTH_RECOVERY}"))
+        }
         Err(SendFailure::Locked(lock)) => Some(lock.reason().into()),
     }
 }
@@ -2016,7 +2245,11 @@ fn lock_after(result: &Result<fell_core::SentMessage, SendFailure>) -> Option<Se
         Err(SendFailure::MaybeSent(_)) => Some(SendLock::MaybeSent),
         // A refused claim leaves the other send's lock in place.
         Err(SendFailure::Locked(lock)) => Some(*lock),
-        Err(SendFailure::NotSent(_)) => None,
+        Err(
+            SendFailure::NotSent(_)
+            | SendFailure::CredentialsRejected(_)
+            | SendFailure::Unavailable(_),
+        ) => None,
     }
 }
 
@@ -2065,7 +2298,7 @@ pub fn prepare_from_editor(
         })
         .collect();
     let sent_bcc = session.sent_bcc(&outgoing);
-    if let Err(err) = session.begin_send() {
+    if let Err(err) = session.begin_send(&outgoing.message_id) {
         // A lock only the mailbox knew of stays a lock; anything else (the
         // claim could not be recorded) sent nothing.
         return Err(match session.send_lock() {
@@ -2085,7 +2318,7 @@ pub fn prepare_from_editor(
 /// file's login and SMTP settings for this account id. Runs
 /// `password_command`, so call it off the UI thread.
 fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure> {
-    let config = crate::mailbox::send_account_config(account).map_err(SendFailure::NotSent)?;
+    let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
     fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)
 }
 
@@ -2357,6 +2590,7 @@ const LABEL_PX: f32 = 100.0;
 
 /// Why send is blocked when To is empty.
 const NO_RECIPIENT: &str = "add at least one recipient";
+const SEND_UNAVAILABLE: &str = "send unavailable for this account";
 
 /// To addresses the original's Reply-To sent the reply to instead of its
 /// sender. Empty when the reply goes to the sender.
@@ -2873,7 +3107,7 @@ fn styled_body(
     hunks: &[(usize, usize, String, u64)],
     focused: Option<u64>,
     links: Links,
-    colors: Palette,
+    paint: &SourcePaint,
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let text = editor.text();
@@ -2891,7 +3125,7 @@ fn styled_body(
     };
     for (index, item) in items.into_iter().enumerate() {
         let (body, mut painted) = match item {
-            BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
+            BodyItem::CaretRow => (None, cursor_line_row(editor, paint)),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
                 let edits: Vec<&(usize, usize, String, u64)> = block
@@ -2907,10 +3141,10 @@ fn styled_body(
                     .unwrap_or_default();
                 let painted = if raw || !edits.is_empty() {
                     raw_source_block(
-                        block, &text, editor, &edits, focused, links, colors, was_lines,
+                        block, &text, editor, &edits, focused, links, paint, was_lines,
                     )
                 } else {
-                    render_block(block, folder, Paint::compose(links), colors)
+                    render_block(block, folder, Paint::compose(links), paint.colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -2985,7 +3219,7 @@ fn cursor_line_covered(text: &str, row: usize, doc: &StyledDoc) -> bool {
     })
 }
 
-fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
+fn cursor_line_row(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let line = editor
         .lines
         .get(editor.row)
@@ -2994,26 +3228,24 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
     raw_line(
         line,
         Some(editor.col),
-        true,
         Urls::Source,
         editor.mode,
         false,
-        colors,
+        paint,
     )
 }
 
-fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
+fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
     for (index, line) in editor.lines.iter().enumerate() {
         let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
             cursor.then_some(editor.col),
-            true,
             Urls::Source,
             editor.mode,
             false,
-            colors,
+            paint,
         ));
     }
     column
@@ -3027,9 +3259,10 @@ fn raw_source_block(
     edits: &[&(usize, usize, String, u64)],
     focused: Option<u64>,
     links: Links,
-    colors: Palette,
+    paint: &SourcePaint,
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
+    let colors = paint.colors;
     let Some((start, end)) = block.source else {
         return render_block(block, Path::new(""), Paint::compose(links), colors);
     };
@@ -3063,15 +3296,7 @@ fn raw_source_block(
             (None, true) => Urls::Bare,
             (None, false) => Urls::Fold(links),
         };
-        let painted = raw_line(
-            line,
-            cursor,
-            cursor.is_some(),
-            urls,
-            editor.mode,
-            tinted,
-            colors,
-        );
+        let painted = raw_line(line, cursor, urls, editor.mode, tinted, paint);
         if !tinted {
             if let Some((block, _)) = tint.take() {
                 column = column.child(block);
@@ -3199,17 +3424,32 @@ fn span_href(span: &str) -> Option<&str> {
     (!href.is_empty()).then_some(href)
 }
 
+struct SourcePaint<'a> {
+    colors: Palette,
+    font: gpui::Font,
+    view: gpui::WeakEntity<ComposeView>,
+    row: usize,
+    window: &'a Window,
+}
+
 /// One source line. On an agent edit's `tinted` background, a link's URL
 /// and where it goes take the body colour, so they keep AA there.
 fn raw_line(
     line: &str,
     cursor: Option<usize>,
-    show_markers: bool,
     urls: Urls,
     mode: Mode,
     tinted: bool,
-    colors: Palette,
+    paint: &SourcePaint,
 ) -> gpui::Div {
+    if let Some(col) = cursor
+        && line.contains("](")
+    {
+        let styles = line_styles(line);
+        if has_source_link(line, &styles) {
+            return focused_link_line(line, &styles, col, mode, tinted, paint);
+        }
+    }
     let row = div()
         .flex()
         .flex_row()
@@ -3217,7 +3457,367 @@ fn raw_line(
         .w_full()
         .min_h(px(24.))
         .items_center();
-    source_pieces(line, cursor, show_markers, urls, mode, tinted, colors).into_row(row, colors)
+    let colors = paint.colors;
+    source_pieces(
+        line,
+        cursor,
+        urls == Urls::Source,
+        urls,
+        mode,
+        tinted,
+        colors,
+    )
+    .into_row(row, colors)
+}
+
+fn has_source_link(line: &str, styles: &[StyleSpan]) -> bool {
+    styles.iter().enumerate().any(|(index, span)| {
+        span.kind == StyleKind::LinkUrl
+            && styles[..index]
+                .iter()
+                .rev()
+                .find(|span| span.kind != StyleKind::LinkText)
+                .is_some_and(|span| {
+                    span.kind == StyleKind::Marker && &line[span.start..span.end] == "["
+                })
+    })
+}
+
+struct FocusedLinkText {
+    text: String,
+    runs: Vec<gpui::TextRun>,
+    /// Display byte ranges with no counterpart in the Markdown.
+    notes: Vec<Range<usize>>,
+    insert_caret: Option<usize>,
+}
+
+fn focused_link_text(
+    line: &str,
+    styles: &[StyleSpan],
+    col: usize,
+    mode: Mode,
+    tinted: bool,
+    font: &gpui::Font,
+    colors: Palette,
+) -> FocusedLinkText {
+    let quiet = if tinted { colors.fg } else { colors.muted };
+    let cursor = source_cursor_byte(line, Some(col), mode).unwrap_or(line.len());
+    let mut text = String::with_capacity(line.len());
+    let mut runs = Vec::new();
+    let mut notes = Vec::new();
+    let mut insert_caret = (mode == Mode::Insert).then_some(cursor);
+    for span in styles {
+        let slice = &line[span.start..span.end];
+        text.push_str(slice);
+        // The closing label bracket takes the same color as the opening one.
+        let close =
+            span.start + usize::from(span.kind == StyleKind::LinkUrl && slice.starts_with(']'));
+        for (range, kind) in [
+            (span.start..close, StyleKind::Marker),
+            (close..span.end, span.kind),
+        ] {
+            if range.is_empty() {
+                continue;
+            }
+            let mut font = font.clone();
+            match kind {
+                StyleKind::Strong => font.weight = FontWeight(700.),
+                StyleKind::Em => font.style = gpui::FontStyle::Italic,
+                StyleKind::Code => font.family = "monospace".into(),
+                _ => {}
+            }
+            let run = gpui::TextRun {
+                len: range.len(),
+                font,
+                color: rgb(source_color(kind, quiet, colors)).into(),
+                background_color: (kind == StyleKind::Code).then(|| rgb(colors.code).into()),
+                underline: (kind == StyleKind::LinkText).then_some(gpui::UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                strikethrough: None,
+            };
+            if mode != Mode::Insert && range.contains(&cursor) {
+                let glyph_len = line[cursor..].chars().next().map_or(0, char::len_utf8);
+                runs.extend([
+                    gpui::TextRun {
+                        len: cursor - range.start,
+                        ..run.clone()
+                    },
+                    gpui::TextRun {
+                        len: glyph_len,
+                        color: rgb(colors.bg).into(),
+                        background_color: Some(rgb(colors.caret).into()),
+                        ..run.clone()
+                    },
+                    gpui::TextRun {
+                        len: range.end - cursor - glyph_len,
+                        ..run
+                    },
+                ]);
+            } else {
+                runs.push(run);
+            }
+        }
+        if span.kind == StyleKind::LinkUrl
+            && let Some(note) = url_note("", slice, Urls::Source)
+        {
+            let start = text.len();
+            text.push(' ');
+            text.push_str(&display_safe(&note));
+            let len = text.len() - start;
+            notes.push(start..text.len());
+            runs.push(gpui::TextRun {
+                len,
+                font: font.clone(),
+                color: rgb(quiet).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            if cursor >= span.end
+                && let Some(at) = &mut insert_caret
+            {
+                *at += len;
+            }
+        }
+    }
+    FocusedLinkText {
+        text,
+        runs,
+        notes,
+        insert_caret,
+    }
+}
+
+fn source_col(line: &str, notes: &[Range<usize>], display_byte: usize) -> usize {
+    let added: usize = notes
+        .iter()
+        .take_while(|note| note.start < display_byte)
+        .map(|note| note.end.min(display_byte) - note.start)
+        .sum();
+    line[..(display_byte - added).min(line.len())]
+        .chars()
+        .count()
+}
+
+/// Pick soft breaks from the shaped advances. Prefer a nearby separator,
+/// but use the available space when a URL segment stretches past the edge.
+fn focused_link_breaks(
+    text: &str,
+    shaped: &gpui::WrappedLine,
+    width: gpui::Pixels,
+) -> Option<Vec<usize>> {
+    let mut stops: Vec<_> = shaped
+        .runs()
+        .iter()
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|glyph| (glyph.index, glyph.position.x))
+        })
+        .collect();
+    if !stops.iter().map(|(byte, _)| byte).is_sorted() || !stops.iter().map(|(_, x)| x).is_sorted()
+    {
+        // Let the platform wrap text whose glyphs reordered for bidi.
+        return None;
+    }
+    stops.dedup_by_key(|(byte, _)| *byte);
+    stops.push((text.len(), shaped.unwrapped_layout.width));
+    let mut breaks = Vec::new();
+    let mut start = 0;
+    while start + 1 < stops.len() {
+        let limit = stops[start].1 + width;
+        let fit = (stops
+            .partition_point(|(_, x)| *x <= limit)
+            .saturating_sub(1))
+        .max(start + 1);
+        if fit + 1 == stops.len() {
+            break;
+        }
+        let near_edge = limit - width / 4.;
+        let next = (start + 1..=fit)
+            .rev()
+            .take_while(|&index| stops[index].1 >= near_edge)
+            .find(|&index| {
+                let at = stops[index].0;
+                text[..at].ends_with([' ', '-', '.', '?', '&', '=', '#'])
+                    || text[..at].ends_with([':', '/']) && !text[at..].starts_with('/')
+            })
+            .unwrap_or(fit);
+        breaks.push(stops[next].0);
+        start = next;
+    }
+    Some(breaks)
+}
+
+/// Materialize visual rows for GPUI while keeping their break bytes out of
+/// the editor's source coordinates. Each inserted newline belongs to the
+/// preceding text run.
+fn wrap_focused_link(
+    text: &str,
+    runs: Vec<gpui::TextRun>,
+    breaks: &[usize],
+) -> (String, Vec<gpui::TextRun>, Vec<usize>) {
+    let mut wrapped = String::with_capacity(text.len() + breaks.len());
+    let mut wrapped_runs = Vec::new();
+    let mut newlines = Vec::with_capacity(breaks.len());
+    let mut breaks = breaks.iter().copied().peekable();
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        while let Some(&at) = breaks.peek().filter(|&&at| at <= end) {
+            wrapped.push_str(&text[start..at]);
+            newlines.push(wrapped.len());
+            wrapped.push('\n');
+            wrapped_runs.push(gpui::TextRun {
+                len: at - start + 1,
+                ..run.clone()
+            });
+            breaks.next();
+            start = at;
+        }
+        if end > start {
+            wrapped.push_str(&text[start..end]);
+            wrapped_runs.push(gpui::TextRun {
+                len: end - start,
+                ..run
+            });
+        }
+        start = end;
+    }
+    (wrapped, wrapped_runs, newlines)
+}
+
+/// Shape the whole source line so style and caret boundaries cannot split
+/// it into flex columns. The same layout supplies the click and caret positions.
+fn focused_link_line(
+    line: &str,
+    styles: &[StyleSpan],
+    col: usize,
+    mode: Mode,
+    tinted: bool,
+    paint: &SourcePaint,
+) -> gpui::Div {
+    let FocusedLinkText {
+        text,
+        runs,
+        notes,
+        mut insert_caret,
+    } = focused_link_text(line, styles, col, mode, tinted, &paint.font, paint.colors);
+    // The compose body fills the window, less its two px_5 gutters.
+    let width = (paint.window.viewport_size().width - paint.window.rem_size() * 2.5).max(px(1.));
+    let breaks = paint
+        .window
+        .text_system()
+        .shape_text(text.clone().into(), px(16.), &runs, None, None)
+        .ok()
+        .and_then(|lines| focused_link_breaks(&text, lines.first()?, width));
+    let flat_wrap = breaks.is_some();
+    let (text, runs, newlines) = match breaks {
+        Some(breaks) if !breaks.is_empty() => {
+            if let Some(at) = &mut insert_caret {
+                *at += breaks.partition_point(|break_at| *break_at <= *at);
+            }
+            wrap_focused_link(&text, runs, &breaks)
+        }
+        _ => (text, runs, Vec::new()),
+    };
+    let text = gpui::StyledText::new(text).with_runs(runs);
+    let layout = text.layout().clone();
+    let click_layout = layout.clone();
+    let view = paint.view.clone();
+    let row = paint.row;
+    let line = line.to_owned();
+    let caret_color = paint.colors.caret;
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .w_full()
+        .min_w(px(0.))
+        .min_h(px(24.))
+        .cursor_text()
+        .when(flat_wrap, |row| row.whitespace_nowrap())
+        .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
+            let mut position = event.position - click_layout.bounds().origin;
+            let height = click_layout.line_height();
+            let row_start = if flat_wrap {
+                let visual_row = (position.y / height) as usize;
+                position.y = px(0.);
+                if visual_row == 0 {
+                    0
+                } else {
+                    let Some(start) = newlines.get(visual_row - 1) else {
+                        return;
+                    };
+                    start + 1
+                }
+            } else {
+                0
+            };
+            let Some(shaped) = click_layout.line_layout_for_index(row_start) else {
+                return;
+            };
+            let index = if mode == Mode::Insert {
+                shaped.closest_index_for_position(position, height)
+            } else {
+                shaped.index_for_position(position, height)
+            };
+            let byte = row_start + index.unwrap_or_else(|end| end);
+            let byte = byte - newlines.partition_point(|newline| *newline < byte);
+            let col = source_col(&line, &notes, byte);
+            let _ = view.update(cx, |this, cx| this.place_link_cursor(row, &line, col, cx));
+        })
+        .child(text)
+        .children(insert_caret.map(|at| {
+            gpui::canvas(
+                |_, _, _| (),
+                move |_, (), window, _| {
+                    let Some(mut position) = layout.position_for_index(at) else {
+                        return;
+                    };
+                    let line_height = layout.line_height();
+                    // GPUI assigns the wrap boundary to the preceding row.
+                    // Draw before the next character on the continuation instead.
+                    if !flat_wrap
+                        && let Some(shaped) = layout.line_layout_for_index(at)
+                        && shaped.wrap_boundaries().iter().any(|wrap| {
+                            shaped.runs()[wrap.run_ix].glyphs[wrap.glyph_ix].index == at
+                        })
+                    {
+                        position.x = layout.bounds().left();
+                        position.y += line_height;
+                    }
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds::new(position, gpui::size(px(2.), line_height)),
+                        rgb(caret_color),
+                    ));
+                },
+            )
+            .absolute()
+            .inset_0()
+        }))
+}
+
+fn source_cursor_byte(line: &str, cursor: Option<usize>, mode: Mode) -> Option<usize> {
+    cursor.map(|col| {
+        let col = if mode == Mode::Insert {
+            col
+        } else {
+            col.min(line.chars().count().saturating_sub(1))
+        };
+        byte_index(line, col)
+    })
+}
+
+fn source_color(kind: StyleKind, quiet: u32, colors: Palette) -> u32 {
+    match kind {
+        StyleKind::Marker => colors.marker,
+        StyleKind::LinkUrl => quiet,
+        StyleKind::LinkText => colors.accent,
+        _ => colors.fg,
+    }
 }
 
 /// What a source line shows, piece by piece.
@@ -3231,12 +3831,6 @@ fn source_pieces(
     colors: Palette,
 ) -> Pieces {
     let quiet = if tinted { colors.fg } else { colors.muted };
-    let line_chars = line.chars().count();
-    let cursor = match (mode, cursor) {
-        (Mode::Insert, col) => col,
-        (_, Some(col)) if line_chars > 0 && col >= line_chars => Some(line_chars - 1),
-        (_, col) => col,
-    };
     let styles = line_styles(line);
     if styles.is_empty() {
         let mut pieces = Pieces::default();
@@ -3245,7 +3839,7 @@ fn source_pieces(
         }
         return pieces;
     }
-    let cursor_byte = cursor.map(|col| byte_index(line, col));
+    let cursor_byte = source_cursor_byte(line, cursor, mode);
     let mut pieces = Pieces::default();
     let mut label = "";
     for span in styles {
@@ -3308,12 +3902,7 @@ fn source_pieces(
                 span.kind,
             );
         } else {
-            let color = match span.kind {
-                StyleKind::Marker => colors.marker,
-                StyleKind::LinkUrl => quiet,
-                StyleKind::LinkText => colors.accent,
-                _ => colors.fg,
-            };
+            let color = source_color(span.kind, quiet, colors);
             source.paint(
                 &mut pieces,
                 (span_start, span_end),
@@ -4158,8 +4747,7 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         })
         .collect::<Vec<_>>()
         .join("  ·  ");
-    // A forward cannot carry the original's files yet: say so here, open
-    // quote or not, so no one sends it thinking they went along.
+    // Surface omitted files even while the forwarded quote is folded.
     let dropped = snap
         .forwarded
         .as_ref()
@@ -4178,7 +4766,7 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         .border_color(rgb(colors.rule))
         .child(
             div()
-                .flex_shrink_0()
+                .min_w(px(0.))
                 .child(if own.is_empty() && dropped.is_some() {
                     "Attachments\u{a0}\u{a0}".to_string()
                 } else if own.is_empty() {
@@ -4201,6 +4789,237 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
             .text_color(rgb(colors.error))
             .child(format!("{lead}{dropped}"))
     }))
+}
+
+/// Outcomes are kept in memory for each draft, including sends whose editor
+/// was closed or switched to another draft before SMTP answered.
+#[derive(Default)]
+struct SendAttempts {
+    next: u64,
+    by_draft: HashMap<String, (u64, Option<SendFailure>)>,
+}
+
+impl gpui::Global for SendAttempts {}
+
+impl SendAttempts {
+    fn start(&mut self, id: &str) -> u64 {
+        self.next += 1;
+        self.by_draft.insert(id.to_string(), (self.next, None));
+        self.next
+    }
+
+    fn finish(&mut self, id: &str, generation: u64, failure: Option<SendFailure>) -> bool {
+        let Some((current, seen)) = self.by_draft.get_mut(id) else {
+            return false;
+        };
+        if *current != generation {
+            return false;
+        }
+        if failure.is_some() {
+            *seen = failure;
+        } else {
+            self.clear(id);
+        }
+        true
+    }
+
+    fn failure(&self, id: &str) -> Option<&SendFailure> {
+        self.by_draft
+            .get(id)
+            .and_then(|(_, failure)| failure.as_ref())
+    }
+
+    fn clear(&mut self, id: &str) {
+        self.by_draft.remove(id);
+    }
+}
+
+#[derive(Default)]
+struct SendFeedbackState {
+    /// Changes with the draft or an explicit send, invalidating older reads.
+    generation: u64,
+    readiness: Option<AccountConfigError>,
+}
+
+impl SendFeedbackState {
+    fn invalidate_readiness(&mut self) {
+        self.generation += 1;
+    }
+
+    fn switch_draft(&mut self) {
+        self.invalidate_readiness();
+        self.readiness = None;
+    }
+
+    fn update_readiness(&mut self, generation: u64, readiness: Option<AccountConfigError>) -> bool {
+        if generation != self.generation || self.readiness == readiness {
+            return false;
+        }
+        self.readiness = readiness;
+        true
+    }
+
+    fn feedback<'a>(
+        &'a self,
+        lock: Option<SendLock>,
+        attempt: Option<&'a SendFailure>,
+    ) -> Option<SendFeedback<'a>> {
+        match (lock, attempt) {
+            (Some(SendLock::Sent), _) => Some(SendFeedback::Confirmed),
+            (Some(SendLock::MaybeSent), Some(SendFailure::MaybeSent(detail))) => {
+                Some(SendFeedback::Uncertain(Some(detail)))
+            }
+            (Some(SendLock::MaybeSent), _) => Some(SendFeedback::Uncertain(None)),
+            (None, Some(SendFailure::Unavailable(error))) => Some(SendFeedback::Unavailable {
+                error,
+                attempted: true,
+            }),
+            (None, Some(SendFailure::NotSent(detail))) => Some(SendFeedback::NotSent(detail)),
+            (None, Some(SendFailure::CredentialsRejected(detail))) => {
+                Some(SendFeedback::CredentialsRejected(detail))
+            }
+            (None, _) => self
+                .readiness
+                .as_ref()
+                .map(|error| SendFeedback::Unavailable {
+                    error,
+                    attempted: false,
+                }),
+            _ => None,
+        }
+    }
+}
+
+enum SendFeedback<'a> {
+    Unavailable {
+        error: &'a AccountConfigError,
+        attempted: bool,
+    },
+    NotSent(&'a str),
+    CredentialsRejected(&'a str),
+    Uncertain(Option<&'a str>),
+    Confirmed,
+}
+
+impl<'a> SendFeedback<'a> {
+    fn detail(&self) -> Option<&'a str> {
+        match self {
+            Self::Unavailable { error, .. } => Some(&error.detail),
+            Self::NotSent(detail) | Self::CredentialsRejected(detail) => Some(detail),
+            Self::Uncertain(detail) => *detail,
+            Self::Confirmed => None,
+        }
+    }
+}
+
+/// Delivery feedback wraps independently of the editor's one-line key hints.
+fn send_feedback_view(
+    feedback: SendFeedback<'_>,
+    state: SendPanel,
+    scroll: &gpui::ScrollHandle,
+    colors: Palette,
+) -> gpui::Div {
+    let (title, guidance, sent_help, actions) = match (&feedback, state) {
+        (_, SendPanel::ConfirmUnlock) => (
+            "Unlock this draft?",
+            "Sending again may deliver a duplicate. Unlocking only restores editing and Send.",
+            None,
+            "y unlock  ·  Esc cancel",
+        ),
+        (
+            SendFeedback::Unavailable {
+                error,
+                attempted: true,
+            },
+            _,
+        ) => ("Not sent", error.recovery, None, ":details  ·  :dismiss"),
+        (
+            SendFeedback::Unavailable {
+                error,
+                attempted: false,
+            },
+            _,
+        ) => ("Send unavailable", error.recovery, None, ":details"),
+        (SendFeedback::NotSent(_), _) => (
+            "Not sent",
+            "Edit the draft and try again.",
+            None,
+            ":details  ·  :dismiss",
+        ),
+        (SendFeedback::CredentialsRejected(_), _) => (
+            "Not sent · SMTP sign-in failed",
+            SMTP_AUTH_RECOVERY,
+            None,
+            ":details  ·  :dismiss",
+        ),
+        (SendFeedback::Uncertain(detail), _) => (
+            "Delivery uncertain",
+            "Close with :q, open Sent with g s, then sync with Space s.",
+            Some("A matching copy confirms the send. Until then, delivery is unknown."),
+            if detail.is_some() {
+                ":details  ·  :unlock"
+            } else {
+                ":unlock"
+            },
+        ),
+        (SendFeedback::Confirmed, _) => (
+            "Send confirmed",
+            "This draft is read-only. Open Sent with g s in the inbox.",
+            None,
+            ":q close",
+        ),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .gap_1()
+        .px_4()
+        .py_2()
+        .border_t_1()
+        .border_color(rgb(colors.rule))
+        .bg(rgb(colors.panel))
+        .text_size(px(14.))
+        .child(
+            div()
+                .text_color(rgb(if matches!(feedback, SendFeedback::Confirmed) {
+                    colors.accent
+                } else {
+                    colors.error
+                }))
+                .font_weight(FontWeight(600.))
+                .child(title),
+        )
+        .child(guidance)
+        .children(sent_help.map(|line| div().child(line)))
+        .children(if state == SendPanel::Details {
+            feedback.detail().map(|detail| {
+                div()
+                    .id("send-details")
+                    .max_h(px(170.))
+                    .overflow_y_scroll()
+                    .track_scroll(scroll)
+                    .text_color(rgb(colors.fg))
+                    .child(
+                        detail
+                            .lines()
+                            .map(display_safe)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+            })
+        } else {
+            None
+        })
+        .child(
+            div()
+                .text_color(rgb(colors.accent))
+                .child(if state == SendPanel::Details {
+                    "Esc close  ·  j/k scroll"
+                } else {
+                    actions
+                }),
+        )
 }
 
 /// Why send is blocked, as the status bar says it. A new draft has nobody
@@ -4249,7 +5068,7 @@ fn status_bar(
     // idle bar, so it never crowds out a message or reads as a count of
     // edits. Narrow: short enough to sit beside the mode and send.
     let fresh_label = match fresh {
-        _ if !idle => None,
+        _ if !idle || snap.send_block.as_deref() == Some(SEND_UNAVAILABLE) => None,
         0 => None,
         count if !wide => Some(format!("first-time: {count}")),
         1 => Some("1 first-time recipient".to_string()),
@@ -4349,7 +5168,6 @@ enum Tone {
     Fg,
     Dim,
     Accent,
-    Error,
 }
 
 impl Tone {
@@ -4358,7 +5176,6 @@ impl Tone {
             Tone::Fg => colors.fg,
             Tone::Dim => colors.dim,
             Tone::Accent => colors.accent,
-            Tone::Error => colors.error,
         }
     }
 }
@@ -4374,13 +5191,14 @@ fn status_right(
     match shown_send_block(snap, send_tried) {
         // The message on the left already says why: one message at a time.
         Some(reason) if repeats_block(status, reason) => Vec::new(),
-        // Gone out: say so plainly, not as a block.
-        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => {
-            vec![("sent".into(), Tone::Accent, true)]
+        // The confirmation panel already says the draft went out.
+        Some(_) if snap.send_lock_reason() == Some(SendLock::Sent.reason()) => Vec::new(),
+        Some(reason) if reason.as_str() == SendLock::InFlight.reason() => {
+            vec![("Sending…".into(), Tone::Fg, false)]
         }
-        // May have gone out: the warning the inbox gives, in its colour.
-        Some(reason) if reason.as_str() == SendLock::MaybeSent.reason() => {
-            vec![(MAYBE_SENT_WARNING.into(), Tone::Error, false)]
+        // The delivery panel already supplies the outcome and recovery.
+        Some(reason) if reason == SendLock::MaybeSent.reason() || reason == SEND_UNAVAILABLE => {
+            Vec::new()
         }
         // Narrow: the reason alone says send is blocked, and leaves the
         // message on the left its room. A missing recipient says so in two
@@ -4512,7 +5330,7 @@ fn which_key(colors: Palette) -> gpui::Div {
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
 }
 
-fn palette_view(query: &str, colors: Palette) -> gpui::Div {
+fn palette_view(query: &str, commands: &'static str, colors: Palette) -> gpui::Div {
     div()
         .absolute()
         .top(px(80.))
@@ -4523,12 +5341,7 @@ fn palette_view(query: &str, colors: Palette) -> gpui::Div {
         .border_color(rgb(colors.accent))
         .p_3()
         .child(format!(":{query}"))
-        .child(
-            div()
-                .text_sm()
-                .text_color(rgb(colors.dim))
-                .child("send · preview · raw · quote · theme · keep · reject · undo"),
-        )
+        .child(div().text_sm().text_color(rgb(colors.dim)).child(commands))
 }
 
 /// A scrim of page colour over the whole window, so the draft behind the
@@ -4664,12 +5477,18 @@ fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
     if href.is_empty() {
         return None;
     }
-    let host = || Some(format!("({})", link_host(href)));
     match links {
         Links::Target => link_target(text, href),
-        _ if idn_place(href).is_some() || label_misleads(text, href) => host(),
-        Links::Host if !label_names(text, href) => host(),
-        Links::Host | Links::Label => None,
+        Links::Host | Links::Label => {
+            let mut places = text
+                .split_whitespace()
+                .filter_map(|word| place_of_word(word, links))
+                .peekable();
+            (idn_place(href).is_some()
+                || (links == Links::Host && places.peek().is_none())
+                || label_misleads(places, href))
+            .then(|| format!("({})", link_host(href)))
+        }
     }
 }
 
@@ -4798,12 +5617,19 @@ fn place_of_href(href: &str) -> Option<Place> {
 }
 
 /// The place one word of a label reads as, if it reads as one at all:
-/// a scheme (`https://…`), a `www.`, an address with `@`, or a dotted name
-/// ending in letters (`bank.com`, not `v1.2` or `e.g.`).
-fn place_of_word(word: &str) -> Option<Place> {
-    let word = word.trim_matches(|ch: char| {
-        !(ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~'))
-    });
+/// a scheme (`https://…`), an address with `@`, or a dotted name ending
+/// in letters. In the user's draft a bare IP can also name a host.
+fn place_of_word(word: &str, links: Links) -> Option<Place> {
+    let word_char =
+        |ch: char| ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~');
+    if links == Links::Label {
+        // Keep IPv6 brackets long enough to distinguish an optional port.
+        let literal = word.trim_matches(|ch| !(word_char(ch) || matches!(ch, '[' | ']')));
+        if let Some(host) = literal_ip_host(literal) {
+            return Some(Place::Host(host));
+        }
+    }
+    let word = word.trim_matches(|ch| !word_char(ch));
     let lower = word.to_lowercase();
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
     if lower.contains("://") {
@@ -4821,16 +5647,57 @@ fn place_of_word(word: &str) -> Option<Place> {
         });
     }
     let name = lower.split(['/', '?', '#']).next()?;
-    let name = name.rsplit_once(':').map_or(name, |(host, port)| {
+    let name = without_port(name);
+    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    ascii_host(dotted_name(name)?).map(Place::Host)
+}
+
+fn without_port(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(host, port)| {
         if port.chars().all(|ch| ch.is_ascii_digit()) {
             host
         } else {
             name
         }
-    });
-    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
-    let name = name.strip_suffix('.').unwrap_or(name);
-    ascii_host(dotted_name(name)?).map(Place::Host)
+    })
+}
+
+/// A bare IP in the same form as a URL host.
+fn literal_ip_host(word: &str) -> Option<String> {
+    let name = word.split(['/', '?', '#']).next()?;
+    // For IPv6 without brackets, every colon belongs to the address.
+    if let Ok(ip) = name.parse::<Ipv6Addr>() {
+        return Some(url::Host::<String>::Ipv6(ip).to_string());
+    }
+    let name = without_port(name);
+    if !name.starts_with('[')
+        && !name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_numeric() || ch == '%')
+    {
+        return None;
+    }
+    match url::Host::parse(name).ok()? {
+        url::Host::Ipv4(ip) => {
+            let label = name.strip_suffix('.').unwrap_or(name);
+            let mut fields = label.rsplit('.');
+            let tail = fields.next()?;
+            // A short decimal or version label is ordinary text. Retain
+            // shorthand when the last field actually packs multiple octets,
+            // and let the URL parser normalize hexadecimal and escapes.
+            let ordinary_number = label.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && match fields.count() {
+                    0 => ip.octets()[0] == 0,
+                    1 | 2 => tail.parse::<u8>().is_ok(),
+                    _ => false,
+                };
+            (!ordinary_number).then(|| ip.to_string())
+        }
+        ip @ url::Host::Ipv6(_) => Some(ip.to_string()),
+        url::Host::Domain(_) => None,
+    }
 }
 
 /// `name` when it reads as a domain: two or more dotted parts, the last
@@ -4843,30 +5710,15 @@ fn dotted_name(name: &str) -> Option<&str> {
     (parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()) && letters).then_some(name)
 }
 
-/// The places a label's words read as.
-fn label_places(text: &str) -> Vec<Place> {
-    text.split_whitespace().filter_map(place_of_word).collect()
-}
-
 /// Whether a word of the label reads as an address that is not where the
 /// link goes: "Sign in at paypal.com" to another host.
-fn label_misleads(text: &str, href: &str) -> bool {
+fn label_misleads(mut places: impl Iterator<Item = Place>, href: &str) -> bool {
     let target = place_of_href(href);
-    label_places(text)
-        .iter()
-        .any(|place| match (&target, place) {
-            (None, _) => true,
-            (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => {
-                address != word
-            }
-            (Some(target), place) => target.domain() != place.domain(),
-        })
-}
-
-/// Whether the label already names where the link goes.
-fn label_names(text: &str, href: &str) -> bool {
-    let places = label_places(text);
-    !places.is_empty() && !label_misleads(text, href)
+    places.any(|place| match (&target, &place) {
+        (None, _) => true,
+        (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => address != word,
+        (Some(target), place) => target.domain() != place.domain(),
+    })
 }
 
 fn canonical_body(body: &str) -> String {
@@ -4899,21 +5751,6 @@ fn cursor_byte(text: &str, row: usize, col: usize) -> usize {
     text.len()
 }
 
-/// What a locked draft's bar offers. A draft that may have gone out can be
-/// unlocked, once Sent has been checked; one that went out only closes.
-fn locked_hint(lock: SendLock, wide: bool) -> &'static str {
-    match (lock, wide) {
-        (SendLock::MaybeSent, true) => "read-only · :unlock if not in Sent",
-        (SendLock::MaybeSent, false) => ":unlock",
-        (_, true) => "read-only",
-        (_, false) => "",
-    }
-}
-
-/// The window's warning for a draft that may have gone out, at any width:
-/// the person checks Sent before unlocking or sending again.
-const MAYBE_SENT_WARNING: &str = "may have been sent · check Sent";
-
 fn palette_action(query: &str) -> Option<&'static str> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -4927,6 +5764,11 @@ fn palette_action(query: &str) -> Option<&'static str> {
     // again.
     if query == "unlock" {
         return Some("unlock");
+    }
+    match query.as_str() {
+        "details" => return Some("details"),
+        "dismiss" => return Some("dismiss"),
+        _ => {}
     }
     let mut found = None;
     for name in [
@@ -5060,21 +5902,115 @@ mod tests {
     }
 
     #[test]
-    fn a_maybe_sent_draft_says_check_sent_at_every_width() {
-        use fell_core::compose::SendLock;
-        assert!(super::MAYBE_SENT_WARNING.contains("check Sent"));
+    fn an_uncertain_send_uses_the_feedback_panel_after_reopening() {
+        use super::{SendFailure, SendFeedback, SendFeedbackState, SendLock};
+        let state = SendFeedbackState::default();
+        let lock = Some(SendLock::MaybeSent);
+        let failure = SendFailure::MaybeSent("SMTP connection closed".into());
+        assert_eq!(
+            state.feedback(lock, Some(&failure)).unwrap().detail(),
+            Some("SMTP connection closed"),
+        );
+        assert!(matches!(
+            state.feedback(Some(SendLock::Sent), Some(&failure)),
+            Some(SendFeedback::Confirmed),
+        ));
+        assert!(matches!(
+            state.feedback(lock, None),
+            Some(SendFeedback::Uncertain(None)),
+        ));
+        let mut snap = super::empty_snapshot("d");
+        snap.send_block = Some(SendLock::MaybeSent.reason().into());
         for wide in [true, false] {
-            assert!(super::locked_hint(SendLock::MaybeSent, wide).contains(":unlock"));
-            // Closing is `:q`, as everywhere: not news.
-            assert!(!super::locked_hint(SendLock::MaybeSent, wide).contains(":q"));
-            assert!(!super::locked_hint(SendLock::Sent, wide).contains(":unlock"));
+            assert!(super::status_right(&snap, "", false, wide).is_empty());
         }
-        // Narrow, both sides share 460 px with room to spare.
-        let narrow = super::locked_hint(SendLock::MaybeSent, false)
-            .chars()
-            .count()
-            + super::MAYBE_SENT_WARNING.chars().count();
-        assert!(narrow <= 50, "{narrow}");
+    }
+
+    #[test]
+    fn stale_readiness_cannot_replace_a_confirmed_attempts_smtp_rejection() {
+        use super::{
+            AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
+        };
+        let missing = AccountConfigError {
+            detail: "account.toml does not exist".into(),
+            recovery: "Run fell account setup.",
+        };
+        let mut state = SendFeedbackState::default();
+        let mut attempts = SendAttempts::default();
+        let before_send = state.generation;
+        assert!(state.update_readiness(before_send, Some(missing.clone())));
+
+        // The file was restored and the user sent against the restored
+        // settings, but the displayed readiness is still stale.
+        state.invalidate_readiness();
+        let attempt = attempts.start("draft");
+        let during_send = state.generation;
+        assert!(attempts.finish(
+            "draft",
+            attempt,
+            Some(SendFailure::NotSent("554 submission refused".into()))
+        ));
+        state.invalidate_readiness();
+        assert!(!state.update_readiness(before_send, None));
+        assert!(!state.update_readiness(during_send, None));
+        assert!(matches!(
+            state.feedback(None, attempts.failure("draft")),
+            Some(SendFeedback::NotSent("554 submission refused")),
+        ));
+        assert!(state.update_readiness(state.generation, None));
+        assert_eq!(
+            state
+                .feedback(None, attempts.failure("draft"))
+                .unwrap()
+                .detail(),
+            Some("554 submission refused")
+        );
+    }
+
+    #[test]
+    fn a_send_time_config_failure_survives_restored_readiness_until_the_next_send() {
+        use super::{
+            AccountConfigError, SendAttempts, SendFailure, SendFeedback, SendFeedbackState,
+        };
+        let missing = AccountConfigError {
+            detail: "account.toml does not exist".into(),
+            recovery: "Run fell account setup.",
+        };
+        let mut state = SendFeedbackState::default();
+        let mut attempts = SendAttempts::default();
+        state.invalidate_readiness();
+        let attempt = attempts.start("draft");
+        assert!(attempts.finish(
+            "draft",
+            attempt,
+            Some(SendFailure::Unavailable(missing.clone()))
+        ));
+        state.invalidate_readiness();
+        assert!(state.update_readiness(state.generation, Some(missing.clone())));
+        assert!(state.update_readiness(state.generation, None));
+        assert!(matches!(
+            state.feedback(None, attempts.failure("draft")),
+            Some(SendFeedback::Unavailable { error, attempted: true }) if error == &missing,
+        ));
+        let before_switch = state.generation;
+        state.switch_draft();
+        assert!(!state.update_readiness(before_switch, Some(missing.clone())));
+        assert!(
+            state
+                .feedback(None, attempts.failure("other draft"))
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .feedback(None, attempts.failure("draft"))
+                .unwrap()
+                .detail(),
+            Some(missing.detail.as_str())
+        );
+
+        attempts.start("draft");
+        assert!(!attempts.finish("draft", attempt, Some(SendFailure::Unavailable(missing))));
+        assert!(state.feedback(None, attempts.failure("draft")).is_none());
     }
 
     #[test]
@@ -5373,6 +6309,9 @@ mod tests {
         assert_eq!(super::palette_action("quit"), Some("close"));
         assert_eq!(super::palette_action("qu"), Some("quote"));
         assert_eq!(super::palette_action("cl"), Some("close"));
+        assert_eq!(super::palette_action("details"), Some("details"));
+        assert_eq!(super::palette_action("unl"), None);
+        assert_eq!(super::palette_action("unlock"), Some("unlock"));
     }
 
     #[test]
@@ -5687,6 +6626,82 @@ mod tests {
     }
 
     #[test]
+    fn focused_link_offsets_skip_idn_notes_and_keep_utf8_source_order() {
+        use super::{
+            Mode, ThemeKind, focused_link_text, has_source_link, source_col, wrap_focused_link,
+        };
+
+        let line = "[café](https://bücher.test/) and [2001:db8::7](https://[2001:db8::8]/révision)";
+        let styles = super::line_styles(line);
+        let colors = super::palette(ThemeKind::Dark);
+        let font = gpui::font("Liberation Sans");
+        let at = line.find("évision").unwrap();
+        let col = line[..at].chars().count();
+        assert!(has_source_link(line, &styles));
+        let image = "![preview](attachment.png)";
+        assert!(!has_source_link(image, &super::line_styles(image)));
+
+        let inserted = focused_link_text(line, &styles, col, Mode::Insert, false, &font, colors);
+        assert_eq!(inserted.notes.len(), 1);
+        let note = &inserted.notes[0];
+        assert_eq!(&inserted.text[note.clone()], " (xn--bcher-kva.test)");
+        for (display_byte, _) in inserted.text.char_indices() {
+            let source_byte =
+                display_byte - (display_byte.clamp(note.start, note.end) - note.start);
+            assert_eq!(
+                source_col(line, &inserted.notes, display_byte),
+                line[..source_byte].chars().count()
+            );
+        }
+        let display_at = inserted.insert_caret.unwrap();
+        assert_eq!(display_at, at + note.len());
+        assert_eq!(source_col(line, &inserted.notes, display_at), col);
+        assert_eq!(
+            source_col(line, &inserted.notes, inserted.text.len()),
+            line.chars().count()
+        );
+        let end = Some(line.chars().count());
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Normal),
+            Some(line.len() - 1)
+        );
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Insert),
+            Some(line.len())
+        );
+
+        let (wrapped, runs, newlines) =
+            wrap_focused_link(&inserted.text, inserted.runs, &[note.start + 5, display_at]);
+        assert_eq!(wrapped.replace('\n', ""), inserted.text);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), wrapped.len());
+        let wrapped_at = newlines[1] + 1;
+        assert!(wrapped[wrapped_at..].starts_with('é'));
+        assert_eq!(
+            source_col(line, &inserted.notes, wrapped_at - newlines.len()),
+            col
+        );
+
+        let normal = focused_link_text(line, &styles, col, Mode::Normal, false, &font, colors);
+        assert_eq!(normal.text, inserted.text);
+        let mut start = 0;
+        let mut highlighted = false;
+        for run in normal.runs {
+            let end = start + run.len;
+            let glyphs = &normal.text[start..end];
+            if run.background_color.is_some() {
+                assert!(!highlighted);
+                highlighted = true;
+                assert_eq!(start, display_at);
+                assert_eq!(glyphs, "é");
+                assert_eq!(run.background_color, Some(gpui::rgb(colors.caret).into()));
+            }
+            start = end;
+        }
+        assert!(highlighted);
+        assert_eq!(start, normal.text.len());
+    }
+
+    #[test]
     fn a_row_breaks_only_after_a_space() {
         fn cut(text: &str) -> Vec<&str> {
             super::words(text).collect()
@@ -5889,6 +6904,98 @@ mod tests {
             shown_target("the plan", "https://example.com/plan", Links::Target).as_deref(),
             Some("(https://example.com/plan)")
         );
+    }
+
+    #[test]
+    fn folded_ip_links_show_a_different_destination() {
+        use super::{Links, Urls, inline_pieces, palette};
+        let colors = palette(super::ThemeKind::Dark);
+        for (label, href, host) in [
+            ("192.0.2.7", "https://docs.example/notes", "docs.example"),
+            (
+                "2001:db8::7",
+                "https://[2001:db8::8]/notes",
+                "[2001:db8::8]",
+            ),
+        ] {
+            let line = format!("[{label}]({href})");
+            let expected = format!("{label} ({host})");
+            assert_eq!(shown(&line, false, Urls::Fold(Links::Label)), expected);
+            assert_eq!(shown(&line, true, Urls::Source), line);
+            let doc = markdown_to_doc(&line);
+            let super::BlockBody::Paragraph { inlines } = &doc.blocks[0].body else {
+                panic!("expected a paragraph");
+            };
+            let styled: String = inline_pieces(inlines, Links::Label, colors)
+                .0
+                .iter()
+                .map(piece_text)
+                .collect();
+            assert_eq!(styled, expected);
+        }
+    }
+
+    #[test]
+    fn literal_ip_labels_use_the_same_host_normalization_as_urls() {
+        use super::{Links, shown_target};
+        for (label, href, host) in [
+            (
+                "See 192.000.002.007.:8443/notes",
+                "https://192.0.2.7/",
+                "192.0.2.7",
+            ),
+            (
+                "2001:0DB8:0:0:0:0:0:7",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "See ([2001:DB8::7]:8443/notes).",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "::ffff:192.0.2.7",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+            (
+                "[::ffff:192.0.2.7]",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+            ("192%2e0%2e2%2e7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192%2e0.2.7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192.0.519", "https://192.0.2.7/", "192.0.2.7"),
+            ("3221225991", "https://192.0.2.7/", "192.0.2.7"),
+            ("0xc0000207", "https://192.0.2.7/", "192.0.2.7"),
+        ] {
+            assert_eq!(shown_target(label, href, Links::Label), None, "{label}");
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label).as_deref(),
+                Some("(docs.example)"),
+                "{label}"
+            );
+            assert_eq!(
+                shown_target(label, href, Links::Host),
+                Some(format!("({host})")),
+                "{label}"
+            );
+        }
+        for label in [
+            "3.5 stars",
+            "42 results",
+            "1.2.3 notes",
+            "v1.2.3.4 notes",
+            "192.0.2.999",
+            "2001:db8:7",
+        ] {
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label),
+                None,
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -6099,6 +7206,15 @@ mod tests {
         // Any other block shows at once.
         snap.send_block = Some("from is not this account".into());
         assert!(super::shown_send_block(&snap, false).is_some());
+    }
+
+    #[test]
+    fn an_unavailable_account_uses_the_feedback_panel_instead_of_the_send_hint() {
+        let mut snap = super::empty_snapshot("d");
+        snap.send_block = Some(super::SEND_UNAVAILABLE.into());
+        for wide in [false, true] {
+            assert!(super::status_right(&snap, "insert", false, wide).is_empty());
+        }
     }
 
     #[test]

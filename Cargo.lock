@@ -1911,6 +1911,7 @@ dependencies = [
  "fell-confirm",
  "fell-core",
  "fell-render",
+ "fell-version",
  "futures",
  "gpui",
  "gtk",
@@ -1967,6 +1968,7 @@ name = "fell-mcp"
 version = "0.1.0"
 dependencies = [
  "fell-core",
+ "fell-version",
  "libc",
  "rustix 1.1.6",
  "saphyr",
@@ -1980,6 +1982,7 @@ name = "fell-render"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "cssparser 0.34.0",
  "ego-tree",
  "html5ever 0.29.1",
  "pulldown-cmark",
@@ -1987,6 +1990,10 @@ dependencies = [
  "tendril 0.4.3",
  "url",
 ]
+
+[[package]]
+name = "fell-version"
+version = "0.1.0"
 
 [[package]]
 name = "field-offset"

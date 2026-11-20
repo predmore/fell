@@ -20,6 +20,7 @@ test-utils = []
 
 [dependencies]
 fell-confirm = { workspace = true, optional = true }
+fell-render.workspace = true
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Stored body parts (src/store/bodies.rs). Pure Rust DEFLATE, MIT OR Zlib OR
 # Apache-2.0, already in the tree through `png`.
@@ -44,8 +45,6 @@ unicode-properties = { version = "0.1.3", default-features = false, features = [
 [dev-dependencies]
 # Tests mint send confirmations.
 fell-confirm.workspace = true
-# Checks that stored bulk headers drive the renderer's bulk-mail check.
-fell-render.workspace = true
 # Builds a tiny ONNX graph in tests. Same major version tract-onnx uses.
 prost = "0.14"
 rcgen = "0.13"

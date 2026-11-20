@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 fell-core.workspace = true
+fell-version.workspace = true
 libc = "0.2.191"
 # `add` writes harness configs through directory descriptors (openat,
 # renameat, flock, fchmod) without unsafe code. Already in the tree via fs4.

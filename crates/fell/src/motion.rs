@@ -217,6 +217,10 @@ impl Motion {
         Self { enabled }
     }
 
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
     /// `FELL_REDUCE_MOTION=1` turns motion off and `=0` forces it on.
     /// Otherwise the desktop decides: `gtk-enable-animations=false` in the
     /// GTK settings file is the reduced-motion switch GNOME, GTK apps and

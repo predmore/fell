@@ -19,6 +19,7 @@ Usage:
   fell embeddings status|install|remove
                                the local search model
   fell mcp add|list|revoke     connect an agent (runs fell-mcp)
+  fell --version               print the build version
   fell --help                  print this help
 
 `fell account --help` and `fell embeddings --help` list their options.
@@ -34,6 +35,7 @@ Development previews:
 enum Command {
     Inbox,
     Help,
+    Version,
     Account(Vec<String>),
     Embeddings(Vec<String>),
     Mcp(Vec<OsString>),
@@ -78,6 +80,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         };
         match arg.as_str() {
             "--help" | "-h" | "help" => return Ok(Command::Help),
+            "--version" | "-V" => return Ok(Command::Version),
             "--fixture" => match value("--fixture")? {
                 "--help" | "-h" => return Ok(Command::Help),
                 name => fixture = Some(name.to_string()),
@@ -144,6 +147,7 @@ fn main() {
     };
     match command {
         Command::Help => println!("{USAGE}"),
+        Command::Version => println!("{}", fell_version::VERSION),
         Command::Account(args) => std::process::exit(fell::account_command(&args)),
         Command::Embeddings(args) => std::process::exit(fell::embeddings_command(&args)),
         Command::Mcp(args) => mcp(&args),
@@ -220,12 +224,12 @@ fn compose_preview(preview: ComposePreview) {
                 show: true,
                 ..Default::default()
             },
-            move |_window, cx| {
+            move |window, cx| {
                 cx.new(|cx| {
                     let mut compose =
                         ComposeView::new(hub.clone(), draft_id.clone(), folder.clone(), cx);
                     compose.set_theme(theme);
-                    compose.watch_live(cx);
+                    compose.watch_live(window, cx);
                     if play {
                         compose.play_edit(cx);
                     }

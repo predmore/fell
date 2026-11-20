@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts, Store,
-    SyncFailureKind, classify_sync_error, fetch_message_bodies, fetch_missing_bodies,
+    SyncFailureKind, SyncReport, classify_sync_error, fetch_message_bodies, fetch_missing_bodies,
     sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -38,8 +38,8 @@ const BACKOFF: [Duration; 4] = [
     Duration::from_secs(60),
     Duration::from_secs(180),
 ];
-/// Progress is reported at most this often, so a fast first sync does not
-/// ask the window to reread the folder for every 32-message batch.
+/// Space out progress so a fast first sync does not ask the window to reread
+/// the folder for every 32-message batch.
 const PROGRESS_EVERY: Duration = Duration::from_millis(750);
 /// A passive checkpoint after this many committed batches keeps the WAL from
 /// growing without bound during a long first sync.
@@ -60,9 +60,11 @@ const BODIES_BETWEEN_PASSES: usize = 48;
 /// What the sync thread tells the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
-    /// The status to show. `Syncing`, and `Synced` with `stored > 0`, mean
-    /// the store has new rows.
+    /// The status to show. `Syncing`, and `Synced` with `changed`, can also
+    /// refresh mail that has just been written.
     Status(SyncKind),
+    /// Exact Sent copies confirmed these drafts.
+    SendsConfirmed(Vec<String>),
     /// A conflict during replay changed a local flag.
     FlagsChanged,
     /// Write-back problems to show together in one notice.
@@ -73,6 +75,34 @@ pub enum SyncEvent {
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
     BodiesStored,
+}
+
+#[derive(Default)]
+struct PassProgress {
+    last_sent: Option<Instant>,
+    sent_positive: bool,
+}
+
+impl PassProgress {
+    fn update(&mut self, report: &SyncReport, now: Instant) -> Option<SyncKind> {
+        let positive = report.new_messages.is_some_and(|count| count > 0);
+        // A copy or flag update can use the first slot. The first real
+        // arrival still gets through immediately; later counts share the
+        // regular cadence and the final total goes in the completion event.
+        let first_positive = positive && !self.sent_positive;
+        let due = self
+            .last_sent
+            .is_none_or(|at| now.duration_since(at) >= PROGRESS_EVERY);
+        if !due && !first_positive {
+            return None;
+        }
+        self.last_sent = Some(now);
+        self.sent_positive |= positive;
+        Some(SyncKind::Syncing {
+            new_messages: report.new_messages,
+            progress: report.progress.clone(),
+        })
+    }
 }
 
 /// Why the window woke the sync thread for a pass.
@@ -292,20 +322,25 @@ fn run(
             }
         }
         let mut alive = true;
-        let mut last_progress: Option<Instant> = None;
+        let mut progress = PassProgress::default();
         let mut batches = 0usize;
+        let mut confirmed = 0;
         let result = config.backend().and_then(|backend| {
             sync_with_progress(&account, backend.as_ref(), &store, &mut |report| {
+                if report.confirmed_drafts.len() > confirmed {
+                    alive &= events
+                        .unbounded_send(SyncEvent::SendsConfirmed(
+                            report.confirmed_drafts[confirmed..].to_vec(),
+                        ))
+                        .is_ok();
+                    confirmed = report.confirmed_drafts.len();
+                }
                 batches += 1;
                 if batches.is_multiple_of(CHECKPOINT_EVERY) {
                     let _ = store.checkpoint(false);
                 }
-                if last_progress.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
-                    last_progress = Some(Instant::now());
-                    alive &= send(SyncKind::Syncing {
-                        stored: report.upserted,
-                        progress: report.progress.clone(),
-                    });
+                if let Some(status) = progress.update(report, Instant::now()) {
+                    alive &= send(status);
                 }
             })
         });
@@ -320,7 +355,8 @@ fn run(
                 failures = 0;
                 if !send(SyncKind::Synced {
                     at: unix_now(),
-                    stored: report.upserted,
+                    changed: report.changed,
+                    new_messages: report.new_messages,
                 }) {
                     return;
                 }
@@ -518,6 +554,53 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn arrival_after_a_copy_bypasses_the_throttle_once() {
+        let mut progress = PassProgress::default();
+        let mut report = SyncReport {
+            changed: true,
+            ..SyncReport::default()
+        };
+        let start = Instant::now();
+        assert_eq!(
+            progress.update(&report, start),
+            Some(SyncKind::Syncing {
+                new_messages: Some(0),
+                progress: None,
+            })
+        );
+
+        let arrival = start + Duration::from_millis(20);
+        report.new_messages = Some(1);
+        assert_eq!(
+            progress.update(&report, arrival),
+            Some(SyncKind::Syncing {
+                new_messages: Some(1),
+                progress: None,
+            })
+        );
+        assert_eq!(
+            progress.update(&report, arrival + Duration::from_millis(10)),
+            None,
+            "another folder copy leaves the cumulative count at one"
+        );
+
+        report.new_messages = Some(2);
+        assert_eq!(progress.update(&report, start + PROGRESS_EVERY), None);
+        assert_eq!(
+            progress.update(&report, arrival + PROGRESS_EVERY),
+            Some(SyncKind::Syncing {
+                new_messages: Some(2),
+                progress: None,
+            })
+        );
+    }
 }
 
 #[cfg(test)]

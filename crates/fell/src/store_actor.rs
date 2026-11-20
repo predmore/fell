@@ -8,7 +8,8 @@
 //! that sync asks for. SQLite's WAL lets the two read at once, so holding
 //! `j` during a first sync never waits behind a refresh.
 
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 use fell_core::Store;
 use futures::channel::oneshot;
@@ -20,7 +21,8 @@ pub struct StoreClient {
     interactive: mpsc::Sender<Job>,
     /// Set once the second connection is open. Until then, and for an
     /// in-memory mailbox, background jobs run on the interactive lane.
-    background: Arc<OnceLock<mpsc::Sender<Job>>>,
+    background_ready: Arc<AtomicBool>,
+    background: mpsc::Sender<Job>,
 }
 
 impl StoreClient {
@@ -32,8 +34,9 @@ impl StoreClient {
     ) -> (Self, oneshot::Receiver<T>) {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready) = oneshot::channel();
-        let background = Arc::new(OnceLock::new());
-        let lane = Arc::clone(&background);
+        let (background, background_jobs) = mpsc::channel();
+        let background_ready = Arc::new(AtomicBool::new(false));
+        let lane = Arc::clone(&background_ready);
         std::thread::Builder::new()
             .name("fell-store".into())
             .spawn(move || {
@@ -41,11 +44,13 @@ impl StoreClient {
                 // The first connection has finished opening and migrating
                 // the file, so the second one never races it for the lock.
                 if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
-                    spawn_background(path, lane);
+                    spawn_background(path, lane, background_jobs);
                     // Search runs on this connection. Its model and vectors
                     // load on a thread of their own, so the first search
                     // does not wait for them and the window never does.
                     store.warm_search();
+                } else {
+                    drop(background_jobs);
                 }
                 let _ = ready_tx.send(info);
                 // Jobs run in order. The loop ends when the window drops its client.
@@ -57,6 +62,7 @@ impl StoreClient {
         (
             Self {
                 interactive: jobs,
+                background_ready,
                 background,
             },
             ready,
@@ -77,15 +83,25 @@ impl StoreClient {
         &self,
         job: impl FnOnce(&Store) -> R + Send + 'static,
     ) -> oneshot::Receiver<R> {
-        match self.background.get() {
-            Some(lane) => send(lane, job),
-            None => send(&self.interactive, job),
+        if self.background_ready.load(Ordering::Acquire) {
+            send(&self.background, job)
+        } else {
+            send(&self.interactive, job)
         }
+    }
+
+    /// Queue maintenance on the background connection even while it opens.
+    /// If opening fails, cancel the reply instead of blocking the reader.
+    pub fn call_maintenance<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Store) -> R + Send + 'static,
+    ) -> oneshot::Receiver<R> {
+        send(&self.background, job)
     }
 
     #[cfg(test)]
     fn has_background_lane(&self) -> bool {
-        self.background.get().is_some()
+        self.background_ready.load(Ordering::Acquire)
     }
 }
 
@@ -111,7 +127,7 @@ const BACKGROUND_RETRIES: [std::time::Duration; 4] = [
 
 /// Open the second connection on its own thread, retrying a few times. If
 /// it never opens, background jobs keep using the interactive lane.
-fn spawn_background(path: std::path::PathBuf, lane: Arc<OnceLock<mpsc::Sender<Job>>>) {
+fn spawn_background(path: std::path::PathBuf, ready: Arc<AtomicBool>, jobs: mpsc::Receiver<Job>) {
     let _ = std::thread::Builder::new()
         .name("fell-store-background".into())
         .spawn(move || {
@@ -121,21 +137,16 @@ fn spawn_background(path: std::path::PathBuf, lane: Arc<OnceLock<mpsc::Sender<Jo
                     Ok(store) => break store,
                     Err(_) => match waits.next() {
                         // Nobody is left to serve once the window is gone.
-                        Some(_) if Arc::strong_count(&lane) == 1 => return,
+                        Some(_) if Arc::strong_count(&ready) == 1 => return,
                         Some(wait) => std::thread::sleep(*wait),
                         None => return,
                     },
                 }
             };
-            let (jobs, rx) = mpsc::channel::<Job>();
-            if lane.set(jobs).is_err() {
-                return;
-            }
-            // The clients' handle now owns the only sender. Keeping this one
-            // would hold the channel open after the window drops its clients,
-            // and this thread, its connection, and its indexer would outlive it.
-            drop(lane);
-            while let Ok(job) = rx.recv() {
+            ready.store(true, Ordering::Release);
+            drop(ready);
+            // Only clients hold the sender. The lane closes with them.
+            while let Ok(job) = jobs.recv() {
                 job(&store);
             }
         });
@@ -257,7 +268,7 @@ mod tests {
             assert!(Instant::now() < deadline, "background lane never opened");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let lane = Arc::clone(&client.background);
+        let lane = Arc::clone(&client.background_ready);
         drop(client);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Arc::strong_count(&lane) > 1 {
