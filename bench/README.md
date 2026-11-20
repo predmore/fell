@@ -26,7 +26,7 @@ The calibration uses the slowest measured p95 or largest RSS snapshot for each r
 | RSS | 13.365 MB | 18.00 MB | 21.60 MB | 250 MB |
 | Hybrid search p95 | 106.841 ms | 125 ms | 150 ms | 150 ms |
 
-The calibration job took 9m54s, including 62s to save an 848 MB cache, 1m24s to build, and 279s to seed the mailbox. The budget job now restores the release cache from the Linux artifacts workflow on `main` and installs the required build packages without their recommendations. Skipping the cache save alone would have left about 68s under the timeout in that run. Recheck the hosted duration and the baselines across subsequent runs.
+The calibration job took 9m54s, including 62s to save an 848 MB cache, 1m24s to build, and 279s to seed the mailbox. A later cold release build exceeded the ten-minute job limit before producing an executable. CI now builds that executable in a prerequisite job and passes it to the budget job from the same run. The ten-minute budget job covers runtime setup, model verification, fixture generation and measurements. The full CI path includes the prerequisite build. [Cold build](https://github.com/predmore/fell/actions/runs/44661013350/job/136038979928)
 
 ## Verify the regression gate
 
