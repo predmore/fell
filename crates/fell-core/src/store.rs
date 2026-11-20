@@ -1157,6 +1157,56 @@ impl Store {
         self.search_with(account_id, query, SearchOptions::default())
     }
 
+    /// Text excerpts for a window of ranked keyword hits. Use the corrected
+    /// query when search supplied one. Operator-only hits have no FTS excerpt.
+    pub fn search_previews(
+        &self,
+        account: &AccountId,
+        query: &str,
+        messages: &[MessageId],
+    ) -> Result<std::collections::HashMap<MessageId, crate::SearchPreview>> {
+        crate::search::previews(&self.conn, account, query, messages)
+    }
+
+    /// Message IDs matching the effective keyword query inside one result.
+    pub fn search_thread_matches(
+        &self,
+        account: &AccountId,
+        query: &str,
+        thread: &ThreadId,
+    ) -> Result<Vec<MessageId>> {
+        crate::search::thread_matches(&self.conn, account, query, thread)
+    }
+
+    /// Values for a search operator, drawn from this account's local mail.
+    pub fn search_suggestions(
+        &self,
+        account: &AccountId,
+        field: crate::SearchField,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        use crate::SearchField::*;
+        let names = match field {
+            Folder => self.folder_names(account)?,
+            Label => self.list_labels(account)?,
+            Sender | Recipient => {
+                return crate::search::address_suggestions(
+                    &self.conn, account, field, prefix, limit,
+                );
+            }
+        };
+        let prefix = prefix.to_lowercase();
+        Ok(names
+            .into_iter()
+            .filter(|name| name.to_lowercase().starts_with(&prefix))
+            .take(limit)
+            .collect())
+    }
+
     /// Search one account in the local store.
     ///
     /// This reads SQLite only. It never calls a backend or a network, so the
@@ -4982,6 +5032,64 @@ mod tests {
             store.upsert_message(&message).unwrap();
         }
         store
+    }
+
+    #[test]
+    fn search_previews_and_message_navigation_use_the_indexed_hit_and_filters() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let ranked = store.search(&account, "zebraunique").unwrap();
+        let ids: Vec<_> = ranked
+            .hits
+            .iter()
+            .map(|hit| hit.message_id.clone())
+            .collect();
+        let previews = store
+            .search_previews(&account, "zebraunique", &ids)
+            .unwrap();
+        let body = &previews[&MessageId::new("body@msg")];
+        assert!(body.text.starts_with('…'));
+        assert_eq!(&body.text[body.highlights[0].clone()], "zebraunique");
+        let subject = &previews[&MessageId::new("subj@msg")];
+        assert_eq!(subject.text, "zebraunique");
+        assert_eq!(subject.highlights, vec![0..11]);
+
+        let thread = ThreadId::from_message_id(&MessageId::new("ada@msg"));
+        let hits = store
+            .search_thread_matches(&account, "invoice", &thread)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let filtered = store
+            .search_thread_matches(&account, "invoice is:unread", &thread)
+            .unwrap();
+        assert_eq!(filtered, vec![MessageId::new("ada@msg")]);
+        let operator_only = store
+            .search_thread_matches(&account, "label:work", &thread)
+            .unwrap();
+        assert_eq!(operator_only, filtered);
+    }
+
+    #[test]
+    fn search_operator_suggestions_read_actual_account_values() {
+        use crate::SearchField::*;
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let suggest = |field, prefix| {
+            store
+                .search_suggestions(&account, field, prefix, 4)
+                .unwrap()
+        };
+        assert_eq!(suggest(Folder, "ar"), ["Archive"]);
+        assert_eq!(suggest(Label, "work"), ["work", "workspace"]);
+        assert_eq!(suggest(Sender, "Ada Lo"), ["ada@x.com"]);
+        assert_eq!(suggest(Recipient, "Bo L"), ["bo@x.com"]);
+        assert_eq!(suggest(Recipient, "cc@"), ["cc@x.com"]);
+        assert!(
+            store
+                .search_suggestions(&AccountId("a2".into()), Folder, "ar", 4)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

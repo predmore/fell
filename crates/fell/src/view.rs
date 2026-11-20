@@ -3,6 +3,7 @@
 mod attachment_actions;
 mod attachment_chips;
 mod disclosure;
+mod search;
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -258,6 +259,7 @@ struct Inbox {
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
+    search_view: search::SearchView,
     split: f32,
     dragging: bool,
     open_thread: Option<String>,
@@ -398,6 +400,7 @@ impl Inbox {
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
+            search_view: search::SearchView::default(),
             split: startup.split,
             dragging: false,
             open_thread: None,
@@ -476,6 +479,7 @@ impl Inbox {
             self.watch_sync(events, cx);
         }
         self.request_threads(ReadIntent::default(), cx);
+        self.search_store_ready(cx);
         cx.notify();
     }
 
@@ -642,6 +646,10 @@ impl Inbox {
     /// flight, further requests merge into a single follow-up, so a burst of
     /// sync batches is one read and never a queue.
     fn request_threads(&mut self, mut intent: ReadIntent, cx: &mut Context<Self>) {
+        if self.session.search.is_some() {
+            self.search_view.defer_folder_read(intent);
+            return;
+        }
         // A sync refresh in flight does not make the reader wait: their read
         // starts now on the interactive lane, and the refresh is dropped
         // when it lands. This read sees everything the refresh would have.
@@ -756,6 +764,14 @@ impl Inbox {
         self.read_in_flight = false;
         self.refresh_in_flight = false;
         let wanted = self.read_wanted.take();
+        if self.session.search.is_some() {
+            let intent = match wanted {
+                Some(next) => intent.merge(next),
+                None => intent,
+            };
+            self.search_view.defer_folder_read(intent);
+            return;
+        }
         // A user action (switch, archive, move, undo) since this read started
         // makes it stale. Skip it and read again with both intents, so the
         // list never flashes a folder or a row the user already left.
@@ -1025,6 +1041,9 @@ impl Inbox {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        if self.session.search.is_some() {
+            return None;
+        }
         let theme = self.theme.clone();
         let now = self.frame_now;
         let mut parts = Vec::new();
@@ -1390,6 +1409,12 @@ impl Inbox {
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
+        if self.open_thread.as_deref() != Some(id.as_str())
+            && let Some(search) = self.session.search.as_mut()
+        {
+            search.matches.clear();
+            self.clear_open_message();
+        }
         if let Some(draft) = self.session.cursor_draft() {
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
@@ -1424,24 +1449,29 @@ impl Inbox {
         let roles = self.session.roles.clone();
         let names = self.session.folders.clone();
         let viewing = self.session.folder.clone();
-        let thread = id.clone();
+        let thread = ThreadId(id.clone());
+        let query = self
+            .session
+            .search
+            .as_ref()
+            .map(|search| search.effective_query().to_owned());
         let cached = self.bodies.stamps();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
                 return None;
             }
             Some(
-                read_conversation(
-                    store,
-                    &account,
-                    &ThreadId(thread),
-                    (&me, &roles, &names, &viewing),
-                )
-                .map(|mut view| {
-                    let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
-                    (view, reads)
-                })
-                .map_err(|err| err.to_string()),
+                read_conversation(store, &account, &thread, (&me, &roles, &names, &viewing))
+                    .map(|mut view| {
+                        let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
+                        let matches = query.as_ref().map(|query| {
+                            store
+                                .search_thread_matches(&account, query, &thread)
+                                .unwrap_or_default()
+                        });
+                        (view, reads, matches)
+                    })
+                    .map_err(|err| err.to_string()),
             )
         });
         cx.spawn(async move |this, cx| {
@@ -1456,7 +1486,7 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok((view, _)) if view.is_empty() && !inbox.session.messages.is_empty() => {
+                    Ok((view, _, _)) if view.is_empty() && !inbox.session.messages.is_empty() => {
                         // The open thread key can disappear between the folder
                         // and message reads. Keep the conversation until a
                         // folder read confirms where its messages belong.
@@ -1464,7 +1494,7 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                     }
-                    Ok((mut view, reads)) => {
+                    Ok((mut view, reads, matches)) => {
                         inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
@@ -1485,6 +1515,9 @@ impl Inbox {
                             inbox.invalidate_conversation_layout();
                             inbox.reveal = Reveal::Waiting;
                             inbox.motion.show_thread(&mut inbox.session, view);
+                            if let Some(matches) = matches {
+                                inbox.session.set_search_matches(&id, matches);
+                            }
                             // A new thread starts at the top of the reader's
                             // message. Scrolling only far enough to show its
                             // end would cut the row above it, or its header
@@ -2414,6 +2447,10 @@ impl Inbox {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.search_editing() && self.search_text_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
@@ -2433,7 +2470,8 @@ impl Inbox {
         // do that only while the conversation is focused, so they expand the
         // message on screen. An open palette, folder filter, or help card
         // types those keys and must leave the cursor alone.
-        if self.session.focused_attachment().is_none()
+        if !self.session.search_editing()
+            && self.session.focused_attachment().is_none()
             && should_follow_visible(
                 &self.session.overlay,
                 self.session.chord.is_empty(),
@@ -2469,6 +2507,8 @@ impl Inbox {
             thread: self.session.cursor_id.clone(),
             folder: self.session.folder.clone(),
             pane: self.session.pane,
+            searching: self.session.search.is_some(),
+            search_generation: self.session.search_generation,
         }
     }
 
@@ -2478,7 +2518,10 @@ impl Inbox {
             thread: thread_before,
             folder: folder_before,
             pane: pane_before,
+            searching,
+            search_generation,
         } = before;
+        let search_changed = self.after_search_step(&step, searching, search_generation, cx);
         if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
             if step.reveal_attachment {
                 self.reveal_selected_attachment();
@@ -2576,6 +2619,14 @@ impl Inbox {
             self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
             self.request_messages(true, cx);
+        } else if searching && self.session.search.is_none() {
+            self.request_messages(false, cx);
+        }
+        if self.session.search.is_none()
+            && let Some(intent) = self.search_view.take_folder_read()
+            && self.session.folder == folder_before
+        {
+            self.request_threads(intent, cx);
         }
         // A move past the loaded rows, or near their end, asks for more.
         self.issue_fetch(cx);
@@ -2592,7 +2643,7 @@ impl Inbox {
         ) {
             self.row_widths.relax();
         }
-        if thread_moved {
+        if thread_moved && !search_changed {
             // Rows the selection moved by, when both rows are on the list.
             let moved = thread_before
                 .as_ref()
@@ -2614,6 +2665,8 @@ impl Inbox {
         if step.scroll_pages != 0 || step.scroll_lines != 0 {
             self.reader_took_over(false);
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
+        } else if step.reveal_search_hit {
+            self.scroll_conversation();
         } else if !step.reveal_attachment && self.session.message_cursor != message_before {
             if self.session.cursor_id == thread_before {
                 self.reader_took_over(true);
@@ -2941,6 +2994,14 @@ impl Inbox {
     }
 
     fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        if self
+            .session
+            .search
+            .as_ref()
+            .is_some_and(|search| !search.hits.contains_key(&id))
+        {
+            return;
+        }
         self.cancel_pending_keys(cx);
         self.session.leave_attachments();
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
@@ -2951,6 +3012,10 @@ impl Inbox {
         }
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
+        if let Some(search) = self.session.search.as_mut() {
+            search.editing = false;
+            self.session.remember_search();
+        }
         if changed {
             self.request_messages(true, cx);
         }
@@ -3005,7 +3070,10 @@ impl Render for Inbox {
             spin_attachment,
         };
         self.conv_layout_current = panes.1;
-        let animating = self.motion.tick(now) | self.row_widths.running(now) | spin_attachment;
+        let animating = self.motion.tick(now)
+            | self.row_widths.running(now)
+            | spin_attachment
+            | self.search_view.animating(now);
         if animating {
             window.request_animation_frame();
         } else {
@@ -3308,13 +3376,10 @@ fn shell(
                 .size_0(),
             )
         })
-        .child(header(
-            &theme,
-            session,
-            &folder,
-            motion.unread_count(now),
-            window,
-        ))
+        .child(match &session.search {
+            Some(search) => search::header(&theme, search, width, window, cx),
+            None => header(&theme, session, &folder, motion.unread_count(now), window),
+        })
         .child(
             div()
                 .relative()
@@ -3525,6 +3590,13 @@ fn thread_list(
                 if inbox.session.has_fetch() {
                     cx.defer_in(window, |inbox, _, cx| inbox.issue_fetch(cx));
                 }
+                if inbox.session.search.is_some() {
+                    inbox.queue_search_previews(range.clone(), window, cx);
+                    let highlighted = inbox.session.highlighted();
+                    return range
+                        .map(|index| search::row(&theme_for_rows, inbox, index, &highlighted, cx))
+                        .collect();
+                }
                 let highlighted = inbox.session.highlighted();
                 let text_width = row_text_width(list_width);
                 let now = inbox.frame_now;
@@ -3652,6 +3724,9 @@ fn thread_list(
     } else {
         pane.flex_1()
     };
+    if let Some(search) = &session.search {
+        pane = pane.child(search::feedback(theme, search, session.threads.len(), cx));
+    }
     if session.threads.is_empty() {
         pane.child(empty_state(theme, session))
     } else {
@@ -3701,6 +3776,8 @@ struct StepBefore {
     thread: Option<String>,
     folder: String,
     pane: Pane,
+    searching: bool,
+    search_generation: u64,
 }
 
 /// How a thread row is drawn.
@@ -4290,6 +4367,9 @@ fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f3
 }
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
+    if let Some(search) = &session.search {
+        return search::empty(theme, search);
+    }
     let banner = session.list_banner();
     div()
         .flex_1()
@@ -5791,13 +5871,13 @@ fn palette(
                 .track_scroll(scroll)
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
-                    let action = item.action;
-                    let is_about = action == Action::About;
+                    let is_about = item.action == Action::About;
                     let detail = if is_about {
                         fell_version::VERSION
                     } else {
                         item.binding.as_str()
                     };
+                    let choice = item.clone();
                     div()
                         .id(gpui::ElementId::named_usize("palette", index))
                         .when(!is_about, |row| row.h(px(PALETTE_ROW_PX)))
@@ -5826,11 +5906,10 @@ fn palette(
                                 }
                                 cx.stop_propagation();
                                 window.focus(&inbox.focus);
-                                inbox.session.overlay = Overlay::None;
                                 inbox.reveal.cancel_pending();
                                 let page = inbox.page_rows();
                                 let before = inbox.before_step();
-                                let step = inbox.session.perform(action, page);
+                                let step = inbox.session.confirm_palette(choice.clone(), page);
                                 inbox.apply_step(step, before, cx);
                             }),
                         )
@@ -5842,7 +5921,7 @@ fn palette(
                         })
                         .child(
                             div()
-                                .when(!is_about, |label| label.flex_1())
+                                .when(!is_about, |label| label.flex_1().min_w_0().truncate())
                                 .when(is_about, |label| label.line_height(px(theme.ui_px + 4.0)))
                                 .child(item.label.clone()),
                         )
@@ -6160,7 +6239,12 @@ fn key_from(stroke: &Keystroke) -> Option<KeyId> {
         "space" | " " => Some(KeyId::Space),
         "up" => Some(KeyId::Up),
         "down" => Some(KeyId::Down),
-        "left" | "right" | "tab" => None,
+        "left" => Some(KeyId::Left),
+        "right" => Some(KeyId::Right),
+        "tab" => Some(KeyId::Tab),
+        "home" => Some(KeyId::Home),
+        "end" => Some(KeyId::End),
+        "delete" => Some(KeyId::Delete),
         other => {
             let mut chars = other.chars();
             let ch = chars.next()?;
@@ -6223,6 +6307,7 @@ fn named_key(key: &str, shift: bool) -> Option<KeyId> {
         "g" if shift => Some(KeyId::Char('G')),
         "v" if shift => Some(KeyId::Char('V')),
         "slash" if shift => Some(KeyId::Char('?')),
+        "slash" => Some(KeyId::Char('/')),
         "semicolon" if shift => Some(KeyId::Char(':')),
         other if other.chars().count() == 1 => {
             let ch = other.chars().next().unwrap();

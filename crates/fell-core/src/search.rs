@@ -28,7 +28,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::account::AccountId;
-use crate::message::MessageId;
+use crate::message::{MessageId, decode_addresses};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
@@ -65,6 +65,181 @@ pub struct SearchHit {
 pub struct SearchResults {
     pub hits: Vec<SearchHit>,
     pub did_you_mean: Option<String>,
+}
+
+/// A short excerpt from an indexed field, with byte ranges of the FTS matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPreview {
+    pub text: String,
+    pub highlights: Vec<std::ops::Range<usize>>,
+}
+
+/// The search values available for autocomplete from the local mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchField {
+    Folder,
+    Label,
+    Sender,
+    Recipient,
+}
+
+pub(crate) fn previews(
+    conn: &Connection,
+    account: &AccountId,
+    query: &str,
+    messages: &[MessageId],
+) -> Result<HashMap<MessageId, SearchPreview>> {
+    let parsed = parse_query(query)?;
+    let Some(fts) = fts_match(&parsed).filter(|_| !messages.is_empty()) else {
+        return Ok(HashMap::new());
+    };
+    let mut sql =
+        String::from("SELECT m.message_id, snippet(messages_fts, -1, char(1), char(2), '…', 18)");
+    let mut params = matching_rows(&mut sql, account, &parsed, Some(&fts));
+    sql.push_str(" AND m.message_id IN (");
+    for (index, message) in messages.iter().enumerate() {
+        sql.push_str(if index == 0 { "?" } else { ",?" });
+        params.push(Value::Text(message.0.clone()));
+    }
+    sql.push(')');
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        let marked: String = row.get(1)?;
+        Ok((MessageId(row.get(0)?), preview_from_marked(&marked)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn preview_from_marked(marked: &str) -> SearchPreview {
+    let mut text = String::with_capacity(marked.len());
+    let mut highlights = Vec::new();
+    let mut start = None;
+    for ch in marked.chars() {
+        match ch {
+            '\u{1}' => start = Some(text.len()),
+            '\u{2}' => {
+                if let Some(from) = start.take().filter(|from| *from < text.len()) {
+                    highlights.push(from..text.len());
+                }
+            }
+            ch if ch.is_whitespace() => {
+                if !text.is_empty() && !text.ends_with(' ') {
+                    text.push(' ');
+                }
+            }
+            ch if !ch.is_control() => text.push(ch),
+            _ => {}
+        }
+    }
+    SearchPreview { text, highlights }
+}
+
+pub(crate) fn thread_matches(
+    conn: &Connection,
+    account: &AccountId,
+    query: &str,
+    thread: &ThreadId,
+) -> Result<Vec<MessageId>> {
+    let parsed = parse_query(query)?;
+    if query.trim().is_empty() || no_match_possible(&parsed) {
+        return Ok(Vec::new());
+    }
+    let mut sql = String::from("SELECT m.message_id");
+    let fts = fts_match(&parsed);
+    let mut params = matching_rows(&mut sql, account, &parsed, fts.as_deref());
+    sql.push_str(" AND m.thread_id = ?");
+    params.push(Value::Text(thread.0.clone()));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| Ok(MessageId(row.get(0)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn matching_rows(
+    sql: &mut String,
+    account: &AccountId,
+    parsed: &ParsedQuery,
+    fts: Option<&str>,
+) -> Vec<Value> {
+    let mut params = vec![Value::Text(account.0.clone())];
+    if let Some(fts) = fts {
+        sql.push_str(
+            " FROM messages_fts JOIN messages m
+                      ON m.account_id = messages_fts.account_id
+                     AND m.message_id = messages_fts.message_id
+                     WHERE m.account_id = ? AND messages_fts MATCH ?",
+        );
+        params.push(Value::Text(fts.to_owned()));
+    } else {
+        sql.push_str(" FROM messages m WHERE m.account_id = ?");
+    }
+    append_filters(sql, &mut params, parsed);
+    params
+}
+
+pub(crate) fn address_suggestions(
+    conn: &Connection,
+    account: &AccountId,
+    field: SearchField,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let prefix = prefix.to_lowercase();
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |email: String, name: Option<String>| {
+        let folded = email.to_lowercase();
+        if !email.is_empty()
+            && (folded.starts_with(&prefix)
+                || name.is_some_and(|name| name.to_lowercase().starts_with(&prefix)))
+            && seen.insert(folded)
+        {
+            values.push(email);
+        }
+        values.len() >= limit
+    };
+    match field {
+        SearchField::Sender => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT from_email, from_name FROM messages
+                 WHERE account_id = ?1 AND (instr(lower(from_email), ?2) = 1
+                    OR instr(lower(from_name), ?2) = 1 OR ?3)",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                account.as_str(),
+                prefix,
+                !prefix.is_ascii()
+            ])?;
+            while let Some(row) = rows.next()? {
+                if add(row.get(0)?, row.get(1)?) {
+                    break;
+                }
+            }
+        }
+        SearchField::Recipient => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT to_line, cc_line, bcc_line FROM messages WHERE account_id = ?1
+                 AND (instr(lower(to_line), ?2) > 0 OR instr(lower(cc_line), ?2) > 0
+                       OR instr(lower(bcc_line), ?2) > 0 OR ?3)",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                account.as_str(),
+                prefix,
+                !prefix.is_ascii()
+            ])?;
+            'messages: while let Some(row) = rows.next()? {
+                for column in 0..3 {
+                    let encoded: String = row.get(column)?;
+                    for address in decode_addresses(&encoded) {
+                        if add(address.email, address.name) {
+                            break 'messages;
+                        }
+                    }
+                }
+            }
+        }
+        _ => unreachable!("address completions require a sender or recipient"),
+    }
+    Ok(values)
 }
 
 /// How [`crate::Store::search_with`] searches.
@@ -458,18 +633,9 @@ fn run_fts(
                     m.snippet AS snippet,
                     m.from_email AS from_email,
                     m.date_unix AS date_unix,
-                    bm25(messages_fts, 8.0, 4.0, 2.0, 1.0) AS score
-                FROM messages_fts
-                JOIN messages m
-                  ON m.account_id = messages_fts.account_id
-                 AND m.message_id = messages_fts.message_id
-                WHERE m.account_id = ? AND messages_fts MATCH ?",
+                    bm25(messages_fts, 8.0, 4.0, 2.0, 1.0) AS score",
     );
-    let mut params = vec![
-        Value::Text(account_id.as_str().to_string()),
-        Value::Text(match_query.to_string()),
-    ];
-    append_filters(&mut sql, &mut params, parsed);
+    let params = matching_rows(&mut sql, account_id, parsed, Some(match_query));
     sql.push_str(")) WHERE rn = 1 ORDER BY score ASC, thread_id ASC");
     query_hits(conn, &sql, params)
 }
@@ -492,12 +658,9 @@ fn run_filtered(
                     PARTITION BY m.thread_id
                     ORDER BY m.date_unix DESC, m.message_id ASC
                 ) AS rn,
-                MAX(m.date_unix) OVER (PARTITION BY m.thread_id) AS thread_date
-            FROM messages m
-            WHERE m.account_id = ?",
+                MAX(m.date_unix) OVER (PARTITION BY m.thread_id) AS thread_date",
     );
-    let mut params = vec![Value::Text(account_id.as_str().to_string())];
-    append_filters(&mut sql, &mut params, parsed);
+    let params = matching_rows(&mut sql, account_id, parsed, None);
     sql.push_str(") WHERE rn = 1 ORDER BY thread_date DESC, thread_id ASC");
     query_hits(conn, &sql, params)
 }

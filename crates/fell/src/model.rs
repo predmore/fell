@@ -1,5 +1,7 @@
 //! Inbox session: folders, selection, chords, palette. No drawing.
 
+pub mod search;
+
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -293,6 +295,9 @@ pub struct Step {
     /// stayed open that long (see [`Session::read_after_dwell`]). The
     /// second value is the open it belongs to ([`Session::read_gen`]).
     pub read_after: Option<(String, u64)>,
+    pub search_request: bool,
+    pub search_completion: bool,
+    pub reveal_search_hit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +370,10 @@ pub struct Session {
     /// Details for the last attachment failure, until another attempt starts.
     pub attachment_error: Option<String>,
     pub recent: Vec<Action>,
+    pub search: Option<search::Search>,
+    pub search_generation: u64,
+    folder_list: Option<std::sync::Arc<search::FolderList>>,
+    recent_searches: Vec<String>,
     pub palette_query: String,
     pub palette_index: usize,
     pub folder_query: String,
@@ -443,6 +452,10 @@ impl Session {
             error_fault: None,
             attachment_error: None,
             recent: Vec::new(),
+            search: None,
+            search_generation: 0,
+            folder_list: None,
+            recent_searches: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
             folder_query: String::new(),
@@ -657,7 +670,11 @@ impl Session {
     }
 
     pub fn mode_label(&self) -> &'static str {
-        if self.focused_attachment().is_some() {
+        if self.search.as_ref().is_some_and(|search| search.editing)
+            && self.overlay == Overlay::None
+        {
+            "insert"
+        } else if self.focused_attachment().is_some() {
             "attachments"
         } else if self.visual {
             "visual"
@@ -675,7 +692,17 @@ impl Session {
     }
 
     pub fn palette(&self) -> Vec<PaletteItem> {
-        keymap::palette_items(&self.keymap, &self.palette_query, &self.recent)
+        keymap::recent_search_items(&self.palette_query, &self.recent_searches)
+            .chain(keymap::palette_items(
+                &self.keymap,
+                &self.palette_query,
+                &self.recent,
+            ))
+            .collect()
+    }
+
+    pub fn search_editing(&self) -> bool {
+        self.overlay == Overlay::None && self.search.as_ref().is_some_and(|search| search.editing)
     }
 
     pub fn folder_choices(&self) -> Vec<String> {
@@ -1483,6 +1510,9 @@ impl Session {
         if self.overlay != Overlay::None {
             return self.overlay_key(key, page_rows);
         }
+        if self.search_editing() && key != KeyId::CtrlShiftP {
+            return self.search_key(key);
+        }
         // The question is asked once: any key answers it. `y` deletes;
         // Escape and `n` only let it go; any other key does what it does.
         if let Some(prompt) = self.confirm_purge.take()
@@ -1538,6 +1568,10 @@ impl Session {
             self.chord.pop();
             self.note_chord();
             step.arm_which = true;
+            return step;
+        }
+        if key == KeyId::Escape && self.end_search() {
+            self.count.clear();
             return step;
         }
         if self.chord.is_empty()
@@ -1616,8 +1650,7 @@ impl Session {
                     self.overlay = Overlay::None;
                     return Step::default();
                 };
-                self.overlay = Overlay::None;
-                self.run(item.action, page_rows)
+                self.confirm_palette(item, page_rows)
             }
             KeyId::Backspace => {
                 self.palette_query.pop();
@@ -1656,6 +1689,19 @@ impl Session {
                 Step::default()
             }
             _ => Step::default(),
+        }
+    }
+
+    pub fn confirm_palette(&mut self, item: PaletteItem, page_rows: usize) -> Step {
+        self.overlay = Overlay::None;
+        match item.search {
+            Some(query) => self.apply_input(|session| {
+                let step = session.start_search(Some(query));
+                session.search.as_mut().unwrap().editing = false;
+                session.remember_search();
+                step
+            }),
+            None => self.perform(item.action, page_rows),
         }
     }
 
@@ -1724,18 +1770,10 @@ impl Session {
                     ..Step::default()
                 }
             }
-            FolderIntent::Go => {
-                if self.folder != chosen {
-                    self.folder = chosen;
-                    self.forget_window();
-                    Step {
-                        reload_threads: true,
-                        ..Step::default()
-                    }
-                } else {
-                    Step::default()
-                }
-            }
+            FolderIntent::Go => Step {
+                reload_threads: self.go_folder(&chosen),
+                ..Step::default()
+            },
         }
     }
 
@@ -1750,7 +1788,28 @@ impl Session {
             self.recent.truncate(8);
         }
         let mut step = Step::default();
+        if self.search.is_some()
+            && matches!(
+                action,
+                Action::Move
+                    | Action::Archive
+                    | Action::Delete
+                    | Action::Spam
+                    | Action::ToggleUnread
+                    | Action::ToggleStar
+                    | Action::Undo
+            )
+        {
+            self.count.clear();
+            self.show_toast("Open a folder to change mail", false);
+            return step;
+        }
         match action {
+            Action::Search => return self.start_search(None),
+            Action::NextHit | Action::PreviousHit => {
+                let count = self.take_count();
+                return self.move_search_hit(action == Action::NextHit, count);
+            }
             Action::Next => {
                 let count = self.take_count();
                 step.reload_messages = self.move_cursor(Motion::Forward(count));
@@ -1766,7 +1825,9 @@ impl Session {
                 if self.cursor_draft().is_some() {
                     // A draft row opens in the editor, not the reading pane.
                     step.open_draft = true;
-                } else if self.pane == Pane::List {
+                } else if self.pane == Pane::List
+                    && (self.search.is_none() || self.cursor_id.is_some())
+                {
                     self.pane = Pane::Conversation;
                     self.opened(&mut step);
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
@@ -2249,6 +2310,7 @@ impl Session {
 
     fn go_folder(&mut self, folder: &str) -> bool {
         self.count.clear();
+        self.end_search();
         if self.folder == folder {
             return false;
         }
