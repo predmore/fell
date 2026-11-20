@@ -41,3 +41,19 @@ if !options.semantic
 ```
 
 The text-and-operators row should exceed the 30 ms CI limit and the process should exit with a failure. Remove the temporary worktree after the check.
+
+## Replay the inbox
+
+Build the release app and seed the same synthetic mailbox used by the store benchmark. The database path for `--seed` must be new.
+
+```sh
+cargo build --locked --release -p fell
+cargo bench --locked -p fell --features bench-store --bench fell-bench -- --seed /tmp/fell-100k.db
+python3 bench/inbox-replay.py target/release/fell /tmp/fell-100k.db /tmp/fell-ui-run
+```
+
+The replay needs Python 3, `xvfb-run`, Xvfb, xauth, xdotool, and Weston with its X11 backend and kiosk shell. Fell also needs a working Vulkan driver. The script starts a fresh X server and nested Wayland compositor, backs up the fixture into a disposable store, and uses separate XDG directories. It sends 200 `j` keys, opens the conversation, scrolls with `Ctrl-d`, returns to the list, archives, and undoes. Add `--search` on a build with live search to send `/` and five query characters. The new output directory keeps the trace and both process logs.
+
+Startup is measured from entry to Fell's `main`. The trace reports window creation, first CPU paint, the first painted folder page, and the first confirmed Wayland presentation of each relevant stage. Presentation can be unavailable when the compositor lacks `wp_presentation`, uses an unsupported clock, or discards a commit. The replay prints sample coverage and nearest-rank p95 for both CPU paint and compositor presentation. Keyboard timing begins at the inbox handler. The synthetic store backup warms the OS page cache, and the nested compositor measures its own output.
+
+To check a runner against a calibrated tolerance, pass `--ci-factor FACTOR`. The command requires complete presentation feedback and fails when usable inbox presentation exceeds `300 ms × FACTOR` or key-to-presentation p95 exceeds `8 ms × FACTOR`. For a regression check, temporarily sleep for 30 ms on each `j` at the start of `Inbox::on_key_down` after starting its trace timer, rebuild, and run both builds against the same fixture and factor. Use a native Wayland session with `fell --trace` for supported-hardware measurements.

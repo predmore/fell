@@ -28,6 +28,7 @@ mod sync_worker;
 mod text_cut;
 mod text_render;
 mod theme;
+mod ui_trace;
 mod view;
 
 use fell_confirm::InteractiveUi;
@@ -35,7 +36,12 @@ use fell_core::{PendingSend, UserSendConfirmation};
 
 /// Open the inbox window.
 pub fn run() {
-    view::run();
+    view::run(None);
+}
+
+/// Open the inbox with startup and presentation tracing.
+pub fn run_traced(started: std::time::Instant) {
+    view::run(Some(started));
 }
 
 pub use compose_ui::{ComposeView, SendFailure, ThemeKind, open_demo, send_from_editor};

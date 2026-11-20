@@ -60,6 +60,10 @@ cargo run -p fell
 
 `fell` opens a two-pane inbox on the local store. With no account set up, an empty store is filled with fixture threads, and the status line says the sync is offline.
 
+### Trace inbox performance
+
+Run `fell --trace` or `FELL_TRACE=1 fell` and open the inbox as usual. Fell prints the path to a private JSONL file under `${XDG_STATE_HOME:-$HOME/.local/state}/fell/trace/`. The trace records startup milestones and measures inbox keyboard actions through CPU paint and Wayland compositor presentation. It records action names and timings. Closing the inbox prints p50, p95, max, and sample counts for both measurements. The [100,000-message replay](bench/README.md#replay-the-inbox) runs the same trace against a synthetic mailbox.
+
 ## Connect your mail
 
 Install and start [Proton Mail Bridge](https://proton.me/mail/bridge) (`sudo pacman -S protonmail-bridge` on Arch), sign in, and copy the IMAP username and password Bridge shows for your account. Then:

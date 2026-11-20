@@ -260,6 +260,7 @@ pub struct ReadDwell {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
+    pub action: Option<Action>,
     pub reload_threads: bool,
     pub reload_messages: bool,
     pub arm_which: bool,
@@ -1569,7 +1570,10 @@ impl Session {
                     return step;
                 }
                 if let Some(action) = self.keymap.attachment_action(key) {
-                    return self.run(action, page_rows);
+                    return Step {
+                        action: Some(action),
+                        ..self.run(action, page_rows)
+                    };
                 }
             }
             match key {
@@ -1623,6 +1627,7 @@ impl Session {
                 // Everything the action asked for, so a new Step field cannot
                 // be dropped here (sync_now was, so `space s` did nothing).
                 step = Step {
+                    action: Some(action),
                     arm_which: true,
                     ..self.run(action, page_rows)
                 };
