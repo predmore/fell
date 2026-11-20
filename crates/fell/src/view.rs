@@ -3706,7 +3706,14 @@ fn shell(
         })
         .child(match &session.search {
             Some(search) => search::header(&theme, search, width, window, cx),
-            None => header(&theme, session, &folder, motion.unread_count(now), window),
+            None => header(
+                &theme,
+                session,
+                &folder,
+                motion.unread_count(now),
+                width,
+                window,
+            ),
         })
         .child(
             div()
@@ -3820,17 +3827,50 @@ fn header(
     session: &Session,
     folder: &str,
     count_fade: Option<(usize, f32)>,
+    width: f32,
     window: &Window,
 ) -> gpui::Div {
+    const PAD: f32 = 16.;
+    const GAP: f32 = 14.;
+
     let unread = session.unread_threads();
     let drafts = session.roles.is(FolderRole::Drafts, folder);
-    let label = |unread: usize| {
-        if unread == 1 {
-            "1 unread".to_string()
-        } else {
-            format!("{unread} unread")
-        }
+    let style = conversation_line_style(window, theme, px(theme.ui_px));
+    let count_width = |unread| {
+        line_px_with_style(
+            window,
+            &style,
+            &format!("{unread} unread"),
+            FontWeight::NORMAL,
+        )
+        .ceil()
     };
+    let count_room = count_fade.map_or_else(
+        || count_width(unread),
+        |(old, shown)| motion::lerp(count_width(old), count_width(unread), shown),
+    );
+    let name_room = (width - 2. * PAD - GAP - if drafts { 0. } else { GAP + count_room }).max(0.);
+    // Let a long folder use at most half the space available to the two names.
+    let (folder_labels, folder_used) = header_labels(
+        window,
+        &style,
+        theme,
+        &session.roles.label(folder),
+        session.folder_detail(folder).as_deref(),
+        name_room * 0.5,
+        6.,
+    );
+    let email =
+        (session.account_email != session.account_name).then_some(session.account_email.as_str());
+    let (account_labels, _) = header_labels(
+        window,
+        &style,
+        theme,
+        &session.account_name,
+        email,
+        name_room - folder_used,
+        GAP,
+    );
     let count = |unread: usize| {
         div()
             .flex_none()
@@ -3840,53 +3880,26 @@ fn header(
             } else {
                 theme.dimmed
             }))
-            .child(label(unread))
+            .child(format!("{unread} unread"))
     };
     div()
         .h(px(44.))
-        .px(px(16.))
+        .px(px(PAD))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(14.))
+        .gap(px(GAP))
         .border_b(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(session.account_name.clone()),
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(account_labels),
         )
-        .child(
-            div()
-                .text_color(rgb(theme.dimmed))
-                .child(session.account_email.clone()),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(6.))
-                .min_w(px(0.))
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(session.roles.label(folder)),
-                )
-                // The folder's own name gives way first in a narrow window.
-                .children(session.folder_detail(folder).map(|name| {
-                    div()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(rgb(theme.dimmed))
-                        .child(name)
-                })),
-        )
+        .child(folder_labels)
         // Drafts are not mail to read: no count there.
         .when(!drafts, |row| {
             row.child(match count_fade {
@@ -3899,11 +3912,7 @@ fn header(
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .w(px(motion::lerp(
-                        line_px(window, &label(old), FontWeight::NORMAL),
-                        line_px(window, &label(unread), FontWeight::NORMAL),
-                        shown,
-                    )))
+                    .w(px(count_room))
                     .child(count(unread).opacity(shown))
                     .child(
                         count(old)
@@ -3912,9 +3921,55 @@ fn header(
                             .right(px(0.))
                             .opacity(1.0 - shown),
                     ),
-                None => div().flex_none().child(count(unread)),
+                None => div().flex_none().w(px(count_room)).child(count(unread)),
             })
         })
+}
+
+/// Fit the name first and use the rest of its group for the secondary label.
+fn header_labels(
+    window: &Window,
+    style: &TextStyle,
+    theme: &Theme,
+    name: &str,
+    detail: Option<&str>,
+    room: f32,
+    gap: f32,
+) -> (gpui::Div, f32) {
+    let fit = |text: &str, room: f32, weight| {
+        clip_shaped(window, style, text, room, weight, None)
+            .filter(|line| f32::from(line.width).ceil() <= room)
+    };
+    let name = fit(name, room.floor(), FontWeight::SEMIBOLD);
+    let name_width = name
+        .as_ref()
+        .map_or(0., |line| f32::from(line.width).ceil());
+    let detail = detail.and_then(|text| fit(text, room - name_width - gap, FontWeight::NORMAL));
+    let used = name_width
+        + detail
+            .as_ref()
+            .map_or(0., |line| gap + f32::from(line.width).ceil());
+    let labels = div()
+        .flex_none()
+        .flex()
+        .items_baseline()
+        .gap(px(gap))
+        .w(px(used))
+        .children(name.map(|line| {
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(line.text)
+        }))
+        .children(detail.map(|line| {
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(rgb(theme.dimmed))
+                .child(line.text)
+        }));
+    (labels, used)
 }
 
 fn thread_list(

@@ -33,12 +33,25 @@ pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
 mod threads;
+pub(crate) mod views;
 mod write_lock;
 
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
+
+pub(crate) fn listed_folder_roles(
+    conn: &Connection,
+    account: &AccountId,
+) -> Result<Option<FolderRoles>> {
+    let Some(roles) = roles::listed(conn, account)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        roles.with_bridge_names(views::is_bridge(conn, account)?),
+    ))
+}
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -494,6 +507,7 @@ impl Store {
         ensure_alias_columns(&conn)?;
         ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
+        conn.execute_batch(views::SCHEMA)?;
         keywords::upgrade_undo_schema(&conn)?;
         bodies::ensure_bodies(&conn)?;
         conn.execute_batch(
@@ -697,6 +711,13 @@ impl Store {
     ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
+        let bridge = (!delta.flags.is_empty() || !delta.links.is_empty())
+            && views::is_bridge(&tx, account_id)?;
+        let views_changed = if let Some(listed) = &delta.views {
+            views::replace(&tx, account_id, listed)?
+        } else {
+            false
+        };
         let mut new_messages = 0;
         let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
             HashSet::new()
@@ -720,6 +741,7 @@ impl Store {
             let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
+            views::project_arrival(&tx, &mut message)?;
             // These labels have copy provenance and are applied with FLAGS below.
             if keyword_copies.contains(&message.remote_id.0) {
                 message.labels.clear();
@@ -733,12 +755,21 @@ impl Store {
                 bodies::mark_withheld(&tx, account_id, &canonical)?;
             }
         }
+        let mut linked = false;
+        for link in &delta.links {
+            if let Some(copy) = crate::imap::parse_remote_id(&link.flags.remote_id.0)
+                && copies::link(&tx, account_id, &copy, &link.message_id)?
+            {
+                linked = true;
+                apply_flag(&tx, account_id, &link.flags, bridge)?;
+            }
+        }
         // Apply every flag in one transaction. Local flag intents keep the
         // user's read state separate from updates reported by the server.
         for flag in &delta.flags {
             #[cfg(test)]
             self.stop_among_flags()?;
-            apply_flag(&tx, account_id, flag)?;
+            apply_flag(&tx, account_id, flag, bridge)?;
         }
         let copy_work = delta.roles.is_some()
             || !delta.removals.is_empty()
@@ -777,6 +808,8 @@ impl Store {
             changed: has_arrivals
                 || !delta.flags.is_empty()
                 || !delta.too_large.is_empty()
+                || views_changed
+                || linked
                 || repaired
                 || took_over
                 || settled,
@@ -1341,21 +1374,13 @@ impl Store {
             return Ok(Vec::new());
         }
         use crate::SearchField::*;
-        let names = match field {
-            Folder => self.folder_names(account)?,
-            Label => return crate::search::label_suggestions(&self.conn, account, prefix, limit),
+        match field {
+            Folder => crate::search::folder_suggestions(&self.conn, account, prefix, limit),
+            Label => crate::search::label_suggestions(&self.conn, account, prefix, limit),
             Sender | Recipient => {
-                return crate::search::address_suggestions(
-                    &self.conn, account, field, prefix, limit,
-                );
+                crate::search::address_suggestions(&self.conn, account, field, prefix, limit)
             }
-        };
-        let prefix = prefix.to_lowercase();
-        Ok(names
-            .into_iter()
-            .filter(|name| name.to_lowercase().starts_with(&prefix))
-            .take(limit)
-            .collect())
+        }
     }
 
     /// Search one account in the local store.
@@ -1535,10 +1560,11 @@ impl Store {
     /// (the demo mailbox, or mail stored before roles were recorded) gets
     /// [`FolderRoles::from_names`] over its stored folders.
     pub fn folder_roles(&self, account_id: &AccountId) -> Result<FolderRoles> {
-        if let Some(found) = roles::listed(&self.conn, account_id)? {
+        if let Some(found) = listed_folder_roles(&self.conn, account_id)? {
             return Ok(found);
         }
-        Ok(FolderRoles::from_names(&self.folder_names(account_id)?))
+        Ok(FolderRoles::from_names(&self.folder_names(account_id)?)
+            .with_bridge_names(views::is_bridge(&self.conn, account_id)?))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -2651,8 +2677,7 @@ fn write_kept(
         &message.remote_id.0,
         message.unread,
     )?;
-    // Applying server stars to the displayed row during sync belongs to
-    // #102. Keep a pending local star and otherwise merge copies as before.
+    // A pending local star wins while arrivals are merged.
     let starred = intents::local_star(conn, &message.account_id, &stored.canonical_id)?
         .unwrap_or(stored.starred || message.starred);
     let from_email = if alias {
@@ -3367,29 +3392,41 @@ fn apply_flag(
     conn: &Connection,
     account_id: &AccountId,
     flag: &crate::backend::FlagUpdate,
+    bridge: bool,
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
     if let (Some(copy), Some(keywords)) = (&copy, &flag.keywords) {
         keywords::observe(conn, account_id, copy, flag.modseq, keywords)?;
     }
-    let Some(server_unread) = flag.unread else {
-        return Ok(());
-    };
-    if let (Some(copy), Some(modseq)) = (&copy, flag.modseq)
-        && !copies::observe_flags(
+    let fresh = if let Some(copy) = &copy
+        && ((flag.unread.is_some() && flag.modseq.is_some()) || (bridge && flag.flagged.is_some()))
+    {
+        copies::observe_flags(
             conn,
             account_id,
             copy,
             copies::CopyFlags {
-                seen: Some(!server_unread),
+                seen: flag.unread.map(|unread| !unread),
                 flagged: flag.flagged,
-                modseq: Some(modseq),
+                modseq: flag.modseq,
             },
             copies::FlagSource::Sync,
         )?
+    } else {
+        true
+    };
+    if bridge
+        && let Some(copy) = &copy
+        && let Some(id) = copies::row_of(conn, account_id, copy)?
     {
+        copies::reconcile_star(conn, account_id, &id)?;
+    }
+    if !fresh {
         return Ok(());
     }
+    let Some(server_unread) = flag.unread else {
+        return Ok(());
+    };
     let targets: Vec<String> = {
         let mut stmt = conn.prepare_cached(FLAG_TARGETS)?;
         stmt.query_map(

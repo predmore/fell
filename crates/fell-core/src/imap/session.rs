@@ -99,11 +99,14 @@ pub(super) enum FetchItems {
     /// `UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]`: enough for a list row and
     /// threading, before the body is fetched.
     Headers,
+    /// Only the Message-ID, to link virtual copies without their bodies.
+    MessageId,
     /// The original Reply-To header only, for legacy rows.
     ReplyTo,
 }
 
 const REPLY_TO_SECTION: &str = "HEADER.FIELDS (REPLY-TO)";
+const MESSAGE_ID_SECTION: &str = "HEADER.FIELDS (MESSAGE-ID)";
 
 /// A UID and the header bytes fetched for it.
 pub(super) type HeaderRow = (u32, Vec<u8>);
@@ -326,6 +329,7 @@ impl Session {
             FetchItems::Flags => "",
             FetchItems::Bodies => " BODY.PEEK[]",
             FetchItems::Headers => " RFC822.SIZE BODY.PEEK[HEADER]",
+            FetchItems::MessageId => " BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]",
             FetchItems::ReplyTo => " BODY.PEEK[HEADER.FIELDS (REPLY-TO)]",
         };
         // CHANGEDSINCE already requests MODSEQ implicitly. Other FETCHes
@@ -375,6 +379,9 @@ impl Session {
             }
             let fetched = match items {
                 FetchItems::Bodies | FetchItems::Headers => parse_fetch(&text, literals),
+                FetchItems::MessageId => {
+                    parse_fetch_with_section(&text, literals, Some(MESSAGE_ID_SECTION))
+                }
                 FetchItems::ReplyTo => {
                     parse_fetch_with_section(&text, literals, Some(REPLY_TO_SECTION))
                 }

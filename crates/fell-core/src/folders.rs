@@ -191,13 +191,22 @@ pub struct ListedMailbox {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FolderRoles {
     folders: Vec<RoleFolder>,
+    bridge_names: bool,
 }
 
 impl FolderRoles {
     pub fn new(mut folders: Vec<RoleFolder>) -> Self {
         folders.sort_by_key(|folder| folder.role);
         folders.dedup_by_key(|folder| folder.role);
-        Self { folders }
+        Self {
+            folders,
+            bridge_names: false,
+        }
+    }
+
+    pub(crate) fn with_bridge_names(mut self, bridge_names: bool) -> Self {
+        self.bridge_names = bridge_names;
+        self
     }
 
     /// Roles from a LIST reply. `overrides` (from `account.toml`) win. Then
@@ -338,7 +347,15 @@ impl FolderRoles {
     pub fn label(&self, folder: &str) -> String {
         match self.role_of(folder) {
             Some(role) => role.label().to_string(),
-            None => folder.to_string(),
+            None => {
+                if self.bridge_names
+                    && let Some(name) = folder.strip_prefix("Folders/")
+                    && !name.is_empty()
+                {
+                    return name.to_string();
+                }
+                folder.to_string()
+            }
         }
     }
 

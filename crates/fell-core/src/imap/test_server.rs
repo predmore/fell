@@ -104,6 +104,8 @@ pub(super) struct TestServer {
     pub state: Arc<Mutex<TestState>>,
     /// Bytes the server has written to clients, greetings and replies alike.
     pub sent: Arc<AtomicUsize>,
+    /// Whole-message literals and quoted strings sent to clients.
+    pub body_responses: Arc<AtomicUsize>,
     /// Write verbs, for the outbox tests. Off by default.
     pub writes: Arc<Mutex<WriteFixture>>,
     shutdown: Arc<AtomicBool>,
@@ -117,11 +119,13 @@ impl TestServer {
         let state = Arc::new(Mutex::new(state));
         let shutdown = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicUsize::new(0));
+        let body_responses = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(Mutex::new(WriteFixture::default()));
         let thread_state = Arc::clone(&state);
         let thread_writes = Arc::clone(&writes);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_sent = Arc::clone(&sent);
+        let thread_bodies = Arc::clone(&body_responses);
         let thread = thread::spawn(move || {
             accept_loop(
                 listener,
@@ -129,12 +133,14 @@ impl TestServer {
                 thread_writes,
                 thread_shutdown,
                 thread_sent,
+                thread_bodies,
             )
         });
         Self {
             addr,
             state,
             sent,
+            body_responses,
             writes,
             shutdown,
             thread: Some(thread),
@@ -158,6 +164,7 @@ fn accept_loop(
     writes: Arc<Mutex<WriteFixture>>,
     shutdown: Arc<AtomicBool>,
     sent: Arc<AtomicUsize>,
+    body_responses: Arc<AtomicUsize>,
 ) {
     listener.set_nonblocking(false).expect("blocking");
     loop {
@@ -172,7 +179,7 @@ fn accept_loop(
                 // As long as the client's own timeout: a large fetch on a
                 // loaded machine can still be persisting when the reply ends.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-                handle(stream, &state, &writes, &sent);
+                handle(stream, &state, &writes, &sent, &body_responses);
             }
             Err(_) => break,
         }
@@ -202,6 +209,7 @@ fn handle(
     state: &Arc<Mutex<TestState>>,
     writes: &Arc<Mutex<WriteFixture>>,
     sent: &Arc<AtomicUsize>,
+    body_responses: &AtomicUsize,
 ) {
     let mut write = Counted {
         stream: stream.try_clone().expect("clone"),
@@ -581,19 +589,25 @@ fn handle(
                         );
                         continue;
                     }
-                    if upper_cmd.contains("BODY.PEEK[HEADER.FIELDS (REPLY-TO)]") {
+                    if let Some((field, prefix)) =
+                        [("REPLY-TO", "reply-to:"), ("MESSAGE-ID", "message-id:")]
+                            .into_iter()
+                            .find(|(field, _)| {
+                                upper_cmd.contains(&format!("BODY.PEEK[HEADER.FIELDS ({field})]"))
+                            })
+                    {
                         if matches!(message.body_form, BodyForm::Omitted | BodyForm::Absent) {
                             continue;
                         }
-                        let header = header_fields(&message.raw, "reply-to:");
+                        let header = header_fields(&message.raw, prefix);
                         let literal = match message.body_form {
                             BodyForm::Nil => "NIL".to_string(),
                             _ => format!("{{{}}}", header.len()),
                         };
                         let _ = write.write_all(
                             format!(
-                                "* {seq} FETCH (UID {} BODY[HEADER.FIELDS (REPLY-TO)] {literal}",
-                                message.uid
+                                "* {seq} FETCH (UID {} FLAGS ({}){revision} BODY[HEADER.FIELDS ({field})] {literal}",
+                                message.uid, message.flags.join(" ")
                             )
                             .as_bytes(),
                         );
@@ -666,6 +680,9 @@ fn handle(
                         continue;
                     }
                     let flags = message.flags.join(" ");
+                    if matches!(message.body_form, BodyForm::Literal | BodyForm::Quoted) {
+                        body_responses.fetch_add(1, Ordering::Relaxed);
+                    }
                     match message.body_form {
                         BodyForm::Literal => {
                             let header = format!(

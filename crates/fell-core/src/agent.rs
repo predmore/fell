@@ -697,7 +697,7 @@ impl crate::Store {
             )?;
         }
         // Sync keeps a read state an agent set until the server agrees, and
-        // a star until write-back sends it (sync does not read stars yet).
+        // a star until write-back sends it.
         for (old, new) in &writes {
             crate::store::intents::record(
                 &tx,

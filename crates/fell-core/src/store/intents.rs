@@ -196,8 +196,7 @@ pub(crate) fn clear_flag(
 }
 
 /// The star Fell set on `message_id`, if one is pending. The outbox settles
-/// the intent. Sync collects `\Flagged` as evidence for replay. Applying it
-/// to the displayed star during sync belongs to #102.
+/// the intent. Server observations can update the displayed star afterward.
 pub(crate) fn local_star(
     conn: &Connection,
     account_id: &AccountId,
@@ -219,8 +218,7 @@ pub struct PendingFlags {
     pub message_id: String,
     /// `None`: read state is the server's.
     pub unread: Option<bool>,
-    /// `None`: the star is the server's. Sync does not read stars yet
-    /// (#102), so a star set in Fell stays here until write-back sends it.
+    /// `None`: the star is the server's.
     pub starred: Option<bool>,
 }
 
