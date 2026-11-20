@@ -5788,13 +5788,15 @@ fn status_bar(
     let (sync_label, sync_color) = match reply_check {
         Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
         Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
-        Some(ReplyCheck::Unavailable) => (
-            format!(
-                "Reply-To unavailable · {} to retry",
-                keymap::binding_text(&session.keymap, Action::SyncNow)
-            ),
-            theme.error,
-        ),
+        Some(ReplyCheck::Unavailable) => {
+            let key = keymap::binding_text(&session.keymap, Action::SyncNow);
+            let label = if width < present::NARROW_WIDTH {
+                format!("Retry Reply-To · {key}")
+            } else {
+                format!("Reply-To unavailable · {key} to retry")
+            };
+            (label, theme.error)
+        }
         Some(ReplyCheck::Verified) => (
             format!(
                 "Reply-To verified · {} to reply",
