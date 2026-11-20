@@ -55,8 +55,7 @@ pub struct PartRequest {
 /// A part's decoded bytes on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedPart {
-    /// Owner-only (0600) file named after the part. Read it; do not hand
-    /// it to anything that runs it.
+    /// Owner-only (0600) file named after the part. Its contents are untrusted.
     pub path: PathBuf,
     pub size: u64,
 }
@@ -336,7 +335,10 @@ pub fn fetch_part(
     request: &PartRequest,
     progress: &mut dyn FnMut(u64),
 ) -> Result<CachedPart> {
-    fetch_part_until(backend, cache, request, &mut |fetched| {
+    if let Some(hit) = cache.lookup(request) {
+        return Ok(hit);
+    }
+    fetch_uncached_part(backend, cache, request, &mut |fetched| {
         progress(fetched);
         ControlFlow::Continue(())
     })
@@ -344,15 +346,12 @@ pub fn fetch_part(
 
 /// [`fetch_part`], stopped (and its session closed) when `progress`
 /// answers `Break`.
-fn fetch_part_until(
+fn fetch_uncached_part(
     backend: &dyn MailBackend,
     cache: &PartCache,
     request: &PartRequest,
     progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
 ) -> Result<CachedPart> {
-    if let Some(hit) = cache.lookup(request) {
-        return Ok(hit);
-    }
     let mut differed = false;
     for copy in &request.copies {
         let Some(raw) = backend.fetch_part(
@@ -410,6 +409,10 @@ pub fn prefetch_inline_parts(
 /// What a [`PartFetcher`] reports for one request.
 #[derive(Debug)]
 pub enum PartEvent {
+    /// The part missed the cache and is about to be requested from the server.
+    Downloading {
+        total: u64,
+    },
     /// Encoded bytes read so far, out of the part's encoded size.
     Progress {
         fetched: u64,
@@ -472,9 +475,18 @@ impl PartFetcher {
                         events(PartEvent::Done(Err(cancelled())));
                         continue;
                     }
+                    // Cached files are usable offline, including when the
+                    // configured password command is unavailable.
+                    if let Some(hit) = cache.lookup(&request) {
+                        events(PartEvent::Done(Ok(hit)));
+                        continue;
+                    }
                     let total = request.part.encoded_size;
                     let result = backend().and_then(|backend| {
-                        fetch_part_until(backend.as_ref(), &cache, &request, &mut |fetched| {
+                        if !request.copies.is_empty() {
+                            events(PartEvent::Downloading { total });
+                        }
+                        fetch_uncached_part(backend.as_ref(), &cache, &request, &mut |fetched| {
                             events(PartEvent::Progress { fetched, total });
                             if stopped() {
                                 ControlFlow::Break(())
@@ -618,6 +630,31 @@ mod tests {
             None,
             "tests never use a real cache"
         );
+    }
+
+    #[test]
+    fn a_cached_part_does_not_resolve_backend_credentials_or_report_download_progress() {
+        let root = temp_root("offline-hit");
+        let cache = PartCache::open(&root, DEFAULT_CACHE_BYTES).unwrap();
+        let request = request("msg@x", "2", Some("report.pdf"));
+        let cached = cache.store(&request, b"data").unwrap();
+        let fetcher = PartFetcher::start(
+            || Err(Error::Backend("credentials unavailable".into())),
+            cache,
+        );
+        let (send, receive) = mpsc::channel();
+        fetcher.fetch(request, move |event| {
+            let _ = send.send(event);
+        });
+        match receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            PartEvent::Done(Ok(hit)) => assert_eq!(hit, cached),
+            other => panic!("expected an offline cache hit, got {other:?}"),
+        }
+        drop(fetcher);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

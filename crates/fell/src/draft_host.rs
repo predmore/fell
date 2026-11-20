@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fell_core::AccountId;
-use fell_core::compose::{DraftFields, DraftHub, DraftSession, ReplyParts, ReplyStart};
+use fell_core::compose::{
+    DraftFields, DraftHub, DraftSession, ReplyParts, ReplyStart, ResolvedFile, StoredCompose,
+};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
     px, size,
@@ -168,16 +170,44 @@ impl DraftHome {
         account: &AccountId,
         start: ReplyStart,
     ) -> Result<String, String> {
+        self.new_reply_with_files(hub, account, start, Vec::new())
+    }
+
+    /// Received files have already been copied out of the part cache. Save
+    /// them in the same transaction as the draft before opening its folder.
+    pub fn new_reply_with_files(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        start: ReplyStart,
+        files: Vec<ResolvedFile>,
+    ) -> Result<String, String> {
         let id = new_draft_id();
-        DraftSession::start_reply_in(
-            &self.root,
-            &id,
-            account.clone(),
-            start.fields,
-            "",
-            &start.parts,
-            &self.store,
-        )?;
+        if files.is_empty() {
+            DraftSession::start_reply_in(
+                &self.root,
+                &id,
+                account.clone(),
+                start.fields,
+                "",
+                &start.parts,
+                &self.store,
+            )?;
+        } else {
+            let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+            store
+                .save_compose(&StoredCompose {
+                    id: id.clone(),
+                    account_id: account.clone(),
+                    fields: start.fields,
+                    body: String::new(),
+                    files,
+                    identities: Vec::new(),
+                    owner: String::new(),
+                    reply: start.parts,
+                })
+                .map_err(|err| err.to_string())?;
+        }
         self.open(hub, &id, account)?;
         Ok(id)
     }
@@ -560,6 +590,57 @@ pub(crate) mod tests {
         let hub = DraftHub::new();
         home.open(&hub, &id, &account.id).unwrap();
         check(&hub);
+    }
+
+    #[test]
+    fn a_forward_keeps_carried_files_and_distinct_paths_when_reopened() {
+        let account = me();
+        let home = temp_home("forward-files", &account);
+        let mut parent = parent_message(&account);
+        parent.has_attachment = true;
+        parent.attachment_names = vec!["missing.pdf".into()];
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Forward,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &fell_core::FolderRoles::default(),
+        );
+        let files = [b"one", b"two"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| ResolvedFile {
+                path: format!("attachments/{index}/notes.pdf"),
+                display_name: "notes.pdf".into(),
+                bytes: bytes.to_vec(),
+                inline: false,
+            })
+            .collect::<Vec<_>>();
+        let hub = DraftHub::new();
+        let id = home
+            .new_reply_with_files(&hub, &account.id, start, files.clone())
+            .unwrap();
+        hub.settle_all();
+        drop(hub);
+        std::fs::remove_dir_all(home.root.join(&id)).unwrap();
+        let hub = DraftHub::new();
+        home.open(&hub, &id, &account.id).unwrap();
+        hub.with_session(&id, |session| {
+            let snap = session.snapshot();
+            assert_eq!(snap.attachments.len(), 2);
+            assert!(snap.attachments.iter().all(|file| file.name == "notes.pdf"));
+            assert_eq!(
+                snap.forwarded.unwrap().not_forwarded.as_deref(),
+                Some("missing.pdf")
+            );
+            for file in files {
+                assert_eq!(
+                    std::fs::read(session.folder().join(file.path)).unwrap(),
+                    file.bytes
+                );
+            }
+        })
+        .unwrap();
     }
 
     #[test]

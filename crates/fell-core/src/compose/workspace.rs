@@ -603,8 +603,8 @@ fn push_file(
     }
 }
 
-pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
-const MAX_ATTACHMENT_FILES: usize = 20;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_FILES: usize = 20;
 
 fn limit_issues(count: usize, total_bytes: u64) -> Vec<DraftIssue> {
     let mut issues = Vec::new();

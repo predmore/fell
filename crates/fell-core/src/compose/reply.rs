@@ -467,7 +467,7 @@ pub struct ForwardSummary {
     /// in the zone the forward was written in, so this is its wall-clock
     /// time read as UTC: subtract the local offset to get the instant.
     pub date_wall: Option<i64>,
-    /// The original's attachment names, or `None` when it had none.
+    /// The names of the original files that were omitted, if any.
     pub not_forwarded: Option<String>,
 }
 
@@ -503,9 +503,8 @@ pub fn forward_summary(quote_text: &str) -> Option<ForwardSummary> {
     Some(summary)
 }
 
-/// The forwarded header block and the original, unquoted. Attachments are
-/// named in the block: Fell does not keep their bytes, so they do not go
-/// with the forward.
+/// The forwarded header block and the original, unquoted. The caller
+/// supplies in the message's attachment fields the files it could not carry.
 fn forward_quote(parent: &Message, offset: i64) -> (String, String) {
     let mut header = vec![
         FORWARD_MARK.to_string(),
