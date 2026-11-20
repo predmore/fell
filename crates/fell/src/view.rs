@@ -2669,7 +2669,6 @@ impl Inbox {
         // message on screen. An open palette, folder filter, or help card
         // types those keys and must leave the cursor alone.
         if self.search_conversation_live()
-            && !self.session.search_editing()
             && self.session.focused_attachment().is_none()
             && should_follow_visible(
                 &self.session.overlay,
@@ -2921,6 +2920,10 @@ impl Inbox {
     }
 
     fn search_conversation_live(&self) -> bool {
+        !self.session.search_editing() && self.search_preview_current()
+    }
+
+    fn search_preview_current(&self) -> bool {
         self.session.search.as_ref().is_none_or(|search| {
             self.open_thread == self.session.cursor_id
                 && search.matches_thread(self.session.cursor_id.as_deref())
@@ -3288,7 +3291,7 @@ impl Render for Inbox {
             attachment_download: self.attachment_download.clone(),
             reveal_attachment,
             spin_attachment,
-            search_live: self.search_conversation_live(),
+            preview_current: self.search_preview_current(),
         };
         self.conv_layout_current = panes.1;
         let animating = self.motion.tick(now)
@@ -3433,7 +3436,7 @@ struct ConvFrame {
     attachment_download: Option<(String, String, Download)>,
     reveal_attachment: bool,
     spin_attachment: bool,
-    search_live: bool,
+    preview_current: bool,
 }
 
 /// Observe GPUI's scroll offset before and after it handles a wheel event.
@@ -3659,7 +3662,8 @@ fn shell(
                             .flex_col()
                             .child(preview)
                             .when(
-                                !conv.search_live && !subject.as_ref().is_none_or(String::is_empty),
+                                !conv.preview_current
+                                    && !subject.as_ref().is_none_or(String::is_empty),
                                 |pane| {
                                     pane.child(preview_shield(
                                         &theme,
@@ -3678,7 +3682,7 @@ fn shell(
                             now,
                             Some(conv_scroll),
                             conv_width,
-                            Live(conv.search_live),
+                            Live(conv.preview_current && !session.search_editing()),
                             &conv,
                             window,
                             cx,
@@ -5034,7 +5038,7 @@ fn conversation(
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
-    let retained = !live.0 && session.search.is_some() && !subject.is_empty();
+    let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     let messages: Vec<_> = session
         .messages
         .iter()

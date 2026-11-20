@@ -59,6 +59,8 @@ impl Render for CachedPreview {
                 let frame = ConvFrame {
                     anchor: inbox.hold_landing(),
                     frames: inbox.frames.clone(),
+                    // The outer pane owns the shield when the preview is stale.
+                    preview_current: true,
                     ..ConvFrame::default()
                 };
                 conversation(
@@ -69,7 +71,7 @@ impl Render for CachedPreview {
                     inbox.frame_now,
                     Some(inbox.conv_scroll.clone()),
                     width,
-                    Live(true),
+                    Live(false),
                     &frame,
                     window,
                     cx,
@@ -303,20 +305,29 @@ impl Inbox {
             Removal::Spam => "Spam status updated".to_owned(),
             Removal::Purge => "Removed from Fell".to_owned(),
         };
-        self.session.picked.clear();
-        self.session.visual = false;
-        self.session.anchor_id = None;
+        let accepted = self
+            .session
+            .search
+            .as_ref()
+            .and_then(Search::accepted_generation);
         self.change_mailbox(
             move |store| match removal {
                 Removal::Delete => store.delete_scoped_threads(&account, &scopes),
                 Removal::Spam => store.spam_scoped_threads(&account, &scopes),
-                Removal::Purge => {
-                    let threads: Vec<_> = scopes.iter().map(|(thread, _)| thread.clone()).collect();
-                    store.purge_threads(&account, &threads, &scopes[0].1)
-                }
+                Removal::Purge => store.purge_scoped_threads(&account, &scopes),
             },
             move |inbox, result| match result {
                 Ok(_) => {
+                    if inbox
+                        .session
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.accepted_generation() == accepted)
+                    {
+                        inbox.session.picked.clear();
+                        inbox.session.visual = false;
+                        inbox.session.anchor_id = None;
+                    }
                     inbox.moved_thread = if removal == Removal::Purge { None } else { key };
                     inbox.session.show_toast(done, false);
                     inbox.send_to_server();

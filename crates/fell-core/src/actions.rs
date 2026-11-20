@@ -566,6 +566,45 @@ impl Store {
         })
     }
 
+    /// Permanently remove each search hit from its own Trash scope.
+    /// A stale target aborts the batch before any row is changed.
+    pub fn purge_scoped_threads(
+        &self,
+        account: &AccountId,
+        targets: &[(ThreadId, String)],
+    ) -> Result<LocalAction> {
+        self.require_account(account)?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        ensure_action_schema(&tx)?;
+        let roles = self.folder_roles(account)?;
+        let mut plans = Vec::new();
+        let mut seen = HashSet::new();
+        for (thread, folder) in targets {
+            let folder = canonical_folder(folder)?;
+            if !roles.is(FolderRole::Trash, &folder) {
+                return Err(Error::Action(
+                    "permanent delete only removes mail from Trash".into(),
+                ));
+            }
+            if !seen.insert(thread) {
+                continue;
+            }
+            let planned = plan_expunge(&load_thread(&tx, account, thread)?, &folder);
+            if planned.is_empty() {
+                return Err(Error::Action(format!("no messages in {folder}")));
+            }
+            plans.extend(planned);
+        }
+        if plans.is_empty() {
+            return Err(Error::Action("no conversation".into()));
+        }
+        let trash = roles.name(FolderRole::Trash);
+        let summary = format!("deleted {} from {trash} for good", plans.len());
+        let action = record_and_apply(&tx, account, ActionKind::Purge, &summary, &plans)?;
+        tx.commit()?;
+        Ok(action)
+    }
+
     /// Discard local drafts together as one undoable action. The row and
     /// its dependent data stay intact, including any independent send record.
     pub(crate) fn discard_compose_drafts(
@@ -2116,6 +2155,51 @@ mod tests {
         assert!(!first_messages[0].starred);
         assert!(first_messages[1].starred);
         assert_eq!(store.undo(&owner).unwrap().id, flag.id);
+    }
+
+    #[test]
+    fn scoped_purge_is_atomic_and_preserves_copies_outside_trash() {
+        let store = open(&[("a1", "a@x")]);
+        let owner = account("a1");
+        let mut first = sample("a1", "first@x", "First", "first body");
+        first.folders = vec![FOLDER_TRASH.into(), FOLDER_SENT.into()];
+        let mut second = sample("a1", "second@x", "Second", "second body");
+        second.folders = vec!["tRaSh".into()];
+        let first = store.upsert_message(&first).unwrap();
+        let second = store.upsert_message(&second).unwrap();
+        let stale = store
+            .upsert_message(&sample("a1", "stale@x", "Stale", "stale body"))
+            .unwrap();
+
+        assert_eq!(
+            text(store.purge_scoped_threads(
+                &owner,
+                &[
+                    (first.clone(), FOLDER_TRASH.into()),
+                    (stale, "trash".into())
+                ],
+            )),
+            "no messages in trash"
+        );
+        assert_eq!(
+            folders_of(&store, &first),
+            [vec![FOLDER_TRASH, FOLDER_SENT]]
+        );
+        assert_eq!(text(store.undo(&owner)), "nothing to undo");
+
+        let action = store
+            .purge_scoped_threads(
+                &owner,
+                &[
+                    (first.clone(), FOLDER_TRASH.into()),
+                    (second.clone(), "tRaSh".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(action.kind, ActionKind::Purge);
+        assert_eq!(folders_of(&store, &first), [vec![FOLDER_SENT]]);
+        assert!(messages(&store, "a1", &second).is_empty());
+        assert_eq!(text(store.undo(&owner)), "nothing to undo");
     }
 
     fn open(ids: &[(&str, &str)]) -> Store {
