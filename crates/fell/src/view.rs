@@ -878,6 +878,9 @@ impl Inbox {
         // each write is read again for it, whichever message it fills.
         let waiting =
             self.open_thread.is_some() && present::awaiting_bodies(&self.session.messages);
+        for row in &rows {
+            self.row_widths.observe_labels(&row.id, &row.labels, now);
+        }
         self.session.set_page(rows, more_before, more_after, unread);
         if let Some(key) = &intent.select {
             self.session.select_if_present(&key.thread_id.0);

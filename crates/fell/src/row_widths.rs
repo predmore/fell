@@ -280,20 +280,26 @@ impl RowWidths {
         kept.frame(now)
     }
 
-    /// Crossfade labels only when a row already on screen changes.
+    /// Start a fade when refreshed labels replace a visible row's labels.
+    pub fn observe_labels(&mut self, id: &str, labels: &[String], now: Instant) {
+        if let Some(kept) = self.rows.get_mut(id)
+            && kept.labels.as_deref() != Some(labels)
+        {
+            kept.previous_labels = kept
+                .labels
+                .replace(labels.to_vec())
+                .zip(self.motion.start(motion::FADE, now));
+        }
+    }
+
     pub fn labels_frame(
         &mut self,
         id: &str,
         labels: &[String],
         now: Instant,
     ) -> Option<(Vec<String>, f32)> {
+        self.observe_labels(id, labels, now);
         let kept = self.rows.get_mut(id)?;
-        if kept.labels.as_deref() != Some(labels) {
-            kept.previous_labels = kept
-                .labels
-                .replace(labels.to_vec())
-                .zip(self.motion.start(motion::FADE, now));
-        }
         if kept
             .previous_labels
             .as_ref()
