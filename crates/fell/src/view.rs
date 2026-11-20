@@ -30,7 +30,7 @@ use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
-use crate::keymap::KeyId;
+use crate::keymap::{Action, KeyId};
 use crate::mail_body::{
     self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
 };
@@ -53,6 +53,7 @@ use crate::theme::{self, Theme};
 use self::disclosure::disclosure;
 
 pub fn run() {
+    eprintln!("{}: opening inbox", fell_version::VERSION);
     Application::new().run(|cx: &mut App| {
         // Agents' drafts open in a compose window from here; see draft_host.
         let _hub = crate::draft_host::host_agent_drafts(cx);
@@ -2989,9 +2990,8 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
-        let viewport_h = f32::from(window.viewport_size().height);
         self.motion
-            .fit_card(card_fit(&self.session, viewport_h), now);
+            .fit_card(card_fit(&self.session, &self.theme, window), now);
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
@@ -5625,6 +5625,10 @@ const PICKER_PX: f32 = 420.0;
 const PALETTE_MAX_PX: f32 = 420.0;
 const PICKER_MAX_PX: f32 = 380.0;
 const PALETTE_ROW_PX: f32 = 36.0;
+const PALETTE_ROW_MARGIN: f32 = 4.0;
+const PALETTE_ROW_PAD: f32 = 10.0;
+const ABOUT_ROW_PAD_Y: f32 = 7.0;
+const ABOUT_ROW_GAP: f32 = 2.0;
 const PICKER_ROW_PX: f32 = 34.0;
 /// Where the palette, folder picker and help card sit below the window's top.
 const CARD_TOP_PX: f32 = 72.0;
@@ -5632,18 +5636,54 @@ const CARD_TOP_PX: f32 = 72.0;
 /// How tall the open palette or folder picker should be to hold its items
 /// (its border, the 44 px query line and 4 px above and below the rows),
 /// up to its maximum and the window. `None` for any other overlay.
-fn card_fit(session: &Session, viewport_h: f32) -> Option<f32> {
-    let (rows, row_px, max) = match session.overlay {
-        Overlay::Palette => (session.palette().len(), PALETTE_ROW_PX, PALETTE_MAX_PX),
-        Overlay::Folders => (session.folder_choices().len(), PICKER_ROW_PX, PICKER_MAX_PX),
+fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
+    let (rows_px, max) = match session.overlay {
+        Overlay::Palette => {
+            let rows_px = session.palette().into_iter().map(|item| match item.action {
+                Action::About => about_palette_height(theme, window),
+                _ => PALETTE_ROW_PX,
+            });
+            (rows_px.sum(), PALETTE_MAX_PX)
+        }
+        Overlay::Folders => (
+            session.folder_choices().len() as f32 * PICKER_ROW_PX,
+            PICKER_MAX_PX,
+        ),
         _ => return None,
     };
     Some(present::card_height(
-        rows,
-        row_px,
+        rows_px,
         max,
-        viewport_h - CARD_TOP_PX - 16.0,
+        f32::from(window.viewport_size().height) - CARD_TOP_PX - 16.0,
     ))
+}
+
+/// The build stamp wraps at the same width and line height used in the row.
+fn about_palette_height(theme: &Theme, window: &Window) -> f32 {
+    let mono_px = theme.mono_px.max(12.0);
+    let mut style = conversation_line_style(window, theme, px(mono_px));
+    if let Some(family) = &theme.mono_family {
+        style.font_family = family.clone().into();
+    }
+    let width = f32::from(window.viewport_size().width).min(PALETTE_PX);
+    let text_width = (width - 2.0 - 2.0 * (PALETTE_ROW_MARGIN + PALETTE_ROW_PAD)).max(1.0);
+    let stamp = fell_version::VERSION;
+    let lines = window.text_system().shape_text(
+        stamp.into(),
+        px(mono_px),
+        &[style.to_run(stamp.len())],
+        Some(px(text_width)),
+        None,
+    );
+    let stamp_height = lines
+        .ok()
+        .and_then(|lines| {
+            lines
+                .first()
+                .map(|line| f32::from(line.size(px(mono_px + 4.0)).height))
+        })
+        .unwrap_or(mono_px + 4.0);
+    theme.ui_px + 4.0 + stamp_height + 2.0 * ABOUT_ROW_PAD_Y + ABOUT_ROW_GAP
 }
 const HELP_PX: f32 = 520.0;
 
@@ -5672,6 +5712,9 @@ fn overlay(
         .flex()
         .justify_center()
         .pt(px(CARD_TOP_PX - drop))
+        .when(session.overlay == Overlay::About, |layer| {
+            layer.items_start()
+        })
         .when(live, |layer| {
             layer.occlude().on_mouse_down(
                 MouseButton::Left,
@@ -5691,6 +5734,7 @@ fn overlay(
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::Help => help(theme, session, cx).opacity(opacity).into_any_element(),
+            Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }
@@ -5705,6 +5749,7 @@ fn palette(
     let selected = session.palette_index;
     div()
         .w(px(PALETTE_PX))
+        .max_w_full()
         .max_h(px(PALETTE_MAX_PX))
         .bg(rgb(theme.surface))
         .border_1()
@@ -5747,11 +5792,17 @@ fn palette(
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let action = item.action;
+                    let is_about = action == Action::About;
+                    let detail = if is_about {
+                        fell_version::VERSION
+                    } else {
+                        item.binding.as_str()
+                    };
                     div()
                         .id(gpui::ElementId::named_usize("palette", index))
-                        .h(px(PALETTE_ROW_PX))
-                        .mx(px(4.))
-                        .px(px(10.))
+                        .when(!is_about, |row| row.h(px(PALETTE_ROW_PX)))
+                        .mx(px(PALETTE_ROW_MARGIN))
+                        .px(px(PALETTE_ROW_PAD))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -5783,19 +5834,65 @@ fn palette(
                                 inbox.apply_step(step, before, cx);
                             }),
                         )
-                        .child(div().flex_1().child(item.label.clone()))
+                        .when(is_about, |row| {
+                            row.flex_col()
+                                .items_start()
+                                .py(px(ABOUT_ROW_PAD_Y))
+                                .gap(px(ABOUT_ROW_GAP))
+                        })
+                        .child(
+                            div()
+                                .when(!is_about, |label| label.flex_1())
+                                .when(is_about, |label| label.line_height(px(theme.ui_px + 4.0)))
+                                .child(item.label.clone()),
+                        )
                         .child(
                             div()
                                 .font_family_opt(theme.mono_family.clone())
-                                .text_size(px((theme.mono_px).max(12.0)))
+                                .text_size(px(theme.mono_px.max(12.0)))
+                                .when(is_about, |stamp| {
+                                    stamp
+                                        .w_full()
+                                        .line_height(px(theme.mono_px.max(12.0) + 4.0))
+                                })
                                 .text_color(rgb(if index == selected {
                                     theme.on_selection
                                 } else {
                                     theme.dimmed
                                 }))
-                                .child(item.binding.clone()),
+                                .child(detail.to_owned()),
                         )
                 })),
+        )
+}
+
+fn about(theme: &Theme, cx: &mut Context<Inbox>) -> gpui::Div {
+    div()
+        .w(px(420.))
+        .mx(px(12.))
+        .p(px(16.))
+        .bg(rgb(theme.surface))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .rounded_md()
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|inbox, _, _, cx| {
+                if inbox.session.overlay == Overlay::About {
+                    cx.stop_propagation();
+                }
+            }),
+        )
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("About Fell"))
+        .child(
+            div()
+                .font_family_opt(theme.mono_family.clone())
+                .text_size(px(theme.mono_px.max(12.0)))
+                .child(fell_version::VERSION),
         )
 }
 
@@ -5919,9 +6016,10 @@ fn folder_picker(
 }
 
 fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
-    let lines: Vec<_> = crate::keymap::Action::all()
+    let lines: Vec<_> = Action::all()
         .iter()
         .copied()
+        .filter(|action| *action != Action::About)
         .map(|action| {
             (
                 action.label().to_string(),

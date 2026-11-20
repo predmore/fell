@@ -60,6 +60,7 @@ pub enum Action {
     ToggleQuotes,
     Palette,
     Help,
+    About,
     ReopenReview,
 }
 
@@ -103,6 +104,7 @@ impl Action {
             Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
+            Self::About => "About Fell",
             Self::ReopenReview => "Reopen the agent review that closed",
         }
     }
@@ -112,7 +114,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 38] = [
+const ALL_ACTIONS: [Action; 39] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -151,6 +153,7 @@ const ALL_ACTIONS: [Action; 38] = [
     Action::Palette,
     Action::Help,
     Action::ReopenReview,
+    Action::About,
 ];
 
 #[derive(Clone, Debug)]
@@ -409,7 +412,11 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
     let mut items: Vec<(i32, usize, PaletteItem)> = Vec::new();
     for (index, action) in Action::all().iter().copied().enumerate() {
         let label = action.label();
-        let Some(score) = fuzzy(query, label) else {
+        let score = fuzzy(query, label).or_else(|| match action {
+            Action::About => fuzzy(query, "version"),
+            _ => None,
+        });
+        let Some(score) = score else {
             continue;
         };
         let recent_rank = recent
