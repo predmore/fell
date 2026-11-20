@@ -249,6 +249,7 @@ pub struct DraftSession {
     /// second press or reopened view sends it again. The mailbox holds the
     /// record a restart reads; see [`Self::begin_send`].
     send_lock: Option<SendLock>,
+    send_guard: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl DraftSession {
@@ -379,6 +380,7 @@ impl DraftSession {
             agent_seen: HashMap::new(),
             reply: ReplyParts::default(),
             send_lock: None,
+            send_guard: None,
         };
         if let Some(email) = email_of(&session.fields.from) {
             session.identities.insert(email);
@@ -1032,6 +1034,13 @@ impl DraftSession {
         self.writer.as_ref().map(DraftWriter::waiter)
     }
 
+    /// Save the state undo must restore, including typing still waiting on
+    /// the editor's debounce. Any subsequent edit changes the generation.
+    pub(crate) fn save_for_discard(&mut self) -> Result<Option<SaveWaiter>, String> {
+        self.flush()?;
+        Ok(self.save_waiter())
+    }
+
     /// `text` is Fell's own: the last text it queued, or, with a writer, a
     /// save numbered `since` or later (a read made when save `since` was the
     /// newest on disk shows that save or a newer one).
@@ -1254,17 +1263,22 @@ impl DraftSession {
             return Err(lock.reason().into());
         }
         let claimed = self.send_store().and_then(|store| {
-            store
+            let guard = store
+                .lock_compose_send(&self.id)
+                .map_err(|err| err.to_string())?;
+            let lock = store
                 .claim_compose_send(&self.account_id, &self.id, Some(message_id.as_str()))
-                .map_err(|err| err.to_string())
+                .map_err(|err| err.to_string())?;
+            Ok((lock, guard))
         });
         match claimed {
-            Ok(None) => {
+            Ok((None, guard)) => {
                 self.send_lock = Some(SendLock::InFlight);
+                self.send_guard = guard.map(std::sync::Arc::new);
                 Ok(())
             }
             // The mailbox knows of a send this session did not see.
-            Ok(Some(lock)) => {
+            Ok((Some(lock), _)) => {
                 self.send_lock = Some(lock);
                 Err(lock.reason().into())
             }
@@ -1283,6 +1297,15 @@ impl DraftSession {
             });
         }
         let store = self.send_store()?;
+        let _guard = store
+            .lock_compose_send(&self.id)
+            .map_err(|err| err.to_string())?;
+        if store
+            .compose_is_discarded(&self.id)
+            .map_err(|err| err.to_string())?
+        {
+            return Err("Draft was discarded".into());
+        }
         store
             .finish_compose_send(&self.account_id, &self.id, None)
             .map_err(|err| format!("could not unlock this draft in the mailbox ({err})"))?;
@@ -1329,6 +1352,7 @@ impl DraftSession {
                 "could not record how this send ended ({err}); after a restart this draft will read as possibly sent"
             ));
         }
+        self.send_guard = None;
     }
 
     /// Apply confirmation of a recorded uncertain send. A live transfer
@@ -1357,12 +1381,16 @@ impl DraftSession {
     /// like a save. Never creates a mailbox.
     fn send_store(&self) -> Result<crate::Store, String> {
         let path = self
-            .store_path
-            .clone()
-            .or_else(|| persist::remembered_store_path(&self.id))
+            .mailbox_path()
             .filter(|path| path.is_file())
             .ok_or_else(|| String::from("this draft has no mailbox"))?;
         crate::Store::open(&path).map_err(|err| err.to_string())
+    }
+
+    pub(crate) fn mailbox_path(&self) -> Option<PathBuf> {
+        self.store_path
+            .clone()
+            .or_else(|| persist::remembered_store_path(&self.id))
     }
 
     /// Keep the lock of the session this one replaces in the hub.
@@ -1373,6 +1401,7 @@ impl DraftSession {
             || (self.send_lock != Some(SendLock::Sent) && previous.send_lock.is_some())
         {
             self.send_lock = previous.send_lock;
+            self.send_guard.clone_from(&previous.send_guard);
         }
     }
 

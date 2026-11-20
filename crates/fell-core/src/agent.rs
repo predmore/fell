@@ -543,25 +543,19 @@ impl crate::Store {
             Some(actor) => Some(require_token(actor, "actor")?),
             None => None,
         };
-        let sql = match actor {
-            Some(_) => {
-                "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
-                        in_reply_to, thread_id, created_unix
-                 FROM review_drafts
-                 WHERE account_id = ?1 AND actor = ?2
-                 ORDER BY id ASC"
-            }
-            None => {
-                "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
-                        in_reply_to, thread_id, created_unix
-                 FROM review_drafts WHERE account_id = ?1 ORDER BY id ASC"
-            }
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = match actor {
-            Some(actor) => stmt.query_map(params![account_id.as_str(), actor], map_draft)?,
-            None => stmt.query_map(params![account_id.as_str()], map_draft)?,
-        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, actor, to_addrs, cc_addrs, bcc_addrs, subject, body,
+                    in_reply_to, thread_id, created_unix
+             FROM review_drafts r
+             WHERE r.account_id = ?1 AND (?2 IS NULL OR r.actor = ?2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM compose_drafts d
+                   WHERE d.id = 'r' || r.id AND d.account_id = r.account_id
+                     AND d.discarded_action_id IS NOT NULL
+               )
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id.as_str(), actor], map_draft)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1109,6 +1103,17 @@ fn undo_draft(conn: &Connection, account_id: &AccountId, action_id: i64) -> Resu
     }
     drop(stmt);
     for draft_id in ids {
+        let discarded: bool = conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM compose_drafts
+                 WHERE account_id = ?1 AND id = 'r' || ?2 AND discarded_action_id IS NOT NULL
+             )",
+            params![account_id.as_str(), draft_id],
+            |row| row.get(0),
+        )?;
+        if discarded {
+            return Err(Error::Action("Draft was discarded in Fell".into()));
+        }
         conn.execute(
             "DELETE FROM review_drafts WHERE account_id = ?1 AND id = ?2",
             params![account_id.as_str(), draft_id],

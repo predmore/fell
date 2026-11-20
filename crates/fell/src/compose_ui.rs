@@ -301,6 +301,7 @@ pub struct ComposeView {
     flush_gen: u64,
     /// `:q` asked to close this window. The next frame removes it.
     closing: bool,
+    discarding: bool,
     /// Close once a send went out, so the person is back in the inbox and
     /// the sent draft does not linger. The demo window stays, showing sent.
     close_on_send: bool,
@@ -375,6 +376,7 @@ impl ComposeView {
             flush_pending: false,
             flush_gen: 0,
             closing: false,
+            discarding: false,
             close_on_send: false,
             bracket: None,
             focused_hunk: None,
@@ -730,6 +732,14 @@ impl ComposeView {
             return;
         }
         self.follow_focus();
+        if self
+            .hub
+            .with_session(self.draft_id.as_ref(), |_| ())
+            .is_none()
+        {
+            self.closing = true;
+            return;
+        }
         if !self.pull_unpainted() {
             self.mark_painted();
         }
@@ -763,6 +773,7 @@ impl ComposeView {
         }
         self.folder = folder;
         self.draft_id = id.into();
+        self.discarding = false;
         self.editor = Editor::from_body(&snap.body);
         self.applied_revision = snap.revision;
         self.field = Field::Body;
@@ -1156,6 +1167,9 @@ impl ComposeView {
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        if self.discarding || self.closing {
+            return;
+        }
         self.touched = true;
         let key = compose_key(&event.keystroke);
         let key = key.as_str();
@@ -1170,19 +1184,25 @@ impl ComposeView {
         // A draft being sent, or already sent, is read-only: what is on
         // screen must stay what went out.
         let id = self.draft_id.to_string();
+        let palette_shortcut =
+            key == "p" && event.keystroke.modifiers.control && event.keystroke.modifiers.shift;
         let typed =
             event.keystroke.key_char.as_deref().filter(|_| {
                 !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform
             });
-        if let Some(Some(_)) = self.hub.with_session(&id, |session| session.send_lock())
+        if let Some(Some(lock)) = self.hub.with_session(&id, |session| session.send_lock())
             && key != "escape"
         {
             // Still a window: `:` and its commands work, so `:q` closes
             // it; `run_action` refuses the ones that would change the draft.
             if self.palette.is_some() {
                 self.palette_key(key, typed, cx);
-            } else if key == ":" {
+            } else if key == ":" || palette_shortcut {
                 self.palette = Some(String::new());
+            } else if self.leader {
+                self.leader_key(key, cx);
+            } else if key == " " && lock == SendLock::MaybeSent {
+                self.begin_leader();
             } else {
                 // Shown as the idle hint for this lock; the bar's right side
                 // already gives the reason.
@@ -1229,6 +1249,7 @@ impl ComposeView {
         }
         match self.editor.mode {
             Mode::Insert => self.insert_key(key, typed),
+            Mode::Normal if palette_shortcut => self.palette = Some(String::new()),
             Mode::Normal => self.normal_key(key, typed),
             Mode::Visual => self.visual_key(key),
         }
@@ -1298,6 +1319,7 @@ impl ComposeView {
                     .clear(self.draft_id.as_ref());
             }
             "send" => self.send(cx),
+            "discard" => self.discard(cx),
             "preview" => {
                 self.preview = !self.preview;
                 self.status = if self.preview {
@@ -1332,6 +1354,30 @@ impl ComposeView {
             }
             _ => {}
         }
+    }
+
+    fn discard(&mut self, cx: &mut Context<Self>) {
+        let id = self.draft_id.to_string();
+        let hub = self.hub.clone();
+        self.discarding = true;
+        let discard = cx.background_spawn({
+            let id = id.clone();
+            async move { hub.discard_open(&id) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = discard.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.draft_id.as_ref() == id {
+                    view.discarding = false;
+                    match result {
+                        Ok(()) => view.closing = true,
+                        Err(err) => view.status = err.to_string().into(),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn send_panel_key(&mut self, key: &str, modifiers: &gpui::Modifiers, cx: &mut Context<Self>) {
@@ -1374,14 +1420,15 @@ impl ComposeView {
     fn leader_key(&mut self, key: &str, cx: &mut Context<Self>) {
         match key {
             "m" => {
-                self.status = "mail: s send · p preview · r raw · q quote · t theme".into();
+                self.status =
+                    "mail: d discard · s send · p preview · r raw · q quote · t theme".into();
                 return;
             }
             "a" => {
                 self.status = "agent: k keep · x reject".into();
                 return;
             }
-            "s" | "p" | "r" | "q" | "t" | "k" | "x" => {}
+            "d" | "s" | "p" | "r" | "q" | "t" | "k" | "x" => {}
             "escape" => {
                 self.leader = false;
                 self.which_visible = false;
@@ -1397,6 +1444,7 @@ impl ComposeView {
         let action = if status.starts_with("mail") {
             match key {
                 "s" => "send",
+                "d" => "discard",
                 "p" => "preview",
                 "r" => "raw",
                 "q" => "quote",
@@ -1417,6 +1465,13 @@ impl ComposeView {
         if !action.is_empty() {
             self.run_action(action, cx);
         }
+    }
+
+    fn begin_leader(&mut self) {
+        self.leader = true;
+        self.leader_at = Some(std::time::Instant::now());
+        self.which_visible = false;
+        self.status = "space".into();
     }
 
     fn field_key(&mut self, key: &str, typed: Option<&str>) {
@@ -1519,12 +1574,7 @@ impl ComposeView {
             return;
         }
         match key {
-            " " => {
-                self.leader = true;
-                self.leader_at = Some(std::time::Instant::now());
-                self.which_visible = false;
-                self.status = "space".into();
-            }
+            " " => self.begin_leader(),
             ":" => self.palette = Some(String::new()),
             "i" => {
                 self.editor.mode = Mode::Insert;
@@ -1670,10 +1720,10 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_from_hub();
         if self.closing {
             window.remove_window();
         }
-        self.sync_from_hub();
         let attempt = cx
             .global::<SendAttempts>()
             .failure(self.draft_id.as_ref())
@@ -1828,11 +1878,14 @@ impl Render for ComposeView {
                 .when_some(mono, |bar, family| bar.font_family(family))
             }))
             .children(self.which_visible.then(|| which_key(colors)))
-            .children(
-                self.palette
-                    .as_ref()
-                    .map(|query| palette_view(query, palette_help, colors)),
-            )
+            .children(self.palette.as_ref().map(|query| {
+                palette_view(
+                    query,
+                    palette_help,
+                    matches!(lock, None | Some(SendLock::MaybeSent)),
+                    colors,
+                )
+            }))
             .children(self.preview.then(|| preview_scrim(colors)))
     }
 }
@@ -5345,13 +5398,21 @@ fn which_key(colors: Palette) -> gpui::Div {
         .child(
             div()
                 .text_color(rgb(colors.dim))
-                .child("s send   p preview   r raw   q quote   t theme"),
+                .child("d discard   s send   p preview   r raw   q quote   t theme"),
         )
         .child("space a  agent edit")
         .child(div().text_color(rgb(colors.dim)).child("k keep   x reject"))
 }
 
-fn palette_view(query: &str, commands: &'static str, colors: Palette) -> gpui::Div {
+const DISCARD_DRAFT_LABEL: &str = "Discard draft";
+
+fn palette_view(
+    query: &str,
+    commands: &'static str,
+    can_discard: bool,
+    colors: Palette,
+) -> gpui::Div {
+    let discard_selected = palette_action(query) == Some("discard");
     div()
         .absolute()
         .top(px(80.))
@@ -5363,6 +5424,26 @@ fn palette_view(query: &str, commands: &'static str, colors: Palette) -> gpui::D
         .p_3()
         .child(format!(":{query}"))
         .child(div().text_sm().text_color(rgb(colors.dim)).child(commands))
+        .when(
+            can_discard && (query.trim().is_empty() || discard_selected),
+            |panel| {
+                panel.child(
+                    div()
+                        .mt_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_sm()
+                        .when(discard_selected, |row| row.bg(rgb(colors.selection)))
+                        .child(DISCARD_DRAFT_LABEL)
+                        .child(div().text_color(rgb(colors.dim)).child("Space m d")),
+                )
+            },
+        )
 }
 
 /// A scrim of page colour over the whole window, so the draft behind the
@@ -5803,7 +5884,11 @@ fn palette_action(query: &str) -> Option<&'static str> {
             found = Some(name);
         }
     }
-    found
+    found.or_else(|| {
+        (query == "d"
+            || (query.len() > 1 && crate::keymap::fuzzy(&query, DISCARD_DRAFT_LABEL).is_some()))
+        .then_some("discard")
+    })
 }
 
 /// The key as the compose window matches it. GPUI names keys ("space",
@@ -6316,7 +6401,10 @@ mod tests {
 
     #[test]
     fn a_substring_of_send_is_not_a_send_command() {
-        assert_eq!(super::palette_action("d"), None);
+        assert_eq!(super::palette_action("d"), Some("discard"));
+        assert_eq!(super::palette_action("draft"), Some("discard"));
+        assert_eq!(super::palette_action("dscrd"), Some("discard"));
+        assert_eq!(super::palette_action("a"), None);
         assert_eq!(super::palette_action("e"), None);
         assert_eq!(super::palette_action("n"), None);
         assert_eq!(super::palette_action("end"), None);
@@ -6332,6 +6420,9 @@ mod tests {
         assert_eq!(super::palette_action("qu"), Some("quote"));
         assert_eq!(super::palette_action("cl"), Some("close"));
         assert_eq!(super::palette_action("details"), Some("details"));
+        assert_eq!(super::palette_action("dismiss"), Some("dismiss"));
+        assert_eq!(super::palette_action("discard"), Some("discard"));
+        assert_eq!(super::palette_action("Discard draft"), Some("discard"));
         assert_eq!(super::palette_action("unl"), None);
         assert_eq!(super::palette_action("unlock"), Some("unlock"));
     }

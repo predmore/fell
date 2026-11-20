@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     quote_text TEXT NOT NULL DEFAULT '',
     quote_html TEXT NOT NULL DEFAULT '',
     reply_to_unverified INTEGER NOT NULL DEFAULT 0,
+    discarded_action_id INTEGER,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
 
@@ -3755,6 +3756,10 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
         (
             "reply_to_unverified",
             "ALTER TABLE compose_drafts ADD COLUMN reply_to_unverified INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "discarded_action_id",
+            "ALTER TABLE compose_drafts ADD COLUMN discarded_action_id INTEGER",
         ),
     ] {
         if have.iter().any(|column| column == name) {

@@ -4,8 +4,11 @@
 //! SQLite so a restart loses nothing.
 
 use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use fs4::fs_std::FileExt;
 use rusqlite::{OptionalExtension, params};
 
 use crate::store::Store;
@@ -84,6 +87,53 @@ CREATE TABLE IF NOT EXISTS compose_review (
 const SEND_MAYBE_SENT: &str = "maybe-sent";
 const SEND_SENT: &str = "sent";
 const SEND_CLEAR: &str = "clear";
+pub(super) const SEND_IN_PROGRESS: &str = "Retry after send";
+
+pub(crate) fn mark_discarded(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    id: &str,
+    action_id: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE compose_drafts AS d SET discarded_action_id = ?3
+         WHERE d.account_id = ?1 AND d.id = ?2 AND d.discarded_action_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM compose_send s
+               WHERE s.account_id = d.account_id AND s.draft_id = d.id AND s.state = ?4
+           )
+           AND (d.owner = '' OR EXISTS (
+               SELECT 1 FROM review_drafts r
+               WHERE r.account_id = d.account_id AND 'r' || r.id = d.id
+           ))",
+        params![account.as_str(), id, action_id, SEND_SENT],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Decide what is visible in Drafts under the same write lock that restores
+/// the batch. A Sent match arriving during the discard keeps its send lock.
+pub(crate) fn undo_discard(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    action_id: i64,
+) -> Result<(i64, i64)> {
+    let (restored, confirmed) = conn.query_row(
+        "SELECT COUNT(*) - COUNT(s.draft_id), COUNT(s.draft_id)
+         FROM compose_drafts d
+         LEFT JOIN compose_send s ON s.account_id = d.account_id
+             AND s.draft_id = d.id AND s.state = ?3
+         WHERE d.account_id = ?1 AND d.discarded_action_id = ?2",
+        params![account.as_str(), action_id, SEND_SENT],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    conn.execute(
+        "UPDATE compose_drafts SET discarded_action_id = NULL
+         WHERE account_id = ?1 AND discarded_action_id = ?2",
+        params![account.as_str(), action_id],
+    )?;
+    Ok((restored, confirmed))
+}
 
 /// Confirm only the exact id observed on an IMAP copy in the account's
 /// listed Sent mailbox. Stored conversation rows can merge other copies by
@@ -184,7 +234,8 @@ const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
             THEN compose_drafts.quote_text ELSE excluded.quote_text END,
         quote_html = CASE WHEN excluded.quote_html = ''
             THEN compose_drafts.quote_html ELSE excluded.quote_html END,
-        reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified";
+        reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified
+     WHERE compose_drafts.discarded_action_id IS NULL";
 
 impl Store {
     pub fn save_compose(&self, draft: &StoredCompose) -> Result<()> {
@@ -205,7 +256,7 @@ impl Store {
         review: Option<&StoredReview>,
     ) -> Result<()> {
         let tx = crate::store::begin_immediate(&self.conn)?;
-        tx.execute(
+        let written = tx.execute(
             UPSERT_COMPOSE,
             params![
                 draft.id,
@@ -226,6 +277,9 @@ impl Store {
                 draft.reply.reply_to_unverified,
             ],
         )?;
+        if written == 0 {
+            return Err(crate::Error::Action("Draft was discarded".into()));
+        }
         if let Some(files) = files {
             tx.execute(
                 "DELETE FROM compose_attachments WHERE draft_id = ?1",
@@ -291,6 +345,43 @@ impl Store {
             .optional()?)
     }
 
+    /// A live SMTP transfer owns this lock even across app processes. The
+    /// file stays in place so a crash releases the lock without changing
+    /// the durable, possibly-sent record or letting callers lock two inodes.
+    pub(crate) fn lock_compose_send(&self, id: &str) -> Result<Option<File>> {
+        workspace::validate_id(id).map_err(crate::Error::Invalid)?;
+        let Some(db) = self.db_path() else {
+            return Ok(None);
+        };
+        let mut directory = fs::canonicalize(db)?.into_os_string();
+        directory.push(".compose-locks");
+        let directory = PathBuf::from(directory);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(directory.join(id))?;
+        if !FileExt::try_lock_exclusive(&file)? {
+            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
+        }
+        Ok(Some(file))
+    }
+
+    pub(crate) fn compose_is_discarded(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM compose_drafts WHERE id = ?1 AND discarded_action_id IS NOT NULL
+             )",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Claim `draft_id` for one send, before anything is transmitted. The
     /// record reads "may have been sent" until [`Self::finish_compose_send`]
     /// says otherwise, so a crash mid-send leaves the draft locked.
@@ -306,7 +397,10 @@ impl Store {
         self.conn.pragma_update(None, "synchronous", "FULL")?;
         let claimed = self.conn.execute(
             "INSERT INTO compose_send (account_id, draft_id, state, message_id, updated_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM compose_drafts WHERE id = ?2 AND discarded_action_id IS NOT NULL
+             )
              ON CONFLICT(account_id, draft_id) DO UPDATE SET
                 state = excluded.state,
                 message_id = excluded.message_id,
@@ -323,6 +417,9 @@ impl Store {
         )?;
         if claimed == 1 {
             return Ok(None);
+        }
+        if self.compose_is_discarded(draft_id)? {
+            return Err(crate::Error::Action("Draft was discarded".into()));
         }
         Ok(Some(
             self.load_compose_send(account_id, draft_id)?
@@ -439,7 +536,7 @@ impl Store {
                 "SELECT account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
                         subject, body, in_reply_to, identities, owner,
                         references_header, quote_text, quote_html, reply_to_unverified
-                 FROM compose_drafts WHERE id = ?1",
+                 FROM compose_drafts WHERE id = ?1 AND discarded_action_id IS NULL",
                 params![id],
                 |row| {
                     Ok((
@@ -520,6 +617,7 @@ impl Store {
              FROM compose_drafts d
              LEFT JOIN compose_send s ON s.account_id = d.account_id AND s.draft_id = d.id
              WHERE d.account_id = ?1
+               AND d.discarded_action_id IS NULL
                AND IFNULL(s.state, ?2) != ?3
                AND (d.owner = '' OR EXISTS (
                    SELECT 1 FROM review_drafts r
@@ -828,10 +926,18 @@ pub fn open_owned_draft(
     account: &str,
 ) -> std::result::Result<PathBuf, String> {
     let folder = workspace::draft_folder(id)?;
+    let store = open_store_for(id);
     if draft_file_is_regular(&folder) {
+        if let Some(store) = &store
+            && store
+                .compose_is_discarded(id)
+                .map_err(|err| err.to_string())?
+        {
+            return Err(format!("draft {id} is not open"));
+        }
         return Ok(folder);
     }
-    let Some(store) = open_store_for(id) else {
+    let Some(store) = store else {
         return Err(format!("draft {id} is not open"));
     };
     let Some(stored) = store.load_compose(id).map_err(|err| err.to_string())? else {

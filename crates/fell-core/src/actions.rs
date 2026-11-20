@@ -3,7 +3,7 @@
 //! These calls update rows the UI already reads. There is no socket, no IMAP
 //! session, and no send. Reversible calls store the previous folders and
 //! labels on that account's undo stack. [`Store::undo`] restores the latest
-//! entry that still has messages to restore.
+//! entry that still has messages or local drafts to restore.
 //!
 //! Archive, delete, and spam change one folder on the messages in a thread
 //! (or in every thread of a selection). Any other folder on the same row,
@@ -167,6 +167,7 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    DiscardDrafts,
     Read,
     Unread,
     Star,
@@ -186,6 +187,7 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::DiscardDrafts => "discard_drafts",
             Self::Read => "read",
             Self::Unread => "unread",
             Self::Star => "star",
@@ -202,6 +204,7 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "discard_drafts" => Ok(Self::DiscardDrafts),
             "read" => Ok(Self::Read),
             "unread" => Ok(Self::Unread),
             "star" => Ok(Self::Star),
@@ -487,15 +490,52 @@ impl Store {
         })
     }
 
-    /// Restore the latest reversible action with messages on this account.
+    /// Discard local drafts together as one undoable action. The row and
+    /// its dependent data stay intact, including any independent send record.
+    pub(crate) fn discard_compose_drafts(
+        &self,
+        account: &AccountId,
+        ids: &[String],
+    ) -> Result<LocalAction> {
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        ensure_action_schema(&tx)?;
+        let summary = match ids.len() {
+            0 => return Err(Error::Action("No draft selected".into())),
+            1 => "Draft discarded".into(),
+            n => format!("{n} drafts discarded"),
+        };
+        let action = insert_local_action(&tx, account, ActionKind::DiscardDrafts, &summary)?;
+        for id in ids {
+            let changed = crate::compose::mark_discarded(&tx, account, id, action.id)?;
+            if !changed {
+                return Err(Error::Action(
+                    "A draft has already been sent or is no longer available".into(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(action)
+    }
+
+    /// Restore the latest reversible local action on this account. For a
+    /// draft discard, the returned summary describes the restore outcome.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
-        let Some(action) = latest_open_action(&tx, account_id)? else {
+        let Some(mut action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        if action.kind.is_flag() {
+        if action.kind == ActionKind::DiscardDrafts {
+            let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;
+            action.summary = match (restored, confirmed) {
+                (1, 0) => "Draft restored".into(),
+                (n, 0) => format!("{n} drafts restored"),
+                (0, 1) => "Confirmed in Sent".into(),
+                (0, n) => format!("{n} confirmed in Sent"),
+                (restored, confirmed) => format!("{restored} restored · {confirmed} in Sent"),
+            };
+        } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else {
             for row in &load_snapshots(&tx, action.id)? {
@@ -715,12 +755,8 @@ fn record_and_apply(
     summary: &str,
     plans: &[Planned],
 ) -> Result<LocalAction> {
-    conn.execute(
-        "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
-         VALUES (?1, ?2, ?3, 0, ?4)",
-        params![account_id.as_str(), kind.as_str(), summary, now_unix()],
-    )?;
-    let id = conn.last_insert_rowid();
+    let action = insert_local_action(conn, account_id, kind, summary)?;
+    let id = action.id;
     for plan in plans {
         if kind != ActionKind::Purge {
             insert_snapshot(conn, id, account_id, plan)?;
@@ -733,8 +769,22 @@ fn record_and_apply(
     for plan in plans {
         apply_plan(conn, account_id, plan)?;
     }
+    Ok(action)
+}
+
+fn insert_local_action(
+    conn: &Connection,
+    account_id: &AccountId,
+    kind: ActionKind,
+    summary: &str,
+) -> Result<LocalAction> {
+    conn.execute(
+        "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![account_id.as_str(), kind.as_str(), summary, now_unix()],
+    )?;
     Ok(LocalAction {
-        id,
+        id: conn.last_insert_rowid(),
         kind,
         summary: summary.to_string(),
     })
@@ -835,6 +885,10 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                AND (
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+                   OR (a.kind = 'discard_drafts' AND EXISTS (
+                       SELECT 1 FROM compose_drafts d
+                       WHERE d.account_id = a.account_id AND d.discarded_action_id = a.id
+                   ))
                )
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str()],

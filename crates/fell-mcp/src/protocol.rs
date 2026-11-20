@@ -1204,6 +1204,25 @@ mod tests {
         let cwd = context["cwd"].as_str().unwrap();
         assert!(!std::path::Path::new(cwd).join("thread").exists());
         assert!(std::path::Path::new(cwd).join("AGENTS.md").is_file());
+
+        fell_core::compose::DraftHub::new()
+            .discard(&session.store, &session.account_id, &[id.to_string()])
+            .unwrap();
+        let listed = tool_json(&call(&mut session, "list_drafts", json!({})));
+        assert_eq!(listed["drafts"], json!([]));
+        for tool in ["get_draft", "get_compose_context", "request_send"] {
+            let denied = call(&mut session, tool, json!({ "draft_id": id }));
+            assert_eq!(denied["result"]["isError"], true, "{denied}");
+        }
+        session.store.undo(&session.account_id).unwrap();
+        let listed = tool_json(&call(&mut session, "list_drafts", json!({})));
+        assert_eq!(listed["drafts"].as_array().unwrap().len(), 1);
+        let context = tool_json(&call(
+            &mut session,
+            "get_compose_context",
+            json!({ "draft_id": id }),
+        ));
+        assert_eq!(context["transmitted"], false);
     }
 
     #[test]

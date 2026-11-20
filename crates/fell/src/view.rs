@@ -2033,16 +2033,23 @@ impl Inbox {
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
         self.change_mailbox(
-            move |store| store.undo(&account).map(|action| action.kind),
+            move |store| store.undo(&account),
             |inbox, result| match result {
-                Ok(kind) => {
+                Ok(action) => {
+                    if action.kind == fell_core::ActionKind::DiscardDrafts {
+                        inbox.session.show_toast(action.summary, false);
+                        return Some(ReadIntent {
+                            changed: true,
+                            ..ReadIntent::default()
+                        });
+                    }
                     inbox.session.show_toast("Undone", false);
                     inbox.send_to_server();
                     // Read and star leave the thread where it is; the thread
                     // `m` or `e` took away waits for its own undo.
                     Some(ReadIntent {
                         changed: true,
-                        select: if kind.is_flag() {
+                        select: if action.kind.is_flag() {
                             None
                         } else {
                             inbox.moved_thread.take()
@@ -2059,6 +2066,33 @@ impl Inbox {
                     }
                     None
                 }
+            },
+            cx,
+        );
+    }
+
+    fn discard_drafts(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            return;
+        };
+        let account = self.account_id.clone();
+        self.change_mailbox(
+            move |store| hub.discard(store, &account, &ids),
+            |inbox, result| {
+                match result {
+                    Ok(()) => {
+                        inbox.session.picked.clear();
+                        inbox.session.visual = false;
+                    }
+                    Err(err) => inbox.session.show_toast(err.to_string(), true),
+                }
+                Some(ReadIntent {
+                    changed: true,
+                    ..ReadIntent::default()
+                })
             },
             cx,
         );
@@ -2522,6 +2556,9 @@ impl Inbox {
         if step.delete {
             let ids = self.session.action_targets();
             self.remove_threads(ids, Removal::Delete, cx);
+        }
+        if !step.discard.is_empty() {
+            self.discard_drafts(step.discard, cx);
         }
         if step.spam {
             let ids = self.session.action_targets();
