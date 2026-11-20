@@ -53,6 +53,7 @@ pub enum Action {
     ToggleQuotes,
     Palette,
     Help,
+    About,
     ReopenReview,
 }
 
@@ -89,6 +90,7 @@ impl Action {
             Self::ToggleQuotes => "Quoted text and recipients",
             Self::Palette => "Command palette",
             Self::Help => "Help",
+            Self::About => "About",
             Self::ReopenReview => "Reopen the agent review that closed",
         }
     }
@@ -98,7 +100,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 31] = [
+const ALL_ACTIONS: [Action; 32] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -130,6 +132,7 @@ const ALL_ACTIONS: [Action; 31] = [
     Action::Palette,
     Action::Help,
     Action::ReopenReview,
+    Action::About,
 ];
 
 #[derive(Clone, Debug)]

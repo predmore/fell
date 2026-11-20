@@ -17,9 +17,30 @@ Bridge is GPL-3.0 and runs as a **separate process**. Fell does not link it and 
 crates/fell-core      accounts, backend trait, sync, SQLite+FTS, threading, search, local actions
 crates/fell-render    styled document, HTML choice, markdown for later compose
 crates/fell-confirm   UI-only token required to mint a send confirmation
+crates/fell-version   build identity shared by the app and the MCP server
 crates/fell           GPUI app (Wayland window, one message body)
 crates/fell-mcp       MCP server (search / read / triage / review drafts; no send)
 ```
+
+## Install from GitHub Releases
+
+Install WebKitGTK 4.1 from your distro first. Use `sudo pacman -S webkit2gtk-4.1` on Arch or `sudo apt install libwebkit2gtk-4.1-0` on Debian and Ubuntu. Download the tarball or AppImage from [GitHub Releases](https://github.com/predmore/fell/releases). Pick `x86_64` for amd64 or `aarch64` for arm64.
+
+To download and verify the latest stable tarball with the GitHub CLI, run the following in an empty directory on either architecture.
+
+```sh
+repo=predmore/fell
+tag=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+arch=$(uname -m)
+asset="fell-${tag#v}-$arch-linux"
+gh release download "$tag" --repo "$repo" --pattern "$asset.tar.gz" --pattern SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$asset.tar.gz"
+"./$asset/fell" --version
+"./$asset/fell"
+```
+
+For the AppImage, download `fell-${tag#v}-$arch.AppImage` and `SHA256SUMS` from the same release. Verify it the same way, then run `chmod +x` on the AppImage and launch it. Both formats include `fell-mcp`. See the Linux packaging guide for launcher installation and AppImage extraction on systems without FUSE. [Linux packaging guide](packaging/linux/README.md)
 
 ## Build
 
@@ -83,7 +104,7 @@ By hand, an entry runs `fell-mcp serve --store PATH --account ACCOUNT --agent AG
 
 A push to `main` builds a release x86_64 binary and uploads two GitHub Actions artifacts (not a GitHub Release): `fell-x86_64-linux.tar.gz` (`fell`, `fell-mcp`, `.desktop` files, and icon) and `fell-x86_64.AppImage`.
 
-`fell` dynamically links WebKitGTK (`libwebkit2gtk` in `DT_NEEDED` via `wry`). The distro package is required to launch (`libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch). Neither artifact bundles the library, so the LGPL code stays out of the crate graph and out of these artifacts. The nightly job's `libwebkit2gtk-4.1-dev` install is [issue #8](https://github.com/predmore/fell/issues/8). Details: [packaging/linux/README.md](packaging/linux/README.md).
+`fell` dynamically links the distro's WebKitGTK 4.1 in both nightlies and releases. See the packaging guide for install details and the release guide for tagging and dry runs. [Linux packaging guide](packaging/linux/README.md) · [Release guide](docs/releasing.md)
 
 Preview one fixture (this is the renderer, not the inbox):
 

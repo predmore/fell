@@ -27,7 +27,7 @@ use fell_core::compose::{DraftSummary, ReplyKind};
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
-use crate::keymap::KeyId;
+use crate::keymap::{Action, KeyId};
 use crate::mail_body::{
     self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
 };
@@ -50,6 +50,7 @@ use crate::theme::{self, Theme};
 use self::disclosure::disclosure;
 
 pub fn run() {
+    eprintln!("{}: opening inbox", fell_version::VERSION);
     Application::new().run(|cx: &mut App| {
         // Agents' drafts open in a compose window from here; see draft_host.
         let _hub = crate::draft_host::host_agent_drafts(cx);
@@ -5537,6 +5538,9 @@ fn overlay(
         .flex()
         .justify_center()
         .pt(px(CARD_TOP_PX - drop))
+        .when(session.overlay == Overlay::About, |layer| {
+            layer.items_start()
+        })
         .when(live, |layer| {
             layer.occlude().on_mouse_down(
                 MouseButton::Left,
@@ -5556,6 +5560,7 @@ fn overlay(
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::Help => help(theme, session, cx).opacity(opacity).into_any_element(),
+            Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }
@@ -5612,6 +5617,12 @@ fn palette(
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let action = item.action;
+                    let is_about = action == Action::About;
+                    let detail = if is_about {
+                        fell_version::VERSION
+                    } else {
+                        item.binding.as_str()
+                    };
                     div()
                         .id(gpui::ElementId::named_usize("palette", index))
                         .h(px(PALETTE_ROW_PX))
@@ -5648,7 +5659,13 @@ fn palette(
                                 inbox.apply_step(step, before, cx);
                             }),
                         )
-                        .child(div().flex_1().child(item.label.clone()))
+                        .when(is_about, |row| row.gap(px(8.)).justify_between())
+                        .child(
+                            div()
+                                .when(!is_about, |label| label.flex_1())
+                                .when(is_about, |label| label.flex_shrink_0())
+                                .child(item.label.clone()),
+                        )
                         .child(
                             div()
                                 .font_family_opt(theme.mono_family.clone())
@@ -5658,9 +5675,39 @@ fn palette(
                                 } else {
                                     theme.dimmed
                                 }))
-                                .child(item.binding.clone()),
+                                .child(detail.to_owned()),
                         )
                 })),
+        )
+}
+
+fn about(theme: &Theme, cx: &mut Context<Inbox>) -> gpui::Div {
+    div()
+        .w(px(420.))
+        .mx(px(12.))
+        .p(px(16.))
+        .bg(rgb(theme.surface))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .rounded_md()
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|inbox, _, _, cx| {
+                if inbox.session.overlay == Overlay::About {
+                    cx.stop_propagation();
+                }
+            }),
+        )
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("About Fell"))
+        .child(
+            div()
+                .font_family_opt(theme.mono_family.clone())
+                .text_size(px(theme.mono_px.max(12.0)))
+                .child(fell_version::VERSION),
         )
 }
 
@@ -5784,9 +5831,10 @@ fn folder_picker(
 }
 
 fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
-    let lines: Vec<_> = crate::keymap::Action::all()
+    let lines: Vec<_> = Action::all()
         .iter()
         .copied()
+        .filter(|action| *action != Action::About)
         .map(|action| {
             (
                 action.label().to_string(),
