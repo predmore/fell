@@ -1,0 +1,24 @@
+Fell #174 running-app evidence
+
+Baseline commit 3747f3db272dfee3d607a435431379c6206780b4
+Issue commit 357bc5ea5f9d147ed9c17aae731809c43afb1287
+
+Each run isolated its mailbox and connected to the synthetic loopback IMAP server in imap.py.
+The server first gave the Field test notes message the keyword triage, then added
+fieldwork, then removed both. Space s started each sync. The dark recording also
+uses j and k to move away from the changed row and back. Each change produced
+UID FETCH FLAGS with CHANGEDSINCE. The command logs show that full body downloads
+occurred during initial sync only.
+
+Capture sizes and stock Omarchy themes
+Dark 1280x800, Tokyo Night
+Light 1280x800, Rose Pine
+Narrow 760x700, Tokyo Night
+Theme files are from Omarchy b20d7876f5ec6a45d18b9e4383dc4b6d9e8492ab.
+Runs used headless Sway with separate Wayland sockets.
+
+The dark, light, and narrow comparison PNGs pair the baseline and issue captures.
+Raw screenshots (initial.png, after-add.png, after-remove.png) and IMAP command
+logs (imap.log) are in baseline-dark, baseline-light, baseline-narrow, issue-dark,
+issue-light, and issue-narrow. The keyboard recordings are baseline-dark/keyboard.mp4
+and issue-dark/keyboard.mp4.
