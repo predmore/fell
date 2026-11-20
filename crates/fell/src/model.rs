@@ -136,6 +136,7 @@ pub enum Overlay {
     Palette,
     Folders,
     Help,
+    About,
 }
 
 /// What confirming the folder picker does.
@@ -1490,6 +1491,12 @@ impl Session {
                 }
                 Step::default()
             }
+            Overlay::About => {
+                if matches!(key, KeyId::Escape | KeyId::Enter) {
+                    self.overlay = Overlay::None;
+                }
+                Step::default()
+            }
             Overlay::None => Step::default(),
         }
     }
@@ -1847,6 +1854,10 @@ impl Session {
             Action::Help => {
                 self.count.clear();
                 self.overlay = Overlay::Help;
+            }
+            Action::About => {
+                self.count.clear();
+                self.overlay = Overlay::About;
             }
             Action::ReopenReview => {
                 self.count.clear();
@@ -3236,6 +3247,22 @@ mod tests {
         session.overlay = Overlay::None;
         session.on_key(KeyId::CtrlShiftP, 4);
         assert_eq!(session.overlay, Overlay::Palette);
+    }
+
+    #[test]
+    fn about_matches_version_and_returns_in_recent_actions() {
+        let mut session = session();
+        session.on_key(KeyId::Char(':'), 4);
+        for ch in "version".chars() {
+            session.on_key(KeyId::Char(ch), 4);
+        }
+        assert_eq!(session.palette()[0].action, Action::About);
+        session.on_key(KeyId::Enter, 4);
+        assert_eq!(session.overlay, Overlay::About);
+        session.on_key(KeyId::Escape, 4);
+        assert_eq!(session.overlay, Overlay::None);
+        session.on_key(KeyId::Char(':'), 4);
+        assert_eq!(session.palette()[0].action, Action::About);
     }
 
     #[test]

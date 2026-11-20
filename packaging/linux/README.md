@@ -1,16 +1,17 @@
 # Fell Linux build
 
-x86_64 CI build from `main`. This is not a GitHub Release.
+Tagged GitHub Releases ship Linux builds for `x86_64` (amd64) and `aarch64` (arm64). The nightly Actions artifacts from `main` use unversioned x86_64 names. See the project README for release downloads and checksum verification. [Install from GitHub Releases](https://github.com/predmore/fell#install-from-github-releases)
 
 ## Tarball
 
-`fell-x86_64-linux.tar.gz` contains:
+Each `fell-<version>-<arch>-linux.tar.gz` release archive contains:
 
 - `fell` — the binary
 - `fell-mcp` — the MCP server for agents; `fell mcp …` runs it
 - `dev.predmore.fell.desktop`
 - `dev.predmore.fell.compose.desktop`: hidden; it gives the compose window (app id `dev.predmore.fell.compose`) the Fell icon
 - `dev.predmore.fell.png`
+- `LICENSE` and `README.md`
 
 Run `./fell`. For a launcher, copy both binaries onto `PATH` (keep them in the same folder), both desktop files to `~/.local/share/applications/`, and the icon to `~/.local/share/icons/hicolor/256x256/apps/`.
 
@@ -30,7 +31,7 @@ hl.window_rule({
 
 ## AppImage
 
-`fell-x86_64.AppImage` is the other CI artifact. `chmod +x` it after download; Actions stores artifacts in a zip and does not keep the executable bit. It embeds the static type 2 runtime, so it does not need `libfuse2`. It carries `fell-mcp` too: `./fell-x86_64.AppImage mcp add codex` connects an agent, and the entry it writes starts the AppImage with `mcp serve …`.
+Run `chmod +x fell-<version>-<arch>.AppImage` before launching. The file embeds the static type 2 runtime. On systems without FUSE mounting, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching. The AppImage also carries `fell-mcp`. Run the AppImage with `mcp add codex` to connect an agent. The resulting entry starts the same AppImage with `mcp serve …`.
 
 ## WebKitGTK
 
@@ -39,4 +40,4 @@ hl.window_rule({
 - Debian or Ubuntu: `libwebkit2gtk-4.1-0`
 - Arch: `webkit2gtk-4.1`
 
-The library is not in the tarball or the AppImage. Compiling the link needs `libwebkit2gtk-4.1-dev` on the nightly job ([issue #8](https://github.com/predmore/fell/issues/8)).
+Both package formats use the host's GTK and WebKitGTK libraries. Building on Ubuntu requires `libwebkit2gtk-4.1-dev`.

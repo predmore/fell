@@ -392,12 +392,12 @@ pub fn landing(switched: bool, holds_viewport: bool, same_thread: bool) -> Landi
     }
 }
 
-/// How tall a palette or folder-picker card is drawn to hold `rows` items
-/// of `row_px` each: its 1 px border top and bottom, the 44 px query line
+/// How tall a palette or folder-picker card is drawn to hold `rows_px`
+/// of items: its 1 px border top and bottom, the 44 px query line
 /// and 4 px above and below the rows. Never taller than `max` or the
 /// `room` the window leaves, never shorter than the query line.
-pub fn card_height(rows: usize, row_px: f32, max: f32, room: f32) -> f32 {
-    let fit = 2.0 + 44.0 + 8.0 + rows as f32 * row_px;
+pub fn card_height(rows_px: f32, max: f32, room: f32) -> f32 {
+    let fit = 2.0 + 44.0 + 8.0 + rows_px;
     fit.min(max).min(room).max(2.0 + 44.0)
 }
 
@@ -1326,12 +1326,12 @@ mod tests {
     #[test]
     fn a_card_is_as_tall_as_its_items_up_to_its_max() {
         // Five folders: no empty surface below the last (#171).
-        assert_eq!(card_height(5, 34.0, 380.0, 900.0), 54.0 + 170.0);
-        assert_eq!(card_height(0, 36.0, 420.0, 900.0), 54.0);
-        assert_eq!(card_height(40, 36.0, 420.0, 900.0), 420.0);
-        assert_eq!(card_height(40, 36.0, 420.0, 300.0), 300.0, "a short window");
+        assert_eq!(card_height(170.0, 380.0, 900.0), 54.0 + 170.0);
+        assert_eq!(card_height(0.0, 420.0, 900.0), 54.0);
+        assert_eq!(card_height(1440.0, 420.0, 900.0), 420.0);
+        assert_eq!(card_height(1440.0, 420.0, 300.0), 300.0, "a short window");
         assert_eq!(
-            card_height(40, 36.0, 420.0, 10.0),
+            card_height(1440.0, 420.0, 10.0),
             46.0,
             "the query line stays"
         );
