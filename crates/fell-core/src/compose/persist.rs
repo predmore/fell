@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS compose_review (
 const SEND_MAYBE_SENT: &str = "maybe-sent";
 const SEND_SENT: &str = "sent";
 const SEND_CLEAR: &str = "clear";
-pub(super) const SEND_IN_PROGRESS: &str = "Sending draft · retry when done";
+pub(super) const SEND_IN_PROGRESS: &str = "Retry after send";
 
 pub(crate) fn mark_discarded(
     conn: &rusqlite::Connection,

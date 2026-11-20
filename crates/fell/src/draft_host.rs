@@ -592,7 +592,7 @@ pub(crate) mod tests {
         let other_hub = DraftHub::new();
         for trying in [&hub, &other_hub] {
             let err = trying.discard(&store, &account.id, &selection).unwrap_err();
-            assert_eq!(err.to_string(), "Sending draft · retry when done");
+            assert_eq!(err.to_string(), "Retry after send");
             assert!(store.load_compose(&other).unwrap().is_some());
         }
         hub.with_session(&id, |session| session.end_send(Some(SendLock::MaybeSent)));
