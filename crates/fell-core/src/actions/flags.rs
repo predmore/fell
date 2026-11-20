@@ -87,17 +87,62 @@ impl Store {
         folder: &str,
         change: FlagChange,
     ) -> Result<Option<LocalAction>> {
+        self.apply_flags(
+            account_id,
+            threads.iter().map(|thread| (thread, folder)),
+            change,
+            false,
+        )
+    }
+
+    /// Apply one undoable edit to ranked results, using each hit's source folder.
+    pub fn flag_scoped_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[(ThreadId, String)],
+        change: FlagChange,
+    ) -> Result<Option<LocalAction>> {
+        self.apply_flags(
+            account_id,
+            threads
+                .iter()
+                .map(|(thread, folder)| (thread, folder.as_str())),
+            change,
+            true,
+        )
+    }
+
+    fn apply_flags<'a>(
+        &self,
+        account_id: &AccountId,
+        threads: impl IntoIterator<Item = (&'a ThreadId, &'a str)>,
+        change: FlagChange,
+        scoped: bool,
+    ) -> Result<Option<LocalAction>> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         super::ensure_action_schema(&tx)?;
+        let roles = scoped.then(|| self.folder_roles(account_id)).transpose()?;
         let mut writes: Vec<(Row, bool, bool)> = Vec::new();
         let mut touched = 0;
         let mut found = false;
-        for thread in threads {
-            let rows = load_flags(&tx, account_id, thread)?;
+        for (thread, folder) in threads {
+            let mut rows = load_flags(&tx, account_id, thread)?;
+            let is_here = |row: &Row| match &roles {
+                Some(roles) => in_source_folder(row, folder, roles.name(crate::FolderRole::Inbox)),
+                None => in_folder(row, folder),
+            };
+            if scoped {
+                // Search uses stored folder identities. Role aliases may
+                // name different folders, and a sync can remove this scope.
+                rows.retain(&is_here);
+                if rows.is_empty() {
+                    return Err(Error::Action(format!("no messages in {folder}")));
+                }
+            }
             found |= !rows.is_empty();
             let before = writes.len();
-            plan(rows, folder, change, &mut writes);
+            plan(rows, is_here, change, &mut writes);
             if writes.len() > before {
                 touched += 1;
             }
@@ -143,12 +188,17 @@ impl Store {
 
 /// The messages to change in one thread, oldest first, with their new
 /// read and star values.
-fn plan(rows: Vec<Row>, folder: &str, change: FlagChange, out: &mut Vec<(Row, bool, bool)>) {
-    let latest_in_folder = rows.iter().rposition(|row| in_folder(row, folder));
+fn plan(
+    rows: Vec<Row>,
+    is_here: impl Fn(&Row) -> bool,
+    change: FlagChange,
+    out: &mut Vec<(Row, bool, bool)>,
+) {
+    let latest_in_folder = rows.iter().rposition(&is_here);
     let latest_here = latest_in_folder.or(rows.len().checked_sub(1));
     let already_starred = rows
         .iter()
-        .any(|row| row.starred && (latest_in_folder.is_none() || in_folder(row, folder)));
+        .any(|row| row.starred && (latest_in_folder.is_none() || is_here(row)));
     for (index, row) in rows.into_iter().enumerate() {
         let (unread, starred) = match change {
             FlagChange::Read => (false, row.starred),
@@ -176,6 +226,15 @@ fn in_folder(row: &Row, folder: &str) -> bool {
         name.eq_ignore_ascii_case(folder)
             || aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
     })
+}
+
+fn in_source_folder(row: &Row, folder: &str, inbox: &str) -> bool {
+    if row.folders.is_empty() && !row.archived {
+        return folder.eq_ignore_ascii_case(inbox);
+    }
+    row.folders
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(folder))
 }
 
 fn load_flags(conn: &Connection, account_id: &AccountId, thread: &ThreadId) -> Result<Vec<Row>> {

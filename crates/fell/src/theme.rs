@@ -31,6 +31,8 @@ pub struct Theme {
     pub on_selection: u32,
     /// Snippet and meta on a selected row. Dimmer than `on_selection`, still AA on `selection`.
     pub on_selection_dim: u32,
+    pub search_match: (u32, u32),
+    pub selected_search_match: (u32, u32),
     pub error: u32,
     pub border: u32,
     pub star: u32,
@@ -158,6 +160,11 @@ fn map_palette(
     let selection = usable_fill(selection_raw, background);
     let on_selection_raw = color(raw, &["selection_foreground"]).unwrap_or(foreground);
     let (on_selection, on_selection_dim) = text_pair(on_selection_raw, on_selection_raw, selection);
+    let accent = ensure_all(accent_raw, &[background, surface], TEXT_CONTRAST);
+    let search_match = |fg, bg| {
+        let fill = mix(bg, fg, 0.14);
+        (ensure(fg, fill, TEXT_CONTRAST), fill)
+    };
     Theme {
         name,
         kind,
@@ -165,10 +172,12 @@ fn map_palette(
         surface,
         foreground,
         dimmed,
-        accent: ensure_all(accent_raw, &[background, surface], TEXT_CONTRAST),
+        accent,
         selection,
         on_selection,
         on_selection_dim,
+        search_match: search_match(accent, background),
+        selected_search_match: search_match(on_selection, selection),
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
@@ -235,7 +244,10 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             return false;
         }
     }
-    contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
+    [theme.search_match, theme.selected_search_match]
+        .into_iter()
+        .all(|(fg, fill)| contrast(fg, fill) >= TEXT_CONTRAST)
+        && contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.star, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.error, theme.selection) >= TEXT_CONTRAST

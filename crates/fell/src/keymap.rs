@@ -19,6 +19,12 @@ pub enum KeyId {
     Enter,
     Up,
     Down,
+    Tab,
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -46,6 +52,9 @@ pub enum Action {
     SaveAllAttachments,
     RetryAttachment,
     FolderPicker,
+    Search,
+    NextHit,
+    PreviousHit,
     Move,
     Archive,
     ToggleUnread,
@@ -90,6 +99,9 @@ impl Action {
             Self::SaveAllAttachments => "Save all attachments",
             Self::RetryAttachment => "Retry attachment action",
             Self::FolderPicker => "Choose folder",
+            Self::Search => "Search mail",
+            Self::NextHit => "Next search hit",
+            Self::PreviousHit => "Previous search hit",
             Self::Move => "Move",
             Self::Archive => "Archive",
             Self::ToggleUnread => "Mark unread or read",
@@ -114,7 +126,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 39] = [
+const ALL_ACTIONS: [Action; 42] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -138,6 +150,9 @@ const ALL_ACTIONS: [Action; 39] = [
     Action::SaveAllAttachments,
     Action::RetryAttachment,
     Action::FolderPicker,
+    Action::Search,
+    Action::NextHit,
+    Action::PreviousHit,
     Action::Move,
     Action::Archive,
     Action::ToggleUnread,
@@ -229,6 +244,9 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char('h')], Action::Back, None);
     bind(&[KeyId::Ctrl('d')], Action::PageDown, None);
     bind(&[KeyId::Ctrl('u')], Action::PageUp, None);
+    bind(&[KeyId::Char('/')], Action::Search, None);
+    bind(&[KeyId::Char('n')], Action::NextHit, None);
+    bind(&[KeyId::Char('N')], Action::PreviousHit, None);
     bind(
         &[KeyId::Char('g'), KeyId::Char('i')],
         Action::Inbox,
@@ -406,6 +424,22 @@ pub struct PaletteItem {
     pub action: Action,
     pub label: String,
     pub binding: String,
+    pub search: Option<String>,
+}
+
+pub fn recent_search_items<'a>(
+    query: &'a str,
+    searches: &'a [String],
+) -> impl Iterator<Item = PaletteItem> + 'a {
+    searches
+        .iter()
+        .filter(|search| fuzzy(query, search).is_some())
+        .map(|search| PaletteItem {
+            action: Action::Search,
+            label: search.clone(),
+            binding: "Recent search".to_owned(),
+            search: Some(search.clone()),
+        })
 }
 
 pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<PaletteItem> {
@@ -433,6 +467,7 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
                 action,
                 label: label.to_string(),
                 binding: binding_text(keymap, action),
+                search: None,
             },
         ));
     }
@@ -475,6 +510,12 @@ pub fn key_label(key: KeyId, leader_name: &str) -> String {
         KeyId::Enter => "enter".into(),
         KeyId::Up => "up".into(),
         KeyId::Down => "down".into(),
+        KeyId::Tab => "tab".into(),
+        KeyId::Left => "left".into(),
+        KeyId::Right => "right".into(),
+        KeyId::Home => "home".into(),
+        KeyId::End => "end".into(),
+        KeyId::Delete => "delete".into(),
     }
 }
 

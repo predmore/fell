@@ -125,6 +125,17 @@ impl FrameLog {
         let _ = self.out.flush();
     }
 
+    /// Search and reply preparation on the store thread, on the frame clock.
+    pub fn search_work(&mut self, start: Instant, end: Instant) {
+        let t_ms = ms(self.opened, start);
+        let duration = ms(start, end);
+        let _ = writeln!(
+            self.out,
+            "{{\"t_ms\":{t_ms:.3},\"event\":\"search_work\",\"ms\":{duration:.3}}}"
+        );
+        let _ = self.out.flush();
+    }
+
     /// The view's element tree is built; layout and paint follow.
     pub fn built(&mut self, at: Instant) {
         self.built_at = Some(at);

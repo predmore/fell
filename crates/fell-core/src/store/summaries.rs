@@ -1144,7 +1144,7 @@ fn in_one_snapshot<T>(conn: &Connection, read: impl FnOnce() -> Result<T>) -> Re
 }
 
 /// Distinct folder names, as first stored, in the order they first appeared.
-pub(super) fn folder_names(conn: &Connection, account_id: &AccountId) -> Result<Vec<String>> {
+pub(crate) fn folder_names(conn: &Connection, account_id: &AccountId) -> Result<Vec<String>> {
     in_one_snapshot(conn, || folder_names_in(conn, account_id))
 }
 

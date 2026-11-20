@@ -5,8 +5,8 @@
 //! There are two lanes, each with its own connection. The interactive lane
 //! runs what the reader is waiting for: opening a conversation, a folder
 //! switch, archive, move, undo. The background lane runs folder refreshes
-//! that sync asks for. SQLite's WAL lets the two read at once, so holding
-//! `j` during a first sync never waits behind a refresh.
+//! that sync asks for and full live queries. SQLite's WAL lets the two read
+//! at once, so holding `j` during a first sync never waits behind a refresh.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -22,6 +22,7 @@ pub struct StoreClient {
     /// Set once the second connection is open. Until then, and for an
     /// in-memory mailbox, background jobs run on the interactive lane.
     background_ready: Arc<AtomicBool>,
+    file_backed: Arc<AtomicBool>,
     background: mpsc::Sender<Job>,
 }
 
@@ -37,6 +38,8 @@ impl StoreClient {
         let (background, background_jobs) = mpsc::channel();
         let background_ready = Arc::new(AtomicBool::new(false));
         let lane = Arc::clone(&background_ready);
+        let file_backed = Arc::new(AtomicBool::new(false));
+        let has_file = Arc::clone(&file_backed);
         std::thread::Builder::new()
             .name("fell-store".into())
             .spawn(move || {
@@ -44,11 +47,8 @@ impl StoreClient {
                 // The first connection has finished opening and migrating
                 // the file, so the second one never races it for the lock.
                 if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
+                    has_file.store(true, Ordering::Release);
                     spawn_background(path, lane, background_jobs);
-                    // Search runs on this connection. Its model and vectors
-                    // load on a thread of their own, so the first search
-                    // does not wait for them and the window never does.
-                    store.warm_search();
                 } else {
                     drop(background_jobs);
                 }
@@ -63,6 +63,7 @@ impl StoreClient {
             Self {
                 interactive: jobs,
                 background_ready,
+                file_backed,
                 background,
             },
             ready,
@@ -74,7 +75,7 @@ impl StoreClient {
         &self,
         job: impl FnOnce(&Store) -> R + Send + 'static,
     ) -> oneshot::Receiver<R> {
-        send(&self.interactive, job)
+        send(&self.interactive, job, None)
     }
 
     /// Run `job` on the background lane: work nobody is waiting on, such as
@@ -84,10 +85,37 @@ impl StoreClient {
         job: impl FnOnce(&Store) -> R + Send + 'static,
     ) -> oneshot::Receiver<R> {
         if self.background_ready.load(Ordering::Acquire) {
-            send(&self.background, job)
+            send(&self.background, job, None)
         } else {
-            send(&self.interactive, job)
+            send(&self.interactive, job, None)
         }
+    }
+
+    /// Run full queries on the background lane once it is ready. Use the
+    /// open connection while the second one is starting or unavailable.
+    pub fn call_search<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Store) -> R + Send + 'static,
+    ) -> oneshot::Receiver<R> {
+        if self.background_ready.load(Ordering::Acquire) {
+            send(&self.background, job, Some(&self.interactive))
+        } else {
+            self.call(job)
+        }
+    }
+
+    /// Queue completion while the second connection opens. If it cannot
+    /// serve the job, retry the bounded lookup on the interactive lane.
+    pub async fn call_search_completion<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Store) -> R + Clone + Send + 'static,
+    ) -> Result<R, oneshot::Canceled> {
+        if self.file_backed.load(Ordering::Acquire)
+            && let Ok(values) = send(&self.background, job.clone(), None).await
+        {
+            return Ok(values);
+        }
+        self.call(job).await
     }
 
     /// Queue maintenance on the background connection even while it opens.
@@ -96,7 +124,7 @@ impl StoreClient {
         &self,
         job: impl FnOnce(&Store) -> R + Send + 'static,
     ) -> oneshot::Receiver<R> {
-        send(&self.background, job)
+        send(&self.background, job, None)
     }
 
     #[cfg(test)]
@@ -108,11 +136,15 @@ impl StoreClient {
 fn send<R: Send + 'static>(
     lane: &mpsc::Sender<Job>,
     job: impl FnOnce(&Store) -> R + Send + 'static,
+    fallback: Option<&mpsc::Sender<Job>>,
 ) -> oneshot::Receiver<R> {
     let (tx, rx) = oneshot::channel();
-    let _ = lane.send(Box::new(move |store| {
+    if let Err(error) = lane.send(Box::new(move |store| {
         let _ = tx.send(job(store));
-    }));
+    })) && let Some(fallback) = fallback
+    {
+        let _ = fallback.send(error.0);
+    }
     rx
 }
 
@@ -143,6 +175,7 @@ fn spawn_background(path: std::path::PathBuf, ready: Arc<AtomicBool>, jobs: mpsc
                     },
                 }
             };
+            store.warm_search();
             ready.store(true, Ordering::Release);
             drop(ready);
             // Only clients hold the sender. The lane closes with them.
@@ -187,7 +220,7 @@ mod tests {
         let opened = dir.join("mail.db");
         let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
-        let asked = client.call(|store| store.testing_search_warm_asked());
+        let asked = client.call_maintenance(|store| store.testing_search_warm_asked());
         assert!(futures::executor::block_on(asked).unwrap());
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
@@ -199,11 +232,93 @@ mod tests {
         futures::executor::block_on(ready).unwrap();
         let answer = client.call_background(|store| store.db_path().is_none());
         assert!(futures::executor::block_on(answer).unwrap());
+        let search = client.call_search(|store| store.db_path().is_none());
+        assert!(futures::executor::block_on(search).unwrap());
         assert!(!client.has_background_lane());
     }
 
     #[test]
-    fn a_slow_background_read_does_not_hold_up_the_reader() {
+    fn search_uses_the_open_connection_when_the_background_lane_is_unavailable() {
+        let (interactive, reader_jobs) = mpsc::channel();
+        let (background, background_jobs) = mpsc::channel();
+        let client = StoreClient {
+            interactive,
+            background_ready: Arc::new(AtomicBool::new(false)),
+            file_backed: Arc::new(AtomicBool::new(true)),
+            background,
+        };
+        let store = Store::open_in_memory().unwrap();
+
+        // The second connection is still opening and cannot take jobs yet.
+        let search = client.call_search(|_| 1);
+        assert!(matches!(
+            background_jobs.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        reader_jobs.try_recv().unwrap()(&store);
+        assert_eq!(futures::executor::block_on(search).unwrap(), 1);
+
+        // A disconnected lane must also fall back, even if readiness was set.
+        client.background_ready.store(true, Ordering::Release);
+        drop(background_jobs);
+        let search = client.call_search(|_| 2);
+        reader_jobs.try_recv().unwrap()(&store);
+        assert_eq!(futures::executor::block_on(search).unwrap(), 2);
+    }
+
+    #[test]
+    fn search_completion_works_with_one_connection() {
+        let (client, ready) = StoreClient::spawn(|| {
+            let store = Store::open_in_memory().unwrap();
+            let account = crate::fixtures::fixture_account();
+            crate::fixtures::seed_if_empty(&store, &account).unwrap();
+            (store, account.id)
+        });
+        let account = futures::executor::block_on(ready).unwrap();
+        let reply = client.call_search_completion(move |store| {
+            store.search_suggestions(&account, fell_core::SearchField::Folder, "in", 4)
+        });
+        assert_eq!(
+            futures::executor::block_on(reply).unwrap().unwrap(),
+            ["INBOX"]
+        );
+    }
+
+    #[test]
+    fn search_completion_waits_for_the_background_lane_and_recovers_if_it_closes() {
+        let (interactive, reader_jobs) = mpsc::channel();
+        let (background, background_jobs) = mpsc::channel();
+        let client = StoreClient {
+            interactive,
+            background_ready: Arc::new(AtomicBool::new(false)),
+            file_backed: Arc::new(AtomicBool::new(true)),
+            background,
+        };
+        let store = Store::open_in_memory().unwrap();
+
+        futures::executor::block_on(async {
+            let mut completion = std::pin::pin!(client.call_search_completion(|_| 1));
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            assert!(matches!(
+                reader_jobs.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            let job = background_jobs.try_recv().unwrap();
+            job(&store);
+            assert_eq!(completion.await.unwrap(), 1);
+
+            let mut completion = std::pin::pin!(client.call_search_completion(|_| 2));
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            drop(background_jobs);
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            let job = reader_jobs.try_recv().unwrap();
+            job(&store);
+            assert_eq!(completion.await.unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn a_slow_search_does_not_hold_up_the_reader() {
         let dir = std::env::temp_dir().join(format!(
             "fell-lanes-{}-{}",
             std::process::id(),
@@ -225,7 +340,7 @@ mod tests {
         // Hold the background lane busy until the reader has its answer.
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        let slow = client.call_background(move |_| {
+        let slow = client.call_search(move |_| {
             entered_tx.send(()).unwrap();
             let _ = gate.recv();
         });

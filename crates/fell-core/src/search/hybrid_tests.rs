@@ -565,21 +565,21 @@ fn operators_filter_the_semantic_side() {
     for message in &mut messages {
         if message.headers.message_id.as_str() == "plumber-invoice@corpus.test" {
             message.unread = true;
-            message.folders = vec!["Archive".into()];
+            message.folders = vec!["MÜNCHEN".into()];
         }
     }
     fill(&store, &messages);
     index_with(&store, &Concepts);
     let found = |query: &str| ids(&hybrid(&store, query));
     assert!(found("money owed").contains(&"refund".to_string()));
-    assert_eq!(found("money owed in:Archive"), ["plumber-invoice"]);
+    assert_eq!(found("money owed in:München"), ["plumber-invoice"]);
     assert_eq!(found("money owed is:unread"), ["plumber-invoice"]);
     assert_eq!(found("money owed from:brightline"), ["plumber-invoice"]);
     assert_eq!(found("money owed from:shoply"), ["refund"]);
     assert!(found("money owed before:2000-01-01").is_empty());
     assert!(found("money owed has:nothing").is_empty());
     // Operators alone have no words to embed: that is keyword search.
-    assert_eq!(hybrid(&store, "in:Archive"), keyword(&store, "in:Archive"));
+    assert_eq!(hybrid(&store, "in:München"), keyword(&store, "in:München"));
     drop(reset);
 }
 
@@ -1329,7 +1329,7 @@ fn semantic_rows_apply_the_operators_again() {
     }
     fill(&store, &messages);
     let rows = |query: &str| {
-        let parsed = parse_query(query).unwrap();
+        let parsed = parse_search_query(&store.conn, &account_id(), query).unwrap();
         let mut found: Vec<String> = semantic_rows(
             &store.conn,
             &account_id(),

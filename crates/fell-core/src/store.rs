@@ -36,6 +36,7 @@ mod write_lock;
 
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use intents::PendingFlags;
+pub(crate) use summaries::folder_names as message_folder_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -1274,6 +1275,76 @@ impl Store {
     /// the default options, so hybrid when a local model is installed.
     pub fn search(&self, account_id: &AccountId, query: &str) -> Result<SearchResults> {
         self.search_with(account_id, query, SearchOptions::default())
+    }
+
+    /// Text excerpts for a window of ranked keyword hits. Use the corrected
+    /// query when search supplied one. Operator-only hits have no FTS excerpt.
+    pub fn search_previews(
+        &self,
+        account: &AccountId,
+        query: &str,
+        messages: &[MessageId],
+    ) -> Result<std::collections::HashMap<MessageId, crate::SearchPreview>> {
+        crate::search::previews(&self.conn, account, query, messages)
+    }
+
+    /// Messages and excerpts matching the effective keyword query inside one result.
+    pub fn search_thread_matches(
+        &self,
+        account: &AccountId,
+        query: &str,
+        thread: &ThreadId,
+    ) -> Result<Vec<crate::SearchMatch>> {
+        crate::search::thread_matches(&self.conn, account, query, thread)
+    }
+
+    /// Folders and flags for ranked rows. An explicit folder filter must
+    /// still match a folder on the hit. With no folder filter, prefer the
+    /// originating folder, then Inbox or the hit's first folder.
+    pub fn search_locations(
+        &self,
+        account: &AccountId,
+        query: &str,
+        folder: &str,
+        hits: &[SearchHit],
+    ) -> Result<std::collections::HashMap<MessageId, crate::SearchLocation>> {
+        crate::search::locations(
+            &self.conn,
+            account,
+            query,
+            folder,
+            &self.folder_roles(account)?,
+            hits,
+        )
+    }
+
+    /// Values for a search operator, drawn from this account's local mail.
+    pub fn search_suggestions(
+        &self,
+        account: &AccountId,
+        field: crate::SearchField,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        use crate::SearchField::*;
+        let names = match field {
+            Folder => self.folder_names(account)?,
+            Label => return crate::search::label_suggestions(&self.conn, account, prefix, limit),
+            Sender | Recipient => {
+                return crate::search::address_suggestions(
+                    &self.conn, account, field, prefix, limit,
+                );
+            }
+        };
+        let prefix = prefix.to_lowercase();
+        Ok(names
+            .into_iter()
+            .filter(|name| name.to_lowercase().starts_with(&prefix))
+            .take(limit)
+            .collect())
     }
 
     /// Search one account in the local store.
@@ -5115,6 +5186,244 @@ mod tests {
             store.upsert_message(&message).unwrap();
         }
         store
+    }
+
+    #[test]
+    fn search_previews_and_message_navigation_use_the_indexed_hit_and_filters() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let ranked = store.search(&account, "zebraunique").unwrap();
+        let ids: Vec<_> = ranked
+            .hits
+            .iter()
+            .map(|hit| hit.message_id.clone())
+            .collect();
+        let previews = store
+            .search_previews(&account, "zebraunique", &ids)
+            .unwrap();
+        let body = &previews[&MessageId::new("body@msg")];
+        assert!(body.text.starts_with('…'));
+        assert_eq!(&body.text[body.highlights[0].clone()], "zebraunique");
+        let subject = &previews[&MessageId::new("subj@msg")];
+        assert_eq!(subject.text, "zebraunique");
+        assert_eq!(subject.highlights, vec![0..11]);
+
+        let thread = ThreadId::from_message_id(&MessageId::new("ada@msg"));
+        let hits = store
+            .search_thread_matches(&account, "invoice", &thread)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let filtered = store
+            .search_thread_matches(&account, "invoice is:unread", &thread)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message, MessageId::new("ada@msg"));
+        let operator_only = store
+            .search_thread_matches(&account, "label:work", &thread)
+            .unwrap();
+        assert_eq!(operator_only.len(), 1);
+        assert_eq!(operator_only[0].message, filtered[0].message);
+        assert!(operator_only[0].preview.is_none());
+    }
+
+    #[test]
+    fn filtered_search_ranks_matching_messages_and_checks_dirty_folders() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let thread = ThreadId::from_message_id(&MessageId::new("ada@msg"));
+        let inbox = store.search(&account, "in:Inbox").unwrap();
+        let winning_message = |hits: Vec<SearchHit>| {
+            hits.into_iter()
+                .find(|hit| hit.thread_id == thread)
+                .unwrap()
+                .message_id
+        };
+        assert_eq!(winning_message(inbox.hits), MessageId::new("reply-ada@msg"));
+
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET folders = 'MÜNCHEN'
+                 WHERE account_id = 'a1' AND message_id = 'reply-ada@msg'",
+                [],
+            )
+            .unwrap();
+        let inbox = store.search(&account, "in:Inbox").unwrap();
+        assert_eq!(winning_message(inbox.hits), MessageId::new("ada@msg"));
+        let munich = || store.search(&account, "in:München").unwrap();
+        assert_eq!(
+            winning_message(munich().hits),
+            MessageId::new("reply-ada@msg")
+        );
+
+        immediate_transaction(&store.conn)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            winning_message(munich().hits),
+            MessageId::new("reply-ada@msg")
+        );
+        assert!(
+            store
+                .search(&account, "in:NoSuchFolder")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn localized_folder_filter_scopes_actions_to_the_stored_name() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut message = msg("munich@msg", None, None, "Train", "travel details");
+        message.folders = vec!["INBOX".into(), "MÜNCHEN".into()];
+        message.unread = true;
+        let thread = store.upsert_message(&message).unwrap();
+        let query = "in:München";
+        let hits = store.search(&account.id, query).unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        let with_text = "train in:münchen";
+        assert_eq!(store.search(&account.id, with_text).unwrap().hits, hits);
+        let message_id = hits[0].message_id.clone();
+        assert!(
+            store
+                .search_previews(&account.id, with_text, std::slice::from_ref(&message_id))
+                .unwrap()
+                .contains_key(&message_id)
+        );
+        let matches = store
+            .search_thread_matches(&account.id, with_text, &thread)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].message, message_id);
+        let locations = || {
+            store
+                .search_locations(&account.id, query, "INBOX", &hits)
+                .unwrap()
+        };
+
+        let before = locations();
+        let scope = &before[&hits[0].message_id];
+        assert_eq!(scope.folder.as_deref(), Some("MÜNCHEN"));
+        assert!(scope.unread);
+
+        let plain = "train";
+        let plain_hits = store.search(&account.id, plain).unwrap().hits;
+        assert_eq!(plain_hits, hits);
+        let from_open_folder = store
+            .search_locations(&account.id, plain, "München", &plain_hits)
+            .unwrap();
+        let scope = &from_open_folder[&message_id];
+        assert_eq!(scope.folder.as_deref(), Some("MÜNCHEN"));
+        assert!(scope.unread);
+        store
+            .archive_thread(&account.id, &thread, scope.folder.as_deref().unwrap())
+            .unwrap();
+        let messages = store.thread_messages(&account.id, &thread).unwrap();
+        assert_eq!(messages[0].folders, ["INBOX", "Archive"]);
+        assert_eq!(locations()[&hits[0].message_id].folder, None);
+    }
+
+    #[test]
+    fn search_stars_follow_the_result_folder() {
+        use crate::FlagChange;
+
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut inbox = msg("inbox@msg", None, None, "Trip", "The original message");
+        inbox.folders = vec!["INBOX".into()];
+        inbox.starred = true;
+        let thread = store.upsert_message(&inbox).unwrap();
+        let mut archive = msg(
+            "archive@msg",
+            None,
+            Some("inbox@msg"),
+            "Re: Trip",
+            "The reply",
+        );
+        archive.folders = vec!["Archive".into()];
+        store.upsert_message(&archive).unwrap();
+        let mut other = msg(
+            "other@msg",
+            None,
+            Some("inbox@msg"),
+            "Re: Trip",
+            "Another reply",
+        );
+        other.folders = vec!["Archived".into()];
+        other.starred = true;
+        other.has_attachment = true;
+        store.upsert_message(&other).unwrap();
+
+        let location = |folder: &str| {
+            let query = format!("in:{folder}");
+            let hits = store.search(&account.id, &query).unwrap().hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].thread_id, thread);
+            let mut locations = store
+                .search_locations(&account.id, &query, "INBOX", &hits)
+                .unwrap();
+            locations.remove(&hits[0].message_id).unwrap()
+        };
+        let archive = location("Archive");
+        assert!(!archive.starred);
+        assert!(archive.has_attachment);
+        let target = [(thread.clone(), archive.folder.unwrap())];
+        store
+            .flag_scoped_threads(&account.id, &target, FlagChange::Star)
+            .unwrap()
+            .unwrap();
+        assert!(location("Archive").starred);
+
+        let unstar = store
+            .flag_scoped_threads(&account.id, &target, FlagChange::Unstar)
+            .unwrap()
+            .unwrap();
+        assert!(!location("Archive").starred);
+        assert!(location("INBOX").starred);
+        assert!(location("Archived").starred);
+        assert_eq!(store.undo(&account.id).unwrap().id, unstar.id);
+        assert!(location("Archive").starred);
+
+        assert!(
+            store
+                .flag_scoped_threads(
+                    &account.id,
+                    &[(thread.clone(), "Missing".into())],
+                    FlagChange::Unstar
+                )
+                .is_err()
+        );
+        assert!(location("Archive").starred);
+        assert!(location("INBOX").starred);
+        assert!(location("Archived").starred);
+    }
+
+    #[test]
+    fn search_operator_suggestions_read_actual_account_values() {
+        use crate::SearchField::*;
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let suggest = |field, prefix| {
+            store
+                .search_suggestions(&account, field, prefix, 4)
+                .unwrap()
+        };
+        assert_eq!(suggest(Folder, "ar"), ["Archive"]);
+        assert_eq!(suggest(Label, "work"), ["work", "workspace"]);
+        assert_eq!(suggest(Sender, "Ada Lo"), ["ada@x.com"]);
+        assert_eq!(suggest(Recipient, "Bo L"), ["bo@x.com"]);
+        assert_eq!(suggest(Recipient, "cc@"), ["cc@x.com"]);
+        assert!(
+            store
+                .search_suggestions(&AccountId("a2".into()), Folder, "ar", 4)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
