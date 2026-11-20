@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::Result;
 use crate::account::{Account, AccountId};
 use crate::backend::MailBackend;
@@ -6,6 +8,7 @@ use crate::store::{BodyRequest, Store};
 
 /// Messages per backfill batch. Each batch is one fetch and one commit.
 const BODY_BATCH: usize = 200;
+const REPLY_TO_BATCH: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
@@ -80,6 +83,64 @@ pub fn sync_with_progress(
         Ok(())
     })?;
     Ok(report)
+}
+
+/// Cursor for walking unchecked Reply-To headers between sync passes.
+/// Unavailable copies stay unchecked. Paging past them lets older mail
+/// make progress before the next walk tries them again.
+#[derive(Default)]
+pub struct ReplyToBackfill {
+    before: Option<i64>,
+}
+
+impl ReplyToBackfill {
+    /// Check up to 32 messages off the UI thread. Returns whether there was
+    /// a page to check. Each finished IMAP fetch is committed independently.
+    pub fn run_batch(
+        &mut self,
+        account: &AccountId,
+        backend: &dyn MailBackend,
+        store: &Store,
+    ) -> Result<bool> {
+        let batch = store.missing_reply_to(account, self.before, REPLY_TO_BATCH)?;
+        let Some(&(last, _)) = batch.last() else {
+            self.before = None;
+            return Ok(false);
+        };
+        let mut waiting = batch
+            .into_iter()
+            .map(|(_, id)| Ok((store.reply_to_copies(account, &id)?, id)))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Prefer the same Inbox-first order as on-demand body fetches, and
+        // try another copy only when the preceding one could not be read.
+        for round in 0.. {
+            let mut ids: HashMap<_, _> = waiting
+                .iter()
+                .filter_map(|(copies, id)| Some((copies.get(round)?.clone(), id.clone())))
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            let copies: Vec<_> = ids.keys().cloned().collect();
+            backend.fetch_reply_to(&copies, &mut |fetched| {
+                store.store_fetched_reply_to(
+                    account,
+                    fetched
+                        .iter()
+                        .filter_map(|answer| Some((ids.get(&answer.remote_id)?, answer))),
+                )?;
+                for answer in fetched {
+                    ids.remove(&answer.remote_id);
+                }
+                Ok(())
+            })?;
+            waiting.retain(|(copies, _)| copies.get(round).is_some_and(|id| ids.contains_key(id)));
+        }
+
+        self.before = Some(last);
+        Ok(true)
+    }
 }
 
 /// Fill parts for mail stored before they were kept, newest first, in up to
@@ -268,7 +329,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         };

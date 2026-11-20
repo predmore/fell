@@ -581,6 +581,36 @@ fn handle(
                         );
                         continue;
                     }
+                    if upper_cmd.contains("BODY.PEEK[HEADER.FIELDS (REPLY-TO)]") {
+                        if matches!(message.body_form, BodyForm::Omitted | BodyForm::Absent) {
+                            continue;
+                        }
+                        let header = header_fields(&message.raw, "reply-to:");
+                        let literal = match message.body_form {
+                            BodyForm::Nil => "NIL".to_string(),
+                            _ => format!("{{{}}}", header.len()),
+                        };
+                        let _ = write.write_all(
+                            format!(
+                                "* {seq} FETCH (UID {} BODY[HEADER.FIELDS (REPLY-TO)] {literal}",
+                                message.uid
+                            )
+                            .as_bytes(),
+                        );
+                        if message.body_form != BodyForm::Nil {
+                            let _ = write.write_all(b"\r\n");
+                            let _ = write.write_all(&header);
+                        }
+                        let _ = write.write_all(b")\r\n");
+                        if let Some(left) = bodies_left.as_mut() {
+                            *left = left.saturating_sub(1);
+                            if *left == 0 {
+                                let _ = write.flush();
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     if upper_cmd.contains("BODY.PEEK[HEADER]") {
                         if matches!(message.body_form, BodyForm::Omitted) {
                             continue;
@@ -1032,15 +1062,20 @@ fn is_special_use(flag: &str) -> bool {
     .any(|known| known.eq_ignore_ascii_case(flag))
 }
 
-/// The `Message-ID` line of a raw message, as `HEADER.FIELDS` returns it.
 fn message_id_header(raw: &[u8]) -> Vec<u8> {
+    header_fields(raw, "message-id:")
+}
+
+/// A selected header and its continuations, as HEADER.FIELDS returns it.
+fn header_fields(raw: &[u8], field: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut out = String::new();
-    for line in text.split("\r\n") {
-        if line.is_empty() {
-            break;
+    let mut keep = false;
+    for line in text.split("\r\n").take_while(|line| !line.is_empty()) {
+        if !line.starts_with([' ', '\t']) {
+            keep = line.to_ascii_lowercase().starts_with(field);
         }
-        if line.to_ascii_lowercase().starts_with("message-id:") {
+        if keep {
             out.push_str(line);
             out.push_str("\r\n");
         }

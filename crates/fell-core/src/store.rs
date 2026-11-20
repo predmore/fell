@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     references_header TEXT NOT NULL DEFAULT '',
     quote_text TEXT NOT NULL DEFAULT '',
     quote_html TEXT NOT NULL DEFAULT '',
+    reply_to_unverified INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
 
@@ -1052,6 +1053,71 @@ impl Store {
             message_id: MessageId(canonical),
             copies,
         }))
+    }
+
+    pub(crate) fn missing_reply_to(
+        &self,
+        account: &AccountId,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<(i64, MessageId)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.rowid, m.message_id FROM messages m
+             WHERE m.rowid < ?2 AND m.account_id = ?1 AND m.reply_to_line = ''
+             AND EXISTS (
+                 SELECT 1 FROM message_copies c
+                 WHERE c.account_id = m.account_id AND c.message_id = m.message_id
+             )
+             ORDER BY m.rowid DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![account.as_str(), before.unwrap_or(i64::MAX), limit],
+            |row| Ok((row.get(0)?, MessageId(row.get(1)?))),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub(crate) fn reply_to_copies(
+        &self,
+        account: &AccountId,
+        message: &MessageId,
+    ) -> Result<Vec<RemoteId>> {
+        bodies::copies_of(&self.conn, account, message.as_str())
+    }
+
+    pub(crate) fn store_fetched_reply_to<'a>(
+        &self,
+        account: &AccountId,
+        fetched: impl Iterator<Item = (&'a MessageId, &'a crate::backend::FetchedReplyTo)>,
+    ) -> Result<()> {
+        let tx = self
+            .lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE messages SET reply_to_line = ?3
+                 WHERE account_id = ?1 AND message_id = ?2 AND reply_to_line = ''
+                 AND EXISTS (
+                     SELECT 1 FROM message_copies
+                     WHERE account_id = ?1 AND message_id = ?2
+                       AND mailbox = ?4 AND uidvalidity = ?5 AND uid = ?6
+                 )",
+            )?;
+            for (message, answer) in fetched {
+                if let Some(copy) = crate::imap::parse_remote_id(&answer.remote_id.0) {
+                    stmt.execute(params![
+                        account.as_str(),
+                        message.as_str(),
+                        crate::message::encode_reply_to(Some(&answer.addresses)),
+                        copy.mailbox,
+                        copy.uidvalidity,
+                        copy.uid,
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Store parts fetched again for messages that had none. `None` parts
@@ -2283,7 +2349,7 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             message.snooze_until,
             fingerprint,
             list_id,
-            encode_addresses(&message.reply_to),
+            crate::message::encode_reply_to(message.reply_to.as_deref()),
             attachment_names,
         ],
     )?;
@@ -2436,12 +2502,10 @@ fn write_kept(
             union_tokens(&stored.attachment_names, &message.attachment_names, false),
         ),
     };
-    // The first copy's Reply-To stands; a copy that names none adds nothing.
-    let reply_to_line = if stored.reply_to_line.is_empty() {
-        encode_addresses(&message.reply_to)
-    } else {
-        stored.reply_to_line.clone()
-    };
+    let reply_to_line = crate::message::merge_reply_to(
+        &stored.reply_to_line,
+        crate::message::encode_reply_to(message.reply_to.as_deref()),
+    );
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
     // Read and star changes made in Fell stay until the server agrees.
     let unread = intents::server_unread(
@@ -3688,6 +3752,10 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
             "quote_html",
             "ALTER TABLE compose_drafts ADD COLUMN quote_html TEXT NOT NULL DEFAULT ''",
         ),
+        (
+            "reply_to_unverified",
+            "ALTER TABLE compose_drafts ADD COLUMN reply_to_unverified INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if have.iter().any(|column| column == name) {
             continue;
@@ -4040,7 +4108,7 @@ pub(crate) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Messag
         archived: row.get::<_, i64>(22)? != 0,
         snooze_until: row.get(23)?,
         list_id: row.get(24)?,
-        reply_to: decode_addresses(&row.get::<_, String>(25)?),
+        reply_to: crate::message::decode_reply_to(&row.get::<_, String>(25)?),
         attachment_names: split_field(&row.get::<_, String>(26)?),
         parts: None,
     })
@@ -4109,7 +4177,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }
@@ -8617,10 +8685,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_account(&account()).unwrap();
         let mut first = msg_for("a1", "rt@x", None, None, "Report", "see attached");
-        first.reply_to = vec![Address {
+        first.reply_to = Some(vec![Address {
             name: Some("List".into()),
             email: "list@x".into(),
-        }];
+        }]);
         first.attachment_names = vec!["report.pdf".into()];
         first.has_attachment = true;
         store.upsert_message(&first).unwrap();
@@ -8632,7 +8700,7 @@ mod tests {
         assert_eq!(read.attachment_names, vec!["report.pdf"]);
         // A later copy with no Reply-To keeps the first; names are unioned.
         let mut second = first.clone();
-        second.reply_to.clear();
+        second.reply_to = Some(Vec::new());
         second.attachment_names = vec!["report.pdf".into(), "chart.png".into()];
         store.upsert_message(&second).unwrap();
         let read = store

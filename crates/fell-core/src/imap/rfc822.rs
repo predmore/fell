@@ -176,7 +176,9 @@ pub(crate) fn to_message(
         archived: false,
         snooze_until: None,
         list_id,
-        reply_to: address_list(parsed.as_ref().and_then(|message| message.reply_to())),
+        reply_to: parsed
+            .as_ref()
+            .map(|message| address_list(message.reply_to())),
         attachment_names: attachment_names(&parts.mime_parts),
         parts: Some(parts),
     }
@@ -627,6 +629,23 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).to_ascii_lowercase()
 }
 
+/// An empty header-fields response has only the terminating blank line.
+/// Missing or incomplete bytes cannot establish that Reply-To is absent.
+pub(super) fn reply_to_from_header(raw: &[u8]) -> Option<Vec<Address>> {
+    if raw == b"\r\n" {
+        return Some(Vec::new());
+    }
+    if !raw.ends_with(b"\r\n\r\n") {
+        return None;
+    }
+    let parsed = MessageParser::new().parse_headers(raw)?;
+    parsed
+        .headers()
+        .iter()
+        .any(|header| header.raw_name().eq_ignore_ascii_case("Reply-To"))
+        .then(|| address_list(parsed.reply_to()))
+}
+
 fn address_list(list: Option<mail_parser::AddressList<'_>>) -> Vec<Address> {
     let Some(list) = list else {
         return Vec::new();
@@ -981,7 +1000,7 @@ mod tests {
         );
         assert_eq!(
             message.reply_to,
-            vec![
+            Some(vec![
                 Address {
                     name: Some("Plans list".into()),
                     email: "plans@lists.x".into(),
@@ -990,7 +1009,7 @@ mod tests {
                     name: None,
                     email: "bob@x".into(),
                 },
-            ]
+            ])
         );
         assert!(message.has_attachment);
         assert_eq!(message.attachment_names, vec!["report.pdf", "attachment"]);

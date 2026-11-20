@@ -35,11 +35,16 @@ pub struct ReplyParts {
     /// The same quote as HTML. Sent after the body in the HTML part, and
     /// painted collapsed below the draft.
     pub quote_html: String,
+    /// The draft was started before the original's Reply-To was verified.
+    pub reply_to_unverified: bool,
 }
 
 impl ReplyParts {
     pub fn is_empty(&self) -> bool {
-        self.references.is_empty() && self.quote_text.is_empty() && self.quote_html.is_empty()
+        self.references.is_empty()
+            && self.quote_text.is_empty()
+            && self.quote_html.is_empty()
+            && !self.reply_to_unverified
     }
 }
 
@@ -100,6 +105,7 @@ pub fn start_reply_in_zone(
                     references: reply_references(parent, parent_id),
                     quote_text,
                     quote_html,
+                    reply_to_unverified: parent.reply_to.is_none(),
                 },
             }
         }
@@ -115,6 +121,7 @@ pub fn start_reply_in_zone(
                     references: Vec::new(),
                     quote_text,
                     quote_html,
+                    reply_to_unverified: false,
                 },
             }
         }
@@ -183,7 +190,8 @@ fn in_sent(message: &Message, roles: &FolderRoles) -> bool {
 
 /// To and Cc for a reply to `parent`. To is Reply-To when the message has
 /// one, else the sender. Reply all adds the other To recipients to To and
-/// keeps Cc as Cc. The person's own addresses (`own`) and repeats are left
+/// keeps Cc as Cc. When incoming mail's Reply-To is unverified, the person
+/// chooses all recipients. The person's own addresses (`own`) and repeats are left
 /// out. A reply to the person's own message (from one of `own`, or a copy
 /// in the Sent folder `roles` name) goes to whoever it went to.
 pub fn reply_recipients(
@@ -198,10 +206,13 @@ pub fn reply_recipients(
         .collect();
     let mine = |address: &Address| own.contains(&address.email.trim().to_lowercase());
     let from_me = mine(&parent.headers.from) || in_sent(parent, roles);
+    if !from_me && parent.reply_to.is_none() {
+        return (Vec::new(), Vec::new());
+    }
     let primary: Vec<&Address> = if from_me {
         parent.to.iter().collect()
-    } else if !parent.reply_to.is_empty() {
-        parent.reply_to.iter().collect()
+    } else if let Some(addresses) = parent.reply_to.as_ref().filter(|list| !list.is_empty()) {
+        addresses.iter().collect()
     } else {
         vec![&parent.headers.from]
     };
@@ -605,7 +616,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }
@@ -625,7 +636,7 @@ mod tests {
     #[test]
     fn reply_to_wins_over_the_sender() {
         let mut message = parent();
-        message.reply_to = vec![address(Some("Plans list"), "plans@lists.x")];
+        message.reply_to = Some(vec![address(Some("Plans list"), "plans@lists.x")]);
         let (to, _) = reply_recipients(&message, &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["Plans list <plans@lists.x>"]);
         let (to, cc) = reply_recipients(&message, &me(), true, &FolderRoles::default());

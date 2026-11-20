@@ -100,7 +100,7 @@ fn extra_messages(account: &Account, count: usize) -> Vec<Message> {
                 archived: false,
                 snooze_until: None,
                 list_id: None,
-                reply_to: Vec::new(),
+                reply_to: Some(Vec::new()),
                 attachment_names: Vec::new(),
                 parts: None,
             }
@@ -906,7 +906,7 @@ fn message(account: &Account, now: i64, row: DraftMail) -> Message {
         archived: false,
         snooze_until: None,
         list_id: None,
-        reply_to: reply_address(row.id),
+        reply_to: Some(reply_address(row.id)),
         attachment_names: attachment_names(&row),
         parts: Some(parts(&row)),
     }

@@ -97,7 +97,11 @@ pub(super) enum FetchItems {
     /// `UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]`: enough for a list row and
     /// threading, before the body is fetched.
     Headers,
+    /// The original Reply-To header only, for legacy rows.
+    ReplyTo,
 }
+
+const REPLY_TO_SECTION: &str = "HEADER.FIELDS (REPLY-TO)";
 
 /// A UID and the header bytes fetched for it.
 pub(super) type HeaderRow = (u32, Vec<u8>);
@@ -318,6 +322,7 @@ impl Session {
             FetchItems::Flags => "",
             FetchItems::Bodies => " BODY.PEEK[]",
             FetchItems::Headers => " RFC822.SIZE BODY.PEEK[HEADER]",
+            FetchItems::ReplyTo => " BODY.PEEK[HEADER.FIELDS (REPLY-TO)]",
         };
         // CHANGEDSINCE already requests MODSEQ implicitly. Other FETCHes
         // need to request it to retain a baseline for later conditional STORE.
@@ -366,6 +371,9 @@ impl Session {
             }
             let fetched = match items {
                 FetchItems::Bodies | FetchItems::Headers => parse_fetch(&text, literals),
+                FetchItems::ReplyTo => {
+                    parse_fetch_with_section(&text, literals, Some(REPLY_TO_SECTION))
+                }
                 FetchItems::Flags => parse_flags(&text),
             };
             if let Some(fetched) = fetched {
@@ -1640,7 +1648,15 @@ fn parse_list(text: &str, literals: &[LiteralBytes]) -> Option<ParsedList> {
     })
 }
 
-fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
+fn parse_fetch(text: &str, literals: Vec<LiteralBytes>) -> Option<Fetched> {
+    parse_fetch_with_section(text, literals, None)
+}
+
+fn parse_fetch_with_section(
+    text: &str,
+    mut literals: Vec<LiteralBytes>,
+    section: Option<&str>,
+) -> Option<Fetched> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('*') {
         return None;
@@ -1651,7 +1667,7 @@ fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
     }
     let uid = number_after(&upper, "UID ")?;
     let flags = paren_after(text, "FLAGS").unwrap_or_default();
-    let (body, skipped, body_missing) = body_after_body_key(text, &mut literals);
+    let (body, skipped, body_missing) = body_after_body_key(text, &mut literals, section);
     Some(Fetched {
         uid,
         flags,
@@ -1727,7 +1743,11 @@ fn partial_origin(text: &str) -> Option<usize> {
 }
 
 /// The nstring after `BODY` / `BODY[...]`, not whichever literal arrived first.
-fn body_after_body_key(text: &str, literals: &mut [LiteralBytes]) -> (Vec<u8>, bool, bool) {
+fn body_after_body_key(
+    text: &str,
+    literals: &mut [LiteralBytes],
+    section: Option<&str>,
+) -> (Vec<u8>, bool, bool) {
     let upper = text.to_ascii_uppercase();
     let bytes = text.as_bytes();
     let mut search = 0;
@@ -1742,17 +1762,28 @@ fn body_after_body_key(text: &str, literals: &mut [LiteralBytes]) -> (Vec<u8>, b
         }
         let mut cursor = after;
         if bytes.get(cursor) == Some(&b'[') {
-            let Some(end) = text[cursor..].find(']') else {
+            let Some(end) = text[cursor..].find(']').map(|end| cursor + end) else {
                 return (Vec::new(), false, true);
             };
-            cursor += end + 1;
+            if section.is_some_and(|section| upper[cursor + 1..end] != *section) {
+                search = end + 1;
+                continue;
+            }
+            cursor = end + 1;
             // A partial fetch names its origin octet: `BODY[2]<0>`.
             if bytes.get(cursor) == Some(&b'<') {
+                if section.is_some() {
+                    search = cursor;
+                    continue;
+                }
                 let Some(end) = text[cursor..].find('>') else {
                     return (Vec::new(), false, true);
                 };
                 cursor += end + 1;
             }
+        } else if section.is_some() {
+            search = after;
+            continue;
         }
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;

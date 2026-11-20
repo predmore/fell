@@ -112,6 +112,8 @@ pub struct Snapshot {
     /// The message this draft replies to, as "sender · subject · date",
     /// when the mailbox has it.
     pub reply_context: Option<ReplyContext>,
+    /// The draft or its original still needs the recipients checked.
+    pub reply_to_unverified: bool,
     /// What a forward carries, read from its header block.
     pub forwarded: Option<super::reply::ForwardSummary>,
     /// An agent wrote this draft (`create_draft`), so every word of it,
@@ -125,9 +127,9 @@ pub struct ReplyContext {
     pub sender: String,
     /// The sender's address, shown when the reply goes somewhere else.
     pub sender_email: String,
-    /// Where the original asked replies to go, lowercased. A To address in
-    /// here that is not the sender is marked, so a redirect is seen.
-    pub reply_to: Vec<String>,
+    /// Where the original asked replies to go, lowercased. `None` means
+    /// the original's Reply-To is unverified.
+    pub reply_to: Option<Vec<String>>,
     pub subject: String,
     pub date_unix: i64,
 }
@@ -1170,6 +1172,11 @@ impl DraftSession {
             text,
             send_requested_by: self.send_requested_by.clone(),
             reply_context: self.reply_context.clone(),
+            reply_to_unverified: self.reply.reply_to_unverified
+                || self
+                    .reply_context
+                    .as_ref()
+                    .is_some_and(|parent| parent.reply_to.is_none()),
             forwarded: super::reply::forward_summary(&self.reply.quote_text),
             agent_authored: !self.owner.is_empty(),
         }
@@ -1889,7 +1896,7 @@ mod tests {
                 archived: false,
                 snooze_until: None,
                 list_id: None,
-                reply_to: Vec::new(),
+                reply_to: Some(Vec::new()),
                 attachment_names: Vec::new(),
                 parts: None,
             })

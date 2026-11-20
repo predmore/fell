@@ -1919,6 +1919,9 @@ impl ComposeView {
                         .is_some_and(|id| !id.trim().is_empty()),
                 |column| column.child(reply_row(snap, &redirects, colors, &fit)),
             )
+            .when(snap.reply_to_unverified, |column| {
+                column.child(unverified_reply_to(colors))
+            })
             .children(snap.forwarded.as_ref().map(|forward| {
                 let who = display_safe(&forward.sender);
                 let when = forward.date_wall.map(|wall| {
@@ -2602,6 +2605,7 @@ fn redirects(snap: &Snapshot) -> HashSet<String> {
     parent
         .reply_to
         .iter()
+        .flatten()
         .filter(|email| **email != sender)
         .cloned()
         .collect()
@@ -2653,6 +2657,23 @@ fn reply_row(
         }
         _ => context_row("In reply to", "none (new message)", "", None, colors),
     }
+}
+
+fn unverified_reply_to(colors: Palette) -> gpui::Div {
+    div()
+        .my_1()
+        .px_2()
+        .py_1()
+        .border_l(px(2.))
+        .border_color(rgb(colors.error))
+        .text_size(px(15.))
+        .child(
+            div()
+                .font_weight(FontWeight(620.))
+                .text_color(rgb(colors.error))
+                .child("Reply-To unverified"),
+        )
+        .child("Check the recipients, or sync and start a new reply.")
 }
 
 /// " · subject", joined so it never breaks from what comes before.
@@ -5436,6 +5457,7 @@ fn empty_snapshot(id: &str) -> Snapshot {
         text: String::new(),
         send_requested_by: None,
         reply_context: None,
+        reply_to_unverified: false,
         forwarded: None,
         agent_authored: false,
     }

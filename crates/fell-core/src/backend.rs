@@ -83,6 +83,12 @@ pub struct FetchedBody {
     pub raw: Option<Vec<u8>>,
 }
 
+/// A server copy whose Reply-To header was read successfully.
+pub struct FetchedReplyTo {
+    pub remote_id: crate::RemoteId,
+    pub addresses: Vec<crate::Address>,
+}
+
 /// Which server copies the store holds already, so sync never downloads a
 /// body it has. Called with a mailbox as remote ids spell it
 /// (`imap:{uidvalidity}:{uid}:{mailbox}`), a UIDVALIDITY, and an inclusive
@@ -166,6 +172,17 @@ pub trait MailBackend {
     /// cut-short fetch is an error. Backends with nothing to fetch return none.
     fn fetch_bodies(&self, _copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         Ok(Vec::new())
+    }
+
+    /// Check Reply-To by remote id. Deliver verified headers in batches;
+    /// a missing or unreadable copy is omitted. An empty address list means
+    /// the server returned the header section with no usable Reply-To.
+    fn fetch_reply_to(
+        &self,
+        _copies: &[crate::RemoteId],
+        _persist: &mut dyn FnMut(&[FetchedReplyTo]) -> Result<()>,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Fetch one MIME part of a stored copy by its IMAP section, still
@@ -261,6 +278,14 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_bodies(&self.imap, copies)
     }
 
+    fn fetch_reply_to(
+        &self,
+        copies: &[crate::RemoteId],
+        persist: &mut dyn FnMut(&[FetchedReplyTo]) -> Result<()>,
+    ) -> Result<()> {
+        crate::imap::fetch_reply_to(&self.imap, copies, persist)
+    }
+
     fn fetch_part(
         &self,
         copy: &crate::RemoteId,
@@ -321,6 +346,14 @@ impl MailBackend for ImapBackend {
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         crate::imap::fetch_bodies(&self.config, copies)
+    }
+
+    fn fetch_reply_to(
+        &self,
+        copies: &[crate::RemoteId],
+        persist: &mut dyn FnMut(&[FetchedReplyTo]) -> Result<()>,
+    ) -> Result<()> {
+        crate::imap::fetch_reply_to(&self.config, copies, persist)
     }
 
     fn fetch_part(
