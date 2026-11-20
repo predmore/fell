@@ -1,0 +1,25 @@
+Synthetic loopback IMAP at 1200 × 780 and 500 × 780.
+On-screen navigation checks ran before the delayed header reply.
+The initial draft kept reviewer@demo.test in every replay.
+The fresh reply used survey-list@demo.test with a header and avery@demo.test with no header.
+
+1795145021.180153 REPLY_TO_REFUSED
+1795145029.274891 REPLY_TO_DELAY_STARTED
+1795145041.277585 REPLY_TO_DELAY_FINISHED
+reviewer@demo.test|1
+Trail Survey List <survey-list@demo.test>|0
+1795145018.539076 REPLY_TO_REFUSED
+1795145027.178778 REPLY_TO_DELAY_STARTED
+1795145039.178896 REPLY_TO_DELAY_FINISHED
+reviewer@demo.test|1
+Trail Survey List <survey-list@demo.test>|0
+1795145019.147869 REPLY_TO_REFUSED
+1795145026.959994 REPLY_TO_DELAY_STARTED
+1795145038.960595 REPLY_TO_DELAY_FINISHED
+reviewer@demo.test|1
+Trail Survey List <survey-list@demo.test>|0
+1795145018.338002 REPLY_TO_REFUSED
+1795145028.221806 REPLY_TO_DELAY_STARTED
+1795145040.223591 REPLY_TO_DELAY_FINISHED
+reviewer@demo.test|1
+Avery Lane <avery@demo.test>|0
