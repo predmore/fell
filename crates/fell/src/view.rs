@@ -1,5 +1,7 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod attachment_actions;
+mod attachment_chips;
 mod disclosure;
 
 use std::cell::OnceCell;
@@ -24,10 +26,11 @@ use gpui::{
 
 use fell_core::compose::{DraftSummary, ReplyKind};
 
+use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
-use crate::keymap::KeyId;
+use crate::keymap::{Action, KeyId};
 use crate::mail_body::{
     self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
 };
@@ -50,6 +53,7 @@ use crate::theme::{self, Theme};
 use self::disclosure::disclosure;
 
 pub fn run() {
+    eprintln!("{}: opening inbox", fell_version::VERSION);
     Application::new().run(|cx: &mut App| {
         // Agents' drafts open in a compose window from here; see draft_host.
         let _hub = crate::draft_host::host_agent_drafts(cx);
@@ -242,6 +246,12 @@ struct Inbox {
     /// Cursor observed before the first inbox read, consumed after it paints.
     cid_repair: Option<futures::channel::oneshot::Receiver<fell_core::Result<CidRepairProgress>>>,
     account_id: AccountId,
+    attachment_fetcher: Fetcher,
+    attachment_busy: bool,
+    attachment_retry: Option<AttachmentRequest>,
+    attachment_download: Option<(String, String, Download)>,
+    reveal_attachment: bool,
+    forwarding_attachments: bool,
     session: Session,
     theme: Theme,
     list_scroll: UniformListScrollHandle,
@@ -374,6 +384,12 @@ impl Inbox {
                 .as_ref()
                 .map(|config| config.account().id)
                 .unwrap_or_else(|| AccountId(String::new())),
+            attachment_fetcher: Fetcher::new(config.clone()),
+            attachment_busy: false,
+            attachment_retry: None,
+            attachment_download: None,
+            reveal_attachment: false,
+            forwarding_attachments: false,
             session,
             store,
             cid_repair: None,
@@ -2193,6 +2209,12 @@ impl Inbox {
     /// the model picked, and bring the compose window up on it. The parent
     /// is read on the store thread and the draft is written off this one.
     fn start_reply(&mut self, kind: ReplyKind, cx: &mut Context<Self>) {
+        let forwarding = kind == ReplyKind::Forward;
+        if forwarding && (self.forwarding_attachments || self.attachment_busy) {
+            self.session
+                .show_toast("An attachment action is already in progress", false);
+            return;
+        }
         // The conversation on screen must be the selected row's: right
         // after a move, it can still be the last row's.
         let loaded = self.open_thread.is_some() && self.open_thread == self.session.cursor_id;
@@ -2219,20 +2241,40 @@ impl Inbox {
             return;
         };
         self.session.show_toast(reply_notice(kind, &sender), false);
+        self.forwarding_attachments |= forwarding;
         let notice = self.session.toast_generation();
         let account = self.account_id.clone();
         let email = self.session.account_email.clone();
         let roles = self.session.roles.clone();
+        let source = self.attachment_source();
         let read = self.store.call({
             let account = account.clone();
-            move |store| store.message(&account, &parent_id)
+            move |store| {
+                let parent = store.message(&account, &parent_id)?;
+                let parts =
+                    if forwarding && parent.as_ref().is_some_and(|parent| parent.has_attachment) {
+                        store.message_attachments(&account, &parent_id)?
+                    } else {
+                        None
+                    };
+                Ok::<_, fell_core::Error>((parent, parts))
+            }
         });
         cx.spawn(async move |this, cx| {
-            let Ok(found) = read.await else {
-                return;
-            };
-            let result = match found {
-                Ok(Some(parent)) => {
+            let result = match read.await {
+                Ok(Ok((Some(mut parent), parts))) => {
+                    let mut files = Vec::new();
+                    if let Some(parts) = parts {
+                        let parts = attachments::visible_parts(parts);
+                        let omitted;
+                        (files, omitted) = source
+                            .forward_files(&this, cx, parent.headers.message_id.as_str(), parts)
+                            .await;
+                        // The existing quote and compose warning name just
+                        // the files that could not be carried.
+                        parent.has_attachment = !omitted.is_empty();
+                        parent.attachment_names = omitted;
+                    }
                     let own = fell_core::compose::own_addresses(&parent, &email, &roles);
                     let offset = crate::present::local_offset(parent.headers.date_unix);
                     let start = fell_core::compose::start_reply_in_zone(
@@ -2240,13 +2282,19 @@ impl Inbox {
                     );
                     let hub = hub.clone();
                     cx.background_executor()
-                        .spawn(async move { home.new_reply(&hub, &account, start) })
+                        .spawn(
+                            async move { home.new_reply_with_files(&hub, &account, start, files) },
+                        )
                         .await
                 }
-                Ok(None) => Err("the message is no longer in the mailbox".to_string()),
-                Err(err) => Err(err.to_string()),
+                Ok(Ok((None, _))) => Err("the message is no longer in the mailbox".to_string()),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err("the mailbox reader stopped".into()),
             };
             let _ = this.update(cx, |inbox, cx| {
+                if forwarding {
+                    inbox.forwarding_attachments = false;
+                }
                 match result {
                     Ok(id) => {
                         if crate::draft_host::show_draft(&hub, &id) {
@@ -2274,10 +2322,17 @@ impl Inbox {
     /// "opening" notice `notice` has done its job and goes, unless something
     /// newer replaced it, such as the notice for a second draft opened since.
     fn settle_opening_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
+        self.dismiss_notice_after(notice, std::time::Duration::from_millis(700), cx);
+    }
+
+    fn dismiss_notice_after(
+        &mut self,
+        notice: u64,
+        delay: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(700))
-                .await;
+            cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.session.clear_toast_if(notice) {
                     cx.notify();
@@ -2366,6 +2421,10 @@ impl Inbox {
         let Some(key) = key_from(&event.keystroke) else {
             return;
         };
+        // A held key that started before a prompt appeared cannot confirm it.
+        if key == KeyId::Char('y') && event.is_held {
+            return;
+        }
         if let Some(log) = &self.frames {
             log.borrow_mut()
                 .key(Instant::now(), event.keystroke.unparse());
@@ -2378,12 +2437,14 @@ impl Inbox {
         // do that only while the conversation is focused, so they expand the
         // message on screen. An open palette, folder filter, or help card
         // types those keys and must leave the cursor alone.
-        if should_follow_visible(
-            &self.session.overlay,
-            self.session.chord.is_empty(),
-            self.session.pane,
-            key,
-        ) {
+        if self.session.focused_attachment().is_none()
+            && should_follow_visible(
+                &self.session.overlay,
+                self.session.chord.is_empty(),
+                self.session.pane,
+                key,
+            )
+        {
             self.follow_visible_message();
         }
         // A command can re-target the message on screen before it runs.
@@ -2422,6 +2483,29 @@ impl Inbox {
             folder: folder_before,
             pane: pane_before,
         } = before;
+        if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
+            if step.reveal_attachment {
+                self.reveal_selected_attachment();
+            }
+            if let Some(request) = step.attachment {
+                self.start_attachment_action(request, false, cx);
+            }
+            if let Some(target) = step.confirmed_attachment {
+                self.start_attachment_action(AttachmentRequest::Open(target), true, cx);
+            }
+        } else if step.reveal_attachment || step.attachment.is_some() {
+            self.session.leave_attachments();
+            self.session
+                .show_toast("The conversation is still loading", false);
+        }
+        if step.retry_attachment {
+            if let Some(request) = self.attachment_retry.clone() {
+                self.start_attachment_action(request, false, cx);
+            } else {
+                self.session
+                    .show_toast("No attachment action to retry", false);
+            }
+        }
         if step.apply_move
             && let Some(destination) = self.session.pending_move.take()
         {
@@ -2534,7 +2618,7 @@ impl Inbox {
         if step.scroll_pages != 0 || step.scroll_lines != 0 {
             self.reader_took_over(false);
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
-        } else if self.session.message_cursor != message_before {
+        } else if !step.reveal_attachment && self.session.message_cursor != message_before {
             if self.session.cursor_id == thread_before {
                 self.reader_took_over(true);
                 self.glide_conversation_to_cursor();
@@ -2580,6 +2664,7 @@ impl Inbox {
 
     fn focus_message(&mut self, index: usize) {
         self.reader_took_over(true);
+        self.session.leave_attachments();
         self.session.pane = Pane::Conversation;
         self.session.message_cursor = index;
     }
@@ -2757,6 +2842,9 @@ impl Inbox {
             next_y < measured_y,
             next_y != measured_y,
         );
+        if self.session.focused_attachment().is_none() {
+            self.session.leave_attachments();
+        }
         self.glide_conversation(measured_y, next_y);
     }
 
@@ -2858,6 +2946,7 @@ impl Inbox {
 
     fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
         self.cancel_pending_keys(cx);
+        self.session.leave_attachments();
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
         if changed || self.session.pane != Pane::List {
             self.session.cancel_read_delay();
@@ -2894,11 +2983,19 @@ impl Render for Inbox {
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
         self.advance_glides(now, window.scale_factor());
         let anchor = self.apply_body_refresh(now);
+        let reveal_attachment = std::mem::take(&mut self.reveal_attachment);
+        let spin_attachment = self.motion.motion.enabled()
+            && panes.1
+            && self.attachment_download.as_ref().is_some_and(|(id, _, _)| {
+                self.session
+                    .messages
+                    .iter()
+                    .any(|message| message.expanded && &message.id == id)
+            });
         self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
-        let viewport_h = f32::from(window.viewport_size().height);
         self.motion
-            .fit_card(card_fit(&self.session, viewport_h), now);
+            .fit_card(card_fit(&self.session, &self.theme, window), now);
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
@@ -2907,9 +3004,12 @@ impl Render for Inbox {
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: self.hold_landing().or(anchor),
             frames: self.frames.clone(),
+            attachment_download: self.attachment_download.clone(),
+            reveal_attachment,
+            spin_attachment,
         };
         self.conv_layout_current = panes.1;
-        let animating = self.motion.tick(now) | self.row_widths.running(now);
+        let animating = self.motion.tick(now) | self.row_widths.running(now) | spin_attachment;
         if animating {
             window.request_animation_frame();
         } else {
@@ -3033,6 +3133,9 @@ struct ConvFrame {
     /// The message held at its previous viewport position, or at the top on open.
     anchor: Option<ScrollAnchor>,
     frames: Option<SharedFrameLog>,
+    attachment_download: Option<(String, String, Download)>,
+    reveal_attachment: bool,
+    spin_attachment: bool,
 }
 
 /// Observe GPUI's scroll offset before and after it handles a wheel event.
@@ -4558,8 +4661,12 @@ fn read_conversation(
         .collect();
     let states = store.body_states(account, &ids)?;
     let mut view = present::conversation(&messages, me, roles, names, viewing);
-    for (message, state) in view.iter_mut().zip(states) {
+    for ((message, state), stored) in view.iter_mut().zip(states).zip(&messages) {
         message.body_state = state;
+        if stored.has_attachment {
+            let parts = store.message_attachments(account, &stored.headers.message_id)?;
+            message.attachments = attachments::visible_parts(parts.unwrap_or_default());
+        }
     }
     Ok(view)
 }
@@ -4584,6 +4691,7 @@ fn conversation(
     let focus = motion.focus_edge(session.pane, now);
     let arrival = motion.arrival(now);
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
+    let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
     let messages: Vec<_> = session
         .messages
@@ -4597,7 +4705,17 @@ fn conversation(
             };
             let block = if message.expanded {
                 expanded_message(
-                    theme, session, message, index, cursor, conv_width, live, frame, window, cx,
+                    theme,
+                    session,
+                    message,
+                    index,
+                    cursor,
+                    conv_width,
+                    live,
+                    frame,
+                    chip_probe.as_ref(),
+                    window,
+                    cx,
                 )
             } else {
                 let body = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
@@ -4671,12 +4789,15 @@ fn conversation(
                 .when(arrival < 1.0, |body| body.opacity(arrival))
                 .children(messages)
                 .into_any_element();
-            match (scroll, hold) {
-                (Some(scroll), Some((anchor, probe))) => LandingHold {
+            let landing = chip_probe
+                .map(|probe| (None, probe))
+                .or_else(|| hold.map(|(anchor, probe)| (Some(anchor.y), probe)));
+            match (scroll, landing) {
+                (Some(scroll), Some((y, probe))) => LandingHold {
                     inner: body,
                     probe,
                     scroll,
-                    y: anchor.y,
+                    y,
                     frames: frame.frames.clone(),
                 }
                 .into_any_element(),
@@ -4839,6 +4960,7 @@ fn expanded_message(
     conv_width: f32,
     live: Live,
     frame: &ConvFrame,
+    chip_probe: Option<&LayoutSlot>,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -4939,6 +5061,11 @@ fn expanded_message(
             frame,
             cx,
         ))
+        .when(!message.attachments.is_empty(), |card| {
+            card.child(attachment_chips::row(
+                theme, session, message, index, body_width, live, frame, chip_probe, window, cx,
+            ))
+        })
         .into_any_element()
 }
 
@@ -5695,6 +5822,10 @@ const PICKER_PX: f32 = 420.0;
 const PALETTE_MAX_PX: f32 = 420.0;
 const PICKER_MAX_PX: f32 = 380.0;
 const PALETTE_ROW_PX: f32 = 36.0;
+const PALETTE_ROW_MARGIN: f32 = 4.0;
+const PALETTE_ROW_PAD: f32 = 10.0;
+const ABOUT_ROW_PAD_Y: f32 = 7.0;
+const ABOUT_ROW_GAP: f32 = 2.0;
 const PICKER_ROW_PX: f32 = 34.0;
 /// Where the palette, folder picker and help card sit below the window's top.
 const CARD_TOP_PX: f32 = 72.0;
@@ -5702,18 +5833,54 @@ const CARD_TOP_PX: f32 = 72.0;
 /// How tall the open palette or folder picker should be to hold its items
 /// (its border, the 44 px query line and 4 px above and below the rows),
 /// up to its maximum and the window. `None` for any other overlay.
-fn card_fit(session: &Session, viewport_h: f32) -> Option<f32> {
-    let (rows, row_px, max) = match session.overlay {
-        Overlay::Palette => (session.palette().len(), PALETTE_ROW_PX, PALETTE_MAX_PX),
-        Overlay::Folders => (session.folder_choices().len(), PICKER_ROW_PX, PICKER_MAX_PX),
+fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
+    let (rows_px, max) = match session.overlay {
+        Overlay::Palette => {
+            let rows_px = session.palette().into_iter().map(|item| match item.action {
+                Action::About => about_palette_height(theme, window),
+                _ => PALETTE_ROW_PX,
+            });
+            (rows_px.sum(), PALETTE_MAX_PX)
+        }
+        Overlay::Folders => (
+            session.folder_choices().len() as f32 * PICKER_ROW_PX,
+            PICKER_MAX_PX,
+        ),
         _ => return None,
     };
     Some(present::card_height(
-        rows,
-        row_px,
+        rows_px,
         max,
-        viewport_h - CARD_TOP_PX - 16.0,
+        f32::from(window.viewport_size().height) - CARD_TOP_PX - 16.0,
     ))
+}
+
+/// The build stamp wraps at the same width and line height used in the row.
+fn about_palette_height(theme: &Theme, window: &Window) -> f32 {
+    let mono_px = theme.mono_px.max(12.0);
+    let mut style = conversation_line_style(window, theme, px(mono_px));
+    if let Some(family) = &theme.mono_family {
+        style.font_family = family.clone().into();
+    }
+    let width = f32::from(window.viewport_size().width).min(PALETTE_PX);
+    let text_width = (width - 2.0 - 2.0 * (PALETTE_ROW_MARGIN + PALETTE_ROW_PAD)).max(1.0);
+    let stamp = fell_version::VERSION;
+    let lines = window.text_system().shape_text(
+        stamp.into(),
+        px(mono_px),
+        &[style.to_run(stamp.len())],
+        Some(px(text_width)),
+        None,
+    );
+    let stamp_height = lines
+        .ok()
+        .and_then(|lines| {
+            lines
+                .first()
+                .map(|line| f32::from(line.size(px(mono_px + 4.0)).height))
+        })
+        .unwrap_or(mono_px + 4.0);
+    theme.ui_px + 4.0 + stamp_height + 2.0 * ABOUT_ROW_PAD_Y + ABOUT_ROW_GAP
 }
 const HELP_PX: f32 = 520.0;
 
@@ -5742,6 +5909,9 @@ fn overlay(
         .flex()
         .justify_center()
         .pt(px(CARD_TOP_PX - drop))
+        .when(session.overlay == Overlay::About, |layer| {
+            layer.items_start()
+        })
         .when(live, |layer| {
             layer.occlude().on_mouse_down(
                 MouseButton::Left,
@@ -5761,6 +5931,7 @@ fn overlay(
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::Help => help(theme, session, cx).opacity(opacity).into_any_element(),
+            Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }
@@ -5775,6 +5946,7 @@ fn palette(
     let selected = session.palette_index;
     div()
         .w(px(PALETTE_PX))
+        .max_w_full()
         .max_h(px(PALETTE_MAX_PX))
         .bg(rgb(theme.surface))
         .border_1()
@@ -5817,11 +5989,17 @@ fn palette(
                 .py(px(4.))
                 .children(items.iter().enumerate().map(|(index, item)| {
                     let action = item.action;
+                    let is_about = action == Action::About;
+                    let detail = if is_about {
+                        fell_version::VERSION
+                    } else {
+                        item.binding.as_str()
+                    };
                     div()
                         .id(gpui::ElementId::named_usize("palette", index))
-                        .h(px(PALETTE_ROW_PX))
-                        .mx(px(4.))
-                        .px(px(10.))
+                        .when(!is_about, |row| row.h(px(PALETTE_ROW_PX)))
+                        .mx(px(PALETTE_ROW_MARGIN))
+                        .px(px(PALETTE_ROW_PAD))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -5853,19 +6031,65 @@ fn palette(
                                 inbox.apply_step(step, before, cx);
                             }),
                         )
-                        .child(div().flex_1().child(item.label.clone()))
+                        .when(is_about, |row| {
+                            row.flex_col()
+                                .items_start()
+                                .py(px(ABOUT_ROW_PAD_Y))
+                                .gap(px(ABOUT_ROW_GAP))
+                        })
+                        .child(
+                            div()
+                                .when(!is_about, |label| label.flex_1())
+                                .when(is_about, |label| label.line_height(px(theme.ui_px + 4.0)))
+                                .child(item.label.clone()),
+                        )
                         .child(
                             div()
                                 .font_family_opt(theme.mono_family.clone())
-                                .text_size(px((theme.mono_px).max(12.0)))
+                                .text_size(px(theme.mono_px.max(12.0)))
+                                .when(is_about, |stamp| {
+                                    stamp
+                                        .w_full()
+                                        .line_height(px(theme.mono_px.max(12.0) + 4.0))
+                                })
                                 .text_color(rgb(if index == selected {
                                     theme.on_selection
                                 } else {
                                     theme.dimmed
                                 }))
-                                .child(item.binding.clone()),
+                                .child(detail.to_owned()),
                         )
                 })),
+        )
+}
+
+fn about(theme: &Theme, cx: &mut Context<Inbox>) -> gpui::Div {
+    div()
+        .w(px(420.))
+        .mx(px(12.))
+        .p(px(16.))
+        .bg(rgb(theme.surface))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .rounded_md()
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|inbox, _, _, cx| {
+                if inbox.session.overlay == Overlay::About {
+                    cx.stop_propagation();
+                }
+            }),
+        )
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("About Fell"))
+        .child(
+            div()
+                .font_family_opt(theme.mono_family.clone())
+                .text_size(px(theme.mono_px.max(12.0)))
+                .child(fell_version::VERSION),
         )
 }
 
@@ -5989,9 +6213,10 @@ fn folder_picker(
 }
 
 fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
-    let lines: Vec<_> = crate::keymap::Action::all()
+    let lines: Vec<_> = Action::all()
         .iter()
         .copied()
+        .filter(|action| *action != Action::About)
         .map(|action| {
             (
                 action.label().to_string(),
@@ -6161,7 +6386,7 @@ fn should_follow_visible(overlay: &Overlay, chord_empty: bool, pane: Pane, key: 
     match key {
         KeyId::Char('j' | 'k' | 'q') => true,
         // Expand, reply, reply all, and forward act on the message on screen.
-        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f') => pane == Pane::Conversation,
+        KeyId::Enter | KeyId::Char('o' | 'r' | 'R' | 'f' | 'a') => pane == Pane::Conversation,
         _ => false,
     }
 }

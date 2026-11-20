@@ -10,6 +10,7 @@ use fell_core::{
     FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId,
 };
 
+use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
 use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
 
@@ -136,6 +137,7 @@ pub enum Overlay {
     Palette,
     Folders,
     Help,
+    About,
 }
 
 /// What confirming the folder picker does.
@@ -281,6 +283,10 @@ pub struct Step {
     pub open_draft: bool,
     /// `r`, `R`, `f`: answer [`Session::reply_target`] in a new draft.
     pub reply: Option<ReplyKind>,
+    pub attachment: Option<AttachmentRequest>,
+    pub confirmed_attachment: Option<AttachmentTarget>,
+    pub retry_attachment: bool,
+    pub reveal_attachment: bool,
     /// Opening a thread, `U`, or `s` changed these rows.
     pub flags: Option<FlagEdit>,
     /// Opened an unread thread with a read delay: mark it read once it has
@@ -336,6 +342,8 @@ pub struct Session {
     pub full_width: bool,
     pub messages: Vec<ConvMessage>,
     pub message_cursor: usize,
+    attachment_focus: Option<AttachmentTarget>,
+    confirm_attachment: Option<(AttachmentTarget, u64)>,
     /// Messages whose collapsed parts (quotes, signature, every recipient)
     /// are open, by Message-ID, so a reread that shifts rows keeps them.
     pub quotes_open: HashSet<String>,
@@ -354,6 +362,8 @@ pub struct Session {
     /// Failure from the latest folder or message read.
     pub error: Option<String>,
     pub error_fault: Option<QueryFault>,
+    /// Details for the last attachment failure, until another attempt starts.
+    pub attachment_error: Option<String>,
     pub recent: Vec<Action>,
     pub palette_query: String,
     pub palette_index: usize,
@@ -417,6 +427,8 @@ impl Session {
             full_width: false,
             messages: Vec::new(),
             message_cursor: 0,
+            attachment_focus: None,
+            confirm_attachment: None,
             quotes_open: HashSet::new(),
             recipients_open: HashSet::new(),
             overlay: Overlay::None,
@@ -429,6 +441,7 @@ impl Session {
             startup_error: None,
             error: None,
             error_fault: None,
+            attachment_error: None,
             recent: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
@@ -484,6 +497,7 @@ impl Session {
         if self.toast.is_some() && self.toast_generation == generation {
             self.toast = None;
             self.confirm_purge = None;
+            self.confirm_attachment = None;
             return true;
         }
         false
@@ -518,10 +532,15 @@ impl Session {
             SyncKind::Failed(failure) => Some(failure.detail.as_str()),
             _ => None,
         };
-        let lines: Vec<&str> = [self.startup_error.as_deref(), self.error.as_deref(), sync]
-            .into_iter()
-            .flatten()
-            .collect();
+        let lines: Vec<&str> = [
+            self.startup_error.as_deref(),
+            self.error.as_deref(),
+            sync,
+            self.attachment_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if lines.is_empty() {
             None
         } else {
@@ -638,7 +657,13 @@ impl Session {
     }
 
     pub fn mode_label(&self) -> &'static str {
-        if self.visual { "visual" } else { "normal" }
+        if self.focused_attachment().is_some() {
+            "attachments"
+        } else if self.visual {
+            "visual"
+        } else {
+            "normal"
+        }
     }
 
     pub fn prefix_text(&self) -> String {
@@ -1265,9 +1290,52 @@ impl Session {
 
     pub fn set_messages(&mut self, messages: Vec<ConvMessage>) {
         self.messages = messages;
+        self.leave_attachments();
         self.quotes_open.clear();
         self.recipients_open.clear();
         self.message_cursor = self.messages.len().saturating_sub(1);
+    }
+
+    pub fn focused_attachment(&self) -> Option<&AttachmentTarget> {
+        let target = self.attachment_focus.as_ref()?;
+        let message = self.messages.get(self.message_cursor)?;
+        (self.pane == Pane::Conversation
+            && message.expanded
+            && message.id == target.message
+            && message.attachments.contains(&target.part))
+        .then_some(target)
+    }
+
+    pub fn focus_attachment(&mut self, index: usize, part: fell_core::MimePart) {
+        self.leave_attachments();
+        self.pane = Pane::Conversation;
+        self.message_cursor = index;
+        self.attachment_focus = Some(AttachmentTarget {
+            message: self.messages[index].id.clone(),
+            part,
+        });
+    }
+
+    pub fn leave_attachments(&mut self) {
+        self.attachment_focus = None;
+        if let Some((_, notice)) = self.confirm_attachment.take() {
+            self.clear_toast_if(notice);
+        }
+    }
+
+    pub fn ask_attachment_confirmation(&mut self, target: AttachmentTarget) {
+        if self.focused_attachment() != Some(&target) {
+            self.show_toast("Focus the executable attachment to confirm opening", true);
+            return;
+        }
+        self.show_toast(
+            format!(
+                "Open executable{NOTICE_DOT}“{}”{NOTICE_DOT}y confirm",
+                target.name()
+            ),
+            true,
+        );
+        self.confirm_attachment = Some((target, self.toast_generation));
     }
 
     /// Reread of the same messages in the same order. Folder and header
@@ -1277,6 +1345,9 @@ impl Session {
             new.expanded = old.expanded;
         }
         self.messages = messages;
+        if self.focused_attachment().is_none() {
+            self.leave_attachments();
+        }
     }
 
     /// Reread of the thread already open. A reader at the end follows when
@@ -1316,6 +1387,9 @@ impl Session {
         }
         self.messages = messages;
         self.message_cursor = cursor.min(len.saturating_sub(1));
+        if self.focused_attachment().is_none() {
+            self.leave_attachments();
+        }
         false
     }
 
@@ -1374,6 +1448,9 @@ impl Session {
         if before != (self.pane, self.cursor_id.clone(), self.folder.clone()) {
             self.cancel_read_delay();
         }
+        if self.attachment_focus.is_some() && self.focused_attachment().is_none() {
+            self.leave_attachments();
+        }
         if let Some((_, generation)) = &mut step.read_after {
             *generation = self.read_gen;
         }
@@ -1386,6 +1463,23 @@ impl Session {
     }
 
     fn handle_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        if let Some((target, notice)) = self.confirm_attachment.take()
+            && notice == self.toast_generation
+            && self.focused_attachment() == Some(&target)
+        {
+            self.clear_toast();
+            if key == KeyId::Char('y') {
+                self.count.clear();
+                return Step {
+                    confirmed_attachment: Some(target),
+                    ..Step::default()
+                };
+            }
+            if matches!(key, KeyId::Escape | KeyId::Char('n')) {
+                self.count.clear();
+                return Step::default();
+            }
+        }
         if self.overlay != Overlay::None {
             return self.overlay_key(key, page_rows);
         }
@@ -1413,6 +1507,16 @@ impl Session {
         }
         let mut step = Step::default();
         if self.chord.is_empty() && self.pane == Pane::Conversation {
+            if self.focused_attachment().is_some() && key != self.keymap.leader {
+                if key == KeyId::Escape {
+                    self.leave_attachments();
+                    self.count.clear();
+                    return step;
+                }
+                if let Some(action) = self.keymap.attachment_action(key) {
+                    return self.run(action, page_rows);
+                }
+            }
             match key {
                 KeyId::Up => {
                     step.scroll_lines = -signed_count(self.take_count());
@@ -1486,6 +1590,12 @@ impl Session {
             Overlay::Folders => self.folder_key(key),
             Overlay::Help => {
                 if matches!(key, KeyId::Escape | KeyId::Enter | KeyId::Char('?')) {
+                    self.overlay = Overlay::None;
+                }
+                Step::default()
+            }
+            Overlay::About => {
+                if matches!(key, KeyId::Escape | KeyId::Enter) {
                     self.overlay = Overlay::None;
                 }
                 Step::default()
@@ -1666,6 +1776,10 @@ impl Session {
             }
             Action::Back => {
                 self.count.clear();
+                if self.focused_attachment().is_some() {
+                    self.leave_attachments();
+                    return step;
+                }
                 self.visual = false;
                 self.picked.clear();
                 self.pane = Pane::List;
@@ -1848,6 +1962,10 @@ impl Session {
                 self.count.clear();
                 self.overlay = Overlay::Help;
             }
+            Action::About => {
+                self.count.clear();
+                self.overlay = Overlay::About;
+            }
             Action::ReopenReview => {
                 self.count.clear();
                 return Step {
@@ -1861,6 +1979,88 @@ impl Session {
                     compose: true,
                     ..Step::default()
                 };
+            }
+            Action::FocusAttachments => {
+                self.count.clear();
+                let index = if self.pane == Pane::List {
+                    self.messages.len().saturating_sub(1)
+                } else {
+                    self.message_cursor
+                };
+                if self.focused_attachment().is_some() {
+                    step.reveal_attachment = true;
+                } else if let Some(part) = self
+                    .messages
+                    .get(index)
+                    .and_then(|message| message.attachments.first())
+                    .cloned()
+                {
+                    let was_list = self.pane == Pane::List;
+                    step.message_disclosure_changed = !self.messages[index].expanded;
+                    self.messages[index].expanded = true;
+                    self.focus_attachment(index, part);
+                    if was_list {
+                        self.opened(&mut step);
+                    }
+                    step.reveal_attachment = true;
+                } else {
+                    self.show_toast("No attachments on this message", false);
+                }
+            }
+            Action::PreviousAttachment | Action::NextAttachment => {
+                let count = self.take_count();
+                if let Some(target) = self.focused_attachment() {
+                    let parts = &self.messages[self.message_cursor].attachments;
+                    let index = parts.iter().position(|part| *part == target.part).unwrap();
+                    let next = if action == Action::PreviousAttachment {
+                        index.saturating_sub(count)
+                    } else {
+                        index.saturating_add(count).min(parts.len() - 1)
+                    };
+                    self.focus_attachment(self.message_cursor, parts[next].clone());
+                    step.reveal_attachment = true;
+                }
+            }
+            Action::OpenAttachment | Action::SaveAttachment | Action::SaveAllAttachments => {
+                self.count.clear();
+                step.attachment = match action {
+                    Action::OpenAttachment => self
+                        .focused_attachment()
+                        .cloned()
+                        .map(AttachmentRequest::Open),
+                    Action::SaveAttachment => self
+                        .focused_attachment()
+                        .cloned()
+                        .map(|target| AttachmentRequest::Save(vec![target])),
+                    _ => self
+                        .reply_target()
+                        .filter(|message| !message.attachments.is_empty())
+                        .map(|message| {
+                            AttachmentRequest::Save(
+                                message
+                                    .attachments
+                                    .iter()
+                                    .cloned()
+                                    .map(|part| AttachmentTarget {
+                                        message: message.id.clone(),
+                                        part,
+                                    })
+                                    .collect(),
+                            )
+                        }),
+                };
+                if step.attachment.is_none() {
+                    let text = if action == Action::SaveAllAttachments {
+                        "No attachments to save"
+                    } else {
+                        "Focus an attachment first"
+                    };
+                    self.show_toast(text, false);
+                }
+            }
+            Action::RetryAttachment => {
+                self.count.clear();
+                step.retry_attachment = true;
             }
             Action::Reply | Action::ReplyAll | Action::Forward => {
                 self.count.clear();
@@ -2516,6 +2716,130 @@ mod tests {
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         session.set_threads(vec![row("a"), row("b"), row("c"), row("d"), row("e")]);
         session
+    }
+
+    fn attachment_message(expanded: bool) -> ConvMessage {
+        let mut message = empty_message(expanded);
+        message.attachments = (2..5)
+            .map(|section| fell_core::MimePart {
+                section: section.to_string(),
+                role: fell_core::PartRole::Attachment,
+                mime_type: "application/pdf".into(),
+                filename: Some(format!("report-{section}.pdf")),
+                size: 42,
+                encoded_size: 42,
+                encoding: fell_core::TransferEncoding::Identity,
+                content_id: None,
+                disposition: fell_core::Disposition::Attachment,
+                nested: false,
+            })
+            .collect();
+        message
+    }
+
+    #[test]
+    fn attachment_keys_focus_expand_move_open_and_save() {
+        let mut session = session();
+        session.set_messages(vec![attachment_message(false), empty_message(true)]);
+        session.pane = Pane::Conversation;
+        session.message_cursor = 0;
+
+        let step = session.on_key(KeyId::Char('a'), 10);
+        assert!(step.reveal_attachment && step.message_disclosure_changed);
+        assert!(session.messages[0].expanded);
+        assert_eq!(session.mode_label(), "attachments");
+        assert_eq!(session.focused_attachment().unwrap().part.section, "2");
+        session.on_key(KeyId::Char('l'), 10);
+        let middle = session.focused_attachment().unwrap().clone();
+        assert_eq!(middle.part.section, "3");
+        for key in [KeyId::Enter, KeyId::Char('o')] {
+            assert_eq!(
+                session.on_key(key, 10).attachment,
+                Some(AttachmentRequest::Open(middle.clone())),
+            );
+        }
+        assert_eq!(
+            session.on_key(KeyId::Char('S'), 10).attachment,
+            Some(AttachmentRequest::Save(vec![middle])),
+        );
+        for key in ['h', 'h'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        assert_eq!(session.focused_attachment().unwrap().part.section, "2");
+        for key in ['9', 'l'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        assert_eq!(session.focused_attachment().unwrap().part.section, "4");
+
+        session.on_key(KeyId::Space, 10);
+        session.on_key(KeyId::Char('a'), 10);
+        let Some(AttachmentRequest::Save(targets)) =
+            session.on_key(KeyId::Char('s'), 10).attachment
+        else {
+            panic!("save-all targets the current message");
+        };
+        assert_eq!(targets.len(), 3);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.message == session.messages[0].id)
+        );
+        assert_eq!(targets[0].part.section, "2");
+        session.on_key(KeyId::Space, 10);
+        session.on_key(KeyId::Char('a'), 10);
+        assert!(session.on_key(KeyId::Char('R'), 10).retry_attachment);
+
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.pane, Pane::Conversation);
+        assert!(session.focused_attachment().is_none());
+        assert!(session.on_key(KeyId::Enter, 10).message_disclosure_changed);
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.pane, Pane::List);
+    }
+
+    #[test]
+    fn executable_confirmation_is_bound_to_the_focused_file_and_notice() {
+        let mut session = session();
+        session.set_messages(vec![attachment_message(true)]);
+        session.on_key(KeyId::Char('a'), 10);
+        let target = session.focused_attachment().unwrap().clone();
+        session.ask_attachment_confirmation(target.clone());
+        assert!(session.toast.as_ref().unwrap().text.contains("y confirm"));
+        assert!(
+            session
+                .on_key(KeyId::Char('n'), 10)
+                .confirmed_attachment
+                .is_none()
+        );
+        assert!(
+            session
+                .on_key(KeyId::Char('y'), 10)
+                .confirmed_attachment
+                .is_none()
+        );
+
+        session.ask_attachment_confirmation(target.clone());
+        session.clear_toast(); // The window clears notices before dispatching a key.
+        assert_eq!(
+            session.on_key(KeyId::Char('y'), 10).confirmed_attachment,
+            Some(target.clone()),
+        );
+        assert!(
+            session
+                .on_key(KeyId::Char('y'), 10)
+                .confirmed_attachment
+                .is_none()
+        );
+        session.ask_attachment_confirmation(target.clone());
+        let mut updated = session.messages.clone();
+        updated[0].attachments[0].filename = Some("different.pdf".into());
+        session.refresh_same_messages(updated);
+        assert!(
+            session
+                .on_key(KeyId::Char('y'), 10)
+                .confirmed_attachment
+                .is_none()
+        );
     }
 
     #[test]
@@ -3239,6 +3563,22 @@ mod tests {
     }
 
     #[test]
+    fn about_matches_version_and_returns_in_recent_actions() {
+        let mut session = session();
+        session.on_key(KeyId::Char(':'), 4);
+        for ch in "version".chars() {
+            session.on_key(KeyId::Char(ch), 4);
+        }
+        assert_eq!(session.palette()[0].action, Action::About);
+        session.on_key(KeyId::Enter, 4);
+        assert_eq!(session.overlay, Overlay::About);
+        session.on_key(KeyId::Escape, 4);
+        assert_eq!(session.overlay, Overlay::None);
+        session.on_key(KeyId::Char(':'), 4);
+        assert_eq!(session.palette()[0].action, Action::About);
+    }
+
+    #[test]
     fn count_and_visual_range_and_stable_selection() {
         let mut session = session();
         session.on_key(KeyId::Char('4'), 4);
@@ -3411,6 +3751,21 @@ mod tests {
         without.remove(1);
         session.set_threads(without);
         assert_eq!(session.cursor_id.as_deref(), Some(rows[2].id.as_str()));
+    }
+
+    #[test]
+    fn attachment_error_details_survive_opening_help() {
+        let mut session = session();
+        let cause = "Couldn't open attachment\nIMAP server refused part 2";
+        session.attachment_error = Some(cause.into());
+        session.show_toast("Couldn't open attachment · space a R retry", true);
+
+        session.on_key(KeyId::Char('?'), 10);
+        assert_eq!(session.overlay, Overlay::Help);
+        assert_eq!(session.detail_text().as_deref(), Some(cause));
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.overlay, Overlay::None);
+        assert_eq!(session.detail_text().as_deref(), Some(cause));
     }
 
     #[test]
@@ -4188,6 +4543,7 @@ mod tests {
             body: crate::text_render::render_stored_body(Some("body"), "snip", ""),
             rich: crate::present::Rich::Plain,
             expanded,
+            attachments: Vec::new(),
             recipients: None,
             context: None,
             body_state: fell_core::BodyState::Stored,

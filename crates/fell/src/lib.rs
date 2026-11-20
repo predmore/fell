@@ -5,6 +5,7 @@
 
 pub mod render;
 
+mod attachments;
 mod compose_ui;
 pub mod draft_host;
 mod embeddings;

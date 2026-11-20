@@ -4279,12 +4279,16 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
         asked.elapsed() < Duration::from_millis(100),
         "fetch() returns at once"
     );
+    assert!(matches!(
+        heard.recv_timeout(Duration::from_secs(30)).unwrap(),
+        crate::parts::PartEvent::Downloading { total } if total == request.part.encoded_size
+    ));
     match heard.recv_timeout(Duration::from_secs(30)).unwrap() {
         crate::parts::PartEvent::Progress { fetched, total } => {
             assert!(fetched < total);
             assert_eq!(total, request.part.encoded_size);
         }
-        crate::parts::PartEvent::Done(result) => panic!("done too soon: {result:?}"),
+        other => panic!("expected progress: {other:?}"),
     }
 
     // A sync pass runs to the end while the part is still downloading.
@@ -4311,7 +4315,8 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
     let cached = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match heard.recv_timeout(left).expect("the fetch finishes") {
-            crate::parts::PartEvent::Progress { .. } => continue,
+            crate::parts::PartEvent::Downloading { .. }
+            | crate::parts::PartEvent::Progress { .. } => continue,
             crate::parts::PartEvent::Done(result) => break result.unwrap(),
         }
     };
@@ -4369,13 +4374,18 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     second.cancel();
     assert!(matches!(
         running.recv_timeout(Duration::from_secs(30)).unwrap(),
+        crate::parts::PartEvent::Downloading { .. }
+    ));
+    assert!(matches!(
+        running.recv_timeout(Duration::from_secs(30)).unwrap(),
         crate::parts::PartEvent::Progress { .. }
     ));
     let asked = Instant::now();
     first.cancel();
     let done = loop {
         match running.recv_timeout(Duration::from_secs(30)).unwrap() {
-            crate::parts::PartEvent::Progress { .. } => {}
+            crate::parts::PartEvent::Downloading { .. }
+            | crate::parts::PartEvent::Progress { .. } => {}
             crate::parts::PartEvent::Done(result) => break result,
         }
     };
@@ -4389,7 +4399,7 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
         crate::parts::PartEvent::Done(result) => {
             assert!(result.unwrap_err().to_string().contains("cancelled"));
         }
-        other @ crate::parts::PartEvent::Progress { .. } => panic!("{other:?}"),
+        other => panic!("{other:?}"),
     }
     let logged = commands(&parts_server);
     let count = |verb: &str| logged.iter().filter(|line| line.contains(verb)).count();
@@ -4406,6 +4416,10 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
     fetcher.fetch(request.clone(), move |event| {
         let _ = events.send(event);
     });
+    assert!(matches!(
+        heard.recv_timeout(Duration::from_secs(30)).unwrap(),
+        crate::parts::PartEvent::Downloading { .. }
+    ));
     assert!(matches!(
         heard.recv_timeout(Duration::from_secs(30)).unwrap(),
         crate::parts::PartEvent::Progress { .. }

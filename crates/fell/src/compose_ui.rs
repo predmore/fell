@@ -4747,8 +4747,7 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         })
         .collect::<Vec<_>>()
         .join("  ·  ");
-    // A forward cannot carry the original's files yet: say so here, open
-    // quote or not, so no one sends it thinking they went along.
+    // Surface omitted files even while the forwarded quote is folded.
     let dropped = snap
         .forwarded
         .as_ref()
@@ -4767,7 +4766,7 @@ fn attachment_row(snap: &Snapshot, colors: Palette, wide: bool) -> gpui::Div {
         .border_color(rgb(colors.rule))
         .child(
             div()
-                .flex_shrink_0()
+                .min_w(px(0.))
                 .child(if own.is_empty() && dropped.is_some() {
                     "Attachments\u{a0}\u{a0}".to_string()
                 } else if own.is_empty() {
