@@ -1,0 +1,50 @@
+commit 46c688932dda91a80bc31f42749282697baa967e
+parents b1640d8f97c25479559ceb76afb8150d5521a420 2de2451347aad145fcdcf2a7576476bd925576d7
+subject Integrate main into SMTP recovery
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+cargo 1.100.0 (3acc79c0c 2026-11-05)
+Build command: CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p fell
+/home/caleb/.cache/fell-207-46c6889.FVVjjtQY/fell-46c6889: OK
+
+Process and SQLite checks by layout
+
+dark
+initial 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+restart 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+after: authoritative Sent folder is Filed, per the IMAP \Sent role.
+Two exact copies yielded sent; weak matches left the third draft maybe-sent.
+Four loopback SMTP DATA transactions, one rejected AUTH, zero extra SMTP attempts.
+The 554 attempt stayed visible with account.toml missing. Dismissal revealed passive readiness.
+Both sent claims and the unknown claim persisted across app restart.
+Bcc appeared only in the tested SMTP envelopes and the private sent_bcc table.
+
+light
+initial 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+restart 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+after: authoritative Sent folder is Filed, per the IMAP \Sent role.
+Two exact copies yielded sent; weak matches left the third draft maybe-sent.
+Four loopback SMTP DATA transactions, one rejected AUTH, zero extra SMTP attempts.
+The 554 attempt stayed visible with account.toml missing. Dismissal revealed passive readiness.
+Both sent claims and the unknown claim persisted across app restart.
+Bcc appeared only in the tested SMTP envelopes and the private sent_bcc table.
+
+narrow
+initial 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+restart 46c688932dda91a80bc31f42749282697baa967e 8ccabece89769272dda0b48b01a70dd6f419fae3a224f1259c604c95ce98e68d
+after: authoritative Sent folder is Filed, per the IMAP \Sent role.
+Two exact copies yielded sent; weak matches left the third draft maybe-sent.
+Four loopback SMTP DATA transactions, one rejected AUTH, zero extra SMTP attempts.
+The 554 attempt stayed visible with account.toml missing. Dismissal revealed passive readiness.
+Both sent claims and the unknown claim persisted across app restart.
+Bcc appeared only in the tested SMTP envelopes and the private sent_bcc table.
+
+Exact-head sync tests
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 660 filtered out; finished in 9.03s
+test result: ok. 15 passed; 0 failed; 1 ignored; 0 measured; 715 filtered out; finished in 4.21s
+
+Exact-head focused regressions
+test imap::sync_tests::only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send ... ok
+test compose::session::tests::a_sent_confirmation_wins_over_an_open_unlock_dialog_and_a_lost_smtp_reply ... ok
+test smtp::tests::credential_refusal_preserves_diagnostics_and_redacts_authentication_data ... ok
+test compose_ui::tests::stale_readiness_cannot_replace_a_confirmed_attempts_smtp_rejection ... ok
+test compose_ui::tests::a_send_time_config_failure_survives_restored_readiness_until_the_next_send ... ok
