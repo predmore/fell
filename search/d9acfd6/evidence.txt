@@ -1,0 +1,9 @@
+Live search at d9acfd684bb7cb5b1cbb15d4b08dd0271120a05b
+
+All captures use the release binary from this head and disposable synthetic mail. Tokyo Night and Catppuccin Latte use 1200 × 780. The narrow capture uses Tokyo Night at 500 × 780. The first nested dark replay did not land on the preceding hit after N. The quiet replay captured n and N, completion and result focus, Escape, and palette recents. The action replay verified five operations on a Sent hit and undid them to the original folders.
+
+The same 100,000-message fixture, one warmup, and 31 samples per query were used for both released store builds. Ranking and location fingerprints matched for all eight queries. in:inbo corrected to in:inbox on both heads. Ranking plus locations p95 went from 215.415 ms to 119.512 ms for in:inbo and from 149.854 ms to 139.042 ms for in:inbox. The latest keyword ranking p95 peaked at 11.195 ms against the 50 ms budget.
+
+The exact head's nested replay used Asahi Vulkan for Fell and nested Weston GL with llvmpipe. The trace now includes ranking, excerpts, locations, and reply construction in the store work interval. With store work in flight, 4/153 paced keys and 241/245 burst keys exceeded 8 ms. Input p95 was 5.131 ms paced and 26.837 ms in the burst. Burst wait-before-render p95 was 24.515 ms. These measurements stop at CPU paint. A nested Hyprland startup failed before paint with a Wayland compositor protocol mismatch. Display presentation and native Hyprland timing remain unverified.
+
+Formatting, strict Clippy and all-feature workspace tests passed, with 1,289 passed and six ignored.

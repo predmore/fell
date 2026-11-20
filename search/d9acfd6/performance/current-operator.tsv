@@ -1,0 +1,9 @@
+query	hits	ordered_hit_and_location_fingerprint	ranking_p50_ms	ranking_p95_ms	with_locations_p50_ms	with_locations_p95_ms
+in:inbox	10098	a4a5a2f93006f1ff	86.175	102.354	120.301	139.042
+in:inbo	10098	5d956f0211fd395f	84.346	85.687	118.133	119.512
+in:Archive is:unread	2728	a6eeffc5b75944d4	46.185	48.687	57.872	61.054
+invoice	1208	8ac8df06faf8e843	10.389	10.927	17.157	18.003
+boiler leak	1109	56f32fa49ee917b7	8.384	8.863	14.581	15.627
+"boarding pass"	923	66cae5ac17339f44	6.929	8.048	13.246	15.624
+warranty from:p10@bench.test in:inbox has:attachment after:2023-12-01	5	8143280e457275cf	3.945	4.206	4.010	4.282
+invioce	1208	fcbed81ca1a09cb5	10.643	11.195	17.303	18.165
