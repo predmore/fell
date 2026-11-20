@@ -3745,7 +3745,10 @@ fn thread_line_one(
     } else {
         theme.dimmed
     };
-    let (sender, sender_width) = names(theme, row, frame, selected, window);
+    // Reserve the same sender width with or without chips. The label lane
+    // only borrows room left after that span and the fixed metadata.
+    let sender_limit = (text_width * 0.60).floor();
+    let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
     let count = (row.message_count > 1).then(|| row.message_count.to_string());
     let date = present::relative_date(now_unix(), row.date_unix);
     let size = theme.ui_px - 1.0;
@@ -3769,13 +3772,12 @@ fn thread_line_one(
             - STAR_SLOT
             - 4.0 * THREAD_LINE_GAP)
             .max(0.0);
-        let sender_room = sender_width.min(room * 0.65);
         thread_label_group(
             theme,
             row,
             selected,
             dim,
-            room - sender_room,
+            (room - sender_width).max(0.0),
             previous_labels,
             window,
         )
@@ -3992,6 +3994,7 @@ fn names(
     row: &ThreadRow,
     frame: RowFrame,
     selected: bool,
+    limit: f32,
     window: &Window,
 ) -> (gpui::Div, f32) {
     let dim = if selected {
@@ -4023,7 +4026,8 @@ fn names(
             .collect()
     };
     let extra_text = (extra > 0).then(|| format!("+{extra}"));
-    let width = (parts(true)
+    let bold_parts = parts(true);
+    let width = (bold_parts
         .iter()
         .map(|(text, span_weight)| line_px(window, text, *span_weight))
         .sum::<f32>()
@@ -4037,18 +4041,41 @@ fn names(
         theme.foreground
     };
     let mut line = div().flex().flex_row().whitespace_nowrap();
-    for (text, span_weight) in parts(frame.bold) {
+    if width > limit {
+        let names: String = bold_parts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .chain(extra_text.as_deref())
+            .collect();
+        let visible = clip_line(
+            window,
+            &window.text_style(),
+            &names,
+            limit,
+            FontWeight::BOLD,
+        );
         line = line.child(
             div()
                 .flex_none()
-                .font_weight(span_weight)
+                .font_weight(row_weight(frame.bold))
                 .text_color(rgb(text_color))
-                .child(text),
+                .child(visible),
         );
+    } else {
+        for (text, span_weight) in parts(frame.bold) {
+            line = line.child(
+                div()
+                    .flex_none()
+                    .font_weight(span_weight)
+                    .text_color(rgb(text_color))
+                    .child(text),
+            );
+        }
+        if let Some(text) = extra_text {
+            line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
+        }
     }
-    if let Some(text) = extra_text {
-        line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
-    }
+    let width = width.min(limit);
     (
         div()
             .relative()
