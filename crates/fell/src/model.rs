@@ -251,6 +251,13 @@ pub struct FlagEdit {
     pub change: FlagChange,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadDwell {
+    id: String,
+    folder: String,
+    generation: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub reload_threads: bool,
@@ -294,9 +301,8 @@ pub struct Step {
     /// Opening a thread, `U`, or `s` changed these rows.
     pub flags: Option<FlagEdit>,
     /// Opened an unread thread with a read delay: mark it read once it has
-    /// stayed open that long (see [`Session::read_after_dwell`]). The
-    /// second value is the open it belongs to ([`Session::read_gen`]).
-    pub read_after: Option<(String, u64)>,
+    /// stayed open that long (see [`Session::read_after_dwell`]).
+    pub read_after: Option<ReadDwell>,
     pub search_request: bool,
     pub search_completion: bool,
     pub reveal_search_hit: bool,
@@ -403,6 +409,8 @@ pub struct Session {
     /// Bumped whenever the open thread, the pane, or the folder changes, so
     /// a read delay started by an earlier open cannot fire for this one.
     pub read_gen: u64,
+    /// A dwell that ended while the open search hit was being refreshed.
+    deferred_read: Option<ReadDwell>,
     /// The list rows on screen, set by the view before each key. `None`:
     /// the list is not showing, or its layout is not known yet.
     pub rows_in_view: Option<Range<usize>>,
@@ -472,6 +480,7 @@ impl Session {
             loading: false,
             read_dwell_ms: 0,
             read_gen: 0,
+            deferred_read: None,
             rows_in_view: None,
         }
     }
@@ -1489,8 +1498,8 @@ impl Session {
         if self.attachment_focus.is_some() && self.focused_attachment().is_none() {
             self.leave_attachments();
         }
-        if let Some((_, generation)) = &mut step.read_after {
-            *generation = self.read_gen;
+        if let Some(read) = &mut step.read_after {
+            read.generation = self.read_gen;
         }
         step
     }
@@ -1498,6 +1507,7 @@ impl Session {
     /// Invalidate the read delay after navigation or an explicit read edit.
     pub fn cancel_read_delay(&mut self) {
         self.read_gen = self.read_gen.wrapping_add(1);
+        self.deferred_read = None;
     }
 
     fn handle_key(&mut self, key: KeyId, page_rows: usize) -> Step {
@@ -2244,30 +2254,48 @@ impl Session {
         let Some(row) = self.cursor_thread() else {
             return;
         };
-        if !row.unread || row.draft.is_some() || self.search_source(&row.id).is_none() {
+        if !row.unread || row.draft.is_some() {
             return;
         }
+        let Some(folder) = self.search_source(&row.id) else {
+            return;
+        };
         let id = row.id.clone();
         if self.read_dwell_ms == 0 {
             step.flags = self.mark_rows(vec![id], FlagChange::Read);
         } else {
             // The open it belongs to is filled in by `on_key`.
-            step.read_after = Some((id, 0));
+            step.read_after = Some(ReadDwell {
+                id,
+                folder: folder.to_owned(),
+                generation: 0,
+            });
         }
     }
 
-    /// The read delay for `id` ran out. Mark it read if it is still the
+    /// The read delay ran out. Mark it read if it is still the
     /// thread open in the conversation pane, from the same open
-    /// (`generation`): leaving and reopening starts a new delay.
-    pub fn read_after_dwell(&mut self, id: &str, generation: u64) -> Option<FlagEdit> {
-        let open = generation == self.read_gen
+    /// and folder. Wait for a pending search refresh to confirm the scope.
+    pub fn read_after_dwell(&mut self, read: ReadDwell) -> Option<FlagEdit> {
+        let open = read.generation == self.read_gen
             && self.pane == Pane::Conversation
-            && self.cursor_id.as_deref() == Some(id)
-            && self.search_results_current();
+            && self.cursor_id.as_deref() == Some(read.id.as_str());
         if !open || !self.cursor_thread().is_some_and(|row| row.unread) {
             return None;
         }
-        self.mark_rows(vec![id.to_string()], FlagChange::Read)
+        if self.search.as_ref().is_some_and(|search| search.pending) {
+            self.deferred_read = Some(read);
+            return None;
+        }
+        if self.search_source(&read.id) != Some(read.folder.as_str()) {
+            return None;
+        }
+        self.mark_rows(vec![read.id], FlagChange::Read)
+    }
+
+    pub fn resume_read_after_search(&mut self) -> Option<FlagEdit> {
+        let read = self.deferred_read.take()?;
+        self.read_after_dwell(read)
     }
 
     /// Threads `U` and `s` act on: the visual range or picked rows plus the
@@ -3216,19 +3244,19 @@ mod tests {
         session.cursor_id = Some("a".into());
         let step = session.on_key(KeyId::Enter, 10);
         assert_eq!(step.flags, None);
-        let (id, first) = step.read_after.unwrap();
-        assert_eq!(id, "a");
+        let first = step.read_after.unwrap();
+        assert_eq!(first.id, "a");
         assert_eq!(unread_rows(&session), vec!["a"]);
         // Left before the delay ran out: still unread.
         session.on_key(KeyId::Escape, 10);
-        assert_eq!(session.read_after_dwell("a", first), None);
+        assert_eq!(session.read_after_dwell(first.clone()), None);
         // Opened again: the first open's delay is stale even though the
         // same thread is open now, so only the second one marks it read.
-        let (_, second) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        let second = session.on_key(KeyId::Enter, 10).read_after.unwrap();
         assert_ne!(first, second);
-        assert_eq!(session.read_after_dwell("a", first), None);
+        assert_eq!(session.read_after_dwell(first), None);
         assert_eq!(unread_rows(&session), vec!["a"]);
-        let edit = session.read_after_dwell("a", second).unwrap();
+        let edit = session.read_after_dwell(second).unwrap();
         assert_eq!(edit.change, FlagChange::Read);
         assert!(unread_rows(&session).is_empty());
         assert_eq!(session.unread_count, 0);
@@ -3240,17 +3268,17 @@ mod tests {
         session.read_dwell_ms = 800;
         session.threads[0].unread = true;
         session.cursor_id = Some("a".into());
-        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        let read = session.on_key(KeyId::Enter, 10).read_after.unwrap();
         // The pointer picks another thread and then this one again.
         session.cancel_read_delay();
-        assert_eq!(session.read_after_dwell("a", generation), None);
-        let (_, generation) = {
+        assert_eq!(session.read_after_dwell(read), None);
+        let read = {
             session.on_key(KeyId::Escape, 10);
             session.on_key(KeyId::Enter, 10).read_after.unwrap()
         };
         session.on_key(KeyId::Char('g'), 10);
         session.on_key(KeyId::Char('s'), 10);
-        assert_eq!(session.read_after_dwell("a", generation), None);
+        assert_eq!(session.read_after_dwell(read), None);
     }
 
     #[test]
@@ -3259,16 +3287,16 @@ mod tests {
         session.read_dwell_ms = 800;
         session.threads[0].unread = true;
         session.cursor_id = Some("a".into());
-        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        let read = session.on_key(KeyId::Enter, 10).read_after.unwrap();
         session.on_key(KeyId::Char('U'), 10);
         session.on_key(KeyId::Char('U'), 10);
-        assert_eq!(session.read_after_dwell("a", generation), None);
+        assert_eq!(session.read_after_dwell(read), None);
         assert!(session.threads[0].unread);
 
         session.on_key(KeyId::Escape, 10);
-        let (_, generation) = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+        let read = session.on_key(KeyId::Enter, 10).read_after.unwrap();
         assert!(session.on_key(KeyId::Char('u'), 10).undo);
-        assert_eq!(session.read_after_dwell("a", generation), None);
+        assert_eq!(session.read_after_dwell(read), None);
     }
 
     #[test]
@@ -3278,10 +3306,10 @@ mod tests {
         session.threads[0].unread = true;
         session.cursor_id = Some("a".into());
         session.cancel_read_delay();
-        let (id, generation) = session.perform(Action::Open, 10).read_after.unwrap();
-        assert_ne!(generation, 0);
+        let read = session.perform(Action::Open, 10).read_after.unwrap();
+        assert_ne!(read.generation, 0);
         assert_eq!(
-            session.read_after_dwell(&id, generation).unwrap().change,
+            session.read_after_dwell(read).unwrap().change,
             FlagChange::Read
         );
     }

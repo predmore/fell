@@ -352,7 +352,7 @@ impl Inbox {
         switched || cleared
     }
 
-    pub(super) fn refresh_search_after_write(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_search(&mut self, cx: &mut Context<Self>) {
         if self.session.refresh_search() {
             self.cancel_search_work();
             self.request_search(cx);
@@ -706,6 +706,9 @@ impl Inbox {
                     self.refresh_search_matches(cx);
                 } else {
                     self.request_messages(true, cx);
+                }
+                if let Some(edit) = self.session.resume_read_after_search() {
+                    self.apply_flags(edit, cx);
                 }
                 cx.notify();
             }

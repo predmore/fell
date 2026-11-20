@@ -37,7 +37,8 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, Session, Step, SyncKind, Toast, row_key,
+    DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, ReadDwell, Session, Step, SyncKind,
+    Toast, row_key,
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
@@ -1556,6 +1557,16 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
+                    Ok((view, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
+                        // A hit may disappear between the two reads. Search
+                        // has its own list, so a folder read cannot replace it.
+                        inbox.clear_open_message();
+                        inbox.session.cancel_read_delay();
+                        inbox.session.clear_query_fault(QueryFault::Message);
+                        if inbox.session.search_results_current() {
+                            inbox.refresh_search(cx);
+                        }
+                    }
                     Ok((view, _, _)) if view.is_empty() && !inbox.session.messages.is_empty() => {
                         // The open thread key can disappear between the folder
                         // and message reads. Keep the conversation until a
@@ -1835,7 +1846,7 @@ impl Inbox {
                         .and_then(|intent| intent.select.as_ref())
                         .map(|key| key.thread_id.0.clone());
                     inbox.refresh_saved_search_folder(select, cx);
-                    inbox.refresh_search_after_write(cx);
+                    inbox.refresh_search(cx);
                 }
                 if let Some(after) = after {
                     inbox.request_threads(after, cx);
@@ -2300,14 +2311,14 @@ impl Inbox {
 
     /// Opened with a read delay: mark the thread read if it is still open
     /// when the delay runs out.
-    fn read_after(&mut self, id: String, generation: u64, cx: &mut Context<Self>) {
+    fn read_after(&mut self, read: ReadDwell, cx: &mut Context<Self>) {
         let delay = self.session.read_dwell_ms;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(delay))
                 .await;
             let _ = this.update(cx, |inbox, cx| {
-                if let Some(edit) = inbox.session.read_after_dwell(&id, generation) {
+                if let Some(edit) = inbox.session.read_after_dwell(read) {
                     inbox.apply_flags(edit, cx);
                     cx.notify();
                 }
@@ -2760,8 +2771,8 @@ impl Inbox {
         if let Some(edit) = step.flags.clone() {
             self.apply_flags(edit, cx);
         }
-        if let Some((id, generation)) = step.read_after.clone() {
-            self.read_after(id, generation, cx);
+        if let Some(read) = step.read_after {
+            self.read_after(read, cx);
         }
         if step.archive {
             self.archive_current(cx);

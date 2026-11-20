@@ -556,6 +556,7 @@ impl Session {
             // An invalid query has no result set of its own. Keep the last
             // valid rows, cursor and reader while presenting the error.
             let search = self.search.as_mut().unwrap();
+            self.deferred_read = None;
             search.pending = false;
             search.error = Some(Toast {
                 text: one_line(&error),
@@ -789,7 +790,7 @@ fn next(query: &str, caret: usize) -> usize {
 mod tests {
     use super::*;
     use crate::keymap::{Action, Keymap};
-    use crate::model::SyncKind;
+    use crate::model::{FlagEdit, SyncKind};
 
     fn session() -> Session {
         Session::new(
@@ -899,6 +900,42 @@ mod tests {
         land(&mut session, empty);
         assert!(session.threads.is_empty());
         assert!(session.search_results_current());
+    }
+
+    #[test]
+    fn read_dwell_waits_for_search_to_confirm_the_open_folder() {
+        for (folder, mark_read) in [("INBOX", true), ("Archive", false)] {
+            let mut session = session();
+            session.read_dwell_ms = 800;
+            session.on_key(KeyId::Char('/'), 10);
+            session.type_search("invoice");
+            let unread_hit = || {
+                let mut reply = reply(vec![row_hit("one", "m1")], None);
+                reply.rows[0].unread = true;
+                reply
+            };
+            land(&mut session, unread_hit());
+            session.on_key(KeyId::Enter, 10);
+            let dwell = session.on_key(KeyId::Enter, 10).read_after.unwrap();
+            assert!(session.on_key(KeyId::Char('s'), 10).flags.is_some());
+            assert!(session.refresh_search());
+
+            assert_eq!(session.read_after_dwell(dwell), None);
+            assert!(session.threads[0].unread);
+
+            let mut updated = unread_hit();
+            updated.hits.get_mut("one").unwrap().folder = Some(folder.into());
+            land(&mut session, updated);
+            assert_eq!(
+                session.resume_read_after_search(),
+                mark_read.then(|| FlagEdit {
+                    ids: vec!["one".into()],
+                    change: fell_core::FlagChange::Read,
+                })
+            );
+            assert_eq!(session.threads[0].unread, !mark_read);
+            assert!(session.resume_read_after_search().is_none());
+        }
     }
 
     #[test]
