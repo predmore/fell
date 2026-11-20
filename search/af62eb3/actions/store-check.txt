@@ -1,0 +1,10 @@
+Synthetic fixture messages after the action replay
+venue-1@fell.test|INBOX|0|0
+venue-2@fell.test|Sent|0|0
+venue-3@fell.test|INBOX|0|0
+Local actions, each undone
+archive|archived 1 from Sent|1
+star|starred 1 thread|1
+move|moved 1 from Sent to Archive|1
+delete|deleted 1 messages|1
+spam|changed spam status for 1 messages|1

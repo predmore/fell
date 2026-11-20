@@ -1,0 +1,11 @@
+Fell #108 integrated revision
+
+The release binary and every screenshot were captured at af62eb3584d6a930dc5da815e5a2e5647fbb6786. The dark and light captures are 1200 × 780 and the narrow capture is 500 × 780. All mail is synthetic.
+
+The full keyboard recording covers typing, highlighting, focusing results, matching-message navigation, restoring the original folder, label completion, spelling correction, and palette recents. The transition recording shows no empty frame when the query changes. All 14 sampled pending frames showed both the accepted list and conversation. In the action replay, archive, star, move, delete, and spam affected the Sent hit and each action was undone.
+
+The 100,000-message keyword benchmark used the exact-head fell-core, the deterministic store fixture, and 31 measurements per query. The slowest keyword p95 was 20.964 ms against 50 ms.
+
+The nested software compositor timing measures from key-handler start to CPU paint. GPU submission and display presentation are outside the measured interval. Paced keyword input during in-flight queries had 4.964 ms p95 and 5.366 ms maximum over 21 samples. Out of 36 mixed in-flight samples, three exceeded 8 ms. The mixed p95 was 12.686 ms. The burst p95 was 22.064 ms with seven of 25 in-flight samples over 8 ms. The strict input gate remains open.
+
+Formatting, strict Clippy, and the workspace suite passed with 1,280 tests passed and six ignored.
