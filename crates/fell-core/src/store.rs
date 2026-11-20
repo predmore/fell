@@ -5356,6 +5356,7 @@ mod tests {
         );
         other.folders = vec!["Archived".into()];
         other.starred = true;
+        other.has_attachment = true;
         store.upsert_message(&other).unwrap();
 
         let location = |folder: &str| {
@@ -5370,6 +5371,7 @@ mod tests {
         };
         let archive = location("Archive");
         assert!(!archive.starred);
+        assert!(archive.has_attachment);
         let target = [(thread.clone(), archive.folder.unwrap())];
         store
             .flag_scoped_threads(&account.id, &target, FlagChange::Star)

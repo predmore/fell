@@ -4177,6 +4177,7 @@ fn thread_row(
 }
 
 const THREAD_LINE_GAP: f32 = 8.0;
+const THREAD_ATTACHMENT_MARK: &str = "⧉";
 
 fn thread_line_one(
     theme: &Theme,
@@ -4201,7 +4202,7 @@ fn thread_line_one(
         line_px_with_style(window, &style, count, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
     });
     let attachment_width = if row.has_attachment {
-        line_px(window, "⧉", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+        line_px(window, THREAD_ATTACHMENT_MARK, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
     } else {
         0.0
     };
@@ -4249,7 +4250,12 @@ fn thread_line_one(
             )
         })
         .when(row.has_attachment, |line| {
-            line.child(div().flex_none().text_color(rgb(dim)).child("⧉"))
+            line.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(dim))
+                    .child(THREAD_ATTACHMENT_MARK),
+            )
         })
         .children(labels)
         .child(div().flex_1().min_w(px(0.)))

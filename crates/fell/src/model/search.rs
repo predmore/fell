@@ -94,7 +94,7 @@ impl SearchReply {
                         extra: 0,
                         message_count: location.as_ref().map_or(1, |hit| hit.message_count),
                         starred: location.as_ref().is_some_and(|hit| hit.starred),
-                        has_attachment: false,
+                        has_attachment: location.as_ref().is_some_and(|hit| hit.has_attachment),
                         date_unix,
                         subject: one_line(&subject),
                         snippet: one_line(&snippet),
@@ -575,14 +575,13 @@ impl Session {
         true
     }
 
-    pub fn defer_empty_search_reply(&self, generation: u64, reply: &SearchReply) -> bool {
+    pub fn defer_search_reply(&self, generation: u64, reply: &SearchReply) -> bool {
         self.search_generation == generation
             && self
                 .search
                 .as_ref()
                 .is_some_and(|search| search.pending && search.editing)
             && reply.rows.is_empty()
-            && reply.error.is_none()
     }
 
     pub fn remember_search(&mut self) {
@@ -815,6 +814,7 @@ mod tests {
                         starred: false,
                         sender_name: Some("Ada".into()),
                         message_count: 3,
+                        has_attachment: true,
                     },
                 )
             })
@@ -853,6 +853,7 @@ mod tests {
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
         assert_eq!(session.threads[0].spans[0].text, "Ada");
         assert_eq!(session.threads[0].message_count, 3);
+        assert!(session.threads[0].has_attachment);
         session.on_key(KeyId::Char('j'), 10);
         assert_eq!(session.cursor_id.as_deref(), Some("two"));
         session.on_key(KeyId::Enter, 10);
@@ -869,20 +870,59 @@ mod tests {
         session.type_search(" v");
         let prefix = session.search_generation;
         let mut empty = reply(Vec::new(), None);
-        assert!(session.defer_empty_search_reply(prefix, &empty));
+        assert!(session.defer_search_reply(prefix, &empty));
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
         assert!(!session.search_results_current());
 
         session.type_search("enue");
         assert!(!session.apply_search_reply(prefix, &mut empty));
         assert_eq!(session.threads.len(), 1);
-        assert!(session.defer_empty_search_reply(session.search_generation, &empty));
+        assert!(session.defer_search_reply(session.search_generation, &empty));
 
         session.on_key(KeyId::Enter, 10);
-        assert!(!session.defer_empty_search_reply(session.search_generation, &empty));
+        assert!(!session.defer_search_reply(session.search_generation, &empty));
         land(&mut session, empty);
         assert!(session.threads.is_empty());
         assert!(session.search_results_current());
+    }
+
+    #[test]
+    fn incomplete_syntax_keeps_previous_results_until_the_query_settles() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("hall");
+        land(&mut session, reply(vec![row_hit("one", "m1")], None));
+
+        session.type_search(" after:2026");
+        let prefix = session.search_generation;
+        let invalid_reply = |message: &str| {
+            SearchReply::new(
+                Err(fell_core::Error::Search(message.into())),
+                HashMap::new(),
+                HashMap::new(),
+                "reader@example.test",
+            )
+        };
+        let mut invalid = invalid_reply("expected YYYY-MM-DD");
+        assert!(session.defer_search_reply(prefix, &invalid));
+        assert_eq!(session.cursor_id.as_deref(), Some("one"));
+        assert!(session.search.as_ref().unwrap().error.is_none());
+        assert!(!session.search_results_current());
+
+        session.type_search("-11-11");
+        assert!(!session.apply_search_reply(prefix, &mut invalid));
+        land(&mut session, reply(vec![row_hit("one", "m1")], None));
+        assert_eq!(session.cursor_id.as_deref(), Some("one"));
+
+        session.type_search(" \"unfinished");
+        let invalid = invalid_reply("unterminated quote");
+        session.on_key(KeyId::Enter, 10);
+        assert!(!session.defer_search_reply(session.search_generation, &invalid));
+        land(&mut session, invalid);
+        assert_eq!(
+            session.search.as_ref().unwrap().error.as_deref(),
+            Some("unterminated quote")
+        );
     }
 
     #[test]

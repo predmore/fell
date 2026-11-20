@@ -15,7 +15,7 @@ use crate::model::search::{CompletionField, Search, SearchReply};
 const PREVIEW_BATCH: usize = 32;
 const SUGGESTION_LIMIT: usize = 4;
 const QUERY_DELAY: Duration = Duration::from_millis(30);
-const EMPTY_SETTLE_DELAY: Duration = Duration::from_millis(220);
+const SEARCH_SETTLE_DELAY: Duration = Duration::from_millis(220);
 
 #[derive(Default)]
 pub(super) struct SearchView {
@@ -31,7 +31,7 @@ pub(super) struct SearchView {
     preview_key: Option<PreviewKey>,
     preview_revision: u64,
     arrival: Option<motion::Transition>,
-    pending_empty: Option<SearchReply>,
+    settling_reply: Option<SearchReply>,
 }
 
 #[derive(PartialEq)]
@@ -249,7 +249,7 @@ impl Inbox {
             self.clear_open_message();
         }
         if switched || previous != generation {
-            self.search_view.pending_empty = None;
+            self.search_view.settling_reply = None;
             self.search_view
                 .current
                 .store(generation, Ordering::Relaxed);
@@ -259,7 +259,7 @@ impl Inbox {
             .search
             .as_ref()
             .is_some_and(|search| !search.editing)
-            && let Some(reply) = self.search_view.pending_empty.take()
+            && let Some(reply) = self.search_view.settling_reply.take()
         {
             self.show_search_reply(generation, reply, cx);
         }
@@ -432,7 +432,7 @@ impl Inbox {
     }
 
     pub(super) fn request_search(&mut self, cx: &mut Context<Self>) {
-        self.search_view.pending_empty = None;
+        self.search_view.settling_reply = None;
         let Some(search) = &self.session.search else {
             return;
         };
@@ -536,19 +536,19 @@ impl Inbox {
         reply: SearchReply,
         cx: &mut Context<Self>,
     ) {
-        if !self.session.defer_empty_search_reply(generation, &reply) {
+        if !self.session.defer_search_reply(generation, &reply) {
             self.show_search_reply(generation, reply, cx);
             return;
         }
-        // Positive results land immediately. Give a temporary zero-match
-        // prefix time to turn into a longer query while retaining its preview.
-        self.search_view.pending_empty = Some(reply);
-        let timer = cx.background_executor().timer(EMPTY_SETTLE_DELAY);
+        // Positive results land immediately. Give an unfinished query time
+        // to resolve a transient error or a zero-match prefix.
+        self.search_view.settling_reply = Some(reply);
+        let timer = cx.background_executor().timer(SEARCH_SETTLE_DELAY);
         cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.session.search_generation == generation
-                    && let Some(reply) = inbox.search_view.pending_empty.take()
+                    && let Some(reply) = inbox.search_view.settling_reply.take()
                 {
                     inbox.show_search_reply(generation, reply, cx);
                 }
@@ -1192,6 +1192,14 @@ pub(super) fn row(
                 )
                 .when(row.starred, |line| {
                     line.child(div().flex_none().text_color(rgb(theme.star)).child("★"))
+                })
+                .when(row.has_attachment, |line| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(dim))
+                            .child(THREAD_ATTACHMENT_MARK),
+                    )
                 })
                 .child(
                     div()
