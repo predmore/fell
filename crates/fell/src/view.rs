@@ -2648,6 +2648,10 @@ impl Inbox {
         let started = Instant::now();
         if self.session.search_editing() && self.search_edit_key(event, started, cx) {
             cx.stop_propagation();
+            // Prepare the edited field as soon as input dispatch has
+            // released the inbox entity. GPUI presents the prepared scene
+            // on its normal frame callback.
+            window.defer(cx, |window, cx| window.draw(cx).clear());
             return;
         }
         let Some(key) = key_from(&event.keystroke) else {
