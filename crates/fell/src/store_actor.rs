@@ -104,6 +104,20 @@ impl StoreClient {
         }
     }
 
+    /// Queue completion while the second connection opens. If it cannot
+    /// serve the job, retry the bounded lookup on the interactive lane.
+    pub async fn call_search_completion<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Store) -> R + Clone + Send + 'static,
+    ) -> Result<R, oneshot::Canceled> {
+        if self.file_backed.load(Ordering::Acquire)
+            && let Ok(values) = send(&self.background, job.clone(), None).await
+        {
+            return Ok(values);
+        }
+        self.call(job).await
+    }
+
     /// Queue maintenance on the background connection even while it opens.
     /// If opening fails, cancel the reply instead of blocking the reader.
     pub fn call_maintenance<R: Send + 'static>(
@@ -232,13 +246,46 @@ mod tests {
             (store, account.id)
         });
         let account = futures::executor::block_on(ready).unwrap();
-        let reply = client.call_background(move |store| {
+        let reply = client.call_search_completion(move |store| {
             store.search_suggestions(&account, fell_core::SearchField::Folder, "in", 4)
         });
         assert_eq!(
             futures::executor::block_on(reply).unwrap().unwrap(),
             ["INBOX"]
         );
+    }
+
+    #[test]
+    fn search_completion_waits_for_the_background_lane_and_recovers_if_it_closes() {
+        let (interactive, reader_jobs) = mpsc::channel();
+        let (background, background_jobs) = mpsc::channel();
+        let client = StoreClient {
+            interactive,
+            background_ready: Arc::new(AtomicBool::new(false)),
+            file_backed: Arc::new(AtomicBool::new(true)),
+            background,
+        };
+        let store = Store::open_in_memory().unwrap();
+
+        futures::executor::block_on(async {
+            let mut completion = std::pin::pin!(client.call_search_completion(|_| 1));
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            assert!(matches!(
+                reader_jobs.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            let job = background_jobs.try_recv().unwrap();
+            job(&store);
+            assert_eq!(completion.await.unwrap(), 1);
+
+            let mut completion = std::pin::pin!(client.call_search_completion(|_| 2));
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            drop(background_jobs);
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            let job = reader_jobs.try_recv().unwrap();
+            job(&store);
+            assert_eq!(completion.await.unwrap(), 2);
+        });
     }
 
     #[test]

@@ -647,15 +647,15 @@ impl Inbox {
             return;
         };
         let account = self.account_id.clone();
-        // Prefer background work. The mailbox may only have one connection.
-        let reply = self.store.call_background(move |store| {
-            if latest.load(Ordering::Relaxed) == revision {
-                search_suggestions(store, &account, field, &prefix)
-            } else {
-                Vec::new()
-            }
-        });
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
+            let reply = store.call_search_completion(move |store| {
+                if latest.load(Ordering::Relaxed) == revision {
+                    search_suggestions(store, &account, field, &prefix)
+                } else {
+                    Vec::new()
+                }
+            });
             let Ok(suggestions) = reply.await else {
                 return;
             };
