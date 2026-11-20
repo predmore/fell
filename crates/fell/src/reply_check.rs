@@ -78,12 +78,11 @@ impl ReplyChecks {
         }
     }
 
-    pub fn checking(&self) -> bool {
-        !self.active.is_empty()
-    }
-
-    pub fn watched(&self, id: &str) -> Option<ReplyCheck> {
-        self.watched.get(id).map(|&check| self.status(id, check))
+    pub fn for_message(&self, id: &str) -> Option<ReplyCheck> {
+        self.watched
+            .get(id)
+            .map(|&check| self.status(id, check))
+            .or_else(|| self.active.contains(id).then_some(ReplyCheck::Checking))
     }
 
     pub fn for_draft(&self, account: &AccountId, id: &str) -> ReplyCheck {
@@ -117,10 +116,14 @@ mod tests {
         let one = MessageId::new("a@x");
         let two = MessageId::new("b@x");
         let other = MessageId::new("other@x");
+        let unrelated = MessageId::new("unrelated@x");
         checks.start(account.clone(), true);
         checks.watch(one.clone());
         checks.watch(two.clone());
-        assert_eq!(checks.watched(one.as_str()), Some(ReplyCheck::Unavailable));
+        assert_eq!(
+            checks.for_message(one.as_str()),
+            Some(ReplyCheck::Unavailable)
+        );
         checks.set_offline(false);
         checks.apply(ReplyToProgress::Checking(vec![
             one.clone(),
@@ -131,18 +134,26 @@ mod tests {
             checks.for_draft(&account, one.as_str()),
             ReplyCheck::Checking
         );
+        assert_eq!(
+            checks.for_message(other.as_str()),
+            Some(ReplyCheck::Checking)
+        );
+        assert_eq!(checks.for_message(unrelated.as_str()), None);
         checks.apply(ReplyToProgress::Verified(vec![one.clone(), other.clone()]));
-        assert_eq!(checks.watched(one.as_str()), Some(ReplyCheck::Verified));
-        assert_eq!(checks.watched(other.as_str()), None);
-        assert_eq!(checks.watched(two.as_str()), Some(ReplyCheck::Checking));
+        assert_eq!(checks.for_message(one.as_str()), Some(ReplyCheck::Verified));
+        assert_eq!(checks.for_message(other.as_str()), None);
+        assert_eq!(checks.for_message(two.as_str()), Some(ReplyCheck::Checking));
         checks.apply(ReplyToProgress::Finished);
-        assert_eq!(checks.watched(two.as_str()), Some(ReplyCheck::Unavailable));
-        assert!(!checks.checking());
+        assert_eq!(
+            checks.for_message(two.as_str()),
+            Some(ReplyCheck::Unavailable)
+        );
+        assert_eq!(checks.for_message(other.as_str()), None);
         checks.apply(ReplyToProgress::Checking(vec![two.clone()]));
         checks.apply(ReplyToProgress::Verified(vec![two.clone()]));
         checks.apply(ReplyToProgress::Finished);
-        assert_eq!(checks.watched(one.as_str()), Some(ReplyCheck::Verified));
-        assert_eq!(checks.watched(two.as_str()), Some(ReplyCheck::Verified));
+        assert_eq!(checks.for_message(one.as_str()), Some(ReplyCheck::Verified));
+        assert_eq!(checks.for_message(two.as_str()), Some(ReplyCheck::Verified));
         assert_eq!(
             checks.for_draft(&AccountId("other".into()), two.as_str()),
             ReplyCheck::Waiting

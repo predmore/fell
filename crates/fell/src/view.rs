@@ -3191,9 +3191,7 @@ impl Render for Inbox {
             let selected = self.session.reply_target().filter(|_| {
                 self.open_thread.is_some() && self.open_thread == self.session.cursor_id
             });
-            selected
-                .and_then(|target| checks.watched(&target.id))
-                .or_else(|| checks.checking().then_some(ReplyCheck::Checking))
+            selected.and_then(|target| checks.for_message(&target.id))
         });
         shell(
             theme,
@@ -5790,9 +5788,6 @@ fn status_bar(
     let (sync_label, sync_color) = match reply_check {
         Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
         Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
-        Some(ReplyCheck::Unavailable) if width < present::NARROW_WIDTH => {
-            ("Reply-To unavailable".into(), theme.error)
-        }
         Some(ReplyCheck::Unavailable) => (
             format!(
                 "Reply-To unavailable · {} to retry",

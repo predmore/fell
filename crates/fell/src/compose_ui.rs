@@ -2749,7 +2749,7 @@ fn reply_to_notice(check: ReplyCheck, colors: Palette) -> gpui::Div {
         ),
         ReplyCheck::Verified => (
             "Reply-To verified",
-            "Start a new reply from the inbox to use it.",
+            "Start a new reply from the inbox to fill in recipients.",
             colors.accent,
         ),
     };
