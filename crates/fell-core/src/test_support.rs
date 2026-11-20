@@ -1,4 +1,4 @@
-//! Skipping tests that need something only some machines have.
+//! Shared test capabilities and performance fixtures.
 //!
 //! A few tests need a capability a developer sandbox may lack, such as the
 //! TEST-NET-1 address on loopback, or a home directory with no real Fell
@@ -7,6 +7,9 @@
 //! (`CI=true`, which GitHub Actions sets) or with `FELL_REQUIRE_ALL_TESTS=1`,
 //! a missing capability fails the test instead, so nothing is silently
 //! skipped where it must run.
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mailbox;
 
 /// `true` when the test should return now. `missing` is `None` when the
 /// capability is there, or the reason it is not.

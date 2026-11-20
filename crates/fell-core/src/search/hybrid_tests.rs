@@ -919,30 +919,6 @@ fn the_matrix_holds_one_byte_per_dimension_and_a_scale_per_row() {
     assert!(matrix <= messages.len() * row_bytes, "{matrix}");
 }
 
-/// Small deterministic generator for the benchmark.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    /// Roughly normal, mean 0, deviation 1.
-    fn gauss(&mut self) -> f32 {
-        let sum: f32 = (0..6)
-            .map(|_| (self.next() >> 40) as f32 / (1u64 << 24) as f32)
-            .sum();
-        (sum - 3.0) * std::f32::consts::SQRT_2
-    }
-}
-
 const BENCH_WORDS: &[&str] = &[
     "invoice",
     "payment",
@@ -1058,7 +1034,7 @@ const BENCH_WORDS: &[&str] = &[
     "noise",
 ];
 
-fn bench_body(rng: &mut Rng) -> String {
+fn bench_body(rng: &mut crate::test_support::mailbox::Rng) -> String {
     let mut words = Vec::with_capacity(14);
     for _ in 0..14 {
         words.push(BENCH_WORDS[rng.below(BENCH_WORDS.len())]);
@@ -1086,6 +1062,7 @@ fn measure_hybrid_search_at_100k_messages() {
     use crate::embed::{
         MINILM_L6_V2_INT8, OnnxEmbedder, installed_model_dir, testing_model_source,
     };
+    use crate::test_support::mailbox::{Rng, noisy_vector};
     struct SourceReset;
     impl Drop for SourceReset {
         fn drop(&mut self) {
@@ -1158,13 +1135,7 @@ fn measure_hybrid_search_at_100k_messages() {
             )
             .unwrap();
         for (index, base) in picks.iter().enumerate() {
-            let mut values: Vec<f32> = base_vectors[*base]
-                .iter()
-                .map(|value| value + rng.gauss() * 0.01)
-                .collect();
-            let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
-            values.iter_mut().for_each(|v| *v /= norm);
-            let blob: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let blob = noisy_vector(&mut rng, &base_vectors[*base]);
             insert
                 .execute(rusqlite::params![
                     format!("m{index}@corpus.test"),

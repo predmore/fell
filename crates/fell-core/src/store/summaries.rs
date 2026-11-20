@@ -2287,54 +2287,22 @@ mod tests {
         }
     }
 
-    /// Times Inbox reads in a mailbox of 100k messages: 20k threads of five
-    /// replies across four folders, every thread in Inbox. Run with
+    /// Extra Inbox diagnostics over the budget suite's mailbox.
+    /// Run with
     /// `cargo test --release -p fell-core --lib measure_inbox_reads -- --ignored --nocapture`.
     #[test]
     #[ignore = "builds a 100k-message mailbox; run by hand in release"]
     fn measure_inbox_reads_at_100k_messages() {
+        use crate::test_support::mailbox;
         use std::time::{Duration, Instant};
-        let dir = std::env::temp_dir().join(format!("fell-measure-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mail.db");
-        let store = Store::open(&path).unwrap();
-        store.upsert_account(&account()).unwrap();
-        let account = account().id;
-        let folders = ["INBOX", "Sent", "INBOX", "Archive", "Work"];
-        let mut rng = Rng(17);
+
+        let path = temp_mailbox("measure-inbox");
         let built = Instant::now();
-        for start in (0..100_000).step_by(1_000) {
-            let batch: Vec<Message> = (start..start + 1_000)
-                .map(|index| {
-                    let mut message = message(&mut rng, index, &[]);
-                    let position = index % 5;
-                    let root = MessageId::new(format!("m{}@x", index - position));
-                    if position > 0 {
-                        let parent = MessageId::new(format!("m{}@x", index - 1));
-                        message.headers.in_reply_to = Some(parent.clone());
-                        message.headers.references = vec![parent];
-                    }
-                    message.thread_id = ThreadId::from_message_id(&root);
-                    message.folders = vec![folders[position].to_string()];
-                    message.archived = false;
-                    message.headers.date_unix = 1_600_000_000 + index as i64 * 60;
-                    // A server copy and stored parts, like mail IMAP sync wrote.
-                    message.remote_id = crate::RemoteId(format!("imap:1:{index}:INBOX"));
-                    message.parts = Some(measured_parts(&mut rng));
-                    message
-                })
-                .collect();
-            store
-                .apply_delta(
-                    &account,
-                    &MailboxDelta {
-                        messages: batch,
-                        ..MailboxDelta::default()
-                    },
-                )
-                .unwrap();
-        }
+        mailbox::seed(&path).unwrap();
         println!("built 100k messages in {:.1?}", built.elapsed());
+        let index_lock = mailbox::hold_indexer(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        let account = mailbox::account().id;
 
         fn median(mut runs: Vec<Duration>) -> Duration {
             runs.sort();
@@ -2352,7 +2320,6 @@ mod tests {
             println!("{label}: {rows} rows, median {:.2?}", median(runs));
         };
         let full = store.folder_threads(&account, "INBOX").unwrap();
-        assert_eq!(full.len(), 20_000);
         time("whole Inbox (folder_threads)", &|| {
             store.folder_threads(&account, "INBOX").unwrap().len()
         });
@@ -2363,7 +2330,7 @@ mod tests {
                 .threads
                 .len()
         });
-        let middle = 10_000;
+        let middle = full.len() / 2;
         time("refresh of 100 rows mid-folder, plus 40 after", &|| {
             store
                 .folder_page(
@@ -2425,11 +2392,11 @@ mod tests {
                 .unwrap()
                 .unread
         });
-        let thread = full[middle].thread_id.clone();
-        time("open thread (thread_messages, 5 messages)", &|| {
+        let thread = mailbox::long_thread(0);
+        time("open thread (thread_messages, 50 messages)", &|| {
             store.thread_messages(&account, &thread).unwrap().len()
         });
-        time("open thread, then message_body for each of the 5", &|| {
+        time("open thread, then message_body for each of the 50", &|| {
             let messages = store.thread_messages(&account, &thread).unwrap();
             for message in &messages {
                 store
@@ -2459,65 +2426,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        println!(
-            "parts: {:.1} MB raw, {:.1} MB stored",
-            measured_raw_bytes() as f64 / 1e6,
-            stored_bytes as f64 / 1e6
-        );
+        println!("parts: {:.1} MB stored", stored_bytes as f64 / 1e6);
         drop(store);
-        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        drop(index_lock);
+        let size = std::fs::metadata(&path).unwrap().len();
         println!("mailbox file {:.1} MB", size as f64 / 1e6);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    static MEASURED_RAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    fn measured_raw_bytes() -> usize {
-        MEASURED_RAW.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// A newsletter-sized HTML part (about 12 KB) and its plain alternative,
-    /// with varied words so compression is not flattered.
-    fn measured_parts(rng: &mut Rng) -> crate::MessageParts {
-        const WORDS: &[&str] = &[
-            "order", "shipping", "account", "update", "weekly", "digest", "meeting", "invoice",
-            "project", "review", "summer", "launch", "team", "notes", "draft", "travel", "receipt",
-            "offer", "member", "event", "report", "photos", "tickets", "garden",
-        ];
-        let sentence = |rng: &mut Rng, words: usize| {
-            (0..words)
-                .map(|_| WORDS[rng.below(WORDS.len())])
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let mut html = String::from(
-            "<html><head><style>td{font-family:Helvetica,Arial,sans-serif;color:#333}</style>\
-             </head><body><table width=\"600\" cellpadding=\"0\" cellspacing=\"0\">",
-        );
-        let mut plain = String::new();
-        while html.len() < 12_000 {
-            let text = sentence(rng, 18);
-            let link = rng.next();
-            html.push_str(&format!(
-                "<tr><td style=\"padding:12px 24px;font-size:15px;line-height:22px\">\
-                 <a href=\"https://news.example/c/{link:x}\">{text}</a></td></tr>"
-            ));
-            plain.push_str(&text);
-            plain.push('\n');
-        }
-        html.push_str("</table></body></html>");
-        MEASURED_RAW.fetch_add(
-            html.len() + plain.len(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        crate::MessageParts {
-            mime_parts: Vec::new(),
-            html: Some(html),
-            plain: Some(plain),
-            bulk_headers: vec![(
-                "List-Unsubscribe".to_string(),
-                "<https://news.example/u>".to_string(),
-            )],
-        }
+        remove_mailbox(&path);
+        let _ = std::fs::remove_file(format!("{}.embed.lock", path.display()));
     }
 }

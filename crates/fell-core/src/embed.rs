@@ -519,7 +519,7 @@ pub(crate) fn testing_abort_next_indexer(abort: bool) {
     ABORT_THIS_INDEXER.with(|cell| cell.set(abort));
 }
 
-fn try_embed_lock(db: &Path) -> Result<Option<Connection>> {
+pub(crate) fn try_embed_lock(db: &Path) -> Result<Option<Connection>> {
     let path = embed_lock_path(db);
     create_lock_file(&path)?;
     let conn = Connection::open(&path)?;
