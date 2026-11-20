@@ -112,7 +112,7 @@ pub struct Snapshot {
     /// The message this draft replies to, as "sender · subject · date",
     /// when the mailbox has it.
     pub reply_context: Option<ReplyContext>,
-    /// The draft or its original still needs the recipients checked.
+    /// The reply opened with recipients withheld pending verification.
     pub reply_to_unverified: bool,
     /// What a forward carries, read from its header block.
     pub forwarded: Option<super::reply::ForwardSummary>,
@@ -1181,11 +1181,7 @@ impl DraftSession {
             text,
             send_requested_by: self.send_requested_by.clone(),
             reply_context: self.reply_context.clone(),
-            reply_to_unverified: self.reply.reply_to_unverified
-                || self
-                    .reply_context
-                    .as_ref()
-                    .is_some_and(|parent| parent.reply_to.is_none()),
+            reply_to_unverified: self.reply.reply_to_unverified,
             forwarded: super::reply::forward_summary(&self.reply.quote_text),
             agent_authored: !self.owner.is_empty(),
         }

@@ -328,6 +328,11 @@ const FLAG_TARGETS: &str = "SELECT message_id FROM messages
            AND uidvalidity = ?4 AND uid = ?5
      )";
 
+pub(crate) enum ReplyToVerification<'a> {
+    Present(&'a crate::backend::FetchedReplyTo),
+    Absent(&'a [RemoteId]),
+}
+
 /// On-disk mailbox. The UI reads this; sync writes it.
 pub struct Store {
     /// File-backed stores fill body vectors here. In-memory stores leave this
@@ -1086,16 +1091,23 @@ impl Store {
         bodies::copies_of(&self.conn, account, message.as_str())
     }
 
-    pub(crate) fn store_fetched_reply_to<'a>(
+    /// Commit only while the header still belongs to this message. An
+    /// absence is evidence about the entire copy set, so recheck that set
+    /// under the write lock before recording it.
+    pub(crate) fn store_verified_reply_to<'a>(
         &self,
         account: &AccountId,
-        fetched: impl Iterator<Item = (&'a MessageId, &'a crate::backend::FetchedReplyTo)>,
-    ) -> Result<()> {
+        verified: &[(&MessageId, ReplyToVerification<'a>)],
+    ) -> Result<Vec<MessageId>> {
+        if verified.is_empty() {
+            return Ok(Vec::new());
+        }
         let tx = self
             .lock_wait
             .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
+        let mut changed = Vec::new();
         {
-            let mut stmt = tx.prepare_cached(
+            let mut present = tx.prepare_cached(
                 "UPDATE messages SET reply_to_line = ?3
                  WHERE account_id = ?1 AND message_id = ?2 AND reply_to_line = ''
                  AND EXISTS (
@@ -1104,21 +1116,44 @@ impl Store {
                        AND mailbox = ?4 AND uidvalidity = ?5 AND uid = ?6
                  )",
             )?;
-            for (message, answer) in fetched {
-                if let Some(copy) = crate::imap::parse_remote_id(&answer.remote_id.0) {
-                    stmt.execute(params![
-                        account.as_str(),
-                        message.as_str(),
-                        crate::message::encode_reply_to(Some(&answer.addresses)),
-                        copy.mailbox,
-                        copy.uidvalidity,
-                        copy.uid,
-                    ])?;
+            let mut absent = tx.prepare_cached(
+                "UPDATE messages SET reply_to_line = ?3
+                 WHERE account_id = ?1 AND message_id = ?2 AND reply_to_line = ''",
+            )?;
+            for (message, verification) in verified {
+                let id = message.as_str();
+                let writes = match verification {
+                    ReplyToVerification::Present(answer) => {
+                        let Some(copy) = crate::imap::parse_remote_id(&answer.remote_id.0) else {
+                            continue;
+                        };
+                        present.execute(params![
+                            account.as_str(),
+                            id,
+                            crate::message::encode_reply_to(Some(&answer.addresses)),
+                            copy.mailbox,
+                            copy.uidvalidity,
+                            copy.uid,
+                        ])?
+                    }
+                    ReplyToVerification::Absent(copies) => {
+                        if bodies::copies_of(&tx, account, id)? != *copies {
+                            continue;
+                        }
+                        absent.execute(params![
+                            account.as_str(),
+                            id,
+                            crate::message::encode_reply_to(Some(&[])),
+                        ])?
+                    }
+                };
+                if writes > 0 {
+                    changed.push((*message).clone());
                 }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Store parts fetched again for messages that had none. `None` parts
@@ -2503,9 +2538,12 @@ fn write_kept(
             union_tokens(&stored.attachment_names, &message.attachment_names, false),
         ),
     };
+    // An empty arrival only answers for this copy. A legacy row can
+    // still have another copy with a Reply-To, so let the backfill check it.
+    let addresses = message.reply_to.as_deref().filter(|list| !list.is_empty());
     let reply_to_line = crate::message::merge_reply_to(
         &stored.reply_to_line,
-        crate::message::encode_reply_to(message.reply_to.as_deref()),
+        crate::message::encode_reply_to(addresses),
     );
     let list_id = merged_list_id(&stored.list_id, &message.list_id);
     // Read and star changes made in Fell stay until the server agrees.

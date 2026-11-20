@@ -4,7 +4,7 @@ use crate::Result;
 use crate::account::{Account, AccountId};
 use crate::backend::MailBackend;
 use crate::message::{MessageId, MessageParts, RemoteId};
-use crate::store::{BodyRequest, Store};
+use crate::store::{BodyRequest, ReplyToVerification, Store};
 
 /// Messages per backfill batch. Each batch is one fetch and one commit.
 const BODY_BATCH: usize = 200;
@@ -93,54 +93,129 @@ pub struct ReplyToBackfill {
     before: Option<i64>,
 }
 
+/// Progress for one page of legacy Reply-To checks. A batch can confirm
+/// some messages before a later fetch is interrupted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyToProgress {
+    Checking(Vec<MessageId>),
+    Verified(Vec<MessageId>),
+    Finished,
+}
+
+struct ReplyToCandidate {
+    id: MessageId,
+    copies: Vec<RemoteId>,
+    empty: usize,
+    found: bool,
+}
+
 impl ReplyToBackfill {
-    /// Check up to 32 messages off the UI thread. Returns whether there was
-    /// a page to check. Each finished IMAP fetch is committed independently.
+    /// Check a page of up to 32 messages off the UI thread. Returns whether
+    /// there was a page to check.
     pub fn run_batch(
         &mut self,
         account: &AccountId,
         backend: &dyn MailBackend,
         store: &Store,
     ) -> Result<bool> {
+        self.run_batch_with_progress(account, backend, store, &mut |_| {})
+    }
+
+    /// Report the messages being checked and their committed results.
+    pub fn run_batch_with_progress(
+        &mut self,
+        account: &AccountId,
+        backend: &dyn MailBackend,
+        store: &Store,
+        progress: &mut dyn FnMut(ReplyToProgress),
+    ) -> Result<bool> {
         let batch = store.missing_reply_to(account, self.before, REPLY_TO_BATCH)?;
         let Some(&(last, _)) = batch.last() else {
             self.before = None;
             return Ok(false);
         };
-        let mut waiting = batch
+        let mut candidates = batch
             .into_iter()
-            .map(|(_, id)| Ok((store.reply_to_copies(account, &id)?, id)))
+            .map(|(_, id)| {
+                Ok(ReplyToCandidate {
+                    copies: store.reply_to_copies(account, &id)?,
+                    id,
+                    empty: 0,
+                    found: false,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
-        // Prefer the same Inbox-first order as on-demand body fetches, and
-        // try another copy only when the preceding one could not be read.
-        for round in 0.. {
-            let mut ids: HashMap<_, _> = waiting
+        progress(ReplyToProgress::Checking(
+            candidates
                 .iter()
-                .filter_map(|(copies, id)| Some((copies.get(round)?.clone(), id.clone())))
-                .collect();
-            if ids.is_empty() {
-                break;
-            }
-            let copies: Vec<_> = ids.keys().cloned().collect();
-            backend.fetch_reply_to(&copies, &mut |fetched| {
-                store.store_fetched_reply_to(
-                    account,
-                    fetched
-                        .iter()
-                        .filter_map(|answer| Some((ids.get(&answer.remote_id)?, answer))),
-                )?;
-                for answer in fetched {
-                    ids.remove(&answer.remote_id);
-                }
-                Ok(())
-            })?;
-            waiting.retain(|(copies, _)| copies.get(round).is_some_and(|id| ids.contains_key(id)));
-        }
-
+                .map(|candidate| candidate.id.clone())
+                .collect(),
+        ));
+        let result = check_reply_to(account, backend, store, &mut candidates, progress);
+        progress(ReplyToProgress::Finished);
+        result?;
         self.before = Some(last);
         Ok(true)
     }
+}
+
+fn check_reply_to(
+    account: &AccountId,
+    backend: &dyn MailBackend,
+    store: &Store,
+    candidates: &mut [ReplyToCandidate],
+    progress: &mut dyn FnMut(ReplyToProgress),
+) -> Result<()> {
+    // Read copies in Inbox-first order. The first actual list of addresses
+    // wins. A missing copy cannot establish absence, but still leaves the
+    // later copies a chance to supply addresses.
+    for round in 0.. {
+        let mut requested: HashMap<_, _> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| !candidate.found)
+            .filter_map(|(index, candidate)| Some((candidate.copies.get(round)?.clone(), index)))
+            .collect();
+        if requested.is_empty() {
+            break;
+        }
+        let copies: Vec<_> = requested.keys().cloned().collect();
+        backend.fetch_reply_to(&copies, &mut |fetched| {
+            let answered: Vec<_> = fetched
+                .iter()
+                .filter_map(|answer| Some((requested.remove(&answer.remote_id)?, answer)))
+                .collect();
+            for &(index, answer) in &answered {
+                if answer.addresses.is_empty() {
+                    candidates[index].empty += 1;
+                }
+            }
+            let answers: Vec<_> = answered
+                .into_iter()
+                .filter_map(|(index, answer)| {
+                    let candidate = &candidates[index];
+                    let result = if !answer.addresses.is_empty() {
+                        ReplyToVerification::Present(answer)
+                    } else if candidate.empty == candidate.copies.len() {
+                        ReplyToVerification::Absent(&candidate.copies)
+                    } else {
+                        return None;
+                    };
+                    Some((&candidate.id, result))
+                })
+                .collect();
+            let changed = store.store_verified_reply_to(account, &answers)?;
+            if !changed.is_empty() {
+                for candidate in candidates.iter_mut() {
+                    candidate.found |= changed.contains(&candidate.id);
+                }
+                progress(ReplyToProgress::Verified(changed));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 /// Fill parts for mail stored before they were kept, newest first, in up to

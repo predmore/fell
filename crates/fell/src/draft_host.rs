@@ -736,7 +736,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_reply_started_before_verification_keeps_the_warning_after_sync() {
+    fn a_reply_started_before_verification_keeps_its_recipient_hold_after_sync() {
         let account = me();
         let home = temp_home("reply-unverified", &account);
         let mut parent = parent_message(&account);
@@ -785,6 +785,40 @@ pub(crate) mod tests {
         let reopened = DraftHub::new();
         home.open(&reopened, &id, &account.id).unwrap();
         check(&reopened, &id);
+    }
+
+    #[test]
+    fn a_sent_reply_opens_normally_with_an_unverified_original_header() {
+        let account = me();
+        let home = temp_home("sent-reply", &account);
+        let mut parent = parent_message(&account);
+        parent.folders = vec!["Sent".into()];
+        parent.to = vec![fell_core::Address {
+            name: None,
+            email: "ada@x".into(),
+        }];
+        parent.reply_to = None;
+        fell_core::Store::open(&home.store)
+            .unwrap()
+            .upsert_message(&parent)
+            .unwrap();
+        let roles = fell_core::FolderRoles::from_names(&parent.folders);
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Reply,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &roles,
+        );
+        let hub = DraftHub::new();
+        let id = home.new_reply(&hub, &account.id, start).unwrap();
+        hub.with_session(&id, |session| {
+            let snap = session.snapshot();
+            assert_eq!(snap.to[0].email, "ada@x");
+            assert!(!snap.reply_to_unverified);
+            assert_eq!(snap.reply_context.unwrap().reply_to, None);
+        })
+        .unwrap();
     }
 
     #[test]

@@ -23,6 +23,7 @@ use smallvec::SmallVec;
 use crate::confirmation_from_ui;
 use crate::mailbox::AccountConfigError;
 use crate::present::display_safe;
+use crate::reply_check::{ReplyCheck, ReplyChecks};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -339,6 +340,9 @@ impl ComposeView {
             .unwrap_or_else(|| empty_snapshot(&draft_id));
         let editor = Editor::from_body(&snap.body);
         cx.default_global::<SendAttempts>();
+        cx.default_global::<ReplyChecks>();
+        cx.observe_global::<ReplyChecks>(|_, cx| cx.notify())
+            .detach();
         cx.observe_global::<SendAttempts>(|this, cx| {
             this.send_feedback.invalidate_readiness();
             cx.notify();
@@ -1756,12 +1760,27 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let (mut snap, lock) = self
+        let (mut snap, lock, reply_check) = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| {
-                (session.snapshot(), session.send_lock())
+                let snap = session.snapshot();
+                let check = snap.reply_to_unverified.then(|| {
+                    if snap
+                        .reply_context
+                        .as_ref()
+                        .is_some_and(|parent| parent.reply_to.is_some())
+                    {
+                        ReplyCheck::Verified
+                    } else if let Some(parent) = snap.in_reply_to.as_deref() {
+                        cx.global::<ReplyChecks>()
+                            .for_draft(session.account_id(), parent)
+                    } else {
+                        ReplyCheck::Waiting
+                    }
+                });
+                (snap, session.send_lock(), check)
             })
-            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None));
+            .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None, None));
         if self.send_feedback.readiness.is_some() && lock.is_none() {
             snap.send_block = Some(SEND_UNAVAILABLE.into());
         }
@@ -1848,7 +1867,7 @@ impl Render for ComposeView {
                     .flex_1()
                     .min_h(px(0.))
                     .child(
-                        self.fields_view(&snap, colors, wide, window, &ui_family)
+                        self.fields_view(&snap, colors, wide, window, &ui_family, reply_check)
                             .flex_shrink_0(),
                     )
                     .child(self.body_view(&snap, colors, window, &ui_family, cx))
@@ -1898,6 +1917,7 @@ impl ComposeView {
         wide: bool,
         window: &Window,
         family: &str,
+        reply_check: Option<ReplyCheck>,
     ) -> gpui::Div {
         let mut column = div().flex().flex_col().bg(rgb(colors.panel)).px_4().py_1();
         let redirects = redirects(snap);
@@ -1972,9 +1992,7 @@ impl ComposeView {
                         .is_some_and(|id| !id.trim().is_empty()),
                 |column| column.child(reply_row(snap, &redirects, colors, &fit)),
             )
-            .when(snap.reply_to_unverified, |column| {
-                column.child(unverified_reply_to(colors))
-            })
+            .children(reply_check.map(|check| reply_to_notice(check, colors)))
             .children(snap.forwarded.as_ref().map(|forward| {
                 let who = display_safe(&forward.sender);
                 let when = forward.date_wall.map(|wall| {
@@ -2712,21 +2730,43 @@ fn reply_row(
     }
 }
 
-fn unverified_reply_to(colors: Palette) -> gpui::Div {
+fn reply_to_notice(check: ReplyCheck, colors: Palette) -> gpui::Div {
+    let (title, detail, color) = match check {
+        ReplyCheck::Waiting => (
+            "Reply-To unverified",
+            "Enter recipients, or sync from the inbox to check.",
+            colors.error,
+        ),
+        ReplyCheck::Checking => (
+            "Checking Reply-To…",
+            "Enter recipients now, or wait for verification.",
+            colors.accent,
+        ),
+        ReplyCheck::Unavailable => (
+            "Reply-To check unavailable",
+            "Enter recipients, or retry sync from the inbox.",
+            colors.error,
+        ),
+        ReplyCheck::Verified => (
+            "Reply-To verified",
+            "Start a new reply from the inbox to use it.",
+            colors.accent,
+        ),
+    };
     div()
         .my_1()
         .px_2()
         .py_1()
         .border_l(px(2.))
-        .border_color(rgb(colors.error))
+        .border_color(rgb(color))
         .text_size(px(15.))
         .child(
             div()
                 .font_weight(FontWeight(620.))
-                .text_color(rgb(colors.error))
-                .child("Reply-To unverified"),
+                .text_color(rgb(color))
+                .child(title),
         )
-        .child("Check the recipients, or sync and start a new reply.")
+        .child(detail)
 }
 
 /// " · subject", joined so it never breaks from what comes before.

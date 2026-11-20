@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts,
-    ReplyToBackfill, Store, SyncFailureKind, SyncReport, classify_sync_error, fetch_message_bodies,
-    fetch_missing_bodies, sync_with_progress,
+    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, classify_sync_error,
+    fetch_message_bodies, fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -75,6 +75,7 @@ pub enum SyncEvent {
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
     BodiesStored,
+    ReplyTo(ReplyToProgress),
 }
 
 #[derive(Default)]
@@ -257,9 +258,6 @@ fn run(
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
-    let bodies_stored = || {
-        let _ = events.unbounded_send(SyncEvent::BodiesStored);
-    };
     let failed = |kind: SyncFailureKind, detail: String| {
         SyncKind::Failed(SyncFailure {
             kind,
@@ -386,7 +384,7 @@ fn run(
                 &wake,
                 &mut bodies,
                 &mut reply_to,
-                &bodies_stored,
+                &events,
             )
         } else {
             None
@@ -446,7 +444,7 @@ fn fill_old_mail(
     wake: &Receiver<Request>,
     bodies: &mut BodyQueue,
     reply_to: &mut ReplyToBackfill,
-    stored: &dyn Fn(),
+    events: &UnboundedSender<SyncEvent>,
 ) -> Option<Woke> {
     let Ok(backend) = config.backend() else {
         return None;
@@ -459,7 +457,14 @@ fn fill_old_mail(
         bodies.serve(config, store, account);
         if more_headers {
             more_headers = matches!(
-                reply_to.run_batch(&account.id, backend.as_ref(), store),
+                reply_to.run_batch_with_progress(
+                    &account.id,
+                    backend.as_ref(),
+                    store,
+                    &mut |progress| {
+                        let _ = events.unbounded_send(SyncEvent::ReplyTo(progress));
+                    },
+                ),
                 Ok(true)
             );
         }
@@ -467,7 +472,7 @@ fn fill_old_mail(
             more_bodies = fetch_missing_bodies(&account.id, backend.as_ref(), store, 1)
                 .is_ok_and(|filled| filled > 0);
             if more_bodies {
-                stored();
+                let _ = events.unbounded_send(SyncEvent::BodiesStored);
             }
         }
         if !more_headers && !more_bodies {

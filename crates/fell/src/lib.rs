@@ -19,6 +19,7 @@ mod model;
 mod motion;
 mod png;
 mod present;
+mod reply_check;
 mod row_widths;
 mod scroll_anchor;
 mod setup;

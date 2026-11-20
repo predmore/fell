@@ -4640,3 +4640,147 @@ fn legacy_reply_to_retries_nil_and_verifies_uidvalidity_before_using_a_copy() {
     assert!(backfill.run_batch(&acct.id, &backend, &store).unwrap());
     assert_eq!(value(), Some(vec![]));
 }
+
+#[test]
+fn legacy_reply_to_checks_the_whole_copy_set_before_accepting_absence() {
+    use crate::compose::{ReplyKind, start_reply};
+
+    let entries = [
+        ("list-only@x", "", "Reply-To: trail@lists.x\r\n"),
+        (
+            "disagree@x",
+            "Reply-To: direct@x\r\n",
+            "Reply-To: other@lists.x\r\n",
+        ),
+        ("empty@x", "", ""),
+        ("missing@x", "", ""),
+        ("missing-direct@x", "", "Reply-To: team@lists.x\r\n"),
+    ];
+    let copy = |uid, id, header| {
+        literal(
+            uid,
+            &[],
+            1,
+            raw_message(
+                id,
+                None,
+                id,
+                "Ann <ann@x>",
+                "This message lives in two folders.",
+                header,
+            ),
+        )
+    };
+    let mut state = sample_state();
+    state.mailboxes = vec![
+        FixtureMailbox {
+            messages: entries
+                .iter()
+                .enumerate()
+                .map(|(i, &(id, direct, _))| copy(i as u32 + 1, id, direct))
+                .collect(),
+            ..empty_mailbox("INBOX", 20)
+        },
+        FixtureMailbox {
+            messages: entries
+                .iter()
+                .enumerate()
+                .map(|(i, &(id, _, list))| copy(i as u32 + 1, id, list))
+                .collect(),
+            ..empty_mailbox("List", 21)
+        },
+    ];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let id = crate::MessageId::new("list-only@x");
+    assert_eq!(store.reply_to_copies(&acct.id, &id).unwrap().len(), 2);
+    store
+        .conn
+        .execute("UPDATE messages SET reply_to_line = ''", [])
+        .unwrap();
+
+    // Even a normal reparse of the direct copy must preserve the unknown
+    // state while the list copy has not been checked.
+    let direct = super::rfc822::to_message(
+        &acct.id,
+        "INBOX",
+        "INBOX",
+        20,
+        1,
+        &[],
+        &copy(1, "list-only@x", "").raw,
+    );
+    assert_eq!(direct.reply_to, Some(vec![]));
+    store.upsert_message(&direct).unwrap();
+    let reply = |id| {
+        let parent = stored(&store, &acct, id).unwrap();
+        start_reply(
+            ReplyKind::Reply,
+            &parent,
+            &acct.email,
+            std::slice::from_ref(&acct.email),
+            &crate::FolderRoles::default(),
+        )
+    };
+    assert!(reply("list-only@x").fields.to.is_empty());
+    {
+        let mut state = server.state.lock().unwrap();
+        mailbox(&mut state, "List")
+            .messages
+            .retain(|item| item.uid != 4);
+        mailbox(&mut state, "INBOX")
+            .messages
+            .retain(|item| item.uid != 5);
+    }
+
+    let mut events = Vec::new();
+    let mut backfill = crate::ReplyToBackfill::default();
+    assert!(
+        backfill
+            .run_batch_with_progress(&acct.id, &backend, &store, &mut |event| {
+                events.push(event);
+            })
+            .unwrap()
+    );
+    assert_eq!(reply("list-only@x").fields.to, ["trail@lists.x"]);
+    assert_eq!(reply("disagree@x").fields.to, ["direct@x"]);
+    assert_eq!(reply("empty@x").fields.to, ["Ann <ann@x>"]);
+    assert_eq!(reply("missing-direct@x").fields.to, ["team@lists.x"]);
+    let missing = reply("missing@x");
+    assert!(missing.parts.reply_to_unverified);
+    assert!(missing.fields.to.is_empty());
+    use crate::ReplyToProgress::{Checking, Finished, Verified};
+    assert!(matches!(events.first(), Some(Checking(ids)) if ids.len() == entries.len()));
+    assert_eq!(events.last(), Some(&Finished));
+    let mut confirmed: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            Verified(ids) => Some(ids),
+            _ => None,
+        })
+        .flatten()
+        .map(|id| id.0)
+        .collect();
+    confirmed.sort();
+    assert_eq!(
+        confirmed,
+        ["disagree@x", "empty@x", "list-only@x", "missing-direct@x"]
+    );
+
+    assert!(!backfill.run_batch(&acct.id, &backend, &store).unwrap());
+    mailbox(&mut server.state.lock().unwrap(), "List")
+        .messages
+        .push(copy(4, "missing@x", ""));
+    assert!(backfill.run_batch(&acct.id, &backend, &store).unwrap());
+    let recovered = reply("missing@x");
+    assert!(!recovered.parts.reply_to_unverified);
+    assert_eq!(recovered.fields.to, ["Ann <ann@x>"]);
+    assert_read_only(&server);
+}
