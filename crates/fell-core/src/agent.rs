@@ -660,7 +660,9 @@ impl crate::Store {
         let action = insert_action(&tx, account_id, actor, kind, &summary)?;
         for (old, new) in &writes {
             let was_keyword = label_edit
-                .map(|edit| keywords::record_edit(&tx, account_id, &new.message_id, edit))
+                .map(|edit| {
+                    keywords::record_edit(&tx, account_id, &new.message_id, edit, &old.labels)
+                })
                 .transpose()?;
             tx.execute(
                 "INSERT INTO agent_action_messages (

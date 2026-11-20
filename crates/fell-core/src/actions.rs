@@ -737,7 +737,15 @@ fn record_and_apply(
     for plan in plans {
         if kind != ActionKind::Purge {
             let was_keyword = label_edit
-                .map(|edit| keywords::record_edit(conn, account_id, &plan.before.message_id, edit))
+                .map(|edit| {
+                    keywords::record_edit(
+                        conn,
+                        account_id,
+                        &plan.before.message_id,
+                        edit,
+                        &plan.before.labels,
+                    )
+                })
                 .transpose()?;
             insert_snapshot(conn, id, account_id, plan, was_keyword)?;
         }

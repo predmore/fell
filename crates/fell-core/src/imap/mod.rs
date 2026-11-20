@@ -496,6 +496,7 @@ fn catch_up(
                 uidnext: None,
                 pruned: None,
                 floor: Some(next),
+                keyword_baseline: pass.keywords,
             },
         );
         return Ok(true);
@@ -507,6 +508,11 @@ fn catch_up(
         .filter(|_| same_validity)
         .and_then(|prev| prev.floor);
     let walking = floor.is_some();
+    let keyword_baseline = pass.keywords
+        && (!same_validity
+            || previous_owned
+                .as_ref()
+                .is_some_and(|prev| prev.keyword_baseline));
     let plan = plan_fetch(previous_owned.as_ref(), examined);
     // High-water body fetches ignore UIDs already at the checkpoint.
     // CHANGEDSINCE results are kept so an older flag update is applied.
@@ -560,6 +566,7 @@ fn catch_up(
             uidnext: None,
             pruned: carried_pruned,
             floor,
+            keyword_baseline,
         };
         emit_progress(
             persist,
@@ -741,18 +748,13 @@ fn catch_up(
     if !walking {
         pass.complete &= clean;
     }
+    let seen = Seen {
+        uidvalidity,
+        uidnext,
+        exists,
+    };
     let tracked = if clean && !walking {
-        track_removals(
-            session,
-            mailbox,
-            Seen {
-                uidvalidity,
-                uidnext,
-                exists,
-            },
-            previous_owned.as_ref(),
-            &plan,
-        )?
+        track_removals(session, mailbox, seen, previous_owned.as_ref(), &plan)?
     } else {
         Tracked {
             removals: Vec::new(),
@@ -762,7 +764,7 @@ fn catch_up(
     if finished && let Some(next) = uidnext {
         pass.caught_up.insert(mailbox.raw.clone(), next);
     }
-    let current = MailboxCheckpoint {
+    let mut current = MailboxCheckpoint {
         uidvalidity,
         uid,
         modseq,
@@ -770,6 +772,7 @@ fn catch_up(
         uidnext: if finished && !walking { uidnext } else { None },
         pruned: tracked.pruned,
         floor,
+        keyword_baseline,
     };
     emit_progress(
         persist,
@@ -779,6 +782,9 @@ fn catch_up(
         flags,
         tracked.removals,
     )?;
+    if clean && !walking {
+        upgrade_keyword_baseline(pass, session, mailbox, seen, &mut current, persist)?;
+    }
     pass.done.insert(mailbox.raw.clone(), current);
     Ok(walking)
 }
@@ -1157,8 +1163,42 @@ fn walk_down(
         flags,
         tracked.removals,
     )?;
+    upgrade_keyword_baseline(pass, session, mailbox, seen, &mut checkpoint, persist)?;
     pass.done.insert(mailbox.raw.clone(), checkpoint);
     Ok(Walked::Finished)
+}
+
+/// A cursor from before keyword tracking can already be at HIGHESTMODSEQ.
+/// Read FLAGS for every UID once after the ordinary sync records the copies.
+fn upgrade_keyword_baseline(
+    pass: &Pass<'_>,
+    session: &mut session::Session,
+    mailbox: &session::Listed,
+    seen: Seen,
+    checkpoint: &mut MailboxCheckpoint,
+    persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if pass.keywords
+        && !checkpoint.keyword_baseline
+        && let Some(mut flags) =
+            walk_flags(session, mailbox, seen, &escape_mailbox(&mailbox.raw), true)?
+    {
+        // Revisions still guard keyword observations. Leave read state and
+        // pending flag intents to the ordinary delta for this mailbox.
+        for flag in &mut flags {
+            flag.unread = None;
+        }
+        checkpoint.keyword_baseline = true;
+        emit_progress(
+            persist,
+            &pass.snapshot(),
+            Some((&mailbox.raw, checkpoint)),
+            Vec::new(),
+            flags,
+            Vec::new(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Refresh flags in bounded UID sets. An incomplete reply leaves the sweep
@@ -1839,6 +1879,9 @@ pub struct MailboxCheckpoint {
     /// `None` once it reaches the oldest message, and for cursors from
     /// before first syncs read newest first.
     pub floor: Option<u32>,
+    /// This UIDVALIDITY started with keyword tracking or finished its
+    /// upgrade sweep. Older cursors and Bridge cursors omit the marker.
+    pub keyword_baseline: bool,
 }
 
 /// Decode a sync cursor written by [`encode_cursor`].
@@ -1901,6 +1944,11 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 None => return Vec::new(),
             },
         };
+        let keyword_baseline = match parts.next() {
+            None => false,
+            Some("keywords") => true,
+            Some(_) => return Vec::new(),
+        };
         if parts.next().is_some() {
             return Vec::new();
         }
@@ -1913,6 +1961,7 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 uidnext,
                 pruned,
                 floor,
+                keyword_baseline,
             },
         ));
     }
@@ -1953,6 +2002,11 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
         if let Some(floor) = checkpoint.floor {
             token.push('\t');
             token.push_str(&floor.to_string());
+        } else if checkpoint.keyword_baseline {
+            token.push_str("\t-");
+        }
+        if checkpoint.keyword_baseline {
+            token.push_str("\tkeywords");
         }
     }
     SyncCursor {
@@ -2044,6 +2098,7 @@ mod tests {
                     uidnext: None,
                     pruned: None,
                     floor: None,
+                    keyword_baseline: true,
                 },
             ),
             (
@@ -2055,6 +2110,7 @@ mod tests {
                     uidnext: None,
                     pruned: None,
                     floor: None,
+                    keyword_baseline: false,
                 },
             ),
         ];
@@ -2074,6 +2130,7 @@ mod tests {
                 uidnext: Some(77),
                 pruned: Some((12, 77)),
                 floor: None,
+                keyword_baseline: false,
             },
         )];
         let cursor = encode_cursor("acct", &mailboxes);
@@ -2086,6 +2143,7 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].1.uid, 40);
         assert_eq!(decoded[0].1.uidnext, None);
+        assert!(!decoded[0].1.keyword_baseline);
     }
 
     #[test]

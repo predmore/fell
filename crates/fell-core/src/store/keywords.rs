@@ -10,7 +10,7 @@ use crate::message::MessageId;
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::{Error, Result};
 
-use super::{Arrival, find_stored, join_tokens, split_field};
+use super::{Arrival, find_stored, join_tokens, split_field, union_tokens};
 
 pub(super) fn observe(
     conn: &Connection,
@@ -90,6 +90,8 @@ pub(super) fn reconcile(
         return Ok(false);
     };
     let mut visible = split_field(&stored.labels);
+    // The marker also names the exact chip that sync owns. A local label
+    // with different spelling can coexist, even though copy support folds case.
     visible.retain(|label| !before.contains(label) || managed.contains(label));
     for keyword in added {
         if !contains(&visible, keyword) && !contains(&managed, keyword) {
@@ -144,11 +146,15 @@ pub(super) fn keep_local(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,
+    visible: &mut Vec<String>,
     label: &str,
 ) -> Result<()> {
     let mut managed = managed_labels(conn, account_id, message_id)?;
-    if managed.iter().any(|keyword| keyword == label) {
-        managed.retain(|keyword| keyword != label);
+    if contains(&managed, label) {
+        visible.retain(|item| {
+            item == label || !item.eq_ignore_ascii_case(label) || !managed.contains(item)
+        });
+        managed.retain(|keyword| !keyword.eq_ignore_ascii_case(label));
         save_managed(conn, account_id, message_id, &managed)?;
     }
     Ok(())
@@ -201,16 +207,22 @@ pub(crate) fn record_edit(
     account_id: &AccountId,
     message_id: &str,
     edit: LabelEdit<'_>,
+    before: &str,
 ) -> Result<bool> {
     let mut managed = managed_labels(conn, account_id, message_id)?;
-    let was_keyword = managed.iter().any(|label| label == edit.label());
-    if let LabelEdit::Added(label) = edit
-        && was_keyword
-    {
-        managed.retain(|keyword| keyword != label);
+    let LabelEdit::Added(label) = edit else {
+        return Ok(managed.iter().any(|keyword| keyword == edit.label()));
+    };
+    // Re-adding a hidden keyword claims it locally under the spelling the
+    // user chose. An already visible chip still owns its exact spelling.
+    let visible = split_field(before);
+    let previous_count = managed.len();
+    managed.retain(|keyword| !keyword.eq_ignore_ascii_case(label) || visible.contains(keyword));
+    let was_hidden = managed.len() != previous_count;
+    if was_hidden {
         save_managed(conn, account_id, message_id, &managed)?;
     }
-    Ok(was_keyword)
+    Ok(was_hidden)
 }
 
 pub(crate) enum LabelHistory {
@@ -368,11 +380,20 @@ fn undo_edit(
         }
         LabelEdit::Added(_) => return Ok(()),
     }
-    if keep_managed != is_managed {
-        managed.retain(|item| item != label);
-        if keep_managed {
+    let previous = managed.clone();
+    if keep_managed {
+        // A prior undo can have left a hidden marker with a different
+        // spelling. Use the spelling of the label this undo restores.
+        managed.retain(|item| {
+            item == label || !item.eq_ignore_ascii_case(label) || visible.contains(item)
+        });
+        if !is_managed {
             managed.push(label.to_owned());
         }
+    } else if is_managed {
+        managed.retain(|item| item != label);
+    }
+    if managed != previous {
         save_managed(conn, account_id, &stored.canonical_id, &managed)?;
     }
     write_labels(conn, account_id, stored, &join_tokens(&visible))?;
@@ -390,29 +411,58 @@ pub(super) fn local_labels(
     Ok(labels)
 }
 
-/// The duplicate merge unions the visible labels and repoints the copies.
-/// A label that was local on either row keeps that ownership.
+/// Union the rows' labels in keeper order. Local labels retain their exact
+/// spelling and win over any managed keyword with the same IMAP identity.
 pub(super) fn merge(
     conn: &Connection,
     account_id: &AccountId,
     from: &Arrival,
     into: &Arrival,
-) -> Result<()> {
+    incoming: &[String],
+) -> Result<String> {
     let source = managed_labels(conn, account_id, &from.canonical_id)?;
-    let mut target = managed_labels(conn, account_id, &into.canonical_id)?;
-    if source.is_empty() && target.is_empty() {
-        return Ok(());
-    }
+    let target = managed_labels(conn, account_id, &into.canonical_id)?;
     let from_labels = split_field(&from.labels);
+    if source.is_empty() && target.is_empty() {
+        let mut incoming = incoming.to_vec();
+        incoming.extend(from_labels);
+        return Ok(union_tokens(&into.labels, &incoming, false));
+    }
     let into_labels = split_field(&into.labels);
-    target.retain(|label| !from_labels.contains(label) || source.contains(label));
-    for label in &source {
-        if !into_labels.contains(label) && !target.contains(label) {
-            target.push(label.clone());
+    let candidates: Vec<_> = into_labels
+        .iter()
+        .map(|label| (label, target.contains(label)))
+        .chain(
+            incoming
+                .iter()
+                .chain(&from_labels)
+                .map(|label| (label, source.contains(label))),
+        )
+        .collect();
+    let local: Vec<_> = candidates
+        .iter()
+        .filter(|(_, owned)| !owned)
+        .map(|(label, _)| (*label).clone())
+        .collect();
+    let mut visible = Vec::new();
+    let mut managed = Vec::new();
+    for (label, owned) in candidates {
+        if owned {
+            if contains(&local, label) || contains(&managed, label) {
+                continue;
+            }
+            managed.push(label.clone());
+        }
+        visible.push(label.clone());
+    }
+    // Keep a suppressed keyword if neither copy showed it or claimed it locally.
+    for label in target.into_iter().chain(source) {
+        if !contains(&local, &label) && !contains(&managed, &label) {
+            managed.push(label);
         }
     }
-    save_managed(conn, account_id, &into.canonical_id, &target)?;
-    Ok(())
+    save_managed(conn, account_id, &into.canonical_id, &managed)?;
+    Ok(union_tokens("", &visible, false))
 }
 
 fn managed_labels(

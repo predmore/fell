@@ -1,9 +1,10 @@
 use crate::account::BackendKind;
-use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
+use crate::backend::{BridgeBackend, ImapBackend, MailBackend, MailboxDelta};
 use crate::{FlagChange, LabelChange, MessageId, Store, sync_once};
 
 use super::sync_tests::{account, commands, config, sample_state, unused_smtp};
-use super::test_server::{TestServer, TestState};
+use super::test_server::{TestServer, TestState, raw_message};
+use super::{decode_cursor, encode_cursor};
 
 fn keyword_state(with_sent_copy: bool) -> TestState {
     let mut state = sample_state();
@@ -40,6 +41,213 @@ fn assert_flag_only(server: &TestServer) {
         !logged.iter().any(|line| line.contains("BODY.PEEK[]")),
         "{logged:?}"
     );
+}
+
+#[test]
+fn a_legacy_checkpoint_at_highest_modseq_gets_one_keyword_baseline() {
+    let mut state = keyword_state(false);
+    state.mailboxes[0].messages[0].flags = vec!["\\Seen".into()];
+    let server = TestServer::spawn(state);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let id = MessageId::new("root@x");
+    sync_once(&acct, &backend, &store).unwrap();
+    let message = store.message(&acct.id, &id).unwrap().unwrap();
+    store
+        .flag_threads(&acct.id, &[message.thread_id], "INBOX", FlagChange::Unread)
+        .unwrap();
+    let pending = store.pending_flag_changes(&acct.id).unwrap();
+    assert!(!pending.is_empty());
+
+    set_flags(&server, "INBOX", 7, &["fieldwork"]);
+    // An older client reached revision 7 and retained the body, but did
+    // not record the keyword. It also has a pending local read change.
+    let mut checkpoints = decode_cursor(store.sync_cursor(&acct.id).unwrap().as_ref());
+    checkpoints[0].1.modseq = Some(7);
+    checkpoints[0].1.keyword_baseline = false;
+    let cursor = encode_cursor(acct.id.as_str(), &checkpoints);
+    store
+        .apply_delta(
+            &acct.id,
+            &MailboxDelta {
+                cursor: Some(cursor),
+                ..MailboxDelta::default()
+            },
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE message_copies SET modseq = ?1, seen_handled = 0",
+            [7u64.to_be_bytes()],
+        )
+        .unwrap();
+
+    // An interrupted baseline must stay pending. CHANGEDSINCE succeeds at
+    // the saved revision and has no changed rows to return.
+    let known =
+        |mailbox: &str, validity, range| store.stored_uids(&acct.id, mailbox, validity, range);
+    let cursor = store.sync_cursor(&acct.id).unwrap();
+    let err = backend
+        .sync_changes(cursor.as_ref(), &known, &mut |delta| {
+            if decode_cursor(delta.cursor.as_ref())
+                .iter()
+                .any(|(_, cp)| cp.keyword_baseline)
+            {
+                return Err(crate::Error::Backend("interrupted keyword baseline".into()));
+            }
+            store.apply_delta(&acct.id, &delta)
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("interrupted keyword baseline"));
+    assert_eq!(
+        decode_cursor(store.sync_cursor(&acct.id).unwrap().as_ref()),
+        checkpoints
+    );
+    assert!(
+        store
+            .message(&acct.id, &id)
+            .unwrap()
+            .unwrap()
+            .labels
+            .is_empty()
+    );
+
+    server.state.lock().unwrap().commands.clear();
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.new_messages, Some(0));
+    let after = store.message(&acct.id, &id).unwrap().unwrap();
+    assert_eq!(after.labels, ["fieldwork"]);
+    assert_eq!(after.body_text, message.body_text);
+    assert_eq!(store.pending_flag_changes(&acct.id).unwrap(), pending);
+    assert_flag_only(&server);
+    let commands_after_upgrade = commands(&server);
+    assert!(
+        commands_after_upgrade
+            .iter()
+            .any(|line| line.contains("(CHANGEDSINCE 7)"))
+    );
+    assert!(
+        commands_after_upgrade
+            .iter()
+            .any(|line| line.contains("UID FETCH 1 (UID FLAGS MODSEQ)"))
+    );
+    checkpoints[0].1.keyword_baseline = true;
+    assert_eq!(
+        decode_cursor(store.sync_cursor(&acct.id).unwrap().as_ref()),
+        checkpoints
+    );
+
+    server.state.lock().unwrap().commands.clear();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(
+        commands(&server)
+            .iter()
+            .filter(|line| line.contains("(UID FLAGS"))
+            .all(|line| line.contains("CHANGEDSINCE"))
+    );
+}
+
+#[test]
+fn keyword_spellings_collapse_and_mixed_case_readds_keep_local_ownership() {
+    let mut state = keyword_state(true);
+    let body = "The complete field report includes the dates and the route schedule.";
+    let sent = state
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.name == "Sent")
+        .unwrap();
+    sent.messages[0].flags = vec!["Work".into(), "local".into()];
+    sent.messages[0].raw = raw_message("post@x", None, "Field report", "Ann <ann@x>", body, "");
+    let echo = |text| {
+        raw_message(
+            "post-list@x",
+            None,
+            "[team] Field report",
+            "Ann <ann@x>",
+            text,
+            "List-Id: Team <team.x.com>\r\n",
+        )
+    };
+    let inbox = state
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .unwrap();
+    inbox.messages[0].flags = vec!["WORK".into()];
+    inbox.messages[0].raw = echo("Earlier material with a different body.");
+    let server = TestServer::spawn(state);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let sent_id = MessageId::new("post@x");
+    let echo_id = MessageId::new("post-list@x");
+    let message = || store.message(&acct.id, &sent_id).unwrap().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let list_copy = store.message(&acct.id, &echo_id).unwrap().unwrap();
+    assert_eq!(list_copy.labels, ["WORK"]);
+    assert_eq!(message().labels, ["Work", "local"]);
+    for label in ["LOCAL", "Tag", "TAG"] {
+        store
+            .label_thread(
+                &acct.id,
+                &list_copy.thread_id,
+                LabelChange::Add(label.into()),
+            )
+            .unwrap();
+    }
+
+    {
+        let mut state = server.state.lock().unwrap();
+        let inbox = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .unwrap();
+        inbox.uidvalidity += 1;
+        inbox.omit_uidnext = true;
+        inbox.messages[0].raw = echo(body);
+    }
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
+    assert_eq!(message().labels, ["Work", "LOCAL", "Tag", "TAG"]);
+    let change = |label| {
+        store
+            .label_thread(&acct.id, &message().thread_id, label)
+            .unwrap()
+    };
+    change(LabelChange::Remove("Work".into()));
+    change(LabelChange::Add("wOrK".into()));
+    store.undo(&acct.id).unwrap();
+    assert_eq!(message().labels, ["LOCAL", "Tag", "TAG"]);
+    store.undo(&acct.id).unwrap();
+    assert_eq!(message().labels, ["Work", "LOCAL", "Tag", "TAG"]);
+
+    set_flags(&server, "INBOX", 2, &[]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["Work", "LOCAL", "Tag", "TAG"]);
+    set_flags(&server, "Sent", 2, &[]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["LOCAL", "Tag", "TAG"]);
+    assert_flag_only(&server);
+
+    set_flags(&server, "Sent", 3, &["WORK"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    change(LabelChange::Remove("WORK".into()));
+    change(LabelChange::Add("wOrK".into()));
+    set_flags(&server, "Sent", 4, &[]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["LOCAL", "Tag", "TAG", "wOrK"]);
+    assert_flag_only(&server);
 }
 
 #[test]
@@ -421,4 +629,15 @@ fn bridge_keeps_mailbox_labels_when_copy_flags_change() {
     assert_eq!(after.labels, before.labels);
     assert!(after.unread);
     assert_flag_only(&server);
+    assert!(
+        commands(&server)
+            .iter()
+            .filter(|line| line.contains("(UID FLAGS"))
+            .all(|line| line.contains("CHANGEDSINCE"))
+    );
+    assert!(
+        decode_cursor(store.sync_cursor(&acct.id).unwrap().as_ref())
+            .iter()
+            .all(|(_, cp)| !cp.keyword_baseline)
+    );
 }

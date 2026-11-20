@@ -2222,13 +2222,13 @@ fn insert_arrival(
         {
             absorb_duplicate(conn, message, &stored, &other)?;
         } else {
-            write_kept(conn, message, &stored, via_alias, &[], &[])?;
+            write_kept(conn, message, &stored, via_alias, &[], None)?;
         }
         return Ok(false);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        write_kept(conn, message, &stored, true, &[], &[])?;
+        write_kept(conn, message, &stored, true, &[], None)?;
         return Ok(false);
     }
     insert_new(conn, message, &fingerprint)?;
@@ -2350,7 +2350,7 @@ fn write_kept(
     stored: &Arrival,
     alias: bool,
     extra_folders: &[String],
-    extra_labels: &[String],
+    merged_labels: Option<String>,
 ) -> Result<ThreadId> {
     let stored_list = list_is_set(&stored.list_id);
     let incoming_list = clean_list_id(&message.list_id).is_some();
@@ -2400,16 +2400,14 @@ fn write_kept(
     let archived = stored.archived || message.archived;
     let mut folder_in = message.folders.clone();
     folder_in.extend(extra_folders.iter().cloned());
-    let mut label_in = message.labels.clone();
-    label_in.extend(extra_labels.iter().cloned());
-    // `extra_*` is the deleted copy. It belongs in the value written here, not
-    // in the previous terms, or those tokens are both sides of the diff and
-    // then disappear when the deleted row's postings are dropped.
+    // The deleted copy's folders and labels enter the new terms here. The
+    // earlier terms belong to the keeper alone.
     let mut folders = union_tokens(&stored.folders, &folder_in, false);
     if archived {
         folders = strip_inbox_tokens(&folders);
     }
-    let labels = union_tokens(&stored.labels, &label_in, false);
+    let labels =
+        merged_labels.unwrap_or_else(|| union_tokens(&stored.labels, &message.labels, false));
     let arrived_via = union_tokens(&stored.arrived_via, &message.arrived_via, true);
     let to_line = union_addresses(&stored.to_line, &message.to);
     let cc_line = union_addresses(&stored.cc_line, &message.cc);
@@ -2876,10 +2874,9 @@ fn absorb_duplicate(
     keeper: &Arrival,
 ) -> Result<ThreadId> {
     let extra_folders = split_field(&doomed.folders);
-    let extra_labels = split_field(&doomed.labels);
-    keywords::merge(conn, &message.account_id, doomed, keeper)?;
+    let labels = keywords::merge(conn, &message.account_id, doomed, keeper, &message.labels)?;
     let keeper = fold_doomed_local_state(keeper, doomed);
-    let thread = write_kept(conn, message, &keeper, true, &extra_folders, &extra_labels)?;
+    let thread = write_kept(conn, message, &keeper, true, &extra_folders, Some(labels))?;
     // The stored parts of the doomed row fill what the keeper lacks; the
     // delete below drops the rest with the row.
     if let Some(list) = bodies::move_into(
@@ -3054,7 +3051,7 @@ fn take_local_state(
 ) -> Result<()> {
     let mut labels = split_field(&into.labels);
     for label in keywords::local_labels(conn, account_id, from)? {
-        keywords::keep_local(conn, account_id, &into.canonical_id, &label)?;
+        keywords::keep_local(conn, account_id, &into.canonical_id, &mut labels, &label)?;
         if !labels.contains(&label) {
             labels.push(label);
         }
