@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use fell_core::{MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, SearchPreview};
 
-use super::{Fetch, Pending, Session, Step};
+use super::{Fetch, Pending, Session, Step, Toast};
 use crate::keymap::KeyId;
 use crate::present::{ConvMessage, NameSpan, Pane, Rich, ThreadRow, display_name, one_line};
 use crate::text_render::BodyBlock;
@@ -31,7 +31,7 @@ pub struct Search {
     pub caret: usize,
     pub editing: bool,
     pub pending: bool,
-    pub error: Option<String>,
+    pub error: Option<Toast>,
     pub correction: Option<String>,
     pub suggestions: Vec<String>,
     pub suggestion_index: usize,
@@ -188,6 +188,10 @@ impl Search {
         self.dirty
     }
 
+    pub fn results_current(&self) -> bool {
+        !self.pending && self.error.is_none()
+    }
+
     pub fn effective_query(&self) -> &str {
         self.correction
             .as_deref()
@@ -196,7 +200,7 @@ impl Search {
     }
 
     pub fn matches_thread(&self, thread: Option<&str>) -> bool {
-        !self.pending
+        self.results_current()
             && self.matches_for.as_ref().is_some_and(|(generation, id)| {
                 self.accepted_generation() == Some(*generation) && Some(id.as_str()) == thread
             })
@@ -362,6 +366,7 @@ impl Session {
         if query != search.requested {
             self.search_generation = self.search_generation.wrapping_add(1);
             search.requested = query;
+            search.error = None;
             search.pending = !search.requested.is_empty()
                 && (search.dirty
                     || search
@@ -370,7 +375,6 @@ impl Session {
                         .is_none_or(|(_, accepted)| *accepted != search.requested));
             if search.requested.is_empty() {
                 search.dirty = false;
-                search.error = None;
                 search.correction = None;
                 search.accepted = None;
                 search.hits.clear();
@@ -404,12 +408,12 @@ impl Session {
     }
 
     pub fn search_results_current(&self) -> bool {
-        self.search.as_ref().is_none_or(|search| !search.pending)
+        self.search.as_ref().is_none_or(Search::results_current)
     }
 
     pub fn search_source(&self, id: &str) -> Option<&str> {
         match &self.search {
-            Some(search) if !search.pending => search.hits.get(id)?.folder.as_deref(),
+            Some(search) if search.results_current() => search.hits.get(id)?.folder.as_deref(),
             Some(_) => None,
             None => Some(&self.folder),
         }
@@ -500,7 +504,7 @@ impl Session {
         let Some(search) = self.search.as_mut() else {
             return Step::default();
         };
-        if !search.pending
+        if search.results_current()
             && let Some(corrected) = search.correction.take()
         {
             // The store has already run this correction and supplied its hits.
@@ -548,6 +552,17 @@ impl Session {
         {
             return false;
         }
+        if let Some(error) = reply.error.take() {
+            // An invalid query has no result set of its own. Keep the last
+            // valid rows, cursor and reader while presenting the error.
+            let search = self.search.as_mut().unwrap();
+            search.pending = false;
+            search.error = Some(Toast {
+                text: one_line(&error),
+                alert: true,
+            });
+            return true;
+        }
         if self.visual {
             self.set_threads(std::mem::take(&mut reply.rows));
         } else {
@@ -568,7 +583,7 @@ impl Session {
         let search = self.search.as_mut().unwrap();
         search.pending = false;
         search.dirty = false;
-        search.error = reply.error.take();
+        search.error = None;
         search.correction = reply.correction.take();
         std::mem::swap(&mut search.hits, &mut reply.hits);
         search.accepted = Some((generation, search.requested.clone()));
@@ -903,14 +918,27 @@ mod tests {
                 "reader@example.test",
             )
         };
-        let mut invalid = invalid_reply("expected YYYY-MM-DD");
+        let invalid = invalid_reply("expected YYYY-MM-DD");
         assert!(session.defer_search_reply(prefix, &invalid));
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
         assert!(session.search.as_ref().unwrap().error.is_none());
         assert!(!session.search_results_current());
 
+        land(&mut session, invalid);
+        assert_eq!(session.threads.len(), 1);
+        assert_eq!(session.cursor_id.as_deref(), Some("one"));
+        assert_eq!(
+            session.status_notice().map(|notice| notice.text.as_str()),
+            Some("expected YYYY-MM-DD")
+        );
+        assert!(!session.search_results_current());
+        assert_eq!(session.perform(Action::Archive, 10), Step::default());
+
         session.type_search("-11-11");
+        let mut invalid = invalid_reply("expected YYYY-MM-DD");
         assert!(!session.apply_search_reply(prefix, &mut invalid));
+        assert_eq!(session.threads.len(), 1);
+        assert!(session.status_notice().is_none());
         land(&mut session, reply(vec![row_hit("one", "m1")], None));
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
 
@@ -920,9 +948,13 @@ mod tests {
         assert!(!session.defer_search_reply(session.search_generation, &invalid));
         land(&mut session, invalid);
         assert_eq!(
-            session.search.as_ref().unwrap().error.as_deref(),
+            session.status_notice().map(|notice| notice.text.as_str()),
             Some("unterminated quote")
         );
+        assert_eq!(session.threads.len(), 1);
+        assert!(!session.search_results_current());
+        session.on_key(KeyId::Escape, 10);
+        assert!(session.status_notice().is_none());
     }
 
     #[test]

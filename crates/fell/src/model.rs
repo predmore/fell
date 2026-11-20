@@ -484,6 +484,12 @@ impl Session {
         });
     }
 
+    pub fn status_notice(&self) -> Option<&Toast> {
+        self.toast
+            .as_ref()
+            .or_else(|| self.search.as_ref()?.error.as_ref())
+    }
+
     pub fn clear_toast(&mut self) {
         self.toast = None;
     }

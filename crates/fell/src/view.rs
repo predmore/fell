@@ -3224,7 +3224,7 @@ impl Inbox {
             .session
             .search
             .as_ref()
-            .is_some_and(|search| search.pending || !search.hits.contains_key(&id))
+            .is_some_and(|search| !search.results_current() || !search.hits.contains_key(&id))
         {
             return;
         }
@@ -4839,7 +4839,7 @@ fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f3
 
 fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
     if let Some(search) = &session.search {
-        return search::empty(theme, search);
+        return search::empty(search);
     }
     let banner = session.list_banner();
     div()

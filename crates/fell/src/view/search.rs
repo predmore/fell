@@ -580,6 +580,10 @@ impl Inbox {
             let old_index = self.session.selected_index();
             let offset = self.list_offset();
             if self.session.apply_search_reply(generation, &mut reply) {
+                if !self.session.search_results_current() {
+                    cx.notify();
+                    return;
+                }
                 if let Some(preferred) = self.search_view.prefer.take() {
                     self.session.select_if_present(&preferred);
                 }
@@ -733,7 +737,7 @@ impl Inbox {
             .session
             .search
             .as_ref()
-            .filter(|search| !search.pending)
+            .filter(|search| search.results_current())
         else {
             return;
         };
@@ -803,7 +807,7 @@ impl Inbox {
                     .as_mut()
                     .filter(|search| search.accepted_generation() == Some(generation))
                 {
-                    if search.pending {
+                    if !search.results_current() {
                         for (_, id) in batch {
                             inbox.search_view.preview_asked.remove(&id);
                         }
@@ -947,8 +951,11 @@ pub(super) fn feedback(
     let suggestion = search
         .suggestions
         .get(search.suggestion_index)
-        .filter(|_| search.editing && (search.pending || search.correction.is_none()));
-    let correction = search.correction.as_ref().filter(|_| !search.pending);
+        .filter(|_| search.editing && (!search.results_current() || search.correction.is_none()));
+    let correction = search
+        .correction
+        .as_ref()
+        .filter(|_| search.results_current());
     let line = if let Some(correction) = correction {
         Some((format!("Did you mean {correction}?"), true))
     } else if let Some(value) = suggestion {
@@ -963,6 +970,8 @@ pub(super) fn feedback(
             .to_owned(),
             false,
         ))
+    } else if search.error.is_some() && count > 0 {
+        Some(("Showing previous results".to_owned(), false))
     } else if count > 0 {
         Some((
             format!(
@@ -1031,14 +1040,12 @@ pub(super) fn feedback(
         }))
 }
 
-pub(super) fn empty(theme: &Theme, search: &Search) -> gpui::Div {
-    let text = if search.pending
+pub(super) fn empty(search: &Search) -> gpui::Div {
+    let text = if !search.results_current()
         || search.query.trim().is_empty()
         || (search.editing && !search.suggestions.is_empty())
     {
         ""
-    } else if search.error.is_some() {
-        "Check your search"
     } else {
         "No mail matches"
     };
@@ -1052,13 +1059,6 @@ pub(super) fn empty(theme: &Theme, search: &Search) -> gpui::Div {
         .px(px(18.))
         .text_center()
         .child(div().child(text))
-        .children(
-            search
-                .error
-                .as_ref()
-                .filter(|_| text == "Check your search")
-                .map(|error| div().text_color(rgb(theme.dimmed)).child(error.clone())),
-        )
 }
 
 pub(super) fn row(
@@ -1149,7 +1149,7 @@ pub(super) fn row(
             MouseButton::Left,
             cx.listener(move |inbox, _, window, cx| {
                 if inbox.session.search.as_ref().is_some_and(|search| {
-                    !search.pending && search.accepted_generation() == generation
+                    search.results_current() && search.accepted_generation() == generation
                 }) {
                     window.focus(&inbox.focus);
                     inbox.select_thread(id.clone(), cx);

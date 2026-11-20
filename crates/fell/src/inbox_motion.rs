@@ -279,8 +279,9 @@ impl InboxMotion {
         if std::mem::take(&mut self.arrival_pending) {
             self.arrival = start(motion::QUICK);
         }
-        if session.toast != self.last_toast {
-            match (&session.toast, self.last_toast.take()) {
+        let notice = session.status_notice();
+        if notice != self.last_toast.as_ref() {
+            match (notice, self.last_toast.take()) {
                 (Some(toast), old) => {
                     // The same notice again (a second `e` in a burst): it
                     // stays up instead of blinking out and back.
@@ -330,7 +331,7 @@ impl InboxMotion {
                 }
                 (None, None) => {}
             }
-            self.last_toast = session.toast.clone();
+            self.last_toast = notice.cloned();
         }
 
         let which =
@@ -602,8 +603,8 @@ impl InboxMotion {
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
         let rising = motion::progress(self.toast_in.as_ref(), now);
         let notice = session
-            .toast
-            .clone()
+            .status_notice()
+            .cloned()
             .map(|toast| (toast, motion::lerp(self.toast_from, 1.0, rising)));
         let leaving = self
             .toast_out
