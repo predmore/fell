@@ -91,13 +91,13 @@ impl StoreClient {
         }
     }
 
-    /// Keep full queries on the background lane, including during startup.
-    /// An in-memory mailbox has only the interactive connection.
+    /// Run full queries on the background lane once it is ready. Use the
+    /// open connection while the second one is starting or unavailable.
     pub fn call_search<R: Send + 'static>(
         &self,
         job: impl FnOnce(&Store) -> R + Send + 'static,
     ) -> oneshot::Receiver<R> {
-        if self.file_backed.load(Ordering::Acquire) {
+        if self.background_ready.load(Ordering::Acquire) {
             send(&self.background, job, Some(&self.interactive))
         } else {
             self.call(job)
@@ -220,7 +220,7 @@ mod tests {
         let opened = dir.join("mail.db");
         let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
-        let asked = client.call_search(|store| store.testing_search_warm_asked());
+        let asked = client.call_maintenance(|store| store.testing_search_warm_asked());
         assert!(futures::executor::block_on(asked).unwrap());
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
@@ -235,6 +235,35 @@ mod tests {
         let search = client.call_search(|store| store.db_path().is_none());
         assert!(futures::executor::block_on(search).unwrap());
         assert!(!client.has_background_lane());
+    }
+
+    #[test]
+    fn search_uses_the_open_connection_when_the_background_lane_is_unavailable() {
+        let (interactive, reader_jobs) = mpsc::channel();
+        let (background, background_jobs) = mpsc::channel();
+        let client = StoreClient {
+            interactive,
+            background_ready: Arc::new(AtomicBool::new(false)),
+            file_backed: Arc::new(AtomicBool::new(true)),
+            background,
+        };
+        let store = Store::open_in_memory().unwrap();
+
+        // The second connection is still opening and cannot take jobs yet.
+        let search = client.call_search(|_| 1);
+        assert!(matches!(
+            background_jobs.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        reader_jobs.try_recv().unwrap()(&store);
+        assert_eq!(futures::executor::block_on(search).unwrap(), 1);
+
+        // A disconnected lane must also fall back, even if readiness was set.
+        client.background_ready.store(true, Ordering::Release);
+        drop(background_jobs);
+        let search = client.call_search(|_| 2);
+        reader_jobs.try_recv().unwrap()(&store);
+        assert_eq!(futures::executor::block_on(search).unwrap(), 2);
     }
 
     #[test]
