@@ -1,0 +1,1 @@
+The paced key-to-paint replay ran the f179841d115ece9816c27f353192b24821f4acd8 release with a private 100k-message mailbox and Asahi Vulkan under nested Weston/Xvfb. Of 152 keys delivered during query work, five exceeded 8 ms to CPU paint. The nearest-rank p95 was 5.992 ms and the maximum was 13.894 ms. Native Hyprland and physical presentation remain unverified.
