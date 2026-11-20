@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod choose;
+mod cid;
 mod corpus;
 mod document;
 mod fixtures;
@@ -16,6 +17,7 @@ mod markdown;
 mod webview_html;
 
 pub use choose::{MailHeaders, PreparedMail, RenderMode, choose_view, layout_is_complex, prepare};
+pub use cid::visit_cid_image_urls;
 pub use corpus::corpus;
 pub use document::{
     Align, Block, ImageSource, Inline, ListItem, MAX_DATA_IMAGE_BYTES, StyledDocument,

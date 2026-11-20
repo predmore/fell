@@ -4,7 +4,7 @@ use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
 use crate::folders::FolderRole;
 use crate::imap::{ImapConfig, ImapSecurity, InboxWait};
 use crate::store::Store;
-use crate::sync::sync_once;
+use crate::sync::{sync_once, sync_with_progress};
 use crate::threading::ThreadId;
 
 use super::test_server::{
@@ -203,7 +203,8 @@ fn local_server_syncs_into_the_store() {
     };
     let store = Store::open_in_memory().unwrap();
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert!(report.upserted >= 4);
+    assert!(report.changed);
+    assert_eq!(report.new_messages, None);
 
     let threads = store.list_threads(&acct.id).unwrap();
     let proton = threads
@@ -271,7 +272,7 @@ fn local_server_syncs_into_the_store() {
     );
 
     let again = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(again.upserted, 0);
+    assert_eq!(again.new_messages, Some(0));
     assert_eq!(store.list_threads(&acct.id).unwrap().len(), threads.len());
 }
 
@@ -304,7 +305,7 @@ fn second_sync_fetches_only_new_uids() {
             });
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 1);
+    assert_eq!(report.new_messages, Some(1));
     let logged = commands(&server);
     let inbox_fetch = logged
         .iter()
@@ -406,7 +407,7 @@ fn condstore_updates_unread_without_a_second_copy() {
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
     // A flag change on stored mail is a flag update, not a new message.
-    assert_eq!(report.upserted, 0);
+    assert_eq!(report.new_messages, Some(0));
     assert_eq!(store.list_threads(&acct.id).unwrap().len(), 1);
     assert!(store.list_threads(&acct.id).unwrap()[0].unread);
     let logged = commands(&server);
@@ -484,7 +485,7 @@ fn a_seen_change_on_stored_mail_fetches_flags_not_bodies() {
             smtp: unused_smtp(),
         };
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 500);
+        sync_once(&acct, &backend, &store).unwrap();
         let threads = store.list_threads(&acct.id).unwrap();
         assert_eq!(threads.len(), 500);
         assert!(threads.iter().all(|thread| thread.unread));
@@ -502,7 +503,7 @@ fn a_seen_change_on_stored_mail_fetches_flags_not_bodies() {
         server.sent.store(0, std::sync::atomic::Ordering::Relaxed);
         let report = sync_once(&acct, &backend, &store).unwrap();
         let sent = server.sent.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(report.upserted, 0, "qresync {qresync}");
+        assert_eq!(report.new_messages, Some(0), "qresync {qresync}");
         let logged = commands(&server);
         assert!(
             logged
@@ -554,7 +555,7 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
         state.commands.clear();
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 1);
+    assert_eq!(report.new_messages, Some(1));
     assert!(stored(&store, &acct, "gone@x").is_some());
     assert!(!stored(&store, &acct, "reply@x").unwrap().unread);
     let bodies = body_fetches(&server);
@@ -562,6 +563,145 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
         bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ BODY.PEEK[])"),
         "only the copy the store does not hold is downloaded: {bodies:?}"
     );
+}
+
+#[test]
+fn sync_counts_new_messages_once_across_folders_and_list_aliases() {
+    let body = "Here is the whole plan for the launch next week, with dates.";
+    let post = raw_message("post@x", None, "Plan", "Ann <ann@x>", body, "");
+    let mut inbox = empty_mailbox("INBOX", 20);
+    inbox.messages.push(literal(1, &[], 1, post.clone()));
+    let mut state = sample_state();
+    state.mailboxes = vec![inbox, empty_mailbox("All Mail", 10)];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+
+    {
+        let mut state = server.state.lock().unwrap();
+        mailbox(&mut state, "All Mail").messages.extend([
+            literal(1, &[], 2, post),
+            literal(
+                2,
+                &[],
+                2,
+                raw_message(
+                    "post-list@x",
+                    None,
+                    "[team] Plan",
+                    "Ann <ann@x>",
+                    body,
+                    "List-Id: Team <team.x.com>\r\nDelivered-To: alias@x\r\n",
+                ),
+            ),
+        ]);
+    }
+    let catch_up = |expected| {
+        let mut seen = Vec::new();
+        let report = sync_with_progress(&acct, &backend, &store, &mut |report| {
+            seen.push(report.new_messages);
+        })
+        .unwrap();
+        assert_eq!(report.new_messages, Some(expected));
+        assert!(report.changed, "the window should refresh the new copies");
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter()
+                .all(|count| count.is_some_and(|n| n <= expected))
+        );
+        assert_eq!(seen.last(), Some(&Some(expected)));
+    };
+    catch_up(0);
+    let row = stored(&store, &acct, "post@x").unwrap();
+    assert_eq!(row.folders, vec!["INBOX", "All Mail"]);
+    assert_eq!(row.arrived_via, vec!["alias@x"]);
+    assert!(stored(&store, &acct, "post-list@x").is_none());
+    assert_eq!(
+        store.stored_uids(&acct.id, "All Mail", 10, (1, 2)).unwrap(),
+        vec![1, 2]
+    );
+
+    // The same new arrival is delivered in both folders on this pass.
+    {
+        let new = raw_message("new@x", None, "New", "Bob <bob@x>", "new body", "");
+        let mut state = server.state.lock().unwrap();
+        mailbox(&mut state, "INBOX")
+            .messages
+            .push(literal(2, &[], 3, new.clone()));
+        mailbox(&mut state, "All Mail")
+            .messages
+            .push(literal(3, &[], 3, new));
+    }
+    catch_up(1);
+    assert_eq!(
+        stored(&store, &acct, "new@x").unwrap().folders,
+        vec!["INBOX", "All Mail"]
+    );
+    assert_eq!(store.list_threads(&acct.id).unwrap().len(), 2);
+
+    server.state.lock().unwrap().commands.clear();
+    let again = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(again.new_messages, Some(0));
+    assert!(!again.changed);
+    assert!(body_fetches(&server).is_empty());
+}
+
+#[test]
+fn catch_up_reports_an_archive_copy_before_an_all_mail_arrival() {
+    let make_mail = |id| raw_message(id, None, id, "Ann <ann@x>", "test body", "");
+    let old = make_mail("old@x");
+    let archived = make_mail("archived@x");
+    let mut inbox = empty_mailbox("INBOX", 20);
+    inbox.messages.extend([
+        literal(1, &[], 1, old.clone()),
+        literal(2, &[], 1, archived.clone()),
+    ]);
+    let mut archive = empty_mailbox("Archive", 30);
+    archive.list_flags = "\\Archive".into();
+    archive.messages.push(literal(1, &[], 1, old.clone()));
+    let mut all_mail = empty_mailbox("All Mail", 40);
+    all_mail.list_flags = "\\All".into();
+    all_mail.messages.push(literal(1, &[], 1, old));
+    let mut state = sample_state();
+    state.mailboxes = vec![inbox, archive, all_mail];
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+
+    {
+        let mut state = server.state.lock().unwrap();
+        mailbox(&mut state, "Archive")
+            .messages
+            .push(literal(2, &[], 2, archived.clone()));
+        mailbox(&mut state, "All Mail").messages.extend([
+            literal(2, &[], 2, archived),
+            literal(3, &[], 2, make_mail("new@x")),
+        ]);
+    }
+    let mut seen = Vec::new();
+    let report = sync_with_progress(&acct, &backend, &store, &mut |report| {
+        let archive_copy = store.stored_uids(&acct.id, "Archive", 30, (2, 2)).unwrap() == [2];
+        let all_mail_arrival = stored(&store, &acct, "new@x").is_some();
+        seen.push((report.new_messages, archive_copy, all_mail_arrival));
+    })
+    .unwrap();
+
+    assert_eq!(seen.first(), Some(&(Some(0), true, false)), "{seen:?}");
+    assert_eq!(seen.last(), Some(&(Some(1), true, true)), "{seen:?}");
+    assert_eq!(report.new_messages, Some(1));
+    assert!(report.changed);
 }
 
 #[test]
@@ -600,7 +740,10 @@ fn without_uidnext_only_new_uids_are_downloaded() {
         });
         state.commands.clear();
     }
-    assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 1);
+    assert_eq!(
+        sync_once(&acct, &backend, &store).unwrap().new_messages,
+        Some(1)
+    );
     assert!(stored(&store, &acct, "d3@x").is_some());
     let bodies = body_fetches(&server);
     assert!(
@@ -609,7 +752,10 @@ fn without_uidnext_only_new_uids_are_downloaded() {
     );
     server.state.lock().expect("state").commands.clear();
     // `4:*` still names UID 3, the highest; it is stored, so nothing is fetched.
-    assert_eq!(sync_once(&acct, &backend, &store).unwrap().upserted, 0);
+    assert_eq!(
+        sync_once(&acct, &backend, &store).unwrap().new_messages,
+        Some(0)
+    );
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
 }
 
@@ -769,7 +915,7 @@ fn an_unread_change_on_the_other_copy_of_one_message_id_reaches_the_row() {
         state.commands.clear();
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 0);
+    assert_eq!(report.new_messages, Some(0));
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
     assert!(
         stored(&store, &acct, "both@x").unwrap().unread,
@@ -814,7 +960,7 @@ fn a_flag_change_after_trash_is_emptied_comes_back_with_undo() {
         state.commands.clear();
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 0);
+    assert_eq!(report.new_messages, Some(0));
     assert!(body_fetches(&server).is_empty(), "{:?}", commands(&server));
     assert!(stored(&store, &acct, "binned@x").is_none());
     store.undo(&acct.id).unwrap();
@@ -1034,7 +1180,8 @@ fn bridge_backend_is_the_same_imap_fetch() {
     };
     let store = Store::open_in_memory().unwrap();
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert!(report.upserted >= 4);
+    assert!(report.changed);
+    assert_eq!(report.new_messages, None);
     assert_eq!(backend.kind(), BackendKind::Bridge);
     assert!(!store.list_threads(&acct.id).unwrap().is_empty());
 }
@@ -1157,7 +1304,7 @@ fn star_range_does_not_reapply_the_highest_uid() {
             state.commands.clear();
         }
         let report = sync_once(&acct, &backend, &store).unwrap();
-        assert_eq!(report.upserted, 0);
+        assert_eq!(report.new_messages, Some(0));
         let logged = commands(&server);
         assert!(
             !logged.iter().any(|line| line.contains("BODY.PEEK")),
@@ -1439,7 +1586,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
     };
     let store = Store::open_in_memory().unwrap();
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 2);
+    assert_eq!(report.new_messages, None);
     let threads = store.list_threads(&acct.id).unwrap();
     assert!(
         threads
@@ -1469,7 +1616,7 @@ fn oversized_message_is_skipped_and_later_sync_does_not_refetch() {
         state.commands.clear();
     }
     let again = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(again.upserted, 0);
+    assert_eq!(again.new_messages, Some(0));
     let logged = commands(&server);
     assert!(
         !logged.iter().any(|line| line.contains("BODY.PEEK")),
@@ -1908,7 +2055,7 @@ fn fetch_batches_survive_a_dropped_connection() {
         state.commands.clear();
     }
     let report = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(report.upserted, 1);
+    assert_eq!(report.new_messages, None);
     let bodies = body_fetches(&server);
     assert!(
         bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
@@ -2098,7 +2245,7 @@ fn quoted_body_is_stored_and_nil_is_not_missing() {
         state.commands.clear();
     }
     let again = sync_once(&acct, &backend, &store).unwrap();
-    assert_eq!(again.upserted, 0);
+    assert_eq!(again.new_messages, Some(0));
     let logged = commands(&server);
     assert!(
         !logged.iter().any(|line| line.contains("BODY.PEEK")),
@@ -2284,8 +2431,6 @@ fn account_file_logs_in_syncs_and_reports_bad_logins() {
     use crate::account_config::{
         AccountConfig, PasswordSource, SyncFailureKind, classify_sync_error,
     };
-    use crate::sync::sync_with_progress;
-
     let server = TestServer::spawn(sample_state());
     let text = format!(
         "backend = \"imap\"\nemail = \"c@x\"\nusername = \"caleb\"\n\
@@ -2299,15 +2444,13 @@ fn account_file_logs_in_syncs_and_reports_bad_logins() {
     let store = Store::open_in_memory().unwrap();
     let backend = config.backend().unwrap();
     let mut seen = Vec::new();
-    let report = sync_with_progress(
-        &config.account(),
-        backend.as_ref(),
-        &store,
-        &mut |progress| seen.push(progress.upserted),
-    )
+    let report = sync_with_progress(&config.account(), backend.as_ref(), &store, &mut |report| {
+        seen.extend(report.progress.clone())
+    })
     .unwrap();
-    assert!(report.upserted >= 4);
-    assert_eq!(seen.last(), Some(&report.upserted));
+    assert!(report.changed);
+    assert_eq!(report.new_messages, None);
+    assert!(seen.iter().any(|progress| progress.folder == "Inbox"));
     assert!(!store.list_threads(&config.account().id).unwrap().is_empty());
 
     let mut wrong = config.clone();
@@ -3518,7 +3661,8 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
         .conn
         .execute_batch(
             "DELETE FROM message_bodies;
-             INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+             INSERT INTO body_backfill (account_id, message_id)
+             SELECT account_id, message_id FROM messages;",
         )
         .unwrap();
     {
@@ -3590,6 +3734,9 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
     // The reply is still unread: the fetch did not set \Seen.
     assert!(stored(&store, &acct, "reply@x").unwrap().unread);
     assert_read_only(&server);
+
+    let report = sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(report.new_messages, Some(0));
 }
 
 #[test]
@@ -3607,7 +3754,7 @@ fn a_new_uidvalidity_records_old_copies_without_bodies() {
         .conn
         .execute_batch(
             "DELETE FROM message_bodies WHERE message_id = 'smile@x';
-             INSERT INTO body_backfill VALUES ('a1', 'smile@x');",
+             INSERT INTO body_backfill (account_id, message_id) VALUES ('a1', 'smile@x');",
         )
         .unwrap();
     mailbox(&mut server.state.lock().expect("state"), "&Jjo-").uidvalidity = 8;
@@ -3638,7 +3785,8 @@ fn synced_without_parts(server: &TestServer, acct: &Account, backend: &ImapBacke
         .conn
         .execute_batch(
             "DELETE FROM message_bodies;
-             INSERT INTO body_backfill SELECT account_id, message_id FROM messages;",
+             INSERT INTO body_backfill (account_id, message_id)
+             SELECT account_id, message_id FROM messages;",
         )
         .unwrap();
     server.state.lock().expect("state").commands.clear();

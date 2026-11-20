@@ -61,8 +61,9 @@ pub use send::{
 pub use smtp::SmtpConfig;
 pub use store::PendingFlags;
 pub use store::{
-    FolderPage, FolderSpan, FolderThread, ListFilter, ListKey, ListSource, PartKinds, PartStamp,
-    Participant, SearchPage, Store, ThreadList, ThreadSummary, folder_aliases,
+    CidRepairBatch, CidRepairProgress, FolderPage, FolderSpan, FolderThread, ListFilter, ListKey,
+    ListSource, PartKinds, PartStamp, Participant, SearchPage, Store, ThreadList, ThreadSummary,
+    folder_aliases,
 };
 pub use sync::{
     SyncReport, fetch_message_bodies, fetch_message_body, fetch_missing_bodies, sync_once,

@@ -547,6 +547,28 @@ fn lstat_at(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Metadata> {
     File::from(fs::openat(dir, name, flags, Mode::empty())?).metadata()
 }
 
+/// Check a command path using directory descriptors from the filesystem root.
+pub(crate) fn regular_file_without_symlinks(path: &Path) -> Option<Metadata> {
+    let spelling = path.as_os_str().as_encoded_bytes();
+    if spelling.ends_with(b"/") || spelling.ends_with(b"/.") {
+        return None;
+    }
+    let mut components = path.strip_prefix("/").ok()?.components();
+    let Component::Normal(name) = components.next_back()? else {
+        return None;
+    };
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::openat(CWD, "/", flags, Mode::empty()).ok()?;
+    for component in components {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        dir = fs::openat(&dir, part, flags, Mode::empty()).ok()?;
+    }
+    let metadata = lstat_at(&dir, name).ok()?;
+    metadata.is_file().then_some(metadata)
+}
+
 /// Why `name` in `dir` (shown as `at`) could not be opened.
 fn refusal(dir: &OwnedFd, name: &OsStr, at: &Path, err: Errno, env: &Env) -> String {
     let shown = env.display(at);

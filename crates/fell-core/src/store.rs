@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use crate::embed::{
     Embedding, dequeue_message, enqueue_message, invalidate_message_embedding,
     remove_message_embedding,
 };
-use crate::folders::FolderRoles;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{
     Address, Message, MessageHeaders, MessageId, RemoteId, body_fingerprint, decode_addresses,
     encode_addresses, is_short_reply_body,
@@ -27,6 +28,7 @@ pub(crate) mod copies;
 pub(crate) mod intents;
 mod roles;
 pub(crate) mod sent_bcc;
+mod sent_echo_repair;
 mod summaries;
 mod threads;
 mod write_lock;
@@ -373,6 +375,8 @@ pub struct ThreadSummary {
     pub unread: bool,
 }
 
+pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let requested = path.as_ref();
@@ -525,6 +529,7 @@ impl Store {
         // Reply-to and subject indexes for incremental threading. The first
         // open fills them and re-resolves every account once.
         threads::ensure_thread_index(&conn)?;
+        sent_echo_repair::on_open(&conn)?;
         // 4 queues mail stored before message_bodies for sync to fetch
         // again. It runs after the version 3 merge, so the queue names the
         // rows that survived it, and stamps 4 in the same transaction.
@@ -647,29 +652,30 @@ impl Store {
     /// the second begins behind any write that is waiting:
     ///
     /// 1. its new messages and every flag;
-    /// 2. its folder roles, every copy its listings found, the copies they
-    ///    no longer list, settling, and the cursor.
+    /// 2. its folder roles, any one-time Sent repair, every copy its listings
+    ///    found, the copies they no longer list, settling, and the cursor.
     ///
     /// Each part is whole, never cut inside. A write that gets in between
     /// comes after every flag, so no flag the server sent before the pass
-    /// lands on top of it. The second part writes no read state. And the
-    /// copies stay as they were until one commit replaces them with what the
-    /// listing found, so an action reading them in between (an archive
-    /// queueing the UIDs to move) never sees half a listing. The cursor is
-    /// written only in the second part, so a pass cut short after the first
-    /// is done again by the next. A delta that confirms a send is also one
-    /// transaction so the copy and confirmed claim become visible together.
+    /// lands on top of it. A Sent repair reads the current rows in the second
+    /// transaction. Copies change together at the second commit, so an
+    /// action reading them in between (an archive queueing the UIDs to move)
+    /// never sees half a listing. The cursor is written only in the second
+    /// part, so a pass cut short after the first is done again by the next.
+    /// Any other delta is one transaction, including deltas that confirm
+    /// a send so the Sent copy and confirmed claim become visible together.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
-        self.apply_delta_with_send_confirmations(account_id, delta)?;
-        Ok(())
+        self.apply_sync_delta(account_id, delta).map(|_| ())
     }
 
-    pub(crate) fn apply_delta_with_send_confirmations(
+    pub(crate) fn apply_sync_delta(
         &self,
         account_id: &AccountId,
         delta: &MailboxDelta,
-    ) -> Result<Vec<String>> {
+    ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
+        let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
+        let mut new_messages = 0;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -682,9 +688,10 @@ impl Store {
             let Some(message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
-            insert_message(&tx, &message)?;
+            // A combined delta can carry the listing for these messages.
+            new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
         }
-        let inserted = !delta.messages.is_empty();
+        let has_arrivals = !delta.messages.is_empty();
         for message_id in &delta.too_large {
             if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
                 bodies::mark_withheld(&tx, account_id, &canonical)?;
@@ -703,7 +710,7 @@ impl Store {
         let confirmed = crate::compose::confirm_synced_sends(&tx, account_id, delta)?;
         let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT && confirmed.is_empty();
         if split {
-            if inserted {
+            if has_arrivals {
                 self.rethread_written(&tx, account_id)?;
             }
             tx.commit()?;
@@ -713,12 +720,15 @@ impl Store {
             }
             tx = self.begin_sync_write()?;
         }
-        if let Some(found) = &delta.roles {
+        let repaired = if let Some(found) = &delta.roles {
             roles::replace(&tx, account_id, found)?;
-        }
+            sent_echo_repair::on_listing(&tx, account_id, found)?
+        } else {
+            false
+        };
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if (inserted && !split) || took_over || settled {
+        if (has_arrivals && !split) || repaired || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -726,7 +736,16 @@ impl Store {
         }
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(confirmed)
+        Ok(DeltaWrites {
+            new_messages,
+            changed: has_arrivals
+                || !delta.flags.is_empty()
+                || !delta.too_large.is_empty()
+                || repaired
+                || took_over
+                || settled,
+            confirmed_drafts: confirmed,
+        })
     }
 
     /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
@@ -789,7 +808,7 @@ impl Store {
 
     pub fn upsert_message(&self, message: &Message) -> Result<ThreadId> {
         let tx = immediate_transaction(&self.conn)?;
-        insert_message(&tx, message)?;
+        insert_message(&tx, message, &mut MergeRoles::new(None))?;
         self.rethread_written(&tx, &message.account_id)?;
         let thread_id =
             thread_id_for_message_id(&tx, &message.account_id, &message.headers.message_id)?
@@ -1038,7 +1057,8 @@ impl Store {
     /// Store parts fetched again for messages that had none. `None` parts
     /// record that no copy could be fetched, so the backfill stops asking;
     /// a later sync of the message still fills them. Parts already stored
-    /// are kept. Returns how many messages gained a body.
+    /// are kept, with unresolved CID roles refreshed for the upgrade queue.
+    /// Returns how many messages gained a body.
     pub fn store_fetched_parts(
         &self,
         account_id: &AccountId,
@@ -1055,12 +1075,38 @@ impl Store {
                 (message_id, stored)
             })
             .collect();
-        let tx = immediate_transaction(&self.conn)?;
+        // A CID-only answer can require inspecting the kept HTML again.
+        // Snapshot that input before contending for the mailbox write lock.
+        let read = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let repairs = compressed
+            .iter()
+            .map(|(id, parts)| {
+                let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
+                    return Ok(None);
+                };
+                bodies::cid_upgrade::prepare_fetched(
+                    &read,
+                    account_id,
+                    canonical,
+                    parts.mime_parts(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        read.commit()?;
+        let tx = self
+            .lock_wait
+            .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for (message_id, parts) in &compressed {
+        for ((message_id, parts), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
+            if bodies::cid_upgrade::apply_fetched(&tx, account_id, &canonical, repair)? {
+                continue;
+            }
             if parts.has_body() {
                 filled += 1;
             }
@@ -2079,13 +2125,69 @@ fn canonical_id_on(
         .map_err(Into::into)
 }
 
-fn insert_message(conn: &Connection, message: &Message) -> Result<ThreadId> {
-    let thread = insert_arrival(conn, message)?;
-    copies::record(conn, message)?;
-    Ok(thread)
+/// Loaded only when a fingerprint match depends on which folder is Sent.
+/// A sync delta shares one lookup of the recorded roles across its arrivals.
+struct MergeRoles<'a> {
+    listed: Option<Cow<'a, FolderRoles>>,
 }
 
-fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
+impl<'a> MergeRoles<'a> {
+    fn new(listing: Option<&'a FolderRoles>) -> Self {
+        Self {
+            listed: listing.map(Cow::Borrowed),
+        }
+    }
+
+    fn resolve<'b>(
+        &'b mut self,
+        conn: &Connection,
+        message: &Message,
+        fallback: &'b mut Option<FolderRoles>,
+    ) -> Result<&'b FolderRoles> {
+        if self.listed.is_none() {
+            self.listed = Some(Cow::Owned(
+                roles::listed(conn, &message.account_id)?.unwrap_or_default(),
+            ));
+        }
+        if let Some(found) = self.listed.as_deref().filter(|roles| !roles.is_empty()) {
+            return Ok(found);
+        }
+        match fallback {
+            Some(found) => Ok(found),
+            None => {
+                let mut names = summaries::folder_names(conn, &message.account_id)?;
+                // The incoming copy may be the first message seen in this folder.
+                names.extend_from_slice(&message.folders);
+                Ok(fallback.insert(FolderRoles::from_names(&names)))
+            }
+        }
+    }
+}
+
+pub(crate) struct DeltaWrites {
+    pub new_messages: usize,
+    /// The caller should refresh its view of the stored mail.
+    pub changed: bool,
+    pub confirmed_drafts: Vec<String>,
+}
+
+/// Returns whether the arrival made a new row. Every accepted arrival still
+/// records its remote copy, including arrivals folded into a stored row.
+fn insert_message(
+    conn: &Connection,
+    message: &Message,
+    roles: &mut MergeRoles<'_>,
+) -> Result<bool> {
+    let inserted = insert_arrival(conn, message, roles)?;
+    copies::record(conn, message)?;
+    Ok(inserted)
+}
+
+fn insert_arrival(
+    conn: &Connection,
+    message: &Message,
+    roles: &mut MergeRoles<'_>,
+) -> Result<bool> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2098,17 +2200,22 @@ fn insert_arrival(conn: &Connection, message: &Message) -> Result<ThreadId> {
                 &fingerprint,
                 Some(&stored.canonical_id),
                 false,
+                roles,
             )?
         {
-            return absorb_duplicate(conn, message, &stored, &other);
+            absorb_duplicate(conn, message, &stored, &other)?;
+        } else {
+            write_kept(conn, message, &stored, via_alias, &[], &[])?;
         }
-        return write_kept(conn, message, &stored, via_alias, &[], &[]);
+        return Ok(false);
     }
-    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false)? {
+    if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        return write_kept(conn, message, &stored, true, &[], &[]);
+        write_kept(conn, message, &stored, true, &[], &[])?;
+        return Ok(false);
     }
-    insert_new(conn, message, &fingerprint)
+    insert_new(conn, message, &fingerprint)?;
+    Ok(true)
 }
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {
@@ -2637,11 +2744,12 @@ fn find_list_collapse(
     fingerprint: &str,
     exclude: Option<&str>,
     unlabeled_ok: bool,
+    role_lookup: &mut MergeRoles<'_>,
 ) -> Result<Option<Arrival>> {
     if fingerprint.is_empty() {
         return Ok(None);
     }
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {ARRIVAL_COLS}
          FROM messages m
          WHERE m.account_id = ?1 AND m.body_fingerprint = ?2 AND m.body_fingerprint != ''"
@@ -2650,22 +2758,67 @@ fn find_list_collapse(
         params![message.account_id.as_str(), fingerprint],
         map_arrival,
     )?;
-    let mut matches = Vec::new();
+    let incoming_list = list_is_set(&message.list_id);
+    let mut incoming_keys = None;
+    let mut fallback_roles = None;
+    let mut found = None;
     for row in rows {
         let stored = row?;
-        if exclude == Some(stored.canonical_id.as_str()) {
+        let stored_list = list_is_set(&stored.list_id);
+        if exclude == Some(stored.canonical_id.as_str())
+            || (!incoming_list && !stored_list && !unlabeled_ok)
+            || !same_sender(&message.headers.from.email, &stored.from_email)
+            || !dates_within_echo_window(stored.date_unix, message.headers.date_unix)
+            || !proton_compatible(
+                &stored.proton_conversation_id,
+                &message.headers.proton_conversation_id,
+            )
+        {
             continue;
         }
-        if is_fingerprint_echo(message, &stored, unlabeled_ok) {
-            matches.push(stored);
+        let (subject, short) = &*incoming_keys.get_or_insert_with(|| {
+            (
+                subject_key(&message.headers.subject),
+                message
+                    .body_text
+                    .as_deref()
+                    .is_some_and(is_short_reply_body),
+            )
+        });
+        if *subject != subject_key(&stored.subject) {
+            continue;
+        }
+        let short = *short;
+        let same_parent = parents_match(message, &stored);
+        let either_list = incoming_list || stored_list;
+        let both_list = incoming_list && stored_list;
+        if short && (both_list || !same_parent) {
+            continue;
+        }
+        // A long list echo with the same parent already matches. The Sent
+        // role only matters for the remaining plausible Sent/list pairs.
+        let matches = if !short && either_list && same_parent {
+            true
+        } else if !both_list
+            && (either_list
+                || subject_has_list_prefix(&message.headers.subject)
+                || subject_has_list_prefix(&stored.subject))
+        {
+            let roles = role_lookup.resolve(conn, message, &mut fallback_roles)?;
+            sent_list_echo(message, &stored, incoming_list, stored_list, short, roles)
+        } else {
+            false
+        };
+        if matches {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = Some(stored);
         }
     }
-    let Some(only) = matches.pop() else {
+    let Some(only) = found else {
         return Ok(None);
     };
-    if !matches.is_empty() {
-        return Ok(None);
-    }
     // A row that already absorbed another Message-ID is not a unique target.
     // A later message with the same body stays its own row.
     if alias_points_at(conn, &message.account_id, &only.canonical_id)? {
@@ -2802,8 +2955,14 @@ fn merge_backfilled_duplicates(conn: &Connection) -> Result<()> {
             if via_alias || alias_points_at(&tx, &message.account_id, &stored.canonical_id)? {
                 continue;
             }
-            let Some(other) =
-                find_list_collapse(&tx, message, &fingerprint, Some(&stored.canonical_id), true)?
+            let Some(other) = find_list_collapse(
+                &tx,
+                message,
+                &fingerprint,
+                Some(&stored.canonical_id),
+                true,
+                &mut MergeRoles::new(None),
+            )?
             else {
                 continue;
             };
@@ -2941,132 +3100,35 @@ fn alias_points_at(conn: &Connection, account_id: &AccountId, canonical_id: &str
     Ok(hit.is_some())
 }
 
-fn is_fingerprint_echo(incoming: &Message, stored: &Arrival, unlabeled_ok: bool) -> bool {
-    let incoming_list = clean_list_id(&incoming.list_id).is_some();
-    let stored_list = list_is_set(&stored.list_id);
-    // Old rows have no list id. Join those only when one copy is in Sent and
-    // the other subject still has a list tag for the same underlying subject.
-    // Two plain messages with the same body stay apart.
-    let listed =
-        incoming_list || stored_list || (unlabeled_ok && unlabeled_sent_and_list(incoming, stored));
-    if !same_sender(&incoming.headers.from.email, &stored.from_email)
-        || !dates_within_echo_window(stored.date_unix, incoming.headers.date_unix)
-        || !listed
-        || !proton_compatible(
-            &stored.proton_conversation_id,
-            &incoming.headers.proton_conversation_id,
-        )
-    {
-        return false;
-    }
-    // `+1` from the same sender is not one send. A Sent copy and its echo of
-    // that short text still join when they are the same post. A longer body
-    // joins a Sent copy only when the subject key matches.
-    match incoming.body_text.as_deref() {
-        Some(body) if is_short_reply_body(body) => {
-            short_reply_is_one_post(incoming, stored, incoming_list, stored_list)
-        }
-        _ => list_echo_matches(incoming, stored, incoming_list, stored_list),
-    }
-}
-
-/// A short list echo shares the subject and parent with the copy it rewrites.
+/// The non-Sent side is the list copy, and the other side is in Sent.
 ///
-/// Two posts that both carry a list id are two messages. Parents match only
-/// when both name the same `In-Reply-To`, or both omit it. A parent on only
-/// one side is a different reply. A list id on only one copy joins only when
-/// the other copy is in Sent, and that Sent copy joins only when the kept
-/// row is not already in Sent.
-fn short_reply_is_one_post(
+/// A subject tag can identify an old list copy. For short replies with a
+/// known list id, that id must belong to the non-Sent copy.
+fn sent_list_echo(
     incoming: &Message,
     stored: &Arrival,
     incoming_list: bool,
     stored_list: bool,
+    short: bool,
+    roles: &FolderRoles,
 ) -> bool {
-    if incoming_list && stored_list {
-        return false;
-    }
-    if subject_key(&incoming.headers.subject) != subject_key(&stored.subject) {
-        return false;
-    }
-    if !short_parents_match(incoming, stored) {
-        return false;
-    }
     let incoming_sent = incoming
         .folders
         .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
-    let stored_sent = split_field(&stored.folders)
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"));
-    if incoming_sent && stored_sent {
-        return false;
-    }
-    // The copy without a list id is the Sent original. An inbox row that
-    // merely lacks a list id is another post.
-    match (incoming_list, stored_list) {
-        (true, false) => stored_sent,
-        (false, true) => incoming_sent,
-        _ => true,
-    }
-}
-
-/// Both copies name the same parent, or both have none.
-fn short_parents_match(incoming: &Message, stored: &Arrival) -> bool {
-    let stored_parent = stored.in_reply_to.as_deref().filter(|id| !id.is_empty());
-    let incoming_parent = incoming
-        .headers
-        .in_reply_to
-        .as_ref()
-        .map(MessageId::as_str)
-        .filter(|id| !id.is_empty());
-    match (stored_parent, incoming_parent) {
-        (Some(stored_id), Some(incoming_id)) => stored_id == incoming_id,
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-/// A list copy joins a Sent copy when the subject key matches. A different
-/// parent does not block that join. Any other pair must share the subject
-/// key and the same parent (or both omit it).
-fn list_echo_matches(
-    incoming: &Message,
-    stored: &Arrival,
-    incoming_list: bool,
-    stored_list: bool,
-) -> bool {
-    let same_subject = subject_key(&incoming.headers.subject) == subject_key(&stored.subject);
-    if list_copy_joins_sent_copy(incoming, stored, incoming_list, stored_list) {
-        return same_subject;
-    }
-    same_subject && parents_match(incoming, stored)
-}
-
-/// The non-Sent side is the list copy, and the other side is in Sent.
-///
-/// Two rows that both carry a list id are not a send and its echo. A subject
-/// that still wears a list tag counts as a list copy for rows stored before
-/// `list_id`.
-fn list_copy_joins_sent_copy(
-    incoming: &Message,
-    stored: &Arrival,
-    incoming_list: bool,
-    stored_list: bool,
-) -> bool {
-    if incoming_list && stored_list {
-        return false;
-    }
-    let incoming_sent = copy_in_sent(&incoming.folders);
-    let stored_sent = copy_in_sent(&split_field(&stored.folders));
+        .any(|f| roles.is(FolderRole::Sent, f));
+    let stored_sent = stored
+        .folders
+        .split('\u{1e}')
+        .any(|f| roles.is(FolderRole::Sent, f));
     if incoming_sent == stored_sent {
         return false;
     }
-    if stored_sent {
-        incoming_list || subject_has_list_prefix(&incoming.headers.subject)
+    let (listed, subject) = if stored_sent {
+        (incoming_list, incoming.headers.subject.as_str())
     } else {
-        stored_list || subject_has_list_prefix(&stored.subject)
-    }
+        (stored_list, stored.subject.as_str())
+    };
+    listed || (!(short && (incoming_list || stored_list)) && subject_has_list_prefix(subject))
 }
 
 /// Both copies name the same `In-Reply-To`, or both have none.
@@ -3083,27 +3145,6 @@ fn parents_match(incoming: &Message, stored: &Arrival) -> bool {
         (None, None) => true,
         _ => false,
     }
-}
-
-fn copy_in_sent(folders: &[String]) -> bool {
-    folders
-        .iter()
-        .any(|folder| folder.eq_ignore_ascii_case("Sent"))
-}
-
-fn unlabeled_sent_and_list(incoming: &Message, stored: &Arrival) -> bool {
-    let incoming_sent = copy_in_sent(&incoming.folders);
-    let stored_sent = copy_in_sent(&split_field(&stored.folders));
-    if incoming_sent == stored_sent {
-        return false;
-    }
-    let list_subject = if incoming_sent {
-        &stored.subject
-    } else {
-        incoming.headers.subject.as_str()
-    };
-    subject_has_list_prefix(list_subject)
-        && subject_key(&incoming.headers.subject) == subject_key(&stored.subject)
 }
 
 fn subject_has_list_prefix(subject: &str) -> bool {
@@ -4010,6 +4051,7 @@ mod tests {
     use super::*;
     use crate::MailboxDelta;
     use crate::backend::SyncCursor;
+    use crate::folders::ListedMailbox;
 
     fn account() -> Account {
         Account {
@@ -6855,6 +6897,401 @@ mod tests {
         assert!(later.folders.iter().any(|folder| folder == "Sent"));
         assert_eq!(later.remote_id.0, "imap:sent-2");
         assert_ne!(kept.remote_id.0, "imap:sent-2");
+    }
+
+    fn gmail_sent_listing() -> ListedMailbox {
+        ListedMailbox {
+            name: "[Gmail]/Sent Mail".into(),
+            raw: "[Gmail]/Sent Mail".into(),
+            delimiter: Some('/'),
+            attributes: vec!["\\Sent".into()],
+        }
+    }
+
+    #[test]
+    fn short_list_echoes_recognize_sent_folders_in_either_arrival_order() {
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        for (folder, listing) in [
+            ("sEnT", None),
+            ("Sent Items", None),
+            ("INBOX.Sent", None),
+            ("[gmail]/Sent Mail", Some(&gmail_roles)),
+        ] {
+            for sent_first in [true, false] {
+                let store = Store::open_in_memory().unwrap();
+                store.upsert_account(&account()).unwrap();
+                if let Some(roles) = listing {
+                    store
+                        .apply_delta(
+                            &account().id,
+                            &MailboxDelta {
+                                roles: Some(roles.clone()),
+                                ..MailboxDelta::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                let mut sent = msg("sent@x", None, Some("patch@x"), "Re: Patch", "+1");
+                sent.folders = vec![folder.into()];
+                let mut echo = msg("list@x", None, Some("patch@x"), "[list] Re: Patch", "+1");
+                echo.folders = vec!["INBOX".into()];
+                echo.list_id = Some("list.example".into());
+                let (first, second) = if sent_first {
+                    (sent, echo)
+                } else {
+                    (echo, sent)
+                };
+                store.upsert_message(&first).unwrap();
+                store.upsert_message(&second).unwrap();
+
+                let rows = listed(&store);
+                assert_eq!(rows.len(), 1, "{folder}, sent first: {sent_first}");
+                assert_eq!(rows[0].headers.message_id, first.headers.message_id);
+                assert_eq!(
+                    rows[0].folders,
+                    [first.folders[0].clone(), second.folders[0].clone()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_list_echoes_require_exactly_one_copy_in_the_sent_role() {
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        for (original_folder, echo_folder) in [
+            ("Sent", "INBOX"),
+            ("[Gmail]/Sent Mail", "[Gmail]/Sent Mail"),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            store.upsert_account(&account()).unwrap();
+            let mut original = msg("sent@x", None, Some("patch@x"), "Re: Patch", "+1");
+            original.folders = vec![original_folder.into()];
+            let mut echo = msg("list@x", None, Some("patch@x"), "[list] Re: Patch", "+1");
+            echo.folders = vec![echo_folder.into()];
+            echo.list_id = Some("list.example".into());
+            store
+                .apply_delta(
+                    &account().id,
+                    &MailboxDelta {
+                        roles: Some(gmail_roles.clone()),
+                        messages: vec![original, echo],
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(listed(&store).len(), 2, "{original_folder}, {echo_folder}");
+        }
+    }
+
+    #[test]
+    fn long_list_echo_uses_the_sent_override_from_its_delta() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let roles = FolderRoles::detect(
+            &[gmail_sent_listing()],
+            &[(FolderRole::Sent, "Envoyés".into())],
+        );
+        let (mut sent, mut echo) = sent_a_and_list_b();
+        sent.folders = vec!["Envoyés".into()];
+        echo.headers.subject = "[list] Re: Patch".into();
+        store
+            .apply_delta(
+                &account().id,
+                &MailboxDelta {
+                    roles: Some(roles),
+                    messages: vec![sent, echo],
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].headers.message_id.as_str(), "sent-a@x");
+        assert_eq!(rows[0].folders, ["Envoyés", "INBOX"]);
+    }
+
+    #[test]
+    fn backfill_joins_an_unlabeled_list_echo_from_sent_items() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_account(&account()).unwrap();
+        let (mut sent, mut echo) = sent_a_and_list_b();
+        sent.folders = vec!["Sent Items".into()];
+        echo.headers.subject = "[list] Re: Patch".into();
+        echo.list_id = None;
+        store.upsert_message(&sent).unwrap();
+        store.upsert_message(&echo).unwrap();
+        assert_eq!(listed(&store).len(), 2);
+
+        merge_backfilled_duplicates(&store.conn).unwrap();
+
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].folders.contains(&"Sent Items".into()));
+        assert!(rows[0].folders.contains(&"INBOX".into()));
+    }
+
+    fn sent_repair_fixture(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fell-sent-repair-{}-{tag}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        dir.join("mail.sqlite")
+    }
+
+    fn split_sent_pair(tag: &str, folder: &str, uid: u32) -> (Message, Message) {
+        let mut sent = msg(&format!("{tag}-sent@x"), None, Some("patch@x"), tag, "+1");
+        sent.unread = false;
+        sent.folders = vec![folder.into()];
+        sent.remote_id = RemoteId(format!("imap:77:{uid}:{folder}"));
+        let mut echo = msg(
+            &format!("{tag}-echo@x"),
+            None,
+            Some("patch@x"),
+            &format!("[list] {tag}"),
+            "+1",
+        );
+        echo.folders = vec!["INBOX".into()];
+        echo.remote_id = RemoteId(format!("imap:77:{uid}:INBOX"));
+        echo.list_id = Some("list.example".into());
+        (sent, echo)
+    }
+
+    // Write the rows a pre-repair version left behind, with the current
+    // schema and real fingerprint, threading, body and copy records.
+    fn seed_split_messages(store: &Store, messages: &[Message]) {
+        let tx = immediate_transaction(&store.conn).unwrap();
+        for message in messages {
+            insert_new(&tx, message, &message_fingerprint(message)).unwrap();
+            copies::record(&tx, message).unwrap();
+        }
+        store.rethread_written(&tx, &account().id).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn predate_sent_echo_repair(store: &Store) {
+        store
+            .conn
+            .execute("DELETE FROM meta WHERE key = 'sent_echo_repair_v1'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn sent_echo_repair_on_open_preserves_stored_mail_and_runs_once() {
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        for (tag, folder, listing) in [
+            ("alternate", "Sent Items", None),
+            ("nested", "INBOX.Sent", None),
+            ("special-use", "[Gmail]/Sent Mail", Some(&gmail_roles)),
+        ] {
+            let path = sent_repair_fixture(tag);
+            let acct = account();
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&acct).unwrap();
+            if let Some(roles) = listing {
+                roles::replace(&store.conn, &acct.id, roles).unwrap();
+            }
+            let (mut sent, mut echo) = split_sent_pair("Patch", folder, 1);
+            if tag == "nested" {
+                echo.list_id = None;
+            }
+            sent.labels.push("work".into());
+            echo.folders.push("Archive".into());
+            echo.labels.push("list-label".into());
+            echo.starred = true;
+            echo.archived = true;
+            echo.snooze_until = Some(1_893_456_000);
+            let attachment = crate::imap::mime_fixtures::mixed_two_attachments("Patch-echo@x");
+            let parts = crate::imap::parts_from_raw(&attachment.raw);
+            echo.parts = Some(parts.clone());
+            let sent_id = sent.headers.message_id.clone();
+            let echo_id = echo.headers.message_id.clone();
+            let (mut unrelated, mut unrelated_echo) = split_sent_pair("Different", folder, 2);
+            unrelated.headers.subject = "Unrelated subject".into();
+            unrelated_echo.folders = vec!["Lists".into()];
+            let (ambiguous_sent, ambiguous_echo) = split_sent_pair("Ambiguous", folder, 3);
+            let (mut second_send, _) = split_sent_pair("Ambiguous", folder, 4);
+            second_send.headers.message_id = MessageId::new("second-send@x");
+            let (pending_sent, mut pending_echo) = split_sent_pair("Pending", folder, 5);
+            pending_echo.unread = false;
+            let pending_id = pending_echo.headers.message_id.clone();
+            seed_split_messages(
+                &store,
+                &[
+                    sent,
+                    echo,
+                    unrelated,
+                    unrelated_echo,
+                    ambiguous_sent,
+                    ambiguous_echo,
+                    second_send,
+                    pending_sent,
+                    pending_echo,
+                ],
+            );
+            intents::record(
+                &store.conn,
+                &acct.id,
+                pending_id.as_str(),
+                Some(false),
+                None,
+            )
+            .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE message_copies SET modseq = x'0000000000000007', seen = 1, flagged = 1
+                 WHERE account_id = ?1 AND message_id = ?2",
+                    params![acct.id.as_str(), echo_id.as_str()],
+                )
+                .unwrap();
+            assert!(message_row_present(&store, echo_id.as_str()));
+            let version = schema_version(&store.conn).unwrap();
+            predate_sent_echo_repair(&store);
+            drop(store);
+
+            let store = Store::open(&path).unwrap();
+            assert_eq!(schema_version(&store.conn).unwrap(), version);
+            assert!(!message_row_present(&store, echo_id.as_str()));
+            let kept = store.message(&acct.id, &echo_id).unwrap().unwrap();
+            assert_eq!(kept.headers.message_id, sent_id);
+            assert_eq!(kept.folders, [folder, "Archive"]);
+            assert_eq!(kept.labels, ["work", "list-label"]);
+            assert!(kept.unread && kept.starred && kept.archived);
+            assert_eq!(kept.snooze_until, Some(1_893_456_000));
+            assert_eq!(
+                store.message_attachments(&acct.id, &echo_id).unwrap(),
+                Some(parts.mime_parts)
+            );
+            let copy_owner: String = store.conn.query_row(
+                "SELECT message_id FROM message_copies WHERE account_id = ?1 AND mailbox = 'INBOX'
+                   AND uidvalidity = 77 AND uid = 1 AND seen = 1 AND flagged = 1
+                   AND modseq = x'0000000000000007'",
+                [acct.id.as_str()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(copy_owner, sent_id.as_str());
+            assert_eq!(
+                store.stored_uids(&acct.id, folder, 77, (1, 1)).unwrap(),
+                [1]
+            );
+            for id in [
+                "Different-sent@x",
+                "Different-echo@x",
+                "Ambiguous-sent@x",
+                "Ambiguous-echo@x",
+                "second-send@x",
+                pending_id.as_str(),
+            ] {
+                assert!(message_row_present(&store, id), "{id}");
+            }
+            assert_eq!(
+                store.pending_flag_changes(&acct.id).unwrap()[0].unread,
+                Some(false)
+            );
+
+            let (new_sent, new_echo) = split_sent_pair("Later", folder, 6);
+            let new_echo_id = new_echo.headers.message_id.clone();
+            seed_split_messages(&store, &[new_sent, new_echo]);
+            drop(store);
+            let store = Store::open(&path).unwrap();
+            assert!(message_row_present(&store, new_echo_id.as_str()));
+            if listing.is_none() {
+                // A first listing that confirms the name already tried
+                // at open does not rescan that folder.
+                store
+                    .apply_delta(
+                        &acct.id,
+                        &MailboxDelta {
+                            roles: Some(FolderRoles::from_names(&[folder.into()])),
+                            ..MailboxDelta::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(message_row_present(&store, new_echo_id.as_str()));
+            }
+            drop(store);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn sent_echo_repair_waits_for_the_first_applicable_listing() {
+        let path = sent_repair_fixture("listing");
+        let acct = account();
+        let folder = "[Gmail]/Sent Mail";
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&acct).unwrap();
+        let (sent, echo) = split_sent_pair("Patch", folder, 1);
+        let reply = msg(
+            "reply@x",
+            None,
+            Some("Patch-echo@x"),
+            "Re: Patch",
+            "A reply",
+        );
+        seed_split_messages(&store, &[sent, echo, reply]);
+        predate_sent_echo_repair(&store);
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let list = |store: &Store, roles: FolderRoles| {
+            store
+                .apply_delta(
+                    &acct.id,
+                    &MailboxDelta {
+                        roles: Some(roles),
+                        ..MailboxDelta::default()
+                    },
+                )
+                .unwrap();
+        };
+        assert!(message_row_present(&store, "Patch-echo@x"));
+        assert_ne!(
+            store
+                .message(&acct.id, &MessageId::new("Patch-sent@x"))
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            store
+                .message(&acct.id, &MessageId::new("reply@x"))
+                .unwrap()
+                .unwrap()
+                .thread_id,
+        );
+        list(&store, FolderRoles::from_names(&["INBOX".into()]));
+        assert!(message_row_present(&store, "Patch-echo@x"));
+        assert_eq!(
+            store.stored_uids(&acct.id, folder, 77, (1, 1)).unwrap(),
+            [1]
+        );
+        assert_eq!(
+            store.stored_uids(&acct.id, "INBOX", 77, (1, 1)).unwrap(),
+            [1]
+        );
+
+        let gmail_roles = FolderRoles::detect(&[gmail_sent_listing()], &[]);
+        list(&store, gmail_roles.clone());
+        assert!(!message_row_present(&store, "Patch-echo@x"));
+        let repaired = store
+            .message(&acct.id, &MessageId::new("Patch-echo@x"))
+            .unwrap()
+            .unwrap();
+        let reply = store
+            .message(&acct.id, &MessageId::new("reply@x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.headers.message_id.as_str(), "Patch-sent@x");
+        assert_eq!(repaired.folders, [folder, "INBOX"]);
+        assert_eq!(reply.thread_id, repaired.thread_id);
+
+        let (new_sent, new_echo) = split_sent_pair("Later", folder, 2);
+        seed_split_messages(&store, &[new_sent, new_echo]);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        list(&store, gmail_roles);
+        assert!(message_row_present(&store, "Later-echo@x"));
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
