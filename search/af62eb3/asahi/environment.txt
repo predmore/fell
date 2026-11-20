@@ -1,0 +1,3 @@
+Fell af62eb3584d6a930dc5da815e5a2e5647fbb6786 on ARM64.
+The app used only the Vulkan Asahi ICD. Weston 15.0.1 used its GL renderer inside private Xvfb. The X server lacked DRI3, so the compositor rendered with Mesa llvmpipe.
+FrameLog measures key delivery through CPU paint. The runs exclude GPU submission and display presentation. They leave timing on native Hyprland unverified.
