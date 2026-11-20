@@ -375,7 +375,7 @@ impl Inbox {
                 });
             let page = store.folder_page(&account, &folder, &span)?;
             let mut rows = present::thread_rows(&page.threads, &me);
-            if store
+            let drafts = if store
                 .folder_roles(&account)?
                 .is(FolderRole::Drafts, &folder)
             {
@@ -386,15 +386,25 @@ impl Inbox {
                     .collect();
                 let recipients = store.folder_recipients(&account, &folder, &ids)?;
                 present::address_draft_rows(&mut rows, &recipients, &me);
-            }
-            Ok::<_, fell_core::Error>((rows, page, select))
+                store.unsent_compose_drafts(&account)?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, fell_core::Error>((rows, page, drafts, select))
         });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok((rows, page, select))) = reply.await else {
+            let Ok(Ok((threads, page, drafts, select))) = reply.await else {
                 return;
             };
-            let _ = this.update(cx, |inbox, _| {
+            let _ = this.update(cx, |inbox, cx| {
                 if inbox.search_view.folder_revision == revision {
+                    inbox.drafts = inbox.live_drafts(drafts, cx);
+                    let mut rows = if page.more_before {
+                        Vec::new()
+                    } else {
+                        present::draft_rows(&inbox.drafts)
+                    };
+                    rows.extend(threads);
                     inbox
                         .session
                         .refresh_saved_folder(rows, &page, select.as_deref());
@@ -420,7 +430,7 @@ impl Inbox {
             if current.load(Ordering::Relaxed) != generation {
                 return;
             }
-            let response = store.call(move |store| {
+            let response = store.call_search(move |store| {
                 if current.load(Ordering::Relaxed) != generation {
                     return None;
                 }

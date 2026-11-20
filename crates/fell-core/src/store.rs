@@ -1297,8 +1297,9 @@ impl Store {
         crate::search::thread_matches(&self.conn, account, query, thread)
     }
 
-    /// Folders and flags for ranked rows. An explicit folder filter wins,
-    /// then the folder the reader came from, then Inbox or the hit's first folder.
+    /// Folders and flags for ranked rows. An explicit folder filter must
+    /// still match a folder on the hit. With no folder filter, prefer the
+    /// originating folder, then Inbox or the hit's first folder.
     pub fn search_locations(
         &self,
         account: &AccountId,
@@ -5269,6 +5270,36 @@ mod tests {
                 .hits
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn localized_folder_filter_scopes_actions_to_the_stored_name() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.upsert_account(&account).unwrap();
+        let mut message = msg("munich@msg", None, None, "Train", "travel details");
+        message.folders = vec!["INBOX".into(), "München".into()];
+        message.unread = true;
+        let thread = store.upsert_message(&message).unwrap();
+        let query = "in:MÜNCHEN";
+        let hits = store.search(&account.id, query).unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        let locations = || {
+            store
+                .search_locations(&account.id, query, "INBOX", &hits)
+                .unwrap()
+        };
+
+        let before = locations();
+        let scope = &before[&hits[0].message_id];
+        assert_eq!(scope.folder.as_deref(), Some("München"));
+        assert!(scope.unread);
+        store
+            .archive_thread(&account.id, &thread, scope.folder.as_deref().unwrap())
+            .unwrap();
+        let messages = store.thread_messages(&account.id, &thread).unwrap();
+        assert_eq!(messages[0].folders, ["INBOX", "Archive"]);
+        assert_eq!(locations()[&hits[0].message_id].folder, None);
     }
 
     #[test]

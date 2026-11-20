@@ -457,8 +457,7 @@ impl Session {
             .iter()
             .position(|row| Some(&row.id) == saved.cursor.as_ref())
             .unwrap_or(0);
-        saved.rows.retain(|row| row.draft.is_some());
-        saved.rows.extend(threads);
+        saved.rows = threads;
         let present = |id: &str| saved.rows.iter().any(|row| row.id == id);
         saved.cursor = select
             .filter(|id| present(id))
@@ -1028,6 +1027,38 @@ mod tests {
             query_key(r#"subject:"a  b"   hall  "#),
             r#"subject:"a  b" hall"#
         );
+    }
+
+    #[test]
+    fn repeated_folder_refresh_replaces_local_and_synced_draft_rows() {
+        let mut session = session();
+        session.folder = "Drafts".into();
+        let rows = reply(
+            vec![row_hit("draft:local", "local"), row_hit("synced", "remote")],
+            None,
+        )
+        .rows;
+        let [mut local, synced] = <[ThreadRow; 2]>::try_from(rows).unwrap();
+        local.draft = Some("local".into());
+        session.set_threads(vec![local.clone(), synced.clone()]);
+        assert_eq!(session.cursor_id.as_deref(), Some("draft:local"));
+        session.perform(Action::Search, 10);
+
+        let mut restored = local;
+        restored.subject = "Restored draft text".into();
+        let refreshed = vec![restored, synced];
+        let page = fell_core::FolderPage {
+            threads: vec![],
+            more_before: false,
+            more_after: false,
+            unread: 0,
+        };
+        for _ in 0..3 {
+            session.refresh_saved_folder(refreshed.clone(), &page, None);
+        }
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.threads, refreshed);
+        assert_eq!(session.cursor_id.as_deref(), Some("draft:local"));
     }
 
     #[test]

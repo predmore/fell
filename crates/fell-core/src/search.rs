@@ -100,7 +100,14 @@ pub(crate) fn locations(
     roles: &crate::FolderRoles,
     hits: &[SearchHit],
 ) -> Result<HashMap<MessageId, SearchLocation>> {
-    let filters = parse_query(query)?.folders;
+    let filters: Vec<_> = parse_query(query)?
+        .folders
+        .into_iter()
+        .map(|name| {
+            let folded = name.to_lowercase();
+            (name, folded)
+        })
+        .collect();
     let mut locations = HashMap::with_capacity(hits.len());
     for chunk in hits.chunks(128) {
         let marks = std::iter::repeat_n("?", chunk.len())
@@ -124,17 +131,28 @@ pub(crate) fn locations(
             if folders.is_empty() && !row.get::<_, bool>(2)? {
                 folders.push(roles.name(crate::FolderRole::Inbox).to_owned());
             }
-            let folder = filters
-                .iter()
-                .map(String::as_str)
-                .chain([current_folder, roles.name(crate::FolderRole::Inbox)])
-                .find_map(|preferred| {
-                    folders
-                        .iter()
-                        .find(|name| name.eq_ignore_ascii_case(preferred))
+            let folder = if filters.is_empty() {
+                [current_folder, roles.name(crate::FolderRole::Inbox)]
+                    .into_iter()
+                    .find_map(|preferred| {
+                        folders
+                            .iter()
+                            .find(|name| name.eq_ignore_ascii_case(preferred))
+                    })
+                    .or_else(|| folders.first())
+            } else {
+                // The SQL filter compares the stored token exactly or
+                // compares SQLite's ASCII fold to the typed lowercase value.
+                // Use the stored spelling for actions and for the folder key.
+                filters.iter().find_map(|(typed, folded)| {
+                    folders.iter().find(|name| *name == typed).or_else(|| {
+                        folders
+                            .iter()
+                            .find(|name| name.eq_ignore_ascii_case(folded))
+                    })
                 })
-                .or_else(|| folders.first())
-                .cloned();
+            }
+            .cloned();
             let unread_folders = row.get::<_, Option<String>>(5)?.unwrap_or_default();
             let unread = match &folder {
                 Some(folder) => unread_folders
