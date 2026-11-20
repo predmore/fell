@@ -2,13 +2,15 @@
 //! text, through the same document model the conversation renderer uses.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv6Addr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fell_core::compose::{
-    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyledDoc, html_to_doc,
-    line_styles, markdown_to_doc,
+    BlockBody, DraftHub, HunkKind, SendLock, Snapshot, StyleKind, StyleSpan, StyledDoc,
+    html_to_doc, line_styles, markdown_to_doc,
 };
 use fell_core::{AccountId, MailBackend};
 use gpui::{
@@ -1034,6 +1036,25 @@ impl ComposeView {
         }
     }
 
+    fn place_link_cursor(&mut self, row: usize, line: &str, col: usize, cx: &mut Context<Self>) {
+        if self.field != Field::Body
+            || self.preview
+            || self.palette.is_some()
+            || self.leader
+            || self.editor.row != row
+            || !self.pull_if_stale()
+            || self.editor.lines.get(self.editor.row).map(String::as_str) != Some(line)
+        {
+            return;
+        }
+        self.editor.col = col.min(line.chars().count());
+        self.editor.preferred = self.editor.col;
+        self.editor.count = 0;
+        self.bracket = None;
+        self.touched = true;
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.touched = true;
@@ -1602,7 +1623,7 @@ impl Render for ComposeView {
                         self.fields_view(&snap, colors, wide, window, &ui_family)
                             .flex_shrink_0(),
                     )
-                    .child(self.body_view(&snap, colors, window, &ui_family))
+                    .child(self.body_view(&snap, colors, window, &ui_family, cx))
                     .children(
                         self.quote_view(&snap, colors)
                             .map(|quote| quote.flex_shrink_0()),
@@ -1764,6 +1785,7 @@ impl ComposeView {
         colors: Palette,
         window: &Window,
         family: &str,
+        cx: &Context<Self>,
     ) -> gpui::Div {
         // Room for an agent edit's "was" text: the body, less its padding,
         // the "was" label and its gap, and a margin for the shaped width
@@ -1771,6 +1793,13 @@ impl ComposeView {
         let measure = |text: &str| text_px(window, text, 16.0, family);
         let was_room = f32::from(window.viewport_size().width) - 40.0 - measure("was") - 8.0 - 8.0;
         let was_lines = |text: &str| break_lines(text, was_room, &measure);
+        let paint = SourcePaint {
+            colors,
+            font: gpui::font(if self.raw { "monospace" } else { family }.to_owned()),
+            view: cx.weak_entity(),
+            row: self.editor.row,
+            window,
+        };
         let body = div()
             .id("compose-body")
             .flex_1()
@@ -1779,7 +1808,7 @@ impl ComposeView {
             .px_5()
             .py_2()
             .child(if self.raw {
-                raw_body(&self.editor, colors)
+                raw_body(&self.editor, &paint)
             } else {
                 styled_body(
                     &self.editor,
@@ -1787,7 +1816,7 @@ impl ComposeView {
                     &body_edit_ranges(snap),
                     self.focused_hunk,
                     draft_links(snap),
-                    colors,
+                    &paint,
                     &was_lines,
                 )
             });
@@ -2873,7 +2902,7 @@ fn styled_body(
     hunks: &[(usize, usize, String, u64)],
     focused: Option<u64>,
     links: Links,
-    colors: Palette,
+    paint: &SourcePaint,
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
     let text = editor.text();
@@ -2891,7 +2920,7 @@ fn styled_body(
     };
     for (index, item) in items.into_iter().enumerate() {
         let (body, mut painted) = match item {
-            BodyItem::CaretRow => (None, cursor_line_row(editor, colors)),
+            BodyItem::CaretRow => (None, cursor_line_row(editor, paint)),
             BodyItem::Block { index, raw } => {
                 let block = &doc.blocks[index];
                 let edits: Vec<&(usize, usize, String, u64)> = block
@@ -2907,10 +2936,10 @@ fn styled_body(
                     .unwrap_or_default();
                 let painted = if raw || !edits.is_empty() {
                     raw_source_block(
-                        block, &text, editor, &edits, focused, links, colors, was_lines,
+                        block, &text, editor, &edits, focused, links, paint, was_lines,
                     )
                 } else {
-                    render_block(block, folder, Paint::compose(links), colors)
+                    render_block(block, folder, Paint::compose(links), paint.colors)
                 };
                 // A block in source form spaces like text, not like an image.
                 ((!raw && edits.is_empty()).then_some(&block.body), painted)
@@ -2985,7 +3014,7 @@ fn cursor_line_covered(text: &str, row: usize, doc: &StyledDoc) -> bool {
     })
 }
 
-fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
+fn cursor_line_row(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let line = editor
         .lines
         .get(editor.row)
@@ -2994,26 +3023,24 @@ fn cursor_line_row(editor: &Editor, colors: Palette) -> gpui::Div {
     raw_line(
         line,
         Some(editor.col),
-        true,
         Urls::Source,
         editor.mode,
         false,
-        colors,
+        paint,
     )
 }
 
-fn raw_body(editor: &Editor, colors: Palette) -> gpui::Div {
+fn raw_body(editor: &Editor, paint: &SourcePaint) -> gpui::Div {
     let mut column = div().flex().flex_col().font_family("monospace");
     for (index, line) in editor.lines.iter().enumerate() {
         let cursor = !editor.caret_hidden && index == editor.row;
         column = column.child(raw_line(
             line,
             cursor.then_some(editor.col),
-            true,
             Urls::Source,
             editor.mode,
             false,
-            colors,
+            paint,
         ));
     }
     column
@@ -3027,9 +3054,10 @@ fn raw_source_block(
     edits: &[&(usize, usize, String, u64)],
     focused: Option<u64>,
     links: Links,
-    colors: Palette,
+    paint: &SourcePaint,
     was_lines: &dyn Fn(&str) -> Vec<String>,
 ) -> gpui::Div {
+    let colors = paint.colors;
     let Some((start, end)) = block.source else {
         return render_block(block, Path::new(""), Paint::compose(links), colors);
     };
@@ -3063,15 +3091,7 @@ fn raw_source_block(
             (None, true) => Urls::Bare,
             (None, false) => Urls::Fold(links),
         };
-        let painted = raw_line(
-            line,
-            cursor,
-            cursor.is_some(),
-            urls,
-            editor.mode,
-            tinted,
-            colors,
-        );
+        let painted = raw_line(line, cursor, urls, editor.mode, tinted, paint);
         if !tinted {
             if let Some((block, _)) = tint.take() {
                 column = column.child(block);
@@ -3199,17 +3219,32 @@ fn span_href(span: &str) -> Option<&str> {
     (!href.is_empty()).then_some(href)
 }
 
+struct SourcePaint<'a> {
+    colors: Palette,
+    font: gpui::Font,
+    view: gpui::WeakEntity<ComposeView>,
+    row: usize,
+    window: &'a Window,
+}
+
 /// One source line. On an agent edit's `tinted` background, a link's URL
 /// and where it goes take the body colour, so they keep AA there.
 fn raw_line(
     line: &str,
     cursor: Option<usize>,
-    show_markers: bool,
     urls: Urls,
     mode: Mode,
     tinted: bool,
-    colors: Palette,
+    paint: &SourcePaint,
 ) -> gpui::Div {
+    if let Some(col) = cursor
+        && line.contains("](")
+    {
+        let styles = line_styles(line);
+        if has_source_link(line, &styles) {
+            return focused_link_line(line, &styles, col, mode, tinted, paint);
+        }
+    }
     let row = div()
         .flex()
         .flex_row()
@@ -3217,7 +3252,367 @@ fn raw_line(
         .w_full()
         .min_h(px(24.))
         .items_center();
-    source_pieces(line, cursor, show_markers, urls, mode, tinted, colors).into_row(row, colors)
+    let colors = paint.colors;
+    source_pieces(
+        line,
+        cursor,
+        urls == Urls::Source,
+        urls,
+        mode,
+        tinted,
+        colors,
+    )
+    .into_row(row, colors)
+}
+
+fn has_source_link(line: &str, styles: &[StyleSpan]) -> bool {
+    styles.iter().enumerate().any(|(index, span)| {
+        span.kind == StyleKind::LinkUrl
+            && styles[..index]
+                .iter()
+                .rev()
+                .find(|span| span.kind != StyleKind::LinkText)
+                .is_some_and(|span| {
+                    span.kind == StyleKind::Marker && &line[span.start..span.end] == "["
+                })
+    })
+}
+
+struct FocusedLinkText {
+    text: String,
+    runs: Vec<gpui::TextRun>,
+    /// Display byte ranges with no counterpart in the Markdown.
+    notes: Vec<Range<usize>>,
+    insert_caret: Option<usize>,
+}
+
+fn focused_link_text(
+    line: &str,
+    styles: &[StyleSpan],
+    col: usize,
+    mode: Mode,
+    tinted: bool,
+    font: &gpui::Font,
+    colors: Palette,
+) -> FocusedLinkText {
+    let quiet = if tinted { colors.fg } else { colors.muted };
+    let cursor = source_cursor_byte(line, Some(col), mode).unwrap_or(line.len());
+    let mut text = String::with_capacity(line.len());
+    let mut runs = Vec::new();
+    let mut notes = Vec::new();
+    let mut insert_caret = (mode == Mode::Insert).then_some(cursor);
+    for span in styles {
+        let slice = &line[span.start..span.end];
+        text.push_str(slice);
+        // The closing label bracket takes the same color as the opening one.
+        let close =
+            span.start + usize::from(span.kind == StyleKind::LinkUrl && slice.starts_with(']'));
+        for (range, kind) in [
+            (span.start..close, StyleKind::Marker),
+            (close..span.end, span.kind),
+        ] {
+            if range.is_empty() {
+                continue;
+            }
+            let mut font = font.clone();
+            match kind {
+                StyleKind::Strong => font.weight = FontWeight(700.),
+                StyleKind::Em => font.style = gpui::FontStyle::Italic,
+                StyleKind::Code => font.family = "monospace".into(),
+                _ => {}
+            }
+            let run = gpui::TextRun {
+                len: range.len(),
+                font,
+                color: rgb(source_color(kind, quiet, colors)).into(),
+                background_color: (kind == StyleKind::Code).then(|| rgb(colors.code).into()),
+                underline: (kind == StyleKind::LinkText).then_some(gpui::UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                strikethrough: None,
+            };
+            if mode != Mode::Insert && range.contains(&cursor) {
+                let glyph_len = line[cursor..].chars().next().map_or(0, char::len_utf8);
+                runs.extend([
+                    gpui::TextRun {
+                        len: cursor - range.start,
+                        ..run.clone()
+                    },
+                    gpui::TextRun {
+                        len: glyph_len,
+                        color: rgb(colors.bg).into(),
+                        background_color: Some(rgb(colors.caret).into()),
+                        ..run.clone()
+                    },
+                    gpui::TextRun {
+                        len: range.end - cursor - glyph_len,
+                        ..run
+                    },
+                ]);
+            } else {
+                runs.push(run);
+            }
+        }
+        if span.kind == StyleKind::LinkUrl
+            && let Some(note) = url_note("", slice, Urls::Source)
+        {
+            let start = text.len();
+            text.push(' ');
+            text.push_str(&display_safe(&note));
+            let len = text.len() - start;
+            notes.push(start..text.len());
+            runs.push(gpui::TextRun {
+                len,
+                font: font.clone(),
+                color: rgb(quiet).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            if cursor >= span.end
+                && let Some(at) = &mut insert_caret
+            {
+                *at += len;
+            }
+        }
+    }
+    FocusedLinkText {
+        text,
+        runs,
+        notes,
+        insert_caret,
+    }
+}
+
+fn source_col(line: &str, notes: &[Range<usize>], display_byte: usize) -> usize {
+    let added: usize = notes
+        .iter()
+        .take_while(|note| note.start < display_byte)
+        .map(|note| note.end.min(display_byte) - note.start)
+        .sum();
+    line[..(display_byte - added).min(line.len())]
+        .chars()
+        .count()
+}
+
+/// Pick soft breaks from the shaped advances. Prefer a nearby separator,
+/// but use the available space when a URL segment stretches past the edge.
+fn focused_link_breaks(
+    text: &str,
+    shaped: &gpui::WrappedLine,
+    width: gpui::Pixels,
+) -> Option<Vec<usize>> {
+    let mut stops: Vec<_> = shaped
+        .runs()
+        .iter()
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(|glyph| (glyph.index, glyph.position.x))
+        })
+        .collect();
+    if !stops.iter().map(|(byte, _)| byte).is_sorted() || !stops.iter().map(|(_, x)| x).is_sorted()
+    {
+        // Let the platform wrap text whose glyphs reordered for bidi.
+        return None;
+    }
+    stops.dedup_by_key(|(byte, _)| *byte);
+    stops.push((text.len(), shaped.unwrapped_layout.width));
+    let mut breaks = Vec::new();
+    let mut start = 0;
+    while start + 1 < stops.len() {
+        let limit = stops[start].1 + width;
+        let fit = (stops
+            .partition_point(|(_, x)| *x <= limit)
+            .saturating_sub(1))
+        .max(start + 1);
+        if fit + 1 == stops.len() {
+            break;
+        }
+        let near_edge = limit - width / 4.;
+        let next = (start + 1..=fit)
+            .rev()
+            .take_while(|&index| stops[index].1 >= near_edge)
+            .find(|&index| {
+                let at = stops[index].0;
+                text[..at].ends_with([' ', '-', '.', '?', '&', '=', '#'])
+                    || text[..at].ends_with([':', '/']) && !text[at..].starts_with('/')
+            })
+            .unwrap_or(fit);
+        breaks.push(stops[next].0);
+        start = next;
+    }
+    Some(breaks)
+}
+
+/// Materialize visual rows for GPUI while keeping their break bytes out of
+/// the editor's source coordinates. Each inserted newline belongs to the
+/// preceding text run.
+fn wrap_focused_link(
+    text: &str,
+    runs: Vec<gpui::TextRun>,
+    breaks: &[usize],
+) -> (String, Vec<gpui::TextRun>, Vec<usize>) {
+    let mut wrapped = String::with_capacity(text.len() + breaks.len());
+    let mut wrapped_runs = Vec::new();
+    let mut newlines = Vec::with_capacity(breaks.len());
+    let mut breaks = breaks.iter().copied().peekable();
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        while let Some(&at) = breaks.peek().filter(|&&at| at <= end) {
+            wrapped.push_str(&text[start..at]);
+            newlines.push(wrapped.len());
+            wrapped.push('\n');
+            wrapped_runs.push(gpui::TextRun {
+                len: at - start + 1,
+                ..run.clone()
+            });
+            breaks.next();
+            start = at;
+        }
+        if end > start {
+            wrapped.push_str(&text[start..end]);
+            wrapped_runs.push(gpui::TextRun {
+                len: end - start,
+                ..run
+            });
+        }
+        start = end;
+    }
+    (wrapped, wrapped_runs, newlines)
+}
+
+/// Shape the whole source line so style and caret boundaries cannot split
+/// it into flex columns. The same layout supplies the click and caret positions.
+fn focused_link_line(
+    line: &str,
+    styles: &[StyleSpan],
+    col: usize,
+    mode: Mode,
+    tinted: bool,
+    paint: &SourcePaint,
+) -> gpui::Div {
+    let FocusedLinkText {
+        text,
+        runs,
+        notes,
+        mut insert_caret,
+    } = focused_link_text(line, styles, col, mode, tinted, &paint.font, paint.colors);
+    // The compose body fills the window, less its two px_5 gutters.
+    let width = (paint.window.viewport_size().width - paint.window.rem_size() * 2.5).max(px(1.));
+    let breaks = paint
+        .window
+        .text_system()
+        .shape_text(text.clone().into(), px(16.), &runs, None, None)
+        .ok()
+        .and_then(|lines| focused_link_breaks(&text, lines.first()?, width));
+    let flat_wrap = breaks.is_some();
+    let (text, runs, newlines) = match breaks {
+        Some(breaks) if !breaks.is_empty() => {
+            if let Some(at) = &mut insert_caret {
+                *at += breaks.partition_point(|break_at| *break_at <= *at);
+            }
+            wrap_focused_link(&text, runs, &breaks)
+        }
+        _ => (text, runs, Vec::new()),
+    };
+    let text = gpui::StyledText::new(text).with_runs(runs);
+    let layout = text.layout().clone();
+    let click_layout = layout.clone();
+    let view = paint.view.clone();
+    let row = paint.row;
+    let line = line.to_owned();
+    let caret_color = paint.colors.caret;
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .w_full()
+        .min_w(px(0.))
+        .min_h(px(24.))
+        .cursor_text()
+        .when(flat_wrap, |row| row.whitespace_nowrap())
+        .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
+            let mut position = event.position - click_layout.bounds().origin;
+            let height = click_layout.line_height();
+            let row_start = if flat_wrap {
+                let visual_row = (position.y / height) as usize;
+                position.y = px(0.);
+                if visual_row == 0 {
+                    0
+                } else {
+                    let Some(start) = newlines.get(visual_row - 1) else {
+                        return;
+                    };
+                    start + 1
+                }
+            } else {
+                0
+            };
+            let Some(shaped) = click_layout.line_layout_for_index(row_start) else {
+                return;
+            };
+            let index = if mode == Mode::Insert {
+                shaped.closest_index_for_position(position, height)
+            } else {
+                shaped.index_for_position(position, height)
+            };
+            let byte = row_start + index.unwrap_or_else(|end| end);
+            let byte = byte - newlines.partition_point(|newline| *newline < byte);
+            let col = source_col(&line, &notes, byte);
+            let _ = view.update(cx, |this, cx| this.place_link_cursor(row, &line, col, cx));
+        })
+        .child(text)
+        .children(insert_caret.map(|at| {
+            gpui::canvas(
+                |_, _, _| (),
+                move |_, (), window, _| {
+                    let Some(mut position) = layout.position_for_index(at) else {
+                        return;
+                    };
+                    let line_height = layout.line_height();
+                    // GPUI assigns the wrap boundary to the preceding row.
+                    // Draw before the next character on the continuation instead.
+                    if !flat_wrap
+                        && let Some(shaped) = layout.line_layout_for_index(at)
+                        && shaped.wrap_boundaries().iter().any(|wrap| {
+                            shaped.runs()[wrap.run_ix].glyphs[wrap.glyph_ix].index == at
+                        })
+                    {
+                        position.x = layout.bounds().left();
+                        position.y += line_height;
+                    }
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds::new(position, gpui::size(px(2.), line_height)),
+                        rgb(caret_color),
+                    ));
+                },
+            )
+            .absolute()
+            .inset_0()
+        }))
+}
+
+fn source_cursor_byte(line: &str, cursor: Option<usize>, mode: Mode) -> Option<usize> {
+    cursor.map(|col| {
+        let col = if mode == Mode::Insert {
+            col
+        } else {
+            col.min(line.chars().count().saturating_sub(1))
+        };
+        byte_index(line, col)
+    })
+}
+
+fn source_color(kind: StyleKind, quiet: u32, colors: Palette) -> u32 {
+    match kind {
+        StyleKind::Marker => colors.marker,
+        StyleKind::LinkUrl => quiet,
+        StyleKind::LinkText => colors.accent,
+        _ => colors.fg,
+    }
 }
 
 /// What a source line shows, piece by piece.
@@ -3231,12 +3626,6 @@ fn source_pieces(
     colors: Palette,
 ) -> Pieces {
     let quiet = if tinted { colors.fg } else { colors.muted };
-    let line_chars = line.chars().count();
-    let cursor = match (mode, cursor) {
-        (Mode::Insert, col) => col,
-        (_, Some(col)) if line_chars > 0 && col >= line_chars => Some(line_chars - 1),
-        (_, col) => col,
-    };
     let styles = line_styles(line);
     if styles.is_empty() {
         let mut pieces = Pieces::default();
@@ -3245,7 +3634,7 @@ fn source_pieces(
         }
         return pieces;
     }
-    let cursor_byte = cursor.map(|col| byte_index(line, col));
+    let cursor_byte = source_cursor_byte(line, cursor, mode);
     let mut pieces = Pieces::default();
     let mut label = "";
     for span in styles {
@@ -3308,12 +3697,7 @@ fn source_pieces(
                 span.kind,
             );
         } else {
-            let color = match span.kind {
-                StyleKind::Marker => colors.marker,
-                StyleKind::LinkUrl => quiet,
-                StyleKind::LinkText => colors.accent,
-                _ => colors.fg,
-            };
+            let color = source_color(span.kind, quiet, colors);
             source.paint(
                 &mut pieces,
                 (span_start, span_end),
@@ -4664,12 +5048,18 @@ fn shown_target(text: &str, href: &str, links: Links) -> Option<String> {
     if href.is_empty() {
         return None;
     }
-    let host = || Some(format!("({})", link_host(href)));
     match links {
         Links::Target => link_target(text, href),
-        _ if idn_place(href).is_some() || label_misleads(text, href) => host(),
-        Links::Host if !label_names(text, href) => host(),
-        Links::Host | Links::Label => None,
+        Links::Host | Links::Label => {
+            let mut places = text
+                .split_whitespace()
+                .filter_map(|word| place_of_word(word, links))
+                .peekable();
+            (idn_place(href).is_some()
+                || (links == Links::Host && places.peek().is_none())
+                || label_misleads(places, href))
+            .then(|| format!("({})", link_host(href)))
+        }
     }
 }
 
@@ -4798,12 +5188,19 @@ fn place_of_href(href: &str) -> Option<Place> {
 }
 
 /// The place one word of a label reads as, if it reads as one at all:
-/// a scheme (`https://…`), a `www.`, an address with `@`, or a dotted name
-/// ending in letters (`bank.com`, not `v1.2` or `e.g.`).
-fn place_of_word(word: &str) -> Option<Place> {
-    let word = word.trim_matches(|ch: char| {
-        !(ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~'))
-    });
+/// a scheme (`https://…`), an address with `@`, or a dotted name ending
+/// in letters. In the user's draft a bare IP can also name a host.
+fn place_of_word(word: &str, links: Links) -> Option<Place> {
+    let word_char =
+        |ch: char| ch.is_alphanumeric() || matches!(ch, '/' | '-' | '_' | '@' | ':' | '%' | '~');
+    if links == Links::Label {
+        // Keep IPv6 brackets long enough to distinguish an optional port.
+        let literal = word.trim_matches(|ch| !(word_char(ch) || matches!(ch, '[' | ']')));
+        if let Some(host) = literal_ip_host(literal) {
+            return Some(Place::Host(host));
+        }
+    }
+    let word = word.trim_matches(|ch| !word_char(ch));
     let lower = word.to_lowercase();
     let lower = lower.strip_prefix("mailto:").unwrap_or(&lower);
     if lower.contains("://") {
@@ -4821,16 +5218,57 @@ fn place_of_word(word: &str) -> Option<Place> {
         });
     }
     let name = lower.split(['/', '?', '#']).next()?;
-    let name = name.rsplit_once(':').map_or(name, |(host, port)| {
+    let name = without_port(name);
+    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    ascii_host(dotted_name(name)?).map(Place::Host)
+}
+
+fn without_port(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(host, port)| {
         if port.chars().all(|ch| ch.is_ascii_digit()) {
             host
         } else {
             name
         }
-    });
-    // `paypal.com./login` names paypal.com: the root's dot is no part of it.
-    let name = name.strip_suffix('.').unwrap_or(name);
-    ascii_host(dotted_name(name)?).map(Place::Host)
+    })
+}
+
+/// A bare IP in the same form as a URL host.
+fn literal_ip_host(word: &str) -> Option<String> {
+    let name = word.split(['/', '?', '#']).next()?;
+    // For IPv6 without brackets, every colon belongs to the address.
+    if let Ok(ip) = name.parse::<Ipv6Addr>() {
+        return Some(url::Host::<String>::Ipv6(ip).to_string());
+    }
+    let name = without_port(name);
+    if !name.starts_with('[')
+        && !name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_numeric() || ch == '%')
+    {
+        return None;
+    }
+    match url::Host::parse(name).ok()? {
+        url::Host::Ipv4(ip) => {
+            let label = name.strip_suffix('.').unwrap_or(name);
+            let mut fields = label.rsplit('.');
+            let tail = fields.next()?;
+            // A short decimal or version label is ordinary text. Retain
+            // shorthand when the last field actually packs multiple octets,
+            // and let the URL parser normalize hexadecimal and escapes.
+            let ordinary_number = label.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && match fields.count() {
+                    0 => ip.octets()[0] == 0,
+                    1 | 2 => tail.parse::<u8>().is_ok(),
+                    _ => false,
+                };
+            (!ordinary_number).then(|| ip.to_string())
+        }
+        ip @ url::Host::Ipv6(_) => Some(ip.to_string()),
+        url::Host::Domain(_) => None,
+    }
 }
 
 /// `name` when it reads as a domain: two or more dotted parts, the last
@@ -4843,30 +5281,15 @@ fn dotted_name(name: &str) -> Option<&str> {
     (parts.len() >= 2 && parts.iter().all(|part| !part.is_empty()) && letters).then_some(name)
 }
 
-/// The places a label's words read as.
-fn label_places(text: &str) -> Vec<Place> {
-    text.split_whitespace().filter_map(place_of_word).collect()
-}
-
 /// Whether a word of the label reads as an address that is not where the
 /// link goes: "Sign in at paypal.com" to another host.
-fn label_misleads(text: &str, href: &str) -> bool {
+fn label_misleads(mut places: impl Iterator<Item = Place>, href: &str) -> bool {
     let target = place_of_href(href);
-    label_places(text)
-        .iter()
-        .any(|place| match (&target, place) {
-            (None, _) => true,
-            (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => {
-                address != word
-            }
-            (Some(target), place) => target.domain() != place.domain(),
-        })
-}
-
-/// Whether the label already names where the link goes.
-fn label_names(text: &str, href: &str) -> bool {
-    let places = label_places(text);
-    !places.is_empty() && !label_misleads(text, href)
+    places.any(|place| match (&target, &place) {
+        (None, _) => true,
+        (Some(Place::Mail { address, .. }), Place::Mail { address: word, .. }) => address != word,
+        (Some(target), place) => target.domain() != place.domain(),
+    })
 }
 
 fn canonical_body(body: &str) -> String {
@@ -5687,6 +6110,82 @@ mod tests {
     }
 
     #[test]
+    fn focused_link_offsets_skip_idn_notes_and_keep_utf8_source_order() {
+        use super::{
+            Mode, ThemeKind, focused_link_text, has_source_link, source_col, wrap_focused_link,
+        };
+
+        let line = "[café](https://bücher.test/) and [2001:db8::7](https://[2001:db8::8]/révision)";
+        let styles = super::line_styles(line);
+        let colors = super::palette(ThemeKind::Dark);
+        let font = gpui::font("Liberation Sans");
+        let at = line.find("évision").unwrap();
+        let col = line[..at].chars().count();
+        assert!(has_source_link(line, &styles));
+        let image = "![preview](attachment.png)";
+        assert!(!has_source_link(image, &super::line_styles(image)));
+
+        let inserted = focused_link_text(line, &styles, col, Mode::Insert, false, &font, colors);
+        assert_eq!(inserted.notes.len(), 1);
+        let note = &inserted.notes[0];
+        assert_eq!(&inserted.text[note.clone()], " (xn--bcher-kva.test)");
+        for (display_byte, _) in inserted.text.char_indices() {
+            let source_byte =
+                display_byte - (display_byte.clamp(note.start, note.end) - note.start);
+            assert_eq!(
+                source_col(line, &inserted.notes, display_byte),
+                line[..source_byte].chars().count()
+            );
+        }
+        let display_at = inserted.insert_caret.unwrap();
+        assert_eq!(display_at, at + note.len());
+        assert_eq!(source_col(line, &inserted.notes, display_at), col);
+        assert_eq!(
+            source_col(line, &inserted.notes, inserted.text.len()),
+            line.chars().count()
+        );
+        let end = Some(line.chars().count());
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Normal),
+            Some(line.len() - 1)
+        );
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Insert),
+            Some(line.len())
+        );
+
+        let (wrapped, runs, newlines) =
+            wrap_focused_link(&inserted.text, inserted.runs, &[note.start + 5, display_at]);
+        assert_eq!(wrapped.replace('\n', ""), inserted.text);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), wrapped.len());
+        let wrapped_at = newlines[1] + 1;
+        assert!(wrapped[wrapped_at..].starts_with('é'));
+        assert_eq!(
+            source_col(line, &inserted.notes, wrapped_at - newlines.len()),
+            col
+        );
+
+        let normal = focused_link_text(line, &styles, col, Mode::Normal, false, &font, colors);
+        assert_eq!(normal.text, inserted.text);
+        let mut start = 0;
+        let mut highlighted = false;
+        for run in normal.runs {
+            let end = start + run.len;
+            let glyphs = &normal.text[start..end];
+            if run.background_color.is_some() {
+                assert!(!highlighted);
+                highlighted = true;
+                assert_eq!(start, display_at);
+                assert_eq!(glyphs, "é");
+                assert_eq!(run.background_color, Some(gpui::rgb(colors.caret).into()));
+            }
+            start = end;
+        }
+        assert!(highlighted);
+        assert_eq!(start, normal.text.len());
+    }
+
+    #[test]
     fn a_row_breaks_only_after_a_space() {
         fn cut(text: &str) -> Vec<&str> {
             super::words(text).collect()
@@ -5889,6 +6388,98 @@ mod tests {
             shown_target("the plan", "https://example.com/plan", Links::Target).as_deref(),
             Some("(https://example.com/plan)")
         );
+    }
+
+    #[test]
+    fn folded_ip_links_show_a_different_destination() {
+        use super::{Links, Urls, inline_pieces, palette};
+        let colors = palette(super::ThemeKind::Dark);
+        for (label, href, host) in [
+            ("192.0.2.7", "https://docs.example/notes", "docs.example"),
+            (
+                "2001:db8::7",
+                "https://[2001:db8::8]/notes",
+                "[2001:db8::8]",
+            ),
+        ] {
+            let line = format!("[{label}]({href})");
+            let expected = format!("{label} ({host})");
+            assert_eq!(shown(&line, false, Urls::Fold(Links::Label)), expected);
+            assert_eq!(shown(&line, true, Urls::Source), line);
+            let doc = markdown_to_doc(&line);
+            let super::BlockBody::Paragraph { inlines } = &doc.blocks[0].body else {
+                panic!("expected a paragraph");
+            };
+            let styled: String = inline_pieces(inlines, Links::Label, colors)
+                .0
+                .iter()
+                .map(piece_text)
+                .collect();
+            assert_eq!(styled, expected);
+        }
+    }
+
+    #[test]
+    fn literal_ip_labels_use_the_same_host_normalization_as_urls() {
+        use super::{Links, shown_target};
+        for (label, href, host) in [
+            (
+                "See 192.000.002.007.:8443/notes",
+                "https://192.0.2.7/",
+                "192.0.2.7",
+            ),
+            (
+                "2001:0DB8:0:0:0:0:0:7",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "See ([2001:DB8::7]:8443/notes).",
+                "https://[2001:db8::7]/",
+                "[2001:db8::7]",
+            ),
+            (
+                "::ffff:192.0.2.7",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+            (
+                "[::ffff:192.0.2.7]",
+                "https://[::ffff:c000:207]/",
+                "[::ffff:c000:207]",
+            ),
+            ("192%2e0%2e2%2e7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192%2e0.2.7", "https://192.0.2.7/", "192.0.2.7"),
+            ("192.0.519", "https://192.0.2.7/", "192.0.2.7"),
+            ("3221225991", "https://192.0.2.7/", "192.0.2.7"),
+            ("0xc0000207", "https://192.0.2.7/", "192.0.2.7"),
+        ] {
+            assert_eq!(shown_target(label, href, Links::Label), None, "{label}");
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label).as_deref(),
+                Some("(docs.example)"),
+                "{label}"
+            );
+            assert_eq!(
+                shown_target(label, href, Links::Host),
+                Some(format!("({host})")),
+                "{label}"
+            );
+        }
+        for label in [
+            "3.5 stars",
+            "42 results",
+            "1.2.3 notes",
+            "v1.2.3.4 notes",
+            "192.0.2.999",
+            "2001:db8:7",
+        ] {
+            assert_eq!(
+                shown_target(label, "https://docs.example/", Links::Label),
+                None,
+                "{label}"
+            );
+        }
     }
 
     #[test]
