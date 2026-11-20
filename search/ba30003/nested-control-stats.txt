@@ -1,0 +1,26 @@
+nested-control/perf/frames.jsonl
+  0 completed work intervals, 200 key frames
+ all keys (n=200)
+  Key handler to end of paint: p50 26.565 ms, p95 51.930 ms, max 59.538 ms, 133/200 over 8 ms
+  Frame build/layout/paint wall time: p50 13.640 ms, p95 30.656 ms, max 40.553 ms
+  Wait before render: p50 8.595 ms, p95 26.141 ms, max 33.535 ms
+  Frame UI-thread CPU: p50 13.483 ms, p95 28.007 ms, max 33.629 ms
+  Keys {'j': 100, 'k': 100}
+ keys during query work (n=0)
+  Key handler to end of paint: no samples
+  Frame build/layout/paint wall time: no samples
+  Wait before render: no samples
+  Frame UI-thread CPU: no samples
+  Keys {}
+ keys during query work in the keyword phase (n=0)
+  Key handler to end of paint: no samples
+  Frame build/layout/paint wall time: no samples
+  Wait before render: no samples
+  Frame UI-thread CPU: no samples
+  Keys {}
+ keys during query work in the filter phase (n=0)
+  Key handler to end of paint: no samples
+  Frame build/layout/paint wall time: no samples
+  Wait before render: no samples
+  Frame UI-thread CPU: no samples
+  Keys {}

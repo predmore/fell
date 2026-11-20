@@ -1,0 +1,52 @@
+nested-paced/perf/frames.jsonl
+  164 completed work intervals, 317 key frames
+ all keys (n=317)
+  Key handler to end of paint: p50 2.180 ms, p95 18.011 ms, max 29.794 ms, 21/317 over 8 ms
+  Frame build/layout/paint wall time: p50 2.078 ms, p95 4.658 ms, max 20.849 ms
+  Wait before render: p50 0.029 ms, p95 15.418 ms, max 29.033 ms
+  Frame UI-thread CPU: p50 1.960 ms, p95 2.846 ms, max 5.322 ms
+  Keys {'/': 1, 'i': 4, 'n': 3, 'v': 1, 'o': 2, 'c': 1, 'e': 91, 'backspace': 150, 'ctrl-u': 1, ':': 1, 'b': 1, 'x': 61}
+ keys during query work (n=148)
+  Key handler to end of paint: p50 1.823 ms, p95 3.877 ms, max 24.009 ms, 4/148 over 8 ms
+  Frame build/layout/paint wall time: p50 1.791 ms, p95 3.122 ms, max 9.169 ms
+  Wait before render: p50 0.018 ms, p95 0.050 ms, max 23.681 ms
+  Frame UI-thread CPU: p50 1.685 ms, p95 2.471 ms, max 2.918 ms
+  Keys {'e': 83, 'n': 1, 'b': 1, 'o': 1, 'x': 60, 'backspace': 2}
+ keys during query work in the keyword phase (n=83)
+  Key handler to end of paint: p50 1.812 ms, p95 3.877 ms, max 9.184 ms, 1/83 over 8 ms
+  Frame build/layout/paint wall time: p50 1.793 ms, p95 3.862 ms, max 9.169 ms
+  Wait before render: p50 0.015 ms, p95 0.050 ms, max 0.062 ms
+  Frame UI-thread CPU: p50 1.689 ms, p95 2.008 ms, max 2.146 ms
+  Keys {'e': 83}
+ keys during query work in the filter phase (n=65)
+  Key handler to end of paint: p50 1.992 ms, p95 2.995 ms, max 24.009 ms, 3/65 over 8 ms
+  Frame build/layout/paint wall time: p50 1.711 ms, p95 2.565 ms, max 2.966 ms
+  Wait before render: p50 0.028 ms, p95 0.047 ms, max 23.681 ms
+  Frame UI-thread CPU: p50 1.685 ms, p95 2.513 ms, max 2.918 ms
+  Keys {'n': 1, 'b': 1, 'o': 1, 'x': 60, 'backspace': 2}
+nested-burst/perf/frames.jsonl
+  133 completed work intervals, 417 key frames
+ all keys (n=417)
+  Key handler to end of paint: p50 21.257 ms, p95 29.740 ms, max 44.374 ms, 399/417 over 8 ms
+  Frame build/layout/paint wall time: p50 2.203 ms, p95 4.710 ms, max 13.775 ms
+  Wait before render: p50 19.002 ms, p95 27.246 ms, max 37.049 ms
+  Frame UI-thread CPU: p50 2.098 ms, p95 3.094 ms, max 5.983 ms
+  Keys {'/': 1, 'i': 4, 'n': 3, 'v': 1, 'o': 2, 'c': 1, 'e': 101, 'backspace': 200, 'ctrl-u': 1, ':': 1, 'b': 1, 'x': 101}
+ keys during query work (n=261)
+  Key handler to end of paint: p50 20.442 ms, p95 27.785 ms, max 44.374 ms, 253/261 over 8 ms
+  Frame build/layout/paint wall time: p50 1.950 ms, p95 4.585 ms, max 9.095 ms
+  Wait before render: p50 18.048 ms, p95 25.423 ms, max 37.049 ms
+  Frame UI-thread CPU: p50 1.754 ms, p95 3.548 ms, max 5.128 ms
+  Keys {'e': 75, 'backspace': 85, 'n': 1, 'b': 1, 'o': 1, 'x': 98}
+ keys during query work in the keyword phase (n=76)
+  Key handler to end of paint: p50 20.525 ms, p95 27.561 ms, max 44.374 ms, 74/76 over 8 ms
+  Frame build/layout/paint wall time: p50 1.681 ms, p95 7.325 ms, max 9.095 ms
+  Wait before render: p50 18.811 ms, p95 23.518 ms, max 37.049 ms
+  Frame UI-thread CPU: p50 1.643 ms, p95 2.027 ms, max 2.145 ms
+  Keys {'e': 75, 'backspace': 1}
+ keys during query work in the filter phase (n=185)
+  Key handler to end of paint: p50 20.343 ms, p95 27.801 ms, max 31.001 ms, 179/185 over 8 ms
+  Frame build/layout/paint wall time: p50 2.103 ms, p95 3.729 ms, max 5.244 ms
+  Wait before render: p50 17.215 ms, p95 26.479 ms, max 28.251 ms
+  Frame UI-thread CPU: p50 2.071 ms, p95 3.653 ms, max 5.128 ms
+  Keys {'n': 1, 'b': 1, 'o': 1, 'x': 98, 'backspace': 84}

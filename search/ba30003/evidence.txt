@@ -1,0 +1,9 @@
+Live search at ba3000372f3386e68b5853784039fceadabd1f85
+
+Reply-To recovery merged into the branch with the cached search preview intact. The binary reported ba3000372f33 in each running-app replay. Dark and light captures are 1200 × 780. Narrow is 500 × 780. All mail is synthetic. The keyboard, retained results, spelling correction and existing mail action and Undo replays passed. Hosted workspace and store-budget checks passed on this commit.
+
+The 100,000-message exact-head keyword benchmark used 31 samples per query. Worst keyword p95 was 12.132 ms against 50 ms.
+
+The 8 ms input requirement remains open. A nested Weston GL replay used Vulkan Asahi for Fell and llvmpipe for the compositor. It measures key handler to CPU paint and excludes GPU submission and display presentation. Paced search exceeded 8 ms in 4/148 in-flight samples (p95 3.877 ms), including 1/83 in the keyword phase. Burst search exceeded 8 ms in 253/261 in-flight samples (p95 27.785 ms). Burst wait-before-render p95 was 25.423 ms. A separate j/k control with no searches exceeded 8 ms in 133/200 input samples. That control also exercised ordinary inbox movement and layout.
+
+A separate test gave Weston access to the Apple M2 GPU. Its Xvnc input path introduced repeated keystrokes, so those timings were discarded. Timing on native Hyprland remains unverified.

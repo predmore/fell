@@ -1,0 +1,7 @@
+ba3000372f3386e68b5853784039fceadabd1f85
+Exact-head store, seeded #125 mailbox, 31 samples per keyword query
+invoice                                                                      p50  11.179 ms p95  12.132 ms max  13.119 ms
+boiler leak                                                                  p50   8.873 ms p95   9.626 ms max   9.728 ms
+"boarding pass"                                                              p50   6.422 ms p95   6.865 ms max   6.941 ms
+warranty from:p10@bench.test in:inbox has:attachment after:2023-12-01        p50   3.943 ms p95   4.256 ms max   4.357 ms
+invioce                                                                      p50  10.830 ms p95  11.448 ms max  11.607 ms

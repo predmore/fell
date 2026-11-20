@@ -1,0 +1,5 @@
+394 sampled video frames at 60 fps
+Pending candidate frames [86, 87, 88, 89, 144, 145, 146, 147, 168, 169, 170, 171, 172, 173]
+Pending frames with both retained panes [86, 87, 88, 89, 144, 145, 146, 147, 171, 172, 173]
+
+The luminance detector also picked up two spelling-suggestion frames. Visual inspection of the remaining candidate with low contrast shows the pending notice and content in both panes. See transition-sample.png.
