@@ -1,0 +1,5 @@
+Before: 162b70afeeb09a4c4cf97b8d798b918bbc95b18a
+After: e8e0e3c083ee65df7df82f5474b68d9bdba28415
+Synthetic loopback Bridge fixture under nested Weston and Xvfb.
+a3afa9a09b28207f26e02de7e174c8069dd9dd54ffbb628fe24d11c95a534bbe  fell-before
+571fb996918d8d957ed72bc91a8ce746b87df71e251afe4f52695e565231d698  fell-e8e0e3c

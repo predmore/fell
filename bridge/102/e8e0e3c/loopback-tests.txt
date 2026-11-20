@@ -1,0 +1,12 @@
+   Compiling fell-core v0.1.0 (/home/caleb/.t3/worktrees/fell/t3-f9a90b7f-e4115e3bc9256a5e/crates/fell-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.27s
+     Running unittests src/lib.rs (target/debug/build/fell-core/7eda3abfc132dcc6/out/fell_core-7eda3abfc132dcc6)
+
+running 3 tests
+test imap::bridge_sync_tests::generic_special_use_all_reuses_bodies_and_keeps_ordinary_names_and_keywords ... ok
+Bridge first sync sent 152655 bytes for 149295 unique message bytes
+test imap::bridge_sync_tests::bridge_upgrades_flattened_folders_and_existing_flag_observations ... ok
+test imap::bridge_sync_tests::bridge_projects_labels_and_stars_and_downloads_one_body_per_message ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 748 filtered out; finished in 3.24s
+
