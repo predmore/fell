@@ -91,7 +91,9 @@ jobs:
             -e FELL_RELEASE_VERSION -e NATIVE_ARCH -e EXPECTED="$expected" \
             "$ARCH_IMAGE" bash -euc '
               test "$(uname -m)" = "$NATIVE_ARCH"
-              pacman -Syu --noconfirm --needed webkit2gtk-4.1
+              # The container can block the nested Landlock ruleset. Keep
+              # the download user and syscall filter and use Docker for filesystem isolation.
+              pacman -Syu --noconfirm --needed --disable-sandbox-filesystem webkit2gtk-4.1
               name=fell-$FELL_RELEASE_VERSION-$NATIVE_ARCH
               cd "$(mktemp -d)"
               tar -xzf "/dist/$name-linux.tar.gz"
