@@ -17,6 +17,8 @@ pub struct SyncReport {
     /// Mail may have changed since the beginning of the pass, including
     /// updates to messages that were already stored.
     pub changed: bool,
+    /// Uncertain local drafts confirmed by exact Message-IDs in Sent.
+    pub confirmed_drafts: Vec<String>,
     /// The most recent first-sync folder progress in this pass, if any.
     pub progress: Option<crate::backend::SyncProgress>,
 }
@@ -26,6 +28,7 @@ impl Default for SyncReport {
         Self {
             new_messages: Some(0),
             changed: false,
+            confirmed_drafts: Vec::new(),
             progress: None,
         }
     }
@@ -69,7 +72,9 @@ pub fn sync_with_progress(
         } else if writes.new_messages > 0 {
             *report.new_messages.get_or_insert(0) += writes.new_messages;
         }
-        if writes.changed || advances_walk {
+        let confirmed_send = !writes.confirmed_drafts.is_empty();
+        report.confirmed_drafts.extend(writes.confirmed_drafts);
+        if writes.changed || advances_walk || confirmed_send {
             progress(&report);
         }
         Ok(())

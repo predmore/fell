@@ -10,7 +10,7 @@ use crate::store::Store;
 use crate::sync::{fetch_message_bodies, sync_once, sync_with_progress};
 
 use super::sync_tests::{
-    account, body_fetches, commands, config, empty_mailbox, sample_state, stored,
+    account, body_fetches, commands, config, empty_mailbox, sample_state, stored, unused_smtp,
 };
 use super::test_server::{BodyForm, FixtureMailbox, FixtureMessage, TestServer, TestState};
 use super::{Windows, decode_cursor, set_windows};
@@ -113,6 +113,7 @@ fn backend_for(server: &TestServer) -> ImapBackend {
     ImapBackend {
         account_id: account("a1", BackendKind::Imap).id,
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     }
 }
 
