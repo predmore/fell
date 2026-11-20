@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::persist::SEND_IN_PROGRESS;
 use super::session::{DraftSession, SendLock};
 use super::workspace::{self, draft_socket_path};
 
@@ -190,13 +191,117 @@ impl DraftHub {
     /// inbox. Unlike `request_send`, no agent is named. `false` when the
     /// draft is not live.
     pub fn show(&self, id: &str) -> bool {
-        if self.with_session(id, DraftSession::open_for_edit).is_none() {
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let Some(session) = sessions.get_mut(id) else {
             return false;
-        }
+        };
+        session.open_for_edit();
         *self.focused.lock().expect("focused") = Some(id.to_string());
         self.reveals.fetch_add(1, Ordering::SeqCst);
+        drop(sessions);
         self.emit();
         true
+    }
+
+    /// Discard from the editor, using the mailbox this draft was opened from.
+    pub fn discard_open(&self, id: &str) -> crate::Result<()> {
+        let Some((Some(path), account)) = self.with_session(id, |session| {
+            (session.mailbox_path(), session.account_id().clone())
+        }) else {
+            return Err(crate::Error::Action("Draft is no longer available".into()));
+        };
+        if !path.is_file() {
+            return Err(crate::Error::Action(
+                "Draft mailbox is no longer available".into(),
+            ));
+        }
+        let store = crate::Store::open(&path)?;
+        self.discard(&store, &account, &[id.to_string()])
+    }
+
+    /// Discard the selection as one local undo action. Stop live sessions
+    /// from writing or reopening it, and leave the workspace available for
+    /// undo along with the saved draft and its dependents in the mailbox.
+    pub fn discard(
+        &self,
+        store: &crate::Store,
+        account: &crate::AccountId,
+        ids: &[String],
+    ) -> crate::Result<()> {
+        // Reserve the drafts before waiting for their saves. A send in this
+        // hub or a second app must finish before discard can proceed.
+        let _guards = ids
+            .iter()
+            .map(|id| store.lock_compose_send(id))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let changed = || crate::Error::Action("Draft changed while discarding · try again".into());
+        let mut saves = Vec::new();
+        {
+            let mut sessions = self.sessions.lock().expect("sessions");
+            let opening = self.opening.lock().expect("opening");
+            for id in ids {
+                if opening.contains(id) {
+                    return Err(changed());
+                }
+                if let Some(session) = sessions.get_mut(id) {
+                    if session.account_id() != account {
+                        return Err(crate::Error::Action(
+                            "Draft belongs to another account".into(),
+                        ));
+                    }
+                    match session.send_lock() {
+                        Some(SendLock::InFlight) => {
+                            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
+                        }
+                        Some(SendLock::Sent) => {
+                            return Err(crate::Error::Action(sentence_case(
+                                SendLock::Sent.reason(),
+                            )));
+                        }
+                        _ => {}
+                    }
+                    let waiter = session.save_for_discard().map_err(crate::Error::Action)?;
+                    saves.push((id, session.paint_generation(), waiter));
+                }
+            }
+        }
+        let mut generations = HashMap::new();
+        for (id, generation, waiter) in saves {
+            if let Some(waiter) = waiter {
+                waiter.wait_for_mailbox().map_err(|err| {
+                    crate::Error::Action(format!("Could not save draft for undo · {err}"))
+                })?;
+            }
+            generations.insert(id, generation);
+        }
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let opening = self.opening.lock().expect("opening");
+        for id in ids {
+            if opening.contains(id)
+                || sessions.get(id).map(DraftSession::paint_generation)
+                    != generations.get(id).copied()
+            {
+                return Err(changed());
+            }
+        }
+        let action = store.discard_compose_drafts(account, ids)?;
+        for id in ids {
+            sessions.remove(id);
+        }
+        for slot in [&self.focused, &self.shown, &self.last_closed] {
+            let mut slot = slot.lock().expect("draft window");
+            if slot.as_ref().is_some_and(|id| ids.contains(id)) {
+                *slot = None;
+            }
+        }
+        drop(opening);
+        drop(sessions);
+        self.closed
+            .lock()
+            .expect("closed")
+            .push((format!("{}  ·  u", action.summary), false));
+        self.emit();
+        Ok(())
     }
 
     pub fn with_session<T>(
@@ -373,27 +478,22 @@ impl DraftHub {
         let Some(id) = self.last_closed.lock().expect("last closed").clone() else {
             return false;
         };
-        let reopened = self.with_session(&id, |session| {
-            if session.send_lock() == Some(SendLock::Sent) {
-                return false;
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let Some(session) = sessions.get_mut(&id) else {
+            return false;
+        };
+        if session.send_lock() == Some(SendLock::Sent) {
+            // Sent since it closed: nothing is left to reopen.
+            let mut last = self.last_closed.lock().expect("last closed");
+            if last.as_deref() == Some(id.as_str()) {
+                *last = None;
             }
-            session.request_send();
-            true
-        });
-        match reopened {
-            Some(true) => {}
-            Some(false) => {
-                // Sent since it closed: nothing is left to reopen.
-                let mut last = self.last_closed.lock().expect("last closed");
-                if last.as_deref() == Some(id.as_str()) {
-                    *last = None;
-                }
-                return false;
-            }
-            None => return false,
+            return false;
         }
+        session.request_send();
         *self.focused.lock().expect("focused") = Some(id);
         self.reveals.fetch_add(1, Ordering::SeqCst);
+        drop(sessions);
         self.emit();
         true
     }
