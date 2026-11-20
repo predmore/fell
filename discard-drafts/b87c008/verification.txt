@@ -1,0 +1,3 @@
+The exact copy filed in Sent confirmed the discarded draft. Undo cleared the discard marker, kept the Sent state, and showed Confirmed in Sent. The SMTP fixture recorded exactly one DATA submission.
+With SMTP held open, an unrelated message synced and produced 1 new. The full Retry after send notice appeared at 500 px while discard stayed blocked. The SMTP fixture recorded exactly one DATA submission.
+The 500 px palette replay verified d, draft, and dscrd each selected Discard draft. Enter discarded the same fixture draft, and undo restored it after each query.
