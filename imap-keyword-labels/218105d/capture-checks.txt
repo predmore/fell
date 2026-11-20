@@ -1,0 +1,9 @@
+dark: sender pixels identical before add, after add, and after removal ((16, 56, 279, 77)).
+dark: date pixels identical before add, after add, and after removal ((449, 56, 480, 77)).
+dark: two flag-only CHANGEDSINCE updates, no body fetch after the first pass.
+light: sender pixels identical before add, after add, and after removal ((16, 56, 279, 77)).
+light: date pixels identical before add, after add, and after removal ((449, 56, 480, 77)).
+light: two flag-only CHANGEDSINCE updates, no body fetch after the first pass.
+narrow: sender pixels identical before add, after add, and after removal ((16, 56, 265, 77)).
+narrow: date pixels identical before add, after add, and after removal ((413, 56, 446, 77)).
+narrow: two flag-only CHANGEDSINCE updates, no body fetch after the first pass.
