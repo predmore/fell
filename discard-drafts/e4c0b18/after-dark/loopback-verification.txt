@@ -1,0 +1,4 @@
+Loopback SMTP DATA submissions: 1
+Final state after discard, Sent sync and undo: sent
+Sent role mailbox: Filed
+Exact Message-ID: <18e99bd8ac49fcef.18e99bd8ac480030@compose.fell>
