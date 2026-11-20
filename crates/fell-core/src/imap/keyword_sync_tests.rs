@@ -2,7 +2,7 @@ use crate::account::BackendKind;
 use crate::backend::{BridgeBackend, ImapBackend, MailBackend};
 use crate::{FlagChange, LabelChange, MessageId, Store, sync_once};
 
-use super::sync_tests::{account, commands, config, sample_state};
+use super::sync_tests::{account, commands, config, sample_state, unused_smtp};
 use super::test_server::{TestServer, TestState};
 
 fn keyword_state(with_sent_copy: bool) -> TestState {
@@ -49,6 +49,7 @@ fn changed_since_adds_and_removes_keywords_with_local_labels_and_flag_intents() 
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let message = || {
@@ -135,6 +136,7 @@ fn a_keyword_survives_until_its_last_copy_loses_it() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let store = Store::open_in_memory().unwrap();
     let message = || {
@@ -186,6 +188,7 @@ fn the_flag_baseline_updates_an_upgraded_row_and_keeps_legacy_labels() {
     let backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(server.addr.port()),
+        smtp: unused_smtp(),
     };
     let path = std::env::temp_dir().join(format!(
         "fell-keyword-migration-{}.sqlite",
