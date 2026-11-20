@@ -70,7 +70,7 @@ jobs:
       - name: Install GPUI / Wayland build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             gcc g++ clang cmake pkg-config \
             libfontconfig-dev libfreetype-dev \
             libwayland-dev wayland-protocols \
@@ -80,7 +80,8 @@ jobs:
             libwebkit2gtk-4.1-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          # The Linux artifacts workflow builds the same release dependencies.
+          # Linux artifacts on main populates the release dependency cache.
           shared-key: artifacts
+          save-if: 'false'
       - name: Measure and enforce store budgets
         run: time cargo bench --locked -p fell --features bench-store --bench fell-bench

@@ -1,8 +1,8 @@
-# Initial baselines from issue #125 and docs/scope.md. Update from ubuntu-latest
-# measurements once calibrated and document the run used in the PR.
-# Each measured p95 and RSS snapshot may exceed its baseline by at most 20%.
-folder_page_p95_ms = 5.0
-thread_open_p95_ms = 16.0
-keyword_search_p95_ms = 50.0
+# Ubuntu CI reference values rounded up for runner variance. See README.md
+# for the measured baseline and product maxima. The gate adds 20% to each value.
+folder_page_p95_ms = 0.75
+thread_open_p95_ms = 3.0
+keyword_search_p95_ms = 25.0
+# Product target until a comparable runner measures the pinned model.
 semantic_search_p95_ms = 150.0
-rest_rss_mb = 250.0
+rest_rss_mb = 18.0
