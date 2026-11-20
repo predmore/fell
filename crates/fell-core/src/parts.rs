@@ -457,8 +457,8 @@ fn cancelled() -> Error {
 }
 
 impl PartFetcher {
-    /// `backend` makes a backend for each fetch (it may resolve a
-    /// `password_command`, which is why it runs on the fetch thread).
+    /// `backend` makes a backend for each fetch. It may resolve a password,
+    /// so it runs on the fetch thread.
     pub fn start<F>(backend: F, cache: PartCache) -> Self
     where
         F: Fn() -> Result<Box<dyn MailBackend + Send>> + Send + 'static,

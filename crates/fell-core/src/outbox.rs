@@ -846,8 +846,8 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
     Ok(entries)
 }
 
-/// Whether any row is due now, without opening a connection (or running
-/// `password_command`) when none is.
+/// Whether any row is due now, without resolving the password or opening a
+/// connection when none is.
 pub(crate) fn any_due(store: &Store, account_id: &AccountId) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;

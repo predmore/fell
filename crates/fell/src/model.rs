@@ -121,8 +121,8 @@ impl SyncKind {
                 }
                 SyncFailureKind::Unreachable => "offline · server unreachable".into(),
                 SyncFailureKind::LoginRejected => "offline · login rejected".into(),
-                SyncFailureKind::Password => "offline · password_command failed".into(),
-                SyncFailureKind::Other => "offline · sync failed".into(),
+                SyncFailureKind::Password => "offline · password unavailable".into(),
+                SyncFailureKind::Tls | SyncFailureKind::Other => "offline · sync failed".into(),
             },
         }
     }
@@ -2587,8 +2587,8 @@ impl Session {
                         "Bridge didn't accept the login"
                     }
                     SyncFailureKind::LoginRejected => "The server didn't accept the login",
-                    SyncFailureKind::Password => "password_command failed",
-                    SyncFailureKind::Other => "Sync failed",
+                    SyncFailureKind::Password => "Account password unavailable",
+                    SyncFailureKind::Tls | SyncFailureKind::Other => "Sync failed",
                 };
                 let fix = match failure.kind {
                     SyncFailureKind::Unreachable if failure.bridge => {
