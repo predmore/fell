@@ -1610,7 +1610,7 @@ impl Session {
     }
 
     fn run(&mut self, action: Action, page_rows: usize) -> Step {
-        if !matches!(action, Action::Palette | Action::Help | Action::About) {
+        if !matches!(action, Action::Palette | Action::Help) {
             self.recent.retain(|item| *item != action);
             self.recent.insert(0, action);
             self.recent.truncate(8);
@@ -3149,10 +3149,10 @@ mod tests {
     }
 
     #[test]
-    fn about_is_searchable_and_escape_dismisses_it() {
+    fn about_matches_version_and_returns_in_recent_actions() {
         let mut session = session();
         session.on_key(KeyId::Char(':'), 4);
-        for ch in "about".chars() {
+        for ch in "version".chars() {
             session.on_key(KeyId::Char(ch), 4);
         }
         assert_eq!(session.palette()[0].action, Action::About);
@@ -3160,6 +3160,8 @@ mod tests {
         assert_eq!(session.overlay, Overlay::About);
         session.on_key(KeyId::Escape, 4);
         assert_eq!(session.overlay, Overlay::None);
+        session.on_key(KeyId::Char(':'), 4);
+        assert_eq!(session.palette()[0].action, Action::About);
     }
 
     #[test]
