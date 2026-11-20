@@ -161,6 +161,14 @@ fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).filter(|arg| arg != "--bench");
     let result = match args.next() {
         None => run_suite(),
+        Some(arg) if arg == "--install-model" => {
+            let code = fell::embeddings_command(&["install".into(), "--yes".into()]);
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(format!("pinned MiniLM installer exited with code {code}").into())
+            }
+        }
         Some(arg) if arg == "--seed" => {
             let path = PathBuf::from(args.next().expect("missing seed path"));
             mailbox::seed(&path).map_err(Into::into)
@@ -183,6 +191,18 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         PathBuf::from,
     );
     let budgets = Budgets::read(&budget_path)?;
+    let executable = std::env::current_exe()?;
+    if std::env::var_os("FELL_BENCH_INSTALL_MODEL").is_some_and(|value| value == "1") {
+        let root = std::env::var_os("FELL_BENCH_MODEL_DIR")
+            .ok_or("FELL_BENCH_MODEL_DIR is required when installing MiniLM")?;
+        let status = Command::new(&executable)
+            .arg("--install-model")
+            .env("FELL_MODEL_DIR", root)
+            .status()?;
+        if !status.success() {
+            return Err(format!("pinned MiniLM setup exited with {status}").into());
+        }
+    }
     let mut report = Report::new();
     let scratch = tempfile::Builder::new()
         .prefix("fell-store-budgets-")
@@ -190,11 +210,9 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
     let path = scratch.path().join("mail.db");
     // The measurement process never allocates the writer's SQLite caches or
     // message batches. Closing the child also checkpoints its WAL.
+    eprintln!("Generating the 100,000-message benchmark fixture");
     let seed_started = Instant::now();
-    let status = Command::new(std::env::current_exe()?)
-        .arg("--seed")
-        .arg(&path)
-        .status()?;
+    let status = Command::new(executable).arg("--seed").arg(&path).status()?;
     if !status.success() {
         return Err(format!("mailbox generation exited with {status}").into());
     }
@@ -279,17 +297,22 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
             store.search_with(&account.id, query, options).unwrap()
         });
     }
-    let semantic = measure_semantic(&store, &mut report, budgets.semantic_search_p95_ms)?;
+    let semantic = measure_semantic(&store, &mut report, budgets.semantic_search_p95_ms);
+    let semantic_note = match &semantic {
+        Ok(note) => note.clone(),
+        Err(err) => format!("Hybrid measurement failed: {err}"),
+    };
     // Include cleanup in the reported suite time.
     drop(store);
     drop(index_lock);
     scratch.close()?;
     writeln!(
         report.out,
-        "\n{semantic}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Each latency row uses nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
+        "\n{semantic_note}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Each latency row uses nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
         suite_started.elapsed()
     )?;
-    report.finish()
+    report.finish()?;
+    semantic.map(|_| ())
 }
 
 fn measure_semantic(

@@ -1,9 +1,11 @@
 //! Deterministic data for the store performance measurements.
 
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
 use std::path::Path;
 
 use crate::embed::{BodyEmbedder, try_embed_lock};
+use crate::store::{DROP_FTS_TRIGGERS, ensure_fts};
 use crate::{
     Account, AccountId, Address, BackendKind, Disposition, Error, MailboxDelta, Message,
     MessageHeaders, MessageId, MessageParts, MimePart, PartRole, RemoteId, Result, Store, ThreadId,
@@ -96,11 +98,13 @@ pub fn hold_indexer(path: &Path) -> Result<rusqlite::Connection> {
 /// Build through the same batched write path as sync. Copies count towards
 /// server deliveries, while the 100k count is for distinct stored messages.
 pub fn seed(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Err(Error::Invalid("benchmark needs a new database".into()));
-    }
+    OpenOptions::new().write(true).create_new(true).open(path)?;
     let _index_lock = hold_indexer(path)?;
     let store = Store::open(path)?;
+    // Index the finished fixture in bulk. While generating it, each Sent
+    // copy would otherwise scan the growing FTS table to replace its row.
+    let conn = store.connection();
+    conn.execute_batch(DROP_FTS_TRIGGERS)?;
     let account = account();
     store.upsert_account(&account)?;
     let mut rng = Rng(17);
@@ -142,10 +146,14 @@ pub fn seed(path: &Path) -> Result<()> {
             )?;
         }
     }
-    let rows: i64 = store
-        .connection()
-        .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?;
+    ensure_fts(conn)?;
+    let (rows, indexed): (i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM messages_fts)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     assert_eq!(rows, MESSAGES as i64);
+    assert_eq!(indexed, rows);
     Ok(())
 }
 
