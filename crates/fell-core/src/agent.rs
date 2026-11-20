@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::account::AccountId;
 use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{Message, MessageId};
+use crate::store::keywords::{self, LabelEdit, LabelHistory};
 use crate::store::{SELECT_MESSAGE_COLS, join_tokens, row_to_message, split_field};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
@@ -243,7 +244,7 @@ impl crate::Store {
         actor: &str,
     ) -> Result<Option<RecordedAction>> {
         let label = canonical_label(label)?;
-        let summary = format!("added label {label}");
+        let summary = LabelEdit::Added(&label).summary();
         self.mutate_thread(account_id, thread_id, actor, "label", summary, |message| {
             if !message.labels.iter().any(|existing| existing == &label) {
                 message.labels.push(label.clone());
@@ -259,7 +260,7 @@ impl crate::Store {
         actor: &str,
     ) -> Result<Option<RecordedAction>> {
         let label = canonical_label(label)?;
-        let summary = format!("removed label {label}");
+        let summary = LabelEdit::Removed(&label).summary();
         self.mutate_thread(
             account_id,
             thread_id,
@@ -653,22 +654,19 @@ impl crate::Store {
         if writes.is_empty() {
             return Ok(None);
         }
+        let label_edit = matches!(kind, "label" | "unlabel")
+            .then(|| LabelEdit::from_summary(&summary))
+            .transpose()?;
         let action = insert_action(&tx, account_id, actor, kind, &summary)?;
         for (old, new) in &writes {
-            if kind == "label" {
-                crate::store::keywords::keep_local_additions(
-                    &tx,
-                    account_id,
-                    &new.message_id,
-                    &old.labels,
-                    &new.labels,
-                )?;
-            }
+            let was_keyword = label_edit
+                .map(|edit| keywords::record_edit(&tx, account_id, &new.message_id, edit))
+                .transpose()?;
             tx.execute(
                 "INSERT INTO agent_action_messages (
                     action_id, message_id, labels, folders, unread, archived, snooze_until,
-                    starred
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    starred, label_was_keyword
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     action.id,
                     old.message_id,
@@ -678,8 +676,13 @@ impl crate::Store {
                     old.archived,
                     old.snooze_until,
                     old.starred,
+                    was_keyword,
                 ],
             )?;
+            if label_edit.is_some() {
+                keywords::set_message_labels(&tx, account_id, &new.message_id, &new.labels)?;
+                continue;
+            }
             tx.execute(
                 "UPDATE messages
                  SET labels = ?1, folders = ?2, unread = ?3, archived = ?4, snooze_until = ?5,
@@ -1038,7 +1041,15 @@ fn undo_messages(conn: &Connection, account_id: &AccountId, action: &RecordedAct
     // The snapshot holds all fields, but undo owns only the fields this
     // action changed. A user or sync may have edited the others since.
     let (restore, flags) = match action.kind.as_str() {
-        "label" | "unlabel" => ("labels = s.labels", None),
+        "label" | "unlabel" => {
+            return keywords::undo_label_action(
+                conn,
+                account_id,
+                action.id,
+                &action.summary,
+                LabelHistory::Agent,
+            );
+        }
         "archive" | "move" => ("folders = s.folders, archived = s.archived", None),
         "snooze" | "unsnooze" => ("snooze_until = s.snooze_until", None),
         "mark_read" | "mark_unread" => ("unread = s.unread", Some(FlagUndo::Unread)),

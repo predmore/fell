@@ -43,6 +43,160 @@ fn assert_flag_only(server: &TestServer) {
 }
 
 #[test]
+fn agent_label_undo_keeps_later_server_labels() {
+    let server = TestServer::spawn(keyword_state(false));
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let message = || {
+        store
+            .message(&acct.id, &MessageId::new("root@x"))
+            .unwrap()
+            .unwrap()
+    };
+    sync_once(&acct, &backend, &store).unwrap();
+    let thread = message().thread_id;
+    store
+        .add_thread_label(&acct.id, &thread, "personal", "agent:bot")
+        .unwrap();
+
+    set_flags(&server, "INBOX", 2, &["fieldwork"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["personal", "fieldwork"]);
+    store.undo_actor(&acct.id, "agent:bot").unwrap();
+    assert_eq!(message().labels, ["fieldwork"]);
+    assert_flag_only(&server);
+
+    store
+        .add_thread_label(&acct.id, &thread, "FIELDWORK", "agent:bot")
+        .unwrap();
+    store.undo_actor(&acct.id, "agent:bot").unwrap();
+    assert_eq!(message().labels, ["fieldwork"]);
+
+    store
+        .add_thread_label(&acct.id, &thread, "personal", "agent:bot")
+        .unwrap();
+    set_flags(&server, "INBOX", 3, &["fieldwork", "PERSONAL"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    store.undo_actor(&acct.id, "agent:bot").unwrap();
+    assert_eq!(message().labels, ["fieldwork", "personal"]);
+
+    set_flags(&server, "INBOX", 4, &["fieldwork"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["fieldwork"]);
+    assert_flag_only(&server);
+}
+
+#[test]
+fn local_label_undo_restores_a_keyword_only_while_a_copy_supports_it() {
+    let mut state = keyword_state(true);
+    for mailbox in &mut state.mailboxes {
+        mailbox.messages[0].flags = vec!["triage".into()];
+    }
+    let server = TestServer::spawn(state);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let message = || {
+        store
+            .message(&acct.id, &MessageId::new("root@x"))
+            .unwrap()
+            .unwrap()
+    };
+    sync_once(&acct, &backend, &store).unwrap();
+    let thread = message().thread_id;
+    let remove = || {
+        store
+            .label_thread(&acct.id, &thread, LabelChange::Remove("triage".into()))
+            .unwrap()
+    };
+
+    remove();
+    store
+        .label_thread(&acct.id, &thread, LabelChange::Add("triage".into()))
+        .unwrap();
+    store.undo(&acct.id).unwrap();
+    assert!(message().labels.is_empty());
+
+    set_flags(&server, "INBOX", 2, &["fieldwork"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(message().labels, ["fieldwork"]);
+    store.undo(&acct.id).unwrap();
+    assert!(message().labels.iter().any(|label| label == "triage"));
+    assert_flag_only(&server);
+
+    remove();
+    set_flags(&server, "Sent", 2, &[]);
+    sync_once(&acct, &backend, &store).unwrap();
+    store.undo(&acct.id).unwrap();
+    assert_eq!(message().labels, ["fieldwork"]);
+    assert_flag_only(&server);
+}
+
+#[test]
+fn legacy_label_actions_undo_only_their_own_edits_after_reopening() {
+    let mut state = keyword_state(false);
+    state.mailboxes[0].messages[0].flags = vec!["triage".into(), "review".into()];
+    let server = TestServer::spawn(state);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let path =
+        std::env::temp_dir().join(format!("fell-keyword-undo-{}.sqlite", std::process::id()));
+    let id = MessageId::new("root@x");
+    {
+        let store = Store::open(&path).unwrap();
+        sync_once(&acct, &backend, &store).unwrap();
+        let thread = store.message(&acct.id, &id).unwrap().unwrap().thread_id;
+        store
+            .add_thread_label(&acct.id, &thread, "personal notes", "agent:bot")
+            .unwrap();
+        store
+            .remove_thread_label(&acct.id, &thread, "review", "agent:bot")
+            .unwrap();
+        store
+            .label_thread(&acct.id, &thread, LabelChange::Remove("triage".into()))
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE agent_action_messages DROP COLUMN label_was_keyword;
+             ALTER TABLE local_action_messages DROP COLUMN label_was_keyword;",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    set_flags(&server, "INBOX", 2, &["fieldwork"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    store.undo(&acct.id).unwrap();
+    store.undo_actor(&acct.id, "agent:bot").unwrap();
+    assert_eq!(
+        store.message(&acct.id, &id).unwrap().unwrap().labels,
+        ["personal notes", "fieldwork"]
+    );
+    store.undo_actor(&acct.id, "agent:bot").unwrap();
+    assert_eq!(
+        store.message(&acct.id, &id).unwrap().unwrap().labels,
+        ["fieldwork"]
+    );
+    assert_flag_only(&server);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn changed_since_adds_and_removes_keywords_with_local_labels_and_flag_intents() {
     let server = TestServer::spawn(keyword_state(false));
     let acct = account("imap", BackendKind::Imap);

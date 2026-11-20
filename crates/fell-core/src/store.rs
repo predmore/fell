@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS agent_action_messages (
     snooze_until INTEGER,
     -- NULL on rows logged before star was undoable: undo leaves the star.
     starred INTEGER,
+    label_was_keyword INTEGER,
     FOREIGN KEY(action_id) REFERENCES agent_actions(id)
 );
 
@@ -474,6 +475,7 @@ impl Store {
         ensure_alias_columns(&conn)?;
         ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
+        keywords::upgrade_undo_schema(&conn)?;
         bodies::ensure_bodies(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_fingerprint
