@@ -215,8 +215,8 @@ pub(crate) fn confirm_synced_sends(
 const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
         subject, body, in_reply_to, identities, owner, updated_unix,
-        references_header, quote_text, quote_html
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        references_header, quote_text, quote_html, reply_to_unverified
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
      ON CONFLICT(id) DO UPDATE SET
         from_addr = excluded.from_addr,
         to_addrs = excluded.to_addrs,
@@ -233,7 +233,8 @@ const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         quote_text = CASE WHEN excluded.quote_text = ''
             THEN compose_drafts.quote_text ELSE excluded.quote_text END,
         quote_html = CASE WHEN excluded.quote_html = ''
-            THEN compose_drafts.quote_html ELSE excluded.quote_html END
+            THEN compose_drafts.quote_html ELSE excluded.quote_html END,
+        reply_to_unverified = compose_drafts.reply_to_unverified OR excluded.reply_to_unverified
      WHERE compose_drafts.discarded_action_id IS NULL";
 
 impl Store {
@@ -273,6 +274,7 @@ impl Store {
                 join_list(&draft.reply.references),
                 draft.reply.quote_text,
                 draft.reply.quote_html,
+                draft.reply.reply_to_unverified,
             ],
         )?;
         if written == 0 {
@@ -533,7 +535,7 @@ impl Store {
             .query_row(
                 "SELECT account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
                         subject, body, in_reply_to, identities, owner,
-                        references_header, quote_text, quote_html
+                        references_header, quote_text, quote_html, reply_to_unverified
                  FROM compose_drafts WHERE id = ?1 AND discarded_action_id IS NULL",
                 params![id],
                 |row| {
@@ -552,6 +554,7 @@ impl Store {
                             references: split_list(&row.get::<_, String>(10)?),
                             quote_text: row.get(11)?,
                             quote_html: row.get(12)?,
+                            reply_to_unverified: row.get(13)?,
                         },
                     ))
                 },
@@ -720,11 +723,13 @@ impl Store {
                             .filter(|name| !name.trim().is_empty())
                             .unwrap_or_else(|| email.clone()),
                         sender_email: email,
-                        reply_to: crate::message::decode_addresses(&reply_to)
-                            .into_iter()
-                            .map(|address| address.email.trim().to_lowercase())
-                            .filter(|email| !email.is_empty())
-                            .collect(),
+                        reply_to: crate::message::decode_reply_to(&reply_to).map(|addresses| {
+                            addresses
+                                .into_iter()
+                                .map(|address| address.email.trim().to_lowercase())
+                                .filter(|email| !email.is_empty())
+                                .collect()
+                        }),
                         subject: row.get(2)?,
                         date_unix: row.get(3)?,
                     })
@@ -1068,7 +1073,7 @@ mod tests {
                     archived: false,
                     snooze_until: None,
                     list_id: None,
-                    reply_to: Vec::new(),
+                    reply_to: Some(Vec::new()),
                     attachment_names: Vec::new(),
                     parts: None,
                 })
@@ -1123,7 +1128,7 @@ mod tests {
                 archived: false,
                 snooze_until: None,
                 list_id: None,
-                reply_to: Vec::new(),
+                reply_to: Some(Vec::new()),
                 attachment_names: Vec::new(),
                 parts: None,
             })

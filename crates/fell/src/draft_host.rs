@@ -562,6 +562,7 @@ pub(crate) mod tests {
                     references: vec!["<parent@example.com>".into()],
                     quote_text: "Original message".into(),
                     quote_html: "<p>Original message</p>".into(),
+                    reply_to_unverified: true,
                 },
             })
             .unwrap();
@@ -596,6 +597,7 @@ pub(crate) mod tests {
             assert_eq!(session.owner(), "agent:atlas");
             assert_eq!(session.fields().bcc, ["robin@example.com"]);
             assert_eq!(session.reply_parts().quote_text, "Original message");
+            assert!(session.reply_parts().reply_to_unverified);
             assert!(session.snapshot().unreviewed > 0);
         });
         assert_eq!(
@@ -686,7 +688,7 @@ pub(crate) mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }
@@ -731,6 +733,92 @@ pub(crate) mod tests {
         let hub = DraftHub::new();
         home.open(&hub, &id, &account.id).unwrap();
         check(&hub);
+    }
+
+    #[test]
+    fn a_reply_started_before_verification_keeps_its_recipient_hold_after_sync() {
+        let account = me();
+        let home = temp_home("reply-unverified", &account);
+        let mut parent = parent_message(&account);
+        parent.reply_to = None;
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Reply,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &fell_core::FolderRoles::default(),
+        );
+
+        // Backfill can finish between reading the parent and opening compose.
+        parent.reply_to = Some(vec![fell_core::Address {
+            name: None,
+            email: "plans@lists.x".into(),
+        }]);
+        fell_core::Store::open(&home.store)
+            .unwrap()
+            .upsert_message(&parent)
+            .unwrap();
+
+        let check = |hub: &DraftHub, id: &str| {
+            hub.with_session(id, |session| {
+                session.mark_seen();
+                let snap = session.snapshot();
+                assert!(snap.to.is_empty());
+                assert!(snap.reply_to_unverified);
+                assert_eq!(
+                    snap.reply_context.unwrap().reply_to.unwrap(),
+                    ["plans@lists.x"]
+                );
+                assert_eq!(
+                    snap.send_block.as_deref(),
+                    Some("add at least one recipient")
+                );
+            })
+            .unwrap();
+        };
+        let hub = DraftHub::new();
+        let id = home.new_reply(&hub, &account.id, start).unwrap();
+        check(&hub, &id);
+        hub.settle_all();
+        drop(hub);
+
+        let reopened = DraftHub::new();
+        home.open(&reopened, &id, &account.id).unwrap();
+        check(&reopened, &id);
+    }
+
+    #[test]
+    fn a_sent_reply_opens_normally_with_an_unverified_original_header() {
+        let account = me();
+        let home = temp_home("sent-reply", &account);
+        let mut parent = parent_message(&account);
+        parent.folders = vec!["Sent".into()];
+        parent.to = vec![fell_core::Address {
+            name: None,
+            email: "ada@x".into(),
+        }];
+        parent.reply_to = None;
+        fell_core::Store::open(&home.store)
+            .unwrap()
+            .upsert_message(&parent)
+            .unwrap();
+        let roles = fell_core::FolderRoles::from_names(&parent.folders);
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Reply,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &roles,
+        );
+        let hub = DraftHub::new();
+        let id = home.new_reply(&hub, &account.id, start).unwrap();
+        hub.with_session(&id, |session| {
+            let snap = session.snapshot();
+            assert_eq!(snap.to[0].email, "ada@x");
+            assert!(!snap.reply_to_unverified);
+            assert_eq!(snap.reply_context.unwrap().reply_to, None);
+        })
+        .unwrap();
     }
 
     #[test]

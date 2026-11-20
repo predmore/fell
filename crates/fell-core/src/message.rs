@@ -75,8 +75,9 @@ pub struct Message {
     pub snooze_until: Option<i64>,
     /// Set when a mailing list rewrote this copy (`List-Id`).
     pub list_id: Option<String>,
-    /// `Reply-To` addresses. A reply goes to these instead of `from`.
-    pub reply_to: Vec<Address>,
+    /// `None` when the original headers have not been checked for Reply-To.
+    /// An empty list means the headers were checked and offered no address.
+    pub reply_to: Option<Vec<Address>>,
     /// File names of the message's attachments, for a forward to list.
     pub attachment_names: Vec<String>,
     /// The body parts sync parsed from the server copy. `None` when the
@@ -228,6 +229,37 @@ pub(crate) fn decode_addresses(raw: &str) -> Vec<Address> {
             }
         })
         .collect()
+}
+
+// The original NOT NULL column used an empty string for both unchecked
+// and absent headers. A separator alone is an empty address list that the
+// original decoder also reads as empty, and the encoder never produces it.
+const NO_REPLY_TO: &str = "\u{1e}";
+
+pub(crate) fn encode_reply_to(addresses: Option<&[Address]>) -> String {
+    let Some(addresses) = addresses else {
+        return String::new();
+    };
+    let encoded = encode_addresses(addresses);
+    if encoded.is_empty() {
+        NO_REPLY_TO.into()
+    } else {
+        encoded
+    }
+}
+
+pub(crate) fn decode_reply_to(line: &str) -> Option<Vec<Address>> {
+    (!line.is_empty()).then(|| decode_addresses(line))
+}
+
+/// Keep the first real address list and retain verified absence when the
+/// other copy has not been checked.
+pub(crate) fn merge_reply_to(stored: &str, incoming: String) -> String {
+    if stored.is_empty() || (stored == NO_REPLY_TO && !incoming.is_empty()) {
+        incoming
+    } else {
+        stored.to_string()
+    }
 }
 
 pub(crate) fn normalize_message_id(raw: &str) -> &str {

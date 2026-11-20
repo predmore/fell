@@ -35,11 +35,16 @@ pub struct ReplyParts {
     /// The same quote as HTML. Sent after the body in the HTML part, and
     /// painted collapsed below the draft.
     pub quote_html: String,
+    /// The draft was started before the original's Reply-To was verified.
+    pub reply_to_unverified: bool,
 }
 
 impl ReplyParts {
     pub fn is_empty(&self) -> bool {
-        self.references.is_empty() && self.quote_text.is_empty() && self.quote_html.is_empty()
+        self.references.is_empty()
+            && self.quote_text.is_empty()
+            && self.quote_html.is_empty()
+            && !self.reply_to_unverified
     }
 }
 
@@ -85,13 +90,13 @@ pub fn start_reply_in_zone(
     let parent_id = parent.headers.message_id.as_str();
     match kind {
         ReplyKind::Reply | ReplyKind::ReplyAll => {
-            let (to, cc) = reply_recipients(parent, own, kind == ReplyKind::ReplyAll, roles);
+            let recipients = route_reply(parent, own, kind == ReplyKind::ReplyAll, roles);
             let (quote_text, quote_html) = reply_quote(parent, offset);
             ReplyStart {
                 fields: DraftFields {
                     from: from.to_string(),
-                    to,
-                    cc,
+                    to: recipients.to,
+                    cc: recipients.cc,
                     subject: reply_subject(subject),
                     in_reply_to: Some(parent_id.to_string()).filter(|id| !id.is_empty()),
                     ..DraftFields::default()
@@ -100,6 +105,7 @@ pub fn start_reply_in_zone(
                     references: reply_references(parent, parent_id),
                     quote_text,
                     quote_html,
+                    reply_to_unverified: recipients.withheld,
                 },
             }
         }
@@ -115,6 +121,7 @@ pub fn start_reply_in_zone(
                     references: Vec::new(),
                     quote_text,
                     quote_html,
+                    reply_to_unverified: false,
                 },
             }
         }
@@ -183,7 +190,8 @@ fn in_sent(message: &Message, roles: &FolderRoles) -> bool {
 
 /// To and Cc for a reply to `parent`. To is Reply-To when the message has
 /// one, else the sender. Reply all adds the other To recipients to To and
-/// keeps Cc as Cc. The person's own addresses (`own`) and repeats are left
+/// keeps Cc as Cc. When incoming mail's Reply-To is unverified, the person
+/// chooses all recipients. The person's own addresses (`own`) and repeats are left
 /// out. A reply to the person's own message (from one of `own`, or a copy
 /// in the Sent folder `roles` name) goes to whoever it went to.
 pub fn reply_recipients(
@@ -192,16 +200,39 @@ pub fn reply_recipients(
     all: bool,
     roles: &FolderRoles,
 ) -> (Vec<String>, Vec<String>) {
+    let recipients = route_reply(parent, own, all, roles);
+    (recipients.to, recipients.cc)
+}
+
+#[derive(Default)]
+struct ReplyRecipients {
+    to: Vec<String>,
+    cc: Vec<String>,
+    withheld: bool,
+}
+
+fn route_reply(
+    parent: &Message,
+    own: &[String],
+    all: bool,
+    roles: &FolderRoles,
+) -> ReplyRecipients {
     let own: HashSet<String> = own
         .iter()
         .map(|email| email.trim().to_lowercase())
         .collect();
     let mine = |address: &Address| own.contains(&address.email.trim().to_lowercase());
     let from_me = mine(&parent.headers.from) || in_sent(parent, roles);
+    if !from_me && parent.reply_to.is_none() {
+        return ReplyRecipients {
+            withheld: true,
+            ..ReplyRecipients::default()
+        };
+    }
     let primary: Vec<&Address> = if from_me {
         parent.to.iter().collect()
-    } else if !parent.reply_to.is_empty() {
-        parent.reply_to.iter().collect()
+    } else if let Some(addresses) = parent.reply_to.as_ref().filter(|list| !list.is_empty()) {
+        addresses.iter().collect()
     } else {
         vec![&parent.headers.from]
     };
@@ -230,7 +261,11 @@ pub fn reply_recipients(
             to.push(format_address(from));
         }
     }
-    (to, cc)
+    ReplyRecipients {
+        to,
+        cc,
+        withheld: false,
+    }
 }
 
 /// The References a reply to `parent` sends. Mail synced before In-Reply-To
@@ -605,7 +640,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }
@@ -625,7 +660,7 @@ mod tests {
     #[test]
     fn reply_to_wins_over_the_sender() {
         let mut message = parent();
-        message.reply_to = vec![address(Some("Plans list"), "plans@lists.x")];
+        message.reply_to = Some(vec![address(Some("Plans list"), "plans@lists.x")]);
         let (to, _) = reply_recipients(&message, &me(), false, &FolderRoles::default());
         assert_eq!(to, vec!["Plans list <plans@lists.x>"]);
         let (to, cc) = reply_recipients(&message, &me(), true, &FolderRoles::default());
@@ -755,6 +790,40 @@ mod tests {
         message.cc.clear();
         let (to, _) = reply_recipients(&message, &me(), true, &FolderRoles::default());
         assert_eq!(to, vec!["Jon <JON@example.com>"]);
+    }
+
+    #[test]
+    fn an_unverified_header_does_not_hold_recipients_of_my_own_mail() {
+        let mut message = parent();
+        message.reply_to = None;
+        let roles = FolderRoles::from_names(&["Sent".into()]);
+        let incoming = start_reply(
+            ReplyKind::ReplyAll,
+            &message,
+            "jon@example.com",
+            &me(),
+            &roles,
+        );
+        assert!(incoming.parts.reply_to_unverified);
+        assert!(incoming.fields.to.is_empty());
+        assert!(incoming.fields.cc.is_empty());
+
+        message.folders.push("Sent".into());
+        let sent = start_reply(
+            ReplyKind::ReplyAll,
+            &message,
+            "jon@example.com",
+            &me(),
+            &roles,
+        );
+        assert!(!sent.parts.reply_to_unverified);
+        assert_eq!(sent.fields.to, ["Maya <maya@x>"]);
+
+        message.folders.clear();
+        message.headers.from = address(Some("Jon"), "JON@example.com");
+        let own = start_reply(ReplyKind::Reply, &message, "jon@example.com", &me(), &roles);
+        assert!(!own.parts.reply_to_unverified);
+        assert_eq!(own.fields.to, ["Maya <maya@x>"]);
     }
 
     #[test]

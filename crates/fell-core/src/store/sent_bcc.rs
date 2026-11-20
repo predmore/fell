@@ -196,7 +196,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }
