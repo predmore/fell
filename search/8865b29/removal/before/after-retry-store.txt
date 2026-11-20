@@ -1,0 +1,2 @@
+corpus-briefing@fell.test|Trash
+corpus-lecture@fell.test|Archive

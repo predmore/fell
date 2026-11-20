@@ -1,0 +1,11 @@
+Live search review fixes at 8865b29ae6cf21586c8b57c1a0c51f9200dd7af9
+
+The comparison binary is d9acfd684bb7cb5b1cbb15d4b08dd0271120a05b. Both use stock palettes and disposable synthetic mailboxes. All standard recordings and after captures report the new head.
+
+Preview. With hall in the query field, clicking the message and shrinking to 500 px hid the result list on the earlier binary. On the new head the query caret and result list remain visible. The preview is read-only during query editing.
+
+Selection. The test moves one fixture message from Inbox to Archive after selecting two search hits. The first Delete fails with no messages in INBOX, records no action, and preserves both rows. Retrying after the result refresh moved one row on the earlier binary, and moved both with the new one. The new head passed with x marks at 1200 px and a V range at 500 px.
+
+Purge. After confirmation, the new head removed both Trash scopes with differing ASCII case, and left a Sent copy of one message. The store regression also exercised a stale scope, which rejected the entire purge and preserved the valid target. The store validates the source folder for each target inside the same transaction.
+
+Formatting and strict Clippy passed. The all-feature workspace suite reported 1,290 passed and six ignored. The 8 ms input requirement is still open. In the exact-head Asahi app and nested Weston llvmpipe replay, 7/155 paced and 255/257 burst keys measured over 8 ms with search work in flight. The paced p95 was 5.428 ms and the burst p95 was 25.519 ms. Timing ends at CPU paint. Native Hyprland and display presentation remain unverified.
