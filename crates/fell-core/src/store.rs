@@ -27,6 +27,7 @@ pub(crate) mod bodies;
 pub(crate) mod copies;
 pub(crate) mod intents;
 pub(crate) mod keywords;
+mod part_cache;
 mod roles;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
@@ -389,7 +390,14 @@ pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let requested = path.as_ref();
+        Self::open_mailbox(path.as_ref(), true)
+    }
+
+    pub(crate) fn open_for_part_fetch(path: &Path) -> Result<Self> {
+        Self::open_mailbox(path, false)
+    }
+
+    fn open_mailbox(requested: &Path, index: bool) -> Result<Self> {
         // The mailbox holds message text. Create it owner-only before SQLite writes.
         create_private_file(requested)?;
         // One path string per inode. A symlink or a second hard link must not
@@ -413,7 +421,9 @@ impl Store {
         store.seal_private_files()?;
         // Embeddings are filled off this thread, and only in one process.
         // A lock problem skips the indexer. Open still returns the mailbox.
-        store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
+        if index {
+            store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
+        }
         Ok(store)
     }
 

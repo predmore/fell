@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use fell_core::Store;
 use futures::channel::oneshot;
@@ -150,12 +151,14 @@ fn send<R: Send + 'static>(
 
 /// Waits between attempts to open the second connection. Until one
 /// succeeds, background jobs run on the interactive lane.
-const BACKGROUND_RETRIES: [std::time::Duration; 4] = [
-    std::time::Duration::from_millis(250),
-    std::time::Duration::from_secs(1),
-    std::time::Duration::from_secs(5),
-    std::time::Duration::from_secs(30),
+const BACKGROUND_RETRIES: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
 ];
+
+const PART_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Open the second connection on its own thread, retrying a few times. If
 /// it never opens, background jobs keep using the interactive lane.
@@ -178,17 +181,42 @@ fn spawn_background(path: std::path::PathBuf, ready: Arc<AtomicBool>, jobs: mpsc
             store.warm_search();
             ready.store(true, Ordering::Release);
             drop(ready);
-            // Only clients hold the sender. The lane closes with them.
-            while let Ok(job) = jobs.recv() {
-                job(&store);
-            }
+            run_background(&store, jobs);
         });
+}
+
+fn run_background(store: &Store, jobs: mpsc::Receiver<Job>) {
+    // Sweep after startup and between jobs, even while working offline or
+    // when nobody has opened an attachment in this window.
+    let mut next_sweep = Instant::now();
+    let mut failed = false;
+    loop {
+        if Instant::now() >= next_sweep {
+            match store.clean_default_part_cache() {
+                Ok(()) => failed = false,
+                Err(err) => {
+                    if !failed {
+                        eprintln!("fell: could not remove cached parts: {err}");
+                    }
+                    failed = true;
+                }
+            }
+            next_sweep = Instant::now() + PART_CACHE_SWEEP_INTERVAL;
+        }
+        match jobs.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
+            Ok(job) => job(store),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = store.clean_default_part_cache();
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn jobs_run_off_the_calling_thread_in_order() {

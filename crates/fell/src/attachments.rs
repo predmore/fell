@@ -77,15 +77,17 @@ pub fn size_label(bytes: u64) -> String {
 #[derive(Clone)]
 pub struct Fetcher {
     config: Option<AccountConfig>,
+    store_path: Option<PathBuf>,
     worker: Arc<Mutex<Option<PartFetcher>>>,
 }
 
 type FetchEvents = (UnboundedReceiver<PartEvent>, CancelFetch);
 
 impl Fetcher {
-    pub fn new(config: Option<AccountConfig>) -> Self {
+    pub fn new(config: Option<AccountConfig>, store_path: Option<PathBuf>) -> Self {
         Self {
             config,
+            store_path,
             worker: Arc::new(Mutex::new(None)),
         }
     }
@@ -93,13 +95,18 @@ impl Fetcher {
     pub fn queue(&self, request: PartRequest) -> Result<FetchEvents, String> {
         let mut worker = self.worker.lock().expect("attachment fetcher lock");
         if worker.is_none() {
+            let path = self
+                .store_path
+                .clone()
+                .ok_or_else(|| "the mailbox is unavailable".to_string())?;
             let cache =
                 PartCache::open_default().map_err(|err| format!("Attachment cache: {err}"))?;
             let config = self.config.clone();
             let account = request.account_id.clone();
-            *worker = Some(PartFetcher::start(
+            *worker = Some(PartFetcher::start_for_store(
                 move || fell_core::backend_for(&account, config.as_ref()),
                 cache,
+                path,
             ));
         }
         let (send, receive) = unbounded();

@@ -127,6 +127,7 @@ END;
 pub(super) fn ensure_bodies(conn: &Connection) -> Result<()> {
     let tx = super::begin_immediate(conn)?;
     tx.execute_batch(BODIES_SCHEMA)?;
+    tx.execute_batch(super::part_cache::SCHEMA)?;
     if !has_column(&tx, "message_bodies", "parts_listed")? {
         tx.execute_batch(
             "ALTER TABLE message_bodies ADD COLUMN parts_listed INTEGER NOT NULL DEFAULT 0",
@@ -763,7 +764,7 @@ fn read_text(
 /// Revision of one stored body. Legacy rows start at zero, and the first
 /// change, including deletion and reinsertion, assigns a fresh revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PartStamp([u8; 16]);
+pub struct PartStamp(pub(super) [u8; 16]);
 
 /// Which parts one stored row has. A row with neither records that no
 /// server copy had a body to give.
@@ -1613,8 +1614,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TRIGGER message_parts_ad;
+                    "DROP TRIGGER part_cache_message_removed;
+                     DROP TRIGGER message_parts_ad;
                      DROP TABLE message_parts;
+                     DROP TABLE part_cache_sections;
                      ALTER TABLE message_bodies DROP COLUMN parts_listed;
                      UPDATE meta SET value = '4' WHERE key = 'schema_version';",
                 )
