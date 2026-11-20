@@ -655,6 +655,15 @@ impl crate::Store {
         }
         let action = insert_action(&tx, account_id, actor, kind, &summary)?;
         for (old, new) in &writes {
+            if kind == "label" {
+                crate::store::keywords::keep_local_additions(
+                    &tx,
+                    account_id,
+                    &new.message_id,
+                    &old.labels,
+                    &new.labels,
+                )?;
+            }
             tx.execute(
                 "INSERT INTO agent_action_messages (
                     action_id, message_id, labels, folders, unread, archived, snooze_until,

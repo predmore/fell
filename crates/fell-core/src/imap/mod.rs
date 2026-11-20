@@ -30,6 +30,8 @@ pub(crate) use rfc822::{
 #[cfg(test)]
 mod first_sync_tests;
 #[cfg(test)]
+mod keyword_sync_tests;
+#[cfg(test)]
 pub(crate) mod mime_fixtures;
 #[cfg(test)]
 mod sync_tests;
@@ -261,6 +263,7 @@ pub(crate) fn fetch_imap(
     config: &ImapConfig,
     cursor: Option<&SyncCursor>,
     known: &KnownCopies<'_>,
+    keywords: bool,
     mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if config.username.is_empty() {
@@ -284,6 +287,7 @@ pub(crate) fn fetch_imap(
         account_id,
         listed: &mailboxes,
         known,
+        keywords,
         prior: decode_cursor(cursor).into_iter().collect(),
         done: HashMap::new(),
         // Every mailbox was read to the end, so a copy moved on the server
@@ -370,6 +374,7 @@ struct Pass<'a> {
     account_id: &'a AccountId,
     listed: &'a [session::Listed],
     known: &'a KnownCopies<'a>,
+    keywords: bool,
     /// The checkpoints the pass started from.
     prior: HashMap<String, MailboxCheckpoint>,
     /// Checkpoints this pass wrote.
@@ -585,7 +590,7 @@ fn catch_up(
                 if seen_through.is_none_or(|floor| uid > floor) {
                     stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                 }
-                pending_flags.push(flag_update(uidvalidity, &escaped, &item));
+                pending_flags.push(flag_update(uidvalidity, &escaped, &item, pass.keywords));
                 if pending_flags.len() >= BATCH_FLAGS {
                     flush_batch(
                         &mut batch,
@@ -616,9 +621,7 @@ fn catch_up(
             return Ok(());
         }
         let raw_len = item.body.len();
-        if item.modseq.is_some() {
-            pending_flags.push(flag_update(uidvalidity, &escaped, &item));
-        }
+        pending_flags.extend(arrival_flags(uidvalidity, &escaped, &item, pass.keywords));
         batch.push(rfc822::to_message(
             account_id,
             &mailbox.raw,
@@ -684,7 +687,7 @@ fn catch_up(
             Ok(rows) => {
                 flags.extend(
                     rows.iter()
-                        .map(|item| flag_update(uidvalidity, &escaped, item)),
+                        .map(|item| flag_update(uidvalidity, &escaped, item, pass.keywords)),
                 );
             }
             Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
@@ -930,7 +933,12 @@ fn walk_down(
         let mut wanted: Vec<(u32, u32)> = Vec::new();
         for row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
-                flags.push(flag_update(checkpoint.uidvalidity, &escaped, &row));
+                flags.push(flag_update(
+                    checkpoint.uidvalidity,
+                    &escaped,
+                    &row,
+                    pass.keywords,
+                ));
                 continue;
             }
             if rfc822::is_deleted(&row.flags) {
@@ -947,9 +955,7 @@ fn walk_down(
                     &row.body,
                 );
                 header_ids.insert(row.uid, header.headers.message_id.clone());
-                let learned = row
-                    .modseq
-                    .map(|_| flag_update(checkpoint.uidvalidity, &escaped, &row));
+                let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, pass.keywords);
                 headers.push((header, learned));
             }
             wanted.push((row.uid, row.size.unwrap_or(0)));
@@ -1028,9 +1034,12 @@ fn walk_down(
                         return Ok(());
                     }
                     batch_bytes += item.body.len();
-                    if item.modseq.is_some() {
-                        body_flags.push(flag_update(checkpoint.uidvalidity, &escaped, &item));
-                    }
+                    body_flags.extend(arrival_flags(
+                        checkpoint.uidvalidity,
+                        &escaped,
+                        &item,
+                        pass.keywords,
+                    ));
                     batch.push(rfc822::to_message(
                         pass.account_id,
                         &mailbox.raw,
@@ -1114,7 +1123,7 @@ fn walk_down(
     // read every flag once more. Keep floor=1 on failure so the next pass
     // retries this sweep without downloading the windows again.
     let flags = if examined.highest_modseq.is_none() {
-        let Some(flags) = walk_flags(session, mailbox, seen, &escaped)? else {
+        let Some(flags) = walk_flags(session, mailbox, seen, &escaped, pass.keywords)? else {
             pass.complete = false;
             return Ok(Walked::Stopped);
         };
@@ -1159,6 +1168,7 @@ fn walk_flags(
     mailbox: &session::Listed,
     seen: Seen,
     escaped: &str,
+    keywords: bool,
 ) -> Result<Option<Vec<FlagUpdate>>, Error> {
     let Some((uids, _)) = list_mailbox(session, mailbox, seen, false)? else {
         return Ok(None);
@@ -1178,7 +1188,7 @@ fn walk_flags(
         }
         flags.extend(
             rows.iter()
-                .map(|row| flag_update(seen.uidvalidity, escaped, row)),
+                .map(|row| flag_update(seen.uidvalidity, escaped, row, keywords)),
         );
     }
     Ok(Some(flags))
@@ -1565,21 +1575,47 @@ fn uid_set(uids: &[u32]) -> String {
 }
 
 /// Flag evidence from one server copy.
-fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> FlagUpdate {
+fn flag_update(
+    uidvalidity: u32,
+    escaped: &str,
+    item: &session::Fetched,
+    keywords: bool,
+) -> FlagUpdate {
     let uid = item.uid;
     FlagUpdate {
         remote_id: RemoteId(format!("imap:{uidvalidity}:{uid}:{escaped}")),
-        unread: !item
-            .flags
-            .iter()
-            .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        unread: Some(
+            !item
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        ),
         flagged: Some(
             item.flags
                 .iter()
                 .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
         ),
+        keywords: (keywords && item.flags_present).then(|| rfc822::keyword_labels(&item.flags)),
         modseq: item.modseq,
     }
+}
+
+/// With no revision, a new row already applied unread as part of its arrival.
+/// Remember its keywords without applying a second read observation.
+fn arrival_flags(
+    uidvalidity: u32,
+    escaped: &str,
+    item: &session::Fetched,
+    keywords: bool,
+) -> Option<FlagUpdate> {
+    if item.modseq.is_none() && !(keywords && item.flags_present) {
+        return None;
+    }
+    let mut update = flag_update(uidvalidity, escaped, item, keywords);
+    if item.modseq.is_none() {
+        update.unread = None;
+    }
+    Some(update)
 }
 
 struct Snapshot<'a> {

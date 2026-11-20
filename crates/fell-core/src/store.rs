@@ -26,6 +26,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 pub(crate) mod bodies;
 pub(crate) mod copies;
 pub(crate) mod intents;
+pub(crate) mod keywords;
 mod roles;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
@@ -673,6 +674,16 @@ impl Store {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
         let mut new_messages = 0;
+        let keyword_copies: HashSet<_> = if delta.messages.is_empty() {
+            HashSet::new()
+        } else {
+            delta
+                .flags
+                .iter()
+                .filter(|flag| flag.keywords.is_some())
+                .map(|flag| &flag.remote_id.0)
+                .collect()
+        };
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -682,9 +693,13 @@ impl Store {
                 )));
             }
             // Skip a folder archive or delete already took off this message.
-            let Some(message) = crate::actions::message_for_delta(&tx, message)? else {
+            let Some(mut message) = crate::actions::message_for_delta(&tx, message)? else {
                 continue;
             };
+            // These labels have copy provenance and are applied with FLAGS below.
+            if keyword_copies.contains(&message.remote_id.0) {
+                message.labels.clear();
+            }
             // A combined delta can carry the listing for these messages.
             new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
         }
@@ -2854,6 +2869,7 @@ fn absorb_duplicate(
 ) -> Result<ThreadId> {
     let extra_folders = split_field(&doomed.folders);
     let extra_labels = split_field(&doomed.labels);
+    keywords::merge(conn, &message.account_id, doomed, keeper)?;
     let keeper = fold_doomed_local_state(keeper, doomed);
     let thread = write_kept(conn, message, &keeper, true, &extra_folders, &extra_labels)?;
     // The stored parts of the doomed row fill what the keeper lacks; the
@@ -3029,7 +3045,8 @@ fn take_local_state(
     into: &Arrival,
 ) -> Result<()> {
     let mut labels = split_field(&into.labels);
-    for label in split_field(&from.labels) {
+    for label in keywords::local_labels(conn, account_id, from)? {
+        keywords::keep_local(conn, account_id, &into.canonical_id, &label)?;
         if !labels.contains(&label) {
             labels.push(label);
         }
@@ -3162,13 +3179,19 @@ fn apply_flag(
     flag: &crate::backend::FlagUpdate,
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
+    if let (Some(copy), Some(keywords)) = (&copy, &flag.keywords) {
+        keywords::observe(conn, account_id, copy, flag.modseq, keywords)?;
+    }
+    let Some(server_unread) = flag.unread else {
+        return Ok(());
+    };
     if let (Some(copy), Some(modseq)) = (&copy, flag.modseq)
         && !copies::observe_flags(
             conn,
             account_id,
             copy,
             copies::CopyFlags {
-                seen: Some(!flag.unread),
+                seen: Some(!server_unread),
                 flagged: flag.flagged,
                 modseq: Some(modseq),
             },
@@ -3195,7 +3218,7 @@ fn apply_flag(
         if let Some(copy) = &copy
             && let Some(message_id) = copies::row_of(conn, account_id, copy)?
         {
-            crate::actions::fold_flag_into_snapshots(conn, account_id, &message_id, flag.unread)?;
+            crate::actions::fold_flag_into_snapshots(conn, account_id, &message_id, server_unread)?;
         }
         return Ok(());
     }
@@ -3211,7 +3234,7 @@ fn apply_flag(
             account_id,
             &message_id,
             &flag.remote_id.0,
-            flag.unread,
+            server_unread,
         )?;
         update.execute(params![i64::from(unread), account_id.as_str(), message_id])?;
     }
@@ -7518,8 +7541,9 @@ mod tests {
                     messages: Vec::new(),
                     flags: vec![crate::backend::FlagUpdate {
                         remote_id: RemoteId("imap:sent".into()),
-                        unread: false,
+                        unread: Some(false),
                         flagged: None,
+                        keywords: None,
                         modseq: None,
                     }],
                     cursor: None,

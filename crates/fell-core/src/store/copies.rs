@@ -41,10 +41,19 @@ CREATE TABLE IF NOT EXISTS message_copies (
     seen INTEGER,
     flagged INTEGER,
     seen_handled INTEGER NOT NULL DEFAULT 0,
+    keywords TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account_id, mailbox, uidvalidity, uid)
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_copies_row ON message_copies(account_id, message_id);
+
+CREATE TABLE IF NOT EXISTS message_keyword_labels (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    labels TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS copy_orphans (
     account_id TEXT NOT NULL,
@@ -57,7 +66,7 @@ CREATE TABLE IF NOT EXISTS copy_orphans (
 /// Create the tables. The first time, record the one copy each row and alias
 /// already names, so mail synced before this table existed can still go.
 pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
-    if has_flag_column(conn, "seen_handled")? {
+    if has_flag_column(conn, "keywords")? {
         return conn.execute_batch(COPIES_SCHEMA).map_err(Into::into);
     }
     // One transaction: a large mailbox is not one commit per row, and a
@@ -70,6 +79,7 @@ pub(super) fn ensure_copies(conn: &Connection) -> Result<()> {
         ("seen", "INTEGER"),
         ("flagged", "INTEGER"),
         ("seen_handled", "INTEGER NOT NULL DEFAULT 0"),
+        ("keywords", "TEXT NOT NULL DEFAULT ''"),
     ] {
         if !has_flag_column(&tx, name)? {
             tx.execute_batch(&format!(
@@ -658,9 +668,13 @@ pub(super) fn settle(conn: &Connection, account_id: &AccountId, settle: Settle) 
     };
     let mut changed = false;
     let mut deleted = HashSet::new();
+    let mut checked_keywords = HashSet::new();
     for (message_id, folder) in queued {
         if deleted.contains(&message_id) {
             continue;
+        }
+        if checked_keywords.insert(message_id.clone()) {
+            changed |= super::keywords::reconcile(conn, account_id, &message_id, &[], true)?;
         }
         let done = settle_one(conn, account_id, &message_id, &folder, settle, &mut changed)?;
         match done {

@@ -44,6 +44,8 @@ pub(super) struct Examined {
 pub(super) struct Fetched {
     pub uid: u32,
     pub flags: Vec<String>,
+    /// A body reply can omit FLAGS. Only a present list is keyword evidence.
+    pub flags_present: bool,
     pub modseq: Option<u64>,
     pub body: Vec<u8>,
     /// The body was larger than the cap. The UID is kept so the checkpoint
@@ -1650,11 +1652,12 @@ fn parse_fetch(text: &str, mut literals: Vec<LiteralBytes>) -> Option<Fetched> {
         return None;
     }
     let uid = number_after(&upper, "UID ")?;
-    let flags = paren_after(text, "FLAGS").unwrap_or_default();
+    let flags = fetch_flags(text, &upper);
     let (body, skipped, body_missing) = body_after_body_key(text, &mut literals);
     Some(Fetched {
         uid,
-        flags,
+        flags_present: flags.is_some(),
+        flags: flags.unwrap_or_default(),
         modseq: fetch_modseq(&upper),
         body,
         skipped,
@@ -1674,7 +1677,8 @@ fn parse_flags(text: &str) -> Option<Fetched> {
     }
     Some(Fetched {
         uid: number_after(&upper, "UID ")?,
-        flags: paren_after(text, "FLAGS")?,
+        flags: fetch_flags(text, &upper)?,
+        flags_present: true,
         modseq: fetch_modseq(&upper),
         body: Vec::new(),
         skipped: false,
@@ -1684,10 +1688,24 @@ fn parse_flags(text: &str) -> Option<Fetched> {
 }
 
 fn fetch_modseq(upper: &str) -> Option<u64> {
-    // FETCH may contain quoted body text or nested lists. Only a top-level
-    // attribute can be a revision. Literal bytes are already out of band.
-    let (_, items) = upper.split_once("FETCH")?;
-    if !items.contains("MODSEQ (") {
+    fetch_list(upper, upper, "MODSEQ")?.parse().ok()
+}
+
+fn fetch_flags(text: &str, upper: &str) -> Option<Vec<String>> {
+    Some(
+        fetch_list(text, upper, "FLAGS")?
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn fetch_list<'a>(text: &'a str, upper: &str, key: &str) -> Option<&'a str> {
+    // A quoted body or a nested list can contain the key too. Literal bytes
+    // are already out of band.
+    let start = upper.find("FETCH")? + "FETCH".len();
+    let items = &upper[start..];
+    if !items.contains(key) {
         return None;
     }
     let mut depth = 0usize;
@@ -1702,9 +1720,15 @@ fn fetch_modseq(upper: &str) -> Option<u64> {
             _ if quoted => {}
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            b'M' if depth == 1 && matches!(items.as_bytes()[index - 1], b'(' | b' ') => {
-                if let Some(revision) = items[index..].strip_prefix("MODSEQ (") {
-                    return revision.split_once(')')?.0.parse().ok();
+            first
+                if depth == 1
+                    && first == key.as_bytes()[0]
+                    && matches!(items.as_bytes()[index - 1], b'(' | b' ')
+                    && items[index..].starts_with(key) =>
+            {
+                let rest = text[start + index + key.len()..].trim_start();
+                if let Some(list) = rest.strip_prefix('(') {
+                    return Some(list.split_once(')')?.0);
                 }
             }
             _ => {}
@@ -1873,17 +1897,6 @@ fn number_after(upper: &str, key: &str) -> Option<u32> {
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(after.len());
     after[..end].parse().ok()
-}
-
-fn paren_after(text: &str, key: &str) -> Option<Vec<String>> {
-    let upper = text.to_ascii_uppercase();
-    let key_upper = key.to_ascii_uppercase();
-    let index = upper.find(&key_upper)?;
-    let after = &text[index + key.len()..];
-    let start = after.find('(')?;
-    let end = after[start + 1..].find(')')?;
-    let inner = &after[start + 1..start + 1 + end];
-    Some(inner.split_whitespace().map(str::to_string).collect())
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
@@ -2218,6 +2231,14 @@ mod tests {
         let multibyte = super::parse_fetch("* 1 FETCH (UID 5 FLAGS () BODY[] éé)", Vec::new())
             .expect("a multibyte tail is not NIL");
         assert!(multibyte.body_missing);
+
+        let quoted_without_flags = super::parse_fetch(
+            "* 1 FETCH (UID 5 BODY[] \"text with FLAGS (false-keyword)\")",
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!quoted_without_flags.flags_present);
+        assert!(multibyte.flags_present);
     }
 
     #[test]

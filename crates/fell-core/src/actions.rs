@@ -731,6 +731,15 @@ fn record_and_apply(
         finish_purge(conn, id, account_id)?;
     }
     for plan in plans {
+        if kind == ActionKind::Label {
+            crate::store::keywords::keep_local_additions(
+                conn,
+                account_id,
+                &plan.before.message_id,
+                &plan.before.labels,
+                &plan.labels,
+            )?;
+        }
         apply_plan(conn, account_id, plan)?;
     }
     Ok(LocalAction {
