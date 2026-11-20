@@ -1,0 +1,71 @@
+Fell issue #113 evidence
+Feature commit  cba285719b7a04786418285f37403bb3e79fdafc
+Baseline commit 22283b98bb722e4acf4e5ef3078947195a82c1c9
+
+Matched screenshots
+Each pair shows the same synthetic message and window size.
+
+wide-dark · 1360×840 · Tokyo Night
+   1  before  /home/caleb/.cache/fell-113-evidence/before/wide-dark-01.png
+   1  after   /home/caleb/.cache/fell-113-evidence/after/wide-dark-01.png
+   3  before  /home/caleb/.cache/fell-113-evidence/before/wide-dark-03.png
+   3  after   /home/caleb/.cache/fell-113-evidence/after/wide-dark-03.png
+  12  before  /home/caleb/.cache/fell-113-evidence/before/wide-dark-12.png
+  12  after   /home/caleb/.cache/fell-113-evidence/after/wide-dark-12.png
+
+wide-light · 1360×840 · Catppuccin Latte
+   1  before  /home/caleb/.cache/fell-113-evidence/before/wide-light-01.png
+   1  after   /home/caleb/.cache/fell-113-evidence/after/wide-light-01.png
+   3  before  /home/caleb/.cache/fell-113-evidence/before/wide-light-03.png
+   3  after   /home/caleb/.cache/fell-113-evidence/after/wide-light-03.png
+  12  before  /home/caleb/.cache/fell-113-evidence/before/wide-light-12.png
+  12  after   /home/caleb/.cache/fell-113-evidence/after/wide-light-12.png
+
+narrow-dark · 700×820 · Tokyo Night
+   1  before  /home/caleb/.cache/fell-113-evidence/before/narrow-dark-01.png
+   1  after   /home/caleb/.cache/fell-113-evidence/after/narrow-dark-01.png
+   3  before  /home/caleb/.cache/fell-113-evidence/before/narrow-dark-03.png
+   3  after   /home/caleb/.cache/fell-113-evidence/after/narrow-dark-03.png
+  12  before  /home/caleb/.cache/fell-113-evidence/before/narrow-dark-12.png
+  12  after   /home/caleb/.cache/fell-113-evidence/after/narrow-dark-12.png
+
+narrow-light · 700×820 · Catppuccin Latte
+   1  before  /home/caleb/.cache/fell-113-evidence/before/narrow-light-01.png
+   1  after   /home/caleb/.cache/fell-113-evidence/after/narrow-light-01.png
+   3  before  /home/caleb/.cache/fell-113-evidence/before/narrow-light-03.png
+   3  after   /home/caleb/.cache/fell-113-evidence/after/narrow-light-03.png
+  12  before  /home/caleb/.cache/fell-113-evidence/before/narrow-light-12.png
+  12  after   /home/caleb/.cache/fell-113-evidence/after/narrow-light-12.png
+
+Keyboard recording (16 seconds)
+  /home/caleb/.cache/fell-113-evidence/keyboard/keyboard.mp4
+  Captures focus, motion, download progress, retry, collision naming, executable
+  confirmation, partial Save All with retry, and forwarding three files.
+
+Proof and additional screenshots
+  /home/caleb/.cache/fell-113-evidence/keyboard/downloading.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/error-retry.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/confirm.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/save-all-partial.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/forward.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/forward-twelve-narrow.png
+  /home/caleb/.cache/fell-113-evidence/keyboard/verified.json
+  /home/caleb/.cache/fell-113-evidence/keyboard/forward-twelve.json
+
+Checks · 1,251 tests passed · 6 ignored
+  cargo fmt --all -- --check
+  cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+  cargo test --locked --workspace --all-features
+  cargo deny --locked check
+  /home/caleb/.cache/fell-113-evidence/build.log
+  /home/caleb/.cache/fell-113-evidence/clippy.log
+  /home/caleb/.cache/fell-113-evidence/test.log
+  /home/caleb/.cache/fell-113-evidence/deny.log
+
+Capture harness
+  Runs a loopback synthetic IMAP server and headless Wayland with separate cache,
+  config, mailbox, Downloads, and draft directories. The opener only logs
+  the requested path and file permissions.
+  /home/caleb/.cache/fell-113-evidence/imap.py
+  /home/caleb/.cache/fell-113-evidence/display.sh
+  /home/caleb/.cache/fell-113-evidence/capture.py

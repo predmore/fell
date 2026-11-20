@@ -1,0 +1,50 @@
+{
+  "opener_calls": [
+    {
+      "path": "/home/caleb/.cache/fell-113-evidence/mailbox.keyboard.TKE9AtTy/cache/fell/parts/94b38bd52be77967aad06692eb93233a/Field notes.pdf",
+      "size": 3249784,
+      "mode": "0o600"
+    },
+    {
+      "path": "/home/caleb/.cache/fell-113-evidence/mailbox.keyboard.TKE9AtTy/cache/fell/parts/93f90f9243c2c7dadc73e3759a6b0572/Open field kit.desktop",
+      "size": 55,
+      "mode": "0o600"
+    }
+  ],
+  "saved_files": [
+    {
+      "name": "Field notes (1).pdf",
+      "bytes": 3249784
+    },
+    {
+      "name": "Field notes (2).pdf",
+      "bytes": 3249784
+    },
+    {
+      "name": "Field notes.pdf",
+      "bytes": 13
+    },
+    {
+      "name": "Open field kit.desktop",
+      "bytes": 55
+    },
+    {
+      "name": "Site plan.png",
+      "bytes": 36071
+    }
+  ],
+  "forwarded_files": [
+    [
+      "Field notes.pdf",
+      3249784
+    ],
+    [
+      "Open field kit.desktop",
+      55
+    ],
+    [
+      "Site plan.png",
+      36071
+    ]
+  ]
+}
