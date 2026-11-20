@@ -1,0 +1,4 @@
+Before fix, after archive
+MÜNCHEN|Archive
+After fix, after archive
+INBOX|Archive
