@@ -1,0 +1,11 @@
+after-dark: pixels in 263x21+16+56 matched before, after addition, and after removal.
+after-dark: pixels in 31x21+449+56 matched before, after addition, and after removal.
+after-dark: two flag-only CHANGEDSINCE updates, no body fetch after initial sync.
+after-light: pixels in 263x21+16+56 matched before, after addition, and after removal.
+after-light: pixels in 31x21+449+56 matched before, after addition, and after removal.
+after-light: two flag-only CHANGEDSINCE updates, no body fetch after initial sync.
+after-narrow: pixels in 249x21+16+56 matched before, after addition, and after removal.
+after-narrow: pixels in 33x21+413+56 matched before, after addition, and after removal.
+after-narrow: two flag-only CHANGEDSINCE updates, no body fetch after initial sync.
+after-metadata: pixels in 255x21+16+56 matched before, after addition, and after removal.
+after-metadata: two flag-only CHANGEDSINCE updates, no body fetch after initial sync.
