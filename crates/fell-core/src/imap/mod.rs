@@ -30,6 +30,8 @@ pub(crate) use rfc822::{
 #[cfg(test)]
 mod first_sync_tests;
 #[cfg(test)]
+mod keyword_sync_tests;
+#[cfg(test)]
 pub(crate) mod mime_fixtures;
 #[cfg(test)]
 mod sync_tests;
@@ -261,6 +263,7 @@ pub(crate) fn fetch_imap(
     config: &ImapConfig,
     cursor: Option<&SyncCursor>,
     known: &KnownCopies<'_>,
+    keywords: bool,
     mut persist: impl FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if config.username.is_empty() {
@@ -284,6 +287,7 @@ pub(crate) fn fetch_imap(
         account_id,
         listed: &mailboxes,
         known,
+        keywords,
         prior: decode_cursor(cursor).into_iter().collect(),
         done: HashMap::new(),
         // Every mailbox was read to the end, so a copy moved on the server
@@ -370,6 +374,7 @@ struct Pass<'a> {
     account_id: &'a AccountId,
     listed: &'a [session::Listed],
     known: &'a KnownCopies<'a>,
+    keywords: bool,
     /// The checkpoints the pass started from.
     prior: HashMap<String, MailboxCheckpoint>,
     /// Checkpoints this pass wrote.
@@ -491,6 +496,7 @@ fn catch_up(
                 uidnext: None,
                 pruned: None,
                 floor: Some(next),
+                keyword_baseline: pass.keywords,
             },
         );
         return Ok(true);
@@ -502,6 +508,11 @@ fn catch_up(
         .filter(|_| same_validity)
         .and_then(|prev| prev.floor);
     let walking = floor.is_some();
+    let keyword_baseline = pass.keywords
+        && (!same_validity
+            || previous_owned
+                .as_ref()
+                .is_some_and(|prev| prev.keyword_baseline));
     let plan = plan_fetch(previous_owned.as_ref(), examined);
     // High-water body fetches ignore UIDs already at the checkpoint.
     // CHANGEDSINCE results are kept so an older flag update is applied.
@@ -555,6 +566,7 @@ fn catch_up(
             uidnext: None,
             pruned: carried_pruned,
             floor,
+            keyword_baseline,
         };
         emit_progress(
             persist,
@@ -585,7 +597,7 @@ fn catch_up(
                 if seen_through.is_none_or(|floor| uid > floor) {
                     stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                 }
-                pending_flags.push(flag_update(uidvalidity, &escaped, &item));
+                pending_flags.push(flag_update(uidvalidity, &escaped, &item, pass.keywords));
                 if pending_flags.len() >= BATCH_FLAGS {
                     flush_batch(
                         &mut batch,
@@ -616,9 +628,7 @@ fn catch_up(
             return Ok(());
         }
         let raw_len = item.body.len();
-        if item.modseq.is_some() {
-            pending_flags.push(flag_update(uidvalidity, &escaped, &item));
-        }
+        pending_flags.extend(arrival_flags(uidvalidity, &escaped, &item, pass.keywords));
         batch.push(rfc822::to_message(
             account_id,
             &mailbox.raw,
@@ -684,7 +694,7 @@ fn catch_up(
             Ok(rows) => {
                 flags.extend(
                     rows.iter()
-                        .map(|item| flag_update(uidvalidity, &escaped, item)),
+                        .map(|item| flag_update(uidvalidity, &escaped, item, pass.keywords)),
                 );
             }
             Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
@@ -738,18 +748,13 @@ fn catch_up(
     if !walking {
         pass.complete &= clean;
     }
+    let seen = Seen {
+        uidvalidity,
+        uidnext,
+        exists,
+    };
     let tracked = if clean && !walking {
-        track_removals(
-            session,
-            mailbox,
-            Seen {
-                uidvalidity,
-                uidnext,
-                exists,
-            },
-            previous_owned.as_ref(),
-            &plan,
-        )?
+        track_removals(session, mailbox, seen, previous_owned.as_ref(), &plan)?
     } else {
         Tracked {
             removals: Vec::new(),
@@ -759,7 +764,7 @@ fn catch_up(
     if finished && let Some(next) = uidnext {
         pass.caught_up.insert(mailbox.raw.clone(), next);
     }
-    let current = MailboxCheckpoint {
+    let mut current = MailboxCheckpoint {
         uidvalidity,
         uid,
         modseq,
@@ -767,6 +772,7 @@ fn catch_up(
         uidnext: if finished && !walking { uidnext } else { None },
         pruned: tracked.pruned,
         floor,
+        keyword_baseline,
     };
     emit_progress(
         persist,
@@ -776,6 +782,9 @@ fn catch_up(
         flags,
         tracked.removals,
     )?;
+    if clean && !walking {
+        upgrade_keyword_baseline(pass, session, mailbox, seen, &mut current, persist)?;
+    }
     pass.done.insert(mailbox.raw.clone(), current);
     Ok(walking)
 }
@@ -930,7 +939,12 @@ fn walk_down(
         let mut wanted: Vec<(u32, u32)> = Vec::new();
         for row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
-                flags.push(flag_update(checkpoint.uidvalidity, &escaped, &row));
+                flags.push(flag_update(
+                    checkpoint.uidvalidity,
+                    &escaped,
+                    &row,
+                    pass.keywords,
+                ));
                 continue;
             }
             if rfc822::is_deleted(&row.flags) {
@@ -947,9 +961,7 @@ fn walk_down(
                     &row.body,
                 );
                 header_ids.insert(row.uid, header.headers.message_id.clone());
-                let learned = row
-                    .modseq
-                    .map(|_| flag_update(checkpoint.uidvalidity, &escaped, &row));
+                let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, pass.keywords);
                 headers.push((header, learned));
             }
             wanted.push((row.uid, row.size.unwrap_or(0)));
@@ -1028,9 +1040,12 @@ fn walk_down(
                         return Ok(());
                     }
                     batch_bytes += item.body.len();
-                    if item.modseq.is_some() {
-                        body_flags.push(flag_update(checkpoint.uidvalidity, &escaped, &item));
-                    }
+                    body_flags.extend(arrival_flags(
+                        checkpoint.uidvalidity,
+                        &escaped,
+                        &item,
+                        pass.keywords,
+                    ));
                     batch.push(rfc822::to_message(
                         pass.account_id,
                         &mailbox.raw,
@@ -1114,7 +1129,7 @@ fn walk_down(
     // read every flag once more. Keep floor=1 on failure so the next pass
     // retries this sweep without downloading the windows again.
     let flags = if examined.highest_modseq.is_none() {
-        let Some(flags) = walk_flags(session, mailbox, seen, &escaped)? else {
+        let Some(flags) = walk_flags(session, mailbox, seen, &escaped, pass.keywords)? else {
             pass.complete = false;
             return Ok(Walked::Stopped);
         };
@@ -1148,8 +1163,42 @@ fn walk_down(
         flags,
         tracked.removals,
     )?;
+    upgrade_keyword_baseline(pass, session, mailbox, seen, &mut checkpoint, persist)?;
     pass.done.insert(mailbox.raw.clone(), checkpoint);
     Ok(Walked::Finished)
+}
+
+/// A cursor from before keyword tracking can already be at HIGHESTMODSEQ.
+/// Read FLAGS for every UID once after the ordinary sync records the copies.
+fn upgrade_keyword_baseline(
+    pass: &Pass<'_>,
+    session: &mut session::Session,
+    mailbox: &session::Listed,
+    seen: Seen,
+    checkpoint: &mut MailboxCheckpoint,
+    persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if pass.keywords
+        && !checkpoint.keyword_baseline
+        && let Some(mut flags) =
+            walk_flags(session, mailbox, seen, &escape_mailbox(&mailbox.raw), true)?
+    {
+        // Revisions still guard keyword observations. Leave read state and
+        // pending flag intents to the ordinary delta for this mailbox.
+        for flag in &mut flags {
+            flag.unread = None;
+        }
+        checkpoint.keyword_baseline = true;
+        emit_progress(
+            persist,
+            &pass.snapshot(),
+            Some((&mailbox.raw, checkpoint)),
+            Vec::new(),
+            flags,
+            Vec::new(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Refresh flags in bounded UID sets. An incomplete reply leaves the sweep
@@ -1159,6 +1208,7 @@ fn walk_flags(
     mailbox: &session::Listed,
     seen: Seen,
     escaped: &str,
+    keywords: bool,
 ) -> Result<Option<Vec<FlagUpdate>>, Error> {
     let Some((uids, _)) = list_mailbox(session, mailbox, seen, false)? else {
         return Ok(None);
@@ -1178,7 +1228,7 @@ fn walk_flags(
         }
         flags.extend(
             rows.iter()
-                .map(|row| flag_update(seen.uidvalidity, escaped, row)),
+                .map(|row| flag_update(seen.uidvalidity, escaped, row, keywords)),
         );
     }
     Ok(Some(flags))
@@ -1565,21 +1615,47 @@ fn uid_set(uids: &[u32]) -> String {
 }
 
 /// Flag evidence from one server copy.
-fn flag_update(uidvalidity: u32, escaped: &str, item: &session::Fetched) -> FlagUpdate {
+fn flag_update(
+    uidvalidity: u32,
+    escaped: &str,
+    item: &session::Fetched,
+    keywords: bool,
+) -> FlagUpdate {
     let uid = item.uid;
     FlagUpdate {
         remote_id: RemoteId(format!("imap:{uidvalidity}:{uid}:{escaped}")),
-        unread: !item
-            .flags
-            .iter()
-            .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        unread: Some(
+            !item
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+        ),
         flagged: Some(
             item.flags
                 .iter()
                 .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
         ),
+        keywords: (keywords && item.flags_present).then(|| rfc822::keyword_labels(&item.flags)),
         modseq: item.modseq,
     }
+}
+
+/// With no revision, a new row already applied unread as part of its arrival.
+/// Remember its keywords without applying a second read observation.
+fn arrival_flags(
+    uidvalidity: u32,
+    escaped: &str,
+    item: &session::Fetched,
+    keywords: bool,
+) -> Option<FlagUpdate> {
+    if item.modseq.is_none() && !(keywords && item.flags_present) {
+        return None;
+    }
+    let mut update = flag_update(uidvalidity, escaped, item, keywords);
+    if item.modseq.is_none() {
+        update.unread = None;
+    }
+    Some(update)
 }
 
 struct Snapshot<'a> {
@@ -1803,6 +1879,9 @@ pub struct MailboxCheckpoint {
     /// `None` once it reaches the oldest message, and for cursors from
     /// before first syncs read newest first.
     pub floor: Option<u32>,
+    /// This UIDVALIDITY started with keyword tracking or finished its
+    /// upgrade sweep. Older cursors and Bridge cursors omit the marker.
+    pub keyword_baseline: bool,
 }
 
 /// Decode a sync cursor written by [`encode_cursor`].
@@ -1865,6 +1944,11 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 None => return Vec::new(),
             },
         };
+        let keyword_baseline = match parts.next() {
+            None => false,
+            Some("keywords") => true,
+            Some(_) => return Vec::new(),
+        };
         if parts.next().is_some() {
             return Vec::new();
         }
@@ -1877,6 +1961,7 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 uidnext,
                 pruned,
                 floor,
+                keyword_baseline,
             },
         ));
     }
@@ -1917,6 +2002,11 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
         if let Some(floor) = checkpoint.floor {
             token.push('\t');
             token.push_str(&floor.to_string());
+        } else if checkpoint.keyword_baseline {
+            token.push_str("\t-");
+        }
+        if checkpoint.keyword_baseline {
+            token.push_str("\tkeywords");
         }
     }
     SyncCursor {
@@ -2008,6 +2098,7 @@ mod tests {
                     uidnext: None,
                     pruned: None,
                     floor: None,
+                    keyword_baseline: true,
                 },
             ),
             (
@@ -2019,6 +2110,7 @@ mod tests {
                     uidnext: None,
                     pruned: None,
                     floor: None,
+                    keyword_baseline: false,
                 },
             ),
         ];
@@ -2038,6 +2130,7 @@ mod tests {
                 uidnext: Some(77),
                 pruned: Some((12, 77)),
                 floor: None,
+                keyword_baseline: false,
             },
         )];
         let cursor = encode_cursor("acct", &mailboxes);
@@ -2050,6 +2143,7 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].1.uid, 40);
         assert_eq!(decoded[0].1.uidnext, None);
+        assert!(!decoded[0].1.keyword_baseline);
     }
 
     #[test]

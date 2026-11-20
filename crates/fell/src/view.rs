@@ -894,6 +894,9 @@ impl Inbox {
         // each write is read again for it, whichever message it fills.
         let waiting =
             self.open_thread.is_some() && present::awaiting_bodies(&self.session.messages);
+        for row in &rows {
+            self.row_widths.observe_labels(&row.id, &row.labels, now);
+        }
         self.session.set_page(rows, more_before, more_after, unread);
         if let Some(key) = &intent.select {
             self.session.select_if_present(&key.thread_id.0);
@@ -1067,6 +1070,7 @@ impl Inbox {
                                         ghost: true,
                                         bar_dx: 0.0,
                                         frame: still_frame(&chunk[index], window),
+                                        previous_labels: None,
                                     };
                                     thread_row(
                                         &row_theme,
@@ -3586,6 +3590,11 @@ fn thread_list(
                             now,
                             drawn,
                         );
+                        let previous_labels = if drawn {
+                            inbox.row_widths.labels_frame(&row.id, &row.labels, now)
+                        } else {
+                            None
+                        };
                         let selected = highlighted.contains(&row.id);
                         let look = RowLook {
                             selected,
@@ -3596,6 +3605,7 @@ fn thread_list(
                             ghost: false,
                             bar_dx,
                             frame,
+                            previous_labels,
                         };
                         let element =
                             thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
@@ -3628,6 +3638,7 @@ fn thread_list(
                                     ghost: true,
                                     bar_dx,
                                     frame: still_frame(&gone, window),
+                                    previous_labels: None,
                                 };
                                 slot_layer(dy, opacity).child(thread_row(
                                     &theme_for_rows,
@@ -3741,7 +3752,6 @@ struct StepBefore {
 }
 
 /// How a thread row is drawn.
-#[derive(Clone, Copy)]
 struct RowLook {
     selected: bool,
     /// The selection just left this row: how much of its highlight shows.
@@ -3752,6 +3762,7 @@ struct RowLook {
     bar_dx: f32,
     /// Its weight, star and subject box this frame.
     frame: RowFrame,
+    previous_labels: Option<(Vec<String>, f32)>,
 }
 
 /// The list's left border, which the unread bars sit just inside.
@@ -3837,7 +3848,15 @@ fn thread_row(
                 .flex_col()
                 .justify_center()
                 .gap(px(3.))
-                .child(thread_line_one(theme, row, frame, selected, window))
+                .child(thread_line_one(
+                    theme,
+                    row,
+                    frame,
+                    selected,
+                    text_width,
+                    look.previous_labels,
+                    window,
+                ))
                 .child(thread_line_two(
                     theme,
                     row,
@@ -3850,11 +3869,15 @@ fn thread_row(
         .into_any_element()
 }
 
+const THREAD_LINE_GAP: f32 = 8.0;
+
 fn thread_line_one(
     theme: &Theme,
     row: &ThreadRow,
     frame: RowFrame,
     selected: bool,
+    text_width: f32,
+    previous_labels: Option<(Vec<String>, f32)>,
     window: &Window,
 ) -> gpui::Div {
     let dim = if selected {
@@ -3862,32 +3885,67 @@ fn thread_line_one(
     } else {
         theme.dimmed
     };
+    let count = (row.message_count > 1).then(|| row.message_count.to_string());
+    let date = present::relative_date(now_unix(), row.date_unix);
+    let size = theme.ui_px - 1.0;
+    let style = conversation_line_style(window, theme, px(size));
+    let date_width = line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil();
+    let count_width = count.as_deref().map_or(0.0, |count| {
+        line_px_with_style(window, &style, count, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+    });
+    let attachment_width = if row.has_attachment {
+        line_px(window, "⧉", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+    } else {
+        0.0
+    };
+    // The sender, spacer, star, and date need three gaps. Optional metadata
+    // and the label group each need one more. Reserve metadata first so the
+    // same sender span fits both with and without labels.
+    let room = (text_width
+        - date_width
+        - count_width
+        - attachment_width
+        - STAR_SLOT
+        - 3.0 * THREAD_LINE_GAP)
+        .max(0.0);
+    let sender_limit = room.min(text_width * 0.60).floor();
+    let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
+    let labels = if row.labels.is_empty() && previous_labels.is_none() {
+        None
+    } else {
+        thread_label_group(
+            theme,
+            row,
+            selected,
+            dim,
+            (room - sender_width - THREAD_LINE_GAP).max(0.0),
+            previous_labels,
+            window,
+        )
+    };
     div()
         .h(px(22.))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.))
+        .gap(px(THREAD_LINE_GAP))
         .min_w(px(0.))
         .overflow_hidden()
-        .child(names(theme, row, frame, selected, window))
-        .when(row.message_count > 1, |line| {
+        .child(sender)
+        .when_some(count, |line, count| {
             line.child(
                 div()
+                    .flex_none()
                     .text_color(rgb(dim))
-                    .text_size(px(theme.ui_px - 1.0))
-                    .child(row.message_count.to_string()),
+                    .text_size(px(size))
+                    .child(count),
             )
         })
         .when(row.has_attachment, |line| {
-            line.child(div().text_color(rgb(dim)).child("⧉"))
+            line.child(div().flex_none().text_color(rgb(dim)).child("⧉"))
         })
-        .children(
-            row.labels.iter().take(2).enumerate().map(|(index, label)| {
-                label_chip(theme, label, row.warn && index == 0, selected, dim)
-            }),
-        )
-        .child(div().flex_1())
+        .children(labels)
+        .child(div().flex_1().min_w(px(0.)))
         // A fixed slot every row keeps, so starring never moves the line.
         // The star fades in as it grows to full size, and out as it shrinks.
         .child(
@@ -3909,17 +3967,126 @@ fn thread_line_one(
         )
         .child(
             div()
+                .flex_none()
                 .text_color(rgb(dim))
-                .text_size(px(theme.ui_px - 1.0))
-                .child(present::relative_date(now_unix(), row.date_unix)),
+                .text_size(px(size))
+                .child(date),
         )
+}
+
+const LABEL_GAP: f32 = 8.0;
+const LABEL_CHIP_CHROME: f32 = 14.0;
+const LABEL_CHIP_MAX: f32 = 144.0;
+
+fn thread_label_group(
+    theme: &Theme,
+    row: &ThreadRow,
+    selected: bool,
+    dim: u32,
+    room: f32,
+    previous: Option<(Vec<String>, f32)>,
+    window: &Window,
+) -> Option<gpui::Div> {
+    let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
+    let layout = |labels: &[String]| {
+        let mut width = 0.0;
+        let mut chips = Vec::new();
+        let overflow = |hidden| format!("+{hidden}");
+        for (index, label) in labels.iter().take(2).enumerate() {
+            let hidden = labels.len() - index - 1;
+            let reserve = if hidden > 0 {
+                line_px_with_style(window, &style, &overflow(hidden), FontWeight::NORMAL).ceil()
+                    + LABEL_CHIP_CHROME
+                    + LABEL_GAP
+            } else {
+                0.0
+            };
+            let gap = if chips.is_empty() { 0.0 } else { LABEL_GAP };
+            let budget = (room - width - gap - reserve).min(LABEL_CHIP_MAX) - LABEL_CHIP_CHROME;
+            if budget <= 0.0 {
+                break;
+            }
+            let label = present::display_safe(label);
+            let Some(line) = clip_shaped(window, &style, &label, budget, FontWeight::NORMAL, None)
+            else {
+                break;
+            };
+            let chip_width = f32::from(line.width).ceil() + LABEL_CHIP_CHROME;
+            if chip_width > budget + LABEL_CHIP_CHROME || (line.text == "…" && label != "…") {
+                break;
+            }
+            width += gap + chip_width;
+            chips.push(label_chip(
+                theme,
+                line.text,
+                chip_width,
+                row.warn && index == 0,
+                selected,
+                dim,
+            ));
+        }
+        let hidden = labels.len() - chips.len();
+        if hidden > 0 {
+            let text = overflow(hidden);
+            let chip_width = line_px_with_style(window, &style, &text, FontWeight::NORMAL).ceil()
+                + LABEL_CHIP_CHROME;
+            let gap = if chips.is_empty() { 0.0 } else { LABEL_GAP };
+            if width + gap + chip_width <= room {
+                width += gap + chip_width;
+                chips.push(label_chip(
+                    theme,
+                    text.into(),
+                    chip_width,
+                    false,
+                    selected,
+                    dim,
+                ));
+            }
+        }
+        let group = div()
+            .flex()
+            .flex_row()
+            .gap(px(LABEL_GAP))
+            .w(px(width))
+            .children(chips);
+        (width, group)
+    };
+    let (width, group) = layout(&row.labels);
+    if let Some((previous, shown)) = previous {
+        let (old_width, old_group) = layout(&previous);
+        if old_width.max(width) > 0.0 {
+            return Some(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w(px(old_width.max(width)))
+                    .h(px(LABEL_CHIP_PX))
+                    .child(group.opacity(shown))
+                    .child(
+                        old_group
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .opacity(1.0 - shown),
+                    ),
+            );
+        }
+    }
+    (width > 0.0).then(|| group.flex_none())
 }
 
 /// A label on a row: an outline that fits inside the 22 px line, so all
 /// four of its edges show. A warning is in the error colour, which holds
 /// AA on the selection as well as on the page. On a selected row the
 /// outline is drawn from the selection, so it stays as visible there.
-fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) -> gpui::Div {
+fn label_chip(
+    theme: &Theme,
+    label: SharedString,
+    width: f32,
+    warn: bool,
+    selected: bool,
+    dim: u32,
+) -> gpui::Div {
     let size = (theme.ui_px - 2.0).max(11.0);
     let outline = match (warn, selected) {
         (true, _) => theme.error,
@@ -3927,8 +4094,11 @@ fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) 
         (false, false) => theme.border,
     };
     div()
-        .flex_shrink_0()
+        .flex_none()
+        .w(px(width))
         .h(px(LABEL_CHIP_PX))
+        .overflow_hidden()
+        .whitespace_nowrap()
         .flex()
         .items_center()
         .px(px(6.))
@@ -3938,7 +4108,7 @@ fn label_chip(theme: &Theme, label: &str, warn: bool, selected: bool, dim: u32) 
         .text_size(px(size))
         .line_height(px(size + 2.0))
         .text_color(rgb(if warn { theme.error } else { dim }))
-        .child(label.to_string())
+        .child(label)
 }
 
 /// A row chip's height, border included: under the 22 px line it sits on.
@@ -3965,8 +4135,9 @@ fn names(
     row: &ThreadRow,
     frame: RowFrame,
     selected: bool,
+    limit: f32,
     window: &Window,
-) -> gpui::Div {
+) -> (gpui::Div, f32) {
     let dim = if selected {
         theme.on_selection
     } else {
@@ -3996,7 +4167,8 @@ fn names(
             .collect()
     };
     let extra_text = (extra > 0).then(|| format!("+{extra}"));
-    let width = (parts(true)
+    let bold_parts = parts(true);
+    let width = (bold_parts
         .iter()
         .map(|(text, span_weight)| line_px(window, text, *span_weight))
         .sum::<f32>()
@@ -4010,24 +4182,50 @@ fn names(
         theme.foreground
     };
     let mut line = div().flex().flex_row().whitespace_nowrap();
-    for (text, span_weight) in parts(frame.bold) {
+    if width > limit {
+        let names: String = bold_parts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .chain(extra_text.as_deref())
+            .collect();
+        let visible = clip_line(
+            window,
+            &window.text_style(),
+            &names,
+            limit,
+            FontWeight::BOLD,
+        );
         line = line.child(
             div()
                 .flex_none()
-                .font_weight(span_weight)
+                .font_weight(row_weight(frame.bold))
                 .text_color(rgb(text_color))
-                .child(text),
+                .child(visible),
         );
+    } else {
+        for (text, span_weight) in parts(frame.bold) {
+            line = line.child(
+                div()
+                    .flex_none()
+                    .font_weight(span_weight)
+                    .text_color(rgb(text_color))
+                    .child(text),
+            );
+        }
+        if let Some(text) = extra_text {
+            line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
+        }
     }
-    if let Some(text) = extra_text {
-        line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
-    }
-    div()
-        .relative()
-        .w(px(width))
-        .min_w(px(0.))
-        .overflow_hidden()
-        .child(line)
+    let width = width.min(limit);
+    (
+        div()
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .overflow_hidden()
+            .child(line),
+        width,
+    )
 }
 
 /// Line two: the subject and the snippet. `background` is the row's fill

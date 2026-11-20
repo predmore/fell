@@ -106,6 +106,8 @@ struct Kept {
     unread_transition: Option<(f32, bool, Transition)>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
+    labels: Option<Vec<String>>,
+    previous_labels: Option<(Vec<String>, Transition)>,
     /// The reader moved in the list: ease back to the text on the next
     /// frame that draws the row.
     relax: bool,
@@ -144,6 +146,10 @@ impl Kept {
                 .unread_transition
                 .is_some_and(|(_, _, t)| t.running(now))
             || self.star.is_some_and(|t| t.running(now))
+            || self
+                .previous_labels
+                .as_ref()
+                .is_some_and(|(_, t)| t.running(now))
     }
 
     /// Wider than its text: it eases back when the reader next moves.
@@ -216,6 +222,8 @@ impl RowWidths {
                         starred,
                         unread_transition: None,
                         star: None,
+                        labels: None,
+                        previous_labels: None,
                         relax: false,
                     },
                 );
@@ -272,6 +280,38 @@ impl RowWidths {
         kept.frame(now)
     }
 
+    /// Start a fade when refreshed labels replace a visible row's labels.
+    pub fn observe_labels(&mut self, id: &str, labels: &[String], now: Instant) {
+        if let Some(kept) = self.rows.get_mut(id)
+            && kept.labels.as_deref() != Some(labels)
+        {
+            kept.previous_labels = kept
+                .labels
+                .replace(labels.to_vec())
+                .zip(self.motion.start(motion::FADE, now));
+        }
+    }
+
+    pub fn labels_frame(
+        &mut self,
+        id: &str,
+        labels: &[String],
+        now: Instant,
+    ) -> Option<(Vec<String>, f32)> {
+        self.observe_labels(id, labels, now);
+        let kept = self.rows.get_mut(id)?;
+        if kept
+            .previous_labels
+            .as_ref()
+            .is_some_and(|(_, t)| !t.running(now))
+        {
+            kept.previous_labels = None;
+        }
+        kept.previous_labels
+            .as_ref()
+            .map(|(labels, t)| (labels.clone(), t.progress(now)))
+    }
+
     /// The reader moved in the list (its cursor, or back to it): every box
     /// left wider than its text eases back on the next frame, with what
     /// that key moves.
@@ -288,6 +328,7 @@ impl RowWidths {
             kept.slide = None;
             kept.unread_transition = None;
             kept.star = None;
+            kept.previous_labels = None;
         }
     }
 
@@ -393,6 +434,30 @@ mod tests {
         assert_eq!(snippet_x(frame), BOLD.ceil() + SUBJECT_GAP);
         assert_eq!(frame.unread, 1.0);
         assert!(!widths.running(at(t0, 40)));
+    }
+
+    #[test]
+    fn labels_change_only_on_already_drawn_rows() {
+        let mut widths = RowWidths::default();
+        let t0 = Instant::now();
+        let original = ["triage".into()];
+        assert!(widths.labels_frame("t1", &original, t0).is_none());
+        draw(&mut widths, "t1", false, t0);
+        assert!(widths.labels_frame("t1", &original, t0).is_none());
+
+        let changed = at(t0, 16);
+        assert_eq!(
+            widths.labels_frame("t1", &[], changed),
+            Some((original.to_vec(), 0.0))
+        );
+        assert!(widths.running(at(t0, 40)));
+        assert!(widths.labels_frame("t1", &[], at(t0, 300)).is_none());
+
+        let mut reduced = RowWidths::new(Motion::new(false));
+        draw(&mut reduced, "t1", false, t0);
+        assert!(reduced.labels_frame("t1", &original, t0).is_none());
+        assert!(reduced.labels_frame("t1", &[], changed).is_none());
+        assert!(!reduced.running(changed));
     }
 
     #[test]
