@@ -100,15 +100,19 @@ pub(crate) fn locations(
     roles: &crate::FolderRoles,
     hits: &[SearchHit],
 ) -> Result<HashMap<MessageId, SearchLocation>> {
-    let filters: Vec<_> = parse_query(query)?
-        .folders
+    let inbox = roles.name(crate::FolderRole::Inbox);
+    let mut preferred = parse_query(query)?.folders;
+    let use_open_folder = preferred.is_empty();
+    if use_open_folder {
+        preferred.extend([current_folder.to_owned(), inbox.to_owned()]);
+    }
+    let preferred: Vec<_> = preferred
         .into_iter()
         .map(|name| {
             let folded = name.to_lowercase();
             (name, folded)
         })
         .collect();
-    let inbox = roles.name(crate::FolderRole::Inbox);
     let mut locations = HashMap::with_capacity(hits.len());
     for chunk in hits.chunks(128) {
         let marks = std::iter::repeat_n("?", chunk.len())
@@ -136,26 +140,28 @@ pub(crate) fn locations(
             if folders.is_empty() && !row.get::<_, bool>(2)? {
                 folders.push(inbox.to_owned());
             }
-            let folder = if filters.is_empty() {
-                [current_folder, inbox]
-                    .into_iter()
-                    .find_map(|preferred| {
-                        folders
-                            .iter()
-                            .find(|name| name.eq_ignore_ascii_case(preferred))
-                    })
-                    .or_else(|| folders.first())
+            let fallback = if use_open_folder {
+                folders.first()
             } else {
-                // Prefer the typed folder identity when distinct stored
-                // folders share a Unicode lowercase spelling.
-                filters.iter().find_map(|(typed, folded)| {
+                None
+            };
+            // Try each preference in order, using its stored identity when
+            // distinct folders share a Unicode lowercase spelling.
+            let folder = preferred
+                .iter()
+                .find_map(|(name, folded)| {
                     folders
                         .iter()
-                        .find(|name| name.eq_ignore_ascii_case(typed))
-                        .or_else(|| folders.iter().find(|name| name.to_lowercase() == *folded))
+                        .find(|stored| stored.eq_ignore_ascii_case(name))
+                        .or_else(|| {
+                            folders.iter().find(|stored| {
+                                stored.eq_ignore_ascii_case(folded)
+                                    || (!stored.is_ascii() && stored.to_lowercase() == *folded)
+                            })
+                        })
                 })
-            }
-            .cloned();
+                .or(fallback)
+                .cloned();
             let (unread, starred) = if let Some(folder) = &folder {
                 let includes_folder = |tokens: Option<String>| {
                     tokens.is_some_and(|tokens| {

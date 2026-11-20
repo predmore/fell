@@ -5309,6 +5309,16 @@ mod tests {
         let scope = &before[&hits[0].message_id];
         assert_eq!(scope.folder.as_deref(), Some("MÜNCHEN"));
         assert!(scope.unread);
+
+        let plain = "train";
+        let plain_hits = store.search(&account.id, plain).unwrap().hits;
+        assert_eq!(plain_hits, hits);
+        let from_open_folder = store
+            .search_locations(&account.id, plain, "München", &plain_hits)
+            .unwrap();
+        let scope = &from_open_folder[&message_id];
+        assert_eq!(scope.folder.as_deref(), Some("MÜNCHEN"));
+        assert!(scope.unread);
         store
             .archive_thread(&account.id, &thread, scope.folder.as_deref().unwrap())
             .unwrap();
