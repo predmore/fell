@@ -1,0 +1,18 @@
+before before-first-star
+venue-1@fell.test|INBOX|1
+venue-2@fell.test|Archive|0
+before after-first-star
+venue-1@fell.test|INBOX|0
+venue-2@fell.test|Archive|0
+final before-first-star
+venue-1@fell.test|INBOX|1
+venue-2@fell.test|Archive|0
+final after-first-star
+venue-1@fell.test|INBOX|1
+venue-2@fell.test|Archive|1
+final after-second-star
+venue-1@fell.test|INBOX|1
+venue-2@fell.test|Archive|0
+final after-undo
+venue-1@fell.test|INBOX|1
+venue-2@fell.test|Archive|1
