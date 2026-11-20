@@ -262,6 +262,7 @@ struct Inbox {
     folder_scroll: ScrollHandle,
     search_view: search::SearchView,
     search_preview: gpui::Entity<search::CachedPreview>,
+    search_rows: gpui::Entity<search::CachedRows>,
     conversation_revision: u64,
     split: f32,
     dragging: bool,
@@ -405,7 +406,8 @@ impl Inbox {
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
             search_view: search::SearchView::default(),
-            search_preview: cx.new(|_| search::CachedPreview::new(reader)),
+            search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
+            search_rows: cx.new(|_| search::CachedRows(reader)),
             conversation_revision: 0,
             split: startup.split,
             dragging: false,
@@ -3351,6 +3353,7 @@ impl Render for Inbox {
         let warm = self.warm_layer(width, panes, animating, window, cx);
         let subject = self.shown_subject();
         let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
+        let cached_search_rows = self.search_rows_for(animating);
         let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
             let selected = self.session.reply_target().filter(|_| {
                 self.open_thread.is_some() && self.open_thread == self.session.cursor_id
@@ -3370,6 +3373,7 @@ impl Render for Inbox {
                 card,
                 conv,
                 cached_preview,
+                cached_search_rows,
                 reply_check,
             },
             width,
@@ -3424,6 +3428,7 @@ struct Shown {
     /// What the conversation's bodies animate this frame.
     conv: ConvFrame,
     cached_preview: Option<(u64, gpui::AnyView)>,
+    cached_search_rows: Option<(u64, gpui::AnyView)>,
     reply_check: Option<ReplyCheck>,
 }
 
@@ -3508,6 +3513,7 @@ fn shell(
         card,
         conv,
         cached_preview,
+        cached_search_rows,
         reply_check,
     } = shown;
     let frames = conv.frames.clone();
@@ -3523,7 +3529,7 @@ fn shell(
     let swapped_out = swap.map(|swap| {
         let (pane, entry) = (swap.leaving, swap.out);
         let pane = match pane {
-            Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), cx),
+            Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), None, cx),
             Pane::Conversation => conversation(
                 &theme,
                 session,
@@ -3640,6 +3646,7 @@ fn shell(
                             show_conv,
                             if show_conv { list_width } else { width },
                             list_scroll,
+                            cached_search_rows,
                             cx,
                         ),
                         list_entry,
@@ -3847,8 +3854,46 @@ fn thread_list(
     beside: bool,
     list_width: f32,
     scroll: UniformListScrollHandle,
+    cached_results: Option<(u64, gpui::AnyView)>,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
+    let mut pane = div()
+        .id("thread-list")
+        .flex()
+        .flex_col()
+        .min_h(px(0.))
+        .min_w(px(0.))
+        .overflow_hidden()
+        .border_l(px(LIST_BORDER_PX))
+        .border_color(rgb(theme.border));
+    pane = if beside {
+        pane.w(px(list_width)).flex_none()
+    } else {
+        pane.flex_1()
+    };
+    if let Some(search) = &session.search {
+        let count = session.threads.len();
+        pane = pane.child(search::feedback(theme, search, count, cx));
+        return if count == 0 {
+            pane.child(empty_state(theme, session))
+        } else if let Some((revision, cached)) = cached_results {
+            pane.child(
+                div()
+                    .id(("cached-search-rows", revision))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(cached),
+            )
+        } else {
+            pane.child(search::rows(theme, count, scroll, cx))
+        };
+    }
+    if session.threads.is_empty() {
+        return pane.child(empty_state(theme, session));
+    }
+
     let entity = cx.entity();
     let theme_for_rows = theme.clone();
     let rows = uniform_list(
@@ -3860,13 +3905,6 @@ fn thread_list(
                 inbox.session.need_rows(Some(range.clone()));
                 if inbox.session.has_fetch() {
                     cx.defer_in(window, |inbox, _, cx| inbox.issue_fetch(cx));
-                }
-                if inbox.session.search.is_some() {
-                    inbox.queue_search_previews(range.clone(), window, cx);
-                    let highlighted = inbox.session.highlighted();
-                    return range
-                        .map(|index| search::row(&theme_for_rows, inbox, index, &highlighted, cx))
-                        .collect();
                 }
                 let highlighted = inbox.session.highlighted();
                 let text_width = row_text_width(list_width);
@@ -3988,28 +4026,7 @@ fn thread_list(
     .flex_1()
     .min_h(px(0.))
     .track_scroll(scroll);
-    let mut pane = div()
-        .id("thread-list")
-        .flex()
-        .flex_col()
-        .min_h(px(0.))
-        .min_w(px(0.))
-        .overflow_hidden()
-        .border_l(px(LIST_BORDER_PX))
-        .border_color(rgb(theme.border));
-    pane = if beside {
-        pane.w(px(list_width)).flex_none()
-    } else {
-        pane.flex_1()
-    };
-    if let Some(search) = &session.search {
-        pane = pane.child(search::feedback(theme, search, session.threads.len(), cx));
-    }
-    if session.threads.is_empty() {
-        pane.child(empty_state(theme, session))
-    } else {
-        pane.child(rows)
-    }
+    pane.child(rows)
 }
 
 /// The list's width beside the conversation in a window `width` wide.

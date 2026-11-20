@@ -30,6 +30,10 @@ pub(super) struct SearchView {
     pub(super) prefer: Option<String>,
     preview_key: Option<PreviewKey>,
     preview_revision: u64,
+    rows_key: Option<RowsKey>,
+    rows_revision: u64,
+    rows_previews: u64,
+    rows_were_current: bool,
     arrival: Option<motion::Transition>,
     settling_reply: Option<SearchReply>,
 }
@@ -41,6 +45,39 @@ struct PreviewKey {
     theme: Theme,
     offset: gpui::Pixels,
     split: f32,
+}
+
+#[derive(PartialEq)]
+struct RowsKey {
+    generation: u64,
+    previews: u64,
+    selected: HashSet<String>,
+    theme: Theme,
+    offset: f32,
+    minute: i64,
+}
+
+/// The results stay in place as the field and feedback change.
+pub(super) struct CachedRows(pub(super) gpui::WeakEntity<Inbox>);
+
+impl Render for CachedRows {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.0
+            .update(cx, |inbox, cx| {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(rows(
+                        &inbox.theme,
+                        inbox.session.threads.len(),
+                        inbox.list_scroll.clone(),
+                        cx,
+                    ))
+                    .into_any_element()
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
 }
 
 /// During field edits, a steady conversation can reuse its laid-out scene.
@@ -105,6 +142,49 @@ impl SearchView {
 }
 
 impl Inbox {
+    pub(super) fn search_rows_for(&mut self, animating: bool) -> Option<(u64, gpui::AnyView)> {
+        let search = self.session.search.as_ref().filter(|search| {
+            search.editing
+                && !animating
+                && !self.session.threads.is_empty()
+                && self
+                    .list_scroll
+                    .0
+                    .borrow()
+                    .deferred_scroll_to_item
+                    .is_none()
+        });
+        let Some((search, generation)) =
+            search.and_then(|search| Some((search, search.accepted_generation()?)))
+        else {
+            self.search_view.rows_key = None;
+            return None;
+        };
+        let key = RowsKey {
+            generation,
+            previews: self.search_view.rows_previews,
+            selected: self.session.highlighted(),
+            theme: self.theme.clone(),
+            offset: self.list_offset(),
+            minute: now_unix() / 60,
+        };
+        let current = search.results_current();
+        // When results become current again, let the list schedule previews
+        // for any rows the reader scrolled to while results were stale.
+        if self.search_view.rows_key.as_ref() != Some(&key)
+            || (current && !self.search_view.rows_were_current)
+        {
+            self.search_view.rows_key = Some(key);
+            self.search_view.rows_revision = self.search_view.rows_revision.wrapping_add(1);
+            self.search_view.rows_were_current = current;
+        }
+        let mut style = div().flex_1().min_h_0();
+        Some((
+            self.search_view.rows_revision,
+            gpui::AnyView::from(self.search_rows.clone()).cached(style.style().clone()),
+        ))
+    }
+
     pub(super) fn search_preview_for(
         &mut self,
         panes: (bool, bool),
@@ -727,7 +807,7 @@ impl Inbox {
         .detach();
     }
 
-    pub(super) fn queue_search_previews(
+    fn queue_search_previews(
         &mut self,
         range: Range<usize>,
         window: &mut Window,
@@ -811,6 +891,8 @@ impl Inbox {
                         for (_, id) in batch {
                             inbox.search_view.preview_asked.remove(&id);
                         }
+                        // The cached list must get a chance to ask again.
+                        inbox.search_view.rows_were_current = false;
                         return;
                     }
                     for (thread, id) in batch {
@@ -818,6 +900,8 @@ impl Inbox {
                             hit.preview = previews.remove(&id);
                         }
                     }
+                    inbox.search_view.rows_previews =
+                        inbox.search_view.rows_previews.wrapping_add(1);
                     cx.notify();
                 }
             });
@@ -1061,7 +1145,29 @@ pub(super) fn empty(search: &Search) -> gpui::Div {
         .child(div().child(text))
 }
 
-pub(super) fn row(
+pub(super) fn rows(
+    theme: &Theme,
+    count: usize,
+    scroll: UniformListScrollHandle,
+    cx: &mut Context<Inbox>,
+) -> gpui::UniformList {
+    let entity = cx.entity();
+    let theme = theme.clone();
+    uniform_list("search-rows", count, move |range, window, app| {
+        entity.update(app, |inbox, cx| {
+            inbox.queue_search_previews(range.clone(), window, cx);
+            let highlighted = inbox.session.highlighted();
+            range
+                .map(|index| row(&theme, inbox, index, &highlighted, cx))
+                .collect()
+        })
+    })
+    .flex_1()
+    .min_h_0()
+    .track_scroll(scroll)
+}
+
+fn row(
     theme: &Theme,
     inbox: &Inbox,
     index: usize,
