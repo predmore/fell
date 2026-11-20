@@ -1,0 +1,5 @@
+narrow-final.log: one SMTP DATA submission; discard was blocked while transport was held.
+The exact copy filed in Sent confirmed the discarded draft. Undo cleared the discard marker, kept the Sent state, and showed Confirmed in Sent.
+safety-final.log: one SMTP DATA submission; discard was blocked while transport was held.
+The Drafts list showed the full retry instruction. Undo kept uncertain delivery locked and another Send attempt submitted nothing.
+The 500 px palette replay verified d, draft, and dscrd each selected Discard draft. Enter discarded the same fixture draft, and undo restored it after each query.
