@@ -1047,32 +1047,12 @@ impl ComposeView {
         {
             return;
         }
-        let len = line.chars().count();
-        self.editor.col = if self.editor.mode == Mode::Insert {
-            col.min(len)
-        } else {
-            col.min(len.saturating_sub(1))
-        };
+        self.editor.col = col.min(line.chars().count());
         self.editor.preferred = self.editor.col;
         self.editor.count = 0;
         self.bracket = None;
         self.touched = true;
         cx.notify();
-    }
-
-    fn clamp_link_cursor(&mut self) {
-        if self.field == Field::Body
-            && self.editor.mode == Mode::Normal
-            && let Some(line) = self.editor.lines.get(self.editor.row)
-            && line.contains("](")
-        {
-            let len = line.chars().count();
-            // The block cursor covers a source glyph. Keep commands like
-            // `$` followed by `i` on the same glyph the editor shows.
-            if self.editor.col >= len && has_source_link(line, &line_styles(line)) {
-                self.editor.col = len.saturating_sub(1);
-            }
-        }
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -1615,7 +1595,6 @@ impl Render for ComposeView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.on_key(event, cx);
-                this.clamp_link_cursor();
                 // Every key can change what is on screen (cursor, focused
                 // edit, status), not only the ones that touch the draft.
                 cx.notify();
@@ -6164,6 +6143,15 @@ mod tests {
         assert_eq!(
             source_col(line, &inserted.notes, inserted.text.len()),
             line.chars().count()
+        );
+        let end = Some(line.chars().count());
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Normal),
+            Some(line.len() - 1)
+        );
+        assert_eq!(
+            super::source_cursor_byte(line, end, Mode::Insert),
+            Some(line.len())
         );
 
         let (wrapped, runs, newlines) =
