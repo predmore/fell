@@ -19,9 +19,12 @@ pub struct SyncCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlagUpdate {
     pub remote_id: crate::RemoteId,
-    pub unread: bool,
+    /// `None` for an arrival whose read state is in the message itself.
+    pub unread: Option<bool>,
     /// Server star evidence for replay. Sync still only applies unread to the row.
     pub flagged: Option<bool>,
+    /// A generic IMAP copy's complete keyword list. `None` means no keyword evidence.
+    pub keywords: Option<Vec<String>>,
     /// The revision of this copy's flags, when the server supports CONDSTORE.
     pub modseq: Option<u64>,
 }
@@ -236,7 +239,7 @@ impl MailBackend for BridgeBackend {
     }
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
-        collect_imap(&self.account_id, &self.imap, cursor)
+        collect_imap(&self.account_id, &self.imap, cursor, false)
     }
 
     fn wait_for_change(
@@ -254,7 +257,7 @@ impl MailBackend for BridgeBackend {
         known: &KnownCopies<'_>,
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
-        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, known, persist)
+        crate::imap::fetch_imap(&self.account_id, &self.imap, cursor, known, false, persist)
     }
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
@@ -298,7 +301,7 @@ impl MailBackend for ImapBackend {
     }
 
     fn fetch_changes(&self, cursor: Option<&SyncCursor>) -> Result<MailboxDelta> {
-        collect_imap(&self.account_id, &self.config, cursor)
+        collect_imap(&self.account_id, &self.config, cursor, true)
     }
 
     fn wait_for_change(
@@ -316,7 +319,7 @@ impl MailBackend for ImapBackend {
         known: &KnownCopies<'_>,
         persist: &mut dyn FnMut(MailboxDelta) -> Result<()>,
     ) -> Result<()> {
-        crate::imap::fetch_imap(&self.account_id, &self.config, cursor, known, persist)
+        crate::imap::fetch_imap(&self.account_id, &self.config, cursor, known, true, persist)
     }
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
@@ -407,23 +410,31 @@ fn collect_imap(
     account_id: &AccountId,
     config: &ImapConfig,
     cursor: Option<&SyncCursor>,
+    keywords: bool,
 ) -> Result<MailboxDelta> {
     let mut combined = MailboxDelta::default();
-    crate::imap::fetch_imap(account_id, config, cursor, &no_known_copies, |mut delta| {
-        combined.messages.append(&mut delta.messages);
-        combined.flags.append(&mut delta.flags);
-        combined.removals.append(&mut delta.removals);
-        if delta.settle != Settle::Later {
-            combined.settle = delta.settle;
-        }
-        if delta.cursor.is_some() {
-            combined.cursor = delta.cursor;
-        }
-        if delta.roles.is_some() {
-            combined.roles = delta.roles;
-        }
-        Ok(())
-    })?;
+    crate::imap::fetch_imap(
+        account_id,
+        config,
+        cursor,
+        &no_known_copies,
+        keywords,
+        |mut delta| {
+            combined.messages.append(&mut delta.messages);
+            combined.flags.append(&mut delta.flags);
+            combined.removals.append(&mut delta.removals);
+            if delta.settle != Settle::Later {
+                combined.settle = delta.settle;
+            }
+            if delta.cursor.is_some() {
+                combined.cursor = delta.cursor;
+            }
+            if delta.roles.is_some() {
+                combined.roles = delta.roles;
+            }
+            Ok(())
+        },
+    )?;
     Ok(combined)
 }
 

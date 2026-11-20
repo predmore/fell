@@ -3,7 +3,7 @@
 //! These calls update rows the UI already reads. There is no socket, no IMAP
 //! session, and no send. Reversible calls store the previous folders and
 //! labels on that account's undo stack. [`Store::undo`] restores the latest
-//! entry that still has messages to restore.
+//! entry that still has messages or local drafts to restore.
 //!
 //! Archive, delete, and spam change one folder on the messages in a thread
 //! (or in every thread of a selection). Any other folder on the same row,
@@ -35,6 +35,7 @@ use crate::embed::{
 use crate::folders::FolderRole;
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
+use crate::store::keywords::{self, LabelEdit, LabelHistory};
 use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS local_action_messages (
     labels TEXT NOT NULL,
     after_folders TEXT NOT NULL DEFAULT '',
     after_labels TEXT NOT NULL DEFAULT '',
+    label_was_keyword INTEGER,
     arrived_via TEXT NOT NULL,
     to_line TEXT NOT NULL,
     cc_line TEXT NOT NULL,
@@ -167,6 +169,7 @@ pub enum ActionKind {
     Move,
     Label,
     Delete,
+    DiscardDrafts,
     Read,
     Unread,
     Star,
@@ -186,6 +189,7 @@ impl ActionKind {
             Self::Move => "move",
             Self::Label => "label",
             Self::Delete => "delete",
+            Self::DiscardDrafts => "discard_drafts",
             Self::Read => "read",
             Self::Unread => "unread",
             Self::Star => "star",
@@ -202,6 +206,7 @@ impl ActionKind {
             "move" => Ok(Self::Move),
             "label" => Ok(Self::Label),
             "delete" => Ok(Self::Delete),
+            "discard_drafts" => Ok(Self::DiscardDrafts),
             "read" => Ok(Self::Read),
             "unread" => Ok(Self::Unread),
             "star" => Ok(Self::Star),
@@ -352,12 +357,12 @@ impl Store {
                 };
                 return Err(Error::Action(message.into()));
             }
-            let summary = if adding {
-                format!("added label {label}")
+            let edit = if adding {
+                LabelEdit::Added(&label)
             } else {
-                format!("removed label {label}")
+                LabelEdit::Removed(&label)
             };
-            Ok((summary, plans))
+            Ok((edit.summary(), plans))
         })
     }
 
@@ -561,16 +566,61 @@ impl Store {
         })
     }
 
-    /// Restore the latest reversible action with messages on this account.
+    /// Discard local drafts together as one undoable action. The row and
+    /// its dependent data stay intact, including any independent send record.
+    pub(crate) fn discard_compose_drafts(
+        &self,
+        account: &AccountId,
+        ids: &[String],
+    ) -> Result<LocalAction> {
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        ensure_action_schema(&tx)?;
+        let summary = match ids.len() {
+            0 => return Err(Error::Action("No draft selected".into())),
+            1 => "Draft discarded".into(),
+            n => format!("{n} drafts discarded"),
+        };
+        let action = insert_local_action(&tx, account, ActionKind::DiscardDrafts, &summary)?;
+        for id in ids {
+            let changed = crate::compose::mark_discarded(&tx, account, id, action.id)?;
+            if !changed {
+                return Err(Error::Action(
+                    "A draft has already been sent or is no longer available".into(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(action)
+    }
+
+    /// Restore the latest reversible local action on this account. For a
+    /// draft discard, the returned summary describes the restore outcome.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
-        let Some(action) = latest_open_action(&tx, account_id)? else {
+        let Some(mut action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
-        if action.kind.is_flag() {
+        if action.kind == ActionKind::DiscardDrafts {
+            let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;
+            action.summary = match (restored, confirmed) {
+                (1, 0) => "Draft restored".into(),
+                (n, 0) => format!("{n} drafts restored"),
+                (0, 1) => "Confirmed in Sent".into(),
+                (0, n) => format!("{n} confirmed in Sent"),
+                (restored, confirmed) => format!("{restored} restored · {confirmed} in Sent"),
+            };
+        } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
+        } else if action.kind == ActionKind::Label {
+            keywords::undo_label_action(
+                &tx,
+                account_id,
+                action.id,
+                &action.summary,
+                LabelHistory::Local,
+            )?;
         } else {
             for row in &load_snapshots(&tx, action.id)? {
                 restore_row(&tx, account_id, row)?;
@@ -789,15 +839,25 @@ fn record_and_apply(
     summary: &str,
     plans: &[Planned],
 ) -> Result<LocalAction> {
-    conn.execute(
-        "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
-         VALUES (?1, ?2, ?3, 0, ?4)",
-        params![account_id.as_str(), kind.as_str(), summary, now_unix()],
-    )?;
-    let id = conn.last_insert_rowid();
+    let label_edit = (kind == ActionKind::Label)
+        .then(|| LabelEdit::from_summary(summary))
+        .transpose()?;
+    let action = insert_local_action(conn, account_id, kind, summary)?;
+    let id = action.id;
     for plan in plans {
         if kind != ActionKind::Purge {
-            insert_snapshot(conn, id, account_id, plan)?;
+            let was_keyword = label_edit
+                .map(|edit| {
+                    keywords::record_edit(
+                        conn,
+                        account_id,
+                        &plan.before.message_id,
+                        edit,
+                        &plan.before.labels,
+                    )
+                })
+                .transpose()?;
+            insert_snapshot(conn, id, account_id, plan, was_keyword)?;
         }
         record_tombstones(conn, id, account_id, plan)?;
     }
@@ -807,8 +867,22 @@ fn record_and_apply(
     for plan in plans {
         apply_plan(conn, account_id, plan)?;
     }
+    Ok(action)
+}
+
+fn insert_local_action(
+    conn: &Connection,
+    account_id: &AccountId,
+    kind: ActionKind,
+    summary: &str,
+) -> Result<LocalAction> {
+    conn.execute(
+        "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![account_id.as_str(), kind.as_str(), summary, now_unix()],
+    )?;
     Ok(LocalAction {
-        id,
+        id: conn.last_insert_rowid(),
         kind,
         summary: summary.to_string(),
     })
@@ -909,6 +983,10 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
                AND (
                    EXISTS (SELECT 1 FROM local_action_messages s WHERE s.action_id = a.id)
                    OR EXISTS (SELECT 1 FROM local_action_flags f WHERE f.action_id = a.id)
+                   OR (a.kind = 'discard_drafts' AND EXISTS (
+                       SELECT 1 FROM compose_drafts d
+                       WHERE d.account_id = a.account_id AND d.discarded_action_id = a.id
+                   ))
                )
              ORDER BY id DESC LIMIT 1",
             params![account_id.as_str()],
@@ -986,18 +1064,11 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             &split_tokens(&snapshot.after_folders),
             true,
         ));
-        let labels = join_tokens(&invert_tokens(
-            &split_tokens(&current.labels),
-            &split_tokens(&saved.labels),
-            &split_tokens(&snapshot.after_labels),
-            false,
-        ));
         let old_terms = terms_of(&current);
-        let new_terms = terms_with(&current, &folders, &labels);
+        let new_terms = terms_with(&current, &folders, &current.labels);
         let changed = conn.execute(
-            "UPDATE messages SET folders = ?1, labels = ?2
-             WHERE account_id = ?3 AND message_id = ?4",
-            params![folders, labels, account_id.as_str(), saved.message_id],
+            "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = ?3",
+            params![folders, account_id.as_str(), saved.message_id],
         )?;
         expect_one(changed, &saved.message_id)?;
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
@@ -1015,12 +1086,16 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             &split_tokens(&snapshot.after_folders),
             true,
         ));
-        let labels = join_tokens(&invert_tokens(
-            &split_tokens(&current.labels),
-            &split_tokens(&saved.labels),
-            &split_tokens(&snapshot.after_labels),
-            false,
-        ));
+        let labels = if snapshot.removed {
+            join_tokens(&invert_tokens(
+                &split_tokens(&current.labels),
+                &split_tokens(&saved.labels),
+                &split_tokens(&snapshot.after_labels),
+                false,
+            ))
+        } else {
+            current.labels.clone()
+        };
         let old_terms = terms_of(&current);
         let new_terms = terms_with(&current, &folders, &labels);
         let changed = conn.execute(
@@ -1510,6 +1585,7 @@ fn insert_snapshot(
     action_id: i64,
     account_id: &AccountId,
     plan: &Planned,
+    was_keyword: Option<bool>,
 ) -> Result<()> {
     let mut values = vec![
         Value::Integer(action_id),
@@ -1518,18 +1594,19 @@ fn insert_snapshot(
     values.extend(saved_values(&plan.before));
     values.push(Value::Text(plan.folders.clone()));
     values.push(Value::Text(plan.labels.clone()));
-    debug_assert_eq!(values.len(), 27);
+    values.push(was_keyword.map_or(Value::Null, |value| Value::Integer(value.into())));
+    debug_assert_eq!(values.len(), 28);
     conn.execute(
         "INSERT INTO local_action_messages (
             action_id, removed, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line,
-            attachment_names, after_folders, after_labels
+            attachment_names, after_folders, after_labels, label_was_keyword
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-            ?26, ?27
+            ?26, ?27, ?28
          )",
         params_from_iter(values),
     )?;

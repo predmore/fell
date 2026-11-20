@@ -1304,12 +1304,12 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
         uidvalidity,
         uid
     ];
-    let (seen, flagged): (Option<bool>, Option<bool>) = conn
+    let (seen, flagged, keywords): (Option<bool>, Option<bool>, String) = conn
         .query_row(
-            "SELECT seen, flagged FROM message_copies
+            "SELECT seen, flagged, keywords FROM message_copies
              WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
             copy,
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .unwrap_or_default();
@@ -1345,8 +1345,8 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
     }
     // MOVE keeps the flags. The destination's MODSEQ comes from its mailbox.
     conn.execute(
-        "INSERT INTO message_copies (account_id, mailbox, uidvalidity, uid, message_id, folder, seen, flagged)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO message_copies (account_id, mailbox, uidvalidity, uid, message_id, folder, seen, flagged, keywords)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(account_id, mailbox, uidvalidity, uid) DO NOTHING",
         params![
             account_id.as_str(),
@@ -1357,6 +1357,7 @@ fn move_copy(conn: &Connection, account_id: &AccountId, sent: &OutboxEntry) -> R
             crate::imap::folder_name(target),
             seen,
             flagged,
+            keywords,
         ],
     )?;
     flags::follow_move(conn, account_id, sent)?;

@@ -270,6 +270,8 @@ pub struct Step {
     pub archive: bool,
     /// `#` outside Trash: move [`Session::action_targets`] to Trash.
     pub delete: bool,
+    /// `#` on selected local drafts: discard them as one undoable action.
+    pub discard: Vec<String>,
     /// `!`: move [`Session::action_targets`] to Spam, or out of it.
     pub spam: bool,
     /// `y` answered the permanent-delete question: delete
@@ -1964,11 +1966,23 @@ impl Session {
                     self.show_toast("No conversation", true);
                     return Step::default();
                 }
-                if targets.iter().any(|id| {
-                    self.threads
-                        .iter()
-                        .any(|row| &row.id == id && row.draft.is_some())
-                }) {
+                let drafts: Vec<_> = self
+                    .threads
+                    .iter()
+                    .filter(|row| targets.contains(&row.id))
+                    .filter_map(|row| row.draft.clone())
+                    .collect();
+                if !drafts.is_empty() {
+                    if action == Action::Delete && self.in_drafts() {
+                        if drafts.len() == targets.len() {
+                            return Step {
+                                discard: drafts,
+                                ..Step::default()
+                            };
+                        }
+                        self.show_toast("Select only local drafts to discard", true);
+                        return Step::default();
+                    }
                     self.show_toast(DRAFT_NOT_THREAD, true);
                     return Step::default();
                 }
@@ -2728,6 +2742,39 @@ mod tests {
         let step = session.on_key(KeyId::Enter, 10);
         assert!(!step.open_draft);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn hash_discards_only_the_selected_local_drafts() {
+        let mut session = session();
+        session.folder = session.roles.name(FolderRole::Drafts).into();
+        let mut first = row("draft-1");
+        first.draft = Some("c1".into());
+        let mut second = row("draft-2");
+        second.draft = Some("r2".into());
+        session.set_threads(vec![first, second, row("synced")]);
+        let hash = KeyId::Char('#');
+        session.cursor_id = Some("draft-1".into());
+        assert_eq!(session.on_key(hash, 10).discard, ["c1"]);
+        session.on_key(KeyId::Char('x'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        session.on_key(KeyId::Char('x'), 10);
+        assert_eq!(session.on_key(hash, 10).discard, ["c1", "r2"]);
+
+        session.picked.clear();
+        session.cursor_id = Some("draft-1".into());
+        session.on_key(KeyId::Char('V'), 10);
+        session.on_key(KeyId::Char('j'), 10);
+        assert_eq!(session.on_key(hash, 10).discard, ["c1", "r2"]);
+        session.on_key(KeyId::Char('j'), 10);
+        let mixed = session.on_key(hash, 10);
+        assert!(mixed.discard.is_empty() && !mixed.delete);
+        assert_eq!(
+            session.toast.as_ref().unwrap().text,
+            "Select only local drafts to discard"
+        );
+        session.visual = false;
+        assert!(session.on_key(hash, 10).delete);
     }
 
     #[test]

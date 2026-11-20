@@ -41,6 +41,10 @@ pub use compose_ui::{ComposeView, SendFailure, ThemeKind, open_demo, send_from_e
 pub use embeddings::embeddings_command;
 pub use setup::account_command;
 
+#[cfg(feature = "bench-store")]
+#[doc(hidden)]
+pub use view::read_conversation as bench_read_conversation;
+
 /// Proof of an explicit Send click in the Fell window.
 ///
 /// Bound to this pending send's id, account, recipients, subject, body,
