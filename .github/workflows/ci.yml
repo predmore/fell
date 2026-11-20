@@ -83,5 +83,15 @@ jobs:
           # Linux artifacts on main populates the release dependency cache.
           shared-key: artifacts
           save-if: 'false'
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/fell-bench-models
+          key: fell-bench-minilm-${{ hashFiles('crates/fell-core/src/embed/model_files.rs') }}
+      - name: Verify or install the pinned MiniLM model
+        env:
+          FELL_MODEL_DIR: ${{ runner.temp }}/fell-bench-models
+        run: cargo run --locked --release -p fell --features bench-store -- embeddings install --yes
       - name: Measure and enforce store budgets
+        env:
+          FELL_BENCH_MODEL_DIR: ${{ runner.temp }}/fell-bench-models
         run: time cargo bench --locked -p fell --features bench-store --bench fell-bench
