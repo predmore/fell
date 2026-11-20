@@ -3848,39 +3848,40 @@ fn thread_line_one(
     } else {
         theme.dimmed
     };
-    // Reserve the same sender width with or without chips. The label lane
-    // only borrows room left after that span and the fixed metadata.
-    let sender_limit = (text_width * 0.60).floor();
-    let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
     let count = (row.message_count > 1).then(|| row.message_count.to_string());
     let date = present::relative_date(now_unix(), row.date_unix);
     let size = theme.ui_px - 1.0;
+    let style = conversation_line_style(window, theme, px(size));
+    let date_width = line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil();
+    let count_width = count.as_deref().map_or(0.0, |count| {
+        line_px_with_style(window, &style, count, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+    });
+    let attachment_width = if row.has_attachment {
+        line_px(window, "⧉", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
+    } else {
+        0.0
+    };
+    // The sender, spacer, star, and date need three gaps. Optional metadata
+    // and the label group each need one more. Reserve metadata first so the
+    // same sender span fits both with and without labels.
+    let room = (text_width
+        - date_width
+        - count_width
+        - attachment_width
+        - STAR_SLOT
+        - 3.0 * THREAD_LINE_GAP)
+        .max(0.0);
+    let sender_limit = room.min(text_width * 0.60).floor();
+    let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
     let labels = if row.labels.is_empty() && previous_labels.is_none() {
         None
     } else {
-        let style = conversation_line_style(window, theme, px(size));
-        let date_width = line_px_with_style(window, &style, &date, FontWeight::NORMAL).ceil();
-        let count_width = count.as_deref().map_or(0.0, |count| {
-            line_px_with_style(window, &style, count, FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
-        });
-        let attachment_width = if row.has_attachment {
-            line_px(window, "⧉", FontWeight::NORMAL).ceil() + THREAD_LINE_GAP
-        } else {
-            0.0
-        };
-        let room = (text_width
-            - date_width
-            - count_width
-            - attachment_width
-            - STAR_SLOT
-            - 4.0 * THREAD_LINE_GAP)
-            .max(0.0);
         thread_label_group(
             theme,
             row,
             selected,
             dim,
-            (room - sender_width).max(0.0),
+            (room - sender_width - THREAD_LINE_GAP).max(0.0),
             previous_labels,
             window,
         )
@@ -4182,8 +4183,8 @@ fn names(
     (
         div()
             .relative()
+            .flex_none()
             .w(px(width))
-            .min_w(px(0.))
             .overflow_hidden()
             .child(line),
         width,
