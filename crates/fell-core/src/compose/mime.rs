@@ -828,6 +828,7 @@ mod tests {
             quote_text: "On a day, Ada wrote:\n> the original\n".into(),
             quote_html: "<p>On a day, Ada wrote:</p><blockquote><p>the original</p></blockquote>"
                 .into(),
+            reply_to_unverified: false,
         };
         let outgoing = build_outgoing(
             AccountId("a".into()),

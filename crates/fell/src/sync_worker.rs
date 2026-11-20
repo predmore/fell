@@ -19,9 +19,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
-    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts, Store,
-    SyncFailureKind, SyncReport, classify_sync_error, fetch_message_bodies, fetch_missing_bodies,
-    sync_with_progress,
+    Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts,
+    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, classify_sync_error,
+    fetch_message_bodies, fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -46,9 +46,9 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(750);
 const CHECKPOINT_EVERY: usize = 16;
 /// Quiet retries of opening the mailbox before the window shows an error.
 const OPEN_RETRIES_BEFORE_ERROR: usize = 3;
-/// Batches of old mail (200 messages each) whose body parts are fetched
-/// after a pass. A request for a pass is checked between batches.
-const BODY_BATCHES_AFTER_PASS: usize = 5;
+/// Batches of old mail to verify or fill after a pass. The worker checks
+/// for a new pass or an on-demand body request between batches.
+const BACKFILL_BATCHES_AFTER_PASS: usize = 5;
 
 /// Body asks served in one backend call, so a conversation of old mail is
 /// one login.
@@ -75,6 +75,7 @@ pub enum SyncEvent {
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
     BodiesStored,
+    ReplyTo(ReplyToProgress),
 }
 
 #[derive(Default)]
@@ -257,9 +258,6 @@ fn run(
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
-    let bodies_stored = || {
-        let _ = events.unbounded_send(SyncEvent::BodiesStored);
-    };
     let failed = |kind: SyncFailureKind, detail: String| {
         SyncKind::Failed(SyncFailure {
             kind,
@@ -303,6 +301,7 @@ fn run(
     // Cleared for good once the server says it has no IDLE.
     let mut idle = true;
     let mut bodies = BodyQueue::default();
+    let mut reply_to = ReplyToBackfill::default();
     loop {
         // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
@@ -378,13 +377,14 @@ fn run(
         bodies.serve(&config, &store, &account);
         let until = Instant::now() + delay;
         let mut pending = if synced {
-            fill_old_bodies(
+            fill_old_mail(
                 &config,
                 &store,
                 &account,
                 &wake,
                 &mut bodies,
-                &bodies_stored,
+                &mut reply_to,
+                &events,
             )
         } else {
             None
@@ -434,28 +434,49 @@ fn run(
     }
 }
 
-/// Fetch body parts for mail stored before they were kept, a batch at a
-/// time. Best effort: a failure waits for the next pass. `Some` when the
+/// Fetch missing Reply-To headers and body parts, a batch at a time.
+/// Best effort: a failure waits for the next pass. `Some` when the
 /// window asked for a pass, or closed, in the meantime.
-fn fill_old_bodies(
+fn fill_old_mail(
     config: &AccountConfig,
     store: &Store,
     account: &Account,
     wake: &Receiver<Request>,
     bodies: &mut BodyQueue,
-    stored: &dyn Fn(),
+    reply_to: &mut ReplyToBackfill,
+    events: &UnboundedSender<SyncEvent>,
 ) -> Option<Woke> {
     let Ok(backend) = config.backend() else {
         return None;
     };
-    for _ in 0..BODY_BATCHES_AFTER_PASS {
+    let (mut more_headers, mut more_bodies) = (true, true);
+    for _ in 0..BACKFILL_BATCHES_AFTER_PASS {
         if let Some(woke) = queue_bodies(wake, bodies) {
             return Some(woke);
         }
         bodies.serve(config, store, account);
-        match fetch_missing_bodies(&account.id, backend.as_ref(), store, 1) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => stored(),
+        if more_headers {
+            more_headers = matches!(
+                reply_to.run_batch_with_progress(
+                    &account.id,
+                    backend.as_ref(),
+                    store,
+                    &mut |progress| {
+                        let _ = events.unbounded_send(SyncEvent::ReplyTo(progress));
+                    },
+                ),
+                Ok(true)
+            );
+        }
+        if more_bodies {
+            more_bodies = fetch_missing_bodies(&account.id, backend.as_ref(), store, 1)
+                .is_ok_and(|filled| filled > 0);
+            if more_bodies {
+                let _ = events.unbounded_send(SyncEvent::BodiesStored);
+            }
+        }
+        if !more_headers && !more_bodies {
+            break;
         }
     }
     None

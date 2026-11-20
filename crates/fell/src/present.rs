@@ -566,7 +566,7 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
         archived: false,
         snooze_until: None,
         list_id: None,
-        reply_to: Vec::new(),
+        reply_to: Some(Vec::new()),
         attachment_names: Vec::new(),
         parts: None,
     };
@@ -1521,7 +1521,7 @@ mod tests {
         reply.reply_context = Some(fell_core::compose::ReplyContext {
             sender: "Jon\u{202e} Smith".into(),
             sender_email: "jon@example.com".into(),
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             subject: "Q3\nplan".into(),
             date_unix: 2_000 - 3 * 86_400,
         });
@@ -1555,7 +1555,7 @@ mod tests {
         mine.reply_context = Some(fell_core::compose::ReplyContext {
             sender: "Caleb".into(),
             sender_email: "Me@Example.com".into(),
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             subject: "Plans".into(),
             date_unix: 2_000,
         });
@@ -1936,7 +1936,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         };
@@ -2010,7 +2010,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }

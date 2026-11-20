@@ -1046,9 +1046,8 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             // has them empty. Keep what a sync has filled in since: local
             // actions never change them.
             let mut saved = saved.clone();
-            if saved.reply_to_line.is_empty() {
-                saved.reply_to_line = current.reply_to_line.clone();
-            }
+            saved.reply_to_line =
+                crate::message::merge_reply_to(&saved.reply_to_line, current.reply_to_line.clone());
             if saved.attachment_names.is_empty() {
                 saved.attachment_names = current.attachment_names.clone();
             }
@@ -2169,7 +2168,7 @@ mod tests {
             archived: false,
             snooze_until: None,
             list_id: None,
-            reply_to: Vec::new(),
+            reply_to: Some(Vec::new()),
             attachment_names: Vec::new(),
             parts: None,
         }

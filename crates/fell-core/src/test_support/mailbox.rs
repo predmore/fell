@@ -261,7 +261,7 @@ fn message(account: &Account, rng: &mut Rng, index: usize, root: usize) -> Messa
         archived: false,
         snooze_until: None,
         list_id: list.then(|| "weekly.list.bench.test".into()),
-        reply_to: Vec::new(),
+        reply_to: Some(Vec::new()),
         attachment_names: Vec::new(),
         parts: Some(parts),
     }

@@ -31,7 +31,7 @@ use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
-use crate::keymap::{Action, KeyId};
+use crate::keymap::{self, Action, KeyId};
 use crate::mail_body::{
     self, BodyAsks, BodyCache, BodyJob, BodyLoad, BodyLoads, HtmlBody, PreparedBody,
 };
@@ -41,6 +41,7 @@ use crate::model::{
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
+use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
     LandingHold, LayoutProbe, LayoutSlot, Reveal, RevealPhase, ScrollAnchor, clamped_offset,
@@ -451,6 +452,37 @@ impl Inbox {
         inbox
     }
 
+    fn refresh_reply_checks(&self, ids: Vec<fell_core::MessageId>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let account = self.account_id.clone();
+        let read = self.store.call(move |store| {
+            let mut verified = Vec::new();
+            for id in ids {
+                if store
+                    .message_summary(&account, &id)?
+                    .is_some_and(|parent| parent.reply_to.is_some())
+                {
+                    verified.push(id);
+                }
+            }
+            Ok::<_, fell_core::Error>(verified)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(verified)) = read.await
+                && !verified.is_empty()
+            {
+                let _ = this.update(cx, |_, cx| {
+                    cx.global_mut::<ReplyChecks>()
+                        .apply(fell_core::ReplyToProgress::Verified(verified));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn on_store_ready(
         &mut self,
         opened: mailbox::Opened,
@@ -473,6 +505,8 @@ impl Inbox {
             self.draft_home = None;
         }
         self.session.sync = opened.sync;
+        cx.default_global::<ReplyChecks>()
+            .start(self.account_id.clone(), sync_with.is_none() || store_failed);
         if !store_failed {
             self.cid_repair = Some(self.store.call(fell_core::Store::cid_repair_progress));
         }
@@ -585,6 +619,20 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
+                            SyncEvent::ReplyTo(progress) => {
+                                let finished =
+                                    matches!(progress, fell_core::ReplyToProgress::Finished);
+                                cx.global_mut::<ReplyChecks>().apply(progress);
+                                if finished {
+                                    // Also resolve watched drafts whose parent has since become an alias.
+                                    inbox.refresh_reply_checks(
+                                        cx.global::<ReplyChecks>().pending(),
+                                        cx,
+                                    );
+                                }
+                                cx.notify();
+                                return;
+                            }
                             SyncEvent::SendsConfirmed(ids) => {
                                 if let Some(drafts) =
                                     cx.try_global::<crate::draft_host::AgentDrafts>()
@@ -621,7 +669,15 @@ impl Inbox {
                         };
                         let wrote = matches!(kind, SyncKind::Syncing { .. })
                             || matches!(kind, SyncKind::Synced { changed: true, .. });
+                        if matches!(kind, SyncKind::Failed(_)) {
+                            cx.global_mut::<ReplyChecks>().set_offline(true);
+                        }
                         if matches!(kind, SyncKind::Synced { .. }) {
+                            cx.global_mut::<ReplyChecks>().set_offline(false);
+                            if wrote {
+                                inbox
+                                    .refresh_reply_checks(cx.global::<ReplyChecks>().pending(), cx);
+                            }
                             // Sync is answering again: asks that failed
                             // while it was not can go now.
                             inbox.bodies_asked.retry_failed();
@@ -2258,6 +2314,36 @@ impl Inbox {
         .detach();
     }
 
+    fn watch_reply_check(&self, id: fell_core::MessageId, cx: &mut Context<Self>) {
+        if cx.global_mut::<ReplyChecks>().watch(id.clone()) {
+            self.refresh_reply_checks(vec![id], cx);
+            cx.notify();
+        }
+    }
+
+    fn watch_held_draft(
+        &self,
+        hub: &fell_core::compose::DraftHub,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = hub.with_session(id, |session| {
+            if session.account_id() == &self.account_id && session.reply_parts().reply_to_unverified
+            {
+                session
+                    .fields()
+                    .in_reply_to
+                    .as_ref()
+                    .map(fell_core::MessageId::new)
+            } else {
+                None
+            }
+        });
+        if let Some(Some(parent)) = parent {
+            self.watch_reply_check(parent, cx);
+        }
+    }
+
     /// `c` (no id) or Enter on a draft row: bring the compose window up on
     /// the draft. A live draft shows at once; otherwise it is created or read
     /// from the mailbox off this thread, then shown.
@@ -2286,6 +2372,7 @@ impl Inbox {
         if let Some(id) = &id
             && crate::draft_host::show_draft(&hub, id)
         {
+            self.watch_held_draft(&hub, id, cx);
             self.settle_opening_notice(notice, cx);
             return;
         }
@@ -2317,6 +2404,7 @@ impl Inbox {
                     Ok(id) => {
                         // `false` while another open of it is still reading
                         // it; that one shows it when it lands.
+                        inbox.watch_held_draft(&hub, &id, cx);
                         if crate::draft_host::show_draft(&hub, &id) {
                             inbox.settle_opening_notice(notice, cx);
                         }
@@ -2413,6 +2501,10 @@ impl Inbox {
                     let start = fell_core::compose::start_reply_in_zone(
                         kind, &parent, &email, &own, offset, &roles,
                     );
+                    if start.parts.reply_to_unverified {
+                        let id = parent.headers.message_id;
+                        let _ = this.update(cx, |inbox, cx| inbox.watch_reply_check(id, cx));
+                    }
                     let hub = hub.clone();
                     cx.background_executor()
                         .spawn(
@@ -3253,6 +3345,12 @@ impl Render for Inbox {
         let subject = self.shown_subject();
         let cached_preview =
             self.search_preview_for(panes, animating || refreshing_body, &subject, cx);
+        let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
+            let selected = self.session.reply_target().filter(|_| {
+                self.open_thread.is_some() && self.open_thread == self.session.cursor_id
+            });
+            selected.and_then(|target| checks.for_message(&target.id))
+        });
         shell(
             theme,
             &self.session,
@@ -3266,6 +3364,7 @@ impl Render for Inbox {
                 card,
                 conv,
                 cached_preview,
+                reply_check,
             },
             width,
             split,
@@ -3319,6 +3418,7 @@ struct Shown {
     /// What the conversation's bodies animate this frame.
     conv: ConvFrame,
     cached_preview: Option<gpui::AnyView>,
+    reply_check: Option<ReplyCheck>,
 }
 
 /// What the conversation's bodies show this frame beyond the session.
@@ -3402,6 +3502,7 @@ fn shell(
         card,
         conv,
         cached_preview,
+        reply_check,
     } = shown;
     let frames = conv.frames.clone();
     let mut subject = Some(subject);
@@ -3586,7 +3687,14 @@ fn shell(
                     ))
                 }),
         )
-        .child(status_bar(&theme, session, status, width, window))
+        .child(status_bar(
+            &theme,
+            session,
+            status,
+            reply_check,
+            width,
+            window,
+        ))
         .children(leaving)
         .when(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
@@ -5888,6 +5996,7 @@ fn status_bar(
     theme: &Theme,
     session: &Session,
     status: StatusMotion,
+    reply_check: Option<ReplyCheck>,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -5915,12 +6024,40 @@ fn status_bar(
     let ui = theme.ui_family.as_ref();
     let mono = theme.mono_family.as_ref();
     let hint_opacity = status.hints;
+    let (sync_label, sync_color) = match reply_check {
+        Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
+        Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
+        Some(ReplyCheck::Unavailable) => {
+            let key = keymap::binding_text(&session.keymap, Action::SyncNow);
+            let label = if width < present::NARROW_WIDTH {
+                format!("Retry Reply-To · {key}")
+            } else {
+                format!("Reply-To unavailable · {key} to retry")
+            };
+            (label, theme.error)
+        }
+        Some(ReplyCheck::Verified) => (
+            format!(
+                "Reply-To verified · {} to reply",
+                keymap::binding_text(&session.keymap, Action::Reply)
+            ),
+            theme.accent,
+        ),
+        None => (
+            session.sync.status(),
+            if session.sync.is_error() {
+                theme.error
+            } else {
+                theme.dimmed
+            },
+        ),
+    };
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
     let mut used = 28.0 + 4.0 * 12.0;
     used += bar_px(window, session.mode_label(), size, mono)
-        + bar_px(window, &session.sync.status(), size, ui)
+        + bar_px(window, &sync_label, size, ui)
         + 2.0 * bar_px(window, "·", size, ui);
     if session.detail_text().is_some() {
         used += 12.0 + bar_px(window, "· ? details", size, ui);
@@ -5981,15 +6118,7 @@ fn status_bar(
                 .child(session.mode_label().to_string()),
         )
         .child(div().text_color(rgb(theme.dimmed)).child("·"))
-        .child(
-            div()
-                .text_color(rgb(if session.sync.is_error() {
-                    theme.error
-                } else {
-                    theme.dimmed
-                }))
-                .child(session.sync.status()),
-        )
+        .child(div().text_color(rgb(sync_color)).child(sync_label))
         .when(session.detail_text().is_some(), |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
