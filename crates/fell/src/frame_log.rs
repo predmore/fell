@@ -125,7 +125,7 @@ impl FrameLog {
         let _ = self.out.flush();
     }
 
-    /// The store thread's query interval, expressed on the frame clock.
+    /// Search and reply preparation on the store thread, on the frame clock.
     pub fn search_work(&mut self, start: Instant, end: Instant) {
         let t_ms = ms(self.opened, start);
         let duration = ms(start, end);

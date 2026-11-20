@@ -748,24 +748,56 @@ fn run_filtered(
     account_id: &AccountId,
     parsed: &ParsedQuery,
 ) -> Result<Vec<SearchHit>> {
+    if !folders_can_match(conn, account_id, &parsed.folders)? {
+        return Ok(Vec::new());
+    }
+    // Rank only the keys. The first message in a thread already has its
+    // largest matching date. Fetch the display fields once per ranked hit.
     let mut sql = String::from(
-        "SELECT message_id, thread_id, subject, snippet, from_email, date_unix FROM (
-            SELECT
-                m.message_id AS message_id,
-                m.thread_id AS thread_id,
-                m.subject AS subject,
-                m.snippet AS snippet,
-                m.from_email AS from_email,
-                m.date_unix AS date_unix,
-                ROW_NUMBER() OVER (
-                    PARTITION BY m.thread_id
-                    ORDER BY m.date_unix DESC, m.message_id ASC
-                ) AS rn,
-                MAX(m.date_unix) OVER (PARTITION BY m.thread_id) AS thread_date",
+        "SELECT m.message_id, ranked.thread_id, m.subject, m.snippet, m.from_email, ranked.date_unix
+         FROM (
+             SELECT m.rowid, m.thread_id, m.date_unix,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY m.thread_id
+                     ORDER BY m.date_unix DESC, m.message_id ASC
+                 ) AS rn",
     );
     let params = matching_rows(&mut sql, account_id, parsed, None);
-    sql.push_str(") WHERE rn = 1 ORDER BY thread_date DESC, thread_id ASC");
+    sql.push_str(
+        ") ranked JOIN messages m ON m.rowid = ranked.rowid
+         WHERE rn = 1 ORDER BY ranked.date_unix DESC, ranked.thread_id ASC",
+    );
     query_hits(conn, &sql, params)
+}
+
+fn folders_can_match(conn: &Connection, account: &AccountId, folders: &[String]) -> Result<bool> {
+    if folders.is_empty() {
+        return Ok(true);
+    }
+    // Stored names use SQLite's ASCII case fold. A queued thread may not
+    // have contributed its folders yet, so in that case read messages.
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS (
+             SELECT 1 FROM account_folders
+             WHERE account_id = ?1 AND folder_key IN (?2, ?3)
+         ) OR EXISTS (
+             SELECT 1 FROM thread_summary_dirty WHERE account_id = ?1
+         )",
+    )?;
+    for folder in folders.iter().filter(|folder| !folder.contains('\u{1e}')) {
+        let may_match = stmt.query_row(
+            rusqlite::params![
+                account.as_str(),
+                folder.to_lowercase(),
+                folder.to_ascii_lowercase()
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !may_match {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn append_filters(sql: &mut String, params: &mut Vec<Value>, parsed: &ParsedQuery) {

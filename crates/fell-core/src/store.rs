@@ -5225,6 +5225,53 @@ mod tests {
     }
 
     #[test]
+    fn filtered_search_ranks_matching_messages_and_checks_dirty_folders() {
+        let store = seed_search();
+        let account = AccountId("a1".into());
+        let thread = ThreadId::from_message_id(&MessageId::new("ada@msg"));
+        let inbox = store.search(&account, "in:Inbox").unwrap();
+        let winning_message = |hits: Vec<SearchHit>| {
+            hits.into_iter()
+                .find(|hit| hit.thread_id == thread)
+                .unwrap()
+                .message_id
+        };
+        assert_eq!(winning_message(inbox.hits), MessageId::new("reply-ada@msg"));
+
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET folders = 'MÜNCHEN'
+                 WHERE account_id = 'a1' AND message_id = 'reply-ada@msg'",
+                [],
+            )
+            .unwrap();
+        let inbox = store.search(&account, "in:Inbox").unwrap();
+        assert_eq!(winning_message(inbox.hits), MessageId::new("ada@msg"));
+        let munich = || store.search(&account, "in:MÜNCHEN").unwrap();
+        assert_eq!(
+            winning_message(munich().hits),
+            MessageId::new("reply-ada@msg")
+        );
+
+        immediate_transaction(&store.conn)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            winning_message(munich().hits),
+            MessageId::new("reply-ada@msg")
+        );
+        assert!(
+            store
+                .search(&account, "in:NoSuchFolder")
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn search_operator_suggestions_read_actual_account_values() {
         use crate::SearchField::*;
         let store = seed_search();

@@ -415,8 +415,8 @@ impl Inbox {
                 }
                 let start = Instant::now();
                 let results = store.search(&account, &query);
-                let end = Instant::now();
-                let reply = (current.load(Ordering::Relaxed) == generation).then(|| {
+                let reply = (current.load(Ordering::Relaxed) == generation).then_some(results);
+                let reply = reply.and_then(|results| {
                     let initial = results
                         .as_ref()
                         .ok()
@@ -437,6 +437,9 @@ impl Inbox {
                                 .unwrap_or_default()
                         })
                         .unwrap_or_default();
+                    if current.load(Ordering::Relaxed) != generation {
+                        return None;
+                    }
                     let locations = results
                         .as_ref()
                         .ok()
@@ -451,9 +454,10 @@ impl Inbox {
                                 .unwrap_or_default()
                         })
                         .unwrap_or_default();
-                    SearchReply::new(results, initial, locations)
+                    (current.load(Ordering::Relaxed) == generation)
+                        .then(|| SearchReply::new(results, initial, locations))
                 });
-                Some((start, end, reply))
+                Some((start, Instant::now(), reply))
             });
             let response = match response.await {
                 Ok(Some(response)) => response,
