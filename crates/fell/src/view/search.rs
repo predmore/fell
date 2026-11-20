@@ -15,6 +15,7 @@ use crate::model::search::{CompletionField, Search, SearchReply};
 const PREVIEW_BATCH: usize = 32;
 const SUGGESTION_LIMIT: usize = 4;
 const QUERY_DELAY: Duration = Duration::from_millis(30);
+const EMPTY_SETTLE_DELAY: Duration = Duration::from_millis(220);
 
 #[derive(Default)]
 pub(super) struct SearchView {
@@ -30,6 +31,7 @@ pub(super) struct SearchView {
     preview_key: Option<PreviewKey>,
     preview_revision: u64,
     arrival: Option<motion::Transition>,
+    pending_empty: Option<SearchReply>,
 }
 
 #[derive(PartialEq)]
@@ -247,9 +249,19 @@ impl Inbox {
             self.clear_open_message();
         }
         if switched || previous != generation {
+            self.search_view.pending_empty = None;
             self.search_view
                 .current
                 .store(generation, Ordering::Relaxed);
+        }
+        if self
+            .session
+            .search
+            .as_ref()
+            .is_some_and(|search| !search.editing)
+            && let Some(reply) = self.search_view.pending_empty.take()
+        {
+            self.show_search_reply(generation, reply, cx);
         }
         if step.search_request && self.search_view.ready {
             self.request_search(cx);
@@ -420,10 +432,12 @@ impl Inbox {
     }
 
     pub(super) fn request_search(&mut self, cx: &mut Context<Self>) {
+        self.search_view.pending_empty = None;
         let Some(search) = &self.session.search else {
             return;
         };
         let query = search.request().to_owned();
+        let me = self.session.account_email.clone();
         let folder = self.session.folder.clone();
         let store = self.store.clone();
         let account = self.account_id.clone();
@@ -481,7 +495,7 @@ impl Inbox {
                         })
                         .unwrap_or_default();
                     (current.load(Ordering::Relaxed) == generation)
-                        .then(|| SearchReply::new(results, initial, locations))
+                        .then(|| SearchReply::new(results, initial, locations, &me))
                 });
                 Some((start, Instant::now(), reply))
             });
@@ -499,6 +513,7 @@ impl Inbox {
                             )),
                             HashMap::new(),
                             HashMap::new(),
+                            "",
                         )),
                     )
                 }
@@ -507,84 +522,116 @@ impl Inbox {
                 if let Some(log) = &inbox.frames {
                     log.borrow_mut().search_work(response.0, response.1);
                 }
-                let Some(mut reply) = response.2 else {
-                    return;
-                };
-                let log = inbox.frames.clone();
-                FrameLog::event(log.as_ref(), "search_results", || {
-                    if inbox.session.search_generation != generation {
-                        return;
-                    }
-                    let old_id = inbox.session.cursor_id.clone();
-                    let old_scope = old_id
-                        .as_ref()
-                        .and_then(|id| inbox.session.search.as_ref()?.hits.get(id)?.folder.clone());
-                    let mailbox_changed = inbox
-                        .session
-                        .search
-                        .as_ref()
-                        .is_some_and(Search::mailbox_changed);
-                    let old_index = inbox.session.selected_index();
-                    let offset = inbox.list_offset();
-                    if inbox.session.apply_search_reply(generation, &mut reply) {
-                        if let Some(preferred) = inbox.search_view.prefer.take() {
-                            inbox.session.select_if_present(&preferred);
-                        }
-                        let search = inbox.session.search.as_ref().unwrap();
-                        inbox
-                            .search_view
-                            .accepted
-                            .store(generation, Ordering::Relaxed);
-                        inbox.search_view.preview_asked.clear();
-                        inbox.search_view.preview_asked.extend(
-                            inbox
-                                .session
-                                .threads
-                                .iter()
-                                .take(PREVIEW_BATCH)
-                                .filter_map(|row| search.hits.get(&row.id))
-                                .map(|hit| hit.message.clone()),
-                        );
-                        if old_id == inbox.session.cursor_id {
-                            if let Some((old, new)) = old_index.zip(inbox.session.selected_index())
-                            {
-                                inbox.set_list_offset(offset + (old as f32 - new as f32) * ROW_PX);
-                            }
-                        } else if old_id.is_none() {
-                            inbox.set_list_offset(0.0);
-                            inbox.search_view.arrival = inbox
-                                .motion
-                                .motion
-                                .start(motion::QUICK, inbox.motion.clock.now());
-                        } else {
-                            inbox.scroll_list_to_cursor();
-                        }
-                        let same_preview = !mailbox_changed
-                            && old_id == inbox.session.cursor_id
-                            && inbox.session.cursor_id == inbox.open_thread
-                            && inbox
-                                .session
-                                .cursor_id
-                                .as_deref()
-                                .and_then(|id| inbox.session.search_source(id))
-                                == old_scope.as_deref();
-                        if same_preview && inbox.open_thread.is_some() {
-                            inbox.refresh_search_matches(cx);
-                        } else {
-                            inbox.request_messages(true, cx);
-                        }
-                        cx.notify();
-                    }
-                });
-                // Dropping thousands of previous rows need not delay input.
-                if reply.rows.len() > PREVIEW_BATCH || reply.hits.len() > PREVIEW_BATCH {
-                    cx.background_executor()
-                        .spawn(async move { drop(reply) })
-                        .detach();
+                if let Some(reply) = response.2 {
+                    inbox.receive_search_reply(generation, reply, cx);
                 }
             });
         })
         .detach();
+    }
+
+    fn receive_search_reply(
+        &mut self,
+        generation: u64,
+        reply: SearchReply,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.session.defer_empty_search_reply(generation, &reply) {
+            self.show_search_reply(generation, reply, cx);
+            return;
+        }
+        // Positive results land immediately. Give a temporary zero-match
+        // prefix time to turn into a longer query while retaining its preview.
+        self.search_view.pending_empty = Some(reply);
+        let timer = cx.background_executor().timer(EMPTY_SETTLE_DELAY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.session.search_generation == generation
+                    && let Some(reply) = inbox.search_view.pending_empty.take()
+                {
+                    inbox.show_search_reply(generation, reply, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn show_search_reply(
+        &mut self,
+        generation: u64,
+        mut reply: SearchReply,
+        cx: &mut Context<Self>,
+    ) {
+        let log = self.frames.clone();
+        FrameLog::event(log.as_ref(), "search_results", || {
+            if self.session.search_generation != generation {
+                return;
+            }
+            let old_id = self.session.cursor_id.clone();
+            let old_scope = old_id
+                .as_ref()
+                .and_then(|id| self.session.search.as_ref()?.hits.get(id)?.folder.clone());
+            let mailbox_changed = self
+                .session
+                .search
+                .as_ref()
+                .is_some_and(Search::mailbox_changed);
+            let old_index = self.session.selected_index();
+            let offset = self.list_offset();
+            if self.session.apply_search_reply(generation, &mut reply) {
+                if let Some(preferred) = self.search_view.prefer.take() {
+                    self.session.select_if_present(&preferred);
+                }
+                let search = self.session.search.as_ref().unwrap();
+                self.search_view
+                    .accepted
+                    .store(generation, Ordering::Relaxed);
+                self.search_view.preview_asked.clear();
+                self.search_view.preview_asked.extend(
+                    self.session
+                        .threads
+                        .iter()
+                        .take(PREVIEW_BATCH)
+                        .filter_map(|row| search.hits.get(&row.id))
+                        .map(|hit| hit.message.clone()),
+                );
+                if old_id == self.session.cursor_id {
+                    if let Some((old, new)) = old_index.zip(self.session.selected_index()) {
+                        self.set_list_offset(offset + (old as f32 - new as f32) * ROW_PX);
+                    }
+                } else if old_id.is_none() {
+                    self.set_list_offset(0.0);
+                    self.search_view.arrival = self
+                        .motion
+                        .motion
+                        .start(motion::QUICK, self.motion.clock.now());
+                } else {
+                    self.scroll_list_to_cursor();
+                }
+                let same_preview = !mailbox_changed
+                    && old_id == self.session.cursor_id
+                    && self.session.cursor_id == self.open_thread
+                    && self
+                        .session
+                        .cursor_id
+                        .as_deref()
+                        .and_then(|id| self.session.search_source(id))
+                        == old_scope.as_deref();
+                if same_preview && self.open_thread.is_some() {
+                    self.refresh_search_matches(cx);
+                } else {
+                    self.request_messages(true, cx);
+                }
+                cx.notify();
+            }
+        });
+        // Dropping thousands of previous rows need not delay input.
+        if reply.rows.len() > PREVIEW_BATCH || reply.hits.len() > PREVIEW_BATCH {
+            cx.background_executor()
+                .spawn(async move { drop(reply) })
+                .detach();
+        }
     }
 
     fn refresh_search_matches(&mut self, cx: &mut Context<Self>) {
@@ -993,7 +1040,7 @@ pub(super) fn empty(theme: &Theme, search: &Search) -> gpui::Div {
     } else if search.error.is_some() {
         "Check your search"
     } else {
-        "No mail matches · Esc to go back"
+        "No mail matches"
     };
     div()
         .flex_1()
@@ -1057,17 +1104,15 @@ pub(super) fn row(
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
+            let (text_color, fill) = if selected {
+                theme.selected_search_match
+            } else {
+                theme.search_match
+            };
             let highlight = HighlightStyle {
-                color: Some(rgb(if selected { foreground } else { theme.accent }).into()),
+                color: Some(rgb(text_color).into()),
                 font_weight: Some(FontWeight::SEMIBOLD),
-                background_color: Some(
-                    rgb(motion::mix(
-                        background,
-                        if selected { foreground } else { theme.accent },
-                        0.14,
-                    ))
-                    .into(),
-                ),
+                background_color: Some(rgb(fill).into()),
                 ..HighlightStyle::default()
             };
             StyledText::new(text)
@@ -1119,6 +1164,22 @@ pub(super) fn row(
                 .gap(px(8.))
                 .child(
                     div()
+                        .flex()
+                        .flex_none()
+                        .max_w(gpui::relative(0.30))
+                        .min_w_0()
+                        .items_center()
+                        .gap(px(5.))
+                        .text_color(rgb(dim))
+                        .text_size(px(theme.ui_px - 2.0))
+                        .child(div().min_w_0().truncate().child(row.spans[0].text.clone()))
+                        .when(row.message_count > 1, |sender| {
+                            sender
+                                .child(div().flex_none().child(format!("· {}", row.message_count)))
+                        }),
+                )
+                .child(
+                    div()
                         .flex_1()
                         .min_w_0()
                         .truncate()
@@ -1135,9 +1196,10 @@ pub(super) fn row(
                 .child(
                     div()
                         .flex_none()
-                        .max_w_1_2()
+                        .max_w(gpui::relative(0.30))
                         .truncate()
                         .text_color(rgb(dim))
+                        .text_size(px(theme.ui_px - 2.0))
                         .child(detail),
                 ),
         )

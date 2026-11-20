@@ -7,7 +7,7 @@ use fell_core::{MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, 
 
 use super::{Fetch, Pending, Session, Step};
 use crate::keymap::KeyId;
-use crate::present::{ConvMessage, NameSpan, Pane, Rich, ThreadRow, one_line};
+use crate::present::{ConvMessage, NameSpan, Pane, Rich, ThreadRow, display_name, one_line};
 use crate::text_render::BodyBlock;
 
 #[derive(Clone, Debug)]
@@ -65,6 +65,7 @@ impl SearchReply {
         results: fell_core::Result<fell_core::SearchResults>,
         mut previews: HashMap<MessageId, SearchPreview>,
         mut locations: HashMap<MessageId, SearchLocation>,
+        me: &str,
     ) -> Self {
         let (mut rows, mut hits, mut correction, mut error) =
             (Vec::new(), HashMap::new(), None, None);
@@ -82,15 +83,16 @@ impl SearchReply {
                     semantic_only,
                 } in results.hits
                 {
-                    let location = locations.remove(&message_id);
+                    let mut location = locations.remove(&message_id);
+                    let sender_name = location.as_mut().and_then(|hit| hit.sender_name.take());
                     rows.push(ThreadRow {
                         id: thread_id.0.clone(),
                         spans: vec![NameSpan {
-                            text: one_line(&sender_email),
+                            text: one_line(&display_name(&sender_name, &sender_email, me)),
                             emphasis: true,
                         }],
                         extra: 0,
-                        message_count: 1,
+                        message_count: location.as_ref().map_or(1, |hit| hit.message_count),
                         starred: location.as_ref().is_some_and(|hit| hit.starred),
                         has_attachment: false,
                         date_unix,
@@ -573,6 +575,16 @@ impl Session {
         true
     }
 
+    pub fn defer_empty_search_reply(&self, generation: u64, reply: &SearchReply) -> bool {
+        self.search_generation == generation
+            && self
+                .search
+                .as_ref()
+                .is_some_and(|search| search.pending && search.editing)
+            && reply.rows.is_empty()
+            && reply.error.is_none()
+    }
+
     pub fn remember_search(&mut self) {
         if let Some(query) = self
             .search
@@ -801,6 +813,8 @@ mod tests {
                         folder: Some(folder.into()),
                         unread: false,
                         starred: false,
+                        sender_name: Some("Ada".into()),
+                        message_count: 3,
                     },
                 )
             })
@@ -812,6 +826,7 @@ mod tests {
             }),
             HashMap::new(),
             locations,
+            "reader@example.test",
         )
     }
 
@@ -836,10 +851,38 @@ mod tests {
         );
         assert_eq!(session.pane, Pane::List);
         assert_eq!(session.cursor_id.as_deref(), Some("one"));
+        assert_eq!(session.threads[0].spans[0].text, "Ada");
+        assert_eq!(session.threads[0].message_count, 3);
         session.on_key(KeyId::Char('j'), 10);
         assert_eq!(session.cursor_id.as_deref(), Some("two"));
         session.on_key(KeyId::Enter, 10);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn empty_prefix_stays_pending_until_settled_or_submitted() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("hall");
+        land(&mut session, reply(vec![row_hit("one", "m1")], None));
+
+        session.type_search(" v");
+        let prefix = session.search_generation;
+        let mut empty = reply(Vec::new(), None);
+        assert!(session.defer_empty_search_reply(prefix, &empty));
+        assert_eq!(session.cursor_id.as_deref(), Some("one"));
+        assert!(!session.search_results_current());
+
+        session.type_search("enue");
+        assert!(!session.apply_search_reply(prefix, &mut empty));
+        assert_eq!(session.threads.len(), 1);
+        assert!(session.defer_empty_search_reply(session.search_generation, &empty));
+
+        session.on_key(KeyId::Enter, 10);
+        assert!(!session.defer_empty_search_reply(session.search_generation, &empty));
+        land(&mut session, empty);
+        assert!(session.threads.is_empty());
+        assert!(session.search_results_current());
     }
 
     #[test]
@@ -940,6 +983,18 @@ mod tests {
         let messages = fixtures
             .thread_messages(&account.id, &hit.thread_id)
             .unwrap();
+        let locations = fixtures
+            .search_locations(&account.id, "hall", "Inbox", std::slice::from_ref(&hit))
+            .unwrap();
+        let matched = messages
+            .iter()
+            .find(|message| message.headers.message_id == hit.message_id)
+            .unwrap();
+        assert_eq!(
+            locations[&hit.message_id].sender_name,
+            matched.headers.from.name
+        );
+        assert_eq!(locations[&hit.message_id].message_count, messages.len());
         let thread = hit.thread_id.0.clone();
         land(&mut session, reply(vec![hit], None));
         session.on_key(KeyId::Enter, 10);

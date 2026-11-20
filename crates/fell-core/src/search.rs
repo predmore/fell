@@ -80,6 +80,8 @@ pub struct SearchLocation {
     pub folder: Option<String>,
     pub unread: bool,
     pub starred: bool,
+    pub sender_name: Option<String>,
+    pub message_count: usize,
 }
 
 /// One message that matches the effective query inside a ranked thread.
@@ -126,7 +128,10 @@ pub(crate) fn locations(
                         CASE WHEN f.folders = '' AND f.archived = 0 THEN ? ELSE f.folders END,
                         char(30))
                      FROM messages f
-                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.starred = 1)
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.starred = 1),
+                    m.from_name,
+                    (SELECT count(*) FROM messages f
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id)
              FROM messages m
              WHERE m.account_id = ? AND m.message_id IN ({marks})"
         );
@@ -180,6 +185,8 @@ pub(crate) fn locations(
                     folder,
                     unread,
                     starred,
+                    sender_name: row.get(7)?,
+                    message_count: row.get::<_, i64>(8)? as usize,
                 },
             );
         }
