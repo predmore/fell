@@ -1,0 +1,2 @@
+discard_drafts|1
+star|1

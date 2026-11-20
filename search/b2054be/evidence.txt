@@ -1,0 +1,11 @@
+Live search at b2054beef8d9acd1073fd145be86073199b76acc
+
+Both builds used stock themes and synthetic mailboxes. The standard captures use 1200 × 780 dark and light and 500 × 780 dark. The localized search was pasted through the private Wayland clipboard to preserve Ü. The same Inbox/München message matched in:MÜNCHEN. Archiving on 8865b29 left München and Archive. On this head it left Inbox and Archive. Store regression coverage also verifies the München unread flag and rejection of the stale explicit scope.
+
+The Drafts replay starts with a local draft, a synced draft, and a discarded local draft. After starring a search result and undoing that action and the discard, Escape shows each draft once. The deferred read landed before the first Escape frame in both compared runs. The model test exercises the saved snapshot directly after three refreshes and verifies refreshed draft text, unique rows, and cursor retention.
+
+The slow-search regression holds the search job open while the interactive connection completes its own read. Full file-backed queries and model warm-up now share one background connection.
+
+Formatting and strict Clippy passed. All-feature workspace tests reported 1,292 passed and six ignored. The prior head passed its hosted budget-job retry, with 2.759 ms thread p95 and 138.709 ms hybrid p95.
+
+The 8 ms input requirement is still open. In the exact-head Asahi app and nested Weston llvmpipe replay, 12/154 paced inputs and 247/256 burst inputs exceeded 8 ms while search was in flight. The paced p95 was 13.274 ms and burst p95 was 25.445 ms. Timing ends at CPU paint. Native Hyprland and display presentation remain unverified.

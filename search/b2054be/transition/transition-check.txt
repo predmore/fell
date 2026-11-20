@@ -1,0 +1,3 @@
+423 sampled video frames at 60 fps
+Pending candidate frames [90, 91, 92, 147, 148, 149, 170, 171, 172, 173, 174, 175, 176]
+Pending frames with both retained panes [90, 91, 92, 147, 148, 149, 173, 174, 175, 176]
