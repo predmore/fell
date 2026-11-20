@@ -1,0 +1,2 @@
+reader-title: 122 frames; 2593 to 2610 text pixels
+result-excerpt: 122 frames; 681 to 1299 text pixels
