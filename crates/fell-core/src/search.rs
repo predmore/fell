@@ -141,15 +141,13 @@ pub(crate) fn locations(
                     })
                     .or_else(|| folders.first())
             } else {
-                // The SQL filter compares the stored token exactly or
-                // compares SQLite's ASCII fold to the typed lowercase value.
-                // Use the stored spelling for actions and for the folder key.
+                // Prefer the typed folder identity when distinct stored
+                // folders share a Unicode lowercase spelling.
                 filters.iter().find_map(|(typed, folded)| {
-                    folders.iter().find(|name| *name == typed).or_else(|| {
-                        folders
-                            .iter()
-                            .find(|name| name.eq_ignore_ascii_case(folded))
-                    })
+                    folders
+                        .iter()
+                        .find(|name| name.eq_ignore_ascii_case(typed))
+                        .or_else(|| folders.iter().find(|name| name.to_lowercase() == *folded))
                 })
             }
             .cloned();
@@ -188,7 +186,11 @@ pub(crate) fn previews(
     query: &str,
     messages: &[MessageId],
 ) -> Result<HashMap<MessageId, SearchPreview>> {
-    let parsed = parse_query(query)?;
+    let snapshot = semantic::Snapshot::begin(conn)?;
+    let parsed = parse_search_query(conn, account, query)?;
+    if no_match_possible(&parsed) {
+        return Ok(HashMap::new());
+    }
     let Some(fts) = fts_match(&parsed).filter(|_| !messages.is_empty()) else {
         return Ok(HashMap::new());
     };
@@ -205,7 +207,9 @@ pub(crate) fn previews(
         let marked: String = row.get(1)?;
         Ok((MessageId(row.get(0)?), preview_from_marked(&marked)))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let previews = rows.collect::<rusqlite::Result<_>>()?;
+    snapshot.commit()?;
+    Ok(previews)
 }
 
 fn preview_from_marked(marked: &str) -> SearchPreview {
@@ -238,7 +242,8 @@ pub(crate) fn thread_matches(
     query: &str,
     thread: &ThreadId,
 ) -> Result<Vec<SearchMatch>> {
-    let parsed = parse_query(query)?;
+    let snapshot = semantic::Snapshot::begin(conn)?;
+    let parsed = parse_search_query(conn, account, query)?;
     if query.trim().is_empty() || no_match_possible(&parsed) {
         return Ok(Vec::new());
     }
@@ -260,7 +265,9 @@ pub(crate) fn thread_matches(
                 .map(preview_from_marked),
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let matches = rows.collect::<rusqlite::Result<_>>()?;
+    snapshot.commit()?;
+    Ok(matches)
 }
 
 fn matching_rows(
@@ -641,7 +648,11 @@ pub(crate) fn execute(
     }
     // When the keyword side corrected the query, its hits are for the
     // correction, so the semantic side embeds and filters that too.
-    let parsed = parse_query(keyword.did_you_mean.as_deref().unwrap_or(query))?;
+    let parsed = parse_search_query(
+        conn,
+        account_id,
+        keyword.did_you_mean.as_deref().unwrap_or(query),
+    )?;
     if no_match_possible(&parsed) || parsed.text_phrases.is_empty() {
         return Ok(keyword);
     }
@@ -667,7 +678,7 @@ fn execute_keyword(
             did_you_mean: None,
         });
     }
-    let parsed = parse_query(query)?;
+    let parsed = parse_search_query(conn, account_id, query)?;
     let hits = run(conn, account_id, &parsed)?;
     if !hits.is_empty() {
         return Ok(SearchResults {
@@ -687,7 +698,7 @@ fn execute_keyword(
             did_you_mean: None,
         });
     }
-    let reparsed = match parse_query(&suggestion) {
+    let mut reparsed = match parse_query(&suggestion) {
         Ok(parsed) => parsed,
         Err(_) => {
             return Ok(SearchResults {
@@ -696,6 +707,7 @@ fn execute_keyword(
             });
         }
     };
+    resolve_folders(conn, account_id, &mut reparsed)?;
     let corrected = run(conn, account_id, &reparsed)?;
     if corrected.is_empty() {
         return Ok(SearchResults {
@@ -709,9 +721,10 @@ fn execute_keyword(
     })
 }
 
-/// An unknown `has:`/`is:` value or an empty date range matches nothing.
+/// A missing folder, unknown flag, or empty date range matches nothing.
 fn no_match_possible(parsed: &ParsedQuery) -> bool {
     parsed.unmatched_flag
+        || parsed.folder_keys.iter().any(Vec::is_empty)
         || matches!((parsed.after, parsed.before), (Some(after), Some(before)) if after >= before)
 }
 
@@ -766,9 +779,6 @@ fn run_filtered(
     account_id: &AccountId,
     parsed: &ParsedQuery,
 ) -> Result<Vec<SearchHit>> {
-    if !folders_can_match(conn, account_id, &parsed.folders)? {
-        return Ok(Vec::new());
-    }
     // Rank only the keys. The first message in a thread already has its
     // largest matching date. Fetch the display fields once per ranked hit.
     let mut sql = String::from(
@@ -788,34 +798,35 @@ fn run_filtered(
     query_hits(conn, &sql, params)
 }
 
-fn folders_can_match(conn: &Connection, account: &AccountId, folders: &[String]) -> Result<bool> {
-    if folders.is_empty() {
-        return Ok(true);
+fn parse_search_query(conn: &Connection, account: &AccountId, query: &str) -> Result<ParsedQuery> {
+    let mut parsed = parse_query(query)?;
+    resolve_folders(conn, account, &mut parsed)?;
+    Ok(parsed)
+}
+
+fn resolve_folders(conn: &Connection, account: &AccountId, parsed: &mut ParsedQuery) -> Result<()> {
+    if parsed.folders.is_empty() {
+        return Ok(());
     }
-    // Stored names use SQLite's ASCII case fold. A queued thread may not
-    // have contributed its folders yet, so in that case read messages.
-    let mut stmt = conn.prepare_cached(
-        "SELECT EXISTS (
-             SELECT 1 FROM account_folders
-             WHERE account_id = ?1 AND folder_key IN (?2, ?3)
-         ) OR EXISTS (
-             SELECT 1 FROM thread_summary_dirty WHERE account_id = ?1
-         )",
-    )?;
-    for folder in folders.iter().filter(|folder| !folder.contains('\u{1e}')) {
-        let may_match = stmt.query_row(
-            rusqlite::params![
-                account.as_str(),
-                folder.to_lowercase(),
-                folder.to_ascii_lowercase()
-            ],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !may_match {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // Resolve Unicode spelling against the folder summaries once. The
+    // message query can then use SQLite's ASCII fold on stored identities.
+    let names: Vec<_> = crate::store::message_folder_names(conn, account)?
+        .into_iter()
+        .map(|name| (name.to_lowercase(), name.to_ascii_lowercase()))
+        .collect();
+    parsed.folder_keys = parsed
+        .folders
+        .iter()
+        .map(|folder| {
+            let folded = folder.to_lowercase();
+            names
+                .iter()
+                .filter(|(name, _)| *name == folded)
+                .map(|(_, key)| format!("\u{1e}{key}\u{1e}"))
+                .collect()
+        })
+        .collect();
+    Ok(())
 }
 
 fn append_filters(sql: &mut String, params: &mut Vec<Value>, parsed: &ParsedQuery) {
@@ -833,8 +844,16 @@ fn append_filters(sql: &mut String, params: &mut Vec<Value>, parsed: &ParsedQuer
         sql.push_str(" AND m.date_unix < ?");
         params.push(Value::Integer(before));
     }
-    for folder in &parsed.folders {
-        push_token_filter(sql, params, "m.folders", folder);
+    for keys in &parsed.folder_keys {
+        sql.push_str(" AND (");
+        for (index, key) in keys.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str("instr(char(30) || lower(m.folders) || char(30), ?) > 0");
+            params.push(Value::Text(key.clone()));
+        }
+        sql.push(')');
     }
     for label in &parsed.labels {
         push_token_filter(sql, params, "m.labels", label);
@@ -1137,6 +1156,7 @@ struct ParsedQuery {
     to: Vec<String>,
     subject: Vec<String>,
     folders: Vec<String>,
+    folder_keys: Vec<Vec<String>>,
     labels: Vec<String>,
     has_attachment: bool,
     is_unread: bool,

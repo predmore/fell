@@ -36,6 +36,7 @@ mod write_lock;
 
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use intents::PendingFlags;
+pub(crate) use summaries::folder_names as message_folder_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 const SCHEMA: &str = r#"
@@ -5249,7 +5250,7 @@ mod tests {
             .unwrap();
         let inbox = store.search(&account, "in:Inbox").unwrap();
         assert_eq!(winning_message(inbox.hits), MessageId::new("ada@msg"));
-        let munich = || store.search(&account, "in:MÜNCHEN").unwrap();
+        let munich = || store.search(&account, "in:München").unwrap();
         assert_eq!(
             winning_message(munich().hits),
             MessageId::new("reply-ada@msg")
@@ -5278,12 +5279,26 @@ mod tests {
         let account = account();
         store.upsert_account(&account).unwrap();
         let mut message = msg("munich@msg", None, None, "Train", "travel details");
-        message.folders = vec!["INBOX".into(), "München".into()];
+        message.folders = vec!["INBOX".into(), "MÜNCHEN".into()];
         message.unread = true;
         let thread = store.upsert_message(&message).unwrap();
-        let query = "in:MÜNCHEN";
+        let query = "in:München";
         let hits = store.search(&account.id, query).unwrap().hits;
         assert_eq!(hits.len(), 1);
+        let with_text = "train in:münchen";
+        assert_eq!(store.search(&account.id, with_text).unwrap().hits, hits);
+        let message_id = hits[0].message_id.clone();
+        assert!(
+            store
+                .search_previews(&account.id, with_text, std::slice::from_ref(&message_id))
+                .unwrap()
+                .contains_key(&message_id)
+        );
+        let matches = store
+            .search_thread_matches(&account.id, with_text, &thread)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].message, message_id);
         let locations = || {
             store
                 .search_locations(&account.id, query, "INBOX", &hits)
@@ -5292,7 +5307,7 @@ mod tests {
 
         let before = locations();
         let scope = &before[&hits[0].message_id];
-        assert_eq!(scope.folder.as_deref(), Some("München"));
+        assert_eq!(scope.folder.as_deref(), Some("MÜNCHEN"));
         assert!(scope.unread);
         store
             .archive_thread(&account.id, &thread, scope.folder.as_deref().unwrap())
