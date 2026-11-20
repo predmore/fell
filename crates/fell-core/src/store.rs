@@ -237,7 +237,7 @@ SELECT
 FROM messages;
 "#;
 
-const DROP_FTS_TRIGGERS: &str = r#"
+pub(crate) const DROP_FTS_TRIGGERS: &str = r#"
 DROP TRIGGER IF EXISTS messages_ai;
 DROP TRIGGER IF EXISTS messages_ad;
 DROP TRIGGER IF EXISTS messages_au;
@@ -4038,7 +4038,7 @@ impl WriteTx<'_> {
     }
 }
 
-fn ensure_fts(conn: &Connection) -> Result<()> {
+pub(crate) fn ensure_fts(conn: &Connection) -> Result<()> {
     // Most opens change nothing here. Check without the write lock, so an
     // open does not hold up sync or the indexer for two counts.
     if fts_is_current(conn)? {

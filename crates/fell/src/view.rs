@@ -4793,7 +4793,7 @@ impl BodyRefresh {
 /// One thread's messages as the conversation shows them, with whether
 /// each has its body yet. `shown`: the account address, its folder roles
 /// and names, and the folder the list shows ([`present::conversation`]).
-fn read_conversation(
+pub fn read_conversation(
     store: &fell_core::Store,
     account: &AccountId,
     thread: &ThreadId,

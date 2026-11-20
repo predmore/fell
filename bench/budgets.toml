@@ -1,0 +1,8 @@
+# Ubuntu CI reference values rounded up for runner variance. See README.md
+# for the measured baseline and product maxima. The gate adds 20% to each value.
+folder_page_p95_ms = 0.75
+thread_open_p95_ms = 3.0
+keyword_search_p95_ms = 25.0
+# With the 20% tolerance, enforce the 150 ms product limit until calibrated.
+semantic_search_p95_ms = 125.0
+rest_rss_mb = 18.0
