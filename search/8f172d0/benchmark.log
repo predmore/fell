@@ -1,0 +1,32 @@
+    Finished `bench` profile [optimized] target(s) in 0.63s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running benches/fell-bench.rs (/home/caleb/.cache/fell-125-target/release/build/fell/d958b8c9853ac34f/out/fell_bench-d958b8c9853ac34f)
+Seeded 100,000 messages in 178.07s (773.7 MB)
+## 100k-message store budgets
+
+| Operation | Samples | p50 (ms) | p95 (ms) or RSS (MB) | Baseline | Limit (+20%) | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| RSS after store open | 1 | — | 39.518 | 18.000 | 21.600 | **Fail** |
+| RSS after first Inbox page | 1 | — | 39.977 | 18.000 | 21.600 | **Fail** |
+| RSS after opening 20 distinct threads | 1 | — | 40.960 | 18.000 | 21.600 | **Fail** |
+| Open populated store | 31 | 1.455 | 1.884 | — | — | Informational |
+| Inbox first page (100 rows) | 31 | 0.385 | 0.406 | 0.750 | 0.900 | Pass |
+| Inbox page near middle cursor (100 rows) | 31 | 0.389 | 0.404 | 0.750 | 0.900 | Pass |
+| Read and present a 50-message thread | 31 | 1.634 | 1.878 | 3.000 | 3.600 | Pass |
+| Keyword · Single term (`invoice`) | 31 | 11.206 | 11.352 | 25.000 | 30.000 | Pass |
+| Keyword · Multiple terms (`boiler leak`) | 31 | 8.843 | 9.802 | 25.000 | 30.000 | Pass |
+| Keyword · Quoted phrase (`"boarding pass"`) | 31 | 6.483 | 7.336 | 25.000 | 30.000 | Pass |
+| Keyword · Text and operators (`warranty from:p10@bench.test in:inbox has:attachment after:2023-12-01`) | 31 | 3.941 | 4.217 | 25.000 | 30.000 | Pass |
+| Keyword · Misspelling (`invioce`) | 31 | 10.907 | 12.530 | 25.000 | 30.000 | Pass |
+| Hybrid search (MiniLM + keyword) | 31 | 9.897 | 96.869 | 125.000 | 150.000 | Pass |
+
+Hybrid setup took 2.09s and seeded 100k vectors from local MiniLM topic vectors with deterministic jitter.
+
+Fixture generation took 178.07s (773.7 MB on disk). Full suite took 183.27s, including setup and cleanup. Each latency row uses nearest-rank percentiles. RSS values are single process snapshots in decimal MB.
+
+fell-bench: store budget exceeded: RSS after store open, RSS after first Inbox page, RSS after opening 20 distinct threads
+error: bench failed, to rerun pass `-p fell --bench fell-bench`
+
+Caused by:
+  process didn't exit successfully: `/home/caleb/.cache/fell-125-target/release/build/fell/d958b8c9853ac34f/out/fell_bench-d958b8c9853ac34f --bench` (exit status: 1)

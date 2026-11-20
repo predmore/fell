@@ -1,0 +1,82 @@
+Fell issue 108 evidence
+
+Source
+  Pushed branch issue-108-search
+  Commit 8f172d016956ad63fb4b9bf235eefa0b839f6d7f
+  Base 30e1f5d3c9e8448c0ba02e4272b2dba68454e999 (fetched origin/main)
+  Release build reported fell 0.1.0 (8f172d016956, 2026-11-20)
+  Executable SHA-256 89c3e837e7765e621154f45ce8464a0e6db31c05b79ccf69144a14fa51448a25
+
+Running app
+  All captures use the release binary and an isolated synthetic mailbox.
+  The config, data, draft socket and cache paths were isolated. The demo store ran offline.
+  Dark is Tokyo Night at 1200 × 780. Light is Catppuccin Latte at 1200 × 780.
+  Narrow is Tokyo Night at 500 × 780, showing one pane.
+
+  State             Dark                    Light                   Narrow
+  Grouped result    dark/results.png        light/results.png       narrow/results.png
+  Empty             dark/empty.png          light/empty.png         narrow/empty.png
+  Did you mean      dark/did-you-mean.png   light/did-you-mean.png   narrow/did-you-mean.png
+
+  dark/multiple-results.png shows five ranked threads for notes.
+  dark/operator.png and dark/operator-accepted.png show the live label completion and Tab.
+  dark/first-hit.png, dark/next-hit.png and dark/previous-hit.png show the selected messages.
+  dark/folder-restored.png shows the restored Inbox selection.
+  dark/palette-recents.png shows the submitted queries in the command palette.
+  dark/keyboard.mp4 covers /, Enter twice, n and N, Escape, label completion,
+  typo correction, palette recents and an empty search. It runs for 13.07 seconds.
+  Each theme directory contains the app version log and capture timeline.
+
+Keyword search benchmark
+  The unmodified #125 harness ran from its separate checkout at
+  13cca9e1ef040c0c076f250fc37f8b129bab9143. Its deterministic synthetic mailbox
+  held 100,000 distinct messages. The suite used 31 warm nearest-rank samples
+  per query with semantic ranking disabled for these rows.
+
+  Keyword p95, milliseconds
+  Invoice                        11.352
+  Boiler leak                     9.802
+  Quoted boarding pass            7.336
+  Warranty with operators         4.217
+  Misspelled invoice              12.530
+
+  All keyword cases passed the 50 ms product budget and the 30 ms harness gate.
+  The harness process exited 1 on its separate RSS gate. It measured
+  39.518 to 40.960 MB against the 21.600 MB CI-calibrated limit.
+  Raw output is in ../benchmark.log.
+
+Exact-build key-to-frame
+  The #125 seed tool made the separate app measurement store with 100,000
+  messages in 19,240 threads. The release app ran on ARM64 Apple M2 under
+  Weston 15.0.1 on private Xvfb. GPUI used Mesa lavapipe and Weston used Pixman.
+  The nested hardware attempt failed with ERROR_SURFACE_LOST_KHR. Its output
+  is in asahi/perf/app.log.
+
+  FrameLog measures from the first delivered key handler to that frame's
+  final paint, including time waiting for the frame. It does not measure
+  keyboard hardware, GPU submission, or display presentation. The actor
+  reports the actual Store::search start and end on the same clock.
+  An overlapping sample is one whose key handler starts within such an
+  interval. The paced run used XTEST at 47 ms per event, alternating Space
+  and Backspace on invoice and then in:INBOX. This generated 417 key frames
+  including navigation and query entry, 233 completed query intervals, and
+  199 frames that started with query work in flight.
+
+  Paced in-flight key-to-paint p50 0.449 ms, p95 1.037 ms, max 11.857 ms.
+  Three of those 199 samples exceeded 8 ms. All 64 keyword-phase overlap
+  samples were below 8 ms, with p95 1.037 ms and max 1.144 ms.
+  In-flight frame build/layout/paint p95 was 0.974 ms.
+  Xdotool burst replays on the same test setup measured 11.364 ms p95
+  (25 overlaps, quiet host) and 20.792 ms p95 (38 overlaps, concurrent tests).
+  Those runs show the effect of input timing and load on this measurement.
+  The strict per-key 8 ms condition was not universal in this environment.
+
+  Raw samples are in perf-paced/frames.jsonl, perf-software/frames.jsonl
+  and perf-software-contended/frames.jsonl. frame-stats.txt holds the full
+  summary. The capture and analysis scripts are in the parent directory.
+
+Validation
+  cargo fmt --all -- --check passed.
+  cargo clippy --locked --workspace --all-targets --all-features -- -D warnings passed.
+  cargo test --locked --workspace --all-features passed, 1,261 tests and 6 ignored.
+  Logs are in ../clippy.log and ../workspace-tests-final.log.

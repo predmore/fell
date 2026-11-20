@@ -1,0 +1,66 @@
+/home/caleb/.cache/fell-108-evidence/8f172d016956/perf-paced/frames.jsonl
+  233 completed work intervals, 417 key frames
+ all keys (n=417)
+  Key handler to end of paint: p50 0.552 ms, p95 1.126 ms, max 15.209 ms
+  Frame build/layout/paint wall time: p50 0.490 ms, p95 0.992 ms, max 1.287 ms
+  Frame UI-thread CPU: p50 0.466 ms, p95 0.954 ms, max 1.255 ms
+  Keys {'/': 1, 'i': 3, 'n': 2, 'v': 1, 'o': 1, 'c': 1, 'e': 1, 'space': 200, 'backspace': 200, 'ctrl-u': 1, ':': 1, 'shift-i': 1, 'shift-n': 1, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1}
+ keys during query work (n=199)
+  Key handler to end of paint: p50 0.449 ms, p95 1.037 ms, max 11.857 ms
+  Frame build/layout/paint wall time: p50 0.416 ms, p95 0.974 ms, max 1.082 ms
+  Frame UI-thread CPU: p50 0.405 ms, p95 0.943 ms, max 1.043 ms
+  Keys {'backspace': 101, 'space': 94, 'shift-n': 1, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1}
+ keys during query work in the keyword phase (n=64)
+  Key handler to end of paint: p50 0.788 ms, p95 1.037 ms, max 1.144 ms
+  Frame build/layout/paint wall time: p50 0.755 ms, p95 0.981 ms, max 1.082 ms
+  Frame UI-thread CPU: p50 0.745 ms, p95 0.950 ms, max 1.043 ms
+  Keys {'backspace': 38, 'space': 26}
+ keys during query work in the filter phase (n=135)
+  Key handler to end of paint: p50 0.432 ms, p95 1.031 ms, max 11.857 ms
+  Frame build/layout/paint wall time: p50 0.401 ms, p95 0.965 ms, max 1.027 ms
+  Frame UI-thread CPU: p50 0.389 ms, p95 0.937 ms, max 0.978 ms
+  Keys {'shift-n': 1, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1, 'space': 68, 'backspace': 63}
+/home/caleb/.cache/fell-108-evidence/8f172d016956/perf-software/frames.jsonl
+  18 completed work intervals, 417 key frames
+ all keys (n=417)
+  Key handler to end of paint: p50 0.439 ms, p95 11.136 ms, max 15.201 ms
+  Frame build/layout/paint wall time: p50 0.204 ms, p95 0.414 ms, max 3.947 ms
+  Frame UI-thread CPU: p50 0.196 ms, p95 0.394 ms, max 0.533 ms
+  Keys {'/': 1, 'i': 3, 'n': 2, 'v': 1, 'o': 1, 'c': 1, 'e': 1, 'space': 200, 'backspace': 200, 'ctrl-u': 1, ':': 1, 'shift-i': 1, 'shift-n': 1, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1}
+ keys during query work (n=25)
+  Key handler to end of paint: p50 5.115 ms, p95 11.364 ms, max 12.143 ms
+  Frame build/layout/paint wall time: p50 0.214 ms, p95 0.349 ms, max 1.450 ms
+  Frame UI-thread CPU: p50 0.206 ms, p95 0.289 ms, max 0.411 ms
+  Keys {'v': 1, 'space': 11, 'backspace': 10, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1}
+ keys during query work in the keyword phase (n=4)
+  Key handler to end of paint: p50 5.115 ms, p95 9.250 ms, max 9.250 ms
+  Frame build/layout/paint wall time: p50 0.216 ms, p95 0.349 ms, max 0.349 ms
+  Frame UI-thread CPU: p50 0.211 ms, p95 0.277 ms, max 0.277 ms
+  Keys {'v': 1, 'space': 2, 'backspace': 1}
+ keys during query work in the filter phase (n=21)
+  Key handler to end of paint: p50 4.839 ms, p95 11.364 ms, max 12.143 ms
+  Frame build/layout/paint wall time: p50 0.209 ms, p95 0.295 ms, max 1.450 ms
+  Frame UI-thread CPU: p50 0.204 ms, p95 0.289 ms, max 0.411 ms
+  Keys {'shift-b': 1, 'shift-o': 1, 'shift-x': 1, 'space': 9, 'backspace': 9}
+/home/caleb/.cache/fell-108-evidence/8f172d016956/perf-software-contended/frames.jsonl
+  9 completed work intervals, 417 key frames
+ all keys (n=417)
+  Key handler to end of paint: p50 0.331 ms, p95 11.858 ms, max 150.122 ms
+  Frame build/layout/paint wall time: p50 0.244 ms, p95 1.129 ms, max 8.852 ms
+  Frame UI-thread CPU: p50 0.221 ms, p95 0.762 ms, max 1.103 ms
+  Keys {'/': 1, 'i': 3, 'n': 2, 'v': 1, 'o': 1, 'c': 1, 'e': 1, 'space': 200, 'backspace': 200, 'ctrl-u': 1, ':': 1, 'shift-i': 1, 'shift-n': 1, 'shift-b': 1, 'shift-o': 1, 'shift-x': 1}
+ keys during query work (n=38)
+  Key handler to end of paint: p50 0.787 ms, p95 20.792 ms, max 23.962 ms
+  Frame build/layout/paint wall time: p50 0.355 ms, p95 5.247 ms, max 6.737 ms
+  Frame UI-thread CPU: p50 0.313 ms, p95 0.854 ms, max 1.068 ms
+  Keys {'space': 18, 'backspace': 19, ':': 1}
+ keys during query work in the keyword phase (n=2)
+  Key handler to end of paint: p50 0.541 ms, p95 20.727 ms, max 20.727 ms
+  Frame build/layout/paint wall time: p50 0.436 ms, p95 1.129 ms, max 1.129 ms
+  Frame UI-thread CPU: p50 0.425 ms, p95 1.068 ms, max 1.068 ms
+  Keys {'space': 1, 'backspace': 1}
+ keys during query work in the filter phase (n=36)
+  Key handler to end of paint: p50 0.787 ms, p95 20.792 ms, max 23.962 ms
+  Frame build/layout/paint wall time: p50 0.338 ms, p95 5.247 ms, max 6.737 ms
+  Frame UI-thread CPU: p50 0.311 ms, p95 0.686 ms, max 0.854 ms
+  Keys {':': 1, 'space': 17, 'backspace': 18}
