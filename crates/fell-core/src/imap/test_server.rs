@@ -23,6 +23,8 @@ pub(super) enum BodyForm {
     Quoted,
     Nil,
     Absent,
+    /// Headers are returned normally but the full-body result has only flags.
+    HeadersOnly,
     /// Listed with its flags, but a body fetch leaves it out and still
     /// answers OK.
     Omitted,
@@ -665,7 +667,7 @@ fn handle(
                             );
                         }
                         BodyForm::Omitted => {}
-                        BodyForm::Absent => {
+                        BodyForm::Absent | BodyForm::HeadersOnly => {
                             let _ = write.write_all(
                                 format!(
                                     "* {seq} FETCH (UID {} FLAGS ({flags}){revision})\r\n",

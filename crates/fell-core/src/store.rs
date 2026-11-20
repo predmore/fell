@@ -662,8 +662,17 @@ impl Store {
     /// part, so a pass cut short after the first is done again by the next.
     /// Any other delta is one transaction.
     pub fn apply_delta(&self, account_id: &AccountId, delta: &MailboxDelta) -> Result<()> {
+        self.apply_sync_delta(account_id, delta).map(|_| ())
+    }
+
+    pub(crate) fn apply_sync_delta(
+        &self,
+        account_id: &AccountId,
+        delta: &MailboxDelta,
+    ) -> Result<DeltaWrites> {
         let mut tx = self.begin_sync_write()?;
         let mut merge_roles = MergeRoles::new(delta.roles.as_ref());
+        let mut new_messages = 0;
         for message in &delta.messages {
             if &message.account_id != account_id {
                 return Err(crate::Error::Backend(format!(
@@ -677,9 +686,9 @@ impl Store {
                 continue;
             };
             // A combined delta can carry the listing for these messages.
-            insert_message(&tx, &message, &mut merge_roles)?;
+            new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
         }
-        let inserted = !delta.messages.is_empty();
+        let has_arrivals = !delta.messages.is_empty();
         for message_id in &delta.too_large {
             if let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? {
                 bodies::mark_withheld(&tx, account_id, &canonical)?;
@@ -697,7 +706,7 @@ impl Store {
             || delta.settle != crate::backend::Settle::Later;
         let split = copy_work && delta.flags.len() >= SPLIT_DELTA_AT;
         if split {
-            if inserted {
+            if has_arrivals {
                 self.rethread_written(&tx, account_id)?;
             }
             tx.commit()?;
@@ -715,7 +724,7 @@ impl Store {
         };
         let took_over = copies::apply_removals(&tx, account_id, &delta.removals)?;
         let settled = copies::settle(&tx, account_id, delta.settle)?;
-        if (inserted && !split) || repaired || took_over || settled {
+        if (has_arrivals && !split) || repaired || took_over || settled {
             self.rethread_written(&tx, account_id)?;
         }
         if let Some(cursor) = &delta.cursor {
@@ -723,7 +732,15 @@ impl Store {
         }
         tx.commit()?;
         self.seal_private_files()?;
-        Ok(())
+        Ok(DeltaWrites {
+            new_messages,
+            changed: has_arrivals
+                || !delta.flags.is_empty()
+                || !delta.too_large.is_empty()
+                || repaired
+                || took_over
+                || settled,
+        })
     }
 
     /// Whether each of `messages` (stored ids, as [`Store::thread_messages`]
@@ -2142,21 +2159,29 @@ impl<'a> MergeRoles<'a> {
     }
 }
 
+pub(crate) struct DeltaWrites {
+    pub new_messages: usize,
+    /// The caller should refresh its view of the stored mail.
+    pub changed: bool,
+}
+
+/// Returns whether the arrival made a new row. Every accepted arrival still
+/// records its remote copy, including arrivals folded into a stored row.
 fn insert_message(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<ThreadId> {
-    let thread = insert_arrival(conn, message, roles)?;
+) -> Result<bool> {
+    let inserted = insert_arrival(conn, message, roles)?;
     copies::record(conn, message)?;
-    Ok(thread)
+    Ok(inserted)
 }
 
 fn insert_arrival(
     conn: &Connection,
     message: &Message,
     roles: &mut MergeRoles<'_>,
-) -> Result<ThreadId> {
+) -> Result<bool> {
     let fingerprint = message_fingerprint(message);
     if let Some((stored, via_alias)) =
         find_stored(conn, &message.account_id, &message.headers.message_id)?
@@ -2172,15 +2197,19 @@ fn insert_arrival(
                 roles,
             )?
         {
-            return absorb_duplicate(conn, message, &stored, &other);
+            absorb_duplicate(conn, message, &stored, &other)?;
+        } else {
+            write_kept(conn, message, &stored, via_alias, &[], &[])?;
         }
-        return write_kept(conn, message, &stored, via_alias, &[], &[]);
+        return Ok(false);
     }
     if let Some(stored) = find_list_collapse(conn, message, &fingerprint, None, false, roles)? {
         remember_alias(conn, message, &stored.canonical_id)?;
-        return write_kept(conn, message, &stored, true, &[], &[]);
+        write_kept(conn, message, &stored, true, &[], &[])?;
+        return Ok(false);
     }
-    insert_new(conn, message, &fingerprint)
+    insert_new(conn, message, &fingerprint)?;
+    Ok(true)
 }
 
 fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result<ThreadId> {

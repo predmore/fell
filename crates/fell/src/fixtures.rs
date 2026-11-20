@@ -1116,7 +1116,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let account = fixture_account();
         let report = seed_if_empty(&store, &account).unwrap();
-        assert!(report.upserted > 10);
+        assert!(report.new_messages.is_some_and(|count| count > 10));
         let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
         assert!(inbox.len() >= 10);
         let sent_copy = inbox
@@ -1143,7 +1143,7 @@ mod tests {
             1
         );
         let again = seed_if_empty(&store, &account).unwrap();
-        assert_eq!(again.upserted, 0);
+        assert!(!again.changed);
     }
 
     #[test]
