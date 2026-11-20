@@ -35,6 +35,7 @@ use crate::embed::{
 use crate::folders::FolderRole;
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
+use crate::store::keywords::{self, LabelEdit, LabelHistory};
 use crate::store::{Store, ThreadSummary};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS local_action_messages (
     labels TEXT NOT NULL,
     after_folders TEXT NOT NULL DEFAULT '',
     after_labels TEXT NOT NULL DEFAULT '',
+    label_was_keyword INTEGER,
     arrived_via TEXT NOT NULL,
     to_line TEXT NOT NULL,
     cc_line TEXT NOT NULL,
@@ -355,12 +357,12 @@ impl Store {
                 };
                 return Err(Error::Action(message.into()));
             }
-            let summary = if adding {
-                format!("added label {label}")
+            let edit = if adding {
+                LabelEdit::Added(&label)
             } else {
-                format!("removed label {label}")
+                LabelEdit::Removed(&label)
             };
-            Ok((summary, plans))
+            Ok((edit.summary(), plans))
         })
     }
 
@@ -537,6 +539,14 @@ impl Store {
             };
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
+        } else if action.kind == ActionKind::Label {
+            keywords::undo_label_action(
+                &tx,
+                account_id,
+                action.id,
+                &action.summary,
+                LabelHistory::Local,
+            )?;
         } else {
             for row in &load_snapshots(&tx, action.id)? {
                 restore_row(&tx, account_id, row)?;
@@ -755,11 +765,25 @@ fn record_and_apply(
     summary: &str,
     plans: &[Planned],
 ) -> Result<LocalAction> {
+    let label_edit = (kind == ActionKind::Label)
+        .then(|| LabelEdit::from_summary(summary))
+        .transpose()?;
     let action = insert_local_action(conn, account_id, kind, summary)?;
     let id = action.id;
     for plan in plans {
         if kind != ActionKind::Purge {
-            insert_snapshot(conn, id, account_id, plan)?;
+            let was_keyword = label_edit
+                .map(|edit| {
+                    keywords::record_edit(
+                        conn,
+                        account_id,
+                        &plan.before.message_id,
+                        edit,
+                        &plan.before.labels,
+                    )
+                })
+                .transpose()?;
+            insert_snapshot(conn, id, account_id, plan, was_keyword)?;
         }
         record_tombstones(conn, id, account_id, plan)?;
     }
@@ -965,18 +989,11 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             &split_tokens(&snapshot.after_folders),
             true,
         ));
-        let labels = join_tokens(&invert_tokens(
-            &split_tokens(&current.labels),
-            &split_tokens(&saved.labels),
-            &split_tokens(&snapshot.after_labels),
-            false,
-        ));
         let old_terms = terms_of(&current);
-        let new_terms = terms_with(&current, &folders, &labels);
+        let new_terms = terms_with(&current, &folders, &current.labels);
         let changed = conn.execute(
-            "UPDATE messages SET folders = ?1, labels = ?2
-             WHERE account_id = ?3 AND message_id = ?4",
-            params![folders, labels, account_id.as_str(), saved.message_id],
+            "UPDATE messages SET folders = ?1 WHERE account_id = ?2 AND message_id = ?3",
+            params![folders, account_id.as_str(), saved.message_id],
         )?;
         expect_one(changed, &saved.message_id)?;
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
@@ -994,12 +1011,16 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             &split_tokens(&snapshot.after_folders),
             true,
         ));
-        let labels = join_tokens(&invert_tokens(
-            &split_tokens(&current.labels),
-            &split_tokens(&saved.labels),
-            &split_tokens(&snapshot.after_labels),
-            false,
-        ));
+        let labels = if snapshot.removed {
+            join_tokens(&invert_tokens(
+                &split_tokens(&current.labels),
+                &split_tokens(&saved.labels),
+                &split_tokens(&snapshot.after_labels),
+                false,
+            ))
+        } else {
+            current.labels.clone()
+        };
         let old_terms = terms_of(&current);
         let new_terms = terms_with(&current, &folders, &labels);
         let changed = conn.execute(
@@ -1489,6 +1510,7 @@ fn insert_snapshot(
     action_id: i64,
     account_id: &AccountId,
     plan: &Planned,
+    was_keyword: Option<bool>,
 ) -> Result<()> {
     let mut values = vec![
         Value::Integer(action_id),
@@ -1497,18 +1519,19 @@ fn insert_snapshot(
     values.extend(saved_values(&plan.before));
     values.push(Value::Text(plan.folders.clone()));
     values.push(Value::Text(plan.labels.clone()));
-    debug_assert_eq!(values.len(), 27);
+    values.push(was_keyword.map_or(Value::Null, |value| Value::Integer(value.into())));
+    debug_assert_eq!(values.len(), 28);
     conn.execute(
         "INSERT INTO local_action_messages (
             action_id, removed, message_id, remote_id, thread_id, proton_conversation_id,
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line,
-            attachment_names, after_folders, after_labels
+            attachment_names, after_folders, after_labels, label_was_keyword
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-            ?26, ?27
+            ?26, ?27, ?28
          )",
         params_from_iter(values),
     )?;

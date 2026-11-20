@@ -1729,8 +1729,9 @@ mod tests {
                             let flags = (0..3)
                                 .map(|_| FlagUpdate {
                                     remote_id: copies[rng.below(copies.len())].remote_id.clone(),
-                                    unread: rng.chance(50),
+                                    unread: Some(rng.chance(50)),
                                     flagged: None,
+                                    keywords: None,
                                     modseq: None,
                                 })
                                 .collect();
