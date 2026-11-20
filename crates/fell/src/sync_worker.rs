@@ -63,6 +63,8 @@ pub enum SyncEvent {
     /// The status to show. `Syncing`, and `Synced` with `changed`, can also
     /// refresh mail that has just been written.
     Status(SyncKind),
+    /// Exact Sent copies confirmed these drafts.
+    SendsConfirmed(Vec<String>),
     /// A conflict during replay changed a local flag.
     FlagsChanged,
     /// Write-back problems to show together in one notice.
@@ -322,8 +324,17 @@ fn run(
         let mut alive = true;
         let mut progress = PassProgress::default();
         let mut batches = 0usize;
+        let mut confirmed = 0;
         let result = config.backend().and_then(|backend| {
             sync_with_progress(&account, backend.as_ref(), &store, &mut |report| {
+                if report.confirmed_drafts.len() > confirmed {
+                    alive &= events
+                        .unbounded_send(SyncEvent::SendsConfirmed(
+                            report.confirmed_drafts[confirmed..].to_vec(),
+                        ))
+                        .is_ok();
+                    confirmed = report.confirmed_drafts.len();
+                }
                 batches += 1;
                 if batches.is_multiple_of(CHECKPOINT_EVERY) {
                     let _ = store.checkpoint(false);

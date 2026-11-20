@@ -85,6 +85,83 @@ const SEND_MAYBE_SENT: &str = "maybe-sent";
 const SEND_SENT: &str = "sent";
 const SEND_CLEAR: &str = "clear";
 
+/// Confirm only the exact id observed on an IMAP copy in the account's
+/// listed Sent mailbox. Stored conversation rows can merge other copies by
+/// body fingerprint and can gain folders through local moves.
+pub(crate) fn confirm_synced_sends(
+    conn: &rusqlite::Connection,
+    account_id: &AccountId,
+    delta: &crate::MailboxDelta,
+) -> Result<Vec<String>> {
+    if delta.messages.is_empty() && delta.removals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let account = account_id.as_str();
+    let pending = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM compose_send WHERE account_id = ?1
+                        AND state = ?2 AND message_id IS NOT NULL)",
+        params![account, SEND_MAYBE_SENT],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !pending {
+        return Ok(Vec::new());
+    }
+    let sent = if let Some(roles) = &delta.roles {
+        roles
+            .get(crate::FolderRole::Sent)
+            .map(|role| role.raw.clone())
+    } else {
+        conn.query_row(
+            "SELECT raw FROM folder_roles WHERE account_id = ?1 AND role = ?2",
+            params![account, crate::FolderRole::Sent.key()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    };
+    let Some(sent) = sent else {
+        return Ok(Vec::new());
+    };
+    let mailbox = crate::imap::escape_mailbox(&sent);
+    let mut confirmed = Vec::new();
+    let mut update = conn.prepare_cached(
+        "UPDATE compose_send SET state = ?4, updated_unix = ?5
+         WHERE account_id = ?1 AND state = ?2 AND message_id = ?3
+         RETURNING draft_id",
+    )?;
+    let mut confirm = |message_id: &crate::MessageId| -> Result<()> {
+        for id in update.query_map(
+            params![
+                account,
+                SEND_MAYBE_SENT,
+                message_id.as_str(),
+                SEND_SENT,
+                now_unix()
+            ],
+            |row| row.get(0),
+        )? {
+            confirmed.push(id?);
+        }
+        Ok(())
+    };
+    for message in &delta.messages {
+        if crate::imap::parse_remote_id(&message.remote_id.0)
+            .is_some_and(|copy| copy.mailbox == mailbox)
+        {
+            confirm(&message.headers.message_id)?;
+        }
+    }
+    for removal in &delta.removals {
+        if removal.mailbox == mailbox
+            && let crate::backend::RemovalKind::Listing { found, .. } = &removal.kind
+        {
+            for (_, message_id) in found {
+                confirm(message_id)?;
+            }
+        }
+    }
+    Ok(confirmed)
+}
+
 const UPSERT_COMPOSE: &str = "INSERT INTO compose_drafts (
         id, account_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
         subject, body, in_reply_to, identities, owner, updated_unix,
@@ -264,7 +341,7 @@ impl Store {
         match lock {
             None => {
                 self.conn.execute(
-                    "UPDATE compose_send SET state = ?3, updated_unix = ?4
+                    "UPDATE compose_send SET state = ?3, updated_unix = ?4, message_id = NULL
                      WHERE account_id = ?1 AND draft_id = ?2 AND state = ?5",
                     params![
                         account_id.as_str(),

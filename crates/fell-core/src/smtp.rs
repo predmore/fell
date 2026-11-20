@@ -1,21 +1,20 @@
-//! SMTP submission for Proton Mail Bridge.
+//! SMTP submission for Bridge and ordinary IMAP accounts.
 //!
-//! [`deliver`] is called from [`crate::backend::BridgeBackend::confirm_send`]
-//! after the editor's send confirmation matches. The bytes on the wire are
+//! [`confirm_send`] checks the editor's confirmation before delivery. The bytes on the wire are
 //! [`crate::PendingSend::mime`]. Bcc addresses are envelope recipients only.
 //!
 //! A failure before the server has the whole message is a plain
-//! [`Error::Backend`]: nothing was sent. Once the message bytes start going
-//! out after `354`, a lost connection or a timeout is
+//! [`Error::Backend`]: nothing was sent. Once the terminating dot starts going
+//! out, a lost connection or a timeout is
 //! [`Error::SendUncertain`], because the server may already have queued it.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::imap::{ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
-use crate::send::{Draft, PendingSend};
-use crate::{Error, Result};
+use crate::imap::{ImapConfig, ImapSecurity, TlsStream, host_is_loopback, wrap_tcp_as_tls};
+use crate::send::{Draft, PendingSend, SentMessage, UserSendConfirmation, require_confirmation};
+use crate::{Error, RemoteId, Result};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -68,7 +67,24 @@ impl Endpoint {
     }
 }
 
-pub(crate) fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
+pub(crate) fn confirm_send(
+    config: &SmtpConfig,
+    login: &ImapConfig,
+    pending: PendingSend,
+    confirmation: UserSendConfirmation,
+) -> Result<SentMessage> {
+    require_confirmation(&pending, &confirmation)?;
+    let remote = deliver(
+        &Endpoint::new(config, &login.username, &login.password),
+        &pending,
+    )?;
+    Ok(SentMessage {
+        pending_id: pending.id,
+        remote_id: RemoteId(remote),
+    })
+}
+
+fn deliver(endpoint: &Endpoint, pending: &PendingSend) -> Result<String> {
     if pending.mime.is_empty() {
         return Err(smtp_err("smtp: message is empty"));
     }
@@ -483,12 +499,48 @@ fn authenticate(pipe: &mut Pipe, hello: &Reply, endpoint: &Endpoint) -> Result<(
     token.extend(username.as_bytes());
     token.push(0);
     token.extend(password.as_bytes());
-    expect(
-        command(pipe, &format!("AUTH PLAIN {}", b64(&token)))?,
-        235,
-        "AUTH",
-    )?;
-    Ok(())
+    let encoded = b64(&token);
+    let reply = command(pipe, &format!("AUTH PLAIN {encoded}"))?;
+    if reply.code == 235 {
+        return Ok(());
+    }
+    let detail = auth_rejection(&reply, &encoded, username, password);
+    if matches!(reply.code, 534 | 535) {
+        Err(Error::SmtpCredentialsRejected(detail))
+    } else {
+        Err(smtp_err(detail))
+    }
+}
+
+/// An AUTH reply can echo the exchange. Keep each diagnostic line, with
+/// literal credentials and their wire encodings removed from the reply text.
+fn auth_rejection(reply: &Reply, token: &str, username: &str, password: &str) -> String {
+    let user_b64 = b64(username.as_bytes());
+    let pass_b64 = b64(password.as_bytes());
+    let mut secrets = [token, &user_b64, &pass_b64, username, password]
+        .into_iter()
+        .flat_map(|secret| [secret, secret.trim_end_matches('=')])
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let mut detail = String::from("smtp: AUTH rejected: ");
+    for (i, line) in reply.lines.iter().enumerate() {
+        if i > 0 {
+            detail.push('\n');
+        }
+        let prefix = if matches!(line.as_bytes().get(3), Some(b' ' | b'-')) {
+            4
+        } else {
+            3
+        };
+        let mut text = line[prefix..].to_owned();
+        for secret in &secrets {
+            text = text.replace(secret, "[redacted]");
+        }
+        detail.push_str(&line[..prefix]);
+        detail.push_str(&text);
+    }
+    detail
 }
 
 fn forbidden(value: &str) -> bool {
@@ -656,15 +708,57 @@ Bcc: this is body text\r\n"
     fn bridge_delivers_after_confirmation_with_bcc_on_the_envelope() {
         let (sent, got) = exchange(Wire::Clear, ImapSecurity::Plain);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
         assert!(got.clear.is_empty());
+    }
+
+    #[test]
+    fn imap_account_uses_its_smtp_settings_and_classifies_delivery() {
+        use crate::{AccountConfig, BackendKind, backend_for};
+
+        for after in [AfterData::Accept, AfterData::Hangup, AfterData::Reject] {
+            let (port, rx, join) = serve(Wire::Clear, after);
+            let config = AccountConfig::parse(&format!(
+                "backend = \"imap\"\nid = \"mailbox\"\nemail = \"jon@example.com\"\n\
+                 host = \"127.0.0.2\"\nusername = \"imap-user\"\n\
+                 password_command = \"printf imap-secret\"\n\
+                 smtp_host = \"127.0.0.1\"\nsmtp_port = {port}\nsmtp_security = \"plain\"\n"
+            ))
+            .unwrap();
+            let backend = backend_for(&config.account().id, Some(&config)).unwrap();
+            assert_eq!(backend.kind(), BackendKind::Imap);
+            let pending = backend
+                .submit_composed(sample_pending().draft, sample_mime(), Vec::new())
+                .unwrap();
+            let mut changed = pending.clone();
+            changed.draft.bcc.clear();
+            assert!(matches!(
+                backend.confirm_send(pending.clone(), confirm(&changed)),
+                Err(Error::SendUnconfirmed)
+            ));
+
+            let result = backend.confirm_send(pending.clone(), confirm(&pending));
+            match after {
+                AfterData::Accept => {
+                    let sent = result.unwrap();
+                    assert_eq!(sent.pending_id, pending.id);
+                    assert_eq!(sent.remote_id.0, "queued as test-id");
+                }
+                AfterData::Hangup => assert!(matches!(result, Err(Error::SendUncertain(_)))),
+                AfterData::Reject => assert!(matches!(result, Err(Error::Backend(_)))),
+                _ => unreachable!(),
+            }
+            let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            join.join().unwrap();
+            assert_delivery(&got, "imap-user", "imap-secret");
+        }
     }
 
     #[test]
     fn implicit_tls_delivers() {
         let (sent, got) = exchange(Wire::Tls, ImapSecurity::Tls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
     }
 
     #[test]
@@ -724,10 +818,26 @@ Bcc: this is body text\r\n"
     }
 
     #[test]
+    fn credential_refusal_preserves_diagnostics_and_redacts_authentication_data() {
+        let (result, got) = attempt(Wire::Clear, ImapSecurity::Plain, AfterData::RejectAuth);
+        let Error::SmtpCredentialsRejected(detail) = result.unwrap_err() else {
+            panic!("535 must be a credential rejection");
+        };
+        assert_eq!(
+            detail,
+            "smtp: AUTH rejected: 535-5.7.8 Authentication failed for [redacted]\n\
+             535 5.7.8 Rejected [redacted] [redacted] [redacted]; check account settings"
+        );
+        assert!(!got.auth.is_empty());
+        assert!(got.quit);
+        assert!(got.from.is_empty() && got.rcpt.is_empty() && got.data.is_empty());
+    }
+
+    #[test]
     fn starttls_hides_the_password_and_still_delivers() {
         let (sent, got) = exchange(Wire::StartTls, ImapSecurity::StartTls);
         assert_eq!(sent.remote_id.0, "queued as test-id");
-        assert_delivery(&got);
+        assert_delivery(&got, "bridge-user", "bridge-secret");
         let clear = String::from_utf8_lossy(&got.clear);
         assert!(!clear.to_ascii_uppercase().contains("AUTH"), "{clear}");
         assert!(!clear.contains("bridge-secret"), "{clear}");
@@ -801,11 +911,11 @@ Bcc: this is body text\r\n"
         assert!(got.auth.is_empty());
     }
 
-    fn assert_delivery(got: &Captured) {
+    fn assert_delivery(got: &Captured, username: &str, password: &str) {
         let mut token = vec![0];
-        token.extend_from_slice(b"bridge-user");
+        token.extend_from_slice(username.as_bytes());
         token.push(0);
-        token.extend_from_slice(b"bridge-secret");
+        token.extend_from_slice(password.as_bytes());
         assert_eq!(got.auth, b64(&token));
         assert_eq!(got.from, "jon@example.com");
         assert_eq!(
@@ -955,7 +1065,14 @@ Bcc: this is body text\r\n"
             } else if let Some(token) = line.strip_prefix("AUTH PLAIN ") {
                 captured.auth = token.to_string();
                 if after == AfterData::RejectAuth {
-                    write_reply(&mut sock, "535 5.7.8 Authentication failed\r\n");
+                    write_reply(
+                        &mut sock,
+                        &format!(
+                            "535-5.7.8 Authentication failed for bridge-user\r\n\
+                             535 5.7.8 Rejected bridge-secret {token} {}; check account settings\r\n",
+                            b64(b"bridge-secret").trim_end_matches('=')
+                        ),
+                    );
                 } else {
                     write_reply(&mut sock, "235 ok\r\n");
                 }

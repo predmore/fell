@@ -9,6 +9,7 @@ use crate::store::Store;
 use crate::sync::sync_once;
 use crate::threading::ThreadId;
 
+use super::sync_tests::unused_smtp;
 use super::test_server::{
     BodyForm, FixtureMailbox, FixtureMessage, TestServer, TestState, raw_message,
 };
@@ -113,6 +114,7 @@ impl Fixture {
         let backend = ImapBackend {
             account_id: account.id.clone(),
             config: config(server.addr.port()),
+            smtp: unused_smtp(),
         };
         sync_once(&account, &backend, &store).unwrap();
         store.set_write_back(&account.id, true).unwrap();

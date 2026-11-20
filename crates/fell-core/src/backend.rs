@@ -283,25 +283,16 @@ impl MailBackend for BridgeBackend {
         pending: PendingSend,
         confirmation: UserSendConfirmation,
     ) -> Result<SentMessage> {
-        require_confirmation(&pending, &confirmation)?;
-        let remote = crate::smtp::deliver(
-            &crate::smtp::Endpoint::new(&self.smtp, &self.imap.username, &self.imap.password),
-            &pending,
-        )?;
-        Ok(SentMessage {
-            pending_id: pending.id,
-            remote_id: crate::RemoteId(remote),
-        })
+        crate::smtp::confirm_send(&self.smtp, &self.imap, pending, confirmation)
     }
 }
 
-/// Any IMAP account, including one that is not Proton Mail Bridge.
-///
-/// Read-only. `confirm_send` does not transmit.
+/// An ordinary IMAP account with SMTP submission using the same credentials.
 #[derive(Debug, Clone)]
 pub struct ImapBackend {
     pub account_id: AccountId,
     pub config: ImapConfig,
+    pub smtp: SmtpConfig,
 }
 
 impl MailBackend for ImapBackend {
@@ -354,8 +345,7 @@ impl MailBackend for ImapBackend {
         pending: PendingSend,
         confirmation: UserSendConfirmation,
     ) -> Result<SentMessage> {
-        require_confirmation(&pending, &confirmation)?;
-        Err(Error::NotImplemented("IMAP send"))
+        crate::smtp::confirm_send(&self.smtp, &self.config, pending, confirmation)
     }
 }
 
