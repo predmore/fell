@@ -1,0 +1,4 @@
+paused-date.mp4        reader title     frames=212 text pixels=2507–2509 blank spans=[] (0 frames)
+paused-date.mp4        result excerpt   frames=212 text pixels=1503–1509 blank spans=[] (0 frames)
+paused-quote.mp4       reader title     frames=152 text pixels=2507–2509 blank spans=[] (0 frames)
+paused-quote.mp4       result excerpt   frames=152 text pixels=1503–1670 blank spans=[] (0 frames)
