@@ -477,6 +477,148 @@ pub(crate) mod tests {
         assert!(home.open(&hub, "c0", &account.id).is_err());
     }
 
+    #[test]
+    fn undo_discard_restores_live_text_files_and_agent_review_in_one_action() {
+        use fell_core::compose::{ResolvedFile, StoredCompose};
+
+        let account = me();
+        let home = temp_home("discard-review", &account);
+        let store = fell_core::Store::open(&home.store).unwrap();
+        let hub = DraftHub::new();
+        let personal = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        hub.with_session(&personal, |session| {
+            session.set_subject_from_user("Unsaved edit".into());
+            session.set_body_from_user("A newer body\n".into());
+            session.arm_outbound(0);
+        });
+        let review = store
+            .create_review_draft(
+                fell_core::ReviewDraftInput {
+                    account_id: account.id.clone(),
+                    to: vec!["ada@example.com".into()],
+                    cc: Vec::new(),
+                    bcc: vec!["robin@example.com".into()],
+                    subject: "Review".into(),
+                    body: "Original\n".into(),
+                    in_reply_to: Some(fell_core::MessageId::new("parent@example.com")),
+                    thread_id: None,
+                },
+                "agent:atlas",
+            )
+            .unwrap();
+        let agent = format!("r{}", review.draft.id);
+        store
+            .save_compose(&StoredCompose {
+                id: agent.clone(),
+                account_id: account.id.clone(),
+                fields: DraftFields {
+                    from: account.email.clone(),
+                    to: review.draft.to,
+                    bcc: review.draft.bcc,
+                    subject: review.draft.subject,
+                    in_reply_to: Some("<parent@example.com>".into()),
+                    ..Default::default()
+                },
+                body: review.draft.body,
+                files: vec![ResolvedFile {
+                    path: "files/map.txt".into(),
+                    display_name: "Map.txt".into(),
+                    bytes: b"synthetic map".to_vec(),
+                    inline: false,
+                }],
+                identities: vec![account.email.clone()],
+                owner: "agent:atlas".into(),
+                reply: ReplyParts {
+                    references: vec!["<parent@example.com>".into()],
+                    quote_text: "Original message".into(),
+                    quote_html: "<p>Original message</p>".into(),
+                },
+            })
+            .unwrap();
+        home.open(&hub, &agent, &account.id).unwrap();
+        hub.with_session(&agent, |session| {
+            session.replace_body("Updated review\n").unwrap();
+            assert!(session.snapshot().unreviewed > 0);
+        });
+        let ids = [personal.clone(), agent.clone()];
+        hub.discard(&store, &account.id, &ids).unwrap();
+        assert_eq!(hub.take_closed(), ["2 drafts discarded  ·  u"]);
+        assert!(store.unsent_compose_drafts(&account.id).unwrap().is_empty());
+        assert!(store.list_review_drafts(&account.id).unwrap().is_empty());
+        assert!(store.undo_actor(&account.id, "agent:atlas").is_err());
+        assert!(!hub.show(&agent));
+        assert!(home.open(&hub, &agent, &account.id).is_err());
+        // Undo works even if the runtime directory went away.
+        std::fs::remove_dir_all(&home.root).unwrap();
+        let hub = DraftHub::new();
+        assert_eq!(
+            store.undo(&account.id).unwrap().kind,
+            fell_core::ActionKind::DiscardDrafts
+        );
+        assert!(store.undo(&account.id).is_err());
+        assert_eq!(store.unsent_compose_drafts(&account.id).unwrap().len(), 2);
+        assert_eq!(store.list_review_drafts(&account.id).unwrap().len(), 1);
+        let restored = store.load_compose(&personal).unwrap().unwrap();
+        assert_eq!(restored.fields.subject, "Unsaved edit");
+        assert_eq!(restored.body, "A newer body\n");
+        home.open(&hub, &agent, &account.id).unwrap();
+        hub.with_session(&agent, |session| {
+            assert_eq!(session.body(), "Updated review\n");
+            assert_eq!(session.owner(), "agent:atlas");
+            assert_eq!(session.fields().bcc, ["robin@example.com"]);
+            assert_eq!(session.reply_parts().quote_text, "Original message");
+            assert!(session.snapshot().unreviewed > 0);
+        });
+        assert_eq!(
+            std::fs::read(home.root.join(agent).join("files/map.txt")).unwrap(),
+            b"synthetic map"
+        );
+    }
+
+    #[test]
+    fn discard_refuses_live_and_confirmed_sends_and_undo_keeps_uncertainty() {
+        use fell_core::compose::SendLock;
+
+        let account = me();
+        let home = temp_home("discard-send", &account);
+        let store = fell_core::Store::open(&home.store).unwrap();
+        let hub = DraftHub::new();
+        let id = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        let other = home.new_draft(&hub, &account.id, &account.email).unwrap();
+        let message = fell_core::MessageId::new("submission@example.com");
+        hub.with_session(&id, |session| session.begin_send(&message))
+            .unwrap()
+            .unwrap();
+        let selection = [other.clone(), id.clone()];
+        let other_hub = DraftHub::new();
+        for trying in [&hub, &other_hub] {
+            let err = trying.discard(&store, &account.id, &selection).unwrap_err();
+            assert!(err.to_string().contains("being sent"), "{err}");
+            assert!(store.load_compose(&other).unwrap().is_some());
+        }
+        hub.with_session(&id, |session| session.end_send(Some(SendLock::MaybeSent)));
+        let mut stale =
+            DraftSession::open_with_store(&home.root.join(&id), account.id.clone(), &store)
+                .unwrap();
+        hub.discard_open(&id).unwrap();
+        assert!(stale.release_maybe_sent().is_err());
+        assert!(store.load_compose(&id).unwrap().is_none());
+        store.undo(&account.id).unwrap();
+        home.open(&hub, &id, &account.id).unwrap();
+        hub.with_session(&id, |session| {
+            assert_eq!(session.send_lock(), Some(SendLock::MaybeSent));
+            assert!(session.begin_send(&message).is_err());
+            session.end_send(Some(SendLock::Sent));
+        });
+        assert!(hub.discard(&store, &account.id, &selection).is_err());
+        assert!(other_hub.discard(&store, &account.id, &selection).is_err());
+        assert_eq!(
+            store.unsent_compose_drafts(&account.id).unwrap()[0].id,
+            other
+        );
+        assert!(store.undo(&account.id).is_err());
+    }
+
     fn parent_message(account: &fell_core::Account) -> fell_core::Message {
         let id = fell_core::MessageId::new("parent@x");
         fell_core::Message {

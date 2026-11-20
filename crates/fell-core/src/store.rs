@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS compose_drafts (
     references_header TEXT NOT NULL DEFAULT '',
     quote_text TEXT NOT NULL DEFAULT '',
     quote_html TEXT NOT NULL DEFAULT '',
+    discarded_action_id INTEGER,
     FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
 
@@ -3687,6 +3688,10 @@ fn ensure_compose_columns(conn: &Connection) -> Result<()> {
         (
             "quote_html",
             "ALTER TABLE compose_drafts ADD COLUMN quote_html TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "discarded_action_id",
+            "ALTER TABLE compose_drafts ADD COLUMN discarded_action_id INTEGER",
         ),
     ] {
         if have.iter().any(|column| column == name) {

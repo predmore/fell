@@ -853,6 +853,10 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
         Some(SendLock::MaybeSent)
     );
 
+    let hub = crate::compose::DraftHub::new();
+    hub.discard(&store, &acct.id, &["uncertain".into()])
+        .unwrap();
+    assert!(store.load_compose("uncertain").unwrap().is_none());
     let mut confirmations = Vec::new();
     let report = crate::sync_with_progress(&acct, &backend(&acct), &store, &mut |report| {
         if !report.confirmed_drafts.is_empty() {
@@ -864,6 +868,16 @@ fn only_the_exact_message_id_in_the_same_accounts_sent_role_confirms_a_send() {
     assert_eq!(report.confirmed_drafts, confirmations);
     assert_eq!(
         store.load_compose_send(&acct.id, "uncertain").unwrap(),
+        Some(SendLock::Sent)
+    );
+    assert_eq!(
+        store.undo(&acct.id).unwrap().kind,
+        crate::ActionKind::DiscardDrafts
+    );
+    assert_eq!(
+        store
+            .claim_compose_send(&acct.id, "uncertain", Some("retry@compose.fell"))
+            .unwrap(),
         Some(SendLock::Sent)
     );
     let listed = store.unsent_compose_drafts(&acct.id).unwrap();

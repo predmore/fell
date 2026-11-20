@@ -106,6 +106,8 @@ struct Progress {
     /// The newest save whose `draft.md` rename succeeded. The file shows
     /// that save or a newer one.
     written: u64,
+    /// The newest save whose draft and attachments reached the mailbox.
+    mailbox_written: u64,
     /// The newest failed write, until the session reports it.
     error: Option<String>,
     /// The newest save whose mailbox row was not written, until the session
@@ -134,6 +136,7 @@ impl DraftWriter {
                 submitted: 0,
                 completed: 0,
                 written: 0,
+                mailbox_written: 0,
                 error: None,
                 mailbox_error: None,
             }),
@@ -221,12 +224,27 @@ pub struct SaveWaiter {
 impl SaveWaiter {
     /// `Err` when the newest of those saves did not reach `draft.md`.
     pub fn wait(self) -> Result<(), String> {
+        self.wait_for(false)
+    }
+
+    pub(crate) fn wait_for_mailbox(self) -> Result<(), String> {
+        self.wait_for(true)
+    }
+
+    fn wait_for(self, mailbox: bool) -> Result<(), String> {
         let mut progress = self.shared.progress.lock().expect("draft writer");
         while progress.completed < self.until {
             progress = self.shared.done.wait(progress).expect("draft writer");
         }
         if progress.written >= self.until {
-            return Ok(());
+            return if !mailbox || progress.mailbox_written >= self.until {
+                Ok(())
+            } else {
+                Err(progress
+                    .mailbox_error
+                    .clone()
+                    .unwrap_or_else(|| "the draft was not saved in the mailbox".into()))
+            };
         }
         Err(progress
             .error
@@ -247,7 +265,10 @@ fn write_loop(rx: Receiver<(u64, SaveJob)>, shared: Arc<Shared>) {
         let mut progress = shared.progress.lock().expect("draft writer");
         progress.completed = progress.completed.max(number);
         match result {
-            Ok(()) => progress.written = progress.written.max(number),
+            Ok(()) => {
+                progress.written = progress.written.max(number);
+                progress.mailbox_written = progress.mailbox_written.max(number);
+            }
             Err(SaveError::Mailbox(err)) => {
                 progress.written = progress.written.max(number);
                 progress.mailbox_error = Some(err);

@@ -2021,6 +2021,12 @@ impl Inbox {
             |inbox, result| match result {
                 Ok(kind) => {
                     inbox.session.show_toast("Undone", false);
+                    if kind == fell_core::ActionKind::DiscardDrafts {
+                        return Some(ReadIntent {
+                            changed: true,
+                            ..ReadIntent::default()
+                        });
+                    }
                     inbox.send_to_server();
                     // Read and star leave the thread where it is; the thread
                     // `m` or `e` took away waits for its own undo.
@@ -2043,6 +2049,33 @@ impl Inbox {
                     }
                     None
                 }
+            },
+            cx,
+        );
+    }
+
+    fn discard_drafts(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(hub) = cx
+            .try_global::<crate::draft_host::AgentDrafts>()
+            .map(|drafts| drafts.0.clone())
+        else {
+            return;
+        };
+        let account = self.account_id.clone();
+        self.change_mailbox(
+            move |store| hub.discard(store, &account, &ids),
+            |inbox, result| {
+                match result {
+                    Ok(()) => {
+                        inbox.session.picked.clear();
+                        inbox.session.visual = false;
+                    }
+                    Err(err) => inbox.session.show_toast(err.to_string(), true),
+                }
+                Some(ReadIntent {
+                    changed: true,
+                    ..ReadIntent::default()
+                })
             },
             cx,
         );
@@ -2438,6 +2471,9 @@ impl Inbox {
         if step.delete {
             let ids = self.session.action_targets();
             self.remove_threads(ids, Removal::Delete, cx);
+        }
+        if !step.discard.is_empty() {
+            self.discard_drafts(step.discard, cx);
         }
         if step.spam {
             let ids = self.session.action_targets();
