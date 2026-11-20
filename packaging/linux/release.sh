@@ -9,10 +9,6 @@ version_pattern="($base)(-rc(\.$number)?)?"
 case "${1:-}" in
   plan)
     tag=$2
-    if [[ ! $tag =~ ^v$version_pattern$ ]]; then
-      echo "expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N, got $tag" >&2
-      exit 1
-    fi
     workspace=$(python3 - "$root/Cargo.toml" <<'PY'
 import sys
 import tomllib
@@ -21,6 +17,11 @@ with open(sys.argv[1], "rb") as manifest:
     print(tomllib.load(manifest)["workspace"]["package"]["version"])
 PY
 )
+    if [[ $tag == --candidate ]]; then tag=v$workspace-rc.1; fi
+    if [[ ! $tag =~ ^v$version_pattern$ ]]; then
+      echo "expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N, got $tag" >&2
+      exit 1
+    fi
     if [[ $workspace != "${BASH_REMATCH[1]}" ]]; then
       echo "tag $tag does not match workspace version $workspace" >&2
       exit 1
@@ -48,7 +49,7 @@ PY
     sha256sum -c SHA256SUMS
     ;;
   *)
-    echo "usage: $0 plan TAG | assemble VERSION ASSET_DIR" >&2
+    echo "usage: $0 plan TAG|--candidate | assemble VERSION ASSET_DIR" >&2
     exit 2
     ;;
 esac

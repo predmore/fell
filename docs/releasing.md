@@ -15,6 +15,8 @@ The **Linux release** workflow builds and tests both architectures on native Ubu
 
 ## Dry run
 
+A pull request that changes the release workflow or the packaging scripts builds a candidate from the branch’s workspace version. It uploads both architectures and skips publication.
+
 Use **Run workflow** on **Linux release** and enter the candidate tag that matches the selected branch's workspace version. The workflow can build `v0.1.0-rc.1` before any tag exists. Download the combined `fell-0.1.0-rc.1-release` Actions artifact for the four packages and `SHA256SUMS`. The manual run uses read-only repository permissions and skips the publish job.
 
 To check the plan locally, run `packaging/linux/release.sh plan v0.1.0-rc.1`. To build the matching assets locally on each architecture, export `FELL_RELEASE_VERSION=0.1.0-rc.1`, run `cargo build --release --locked -p fell`, then run `packaging/linux/package.sh`. Copy all four assets into one directory and run `packaging/linux/release.sh assemble 0.1.0-rc.1 PATH` to write and verify the checksum manifest.

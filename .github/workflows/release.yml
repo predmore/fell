@@ -3,6 +3,11 @@ name: Linux release
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'packaging/linux/package.sh'
+      - 'packaging/linux/release.sh'
   workflow_dispatch:
     inputs:
       tag:
@@ -29,7 +34,7 @@ jobs:
       - id: plan
         name: Validate tag and workspace version
         env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          TAG: ${{ github.event_name == 'pull_request' && '--candidate' || inputs.tag || github.ref_name }}
         run: packaging/linux/release.sh plan "$TAG" >> "$GITHUB_OUTPUT"
 
   build:
