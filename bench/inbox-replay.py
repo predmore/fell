@@ -40,8 +40,14 @@ def wait_for(child, description, condition, timeout=15):
 
 
 def copy_fixture(source, path):
-    # The benchmark produces a closed, checkpointed fixture. An immutable
-    # connection checks it without locking or creating SQLite sidecars.
+    # The fixture must be quiescent: closed by every writer and fully
+    # checkpointed, as `fell-bench --seed` leaves it. An immutable connection
+    # reads it without locking or creating SQLite sidecars, but it ignores
+    # frames still in the WAL, so a live or crashed writer's database could
+    # pass the row check with a stale snapshot. Refuse one with a non-empty WAL.
+    wal = source.with_name(source.name + "-wal")
+    if wal.exists() and wal.stat().st_size > 32:
+        raise ValueError(f"{source} has uncheckpointed WAL frames; close every writer and checkpoint it first")
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
         count, examples = db.execute(
             "SELECT count(*), sum(from_email LIKE '%@bench.test') FROM messages"
