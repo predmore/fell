@@ -10,7 +10,7 @@ use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use mail_parser::{HeaderForm, MessageParser, MessageRef, PartKind};
+use mail_parser::{DateTime, HeaderForm, MessageParser, MessageRef, PartKind};
 
 use crate::account::AccountId;
 use crate::message::{
@@ -125,21 +125,43 @@ pub(crate) fn to_message(
     )
 }
 
+pub(super) struct FetchedMessage {
+    pub message: Message,
+    pub deferred_date: Option<crate::backend::DeferredMailDate>,
+}
+
 pub(super) fn fetched_message(
     account_id: &AccountId,
     mailbox: &session::Listed,
     uidvalidity: u32,
     item: &session::Fetched,
     bridge: bool,
-) -> Message {
-    parse_message(
+) -> FetchedMessage {
+    let mut message = parse_message(
         account_id,
         (&mailbox.raw, &mailbox.decoded),
         (uidvalidity, item.uid),
         &item.flags,
         &item.body,
         bridge,
-    )
+    );
+    let latest = crate::latest_mail_date();
+    let header = message.headers.date_unix;
+    let arrival = item.internal_date;
+    message.headers.date_unix = effective_date(header, arrival, latest);
+    let deferred_date = if message.headers.date_unix == 0 {
+        let plausible = |date: &i64| crate::plausible_future_mail_date(*date, latest);
+        let header = Some(header).filter(plausible);
+        let arrival = arrival.filter(plausible);
+        (header.is_some() || arrival.is_some())
+            .then_some(crate::backend::DeferredMailDate { header, arrival })
+    } else {
+        None
+    };
+    FetchedMessage {
+        message,
+        deferred_date,
+    }
 }
 
 fn parse_message(
@@ -188,7 +210,7 @@ fn parse_message(
     let date_unix = parsed
         .as_ref()
         .and_then(|message| message.date())
-        .map(|date| date.to_timestamp())
+        .and_then(|date| valid_date(&date))
         .unwrap_or(0);
     let proton_conversation_id = parsed.as_ref().and_then(proton_conversation);
     let body_text = parsed
@@ -249,6 +271,23 @@ fn parse_message(
     }
 }
 
+pub(super) fn valid_date(date: &DateTime) -> Option<i64> {
+    if !date.is_valid() {
+        return None;
+    }
+    // The parser permits days up to 31 before checking the month.
+    let round_trip = DateTime::from_timestamp(date.to_timestamp_local());
+    (round_trip.day == date.day).then(|| date.to_timestamp())
+}
+
+fn effective_date(header: i64, arrival: Option<i64>, latest: i64) -> i64 {
+    [Some(header), arrival]
+        .into_iter()
+        .flatten()
+        .find(|date| (1..=latest).contains(date))
+        .unwrap_or(0)
+}
+
 /// A list row from a message's header alone, before its body is fetched.
 ///
 /// It has no snippet, body or parts, so the store writes no body row for it
@@ -261,14 +300,15 @@ pub(super) fn headers_message(
     uidvalidity: u32,
     item: &session::Fetched,
     bridge: bool,
-) -> Message {
-    let mut message = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
+) -> FetchedMessage {
+    let mut fetched = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
+    let message = &mut fetched.message;
     message.snippet.clear();
     message.body_text = None;
     message.parts = None;
     message.has_attachment = false;
     message.attachment_names.clear();
-    message
+    fetched
 }
 
 /// Header names the renderer's bulk-mail check reads, matched exactly
@@ -794,6 +834,15 @@ fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::account::AccountId;
+
+    #[test]
+    fn dates_allow_one_day_of_clock_skew() {
+        let now = 1_707_519_600;
+        let latest = now + 86_400;
+        assert_eq!(effective_date(latest, Some(now), latest), latest);
+        assert_eq!(effective_date(latest + 1, Some(now), latest), now);
+        assert_eq!(effective_date(0, Some(latest + 1), latest), 0);
+    }
 
     #[test]
     fn list_id_is_the_angle_addr_and_cjk_subject_parses() {

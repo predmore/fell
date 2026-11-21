@@ -567,6 +567,12 @@ fn handle(
                     }
                     let seq = index + 1;
                     let upper_cmd = rest.to_ascii_uppercase();
+                    let internal_date = if upper_cmd.contains("INTERNALDATE") {
+                        header_value(&message.raw, "X-Test-Internal-Date")
+                            .map_or_else(String::new, |date| format!(" INTERNALDATE \"{date}\""))
+                    } else {
+                        String::new()
+                    };
                     let revision = if guard.condstore
                         && (condstore_enabled || selected_condstore)
                         && (upper_cmd.contains("MODSEQ") || changed_since.is_some())
@@ -640,7 +646,7 @@ fn handle(
                         let header = &message.raw[..end];
                         let _ = write.write_all(
                             format!(
-                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}){revision} BODY[HEADER] {{{}}}\r\n",
+                                "* {seq} FETCH (UID {} RFC822.SIZE {} FLAGS ({flags}){revision}{internal_date} BODY[HEADER] {{{}}}\r\n",
                                 message.uid,
                                 message.raw.len(),
                                 header.len()
@@ -663,7 +669,8 @@ fn handle(
                             );
                         } else {
                             let _ = write.write_all(
-                                format!("* {seq} FETCH (UID {})\r\n", message.uid).as_bytes(),
+                                format!("* {seq} FETCH (UID {}{internal_date})\r\n", message.uid)
+                                    .as_bytes(),
                             );
                         }
                         continue;
@@ -678,7 +685,7 @@ fn handle(
                     match message.body_form {
                         BodyForm::Literal => {
                             let header = format!(
-                                "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] {{{}}}\r\n",
+                                "* {seq} FETCH (UID {} FLAGS ({flags}){revision}{internal_date} BODY[] {{{}}}\r\n",
                                 message.uid,
                                 message.raw.len()
                             );
@@ -690,7 +697,7 @@ fn handle(
                             let quoted = quote_bytes(&message.raw);
                             let _ = write.write_all(
                                 format!(
-                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] {quoted})\r\n",
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision}{internal_date} BODY[] {quoted})\r\n",
                                     message.uid
                                 )
                                 .as_bytes(),
@@ -699,7 +706,7 @@ fn handle(
                         BodyForm::Nil => {
                             let _ = write.write_all(
                                 format!(
-                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision} BODY[] NIL)\r\n",
+                                    "* {seq} FETCH (UID {} FLAGS ({flags}){revision}{internal_date} BODY[] NIL)\r\n",
                                     message.uid
                                 )
                                 .as_bytes(),

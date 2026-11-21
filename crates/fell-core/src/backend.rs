@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::account::{AccountId, BackendKind};
 use crate::account_config::AccountConfig;
 use crate::imap::ImapConfig;
@@ -121,6 +123,25 @@ pub struct MailboxView {
     pub kind: MailboxViewKind,
 }
 
+/// Dates from a fetched copy that may be usable after the local clock advances.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredMailDate {
+    pub header: Option<i64>,
+    pub arrival: Option<i64>,
+}
+
+impl DeferredMailDate {
+    pub(crate) fn merge(&mut self, later: Self) {
+        self.header = self.header.or(later.header);
+        self.arrival = self
+            .arrival
+            .zip(later.arrival)
+            .map(|(a, b)| a.min(b))
+            .or(self.arrival)
+            .or(later.arrival);
+    }
+}
+
 /// Messages, flag updates, and vanished copies to apply to the local store.
 ///
 /// Removals drop server copies only. The folders they backed come off the
@@ -129,6 +150,8 @@ pub struct MailboxView {
 #[derive(Debug, Clone, Default)]
 pub struct MailboxDelta {
     pub messages: Vec<Message>,
+    /// Clock-skew candidates for undated arrivals, keyed by server copy.
+    pub deferred_dates: HashMap<crate::RemoteId, DeferredMailDate>,
     pub flags: Vec<FlagUpdate>,
     pub links: Vec<CopyLink>,
     /// Virtual mailboxes from the latest successful LIST.
@@ -196,6 +219,19 @@ pub trait MailBackend {
     /// cut-short fetch is an error. Backends with nothing to fetch return none.
     fn fetch_bodies(&self, _copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         Ok(Vec::new())
+    }
+
+    /// Read arrival dates without fetching bodies. Report every requested copy
+    /// in a completed mailbox fetch, even when it returned no date. Skipped
+    /// mailboxes and incomplete fetches leave their copies unreported. An
+    /// interrupted or truncated pass returns an error after reporting any
+    /// results from completed mailbox fetches.
+    fn fetch_internal_dates(
+        &self,
+        _copies: &[crate::RemoteId],
+        _completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Check Reply-To by remote id. Deliver verified headers in batches;
@@ -302,6 +338,14 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_bodies(&self.imap, copies)
     }
 
+    fn fetch_internal_dates(
+        &self,
+        copies: &[crate::RemoteId],
+        completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        crate::imap::fetch_internal_dates(&self.imap, copies, completed)
+    }
+
     fn fetch_reply_to(
         &self,
         copies: &[crate::RemoteId],
@@ -370,6 +414,14 @@ impl MailBackend for ImapBackend {
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         crate::imap::fetch_bodies(&self.config, copies)
+    }
+
+    fn fetch_internal_dates(
+        &self,
+        copies: &[crate::RemoteId],
+        completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        crate::imap::fetch_internal_dates(&self.config, copies, completed)
     }
 
     fn fetch_reply_to(
@@ -506,6 +558,13 @@ fn collect_imap(
                 }
             }
             combined.messages.append(&mut delta.messages);
+            for (id, date) in delta.deferred_dates {
+                combined
+                    .deferred_dates
+                    .entry(id)
+                    .and_modify(|saved| saved.merge(date))
+                    .or_insert(date);
+            }
             combined.flags.append(&mut delta.flags);
             combined.links.append(&mut delta.links);
             combined.too_large.append(&mut delta.too_large);

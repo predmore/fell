@@ -6,7 +6,8 @@ use crate::sync::sync_once;
 use crate::{BackendKind, FolderRole, SearchField};
 
 use super::sync_tests::{
-    account, body_fetches, commands, config, empty_mailbox, sample_state, stored, unused_smtp,
+    account, body_fetches, commands, config, empty_mailbox, queue_legacy_internal_dates,
+    sample_state, stored, unused_smtp,
 };
 use super::test_server::{FixtureMailbox, FixtureMessage, TestServer, TestState, raw_message};
 
@@ -442,6 +443,64 @@ fn bridge_links_copies_without_a_message_id_before_downloading_a_body() {
     let mail = stored(&store, &acct, "bridge.aBc_42-XY=@imap.fell").unwrap();
     assert_eq!(mail.folders, ["INBOX", "Folders/Trips"]);
     assert_eq!(server.body_responses.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn bridge_repairs_cached_dates_from_all_mail_and_label_copies() {
+    let copy = |uid, id, reported: bool| {
+        FixtureMessage {
+        raw: format!(
+            "From: Avery <avery@example.test>\r\nSubject: {id}\r\nX-Pm-Internal-Id: {id}\r\n{}\r\nSample mail",
+            if reported {
+                "X-Test-Internal-Date: 09-Feb-2024 21:00:00 +0000\r\n"
+            } else {
+                ""
+            }
+        )
+        .into_bytes(),
+        ..message(uid, "unused", &[])
+    }
+    };
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![
+            mailbox("INBOX", 10, vec![copy(2, "shared", false)]),
+            mailbox(
+                "All Mail",
+                11,
+                vec![copy(7, "shared", false), copy(8, "all-only", true)],
+            ),
+            mailbox("Labels/A", 12, vec![copy(5, "shared", true)]),
+        ],
+        ..sample_state()
+    });
+    let acct = account("proton", BackendKind::Bridge);
+    let backend = BridgeBackend {
+        account_id: acct.id.clone(),
+        imap: config(server.addr.port()),
+        ..BridgeBackend::default()
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let all_mail_dates = || {
+        store
+            .folder_threads(&acct.id, "All Mail")
+            .unwrap()
+            .iter()
+            .map(|row| row.last_date_unix)
+            .collect::<Vec<_>>()
+    };
+    let arrival = 1_707_512_400;
+    assert_eq!(all_mail_dates(), [arrival, 0]);
+
+    queue_legacy_internal_dates(&store);
+    server.state.lock().unwrap().commands.clear();
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(all_mail_dates(), [arrival, arrival]);
+    let shared = stored(&store, &acct, "bridge.shared@imap.fell").unwrap();
+    assert_eq!(shared.labels, ["A"]);
+    assert_eq!(shared.headers.date_unix, arrival);
+    assert!(body_fetches(&server).is_empty());
+    assert!(store.missing_internal_dates(&acct.id).unwrap().is_empty());
 }
 
 #[test]
