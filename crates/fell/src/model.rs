@@ -371,6 +371,7 @@ pub struct Session {
     pub visual: bool,
     pub pane: Pane,
     pub full_width: bool,
+    reading_return_pane: Pane,
     pub messages: Vec<ConvMessage>,
     pub message_cursor: usize,
     attachment_focus: Option<AttachmentTarget>,
@@ -462,6 +463,7 @@ impl Session {
             visual: false,
             pane: Pane::List,
             full_width: false,
+            reading_return_pane: Pane::List,
             messages: Vec::new(),
             message_cursor: 0,
             attachment_focus: None,
@@ -2129,9 +2131,14 @@ impl Session {
             Action::FullWidth => {
                 self.count.clear();
                 self.full_width = !self.full_width;
-                if self.full_width && self.pane == Pane::List {
-                    self.pane = Pane::Conversation;
-                    self.opened(&mut step);
+                if self.full_width {
+                    self.reading_return_pane = self.pane;
+                    if self.pane == Pane::List {
+                        self.pane = Pane::Conversation;
+                        self.opened(&mut step);
+                    }
+                } else if self.pane == Pane::Conversation {
+                    self.pane = self.reading_return_pane;
                 }
             }
             Action::ToggleQuotes => {
@@ -3065,6 +3072,20 @@ mod tests {
         assert!(session.on_key(KeyId::Enter, 10).message_disclosure_changed);
         session.on_key(KeyId::Escape, 10);
         assert_eq!(session.pane, Pane::List);
+    }
+
+    #[test]
+    fn reading_mode_returns_focus_to_the_pane_it_opened_from() {
+        for pane in [Pane::List, Pane::Conversation] {
+            let mut session = session();
+            session.pane = pane;
+            session.on_key(KeyId::Char('z'), 10);
+            assert!(session.full_width);
+            assert_eq!(session.pane, Pane::Conversation);
+            session.on_key(KeyId::Char('z'), 10);
+            assert!(!session.full_width);
+            assert_eq!(session.pane, pane);
+        }
     }
 
     #[test]

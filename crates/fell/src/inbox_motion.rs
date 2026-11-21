@@ -193,6 +193,7 @@ pub struct InboxMotion {
     /// Where the reading column was when its current slide started.
     reading_slide: Option<(f32, Transition)>,
     reading_list_fade: Option<(f32, Transition)>,
+    reading_reflow: Option<([f32; 2], Transition)>,
     /// The conversation's focus edge changing colour.
     focus: Option<Transition>,
     /// The row the selection just left, its highlight fading out.
@@ -311,6 +312,7 @@ impl InboxMotion {
             last_layout: (Pane::List, false),
             reading_slide: None,
             reading_list_fade: None,
+            reading_reflow: None,
             focus: None,
             selection_out: None,
             last_selected: None,
@@ -440,6 +442,17 @@ impl InboxMotion {
                     start(motion::SLIDE).map(|slide| (self.reading_progress(now), slide));
                 self.reading_list_fade =
                     start(motion::FADE).map(|fade| (self.reading_list_opacity(now), fade));
+                let alpha = self.reading_reflow(now).map_or_else(
+                    || {
+                        if self.reading_target() {
+                            [0.0, 1.0]
+                        } else {
+                            [1.0, 0.0]
+                        }
+                    },
+                    |reflow| reflow.alpha,
+                );
+                self.reading_reflow = start(motion::READING_REFLOW).map(|fade| (alpha, fade));
             }
             if panes != self.last_panes {
                 let entering = match (self.last_panes, panes) {
@@ -490,6 +503,17 @@ impl InboxMotion {
 
     pub fn reading_sliding(&self) -> bool {
         self.reading_slide.is_some()
+    }
+
+    pub fn reading_reflow(&self, now: Instant) -> Option<motion::ReadingReflow> {
+        let (from, fade) = self.reading_reflow?;
+        if !fade.running(now) {
+            return None;
+        }
+        Some(motion::ReadingReflow {
+            alpha: motion::ReadingReflow::opacities(from, self.reading_target(), fade, now),
+            height: self.reading_progress(now),
+        })
     }
 
     pub fn reading_list_opacity(&self, now: Instant) -> f32 {
@@ -643,6 +667,7 @@ impl InboxMotion {
         running |= keep_with(&mut self.pane_out, now);
         running |= keep_with(&mut self.reading_slide, now);
         running |= keep_with(&mut self.reading_list_fade, now);
+        running |= keep_with(&mut self.reading_reflow, now);
         if self
             .list
             .as_ref()
@@ -1345,21 +1370,38 @@ mod tests {
         session.full_width = true;
         motion.observe(&session, (false, true), now);
         assert_eq!(motion.reading_progress(now), 0.0);
+        let reflow = motion.reading_reflow(now).unwrap();
+        assert_eq!((reflow.alpha, reflow.height), ([1.0, 0.0], 0.0));
+        assert_eq!(motion.reading_reflow(later(now, 40)).unwrap().alpha[1], 0.0);
+        assert_eq!(motion.reading_reflow(later(now, 60)).unwrap().alpha[0], 0.0);
         assert_eq!(motion.pane_entry(Pane::Conversation, now).dx, 0.0);
         let mid = later(now, 48);
         let drawn = motion.reading_progress(mid);
         assert!(drawn > 0.0 && drawn < 1.0);
+        let alpha = motion.reading_reflow(mid).unwrap().alpha;
+        assert!(alpha.iter().all(|alpha| *alpha > 0.0 && *alpha < 1.0));
 
         motion.settle(mid);
         session.full_width = false;
         motion.observe(&session, (true, true), mid);
         assert_eq!(motion.reading_progress(mid), drawn);
+        assert_eq!(motion.reading_reflow(mid).unwrap().alpha, alpha);
+        assert_eq!(
+            motion.reading_reflow(mid + motion::SLIDE).unwrap().height,
+            0.0
+        );
+        assert!(
+            motion
+                .reading_reflow(mid + motion::READING_REFLOW)
+                .is_none()
+        );
         assert_eq!(motion.reading_progress(mid + motion::SLIDE), 0.0);
 
         let mut reduced = InboxMotion::new(Motion::new(false));
         session.full_width = true;
         reduced.observe(&session, (false, true), now);
         assert_eq!(reduced.reading_progress(now), 1.0);
+        assert!(reduced.reading_reflow(now).is_none());
     }
 
     #[test]

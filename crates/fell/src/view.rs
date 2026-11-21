@@ -2,7 +2,7 @@
 
 mod attachment_actions;
 mod attachment_chips;
-mod disclosure;
+pub(crate) mod disclosure;
 mod help;
 mod search;
 
@@ -3356,6 +3356,13 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
+        let reflow = self.motion.reading_reflow(now);
+        let reveal_attachment = if reflow.is_some() && reveal_attachment {
+            self.reveal_attachment = true;
+            false
+        } else {
+            reveal_attachment
+        };
         self.motion
             .observe_header(&self.list_folder, self.session.unread_threads(), now);
         self.motion
@@ -3826,7 +3833,8 @@ fn shell(
                                 motion.reading_target(),
                                 reading,
                                 scale,
-                            ),
+                            )
+                            .with_reflow(motion.reading_reflow(now)),
                             Live(conv.preview_current && !session.search_editing()),
                             &conv,
                             window,
@@ -5271,8 +5279,12 @@ struct ReaderColumns {
     prose: ReaderColumn,
     card: ReaderColumn,
     wide: ReaderColumn,
+    split_width: f32,
+    reading_prose: f32,
     reading_wide: f32,
+    pane_right: f32,
     progress: f32,
+    reflow: Option<motion::ReadingReflow>,
 }
 
 impl ReaderColumns {
@@ -5293,8 +5305,6 @@ impl ReaderColumns {
         let reading_wide = full
             .min(READING_WIDE_PX)
             .min((window - 2.0 * READING_GUTTER_PX).max(split));
-        // Layout uses the destination measure from the first frame. The
-        // pane clips content as the insets move and the card resizes.
         let centered_inset = |to_width: f32| {
             let to_left = ((full - to_width) * 0.5).round();
             let left = motion::snap(motion::lerp(split_left, to_left, progress), scale);
@@ -5307,23 +5317,105 @@ impl ReaderColumns {
                 .min((available - inset).max(0.0).floor()),
             inset,
         };
-        let header_width = if reading { reading_prose } else { split };
         Self {
-            header: ReaderColumn {
-                width: header_width,
-                inset,
-            },
-            prose: ReaderColumn {
-                width: header_width.min(READING_MEASURE_PX),
-                inset,
-            },
+            header: card,
+            prose: card,
             card,
             wide: ReaderColumn {
-                width: if reading { reading_wide } else { split },
+                width: reading_wide,
                 inset: centered_inset(reading_wide),
             },
+            split_width: split,
+            reading_prose,
             reading_wide,
+            pane_right: available,
             progress,
+            reflow: None,
+        }
+        .at_measure(reading)
+    }
+
+    fn at_measure(mut self, reading: bool) -> Self {
+        self.header.width = if reading {
+            self.reading_prose
+        } else {
+            self.split_width
+        };
+        self.prose.width = self.header.width.min(READING_MEASURE_PX);
+        self.wide.width = if reading {
+            self.reading_wide
+        } else {
+            self.split_width
+        };
+        self
+    }
+
+    fn with_reflow(mut self, frame: Option<motion::ReadingReflow>) -> Self {
+        self.reflow = frame;
+        self
+    }
+
+    fn card_right(self) -> f32 {
+        self.card.inset + self.card.width
+    }
+
+    fn moving_prose(self) -> ReaderColumn {
+        ReaderColumn {
+            width: self.card.width.min(READING_MEASURE_PX),
+            ..self.card
+        }
+    }
+
+    fn flow(
+        self,
+        measure: impl Fn(Self) -> ReaderColumn,
+        mut layer: impl FnMut(f32, bool) -> gpui::AnyElement,
+    ) -> gpui::AnyElement {
+        let column = measure(self);
+        let place = |column: ReaderColumn, child| {
+            disclosure::clip_column(
+                column.inset,
+                column.width,
+                self.card_right(),
+                div().child(child),
+            )
+            .into_any_element()
+        };
+        if let Some(frame) = self.reflow {
+            let split = measure(self.at_measure(false));
+            let reading = measure(self.at_measure(true));
+            if split.width != reading.width {
+                let live = frame.alpha[1] > frame.alpha[0];
+                return disclosure::reflow(
+                    self.pane_right,
+                    frame,
+                    [
+                        place(split, layer(split.width, !live)),
+                        place(reading, layer(reading.width, live)),
+                    ],
+                );
+            }
+        }
+        place(column, layer(column.width, true))
+    }
+
+    fn blocks(self, fill: u32) -> crate::render::BlockColumns {
+        let layout = |columns: Self| {
+            crate::render::BlockColumn::reading(
+                (columns.wide.width, columns.wide.inset),
+                (columns.prose.width, columns.prose.inset),
+                (columns.reading_wide, columns.progress),
+                (columns.card_right(), columns.pane_right),
+                fill,
+            )
+        };
+        match self.reflow {
+            Some(frame) => crate::render::BlockColumns::reflow(
+                layout(self.at_measure(false)),
+                layout(self.at_measure(true)),
+                frame,
+            ),
+            None => layout(self).into(),
         }
     }
 
@@ -5481,11 +5573,12 @@ fn conversation(
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
-    let on_collapsed = session
-        .messages
-        .get(session.message_cursor)
-        .is_some_and(|message| !message.expanded);
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
+    // Short subjects keep their one-line measure in both modes.
+    let title_width = columns.reflow.map_or(f32::INFINITY, |_| {
+        let style = conversation_line_style(window, theme, px(theme.ui_px + 11.0));
+        line_px_with_style(window, &style, &subject, FontWeight::BOLD).ceil() + 4.0
+    });
     let messages: Vec<_> = session
         .messages
         .iter()
@@ -5497,11 +5590,7 @@ fn conversation(
                 0.0
             };
             let block = if message.expanded {
-                let fill = motion::mix(
-                    theme.background,
-                    theme.surface,
-                    if on_collapsed { 0.4 * focus } else { cursor },
-                );
+                let fill = expanded_card_fill(theme, cursor);
                 expanded_message(
                     theme,
                     session,
@@ -5524,7 +5613,7 @@ fn conversation(
                     (cursor, body),
                     columns,
                     collapsed_rows
-                        .get_or_init(|| CollapsedRows::new(window, theme, columns.header.width)),
+                        .get_or_init(|| CollapsedRows::new(window, theme, columns.card.width)),
                     live,
                     window,
                     cx,
@@ -5570,12 +5659,15 @@ fn conversation(
                     .border_color(rgb(theme.border))
                     .child(
                         div()
-                            .ml(px(CONVERSATION_PAD_PX
-                                + MESSAGE_PAD_PX
-                                + columns.header.inset))
-                            .w(px(columns.header.width))
+                            .px(px(CONVERSATION_PAD_PX + MESSAGE_PAD_PX))
                             .when(arrival < 1.0, |text| text.opacity(arrival))
-                            .child(subject),
+                            .child(columns.flow(
+                                |columns| ReaderColumn {
+                                    width: columns.header.width.min(title_width),
+                                    ..columns.header
+                                },
+                                |_, _| div().child(subject.clone()).into_any_element(),
+                            )),
                     ),
             )
         })
@@ -5613,6 +5705,14 @@ fn conversation(
         })
 }
 
+fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
+    motion::mix(
+        theme.background,
+        theme.surface,
+        motion::lerp(0.4, 1.0, focus),
+    )
+}
+
 fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
     div()
         .id("retained-preview")
@@ -5645,8 +5745,7 @@ fn conversation_line_style(window: &Window, theme: &Theme, size: gpui::Pixels) -
     style
 }
 
-/// The leading fields have already been laid out at the destination width.
-/// Clip them as the card moves so the date always has its own space.
+/// Give the date its own space while the leading fields ellipsize.
 fn message_date_row<T: Styled + ParentElement>(
     row: T,
     gap: f32,
@@ -5845,7 +5944,7 @@ fn expanded_message_header(
             .map_or(0.0, |line| f32::from(line.width).ceil())
     };
     let [sender_width, email_width, folder_width, _] = expanded_header_widths(
-        columns.header.width,
+        columns.card.width,
         [
             measure(
                 &sender_style,
@@ -5911,16 +6010,20 @@ fn expanded_message_header(
                 .join(" · ");
             fit_folders(&leaves)
         });
-    let leading = div().flex().items_center().gap(px(MESSAGE_HEADER_GAP_PX)).children(
-        [sender, email, folders]
-            .into_iter()
-            .flatten()
-            .map(|line| shaped_text(line, window)),
-    );
+    let leading = div()
+        .flex()
+        .items_center()
+        .gap(px(MESSAGE_HEADER_GAP_PX))
+        .children(
+            [sender, email, folders]
+                .into_iter()
+                .flatten()
+                .map(|line| shaped_text(line, window)),
+        );
     let date = fit(
         &sender_style,
         &date,
-        columns.header.width,
+        columns.card.width,
         FontWeight::NORMAL,
         theme.dimmed,
     );
@@ -5949,7 +6052,6 @@ fn expanded_message(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let header_width = columns.header.width;
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
@@ -5982,22 +6084,36 @@ fn expanded_message(
             )
         })
         .child(
-            columns.header.place(
-                div()
-                    .child(expanded_message_header(theme, message, columns, window))
-                    .children(message.recipients.as_ref().map(|line| {
+            columns
+                .card
+                .place(expanded_message_header(theme, message, columns, window)),
+        )
+        .children(message.recipients.as_ref().map(|line| {
+            div()
+                .id(gpui::ElementId::named_usize("recipients", index))
+                .child(columns.flow(
+                    |columns| ReaderColumn {
+                        width: columns.header.width.min(680.),
+                        ..columns.header
+                    },
+                    |width, active| {
                         recipient_lines(
                             theme,
                             line,
                             session.recipients_are_open(index),
                             frame.disclosures.recipients.get(&message.id).copied(),
                             index,
-                            header_width.min(680.),
-                            live,
+                            width,
+                            Live(live.0 && active),
                             window,
                             cx,
                         )
-                    }))
+                    },
+                ))
+        }))
+        .child(
+            columns.card.place(
+                div()
                     .children(
                         live.0
                             .then(|| search::match_reason(theme, session, message))
@@ -6035,17 +6151,25 @@ fn expanded_message(
             cx,
         ))
         .when(!message.attachments.is_empty(), |card| {
-            card.child(columns.header.place(attachment_chips::row(
-                theme,
-                session,
-                message,
-                index,
-                header_width,
-                live,
-                frame,
-                chip_probe,
-                window,
-                cx,
+            card.child(div().id("attachment-layout").child(columns.flow(
+                |columns| columns.header,
+                |width, active| {
+                    div()
+                        .id(("attachment-measure", width as usize))
+                        .child(attachment_chips::row(
+                            theme,
+                            session,
+                            message,
+                            index,
+                            width,
+                            Live(live.0 && active),
+                            frame,
+                            chip_probe.filter(|_| active),
+                            window,
+                            cx,
+                        ))
+                        .into_any_element()
+                },
             )))
         })
         .into_any_element()
@@ -6083,18 +6207,18 @@ fn message_body(
 ) -> gpui::AnyElement {
     let alpha = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
     if let Some(line) = present::missing_body_line(message.body_state) {
-        return folds
-            .columns
-            .prose
-            .place(
+        return folds.columns.flow(
+            |columns| columns.prose,
+            |_, _| {
                 div()
                     .pb(px(8.))
                     .line_height(px(theme.ui_px * 1.45))
                     .text_color(rgb(theme.dimmed))
                     .opacity(alpha)
-                    .child(line),
-            )
-            .into_any_element();
+                    .child(line.clone())
+                    .into_any_element()
+            },
+        );
     }
     let reveal = frame.disclosures.quotes.get(&message.id).copied();
     if let Rich::Html(body) = &message.rich {
@@ -6112,7 +6236,7 @@ fn message_body(
             let palette = mail_body::palette(theme);
             let quiet = mail_body::history_palette(theme);
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
-            let mut drafts: HashMap<usize, gpui::AnyElement> = HashMap::new();
+            let mut drafts = HashMap::new();
             let body = match &message.rich {
                 Rich::PlainPart(plain) => plain,
                 _ => &message.body,
@@ -6121,11 +6245,7 @@ fn message_body(
                 let (kind, text) = match block {
                     BodyBlock::Text(text) => (None, text.as_str()),
                     BodyBlock::Markdown { doc, agent } => {
-                        drafts.insert(
-                            at,
-                            crate::compose_ui::render_draft_doc(doc, *agent, theme)
-                                .into_any_element(),
-                        );
+                        drafts.insert(at, (doc, *agent));
                         runs.push((at, None, Vec::new()));
                         continue;
                     }
@@ -6149,15 +6269,27 @@ fn message_body(
             runs.into_iter()
                 .enumerate()
                 .map(|(run, (at, kind, texts))| match kind {
-                    None => div()
-                        .max_w(px(READING_MEASURE_PX))
-                        .pb(px(8.))
-                        .line_height(px(theme.ui_px * 1.45))
-                        .map(|text| match drafts.remove(&at) {
-                            Some(draft) => text.child(draft),
-                            None => text.child(crate::render::plain_text(texts.concat(), palette)),
-                        })
-                        .into_any_element(),
+                    None => {
+                        let text = texts.concat();
+                        folds.columns.flow(
+                            |columns| columns.prose,
+                            |_, _| {
+                                div()
+                                    .pb(px(8.))
+                                    .line_height(px(theme.ui_px * 1.45))
+                                    .map(|block| match drafts.get(&at) {
+                                        Some((doc, agent)) => block.child(
+                                            crate::compose_ui::render_draft_doc(doc, *agent, theme),
+                                        ),
+                                        None => block.child(crate::render::plain_text(
+                                            text.clone(),
+                                            palette,
+                                        )),
+                                    })
+                                    .into_any_element()
+                            },
+                        )
+                    }
                     Some(kind) => {
                         let text = texts.join("\n\n");
                         let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
@@ -6171,24 +6303,23 @@ fn message_body(
                                 rtl: crate::render::is_right_to_left(&text),
                             },
                             folds,
-                            (
-                                ReaderColumn {
-                                    width: folds.columns.prose.width,
-                                    inset: 0.0,
-                                },
-                                folds.columns.prose.width,
-                            ),
+                            (folds.columns.moving_prose(), folds.columns.pane_right),
                             reveal,
-                            move || {
-                                history_rule(
-                                    div(),
-                                    crate::render::is_right_to_left(&text),
-                                    crate::theme::strong_border(theme),
+                            || {
+                                folds.columns.flow(
+                                    |columns| columns.prose,
+                                    |_, _| {
+                                        history_rule(
+                                            div(),
+                                            crate::render::is_right_to_left(&text),
+                                            crate::theme::strong_border(theme),
+                                        )
+                                        .text_color(rgb(theme.dimmed))
+                                        .line_height(line_height)
+                                        .child(crate::render::plain_text(text.clone(), quiet))
+                                        .into_any_element()
+                                    },
                                 )
-                                .text_color(rgb(theme.dimmed))
-                                .line_height(line_height)
-                                .child(crate::render::plain_text(text, quiet))
-                                .into_any_element()
                             },
                             cx,
                         )
@@ -6197,11 +6328,7 @@ fn message_body(
                 .collect()
         }
     };
-    folds
-        .columns
-        .prose
-        .place(div().opacity(alpha).children(blocks))
-        .into_any_element()
+    div().opacity(alpha).children(blocks).into_any_element()
 }
 
 /// A prepared HTML body, one section at a time: what the sender wrote is
@@ -6230,13 +6357,7 @@ fn html_sections(
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
-            let layout = crate::render::BlockColumn::reading(
-                (columns.wide.width, columns.wide.inset),
-                (columns.prose.width, columns.prose.inset),
-                columns.reading_wide,
-                columns.progress,
-                folds.fill,
-            );
+            let layout = columns.blocks(folds.fill);
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.
@@ -6284,11 +6405,7 @@ fn html_sections(
                             rtl,
                         },
                         folds,
-                        (
-                            columns.prose,
-                            (columns.wide.width + columns.wide.inset)
-                                .max(columns.prose.width + columns.prose.inset),
-                        ),
+                        (columns.moving_prose(), columns.pane_right),
                         reveal,
                         || {
                             history_section(
@@ -6312,7 +6429,7 @@ fn history_section(
     kind: Option<fell_render::Fold>,
     palette: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumn),
+    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumns),
 ) -> gpui::AnyElement {
     let (rule, layout) = layout.quote(
         div(),
@@ -6356,7 +6473,7 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumn),
+    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumns),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
     let nested = matches!(
@@ -6485,6 +6602,7 @@ fn folded_line(
         .mb(px(FOLD_GAP_PX))
         .flex()
         .items_center()
+        .truncate()
         .when(label.rtl, |line| {
             line.max_w(px(READING_MEASURE_PX)).justify_end()
         })
@@ -6626,7 +6744,6 @@ fn recipient_lines(
             .into_any_element()
     };
     div()
-        .id(gpui::ElementId::named_usize("recipients", index))
         .max_w(px(680.))
         .pb(px(10.))
         .text_size(size)
@@ -7562,6 +7679,19 @@ mod tests {
         assert_eq!(collapsed_sender_budget(70., 18.2, 17.1, 72.), 52.);
         assert_eq!(collapsed_sender_budget(24., 18.2, 17.1, 72.), 24.);
         assert_eq!(collapsed_sender_budget(0., 18.2, 17.1, 72.), 0.);
+    }
+
+    #[test]
+    fn an_unfocused_expanded_card_keeps_its_resting_fill() {
+        for theme in crate::theme::every_test_theme() {
+            let resting = motion::mix(theme.background, theme.surface, 0.4);
+            assert_eq!(super::expanded_card_fill(&theme, 0.0), resting);
+            assert_eq!(super::expanded_card_fill(&theme, 1.0), theme.surface);
+            assert_eq!(
+                super::expanded_card_fill(&theme, 0.5),
+                motion::mix(theme.background, theme.surface, 0.7)
+            );
+        }
     }
 
     #[test]
