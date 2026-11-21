@@ -214,37 +214,127 @@ pub fn blocks_column(
         palette,
         allow_remote,
         gallery,
-        width,
+        BlockColumn::full(width),
         BLOCK_GAP,
-        None,
     )
 }
 
+/// The wide block width and, when set, the position of the prose within it.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockColumn {
+    pub width: f32,
+    pub prose: Option<(f32, f32)>,
+    wide_inset: f32,
+    measure: Option<f32>,
+}
+
+impl BlockColumn {
+    pub fn full(width: f32) -> Self {
+        Self {
+            width,
+            prose: None,
+            wide_inset: 0.0,
+            measure: None,
+        }
+    }
+
+    pub fn measured(width: f32, measure: f32) -> Self {
+        Self {
+            measure: Some(measure),
+            ..Self::full(width)
+        }
+    }
+
+    pub fn reading(wide: f32, wide_inset: f32, prose: f32, prose_inset: f32) -> Self {
+        Self {
+            width: wide,
+            prose: Some((prose, prose_inset)),
+            wide_inset,
+            measure: None,
+        }
+    }
+
+    pub fn indented(self, indent: f32) -> Self {
+        Self {
+            width: (self.width - indent).max(0.),
+            measure: self.measure.map(|width| (width - indent).max(0.)),
+            prose: self
+                .prose
+                .map(|(width, inset)| ((width - indent).max(0.), inset)),
+            ..self
+        }
+    }
+
+    fn prose(self, element: gpui::Div) -> gpui::Div {
+        element.when_some(self.prose, |element, (width, inset)| {
+            element.w(px(width)).ml(px(inset))
+        })
+    }
+
+    fn wide(self, element: gpui::Div) -> gpui::Div {
+        element.when(self.prose.is_some(), |element| {
+            element.w(px(self.width)).ml(px(self.wide_inset))
+        })
+    }
+
+    /// Keep the history rule beside the text when there are no wide blocks.
+    pub fn history(self, blocks: &[Block], gallery: &ImageGallery) -> (Self, f32) {
+        if let Some((width, inset)) = self.prose
+            && !blocks.iter().any(|block| is_wide_block(block, gallery))
+        {
+            return (Self::reading(width, 0.0, width, 0.0), inset);
+        }
+        (self, 0.0)
+    }
+}
+
+const WIDE_IMAGE_PX: f32 = 600.0;
+
+fn is_wide_block(block: &Block, gallery: &ImageGallery) -> bool {
+    let decoded = |source: &ImageSource| matches!(source, ImageSource::Data { bytes, .. } if gallery.placed(bytes, false).is_some_and(|(_, width, _)| width > WIDE_IMAGE_PX));
+    match block {
+        Block::Table { .. } | Block::Code { .. } => true,
+        Block::Image { source, .. } => decoded(source),
+        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+            let mut has_image = false;
+            walk_inlines_sources(inlines, &mut |source| has_image |= decoded(source));
+            has_image
+        }
+        Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
+            blocks.iter().any(|block| is_wide_block(block, gallery))
+        }
+        Block::List { items, .. } => items
+            .iter()
+            .flat_map(|item| &item.blocks)
+            .any(|block| is_wide_block(block, gallery)),
+        Block::ThematicBreak => false,
+    }
+}
+
 /// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
-/// opened history sits tighter than the sender's own paragraphs. With a
-/// `measure`, prose is held to that width while tables and code blocks
-/// take the whole column: a table's columns need the room, and a log line
-/// wrapped at 72 characters is harder to read, not easier.
-pub fn blocks_column_spaced(
+/// opened history sits tighter than the sender's own paragraphs.
+pub(crate) fn blocks_column_spaced(
     blocks: &[Block],
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
-    width: f32,
+    layout: BlockColumn,
     gap: f32,
-    measure: Option<f32>,
 ) -> gpui::Div {
     // A short letter should reach the lower part of the pane. The gaps and
     // line height do that without adding a fake closing rule.
     let mut column = div().flex().flex_col().line_height(px(22.));
     let mut previous: Option<&Block> = None;
     for (start, end) in column_runs(blocks, allow_remote, gallery) {
-        let wide = matches!(
-            blocks[start],
-            Block::Table { .. } | Block::Code { large: false, .. }
-        );
-        let measure = measure.filter(|_| !wide);
-        let block_width = measure.map_or(width, |measure| measure.min(width));
+        let measure = layout.measure.filter(|_| {
+            !matches!(
+                blocks[start],
+                Block::Table { .. } | Block::Code { large: false, .. }
+            )
+        });
+        let block_layout = measure.map_or(layout, |measure| {
+            BlockColumn::full(measure.min(layout.width))
+        });
         let child = if end - start == 2 {
             sketch_with_caption(
                 &blocks[start],
@@ -252,10 +342,10 @@ pub fn blocks_column_spaced(
                 palette,
                 allow_remote,
                 gallery,
-                block_width,
+                block_layout,
             )
         } else {
-            render_block(&blocks[start], palette, allow_remote, gallery, block_width)
+            render_block(&blocks[start], palette, allow_remote, gallery, block_layout)
         };
         let gap = previous.map_or(0., |above| {
             // Blocked-image lines stacked one under another read as a
@@ -304,14 +394,20 @@ fn sketch_with_caption(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
-    width: f32,
+    layout: BlockColumn,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(CAPTION_GAP))
-        .child(render_block(sketch, palette, allow_remote, gallery, width))
-        .child(render_block(caption, palette, allow_remote, gallery, width))
+        .child(render_block(sketch, palette, allow_remote, gallery, layout))
+        .child(render_block(
+            caption,
+            palette,
+            allow_remote,
+            gallery,
+            layout,
+        ))
         .into_any_element()
 }
 
@@ -385,7 +481,7 @@ fn render_block(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
-    width: f32,
+    layout: BlockColumn,
 ) -> AnyElement {
     match block {
         Block::Heading { level, inlines } => {
@@ -399,14 +495,26 @@ fn render_block(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .children(render_inlines(inlines, palette, allow_remote, gallery))
+                .children(render_inlines(
+                    inlines,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    layout,
+                ))
                 .into_any_element()
         }
         Block::Paragraph { inlines } => div()
             .flex()
             .flex_col()
             .gap_2()
-            .children(render_inlines(inlines, palette, allow_remote, gallery))
+            .children(render_inlines(
+                inlines,
+                palette,
+                allow_remote,
+                gallery,
+                layout,
+            ))
             .into_any_element(),
         Block::Small { blocks } => {
             let quiet = Palette {
@@ -423,7 +531,7 @@ fn render_block(
                 .children(
                     blocks
                         .iter()
-                        .map(|child| render_block(child, &quiet, allow_remote, gallery, width)),
+                        .map(|child| render_block(child, &quiet, allow_remote, gallery, layout)),
                 )
                 .into_any_element()
         }
@@ -434,49 +542,70 @@ fn render_block(
             .children(
                 blocks
                     .iter()
-                    .map(|child| render_block(child, palette, allow_remote, gallery, width)),
+                    .map(|child| render_block(child, palette, allow_remote, gallery, layout)),
             )
             .into_any_element(),
-        Block::Quote { blocks } => div()
-            .border_l(px(QUOTE_RULE_PX))
-            .border_color(paint(palette.quote))
-            .pl(px(QUOTE_INSET_PX - QUOTE_RULE_PX))
-            .text_color(paint(palette.foreground))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(blocks.iter().map(|child| {
-                render_block(
-                    child,
-                    palette,
-                    allow_remote,
-                    gallery,
-                    (width - QUOTE_INSET_PX).max(0.),
-                )
-            }))
-            .into_any_element(),
+        Block::Quote { blocks } => {
+            let (quote_layout, inset) = layout.history(blocks, gallery);
+            let tight = quote_layout.width != layout.width || inset > 0.0;
+            let layout = quote_layout;
+            div()
+                .ml(px(inset))
+                .when(tight, |quote| quote.w(px(layout.width)))
+                .border_l(px(QUOTE_RULE_PX))
+                .border_color(paint(palette.quote))
+                .pl(px(QUOTE_INSET_PX - QUOTE_RULE_PX))
+                .text_color(paint(palette.foreground))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(blocks.iter().map(|child| {
+                    render_block(
+                        child,
+                        palette,
+                        allow_remote,
+                        gallery,
+                        layout.indented(QUOTE_INSET_PX),
+                    )
+                }))
+                .into_any_element()
+        }
         Block::List { ordered, items } => div()
             .flex()
             .flex_col()
             .gap_2()
             .children(items.iter().enumerate().map(|(index, item)| {
-                list_item(index, *ordered, item, palette, allow_remote, gallery, width)
+                list_item(
+                    index,
+                    *ordered,
+                    item,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    layout,
+                )
             }))
             .into_any_element(),
-        Block::Code { text, large: false } => div()
-            .font_family(CODE_FONT)
-            .text_sm()
-            .bg(paint(palette.code_bg))
-            .p_3()
-            .rounded(px(4.))
-            .child(PreText::new(text))
+        Block::Code { text, large: false } => layout
+            .wide(div())
+            .child(
+                div()
+                    .font_family(CODE_FONT)
+                    .bg(paint(palette.code_bg))
+                    .px_3()
+                    .py_2()
+                    .rounded(px(4.))
+                    .child(PreText::new(text)),
+            )
             .into_any_element(),
         // A box that fits the code, not the line: it reads as one thing.
-        Block::Code { text, large: true } => div()
+        Block::Code { text, large: true } => layout
+            .wide(div())
             .flex()
             .child(
                 div()
                     .flex_none()
+                    .when(layout.prose.is_some(), |code| code.max_w_full())
                     .font_family(CODE_FONT)
                     .bg(paint(palette.code_bg))
                     .px_3()
@@ -489,12 +618,23 @@ fn render_block(
             header,
             rows,
             align,
-        } => render_table(header, rows, align, palette, allow_remote, gallery, width),
-        Block::Image { source, alt } => image_el(source, alt, palette, allow_remote, gallery),
-        Block::ThematicBreak => div()
-            .h(px(1.))
-            .w_full()
-            .bg(paint(palette.border))
+        } => layout
+            .wide(div())
+            .child(render_table(
+                header,
+                rows,
+                align,
+                palette,
+                allow_remote,
+                gallery,
+                layout.width,
+            ))
+            .into_any_element(),
+        Block::Image { source, alt } => {
+            image_el(source, alt, palette, allow_remote, gallery, layout)
+        }
+        Block::ThematicBreak => layout
+            .prose(div().h(px(1.)).w_full().bg(paint(palette.border)))
             .into_any_element(),
     }
 }
@@ -510,7 +650,7 @@ fn list_item(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
-    width: f32,
+    layout: BlockColumn,
 ) -> AnyElement {
     let marker = if ordered {
         format!("{}.", index + 1)
@@ -525,6 +665,9 @@ fn list_item(
         .child(
             div()
                 .w(px(LIST_MARKER_PX))
+                .when_some(layout.prose, |marker, (_, inset)| {
+                    marker.relative().left(px(inset))
+                })
                 .flex_shrink_0()
                 .text_color(paint(palette.foreground))
                 .child(marker),
@@ -542,7 +685,7 @@ fn list_item(
                         palette,
                         allow_remote,
                         gallery,
-                        (width - LIST_MARKER_PX).max(0.),
+                        layout.indented(LIST_MARKER_PX),
                     )
                 })),
         )
@@ -565,11 +708,15 @@ fn render_table(
             .flex()
             .flex_col()
             .gap_2()
-            .children(
-                blocks
-                    .iter()
-                    .map(|block| render_block(block, palette, allow_remote, gallery, width)),
-            )
+            .children(blocks.iter().map(|block| {
+                render_block(
+                    block,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    BlockColumn::full(width),
+                )
+            }))
             .into_any_element();
         TableCell {
             content,
@@ -1022,9 +1169,15 @@ fn render_inlines(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    layout: BlockColumn,
 ) -> Vec<AnyElement> {
     if let Some(line) = blocked_image_line(inlines, allow_remote) {
-        return vec![dimmed_line(line, palette)];
+        return vec![
+            layout
+                .prose(div())
+                .child(dimmed_line(line, palette))
+                .into_any_element(),
+        ];
     }
     let mut out = Vec::new();
     let mut text = String::new();
@@ -1037,8 +1190,13 @@ fn render_inlines(
             && let Some((end, alts)) = image_run(inlines, at)
             && alts.len() >= 2
         {
-            flush_text(&mut text, &mut ranges, palette, &mut out);
-            out.push(blocked_label(&alts, palette));
+            flush_text(&mut text, &mut ranges, palette, layout, &mut out);
+            out.push(
+                layout
+                    .prose(div())
+                    .child(blocked_label(&alts, palette))
+                    .into_any_element(),
+            );
             at = end;
             continue;
         }
@@ -1048,13 +1206,14 @@ fn render_inlines(
             palette,
             allow_remote,
             gallery,
+            layout,
             &mut text,
             &mut ranges,
             &mut out,
         );
         at += 1;
     }
-    flush_text(&mut text, &mut ranges, palette, &mut out);
+    flush_text(&mut text, &mut ranges, palette, layout, &mut out);
     if out.is_empty() {
         out.push(div().into_any_element());
     }
@@ -1068,6 +1227,7 @@ fn walk_inlines(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    layout: BlockColumn,
     text: &mut String,
     ranges: &mut Vec<(Range<usize>, Mark)>,
     out: &mut Vec<AnyElement>,
@@ -1094,6 +1254,7 @@ fn walk_inlines(
                     palette,
                     allow_remote,
                     gallery,
+                    layout,
                     text,
                     ranges,
                     out,
@@ -1108,6 +1269,7 @@ fn walk_inlines(
                     palette,
                     allow_remote,
                     gallery,
+                    layout,
                     text,
                     ranges,
                     out,
@@ -1122,6 +1284,7 @@ fn walk_inlines(
                     palette,
                     allow_remote,
                     gallery,
+                    layout,
                     text,
                     ranges,
                     out,
@@ -1136,14 +1299,22 @@ fn walk_inlines(
                     palette,
                     allow_remote,
                     gallery,
+                    layout,
                     text,
                     ranges,
                     out,
                 );
             }
             Inline::Image { source, alt } => {
-                flush_text(text, ranges, palette, out);
-                out.push(image_el(source, alt, palette, allow_remote, gallery));
+                flush_text(text, ranges, palette, layout, out);
+                out.push(image_el(
+                    source,
+                    alt,
+                    palette,
+                    allow_remote,
+                    gallery,
+                    layout,
+                ));
             }
         }
     }
@@ -1161,6 +1332,7 @@ fn flush_text(
     text: &mut String,
     ranges: &mut Vec<(Range<usize>, Mark)>,
     palette: &Palette,
+    layout: BlockColumn,
     out: &mut Vec<AnyElement>,
 ) {
     if text.is_empty() {
@@ -1171,7 +1343,12 @@ fn flush_text(
         .map(|(range, mark)| (range.len(), mark))
         .collect();
     let element = MailText::new(SharedString::from(std::mem::take(text)), runs, *palette);
-    out.push(div().w_full().child(element).into_any_element());
+    out.push(
+        layout
+            .prose(div().w_full())
+            .child(element)
+            .into_any_element(),
+    );
 }
 
 pub(crate) fn plain_text(text: String, palette: Palette) -> impl IntoElement {
@@ -2106,14 +2283,25 @@ fn image_el(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
+    layout: BlockColumn,
 ) -> AnyElement {
     if let ImageSource::Data { bytes, .. } = source
         && let Some((rendered, width, height)) = gallery.placed(bytes, palette.scheme() == "dark")
     {
+        let (limit, inset) = layout.prose.map_or((width, 0.0), |prose| {
+            if width > WIDE_IMAGE_PX {
+                (layout.width, layout.wide_inset)
+            } else {
+                prose
+            }
+        });
+        let shown_width = width.min(limit);
+        let shown_height = height * (shown_width / width);
         let mut frame = div()
-            .w(px(width))
-            .h(px(height))
-            .child(img(rendered).w(px(width)).h(px(height)));
+            .ml(px(inset))
+            .w(px(shown_width))
+            .h(px(shown_height))
+            .child(img(rendered).w_full().h_full());
         frame.style().align_self = Some(gpui::AlignItems::FlexStart);
         return frame.into_any_element();
     }
@@ -2141,7 +2329,8 @@ fn image_el(
             }
         }
     };
-    let mut placeholder = div()
+    let mut placeholder = layout
+        .prose(div())
         .text_sm()
         .text_color(paint(palette.dimmed))
         .child(label);
