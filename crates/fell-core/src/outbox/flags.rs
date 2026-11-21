@@ -310,7 +310,10 @@ fn flag_value(flags: CopyFlags, kind: OutboxKind) -> Option<bool> {
     match kind {
         OutboxKind::Seen => flags.seen,
         OutboxKind::Flagged => flags.flagged,
-        OutboxKind::Move | OutboxKind::Keyword | OutboxKind::BridgeLabel => None,
+        OutboxKind::Move
+        | OutboxKind::AppendSent
+        | OutboxKind::Keyword
+        | OutboxKind::BridgeLabel => None,
     }
 }
 

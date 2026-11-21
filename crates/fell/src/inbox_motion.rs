@@ -236,7 +236,7 @@ pub struct InboxMotion {
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
-    bodies: HashMap<String, Transition>,
+    bodies: HashMap<String, (Transition, bool)>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -662,7 +662,7 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
-        self.bodies.retain(|_, fade| fade.running(now));
+        self.bodies.retain(|_, (fade, _)| fade.running(now));
         running |= self.quotes.tick(now);
         running |= self.recipients.tick(now);
         running |= !self.bodies.is_empty();
@@ -1095,15 +1095,30 @@ impl InboxMotion {
     /// text, under a header already drawn: it settles in over [`motion::QUICK`].
     pub fn body_arrived(&mut self, id: &str, now: Instant) {
         if let Some(fade) = self.motion.start(motion::QUICK, now) {
-            self.bodies.insert(id.to_string(), fade);
+            self.bodies
+                .entry(id.to_string())
+                .and_modify(|(old, whole)| {
+                    if !*whole {
+                        *old = fade;
+                    }
+                })
+                .or_insert((fade, false));
         }
     }
 
-    /// Opacity of each body still settling in, by message id.
-    pub fn body_alphas(&self, now: Instant) -> HashMap<String, f32> {
+    /// Fade in the whole card when a newly sent reply joins the open thread.
+    pub fn message_arrived(&mut self, id: &str, now: Instant) {
+        if let Some(fade) = self.motion.start(motion::QUICK, now) {
+            self.bodies.insert(id.to_string(), (fade, true));
+        }
+    }
+
+    /// Opacity for each body or card still settling in, by message id.
+    pub fn arrival_alphas(&self, now: Instant, whole_card: bool) -> HashMap<String, f32> {
         self.bodies
             .iter()
-            .map(|(id, fade)| {
+            .filter(|(_, (_, whole))| *whole == whole_card)
+            .map(|(id, (fade, _))| {
                 let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
                 (id.clone(), alpha)
             })
@@ -1921,7 +1936,7 @@ mod tests {
         motion.body_arrived("a", now);
         session.quotes_open.insert("a".into());
         session.recipients_open.insert("a".into());
-        assert!(motion.body_alphas(now).is_empty());
+        assert!(motion.arrival_alphas(now, false).is_empty());
         let shown = motion.disclosures(&session, now);
         assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
@@ -1935,13 +1950,13 @@ mod tests {
         motion.body_arrived("a", now);
         session.quotes_open.insert("b".into());
         session.recipients_open.insert("b".into());
-        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
+        assert_eq!(motion.arrival_alphas(now, false)["a"], motion::ARRIVE_FROM);
         let opening = motion.disclosures(&session, now);
         assert_eq!(opening.quotes["b"], 0.0);
         assert_eq!(opening.recipients["b"], 0.0);
 
         let mid = later(now, 40);
-        let alpha = motion.body_alphas(mid)["a"];
+        let alpha = motion.arrival_alphas(mid, false)["a"];
         assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
         assert!(motion.tick(mid));
         let shown = motion.disclosures(&session, mid);
@@ -1951,7 +1966,7 @@ mod tests {
         // The body is in after QUICK; both disclosures keep moving until SLIDE.
         let after = later(now, 90);
         assert!(motion.tick(after));
-        assert!(!motion.body_alphas(after).contains_key("a"));
+        assert!(!motion.arrival_alphas(after, false).contains_key("a"));
         assert!(motion.disclosures(&session, after).quotes["b"] > 0.9);
 
         let close = later(now, 130);

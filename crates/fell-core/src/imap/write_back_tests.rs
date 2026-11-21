@@ -149,7 +149,7 @@ impl Fixture {
     }
 
     fn replay(&self) -> crate::outbox::ReplayReport {
-        replay_outbox(&self.backend.config, &self.account.id, &self.store).unwrap()
+        replay_outbox(&self.backend.config, &self.account.id, &self.store, true).unwrap()
     }
 
     /// Replay as the sync thread does, through the account file: what the
@@ -758,7 +758,7 @@ fn early_keyword_edit_replays_and_undoes_for_every_copy_in_order() {
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].uid, None);
 
-    let replay = || replay_outbox(&fx.backend.config, account, &store).unwrap();
+    let replay = || replay_outbox(&fx.backend.config, account, &store, false).unwrap();
     assert_eq!(replay().waiting, 1);
     server_has_label(false);
     sync_once(&fx.account, &fx.backend, &store).unwrap();
@@ -853,7 +853,7 @@ fn bridge_labels_create_copy_and_remove_only_the_label_copy() {
     let action = store
         .label_threads(&account.id, &threads, crate::LabelChange::Add(label.into()))
         .unwrap();
-    let replay = || replay_outbox(&backend.imap, &account.id, &store).unwrap();
+    let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
     assert!(replay().interrupted.is_some());
     assert_eq!(
         replay().waiting,
@@ -958,7 +958,7 @@ fn bridge_label_undo_survives_a_fetch_after_an_interrupted_copy() {
     let action = store
         .label_thread(&account.id, &thread, crate::LabelChange::Add(label.into()))
         .unwrap();
-    let replay = || replay_outbox(&backend.imap, &account.id, &store).unwrap();
+    let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
     assert!(replay().interrupted.is_some());
     assert_eq!(store.undo(&account.id).unwrap().id, action.id);
     sync_once(&account, &backend, &store).unwrap();
@@ -1008,7 +1008,7 @@ fn bridge_label_removal_resumes_each_copy_after_a_lost_reply() {
                 crate::LabelChange::Remove("Review".into()),
             )
             .unwrap();
-        let replay = || replay_outbox(&backend.imap, &account.id, &store).unwrap();
+        let replay = || replay_outbox(&backend.imap, &account.id, &store, false).unwrap();
         assert!(replay().interrupted.is_some(), "{command}");
         {
             let state = server.state.lock().unwrap();
@@ -1535,15 +1535,20 @@ fn a_lost_move_reply_takes_only_the_exact_message_id_that_arrived_after() {
     fx.server.writes.lock().unwrap().lose_reply_to = Some("MOVE");
     // A look-alike the search also matches lands in Archive after replay
     // read UIDNEXT and before the move, so it is above the bound too.
-    let report =
-        super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
+    let report = super::write_back::replay_with(
+        &fx.backend.config,
+        &fx.account.id,
+        &fx.store,
+        true,
+        &|| {
             fx.deliver(
                 "Archive",
                 1,
                 raw_with_message_id("Message-ID: <BRAVO@x>\r\n", "Look-alike"),
             )
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert!(report.interrupted.is_some());
     assert_eq!(
         fx.on_server("Archive"),
@@ -1604,11 +1609,14 @@ fn turning_write_back_off_after_the_pass_loaded_its_rows_sends_nothing() {
         .archive_thread(&fx.account.id, &alpha, "INBOX")
         .unwrap();
     fx.clear_commands();
-    let report =
-        super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
-            fx.store.set_write_back(&fx.account.id, false).unwrap()
-        })
-        .unwrap();
+    let report = super::write_back::replay_with(
+        &fx.backend.config,
+        &fx.account.id,
+        &fx.store,
+        true,
+        &|| fx.store.set_write_back(&fx.account.id, false).unwrap(),
+    )
+    .unwrap();
     assert_eq!(report.sent, 0);
     let moves: Vec<String> = without_tags(&fx.commands())
         .into_iter()
@@ -1627,7 +1635,7 @@ fn an_undo_after_the_pass_loaded_its_rows_sends_nothing() {
         .archive_thread(&fx.account.id, &alpha, "INBOX")
         .unwrap();
     fx.clear_commands();
-    super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
+    super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, true, &|| {
         fx.store.undo(&fx.account.id).unwrap();
     })
     .unwrap();
@@ -2277,12 +2285,17 @@ fn an_edit_during_select_retires_the_unsent_snapshot() {
     let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(true));
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Star);
-    let report =
-        super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
+    let report = super::write_back::replay_with(
+        &fx.backend.config,
+        &fx.account.id,
+        &fx.store,
+        true,
+        &|| {
             assert!(without_tags(&fx.commands()).contains(&"SELECT \"INBOX\" (CONDSTORE)".into()));
             fx.flag(&alpha, FlagChange::Unstar);
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     assert_eq!((report.sent, report.waiting), (0, 0));
     assert!(fx.stores().is_empty());
@@ -2351,13 +2364,18 @@ fn a_copy_without_a_revision_fetches_a_baseline_before_writing() {
     let alpha = fx.thread("INBOX", "Alpha");
     fx.flag(&alpha, FlagChange::Star);
     let changed_once = std::cell::Cell::new(false);
-    let report =
-        super::write_back::replay_with(&fx.backend.config, &fx.account.id, &fx.store, &|| {
+    let report = super::write_back::replay_with(
+        &fx.backend.config,
+        &fx.account.id,
+        &fx.store,
+        true,
+        &|| {
             if !changed_once.replace(true) {
                 fx.server.state.lock().unwrap().mailboxes[0].messages[0].modseq = 15;
             }
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert_eq!((report.sent, report.waiting), (3, 0));
     assert_eq!(
         fx.stores(),
@@ -2681,4 +2699,209 @@ fn the_write_back_switch_gates_flags_and_nomodseq_uses_plain_store() {
         (u64::from_be_bytes(modseq), seen, flagged, seen_handled),
         (4, true, true, true)
     );
+}
+
+fn sent_fixture() -> Fixture {
+    Fixture::with(
+        Store::open_in_memory().unwrap(),
+        state_with(vec![
+            mailbox("INBOX", "", 7, &[(1, "Alpha")]),
+            mailbox("Filed mail", "\\Sent", 65, &[]),
+        ]),
+    )
+}
+
+const REPLY_MIME: &[u8] = b"From: Robin <c@x>\r\nTo: Ann <ann@x>\r\n\
+Subject: Re: Alpha\r\nDate: Sat, 21 Nov 2026 10:00:00 +0000\r\n\
+Message-ID: <reply@compose.fell>\r\nIn-Reply-To: <alpha@x>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\r\nThanks for the update.\r\n";
+
+fn record_reply(fixture: &Fixture, append: bool) -> ThreadId {
+    let (thread, _) = fixture
+        .store
+        .record_sent_message(
+            &fixture.account.id,
+            "fixture-reply",
+            &crate::MessageId::new("reply@compose.fell"),
+            &[crate::Address {
+                name: None,
+                email: "hidden@example.com".into(),
+            }],
+            REPLY_MIME,
+            append,
+        )
+        .unwrap();
+    thread
+}
+
+#[test]
+fn sent_reply_is_inline_before_sync_and_dedups_with_bcc_after_sync() {
+    let fixture = sent_fixture();
+    let parent = fixture.thread("INBOX", "Alpha");
+    let thread = record_reply(&fixture, false);
+    assert_eq!(thread, parent);
+    let check = || {
+        let messages = fixture
+            .store
+            .thread_messages(&fixture.account.id, &thread)
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        let reply = messages
+            .iter()
+            .find(|message| message.headers.message_id.as_str() == "reply@compose.fell")
+            .unwrap();
+        assert_eq!(reply.folders, ["Filed mail"]);
+        assert_eq!(
+            reply.body_text.as_deref().unwrap().trim(),
+            "Thanks for the update."
+        );
+        assert_eq!(reply.bcc[0].email, "hidden@example.com");
+        assert!(!reply.unread);
+    };
+    check();
+    // A new empty listing must keep the local message, even across UID reset.
+    fixture.server.state.lock().unwrap().mailboxes[1].uidvalidity += 1;
+    fixture.sync();
+    check();
+    fixture.deliver("Filed mail", 1, REPLY_MIME.to_vec());
+    fixture.server.state.lock().unwrap().mailboxes[1].messages[0].flags = vec!["\\Seen".into()];
+    fixture.sync();
+    check();
+    assert!(fixture.copy_recorded("Filed mail", 1));
+    assert!(
+        fixture
+            .store
+            .search(&fixture.account.id, "hidden")
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+}
+
+#[test]
+fn sent_append_recovers_a_lost_reply_without_a_second_append() {
+    let fixture = sent_fixture();
+    record_reply(&fixture, true);
+    fixture.server.writes.lock().unwrap().lose_reply_to = Some("APPEND");
+    let report = fixture.replay();
+    assert!(report.sent_append_delayed);
+    assert_eq!(report.waiting, 1);
+    fixture.make_due();
+    let report = fixture.replay();
+    assert_eq!(report.sent, 1);
+    assert_eq!(fixture.replay().sent, 0);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+    let state = fixture.server.state.lock().unwrap();
+    let appended = &state.mailboxes[1].messages[0];
+    assert_eq!(appended.flags, ["\\Seen"]);
+    assert_eq!(appended.raw, REPLY_MIME);
+    assert_eq!(
+        state
+            .commands
+            .iter()
+            .filter(|command| command.contains(" APPEND "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn refused_sent_append_leaves_local_reply_and_retries() {
+    let fixture = sent_fixture();
+    let message_id = crate::MessageId::new("reply@compose.fell");
+    assert_eq!(
+        fixture
+            .store
+            .claim_compose_send(
+                &fixture.account.id,
+                "fixture-reply",
+                Some(message_id.as_str())
+            )
+            .unwrap(),
+        None
+    );
+    let sent = crate::smtp::tests::confirm_fixture_delivery(
+        &fixture.backend.config,
+        &fixture.account.id,
+        REPLY_MIME,
+    );
+    fixture.server.writes.lock().unwrap().refuse_append = true;
+    let thread = record_reply(&fixture, true);
+    let report = fixture.replay();
+    assert!(report.sent_append_delayed);
+    assert_eq!(report.waiting, 1);
+    assert!(fixture.on_server("Filed mail").is_empty());
+    let rows = fixture.store.outbox(&fixture.account.id).unwrap();
+    assert_eq!(rows[0].state, OutboxState::Pending);
+    assert_eq!(rows[0].attempts, 1);
+    assert!(sent.is_ok());
+    assert_eq!(
+        fixture
+            .store
+            .load_compose_send(&fixture.account.id, "fixture-reply")
+            .unwrap(),
+        Some(crate::compose::SendLock::Sent)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .thread_messages(&fixture.account.id, &thread)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(fixture.replay().sent, 0);
+
+    fixture.server.writes.lock().unwrap().refuse_append = false;
+    fixture.make_due();
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.replay().sent, 0);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn server_mode_and_disabled_write_back_keep_only_the_local_sent_row() {
+    let mut bridge = crate::AccountConfig::bridge(
+        "c@x",
+        "demo",
+        crate::PasswordSource::Inline("fixture".into()),
+    );
+    bridge.write_back = true;
+    for mode in [
+        crate::SaveSent::Auto,
+        crate::SaveSent::Server,
+        crate::SaveSent::Append,
+    ] {
+        let fixture = sent_fixture();
+        bridge.save_sent = mode;
+        if mode == crate::SaveSent::Append {
+            fixture
+                .store
+                .set_write_back(&fixture.account.id, false)
+                .unwrap();
+        }
+        let thread = record_reply(&fixture, bridge.append_sent());
+        assert_eq!(
+            fixture
+                .store
+                .thread_messages(&fixture.account.id, &thread)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            fixture
+                .store
+                .outbox(&fixture.account.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.replay().sent, 0);
+        assert!(
+            fixture
+                .commands()
+                .iter()
+                .all(|command| !command.contains(" APPEND "))
+        );
+    }
 }

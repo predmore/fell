@@ -33,30 +33,40 @@ impl Store {
         message_id: &MessageId,
         bcc: &[Address],
     ) -> Result<()> {
-        let bcc: Vec<Address> = bcc
-            .iter()
-            .filter(|addr| !addr.email.trim().is_empty())
-            .cloned()
-            .collect();
-        if bcc.is_empty() || message_id.as_str().is_empty() {
-            return Ok(());
-        }
         let tx = immediate_transaction(&self.conn)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT bcc_addrs FROM sent_bcc WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id.as_str(), message_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let recorded = union_addresses(existing.as_deref().unwrap_or(""), &bcc);
-        tx.execute(
-            "INSERT INTO sent_bcc (account_id, message_id, bcc_addrs) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id, message_id) DO UPDATE SET bcc_addrs = excluded.bcc_addrs",
-            params![account_id.as_str(), message_id.as_str(), recorded],
-        )?;
+        record(&tx, account_id, message_id, bcc)?;
         tx.commit()
     }
+}
+
+pub(super) fn record(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &MessageId,
+    bcc: &[Address],
+) -> Result<()> {
+    let bcc: Vec<Address> = bcc
+        .iter()
+        .filter(|addr| !addr.email.trim().is_empty())
+        .cloned()
+        .collect();
+    if bcc.is_empty() || message_id.as_str().is_empty() {
+        return Ok(());
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT bcc_addrs FROM sent_bcc WHERE account_id = ?1 AND message_id = ?2",
+            params![account_id.as_str(), message_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let recorded = union_addresses(existing.as_deref().unwrap_or(""), &bcc);
+    conn.execute(
+        "INSERT INTO sent_bcc (account_id, message_id, bcc_addrs) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, message_id) DO UPDATE SET bcc_addrs = excluded.bcc_addrs",
+        params![account_id.as_str(), message_id.as_str(), recorded],
+    )?;
+    Ok(())
 }
 
 /// Add each message's recorded Bcc, found by its own id or any id that

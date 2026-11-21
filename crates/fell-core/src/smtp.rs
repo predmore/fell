@@ -598,7 +598,7 @@ fn smtp_err(message: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -646,6 +646,30 @@ Bcc: this is body text\r\n"
             &fell_confirm::InteractiveUi::for_fell_app(),
             pending,
         )
+    }
+
+    pub(crate) fn confirm_fixture_delivery(
+        login: &ImapConfig,
+        account: &AccountId,
+        mime: &[u8],
+    ) -> Result<SentMessage> {
+        let (port, captured, join) = serve(Wire::Clear, AfterData::Accept);
+        let mut pending = sample_pending();
+        pending.draft.account_id = account.clone();
+        pending.mime = mime.to_vec();
+        let confirmation = confirm(&pending);
+        let sent = confirm_send(
+            &backend(port, ImapSecurity::Plain).smtp,
+            login,
+            pending,
+            confirmation,
+        );
+        assert_eq!(
+            captured.recv_timeout(Duration::from_secs(5)).unwrap().data,
+            mime
+        );
+        join.join().unwrap();
+        sent
     }
 
     fn backend(port: u16, security: ImapSecurity) -> BridgeBackend {

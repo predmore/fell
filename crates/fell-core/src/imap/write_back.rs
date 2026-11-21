@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 use crate::account::AccountId;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::outbox::{
     self, DropReason, DroppedWrite, OutboxEntry, OutboxKind, Outcome, ReplayReport, Reversed,
     Settled,
@@ -38,9 +39,9 @@ use crate::outbox::{
 };
 use crate::store::{Store, copies::CopyFlags};
 
-use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_synthetic_message_id};
 use super::session::{FlagReply, Placed, WriteError, WriteSession};
+use super::{ImapConfig, listed_mailboxes};
 
 mod labels;
 
@@ -52,23 +53,17 @@ const BACKOFF_SECS: [i64; 5] = [10, 30, 120, 600, 1800];
 /// Send every outbox row that is due. Returns what was sent and dropped.
 /// A connection that fails part way is in [`ReplayReport::interrupted`];
 /// what was settled before it stays settled.
-pub(crate) fn replay(
-    config: &ImapConfig,
-    account_id: &AccountId,
-    store: &Store,
-) -> crate::Result<ReplayReport> {
-    replay_with(config, account_id, store, &|| {})
-}
-
-/// [`replay`], running `before_send` after the pass loaded its rows and
-/// just before it marks a batch sent. Tests change the store there.
 pub(super) fn replay_with(
     config: &ImapConfig,
     account_id: &AccountId,
     store: &Store,
+    append_sent: bool,
     before_send: &dyn Fn(),
 ) -> crate::Result<ReplayReport> {
-    let entries = outbox::unfinished(store, account_id)?;
+    let mut entries = outbox::unfinished(store, account_id)?;
+    if !append_sent {
+        entries.retain(|entry| entry.kind != OutboxKind::AppendSent);
+    }
     let mut report = ReplayReport::default();
     if entries.is_empty() {
         return Ok(report);
@@ -78,7 +73,6 @@ pub(super) fn replay_with(
         report.waiting = entries.len();
         return Ok(report);
     }
-    let mut session = WriteSession::open(config)?;
     let mut pass = Pass {
         store,
         account_id,
@@ -88,17 +82,47 @@ pub(super) fn replay_with(
         held_moves: HashMap::new(),
         unconfirmed_stores: HashMap::new(),
         listing: None,
+        sent_mailbox: None,
+        overrides: &config.folder_overrides,
         selected: None,
         bounds: HashMap::new(),
         before_send,
         report: &mut report,
     };
-    let result = pass.run(&mut session);
+    let result = match WriteSession::open(config) {
+        Ok(mut session) => {
+            let result = pass.run(&mut session);
+            if !matches!(&result, Err(Stop::Connection(_))) {
+                session.logout();
+            }
+            result
+        }
+        Err(err)
+            if entries
+                .iter()
+                .any(|entry| entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now) =>
+        {
+            let note = err.to_string();
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.kind == OutboxKind::AppendSent && entry.retry_unix <= now {
+                    match pass.retry_append(index, &note, false) {
+                        Ok(()) => {}
+                        Err(Stop::Store(error)) => return Err(error),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(Stop::Connection(err))
+        }
+        Err(err) => return Err(err),
+    };
     let settled = pass.settled.iter().filter(|done| **done).count();
-    session.logout();
     match result {
         Ok(()) => {}
         Err(Stop::Store(err)) => return Err(err),
+        Err(Stop::AppendRetry(message) | Stop::AppendRefused(message)) => {
+            return Err(Error::Backend(message));
+        }
         Err(Stop::Connection(err)) => report.interrupted = Some(err.to_string()),
         // Write-back was turned off by another process mid-pass.
         Err(Stop::Stale) => {}
@@ -110,8 +134,17 @@ pub(super) fn replay_with(
 enum Stop {
     Connection(Error),
     Store(Error),
+    AppendRetry(String),
+    AppendRefused(String),
     /// The row is no longer in this write-back generation: send nothing more.
     Stale,
+}
+
+fn append_error(error: WriteError) -> Stop {
+    match error {
+        WriteError::Refused(message) => Stop::AppendRetry(message),
+        WriteError::Connection(error) => Stop::Connection(error),
+    }
 }
 
 enum MoveHold {
@@ -139,6 +172,8 @@ struct Pass<'a> {
     unconfirmed_stores: HashMap<String, HashSet<(u32, u32)>>,
     /// Folder name → raw mailbox name, from LIST when first needed.
     listing: Option<HashMap<String, String>>,
+    sent_mailbox: Option<String>,
+    overrides: &'a [(FolderRole, String)],
     /// The mailbox selected now and its UIDVALIDITY.
     selected: Option<(String, u32)>,
     /// Row id → the target's `(UIDVALIDITY, UIDNEXT)` before its first
@@ -179,6 +214,10 @@ impl Pass<'_> {
                         .insert(entry.message_id.clone(), MoveHold::EarlierMove);
                 }
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
+                OutboxKind::AppendSent if entry.retry_unix <= self.now => {
+                    self.replay_append(session, index)?;
+                }
+                OutboxKind::AppendSent => {}
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
                 OutboxKind::Keyword | OutboxKind::BridgeLabel => {
@@ -189,6 +228,109 @@ impl Pass<'_> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn replay_append(&mut self, session: &mut WriteSession, index: usize) -> Result<(), Stop> {
+        // Serialize recovery and transfer across app processes. Recheck the
+        // row once we have the lock: another pass may already have sent it.
+        let guard = self.store.try_lock_mailbox_operation(".append-sent")?;
+        if guard.is_none() && self.store.db_path().is_some() {
+            return Ok(());
+        }
+        let entry = &self.entries[index];
+        let Some(pending) = outbox::pending_append(self.store, entry)? else {
+            return Ok(());
+        };
+        match self.append(session, entry, pending) {
+            Ok(()) => {
+                if outbox::complete_append(self.store, entry)? {
+                    self.report.sent += 1;
+                    self.settled[index] = true;
+                }
+                Ok(())
+            }
+            Err(Stop::Connection(err)) => {
+                self.retry_append(index, &err.to_string(), false)?;
+                Err(Stop::Connection(err))
+            }
+            Err(Stop::AppendRetry(message)) => self.retry_append(index, &message, false),
+            Err(Stop::AppendRefused(message)) => self.retry_append(index, &message, true),
+            Err(stop) => Err(stop),
+        }
+    }
+
+    fn append(
+        &mut self,
+        session: &mut WriteSession,
+        entry: &OutboxEntry,
+        pending: outbox::PendingAppend,
+    ) -> Result<(), Stop> {
+        let mailbox = if let Some(mailbox) = pending.sent_to {
+            // A lost reply may have followed a successful APPEND. Confirm
+            // an exact match in the original mailbox before sending again.
+            let validity = self.select(session, &mailbox)?.map_err(Stop::AppendRetry)?;
+            let candidates = session
+                .search_message_id(&entry.message_id)
+                .map_err(append_error)?;
+            if !candidates.is_empty() {
+                let headers = session
+                    .uid_fetch_message_ids(&candidates)
+                    .map_err(append_error)?;
+                if headers.iter().any(|(uid, bytes)| {
+                    candidates.contains(uid)
+                        && copy_message_id(&mailbox, validity, *uid, bytes, false).as_str()
+                            == entry.message_id
+                }) {
+                    return Ok(());
+                }
+                if candidates
+                    .iter()
+                    .any(|uid| !headers.iter().any(|(have, _)| have == uid))
+                {
+                    return Err(Stop::AppendRetry("incomplete Sent Message-ID check".into()));
+                }
+            }
+            mailbox
+        } else {
+            self.load_listing(session)?;
+            self.sent_mailbox
+                .clone()
+                .ok_or_else(|| Stop::AppendRetry("no Sent mailbox".into()))?
+        };
+        if !outbox::mark_append_sent(self.store, entry, &mailbox)? {
+            return Err(Stop::Stale);
+        }
+        match session.append_seen(&mailbox, &pending.mime) {
+            Ok(()) => Ok(()),
+            Err(WriteError::Refused(message)) => Err(Stop::AppendRefused(message)),
+            Err(WriteError::Connection(error)) => Err(Stop::Connection(error)),
+        }
+    }
+
+    fn retry_append(&mut self, index: usize, message: &str, refused: bool) -> Result<(), Stop> {
+        let entry = &self.entries[index];
+        if entry.attempts + 1 >= MAX_ATTEMPTS {
+            return self.drop_row(index, DropReason::Refused, message);
+        }
+        let wait = BACKOFF_SECS[entry.attempts as usize];
+        match outbox::settle(
+            self.store,
+            self.account_id,
+            entry,
+            None,
+            None,
+            Outcome::Retry {
+                error: message,
+                retry_unix: self.now + wait,
+                counts: true,
+                refused,
+            },
+        )? {
+            Settled::Recorded => self.report.sent_append_delayed |= entry.attempts == 0,
+            Settled::Stale => return Err(Stop::Stale),
+            Settled::Retired | Settled::Recovering => {}
         }
         Ok(())
     }
@@ -672,8 +814,16 @@ impl Pass<'_> {
         if let Some(raw) = queued {
             return Ok(Some(raw.to_string()));
         }
+        self.load_listing(session)?;
+        Ok(self.listed(folder))
+    }
+
+    fn load_listing(&mut self, session: &mut WriteSession) -> Result<(), Stop> {
         if self.listing.is_none() {
             let listed = session.list().map_err(Stop::Connection)?;
+            self.sent_mailbox = FolderRoles::detect(&listed_mailboxes(&listed), self.overrides)
+                .get(FolderRole::Sent)
+                .map(|folder| folder.raw.clone());
             self.listing = Some(
                 listed
                     .into_iter()
@@ -681,7 +831,7 @@ impl Pass<'_> {
                     .collect(),
             );
         }
-        Ok(self.listed(folder))
+        Ok(())
     }
 
     fn listed(&self, folder: &str) -> Option<String> {

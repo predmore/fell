@@ -34,14 +34,16 @@ pub use persist::{
     DraftSummary, StoredCompose, ensure_draft_folder, mailbox_db_path, open_owned_draft,
     remember_compose_store, remembered_store_path, stored_compose_account, stored_compose_owner,
 };
-pub(crate) use persist::{confirm_synced_sends, mark_discarded, undo_discard};
+pub(crate) use persist::{
+    confirm_synced_sends, mark_discarded, record_confirmed_send, undo_discard,
+};
 pub use reply::{
     ForwardSummary, MAX_REFERENCES, ReplyKind, ReplyParts, ReplyStart, build_references,
     forward_subject, own_addresses, reply_recipients, reply_subject, start_reply,
     start_reply_in_zone,
 };
 pub use session::{
-    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentBcc, Snapshot,
+    AddressView, AttachmentView, DraftSession, HunkView, ReplyContext, SendLock, SentCopy, Snapshot,
 };
 pub use workspace::{
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_FILES, control_dir, draft_file_is_symlink, draft_folder,

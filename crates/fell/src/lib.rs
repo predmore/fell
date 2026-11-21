@@ -352,8 +352,9 @@ mod tests {
                     assert_eq!(press, 0);
                     let counting = backend.clone();
                     crate::compose_ui::transmit_from_hub(&hub, "hub", prepared, move |_| {
-                        Ok(Box::new(counting))
+                        Ok((Box::new(counting), false))
                     })
+                    .0
                     .unwrap();
                 }
                 Err(err) => {
@@ -427,11 +428,15 @@ mod tests {
         hub.note_shown(&other);
         let _ = hub.take_closed();
         let counting = backend.clone();
-        let outcome = crate::compose_ui::transmit_from_hub(&hub, &sent, prepared, |account| {
-            asked.lock().unwrap().push(account.clone());
-            Ok(Box::new(counting))
-        });
+        let (outcome, copy) =
+            crate::compose_ui::transmit_from_hub(&hub, &sent, prepared, |account| {
+                asked.lock().unwrap().push(account.clone());
+                Ok((Box::new(counting), false))
+            });
         assert!(outcome.is_ok());
+        let (_, message) = copy.unwrap().unwrap();
+        assert_eq!(message.headers.subject, "Lunch");
+        assert!(message.folders.iter().any(|folder| folder == "Sent"));
         let end = crate::compose_ui::finish_send(&hub, &sent, &other, true, &outcome);
         assert_eq!(end.status, None, "the draft on screen keeps its status");
         assert!(!end.close, "the draft on screen is not closed");
@@ -490,8 +495,9 @@ mod tests {
         let counting = backend.clone();
         crate::compose_ui::transmit_from_hub(hub, id, prepared, move |account| {
             asked.lock().unwrap().push(account.clone());
-            Ok(Box::new(counting))
+            Ok((Box::new(counting), false))
         })
+        .0
     }
 
     #[test]

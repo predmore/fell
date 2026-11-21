@@ -135,6 +135,28 @@ pub(crate) fn undo_discard(
     Ok((restored, confirmed))
 }
 
+/// Commit SMTP confirmation alongside the local Sent copy and any APPEND.
+pub(crate) fn record_confirmed_send(
+    conn: &rusqlite::Connection,
+    account: &AccountId,
+    draft_id: &str,
+    message_id: &crate::MessageId,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE compose_send SET state = ?4, updated_unix = ?5
+         WHERE account_id = ?1 AND draft_id = ?2 AND message_id = ?3 AND state = ?6",
+        params![
+            account.as_str(),
+            draft_id,
+            message_id.as_str(),
+            SEND_SENT,
+            now_unix(),
+            SEND_MAYBE_SENT
+        ],
+    )?;
+    Ok(())
+}
+
 /// Confirm only the exact id observed on an IMAP copy in the account's
 /// listed Sent mailbox. Stored conversation rows can merge other copies by
 /// body fingerprint and can gain folders through local moves.
@@ -404,6 +426,15 @@ impl Store {
     /// the durable, possibly-sent record or letting callers lock two inodes.
     pub(crate) fn lock_compose_send(&self, id: &str) -> Result<Option<File>> {
         workspace::validate_id(id).map_err(crate::Error::Invalid)?;
+        let guard = self.try_lock_mailbox_operation(id)?;
+        if guard.is_none() && self.db_path().is_some() {
+            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
+        }
+        Ok(guard)
+    }
+
+    /// Cross-process lock. In-memory stores have no second connection.
+    pub(crate) fn try_lock_mailbox_operation(&self, name: &str) -> Result<Option<File>> {
         let Some(db) = self.db_path() else {
             return Ok(None);
         };
@@ -419,9 +450,9 @@ impl Store {
             .truncate(false)
             .write(true)
             .mode(0o600)
-            .open(directory.join(id))?;
+            .open(directory.join(name))?;
         if !FileExt::try_lock_exclusive(&file)? {
-            return Err(crate::Error::Action(SEND_IN_PROGRESS.into()));
+            return Ok(None);
         }
         Ok(Some(file))
     }

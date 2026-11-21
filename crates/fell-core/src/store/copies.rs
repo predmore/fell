@@ -228,6 +228,12 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
             copy.folder
         ],
     )?;
+    super::sent::copy_arrived(
+        conn,
+        &message.account_id,
+        &stored.canonical_id,
+        &copy.folder,
+    )?;
     if message.folders.is_empty() {
         super::views::retire_restore(
             conn,
@@ -555,6 +561,7 @@ pub(super) fn link(
             row,
             copy.folder
         ])?;
+    super::sent::copy_arrived(conn, account_id, &row, &copy.folder)?;
     if inserted != 0 && super::views::has_view(conn, account_id, &copy.mailbox)? {
         super::views::retire_restore(conn, account_id, &row, &copy.folder)?;
         super::views::refresh_message(conn, account_id, &row)?;
@@ -637,6 +644,10 @@ pub(super) const SWEEP_STALE: &str = "SELECT m.message_id FROM messages m
            SELECT 1 FROM message_copies c INDEXED BY idx_message_copies_row
            WHERE c.account_id = m.account_id AND c.message_id = m.message_id
              AND c.mailbox = ?3 AND c.uidvalidity = ?4
+       )
+       AND NOT EXISTS (
+           SELECT 1 FROM local_sent s
+           WHERE s.account_id = m.account_id AND s.message_id = m.message_id AND s.folder = ?2
        )";
 
 /// Rows that list this folder but have no copy in the mailbox. Only for a
@@ -804,7 +815,10 @@ fn settle_one(
     let still_here: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM message_copies
-             WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3 LIMIT 1",
+             WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3
+             UNION ALL
+             SELECT 1 FROM local_sent WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3
+             LIMIT 1",
             params![account_id.as_str(), stored.canonical_id, folder],
             |row| row.get(0),
         )

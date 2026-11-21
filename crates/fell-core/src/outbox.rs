@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     -- before replaying the replacement, without sending the old value again.
     flag_superseded INTEGER NOT NULL DEFAULT 0,
     -- Extra copies bound from an early keyword edit replay with that edit.
-    keyword_parent INTEGER
+    keyword_parent INTEGER,
+    append_mime BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -143,6 +144,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "flag_value", "INTEGER"),
     ("server_outbox", "flag_modseq", "BLOB"),
     ("server_outbox", "flag_base", "INTEGER"),
+    ("server_outbox", "append_mime", "BLOB"),
     (
         "server_outbox",
         "flag_superseded",
@@ -160,6 +162,7 @@ pub enum OutboxKind {
     /// Move one copy from `source` to `target` (archive, move, delete to
     /// Trash, spam, and not spam).
     Move,
+    AppendSent,
     Seen,
     Flagged,
     Keyword,
@@ -170,6 +173,7 @@ impl OutboxKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Move => "move",
+            Self::AppendSent => "append_sent",
             Self::Seen => "seen",
             Self::Flagged => "flagged",
             Self::Keyword => "keyword",
@@ -180,6 +184,7 @@ impl OutboxKind {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "move" => Ok(Self::Move),
+            "append_sent" => Ok(Self::AppendSent),
             "seen" => Ok(Self::Seen),
             "flagged" => Ok(Self::Flagged),
             "keyword" => Ok(Self::Keyword),
@@ -190,7 +195,7 @@ impl OutboxKind {
 
     pub(crate) fn flag_name(self) -> Option<&'static str> {
         match self {
-            Self::Move | Self::Keyword | Self::BridgeLabel => None,
+            Self::Move | Self::AppendSent | Self::Keyword | Self::BridgeLabel => None,
             Self::Seen => Some("\\Seen"),
             Self::Flagged => Some("\\Flagged"),
         }
@@ -280,6 +285,8 @@ pub struct ReplayReport {
     /// A previous flag write reached the retry limit without confirmation.
     /// The newer edit still waits for that confirmation.
     pub flag_recovery_delayed: bool,
+    /// An APPEND failed and the Sent copy is still queued.
+    pub sent_append_delayed: bool,
     /// Replay applied a conflicting server value to the local store.
     pub flags_changed: bool,
     /// The connection failed part way; the rest waits for the next pass.
@@ -422,6 +429,85 @@ fn enabled(conn: &Connection, account_id: &AccountId) -> Result<bool> {
         )
         .optional()?;
     Ok(enabled.is_some_and(|value| value != 0))
+}
+
+/// Queue the Bcc-free SMTP bytes in the same transaction as the local row.
+pub(crate) fn queue_append(
+    conn: &Connection,
+    account: &AccountId,
+    id: &crate::MessageId,
+    folder: &str,
+    mime: &[u8],
+) -> Result<()> {
+    if enabled(conn, account)? {
+        conn.execute(
+            "INSERT INTO server_outbox
+                 (account_id, kind, state, message_id, source_folder, target_folder,
+                  created_unix, generation, append_mime)
+             SELECT ?1, 'append_sent', 'pending', ?2, '', ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (SELECT 1 FROM server_outbox
+                                WHERE account_id = ?1 AND kind = 'append_sent'
+                                  AND message_id = ?2 AND generation = ?5)",
+            params![
+                account.as_str(),
+                id.as_str(),
+                folder,
+                now_unix(),
+                generation(conn, account)?,
+                mime
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) struct PendingAppend {
+    pub mime: Vec<u8>,
+    /// The exact mailbox used if a command may already have reached it.
+    pub sent_to: Option<String>,
+}
+
+pub(crate) fn pending_append(store: &Store, entry: &OutboxEntry) -> Result<Option<PendingAppend>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT o.append_mime, CASE WHEN o.sent THEN o.target_mailbox END
+         FROM server_outbox o JOIN write_back_accounts a USING (account_id)
+         WHERE o.id = ?1 AND o.state = 'pending' AND a.enabled
+           AND o.generation = a.generation AND o.retry_unix <= ?2",
+            params![entry.id, now_unix()],
+            |row| {
+                Ok(PendingAppend {
+                    mime: row.get(0)?,
+                    sent_to: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+pub(crate) fn mark_append_sent(store: &Store, entry: &OutboxEntry, mailbox: &str) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = tx.execute(
+        "UPDATE server_outbox SET sent = 1, target_mailbox = ?2
+         WHERE id = ?1 AND state = 'pending' AND generation IN
+             (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)",
+        params![entry.id, mailbox],
+    )?;
+    tx.commit()?;
+    Ok(changed != 0)
+}
+
+pub(crate) fn complete_append(store: &Store, entry: &OutboxEntry) -> Result<bool> {
+    let tx = crate::store::immediate_transaction(store.connection())?;
+    let changed = tx.execute(
+        "UPDATE server_outbox
+         SET state = 'done', append_mime = NULL, error = '', settled_unix = ?2
+         WHERE id = ?1 AND state = 'pending'",
+        params![entry.id, now_unix()],
+    )?;
+    tx.commit()?;
+    Ok(changed != 0)
 }
 
 /// Queue the server side of moving `messages` from `from` to `to`, in the
@@ -861,17 +947,18 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
 
 /// Whether any row is due now, without resolving the password or opening a
 /// connection when none is.
-pub(crate) fn any_due(store: &Store, account_id: &AccountId) -> Result<bool> {
+pub(crate) fn any_due(store: &Store, account_id: &AccountId, append_sent: bool) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
     ensure_schema(&tx)?;
     let due: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending' AND retry_unix <= ?2
+               AND (?3 OR kind != 'append_sent')
                AND generation = (SELECT COALESCE(MAX(generation), 0)
                                  FROM write_back_accounts WHERE account_id = ?1)
              LIMIT 1",
-            params![account_id.as_str(), now_unix()],
+            params![account_id.as_str(), now_unix(), append_sent],
             |row| row.get(0),
         )
         .optional()?;
@@ -995,7 +1082,7 @@ pub(crate) fn report_for_status(
             .dropped
             .retain(|dropped| dropped.reason != DropReason::NoMove);
     }
-    if report.dropped.is_empty() && !report.flag_recovery_delayed {
+    if report.dropped.is_empty() && !report.flag_recovery_delayed && !report.sent_append_delayed {
         report.dropped = take_abandoned(store, account_id)?;
     }
     Ok(report)
@@ -1124,10 +1211,14 @@ pub(crate) fn settle(
         tx.commit()?;
         return Ok(Settled::Stale);
     }
-    let recovering = entry.kind != OutboxKind::Move
+    if entry.kind == OutboxKind::AppendSent && live.is_none() {
+        tx.commit()?;
+        return Ok(Settled::Retired);
+    }
+    let recovering = entry.kind.flag_name().is_some()
         && matches!(live, Some((_, true, true)))
         && matches!(outcome, Outcome::Retry { refused: false, .. });
-    if entry.kind != OutboxKind::Move
+    if entry.kind.flag_name().is_some()
         && live.is_none_or(|(_, superseded, _)| superseded)
         && !recovering
     {
@@ -1169,7 +1260,7 @@ pub(crate) fn settle(
         }
         Outcome::Dropped { error } => {
             tx.execute(
-                "UPDATE server_outbox SET state = 'dropped', error = ?2, settled_unix = ?3
+                "UPDATE server_outbox SET state = 'dropped', append_mime = NULL, error = ?2, settled_unix = ?3
                  WHERE id = ?1",
                 params![entry.id, error, now],
             )?;

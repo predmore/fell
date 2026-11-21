@@ -106,6 +106,20 @@ pub(super) fn keywords(flags: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Parse the exact outgoing MIME without inventing a server copy or UID.
+pub(crate) fn local_sent_message(account: &AccountId, folder: &str, mime: &[u8]) -> Message {
+    let mut message = parse_message(
+        account,
+        (folder, folder),
+        (0, 0),
+        &["\\Seen".into()],
+        mime,
+        false,
+    );
+    message.remote_id = RemoteId(String::new());
+    message
+}
+
 #[cfg(test)]
 pub(crate) fn to_message(
     account_id: &AccountId,

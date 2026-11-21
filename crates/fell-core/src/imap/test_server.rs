@@ -241,6 +241,10 @@ fn handle(
                     "LOGIN literal"
                 };
                 guard.commands.push(kind.into());
+            } else if verb.eq_ignore_ascii_case("APPEND") {
+                guard
+                    .commands
+                    .push(format!("{tag} APPEND {}", mailbox_name(&rest)));
             } else {
                 guard.commands.push(line.clone());
             }
@@ -250,6 +254,10 @@ fn handle(
             "SELECT" => selected_write = true,
             "EXAMINE" => selected_write = false,
             _ => {}
+        }
+        if authed && verb_upper == "APPEND" {
+            writes::append(&tag, &rest, literals, state, writes, &mut write);
+            continue;
         }
         if authed
             && writes::handle(

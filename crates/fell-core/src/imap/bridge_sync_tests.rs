@@ -583,7 +583,7 @@ fn bridge_views_are_not_move_targets_and_actions_from_them_move_real_copies() {
             assert!(!["All Mail", "Starred", "Labels/A"].contains(&entry.source_folder.as_str()));
         }
     }
-    super::replay_outbox(&backend.imap, &acct.id, &store).unwrap();
+    super::replay_outbox(&backend.imap, &acct.id, &store, false).unwrap();
     let commands = commands(&server);
     let moves: Vec<_> = commands
         .iter()

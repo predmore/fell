@@ -22,6 +22,7 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse: Option<String>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
+    pub refuse_append: bool,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
     /// Apply the next command with this verb (`"MOVE"`), then drop the
@@ -155,6 +156,53 @@ fn selected(state: &TestState) -> Option<String> {
         let index = upper.find(" SELECT ")?;
         Some(mailbox_name(&command[index + " SELECT ".len()..]))
     })
+}
+
+pub(super) fn append(
+    tag: &str,
+    rest: &str,
+    mut literals: Vec<Vec<u8>>,
+    state: &Mutex<TestState>,
+    writes: &Mutex<WriteFixture>,
+    out: &mut Counted,
+) {
+    let mut state = state.lock().expect("state");
+    let mut writes = writes.lock().expect("writes");
+    let name = mailbox_name(rest);
+    let mailbox = state.mailboxes.iter_mut().find(|item| item.name == name);
+    let reply = match (writes.refuse_append, mailbox, literals.pop()) {
+        (true, _, _) => format!("{tag} NO Sent storage temporarily unavailable\r\n"),
+        (false, Some(mailbox), Some(raw)) => {
+            let uid = mailbox
+                .messages
+                .iter()
+                .map(|message| message.uid)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let flags = if rest.contains(" (\\Seen) ") {
+                vec!["\\Seen".into()]
+            } else {
+                Vec::new()
+            };
+            mailbox.messages.push(FixtureMessage {
+                uid,
+                flags,
+                modseq: 1,
+                raw,
+                body_form: super::BodyForm::Literal,
+            });
+            if writes.lose_reply_to == Some("APPEND") {
+                writes.lose_reply_to = None;
+                let _ = out.stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            format!("{tag} OK APPEND done\r\n")
+        }
+        _ => format!("{tag} BAD invalid APPEND\r\n"),
+    };
+    let _ = out.write_all(reply.as_bytes());
+    let _ = out.flush();
 }
 
 fn select(tag: &str, rest: &str, state: &TestState, nomodseq: bool) -> String {

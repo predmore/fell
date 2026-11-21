@@ -18,6 +18,7 @@
 //! # smtp_port = 1025            # Bridge's SMTP port; 587 or 465 for imap
 //! # smtp_security = "starttls"  # "plain" only for a loopback address
 //! # sent_folder = "Sent Items"  # only for a server that does not mark its folders
+//! # save_sent = "auto"        # "append" or "server" overrides provider detection
 //! # write_back = true           # send moves and flag changes to the server (off by default)
 //! # notifications = "on"       # "on", "private", or "off"
 //! ```
@@ -28,8 +29,14 @@
 //! `archive_folder`, `all_mail_folder`, and `flagged_folder` name the folder
 //! for that role and win over both.
 //!
-//! With `write_back = true`, Fell queues server moves and read and star
-//! changes for the sync thread (see [`crate::outbox`]).
+//! After SMTP confirms a send, Fell immediately saves a local Sent copy.
+//! `save_sent = "auto"` lets Proton Bridge and Gmail file their own copies
+//! and selects `"append"` elsewhere. Set `"server"` to let your provider
+//! file the copy, or `"append"` to have Fell file it with IMAP.
+//!
+//! With `write_back = true`, Fell queues Sent appends, moves, and read and star
+//! changes for the sync thread (see [`crate::outbox`]). With write-back off,
+//! append mode saves the local Sent copy only.
 //!
 //! Sending uses only this file's username and password source, never anything in a
 //! draft folder. `smtp_security = "starttls"` (the default) refuses a server
@@ -68,6 +75,25 @@ impl fmt::Debug for PasswordSource {
     }
 }
 
+/// How a confirmed SMTP send is saved to the server's Sent mailbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SaveSent {
+    #[default]
+    Auto,
+    Append,
+    Server,
+}
+
+impl SaveSent {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Append => "append",
+            Self::Server => "server",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountConfig {
     pub id: String,
@@ -85,7 +111,8 @@ pub struct AccountConfig {
     pub smtp_security: Option<ImapSecurity>,
     /// `sent_folder = "..."` and the like, in [`FolderRole::ALL`] order.
     pub folders: Vec<(FolderRole, String)>,
-    /// `write_back = true` sends moves and read and star changes to the server.
+    pub save_sent: SaveSent,
+    /// Allow server moves, flag changes and Sent appends.
     pub write_back: bool,
     pub notifications: NotificationMode,
 }
@@ -150,6 +177,7 @@ impl AccountConfig {
             smtp_port: None,
             smtp_security: None,
             folders: Vec::new(),
+            save_sent: SaveSent::Auto,
             write_back: false,
             notifications: NotificationMode::On,
         }
@@ -270,6 +298,16 @@ impl AccountConfig {
                 folders.push((role, name.trim().to_string()));
             }
         }
+        let save_sent = match get("save_sent")
+            .map(|value| value.text("save_sent"))
+            .transpose()?
+            .as_deref()
+        {
+            None | Some("auto") => SaveSent::Auto,
+            Some("append") => SaveSent::Append,
+            Some("server") => SaveSent::Server,
+            Some(_) => return Err(invalid("save_sent must be auto, append or server")),
+        };
         let write_back = get("write_back")
             .map(|value| value.flag("write_back"))
             .transpose()?
@@ -294,6 +332,7 @@ impl AccountConfig {
             smtp_port,
             smtp_security,
             folders,
+            save_sent,
             write_back,
             notifications,
         };
@@ -385,6 +424,9 @@ impl AccountConfig {
                 push(&mut out, key, name);
             }
         }
+        if self.save_sent != SaveSent::Auto {
+            push(&mut out, "save_sent", self.save_sent.name());
+        }
         if self.write_back {
             out.push_str("write_back = true\n");
         }
@@ -460,17 +502,42 @@ impl AccountConfig {
         })
     }
 
+    /// Whether a newly sent message should be queued for IMAP APPEND.
+    pub fn append_sent(&self) -> bool {
+        self.write_back
+            && match self.save_sent {
+                SaveSent::Append => true,
+                SaveSent::Server => false,
+                SaveSent::Auto => {
+                    let gmail = |host: &str| {
+                        matches!(
+                            host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+                            "imap.gmail.com"
+                                | "imap.googlemail.com"
+                                | "smtp.gmail.com"
+                                | "smtp.googlemail.com"
+                        )
+                    };
+                    self.backend != BackendKind::Bridge
+                        && !gmail(&self.host)
+                        && !self.smtp_host.as_deref().is_some_and(gmail)
+                }
+            }
+    }
+
     /// Send the writes queued for this account on a separate
     /// `SELECT` session. Run it on the sync thread; it connects only when a
     /// row is due. Sends nothing while `write_back` is off, but still
     /// reports, once, a copy an earlier build of write-back left half done.
     pub fn replay_outbox(&self, store: &crate::Store) -> Result<crate::ReplayReport> {
         let account_id = AccountId(self.id.clone());
-        let report = if !self.write_back || !crate::outbox::any_due(store, &account_id)? {
-            crate::ReplayReport::default()
-        } else {
-            crate::imap::replay_outbox(&self.imap_config()?, &account_id, store)?
-        };
+        let append_sent = self.append_sent();
+        let report =
+            if !self.write_back || !crate::outbox::any_due(store, &account_id, append_sent)? {
+                crate::ReplayReport::default()
+            } else {
+                crate::imap::replay_outbox(&self.imap_config()?, &account_id, store, append_sent)?
+            };
         crate::outbox::report_for_status(store, &account_id, report)
     }
 
@@ -833,6 +900,29 @@ mod tests {
             assert!(!config.render().contains("notification_content"));
         }
         assert!(AccountConfig::parse(&format!("{base}notifications = \"sometimes\"")).is_err());
+    }
+
+    #[test]
+    fn save_sent_modes_parse_and_choose_by_provider() {
+        let base = "backend = \"imap\"\nemail = \"demo@example.com\"\npassword = \"fixture\"\nwrite_back = true\n";
+        let parse =
+            |host, mode| AccountConfig::parse(&format!("{base}host = \"{host}\"\n{mode}")).unwrap();
+        assert!(parse("imap.example.com", "").append_sent());
+        assert!(!parse("IMAP.GMAIL.COM.", "save_sent = \"auto\"\n").append_sent());
+        assert!(!parse("imap.googlemail.com", "").append_sent());
+        assert!(!parse("imap.example.com", "smtp_host = \"smtp.gmail.com\"\n").append_sent());
+        let append = parse("imap.gmail.com", "save_sent = \"append\"\n");
+        let server = parse("imap.example.com", "save_sent = \"server\"\n");
+        assert!(append.append_sent());
+        assert!(!server.append_sent());
+        assert_eq!(AccountConfig::parse(&append.render()).unwrap(), append);
+        assert_eq!(AccountConfig::parse(&server.render()).unwrap(), server);
+        assert!(
+            AccountConfig::parse(&format!(
+                "{base}host = \"imap.example.com\"\nsave_sent = \"yes\""
+            ))
+            .is_err()
+        );
     }
 
     #[test]

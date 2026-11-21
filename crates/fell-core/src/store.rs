@@ -31,6 +31,7 @@ pub(crate) mod intents;
 pub(crate) mod keywords;
 mod part_cache;
 mod roles;
+mod sent;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
 mod summaries;
@@ -573,6 +574,7 @@ impl Store {
         summaries::ensure_thread_summaries(&conn)?;
         ensure_agent_grant_revision(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
+        conn.execute_batch(sent::LOCAL_SENT_TABLE)?;
         conn.execute_batch(roles::ROLES_TABLE)?;
         conn.execute_batch(intents::INTENT_SCHEMA)?;
         let outbox_tx =
@@ -850,7 +852,8 @@ impl Store {
         }
         let repaired = if let Some(found) = &delta.roles {
             roles::replace(&tx, account_id, found)?;
-            sent_echo_repair::on_listing(&tx, account_id, found)?
+            let sent_changed = sent::on_listing(&tx, account_id, found)?;
+            sent_echo_repair::on_listing(&tx, account_id, found)? || sent_changed
         } else {
             false
         };
@@ -2858,7 +2861,7 @@ fn write_kept(
     if alias {
         remember_alias(conn, message, &stored.canonical_id)?;
     }
-    let remote_id = if alias && !stored.remote_id.is_empty() {
+    let remote_id = if (alias || message.remote_id.0.is_empty()) && !stored.remote_id.is_empty() {
         stored.remote_id.clone()
     } else {
         message.remote_id.0.clone()
@@ -3263,6 +3266,12 @@ fn absorb_duplicate(
         message.account_id.as_str(),
         &old_terms,
         &HashSet::new(),
+    )?;
+    sent::repoint(
+        conn,
+        &message.account_id,
+        &doomed.canonical_id,
+        &keeper.canonical_id,
     )?;
     conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND message_id = ?2",

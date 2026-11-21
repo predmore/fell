@@ -1007,19 +1007,32 @@ impl ComposeView {
         let hub = self.hub.clone();
         cx.spawn(async move |this, cx| {
             let sent_id = id.clone();
-            let outcome = cx
+            let (outcome, copy) = cx
                 .background_executor()
                 .spawn({
                     let hub = hub.clone();
                     async move { transmit_from_hub(&hub, &id, prepared, account_backend) }
                 })
                 .await;
+            let copy_saved = copy.as_ref().map(Result::is_ok);
+            if let Some(Ok((thread, message))) = copy
+                && let Ok(Some(ready)) =
+                    cx.update(|cx| crate::view::present_sent_copy(cx, thread, message))
+            {
+                // Give the inbox its first paint before revealing it. A
+                // compositor may withhold frames from an occluded inbox.
+                let occluded = cx.background_executor().timer(Duration::from_millis(120));
+                let _ = futures::future::select(ready, occluded).await;
+            }
             let current = cx
                 .update_global::<SendAttempts, _>(|attempts, _| {
                     attempts.finish(&sent_id, attempt, outcome.as_ref().err().cloned())
                 })
                 .unwrap_or(false);
             if !current {
+                if let Some(saved) = copy_saved {
+                    let _ = cx.update(|cx| crate::view::finish_sent_copy(cx, saved));
+                }
                 return;
             }
             let shown = this.update(cx, |this, cx| {
@@ -1051,6 +1064,9 @@ impl ComposeView {
                     &sent_id,
                     send_failure_line(&hub, &sent_id, &outcome).as_deref(),
                 );
+            }
+            if let Some(saved) = copy_saved {
+                let _ = cx.update(|cx| crate::view::finish_sent_copy(cx, saved));
             }
         })
         .detach();
@@ -2334,13 +2350,11 @@ pub fn send_from_editor(
     session: &mut fell_core::compose::DraftSession,
     backend: &dyn MailBackend,
 ) -> Result<fell_core::SentMessage, SendFailure> {
-    let mut prepared = prepare_from_editor(session)?;
-    let sent_bcc = prepared.sent_bcc.take();
+    let prepared = prepare_from_editor(session)?;
     // This call holds the session throughout, so the claim cannot be lost.
-    let result = prepared.transmit_checked(backend, || true);
+    let result = prepared.transmit_checked(backend, false, || true, |_| {});
     log_send_result(&result);
     session.end_send(lock_after(&result));
-    remember_bcc(sent_bcc, &result);
     result
 }
 
@@ -2350,8 +2364,7 @@ pub struct PreparedSend {
     account: fell_core::AccountId,
     outgoing: fell_core::compose::Outgoing,
     files: Vec<fell_core::SubmittedFile>,
-    /// Recorded after the server has, or may have, the message.
-    sent_bcc: Option<fell_core::compose::SentBcc>,
+    sent_copy: Option<fell_core::compose::SentCopy>,
 }
 
 /// Run the editor's send checks, read the attachments, and claim the draft
@@ -2373,7 +2386,7 @@ pub fn prepare_from_editor(
             inline: file.inline,
         })
         .collect();
-    let sent_bcc = session.sent_bcc(&outgoing);
+    let sent_copy = session.sent_copy(&outgoing);
     if let Err(err) = session.begin_send(&outgoing.message_id) {
         // A lock only the mailbox knew of stays a lock; anything else (the
         // claim could not be recorded) sent nothing.
@@ -2386,16 +2399,24 @@ pub fn prepare_from_editor(
         account: session.account_id().clone(),
         outgoing,
         files,
-        sent_bcc,
+        sent_copy,
     })
 }
 
 /// The backend for a send from the window: the demo mailbox, or the account
 /// file's login and SMTP settings for this account id. Resolves the account
 /// password, so call it off the UI thread.
-fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure> {
+type SendBackend = (Box<dyn MailBackend + Send>, bool);
+type StoredSentCopy = fell_core::Result<(fell_core::ThreadId, fell_core::Message)>;
+
+fn account_backend(account: &AccountId) -> Result<SendBackend, SendFailure> {
     let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
-    fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)
+    let append = config
+        .as_ref()
+        .is_some_and(fell_core::AccountConfig::append_sent);
+    let backend =
+        fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)?;
+    Ok((backend, append))
 }
 
 /// Transmit a send [`prepare_from_editor`] claimed and record how it ended on
@@ -2403,23 +2424,30 @@ fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, S
 pub(crate) fn transmit_from_hub(
     hub: &DraftHub,
     id: &str,
-    mut prepared: PreparedSend,
-    backend: impl FnOnce(&AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure>,
-) -> Result<fell_core::SentMessage, SendFailure> {
-    let sent_bcc = prepared.sent_bcc.take();
+    prepared: PreparedSend,
+    backend: impl FnOnce(&AccountId) -> Result<SendBackend, SendFailure>,
+) -> (
+    Result<fell_core::SentMessage, SendFailure>,
+    Option<StoredSentCopy>,
+) {
     // While the lock is held every edit path is refused, so the prepared
     // message is still the draft. Only a send that lost its lock stops.
-    let result = backend(&prepared.account).and_then(|backend| {
-        prepared.transmit_checked(backend.as_ref(), || {
-            hub.with_session(id, |session| session.send_lock())
-                .flatten()
-                == Some(SendLock::InFlight)
-        })
+    let mut copy = None;
+    let result = backend(&prepared.account).and_then(|(backend, append)| {
+        prepared.transmit_checked(
+            backend.as_ref(),
+            append,
+            || {
+                hub.with_session(id, |session| session.send_lock())
+                    .flatten()
+                    == Some(SendLock::InFlight)
+            },
+            |stored| copy = Some(stored),
+        )
     });
     log_send_result(&result);
     hub.with_session(id, |session| session.end_send(lock_after(&result)));
-    remember_bcc(sent_bcc, &result);
-    result
+    (result, copy)
 }
 
 fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
@@ -2439,22 +2467,13 @@ fn log_send_result(result: &Result<fell_core::SentMessage, SendFailure>) {
 /// shows it once it syncs. A message that was not sent leaves no record.
 /// The write runs on its own thread with a few retries: the mail already
 /// went out, so a busy mailbox must neither hold up the send nor lose this.
-fn remember_bcc(
-    sent_bcc: Option<fell_core::compose::SentBcc>,
-    result: &Result<fell_core::SentMessage, SendFailure>,
-) {
-    if !matches!(result, Ok(_) | Err(SendFailure::MaybeSent(_))) {
-        return;
-    }
-    let Some(record) = sent_bcc else {
-        return;
-    };
+fn remember_bcc(record: fell_core::compose::SentCopy) {
     std::thread::spawn(move || {
         for attempt in 0..4 {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
             }
-            if record.save().is_ok() {
+            if record.remember_bcc().is_ok() {
                 return;
             }
         }
@@ -2469,7 +2488,9 @@ impl PreparedSend {
     fn transmit_checked(
         self,
         backend: &dyn MailBackend,
+        append: bool,
         still_claimed: impl FnOnce() -> bool,
+        saved: impl FnOnce(StoredSentCopy),
     ) -> Result<fell_core::SentMessage, SendFailure> {
         fell_core::diagnostic!(DEBUG, "Preparing SMTP transmission");
         let pending = backend
@@ -2481,9 +2502,25 @@ impl PreparedSend {
             ));
         }
         let confirm = confirmation_from_ui(&pending);
-        backend
+        let sent_copy = self.sent_copy.map(|record| (record, pending.mime.clone()));
+        let result = backend
             .confirm_send(pending, confirm)
-            .map_err(SendFailure::from_core)
+            .map_err(SendFailure::from_core);
+        if let Some((record, mime)) = sent_copy {
+            match &result {
+                Ok(_) => {
+                    let stored = record.save(&mime, append);
+                    if let Err(err) = &stored {
+                        eprintln!("fell: could not save the local Sent copy: {err}");
+                        remember_bcc(record);
+                    }
+                    saved(stored);
+                }
+                Err(SendFailure::MaybeSent(_)) => remember_bcc(record),
+                Err(_) => {}
+            }
+        }
+        result
     }
 }
 
