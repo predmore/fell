@@ -475,8 +475,8 @@ pub fn draft_row_id(id: &str) -> String {
     format!("draft:{id}")
 }
 
-pub fn is_draft_row_id(id: &str) -> bool {
-    id.starts_with("draft:")
+pub fn draft_id_from_row(id: &str) -> Option<&str> {
+    id.strip_prefix("draft:")
 }
 
 /// What an original no longer in the mailbox reads as, after "In reply

@@ -113,6 +113,78 @@ impl Store {
         )
     }
 
+    /// Toggle the flag across a marked selection, including threads outside
+    /// the UI's loaded page. The decision and write use the same snapshot.
+    pub fn toggle_selected_flags(
+        &self,
+        account: &AccountId,
+        ids: &[String],
+        source: crate::store::ListSource<'_>,
+        star: bool,
+    ) -> Result<(FlagChange, usize)> {
+        use crate::store::ListSource;
+
+        self.require_account(account)?;
+        let tx = crate::store::immediate_transaction(self.connection())?;
+        super::ensure_action_schema(&tx)?;
+        let labels = match source {
+            ListSource::Label(_) => self.thread_labels(account, ids)?,
+            ListSource::Folder(_) => Default::default(),
+        };
+        let folder = match source {
+            ListSource::Folder(folder) => folder,
+            ListSource::Label(_) => "",
+        };
+        let mut selected = Vec::new();
+        for id in ids {
+            let thread = ThreadId(id.clone());
+            let eligible = match source {
+                ListSource::Folder(folder) => {
+                    self.folder_key_of(account, folder, &thread)?.is_some()
+                }
+                ListSource::Label(label) => labels
+                    .get(id)
+                    .is_some_and(|item| item.labels.contains(label)),
+            };
+            if !eligible {
+                continue;
+            }
+            let rows = load_flags(&tx, account, &thread)?;
+            let folder_has_copy = rows.iter().any(|row| in_folder(row, folder));
+            let marked = if star {
+                rows.iter().any(|row| row.starred)
+            } else {
+                rows.iter()
+                    .any(|row| row.unread && (!folder_has_copy || in_folder(row, folder)))
+            };
+            selected.push((rows, marked));
+        }
+        if selected.is_empty() {
+            return Err(Error::Action("No conversation".into()));
+        }
+        let turn_on = !selected.iter().all(|(_, marked)| *marked);
+        let change = match (star, turn_on) {
+            (true, true) => FlagChange::Star,
+            (true, false) => FlagChange::Unstar,
+            (false, true) => FlagChange::Unread,
+            (false, false) => FlagChange::Read,
+        };
+        let mut writes = Vec::new();
+        let mut touched = 0;
+        for (rows, marked) in selected {
+            if marked != turn_on {
+                let before = writes.len();
+                plan(rows, |row| in_folder(row, folder), change, &mut writes);
+                touched += usize::from(writes.len() > before);
+            }
+        }
+        if touched > 0 {
+            write_flags(&tx, account, change, touched, writes)?;
+        }
+        tx.commit()?;
+        Ok((change, touched))
+    }
+
     fn apply_flags<'a>(
         &self,
         account_id: &AccountId,
@@ -154,42 +226,53 @@ impl Store {
         if writes.is_empty() {
             return Ok(None);
         }
-        let kind = change.kind();
-        let summary = change.summary(touched);
-        tx.execute(
-            "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            params![account_id.as_str(), kind.as_str(), summary, now_unix()],
-        )?;
-        let id = tx.last_insert_rowid();
-        for (row, unread, starred) in &writes {
-            tx.execute(
-                "INSERT INTO local_action_flags (action_id, message_id, unread, starred)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    id,
-                    row.message_id,
-                    i64::from(row.unread),
-                    i64::from(row.starred)
-                ],
-            )?;
-            set_flags(&tx, account_id, &row.message_id, *unread, *starred)?;
-            intents::record(
-                &tx,
-                account_id,
-                &row.message_id,
-                (row.unread != *unread).then_some(*unread),
-                (row.starred != *starred).then_some(*starred),
-            )?;
-        }
+        let action = write_flags(&tx, account_id, change, touched, writes)?;
         tx.commit()?;
-        Ok(Some(LocalAction {
-            id,
-            kind,
-            summary,
-            label_undo_target: None,
-        }))
+        Ok(Some(action))
     }
+}
+
+fn write_flags(
+    tx: &Connection,
+    account_id: &AccountId,
+    change: FlagChange,
+    touched: usize,
+    writes: Vec<(Row, bool, bool)>,
+) -> Result<LocalAction> {
+    let kind = change.kind();
+    let summary = change.summary(touched);
+    tx.execute(
+        "INSERT INTO local_actions (account_id, kind, summary, undone, created_unix)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+        params![account_id.as_str(), kind.as_str(), summary, now_unix()],
+    )?;
+    let id = tx.last_insert_rowid();
+    for (row, unread, starred) in &writes {
+        tx.execute(
+            "INSERT INTO local_action_flags (action_id, message_id, unread, starred)
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                row.message_id,
+                i64::from(row.unread),
+                i64::from(row.starred)
+            ],
+        )?;
+        set_flags(tx, account_id, &row.message_id, *unread, *starred)?;
+        intents::record(
+            tx,
+            account_id,
+            &row.message_id,
+            (row.unread != *unread).then_some(*unread),
+            (row.starred != *starred).then_some(*starred),
+        )?;
+    }
+    Ok(LocalAction {
+        id,
+        kind,
+        summary,
+        label_undo_target: None,
+    })
 }
 
 /// The messages to change in one thread, oldest first, with their new

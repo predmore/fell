@@ -2351,62 +2351,53 @@ impl Inbox {
                 .show_toast("The folder is still loading", false);
             return;
         }
-        let Some(key) = ids.first().and_then(|first| {
+        if ids.is_empty() {
+            self.session.show_toast("No conversation", true);
+            return;
+        }
+        let key = ids.iter().find_map(|id| {
             self.session
                 .threads
                 .iter()
-                .find(|row| &row.id == first)
+                .find(|row| &row.id == id)
                 .map(row_key)
-        }) else {
-            self.session.show_toast("No conversation", true);
-            return;
-        };
+        });
         let roles = &self.session.roles;
         let folder = self.list_folder.clone();
-        let count = ids.len();
-        let done_text = match removal {
-            Removal::Archive => archived_notice(count, count),
-            Removal::Delete => moved_notice(
-                count,
-                &self.session.folder_text(roles.name(FolderRole::Trash)),
-            ),
-            Removal::Spam if roles.is(FolderRole::Junk, &folder) => moved_notice(
-                count,
-                &self.session.folder_text(roles.name(FolderRole::Inbox)),
-            ),
-            Removal::Spam => moved_notice(
-                count,
-                &self.session.folder_text(roles.name(FolderRole::Junk)),
-            ),
-            Removal::Purge => match count {
-                1 => "Removed from Fell".to_string(),
-                n => format!("Removed {n} from Fell"),
-            },
+        let spam_to = if roles.is(FolderRole::Junk, &folder) {
+            FolderRole::Inbox
+        } else {
+            FolderRole::Junk
         };
+        let destination = self
+            .session
+            .folder_text(roles.name(if removal == Removal::Delete {
+                FolderRole::Trash
+            } else {
+                spam_to
+            }));
         let account = self.account_id.clone();
         let threads: Vec<ThreadId> = ids.iter().cloned().map(ThreadId).collect();
         self.session.picked.clear();
         self.session.visual = false;
         self.session.anchor_id = None;
-        if !roles.is_view(&folder) {
+        if key.is_some() && !roles.is_view(&folder) {
             self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
-            move |store| {
-                match removal {
-                    Removal::Archive => store.archive_threads(&account, &threads, &folder),
-                    Removal::Delete => store.delete_threads(&account, &threads, &folder),
-                    Removal::Spam => store.spam_threads(&account, &threads, &folder),
-                    Removal::Purge => store.purge_threads(&account, &threads, &folder),
-                }
-                .map(|_| ())
-            },
+            move |store| removal.in_folder(store, &account, threads, folder),
             move |inbox, result| {
                 for id in &ids {
                     inbox.pending_removals.remove(id);
                 }
                 match result {
-                    Ok(()) => {
+                    Ok(count) => {
+                        let done_text = match removal {
+                            Removal::Archive => archived_notice(count, ids.len()),
+                            Removal::Delete | Removal::Spam => moved_notice(count, &destination),
+                            Removal::Purge if count == 1 => "Removed from Fell".to_owned(),
+                            Removal::Purge => format!("Removed {count} from Fell"),
+                        };
                         inbox.session.show_toast(done_text, false);
                         inbox.send_to_server();
                         Some(ReadIntent {
@@ -2423,7 +2414,7 @@ impl Inbox {
                         inbox.session.show_toast(message, true);
                         Some(ReadIntent {
                             changed: true,
-                            select: Some(key),
+                            select: key,
                             ..ReadIntent::default()
                         })
                     }
@@ -2728,6 +2719,42 @@ impl Inbox {
                     changed: true,
                     ..ReadIntent::default()
                 })
+            },
+            cx,
+        );
+    }
+
+    fn toggle_off_page_flags(&mut self, ids: Vec<String>, star: bool, cx: &mut Context<Self>) {
+        if self.session.folder != self.list_folder || self.session.label_scope != self.list_label {
+            self.session
+                .show_toast("The folder is still loading", false);
+            return;
+        }
+        let account = self.account_id.clone();
+        let folder = self.list_folder.clone();
+        let label = self.list_label.clone();
+        let selected = ids.len();
+        self.change_mailbox(
+            move |store| {
+                use fell_core::store::ListSource;
+                let source = label
+                    .as_deref()
+                    .map_or(ListSource::Folder(&folder), ListSource::Label);
+                store.toggle_selected_flags(&account, &ids, source, star)
+            },
+            move |inbox, result| match result {
+                Ok((change, count)) => {
+                    inbox.session.show_flag_notice(change, selected, count);
+                    inbox.send_to_server();
+                    Some(ReadIntent {
+                        changed: true,
+                        ..ReadIntent::default()
+                    })
+                }
+                Err(err) => {
+                    inbox.session.show_toast(err.to_string(), true);
+                    None
+                }
             },
             cx,
         );
@@ -3232,6 +3259,9 @@ impl Inbox {
         }
         if let Some(edit) = step.flags.clone() {
             self.apply_flags(edit, cx);
+        }
+        if let Some((ids, star)) = step.off_page_flags {
+            self.toggle_off_page_flags(ids, star, cx);
         }
         if let Some(read) = step.read_after {
             self.read_after(read, cx);
@@ -3879,34 +3909,35 @@ impl Render for Inbox {
             layer.swap(&mut self.session);
         }
         let viewport_height = f32::from(window.viewport_size().height);
-        let mut overlay_card = |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
-            let help = self
-                .help_scroll
-                .card(&theme, session, window, now, live, cx);
-            overlay(
-                &theme,
-                session,
-                motion,
-                card,
-                live,
-                &self.palette_scroll,
-                &self.folder_scroll,
-                picker,
-                help,
-                (session.overlay == Overlay::Agents).then(|| {
-                    agents::card(
-                        &theme,
-                        &session.agents,
-                        live.then_some(&self.agents_scroll),
-                        viewport_height - CARD_TOP_PX - 16.0,
-                        live.then_some((&self.agents_motion, now)),
-                        cx,
-                    )
-                }),
-                window,
-                cx,
-            )
-        };
+        let mut overlay_card =
+            |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>, f32)| {
+                let help = self
+                    .help_scroll
+                    .card(&theme, session, window, now, live, cx);
+                overlay(
+                    &theme,
+                    session,
+                    motion,
+                    card,
+                    live,
+                    &self.palette_scroll,
+                    &self.folder_scroll,
+                    picker,
+                    help,
+                    (session.overlay == Overlay::Agents).then(|| {
+                        agents::card(
+                            &theme,
+                            &session.agents,
+                            live.then_some(&self.agents_scroll),
+                            viewport_height - CARD_TOP_PX - 16.0,
+                            live.then_some((&self.agents_motion, now)),
+                            cx,
+                        )
+                    }),
+                    window,
+                    cx,
+                )
+            };
         if let Some((layer, opacity)) = self.motion.closing_overlay(now) {
             layer.swap(&mut self.session);
             leaving.push(
@@ -8732,6 +8763,30 @@ enum Removal {
     Purge,
 }
 
+impl Removal {
+    fn in_folder(
+        self,
+        store: &fell_core::Store,
+        account: &AccountId,
+        threads: Vec<ThreadId>,
+        folder: String,
+    ) -> fell_core::Result<usize> {
+        if self == Self::Purge {
+            return store
+                .purge_threads(account, &threads, &folder)
+                .map(|_| threads.len());
+        }
+        let scopes: Vec<_> = threads.into_iter().map(|id| (id, folder.clone())).collect();
+        match self {
+            Self::Archive => store.archive_scoped_threads(account, &scopes),
+            Self::Delete => store.delete_scoped_threads(account, &scopes),
+            Self::Spam => store.spam_scoped_threads(account, &scopes),
+            Self::Purge => unreachable!(),
+        }
+        .map(|(_, count)| count)
+    }
+}
+
 /// "Moved to Trash · u", or "Moved 3 to Trash · u" for a selection.
 fn moved_notice(count: usize, to: &str) -> String {
     match count {
@@ -9642,5 +9697,67 @@ mod tests {
             write_back_notice(&session, &[], true),
             "Read/star sync delayed. Retrying"
         );
+    }
+
+    #[test]
+    fn delete_trashes_exactly_the_marks_across_pages() {
+        use super::{Removal, Session, SyncKind};
+        use crate::keymap::Keymap;
+        use crate::present::thread_rows;
+
+        for mark_on_second_page in [false, true] {
+            let store = fell_core::Store::open_in_memory().unwrap();
+            let account = crate::fixtures::fixture_account();
+            crate::fixtures::seed_if_empty(&store, &account).unwrap();
+            let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+            let [first, second, cursor, ..] = inbox.as_slice() else {
+                panic!("three fixture rows");
+            };
+            let ids = |rows: &[fell_core::store::FolderThread]| thread_rows(rows, &account.email);
+            let mut session = Session::new(
+                "Demo",
+                &account.email,
+                SyncKind::FixtureOffline,
+                Keymap::default(),
+            );
+            session.set_page(ids(&inbox[..1]), false, true, 0);
+            session.on_key(KeyId::Char('x'), 10);
+            session.set_page(ids(&inbox[1..3]), true, false, 0);
+            if mark_on_second_page {
+                session.on_key(KeyId::Char('x'), 10);
+            }
+            session.on_key(KeyId::Char('j'), 10);
+            assert_eq!(
+                session.cursor_id.as_deref(),
+                Some(cursor.thread_id.as_str())
+            );
+            assert!(session.on_key(KeyId::Char('#'), 10).delete);
+            let (ids, drafts) = session.split_removal_targets(session.action_targets());
+            assert!(drafts.is_empty());
+            let selected = if mark_on_second_page {
+                vec![second.thread_id.0.clone(), first.thread_id.0.clone()]
+            } else {
+                vec![first.thread_id.0.clone()]
+            };
+            assert_eq!(ids, selected);
+            let mut threads: Vec<_> = ids.into_iter().map(fell_core::ThreadId).collect();
+            threads.push(fell_core::ThreadId("missing".into()));
+            let count = Removal::Delete
+                .in_folder(&store, &account.id, threads, "INBOX".into())
+                .unwrap();
+            assert_eq!(count, selected.len());
+
+            let trash = store.folder_threads(&account.id, "Trash").unwrap();
+            for row in [first, second, cursor] {
+                let trashed = trash.iter().any(|item| item.thread_id == row.thread_id);
+                assert_eq!(trashed, selected.contains(&row.thread_id.0));
+            }
+            assert!(
+                store
+                    .folder_key_of(&account.id, "INBOX", &cursor.thread_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }

@@ -352,6 +352,8 @@ pub struct Step {
     pub apply_move: bool,
     pub read_label_targets: bool,
     pub labels: Option<LabelEdit>,
+    /// Resolve a flag toggle against marked conversations outside the loaded page.
+    pub off_page_flags: Option<(Vec<String>, bool)>,
     /// `u` restores the latest local action.
     pub undo: bool,
     /// `e` archives the open thread out of the folder on screen.
@@ -1107,8 +1109,8 @@ impl Session {
         Some(&self.threads[anchor.min(cursor)..=anchor.max(cursor)])
     }
 
-    /// What `#` and `!` act on, in list order. A visual range takes
-    /// precedence over picks. The cursor supplies a target for single-row use.
+    /// A visual range takes precedence over marks. Marks keep their IDs across
+    /// pages. With neither, the cursor supplies the single-row target.
     pub fn action_targets(&self) -> Vec<String> {
         if self.visual {
             return self
@@ -1118,50 +1120,21 @@ impl Session {
                 .map(|row| row.id.clone())
                 .collect();
         }
-        let picked = self.loaded_picks();
-        if picked.is_empty() {
-            self.threads
+        if self.picked.is_empty() {
+            return self
+                .threads
                 .iter()
                 .find(|thread| Some(&thread.id) == self.cursor_id.as_ref())
                 .map(|thread| thread.id.clone())
                 .into_iter()
-                .collect()
-        } else {
-            picked
+                .collect();
         }
-    }
-
-    fn loaded_picks(&self) -> Vec<String> {
-        self.threads
+        let mut targets: Vec<_> = self
+            .threads
             .iter()
             .filter(|thread| self.picked.contains(&thread.id))
             .map(|thread| thread.id.clone())
-            .collect()
-    }
-
-    /// The selected conversation row IDs and local draft IDs, in order.
-    /// Conversation actions skip local drafts. In Drafts, a draft-only
-    /// delete discards those drafts through the editor's path.
-    pub fn split_removal_targets(&self, mut ids: Vec<String>) -> (Vec<String>, Vec<String>) {
-        let mut drafts = Vec::new();
-        ids.retain(|id| {
-            let Some(row) = self.threads.iter().find(|row| &row.id == id) else {
-                return false;
-            };
-            if let Some(draft) = &row.draft {
-                drafts.push(draft.clone());
-                return false;
-            }
-            true
-        });
-        (ids, drafts)
-    }
-
-    fn label_targets(&self) -> Vec<String> {
-        if self.visual || self.picked.is_empty() {
-            return self.action_targets();
-        }
-        let mut targets = self.loaded_picks();
+            .collect();
         let loaded: HashSet<_> = targets.iter().collect();
         let mut off_page: Vec<_> = self
             .picked
@@ -1172,6 +1145,26 @@ impl Session {
         off_page.sort_unstable();
         targets.extend(off_page);
         targets
+    }
+
+    /// The selected conversation row IDs and local draft IDs, in order.
+    /// Conversation actions skip local drafts. In Drafts, a draft-only
+    /// delete discards those drafts through the editor's path.
+    pub fn split_removal_targets(&self, mut ids: Vec<String>) -> (Vec<String>, Vec<String>) {
+        let mut drafts = Vec::new();
+        ids.retain(|id| {
+            let loaded_draft = self
+                .threads
+                .iter()
+                .find(|row| &row.id == id)
+                .and_then(|row| row.draft.as_deref());
+            if let Some(draft) = loaded_draft.or_else(|| present::draft_id_from_row(id)) {
+                drafts.push(draft.to_owned());
+                return false;
+            }
+            true
+        });
+        (ids, drafts)
     }
 
     /// The threads `y` confirmed for a permanent delete, once.
@@ -1216,10 +1209,11 @@ impl Session {
         self.threads = threads;
         if self.confirm_purge.as_ref().is_some_and(|prompt| {
             prompt.folder != self.folder
-                || !prompt
-                    .ids
-                    .iter()
-                    .all(|id| self.threads.iter().any(|row| &row.id == id))
+                || ((!self.more_before && !self.more_after)
+                    && !prompt
+                        .ids
+                        .iter()
+                        .all(|id| self.threads.iter().any(|row| &row.id == id)))
         }) {
             self.withdraw_purge();
         }
@@ -2413,12 +2407,12 @@ impl Session {
             Action::Label | Action::LabelList => {
                 self.count.clear();
                 if action == Action::Label {
-                    let mut targets = self.label_targets();
+                    let targets = self.action_targets();
                     if targets.is_empty() {
                         self.show_toast("No conversation", true);
                         return step;
                     }
-                    targets.retain(|id| !present::is_draft_row_id(id));
+                    let (targets, _) = self.split_removal_targets(targets);
                     if targets.is_empty() {
                         self.show_toast(DRAFT_NOT_THREAD, true);
                         return step;
@@ -2471,7 +2465,7 @@ impl Session {
             }
             Action::Archive => {
                 self.count.clear();
-                if self.cursor_id.is_none() {
+                if self.action_targets().is_empty() {
                     self.show_toast("No conversation", true);
                     return Step::default();
                 }
@@ -2534,19 +2528,17 @@ impl Session {
                 }
                 // Destructive and not undoable: ask, and show the answer key.
                 let target = match targets.as_slice() {
-                    [id] => {
-                        let subject = self
-                            .threads
-                            .iter()
-                            .find(|row| &row.id == id)
-                            .map_or("", |row| &row.subject);
-                        let subject = display_safe(subject).replace(['“', '”'], "'");
-                        if subject.trim().is_empty() {
-                            "“(no subject)”".to_string()
-                        } else {
-                            format!("“{subject}”")
-                        }
-                    }
+                    [id] => self.threads.iter().find(|row| &row.id == id).map_or_else(
+                        || "1 marked".into(),
+                        |row| {
+                            let subject = display_safe(&row.subject).replace(['“', '”'], "'");
+                            if subject.trim().is_empty() {
+                                "“(no subject)”".to_string()
+                            } else {
+                                format!("“{subject}”")
+                            }
+                        },
+                    ),
                     ids => format!("{} marked", ids.len()),
                 };
                 self.show_toast(
@@ -2818,23 +2810,14 @@ impl Session {
         self.read_after_dwell(read)
     }
 
-    /// Threads `U` and `s` act on: the visual range or picked rows plus the
-    /// cursor, in list order. Draft rows are not threads.
-    fn flag_targets(&self) -> Vec<String> {
-        let ids = self.highlighted();
-        self.threads
-            .iter()
-            .filter(|row| row.draft.is_none() && ids.contains(&row.id))
-            .map(|row| row.id.clone())
-            .collect()
-    }
-
     /// `U` (`star` false) or `s` on the targets. All already unread (or
     /// starred) turns it off; otherwise every target gets it.
     fn toggle_flag(&mut self, star: bool) -> Step {
-        let mut ids = self.flag_targets();
+        let targets = self.action_targets();
+        let multiple_selected = targets.len() > 1;
+        let (mut ids, drafts) = self.split_removal_targets(targets);
         if ids.is_empty() {
-            let text = if self.cursor_draft().is_some() {
+            let text = if !drafts.is_empty() {
                 DRAFT_NOT_THREAD
             } else {
                 "No conversation"
@@ -2842,7 +2825,6 @@ impl Session {
             self.show_toast(text, true);
             return Step::default();
         }
-        let multiple_selected = ids.len() > 1;
         if self.search.is_some() {
             ids.retain(|id| self.search_source(id).is_some());
             if ids.is_empty() {
@@ -2855,6 +2837,7 @@ impl Session {
             .iter()
             .filter(|row| ids.contains(&row.id))
             .collect();
+        let off_page = rows.len() != ids.len();
         let change = if star {
             if rows.iter().all(|row| row.starred) {
                 FlagChange::Unstar
@@ -2866,43 +2849,53 @@ impl Session {
         } else {
             FlagChange::Unread
         };
-        let count = ids.len();
         // The selection was the operand: it is used up, as in vim.
         if multiple_selected {
             self.visual = false;
             self.anchor_id = None;
             self.picked.clear();
         }
+        if !star {
+            self.cancel_read_delay();
+        }
+        if off_page {
+            return Step {
+                off_page_flags: Some((ids, star)),
+                ..Step::default()
+            };
+        }
+        let count = ids.len();
+        // Quiet: a single row on screen with the list focused shows the
+        // change itself. Say it only when the reader cannot see it there.
+        let toast = count > 1 || !self.flag_targets_in_view(&ids);
+        let flags = self.mark_rows(ids, change);
+        if toast {
+            // A selection counts the rows that changed, not the ones that
+            // already had it.
+            let changed = flags.as_ref().map_or(0, |edit| edit.ids.len());
+            self.show_flag_notice(change, count, changed);
+        }
+        Step {
+            flags,
+            ..Step::default()
+        }
+    }
+
+    pub fn show_flag_notice(&mut self, change: FlagChange, selected: usize, changed: usize) {
         let what = match change {
             FlagChange::Read => "marked read",
             FlagChange::Unread => "marked unread",
             FlagChange::Star => "starred",
             FlagChange::Unstar => "unstarred",
         };
-        // Quiet: a single row on screen with the list focused shows the
-        // change itself. Say it only when the reader cannot see it there.
-        let toast = count > 1 || !self.flag_targets_in_view(&ids);
-        let flags = self.mark_rows(ids, change);
-        if !star {
-            self.cancel_read_delay();
-        }
-        if toast {
-            // A selection counts the rows that changed, not the ones that
-            // already had it.
-            let changed = flags.as_ref().map_or(0, |edit| edit.ids.len());
-            let text = if count == 1 {
-                let mut text = what.to_string();
-                text[..1].make_ascii_uppercase();
-                text
-            } else {
-                format!("{changed} {what}")
-            };
-            self.show_toast(text, false);
-        }
-        Step {
-            flags,
-            ..Step::default()
-        }
+        let text = if selected == 1 {
+            let mut text = what.to_string();
+            text[..1].make_ascii_uppercase();
+            text
+        } else {
+            format!("{changed} {what}")
+        };
+        self.show_toast(text, false);
     }
 
     /// The list has focus and every row in `ids` is on screen.
@@ -4324,8 +4317,61 @@ mod tests {
         session.picked.insert("a".into());
         session.cursor_id = Some("e".into());
         let edit = session.on_key(KeyId::Char('s'), 10).flags.unwrap();
-        assert_eq!(edit.ids, vec!["a", "e"]);
+        assert_eq!(edit.ids, vec!["a"]);
         assert!(session.picked.is_empty());
+    }
+
+    #[test]
+    fn flags_follow_marks_out_of_the_loaded_page_and_skip_missing_threads() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let inbox = store.folder_threads(&account.id, "INBOX").unwrap();
+        let marked = inbox
+            .iter()
+            .find(|row| !row.unread && !row.starred)
+            .unwrap();
+        let other = inbox
+            .iter()
+            .find(|row| row.thread_id != marked.thread_id)
+            .unwrap();
+        let rows = |row: &fell_core::store::FolderThread| {
+            present::thread_rows(std::slice::from_ref(row), &account.email)
+        };
+        let mut session = session();
+        session.set_page(rows(marked), false, true, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(rows(other), true, false, 0);
+        for (key, expected) in [
+            ('U', FlagChange::Unread),
+            ('U', FlagChange::Read),
+            ('s', FlagChange::Star),
+            ('s', FlagChange::Unstar),
+        ] {
+            let step = session.on_key(KeyId::Char(key), 10);
+            assert!(step.flags.is_none());
+            let (mut ids, star) = step.off_page_flags.unwrap();
+            assert_eq!(ids, [marked.thread_id.as_str()]);
+            ids.push("missing".into());
+            let actual = store
+                .toggle_selected_flags(
+                    &account.id,
+                    &ids,
+                    fell_core::store::ListSource::Folder("INBOX"),
+                    star,
+                )
+                .unwrap();
+            assert_eq!(actual, (expected, 1));
+            let refreshed = store.folder_threads(&account.id, "INBOX").unwrap();
+            let unchanged = refreshed
+                .iter()
+                .find(|row| row.thread_id == other.thread_id)
+                .unwrap();
+            assert_eq!(
+                (unchanged.unread, unchanged.starred),
+                (other.unread, other.starred)
+            );
+        }
     }
 
     #[test]
