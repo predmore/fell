@@ -26,7 +26,11 @@ use crate::compose_ui::ComposeView;
 /// already serving it keeps it; this one then serves no agents.
 pub fn serve_socket(hub: Arc<DraftHub>) {
     if let Err(err) = serve_socket_at(hub, &fell_core::compose::draft_socket_path()) {
-        eprintln!("fell: agent drafts are not served here: {err}");
+        fell_core::diagnostic!(
+            WARN,
+            "Could not serve agent drafts",
+            error = &err as &dyn std::error::Error
+        );
     }
 }
 

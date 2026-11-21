@@ -58,7 +58,8 @@ pub fn account_command(args: &[String]) -> i32 {
     match result {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("fell: {err}");
+            fell_core::diagnostic!(WARN, "Account command failed");
+            let _ = writeln!(io::stderr(), "fell: {err}");
             // Usage errors end with the usage text; they exit 2 like the
             // top-level parser. Anything else (a failed login) exits 1.
             if err.ends_with(USAGE) { 2 } else { 1 }

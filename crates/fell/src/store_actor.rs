@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use fell_core::Store;
-use futures::channel::oneshot;
+use fell_core::{Store, diagnostic};
+use futures::channel::{mpsc::UnboundedSender, oneshot};
+
+use crate::worker::{Restart, Worker};
 
 type Job = Box<dyn FnOnce(&Store) + Send>;
 
@@ -32,7 +34,8 @@ impl StoreClient {
     /// whatever the window needs to know about the mailbox it opened. A
     /// file-backed mailbox then gets its background connection.
     pub fn spawn<T: Send + 'static>(
-        open: impl FnOnce() -> (Store, T) + Send + 'static,
+        open: impl Fn() -> (Store, T) + Send + 'static,
+        notices: UnboundedSender<Worker>,
     ) -> (Self, oneshot::Receiver<T>) {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready) = oneshot::channel();
@@ -44,20 +47,30 @@ impl StoreClient {
         std::thread::Builder::new()
             .name("fell-store".into())
             .spawn(move || {
-                let (store, info) = open();
+                let mut restart = Restart::new(Worker::Store, |worker| {
+                    notices.unbounded_send(worker).is_ok()
+                });
+                let Some((store, info)) = restart.run(open) else {
+                    return;
+                };
+                diagnostic!(INFO, "Mailbox worker opened the store");
                 // The first connection has finished opening and migrating
                 // the file, so the second one never races it for the lock.
                 if let Some(path) = store.db_path().map(std::path::Path::to_path_buf) {
                     has_file.store(true, Ordering::Release);
-                    spawn_background(path, lane, background_jobs);
+                    spawn_background(path, lane, background_jobs, notices.clone());
                 } else {
                     drop(background_jobs);
                 }
                 let _ = ready_tx.send(info);
-                // Jobs run in order. The loop ends when the window drops its client.
-                while let Ok(job) = rx.recv() {
-                    job(&store);
-                }
+                // Do not replay an interrupted job. Unwinding rolls back its
+                // SQLite transaction and drops its sender (an Err to the caller).
+                // The channel still owns all jobs we have not started.
+                restart.run(|| {
+                    for job in &rx {
+                        job(&store);
+                    }
+                });
             })
             .expect("spawn store thread");
         (
@@ -71,7 +84,8 @@ impl StoreClient {
         )
     }
 
-    /// Run `job` on the interactive lane. The receiver is canceled if the thread is gone.
+    /// Run `job` on the interactive lane. An interrupted job or a closed
+    /// worker returns `Err(Canceled)` on the receiver.
     pub fn call<R: Send + 'static>(
         &self,
         job: impl FnOnce(&Store) -> R + Send + 'static,
@@ -162,30 +176,52 @@ const PART_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Open the second connection on its own thread, retrying a few times. If
 /// it never opens, background jobs keep using the interactive lane.
-fn spawn_background(path: std::path::PathBuf, ready: Arc<AtomicBool>, jobs: mpsc::Receiver<Job>) {
+fn spawn_background(
+    path: std::path::PathBuf,
+    ready: Arc<AtomicBool>,
+    jobs: mpsc::Receiver<Job>,
+    notices: UnboundedSender<Worker>,
+) {
     let _ = std::thread::Builder::new()
         .name("fell-store-background".into())
         .spawn(move || {
-            let mut waits = BACKGROUND_RETRIES.iter();
-            let store = loop {
-                match Store::open(&path) {
-                    Ok(store) => break store,
-                    Err(_) => match waits.next() {
-                        // Nobody is left to serve once the window is gone.
-                        Some(_) if Arc::strong_count(&ready) == 1 => return,
-                        Some(wait) => std::thread::sleep(*wait),
-                        None => return,
-                    },
+            let mut restart = Restart::new(Worker::BackgroundStore, |worker| {
+                notices.unbounded_send(worker).is_ok()
+            });
+            let Some(Some(store)) = restart.run(|| {
+                let mut waits = BACKGROUND_RETRIES.iter();
+                loop {
+                    match Store::open(&path) {
+                        Ok(store) => {
+                            store.warm_search();
+                            break Some(store);
+                        }
+                        Err(err) => {
+                            diagnostic!(
+                                DEBUG,
+                                "Mailbox background connection failed",
+                                error = &err as &dyn std::error::Error
+                            );
+                            match waits.next() {
+                                // Nobody is left to serve once the window is gone.
+                                Some(_) if Arc::strong_count(&ready) == 1 => break None,
+                                Some(wait) => std::thread::sleep(*wait),
+                                None => break None,
+                            }
+                        }
+                    }
                 }
+            }) else {
+                return;
             };
-            store.warm_search();
+            diagnostic!(DEBUG, "Mailbox background connection opened");
             ready.store(true, Ordering::Release);
             drop(ready);
-            run_background(&store, jobs);
+            restart.run(|| run_background(&store, &jobs));
         });
 }
 
-fn run_background(store: &Store, jobs: mpsc::Receiver<Job>) {
+fn run_background(store: &Store, jobs: &mpsc::Receiver<Job>) {
     // Sweep after startup and between jobs, even while working offline or
     // when nobody has opened an attachment in this window.
     let mut next_sweep = Instant::now();
@@ -196,7 +232,11 @@ fn run_background(store: &Store, jobs: mpsc::Receiver<Job>) {
                 Ok(()) => failed = false,
                 Err(err) => {
                     if !failed {
-                        eprintln!("fell: could not remove cached parts: {err}");
+                        diagnostic!(
+                            WARN,
+                            "Could not remove cached parts",
+                            error = &err as &dyn std::error::Error
+                        );
                     }
                     failed = true;
                 }
@@ -217,10 +257,53 @@ fn run_background(store: &Store, jobs: mpsc::Receiver<Job>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
+
+    fn spawn<T: Send + 'static>(
+        open: impl Fn() -> (Store, T) + Send + 'static,
+    ) -> (StoreClient, oneshot::Receiver<T>) {
+        StoreClient::spawn(open, futures::channel::mpsc::unbounded().0)
+    }
+
+    #[test]
+    fn a_panicked_job_rolls_back_and_answers_with_an_error_on_both_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        let opened = path.clone();
+        let (notices, mut restarts) = futures::channel::mpsc::unbounded();
+        let (client, ready) =
+            StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()), notices);
+        futures::executor::block_on(ready).unwrap();
+        futures::executor::block_on(client.call_maintenance(|_| ())).unwrap();
+        futures::executor::block_on(async {
+            let job = |store: &Store| {
+                store.testing_with_uncommitted_write(|| panic!("interrupted write"))
+            };
+            let complete = |store: &Store| store.testing_with_uncommitted_write(|| ());
+            // A concurrent SQLite connection sees neither interrupted write.
+            assert!(client.call(job).await.is_err());
+            assert!(matches!(restarts.next().await, Some(Worker::Store)));
+            assert!(client.call_maintenance(job).await.is_err());
+            assert!(matches!(
+                restarts.next().await,
+                Some(Worker::BackgroundStore)
+            ));
+            client.call(complete).await.unwrap().unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let value: String = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'uncommitted-test'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(value, "1");
+        });
+    }
 
     #[test]
     fn jobs_run_off_the_calling_thread_in_order() {
-        let (client, ready) = StoreClient::spawn(|| {
+        let (client, ready) = spawn(|| {
             (
                 Store::open_in_memory().unwrap(),
                 std::thread::current().id(),
@@ -246,7 +329,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let opened = dir.join("mail.db");
-        let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
+        let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
         let asked = client.call_maintenance(|store| store.testing_search_warm_asked());
         assert!(futures::executor::block_on(asked).unwrap());
@@ -256,7 +339,7 @@ mod tests {
 
     #[test]
     fn an_in_memory_mailbox_runs_background_jobs_on_its_one_lane() {
-        let (client, ready) = StoreClient::spawn(|| (Store::open_in_memory().unwrap(), ()));
+        let (client, ready) = spawn(|| (Store::open_in_memory().unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
         let answer = client.call_background(|store| store.db_path().is_none());
         assert!(futures::executor::block_on(answer).unwrap());
@@ -296,7 +379,7 @@ mod tests {
 
     #[test]
     fn search_completion_works_with_one_connection() {
-        let (client, ready) = StoreClient::spawn(|| {
+        let (client, ready) = spawn(|| {
             let store = Store::open_in_memory().unwrap();
             let account = crate::fixtures::fixture_account();
             crate::fixtures::seed_if_empty(&store, &account).unwrap();
@@ -358,7 +441,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.db");
         let opened = path.clone();
-        let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
+        let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !client.has_background_lane() {
@@ -404,7 +487,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mail.db");
         let opened = path.clone();
-        let (client, ready) = StoreClient::spawn(move || (Store::open(&opened).unwrap(), ()));
+        let (client, ready) = spawn(move || (Store::open(&opened).unwrap(), ()));
         futures::executor::block_on(ready).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !client.has_background_lane() {

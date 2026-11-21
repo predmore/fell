@@ -3,6 +3,7 @@
 mod agents;
 mod attachment_actions;
 mod attachment_chips;
+mod diagnostics;
 pub(crate) mod disclosure;
 mod help;
 mod search;
@@ -62,12 +63,16 @@ use crate::ui_trace::UiTrace;
 use self::disclosure::disclosure;
 
 pub fn run(trace_start: Option<Instant>) {
-    eprintln!("{}: opening inbox", fell_version::VERSION);
+    fell_core::diagnostic!(INFO, "Opening inbox");
     Application::new().run(move |cx: &mut App| {
         let trace = trace_start.and_then(|start| match UiTrace::open(start) {
             Ok(trace) => Some(trace),
             Err(error) => {
-                eprintln!("fell: could not open UI trace: {error}");
+                fell_core::diagnostic!(
+                    WARN,
+                    "Could not open UI trace",
+                    error = &error as &dyn std::error::Error
+                );
                 None
             }
         });
@@ -117,7 +122,7 @@ pub fn run(trace_start: Option<Instant>) {
                     .detach();
                 }
             }
-            Err(_) => eprintln!("fell: could not open a window"),
+            Err(_) => fell_core::diagnostic!(ERROR, "Could not open inbox window"),
         }
         cx.activate(true);
     });
@@ -293,6 +298,7 @@ struct Inbox {
     focus: FocusHandle,
     /// The mailbox connection's own thread. The window never calls SQLite.
     store: StoreClient,
+    startup_crash: Option<std::path::PathBuf>,
     /// Cursor observed before the first inbox read, consumed after it paints.
     cid_repair: Option<futures::channel::oneshot::Receiver<fell_core::Result<CidRepairProgress>>>,
     account_id: AccountId,
@@ -413,10 +419,14 @@ impl Inbox {
         let config = startup.config.clone();
         let path = startup.path.clone();
         let draft_home = startup.path.clone().ok().map(DraftHome::real);
-        let (store, ready) = StoreClient::spawn({
-            let config = config.clone();
-            move || mailbox::open_store(path, config.as_ref())
-        });
+        let (notices, store_restarts) = futures::channel::mpsc::unbounded();
+        let (store, ready) = StoreClient::spawn(
+            {
+                let config = config.clone();
+                move || mailbox::open_store(path.clone(), config.as_ref())
+            },
+            notices,
+        );
         let (name, email) = match &config {
             Some(config) => {
                 let account = config.account();
@@ -437,7 +447,7 @@ impl Inbox {
             session.record_startup_error(error);
         }
         let reader = cx.entity().downgrade();
-        let inbox = Self {
+        let mut inbox = Self {
             focus: cx.focus_handle(),
             account_id: config
                 .as_ref()
@@ -451,6 +461,7 @@ impl Inbox {
             forwarding_attachments: false,
             session,
             store,
+            startup_crash: None,
             cid_repair: None,
             theme,
             list_scroll: UniformListScrollHandle::new(),
@@ -503,6 +514,8 @@ impl Inbox {
             let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
         })
         .detach();
+        inbox.show_crash_notice(cx);
+        inbox.watch_store_restarts(store_restarts, cx);
         inbox.watch_theme(cx);
         inbox.watch_reviews(cx);
         inbox.watch_dates(cx);
@@ -593,7 +606,11 @@ impl Inbox {
             let mut progress = match start.await {
                 Ok(Ok(progress)) => progress,
                 Ok(Err(err)) => {
-                    eprintln!("fell: could not check cached CID roles: {err}");
+                    fell_core::diagnostic!(
+                        WARN,
+                        "Could not check cached CID roles",
+                        error = &err as &dyn std::error::Error
+                    );
                     return;
                 }
                 Err(_) => return,
@@ -618,7 +635,11 @@ impl Inbox {
                     Ok(Ok(batch)) => batch,
                     Ok(Err(err)) => {
                         if !retry {
-                            eprintln!("fell: could not repair cached CID roles: {err}");
+                            fell_core::diagnostic!(
+                                WARN,
+                                "Could not repair cached CID roles",
+                                error = &err as &dyn std::error::Error
+                            );
                         }
                         retry = true;
                         continue;
@@ -679,6 +700,10 @@ impl Inbox {
                     .update(cx, |inbox, cx| {
                         let kind = match event {
                             SyncEvent::Status(kind) => kind,
+                            SyncEvent::Restarting => {
+                                inbox.show_worker_restart(crate::worker::Worker::Sync, cx);
+                                return;
+                            }
                             SyncEvent::ReplyTo(progress) => {
                                 let finished =
                                     matches!(progress, fell_core::ReplyToProgress::Finished);
@@ -2867,6 +2892,9 @@ impl Inbox {
             && let Some(ids) = self.session.take_purge()
         {
             self.remove_threads(ids, Removal::Purge, cx);
+        }
+        if let Some(file) = step.open_diagnostic {
+            self.open_diagnostic(file, cx);
         }
         if step.reopen_review {
             let reopened = cx

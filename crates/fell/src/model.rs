@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::ops::Range;
 
 use fell_core::compose::ReplyKind;
+use fell_core::diagnostics::DiagnosticFile;
 use fell_core::onboarding::connection_recovery;
 use fell_core::{
     AccountConfig, BackendKind, Error, FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey,
@@ -308,6 +309,7 @@ pub struct Step {
     pub sync_now: bool,
     /// Bring back the agent review window that closed last.
     pub reopen_review: bool,
+    pub open_diagnostic: Option<DiagnosticFile>,
     /// `c`: start a new draft and open it in the compose editor.
     pub compose: bool,
     /// Open the selected row's draft in the compose editor.
@@ -1929,6 +1931,8 @@ impl Session {
                     | Action::Undo
                     | Action::ReopenReview
                     | Action::Agents
+                    | Action::OpenDiagnosticLog
+                    | Action::OpenCrashReport
             )
         {
             self.count.clear();
@@ -2227,6 +2231,13 @@ impl Session {
                 step.agents = self.agents.open();
             }
             Action::AgentControl(_) | Action::UndoAgentRevoke => {}
+            Action::OpenDiagnosticLog | Action::OpenCrashReport => {
+                self.count.clear();
+                step.open_diagnostic = Some(match action {
+                    Action::OpenDiagnosticLog => DiagnosticFile::Log,
+                    _ => DiagnosticFile::Crash,
+                });
+            }
             Action::ReopenReview => {
                 self.count.clear();
                 return Step {

@@ -485,6 +485,20 @@ impl Store {
         }
     }
 
+    /// Exercise unwinding while this store has an uncommitted write.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn testing_with_uncommitted_write(&self, work: impl FnOnce()) -> Result<()> {
+        let tx = begin_immediate(&self.conn)?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('uncommitted-test', '1')",
+            [],
+        )?;
+        work();
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()
     }

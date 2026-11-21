@@ -74,6 +74,8 @@ pub enum Action {
     Agents,
     AgentControl(crate::model::agents::Control),
     UndoAgentRevoke,
+    OpenDiagnosticLog,
+    OpenCrashReport,
 }
 
 impl Action {
@@ -124,6 +126,8 @@ impl Action {
             Self::Agents => "Agents",
             Self::AgentControl(control) => control.command(),
             Self::UndoAgentRevoke => "Undo agent revoke",
+            Self::OpenDiagnosticLog => "Open diagnostic log",
+            Self::OpenCrashReport => "Open crash report",
         }
     }
 
@@ -132,7 +136,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 43] = [
+const ALL_ACTIONS: [Action; 45] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -175,6 +179,8 @@ const ALL_ACTIONS: [Action; 43] = [
     Action::Help,
     Action::ReopenReview,
     Action::Agents,
+    Action::OpenDiagnosticLog,
+    Action::OpenCrashReport,
     Action::About,
 ];
 
@@ -294,7 +300,17 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char(':')], Action::Palette, None);
     bind(&[KeyId::CtrlShiftP], Action::Palette, None);
     bind(&[KeyId::Char('?')], Action::Help, None);
-    bind(&[KeyId::Leader, KeyId::Char('?')], Action::Help, None);
+    for (key, action) in [
+        ('?', Action::Help),
+        ('l', Action::OpenDiagnosticLog),
+        ('c', Action::OpenCrashReport),
+    ] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('?'), KeyId::Char(key)],
+            action,
+            Some("Help / diagnostics"),
+        );
+    }
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('i')],
         Action::Inbox,
@@ -647,18 +663,27 @@ mod tests {
         assert!(
             palette_items(&keymap, "help", &[])
                 .iter()
-                .any(|item| item.action == Action::Help && item.binding == "? · space ?")
+                .any(|item| item.action == Action::Help && item.binding == "? · space ? ?")
         );
         let leader = which_key(&keymap, &[KeyId::Leader]);
-        assert!(
-            leader
-                .iter()
-                .any(|item| item.key == "?" && item.label == "Help" && !item.is_group)
-        );
-        assert_eq!(
-            match_seq(&keymap, &[KeyId::Leader, KeyId::Char('?')]),
-            SeqMatch::Action(Action::Help)
-        );
+        assert!(leader.iter().any(|item| item.key == "?" && item.is_group));
+        let help = [KeyId::Leader, KeyId::Char('?')];
+        assert_eq!(match_seq(&keymap, &help), SeqMatch::Prefix);
+        for (key, action) in [
+            ('?', Action::Help),
+            ('c', Action::OpenCrashReport),
+            ('l', Action::OpenDiagnosticLog),
+        ] {
+            assert_eq!(
+                match_seq(&keymap, &[help[0], help[1], KeyId::Char(key)]),
+                SeqMatch::Action(action)
+            );
+            assert!(
+                which_key(&keymap, &help)
+                    .iter()
+                    .any(|item| item.key == key.to_string() && item.label == action.label())
+            );
+        }
         assert!(
             leader
                 .iter()

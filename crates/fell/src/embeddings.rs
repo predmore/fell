@@ -53,7 +53,8 @@ pub fn embeddings_command(args: &[String]) -> i32 {
     match result {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("fell: {err}");
+            fell_core::diagnostic!(WARN, "Embeddings command failed");
+            let _ = writeln!(io::stderr(), "fell: {err}");
             1
         }
     }

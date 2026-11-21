@@ -30,6 +30,7 @@ mod text_render;
 mod theme;
 mod ui_trace;
 mod view;
+mod worker;
 
 use fell_confirm::InteractiveUi;
 use fell_core::{PendingSend, UserSendConfirmation};

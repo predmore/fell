@@ -157,7 +157,11 @@ fn publish_failed(token: u64) {
 
 fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
     if let Err(err) = gtk::init() {
-        eprintln!("fell: gtk init failed: {err}");
+        fell_core::diagnostic!(
+            WARN,
+            "Could not initialize GTK for HTML mail",
+            error = &err as &dyn std::error::Error
+        );
         return;
     }
     #[allow(deprecated)]
@@ -188,13 +192,18 @@ fn gtk_thread(ready: mpsc::Sender<gtk::glib::Sender<Cmd>>) {
 }
 
 fn present(request: WebRequest) {
+    fell_core::diagnostic!(DEBUG, "Rendering mail in the web view");
     let created = HOST.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             match open_host(&request) {
                 Ok(host) => *slot = Some(host),
                 Err(err) => {
-                    eprintln!("fell: web view failed: {err}");
+                    fell_core::diagnostic!(
+                        WARN,
+                        "Could not open the web view",
+                        error = &err as &dyn std::error::Error
+                    );
                     publish_failed(request.token);
                     return None;
                 }

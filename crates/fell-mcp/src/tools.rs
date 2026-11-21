@@ -66,8 +66,14 @@ pub(crate) fn call(session: &mut Session, name: &str, args: &Value) -> CallResul
     }
     let result = dispatch(session, name, args);
     CallResult::Tool(match result {
-        Ok(body) => tool_ok(body),
-        Err(err) => tool_err(err),
+        Ok(body) => {
+            fell_core::diagnostic!(DEBUG, "MCP tool completed");
+            tool_ok(body)
+        }
+        Err(err) => {
+            fell_core::diagnostic!(DEBUG, "MCP tool failed");
+            tool_err(err)
+        }
     })
 }
 

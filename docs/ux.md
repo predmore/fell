@@ -61,7 +61,8 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 ## Feedback and states
 - Every action gives immediate visual feedback in the same frame; network work happens after.
 - Empty folder, first sync, offline and auth-failed states each have a clear one-line message; offline and auth-failed also name the fix.
-- Errors never block the UI; they appear in the status bar with a key to see details.
+- Errors appear in the status bar without blocking input. If Fell crashed, the next inbox launch shows “Fell crashed last time · Space ? c to view” once. The crash report stays available from the command palette and the `Space ?` group after the notice fades.
+- If a sync or mailbox worker panics, the status bar shows which worker is restarting. An interrupted request returns an error. The worker resumes queued work after a short delay. `Space ? l` opens the diagnostic log.
 
 ## Evidence for UX judges
 - Screenshots of the running app on Hyprland-sized windows, on at least two stock Omarchy themes (one dark, one light), plus a narrow-window shot.
