@@ -1674,6 +1674,17 @@ impl Store {
         summaries::folder_page(&self.conn, account_id, folder, span)
     }
 
+    /// A window of an exact label's list and the position of its selected thread.
+    pub fn label_page(
+        &self,
+        account: &AccountId,
+        label: &str,
+        span: &FolderSpan,
+        follow: Option<&ThreadId>,
+    ) -> Result<(FolderPage, Option<ListKey>)> {
+        summaries::label_page(&self.conn, account, label, span, follow)
+    }
+
     /// Up to `limit` threads of a folder or label after `after` (from the
     /// top when `None`) that pass `filter`, newest activity first. Paging by
     /// key, as [`Store::folder_page`] does, so new mail never shifts a page.

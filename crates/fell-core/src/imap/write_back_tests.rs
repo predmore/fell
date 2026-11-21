@@ -582,8 +582,9 @@ fn write_back_off_queues_nothing_and_turning_it_off_clears_the_queue() {
 }
 
 #[test]
-fn labels_stay_local() {
+fn labels_stay_local_with_write_back_off() {
     let fx = Fixture::new();
+    fx.store.set_write_back(&fx.account.id, false).unwrap();
     let alpha = fx.thread("INBOX", "Alpha");
     fx.store
         .label_thread(
@@ -595,6 +596,197 @@ fn labels_stay_local() {
     assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
     fx.store.undo(&fx.account.id).unwrap();
     assert!(fx.store.outbox(&fx.account.id).unwrap().is_empty());
+}
+
+#[test]
+fn keyword_labels_preserve_reserved_flags_and_undo_per_copy() {
+    let mut state = flag_state(false);
+    state.mailboxes[0].messages[0]
+        .flags
+        .push("$Forwarded".into());
+    state.mailboxes[1].messages[0].flags.push("Review".into());
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), state);
+    let account = &fx.account.id;
+    let alpha = fx.thread("INBOX", "Alpha");
+    let initial = fx.store.thread_messages(account, &alpha).unwrap()[0]
+        .labels
+        .clone();
+    assert_eq!(initial, ["Review"]);
+    // Save a local removal first, leaving the server copies' flags as they were.
+    fx.store.set_write_back(account, false).unwrap();
+    fx.store
+        .label_thread(account, &alpha, crate::LabelChange::Remove("Review".into()))
+        .unwrap();
+    fx.store.set_write_back(account, true).unwrap();
+    let action = fx
+        .store
+        .label_thread(account, &alpha, crate::LabelChange::Add("Review".into()))
+        .unwrap();
+    assert_eq!(
+        fx.store
+            .outbox(account)
+            .unwrap()
+            .iter()
+            .filter(|row| row.kind == OutboxKind::Keyword)
+            .count(),
+        3
+    );
+    fx.clear_commands();
+    assert!(fx.replay().dropped.is_empty());
+    assert!(fx.flags("INBOX", 4).contains(&"$Forwarded".into()));
+    assert!(fx.flags("INBOX", 4).contains(&"Review".into()));
+    assert!(fx.flags(ESCAPED_FOLDER, 12).contains(&"Review".into()));
+    assert_eq!(
+        fx.stores(),
+        [
+            "UID STORE 4 +FLAGS.SILENT (Review)",
+            "UID STORE 12 +FLAGS.SILENT (Review)"
+        ]
+    );
+
+    assert_eq!(fx.store.undo(account).unwrap().id, action.id);
+    fx.clear_commands();
+    assert!(fx.replay().dropped.is_empty());
+    assert!(fx.flags("INBOX", 4).contains(&"$Forwarded".into()));
+    assert!(!fx.flags("INBOX", 4).contains(&"Review".into()));
+    assert!(fx.flags(ESCAPED_FOLDER, 9).contains(&"Review".into()));
+    assert_eq!(
+        fx.stores(),
+        [
+            "UID STORE 4 -FLAGS.SILENT (Review)",
+            "UID STORE 12 -FLAGS.SILENT (Review)"
+        ]
+    );
+}
+
+#[test]
+fn agent_keyword_labels_use_the_same_outbox_and_undo() {
+    let fx = Fixture::new();
+    let account = &fx.account.id;
+    let alpha = fx.thread("INBOX", "Alpha");
+    let action = fx
+        .store
+        .add_thread_label(account, &alpha, "Review", "test-agent")
+        .unwrap()
+        .unwrap();
+    assert!(fx.replay().dropped.is_empty());
+    assert!(fx.flags("INBOX", 1).contains(&"Review".into()));
+    assert_eq!(
+        fx.store.undo_actor(account, "test-agent").unwrap().id,
+        action.id
+    );
+    assert!(fx.replay().dropped.is_empty());
+    assert!(!fx.flags("INBOX", 1).contains(&"Review".into()));
+}
+
+#[test]
+fn bridge_labels_create_copy_and_remove_only_the_label_copy() {
+    let server = TestServer::spawn(state());
+    {
+        let mut writes = server.writes.lock().unwrap();
+        writes.uidplus = true;
+        writes.moves = true;
+        writes.lose_reply_to = Some("COPY");
+    }
+    let account = super::sync_tests::account("bridge", BackendKind::Bridge);
+    let store = Store::open_in_memory().unwrap();
+    let backend = crate::backend::BridgeBackend {
+        account_id: account.id.clone(),
+        imap: config(server.addr.port()),
+        ..Default::default()
+    };
+    sync_once(&account, &backend, &store).unwrap();
+    store.set_write_back(&account.id, true).unwrap();
+    let threads: Vec<_> = store
+        .threads_in_folder(&account.id, "INBOX")
+        .unwrap()
+        .into_iter()
+        .map(|row| row.thread_id)
+        .collect();
+    let label = "Café & travel";
+    let raw = "Labels/Caf&AOk- &- travel";
+    let action = store
+        .label_threads(&account.id, &threads, crate::LabelChange::Add(label.into()))
+        .unwrap();
+    let replay = || replay_outbox(&backend.imap, &account.id, &store).unwrap();
+    assert!(replay().interrupted.is_some());
+    assert_eq!(
+        replay().waiting,
+        0,
+        "recover the lost reply without copying again"
+    );
+    let page = store
+        .label_page(
+            &account.id,
+            label,
+            &crate::FolderSpan::Top { rows: 2 },
+            None,
+        )
+        .unwrap()
+        .0;
+    assert_eq!(page.threads.len(), 2);
+    {
+        let state = server.state.lock().unwrap();
+        let destination = state.mailboxes.iter().find(|m| m.name == raw).unwrap();
+        assert_eq!(destination.messages.len(), 2);
+        assert_eq!(
+            state
+                .commands
+                .iter()
+                .filter(|cmd| cmd.contains(" UID COPY "))
+                .count(),
+            2
+        );
+        assert_eq!(state.mailboxes[0].messages.len(), 2);
+    }
+    assert_eq!(store.undo(&account.id).unwrap().id, action.id);
+    assert_eq!(replay().waiting, 0);
+    sync_once(&account, &backend, &store).unwrap();
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.mailboxes[0].messages.len(), 2);
+        assert!(
+            state
+                .mailboxes
+                .iter()
+                .find(|m| m.name == raw)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .commands
+                .iter()
+                .filter(|cmd| cmd.contains(" UID EXPUNGE "))
+                .count(),
+            2
+        );
+        assert!(!state.commands.iter().any(|cmd| cmd.contains(" MOVE ")));
+        let mut selected = "";
+        for command in &state.commands {
+            if let Some((_, mailbox)) = command.split_once(" SELECT ") {
+                selected = mailbox;
+            }
+            if command.contains(" UID STORE ") || command.contains(" UID EXPUNGE ") {
+                assert_eq!(selected, format!("\"{raw}\""));
+            }
+        }
+    }
+    assert!(
+        store
+            .label_page(
+                &account.id,
+                label,
+                &crate::FolderSpan::Top { rows: 2 },
+                None
+            )
+            .unwrap()
+            .0
+            .threads
+            .is_empty()
+    );
+    assert_eq!(store.list_labels(&account.id).unwrap(), [label]);
 }
 
 /// INBOX with Alpha and Bravo; Trash and Junk named as this server names

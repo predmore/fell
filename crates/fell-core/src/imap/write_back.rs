@@ -42,6 +42,8 @@ use super::ImapConfig;
 use super::rfc822::{copy_message_id, is_synthetic_message_id};
 use super::session::{FlagReply, Placed, WriteError, WriteSession};
 
+mod labels;
+
 /// Refusals (or "not on the server yet") before a row is dropped.
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
 /// Wait before the next try, by attempts so far. The last one repeats.
@@ -179,6 +181,13 @@ impl Pass<'_> {
                 OutboxKind::Move => self.replay_move(session, index, &mut visited)?,
                 _ if matches!(held_move, Some(MoveHold::EarlierMove)) => {}
                 OutboxKind::Seen | OutboxKind::Flagged => self.replay_flag(session, index)?,
+                OutboxKind::Keyword | OutboxKind::BridgeLabel => {
+                    self.replay_label(session, index)?;
+                    if !self.settled[index] {
+                        self.held_moves
+                            .insert(entry.message_id.clone(), MoveHold::EarlierMove);
+                    }
+                }
             }
         }
         Ok(())
@@ -771,7 +780,10 @@ impl Pass<'_> {
         if entry.kind == OutboxKind::Move {
             self.held_moves
                 .insert(entry.message_id.clone(), MoveHold::EarlierMove);
-        } else if !refused && let Some(current) = self.pending_flag(index)? {
+        } else if matches!(entry.kind, OutboxKind::Seen | OutboxKind::Flagged)
+            && !refused
+            && let Some(current) = self.pending_flag(index)?
+        {
             self.hold_unconfirmed_store(&current);
         }
         Ok(())

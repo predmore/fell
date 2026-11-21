@@ -35,7 +35,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 - Opening a thread shows the whole conversation, including messages that live in other folders (for example your replies in Sent), with each message's folder marked subtly.
 - `m` moves the thread out of the current folder: a fuzzy folder picker, then only the messages in the current folder move (Sent copies stay in Sent). `e` archives (move to the account's Archive, or All Mail where there is none). Folders show by role: Gmail's `[Gmail]/Sent Mail` reads as Sent, and `gs` opens it. Both are undoable with `u` and show a short toast.
 - `#` moves the thread's messages in the current folder to Trash, and `!` to Spam. In Spam, `!` moves them back to the Inbox. Both act on the `x` or `V` selection, slide the remaining rows into place, and support undo with `u`. In Trash, `#` shows a warning for the subject or marked count. `y` removes those copies from Fell and any other key dismisses the confirmation. The server copies stay in Trash and undo can still restore unrelated changes.
-- Proton labels stay separate from folders (`l` to label) and show as small chips on the row.
+- Labels stay separate from folders and show as small chips on the row. `l` opens a fuzzy picker for the current thread or the `x` or `V` selection. Picking a checked label removes it. A partially applied label is added to the rest of the selection. Typing a new name offers to create and apply it. `u` undoes the whole edit. `gl` or `Space f l` opens a label’s thread list.
 
 ## Thread list rows: comfortable, two lines
 - Line 1: participants (you shown as "me", latest sender emphasized), message count when > 1, attachment and star markers, relative date right-aligned.

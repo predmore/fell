@@ -21,6 +21,7 @@ test-utils = []
 [dependencies]
 fell-confirm = { workspace = true, optional = true }
 fell-render.workspace = true
+base64 = "0.22"
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Stored body parts (src/store/bodies.rs). Pure Rust DEFLATE, MIT OR Zlib OR
 # Apache-2.0, already in the tree through `png`.

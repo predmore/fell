@@ -1947,6 +1947,7 @@ name = "fell-core"
 version = "0.1.0"
 dependencies = [
  "async-io",
+ "base64 0.22.1",
  "fell-confirm",
  "fell-render",
  "fs4",
