@@ -1,12 +1,99 @@
 //! Shared layout and fade-through for conversation disclosures.
 
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Size, Style, Styled, Window,
-    div, px, size,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, Edges, Element, ElementId,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Size, Style,
+    Styled, Window, div, px, size,
 };
 
 use crate::motion;
+
+/// Reserve the current height in the thread stack and clip the full card
+/// to it while the newly arrived body grows into view.
+pub(super) struct GrowingMessage {
+    pub inner: AnyElement,
+    pub width: Pixels,
+    pub from: f32,
+    pub progress: f32,
+    pub gap: Pixels,
+}
+
+impl IntoElement for GrowingMessage {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for GrowingMessage {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let space = size(
+            AvailableSpace::Definite(self.width),
+            AvailableSpace::MaxContent,
+        );
+        let full = self.inner.layout_as_root(space, window, cx).height;
+        let height = motion::lerp(self.from, f32::from(full), self.progress);
+        let style = Style {
+            size: Size {
+                height: px(motion::snap(height, window.scale_factor())).into(),
+                ..Size::auto()
+            },
+            margin: Edges {
+                bottom: self.gap.into(),
+                ..Edges::default()
+            },
+            ..Style::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            self.inner.prepaint_at(bounds.origin, window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            self.inner.paint(window, cx);
+        });
+    }
+}
 
 pub(super) fn disclosure(
     width: f32,

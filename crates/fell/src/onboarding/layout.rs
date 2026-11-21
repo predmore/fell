@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fell_core::ImapSecurity;
 use gpui::{
@@ -51,14 +51,24 @@ impl Render for Onboarding {
             }
             None => self.transition = None,
         }
-        let feedback = self.feedback.refresh(&self.form, self.motion, now);
+        let feedback = self
+            .feedback
+            .refresh(&self.form, self.bridge, self.motion, now);
         if self.feedback.checks_settled()
             && let Some(check) = self.checked.take()
         {
-            let entity = cx.entity();
-            window.defer(cx, move |_, cx| {
-                entity.update(cx, |view, cx| view.finish_check(check, cx));
-            });
+            if self.form.checks == [Check::Failed; 2] {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let _ = this.update(cx, |view, cx| view.finish_check(check, cx));
+                })
+                .detach();
+            } else {
+                let entity = cx.entity();
+                window.defer(cx, move |_, cx| {
+                    entity.update(cx, |view, cx| view.finish_check(check, cx));
+                });
+            }
         }
         let pulsing = self.motion.enabled()
             && self.form.step == Step::Connection
@@ -336,10 +346,14 @@ impl Onboarding {
                 self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
             }
             Step::Done => {
-                let heading = self
-                    .feedback
-                    .save_heading
-                    .paint(false, |(title, detail), _| self.heading(title, detail));
+                let heading = self.heading_column(
+                    self.feedback
+                        .save_title
+                        .paint(false, |title, _| self.title(title)),
+                    self.feedback
+                        .save_subtitle
+                        .paint(false, |detail, _| self.meta(*detail)),
+                );
                 self.reserved_heading(SaveState::HEADINGS, heading)
             }
             _ => self.heading(title, detail),
@@ -396,21 +410,22 @@ impl Onboarding {
     }
 
     fn heading(&self, title: &str, detail: &str) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
-                div()
-                    .text_size(px(self.theme.ui_px + 15.))
-                    .line_height(px(self.theme.ui_px + 21.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title.to_owned()),
-            )
-            .child(self.meta(detail.to_owned()))
+        self.heading_column(self.title(title), self.meta(detail.to_owned()))
     }
 
-    fn reserved_heading(&self, headings: [(&str, &str); 3], current: Div) -> Div {
+    fn title(&self, title: &str) -> Div {
+        div()
+            .text_size(px(self.theme.ui_px + 15.))
+            .line_height(px(self.theme.ui_px + 21.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(title.to_owned())
+    }
+
+    fn heading_column(&self, title: Div, detail: Div) -> Div {
+        div().flex().flex_col().gap_1p5().child(title).child(detail)
+    }
+
+    fn reserved_heading<const N: usize>(&self, headings: [(&str, &str); N], current: Div) -> Div {
         // Each measuring copy takes the full column width. The row keeps
         // the tallest heading's height at the current window size.
         div()
@@ -430,24 +445,45 @@ impl Onboarding {
         cx: &Context<Self>,
     ) -> [Footer; 3] {
         std::array::from_fn(|index| {
+            if saving && index == 1 {
+                return Some(
+                    self.feedback
+                        .save_note
+                        .paint(live, |state, live| {
+                            div().when(state.inline_available(), |el| {
+                                el.child(self.button(
+                                    Control::Inline,
+                                    "Save in file…",
+                                    false,
+                                    live,
+                                    cx,
+                                ))
+                            })
+                        })
+                        .flex_none()
+                        .into_any_element(),
+                );
+            }
             Some(
                 actions[index]
                     .paint(live, |action, live| {
                         div().children(action.map(|action| {
                             let primary = index == 2;
-                            self.button(
-                                action.control,
-                                action.label,
-                                primary,
-                                live && action.enabled,
-                                cx,
-                            )
-                            .when(primary && saving, |button| {
-                                button.w(px(SAVE_WIDTH)).text_center()
-                            })
-                            .when(!primary && !action.enabled, |button| {
-                                button.text_color(rgb(self.theme.dimmed))
-                            })
+                            let back = index == 0 && saving;
+                            let enabled = action.enabled
+                                && (!back
+                                    || !matches!(self.form.storage, super::Storage::Saving { .. }));
+                            self.button(action.control, action.label, primary, live && enabled, cx)
+                                .when(primary && saving, |button| {
+                                    button.w(px(SAVE_WIDTH)).text_center()
+                                })
+                                .when(back, |button| {
+                                    button.text_color(rgb(motion::mix(
+                                        self.theme.foreground,
+                                        self.theme.dimmed,
+                                        self.feedback.back_amount,
+                                    )))
+                                })
                         }))
                     })
                     .flex_none()
@@ -518,7 +554,19 @@ impl Onboarding {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(self.meta(detail))
                     .when(control == Control::Provider(Provider::Bridge), |el| {
-                        el.child(self.bridge_status(live, cx))
+                        let status = self
+                            .feedback
+                            .bridge
+                            .paint(live, |bridge, live| self.bridge_status(*bridge, live, cx));
+                        // Keep the height of the wrapped offline hint even
+                        // when the listener comes up at narrow widths.
+                        el.child(
+                            div()
+                                .relative()
+                                .mt_1()
+                                .child(self.bridge_status(Bridge::Offline, false, cx).opacity(0.))
+                                .child(status.absolute().inset_0()),
+                        )
                     }),
             )
             .child(
@@ -533,8 +581,8 @@ impl Onboarding {
             )
     }
 
-    fn bridge_status(&self, live: bool, cx: &Context<Self>) -> Div {
-        let (text, marker, color) = match self.bridge {
+    fn bridge_status(&self, bridge: Bridge, live: bool, cx: &Context<Self>) -> Div {
+        let (text, marker, color) = match bridge {
             Bridge::Checking => ("Checking Bridge…", "•", self.theme.dimmed),
             Bridge::Listening => ("Bridge is running", "✓", self.theme.success),
             Bridge::Offline => (
@@ -545,7 +593,6 @@ impl Onboarding {
         };
         let link_focused = live && self.control == Control::Install;
         div()
-            .mt_1()
             .flex()
             .items_start()
             .gap_1p5()
@@ -565,18 +612,24 @@ impl Onboarding {
                     .items_center()
                     .gap_x_1()
                     .child(self.meta(text).min_w_0().max_w_full())
-                    .when(self.bridge == Bridge::Offline, |el| {
-                        el.child(
-                            self.clickable(Control::Install, "Install Bridge ↗", live, cx)
-                                .text_size(px(self.theme.ui_px - 1.))
-                                .line_height(px(self.theme.ui_px + 4.))
-                                .text_color(rgb(self.theme.accent))
-                                .rounded_sm()
-                                .when(link_focused, |link| {
-                                    link.relative().child(focus_ring(self.theme.accent, 5.))
-                                })
-                                .child("Install Bridge ↗"),
-                        )
+                    .when(bridge == Bridge::Offline, |el| {
+                        let link = div()
+                            .text_size(px(self.theme.ui_px - 1.))
+                            .line_height(px(self.theme.ui_px + 4.))
+                            .text_color(rgb(self.theme.accent))
+                            .child("Install Bridge ↗");
+                        if live {
+                            el.child(
+                                self.clickable(Control::Install, "Install Bridge ↗", true, cx)
+                                    .rounded_sm()
+                                    .when(link_focused, |link| {
+                                        link.relative().child(focus_ring(self.theme.accent, 5.))
+                                    })
+                                    .child(link),
+                            )
+                        } else {
+                            el.child(link)
+                        }
                     }),
             )
     }
@@ -680,20 +733,7 @@ impl Onboarding {
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(self.label(label))
-                    .when(field == Field::Email, |el| {
-                        el.min_h(px(self.theme.ui_px + 4.))
-                            .child(self.feedback.email.paint(false, |issue, _| {
-                                div().children(issue.as_ref().map(|issue| self.field_issue(issue)))
-                            }))
-                    }),
-            )
+            .child(self.label(label))
             .child(
                 div()
                     .id(SharedString::from(format!("{field:?}")))
@@ -724,16 +764,32 @@ impl Onboarding {
                         cx,
                     ))),
             )
+            .when(field == Field::Email, |el| {
+                el.child(
+                    self.feedback
+                        .email
+                        .paint(false, |issue, _| {
+                            div().children(issue.as_ref().map(|issue| self.field_issue(issue)))
+                        })
+                        .min_h(px(self.theme.ui_px + 4.)),
+                )
+            })
     }
 
     fn field_border(&self, field: Field, focus: bool) -> u32 {
-        if self.form.issues.iter().any(|issue| issue.field == field) {
-            self.theme.error
-        } else if focus {
+        let regular = if focus {
             self.theme.accent
         } else {
             self.theme.input_border
-        }
+        };
+        let error = self.feedback.issue(field).map_or(0., |issue| {
+            if issue.value.is_some() {
+                1.
+            } else {
+                issue.clearing()
+            }
+        });
+        motion::mix(regular, self.theme.error, error)
     }
 
     fn label(&self, label: &'static str) -> Div {

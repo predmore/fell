@@ -94,6 +94,11 @@ pub struct StatusMotion {
     pub sync: f32,
 }
 
+struct BodyArrival {
+    fade: Transition,
+    height: Option<(f32, Transition)>,
+}
+
 /// What an overlay or which-key showed, kept from the frame before it
 /// closed: the key that closed it may already have cleared its query, so
 /// it fades out as it was, not as the session is now.
@@ -238,9 +243,10 @@ pub struct InboxMotion {
     /// that first draws them, so a late frame cannot eat it.
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
-    bodies: HashMap<String, (Transition, bool)>,
+    bodies: HashMap<String, BodyArrival>,
     /// Sent cards already laid out but hidden until the compose hand-off.
     messages_pending: HashSet<String>,
+    message_fades: HashMap<String, Transition>,
     /// The pending cards are painted at their starting opacity for this viewport.
     arrival_frame: Option<((Size<Pixels>, f32), u64)>,
     arrival_frame_id: u64,
@@ -380,6 +386,7 @@ impl InboxMotion {
             card_glide: None,
             bodies: HashMap::new(),
             messages_pending: HashSet::new(),
+            message_fades: HashMap::new(),
             arrival_frame: None,
             arrival_frame_id: 0,
             uncovered_size: None,
@@ -574,6 +581,7 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = true;
         self.bodies.clear();
+        self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
     }
@@ -610,6 +618,7 @@ impl InboxMotion {
         self.arrival_pending = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
+        self.message_fades.clear();
         self.messages_pending.clear();
         self.arrival_frame = None;
         self.quotes.transitions.clear();
@@ -681,10 +690,13 @@ impl InboxMotion {
         running |= keep_with(&mut self.overlay_out, now);
         running |= keep(&mut self.focus, now);
         running |= keep(&mut self.arrival, now);
-        self.bodies.retain(|_, (fade, _)| fade.running(now));
+        self.bodies.retain(|_, body| {
+            body.fade.running(now) || body.height.is_some_and(|(_, growth)| growth.running(now))
+        });
         running |= self.quotes.tick(now);
         running |= self.recipients.tick(now);
-        running |= !self.bodies.is_empty();
+        self.message_fades.retain(|_, fade| fade.running(now));
+        running |= !self.bodies.is_empty() || !self.message_fades.is_empty();
         if self.card_glide.is_some_and(|glide| !glide.running(now)) {
             self.card_glide = None;
         }
@@ -1122,16 +1134,13 @@ impl InboxMotion {
 
     /// A message's HTML body replaced the room kept for it, or its stored
     /// text, under a header already drawn: it settles in over [`motion::QUICK`].
-    pub fn body_arrived(&mut self, id: &str, now: Instant) {
-        if let Some(fade) = self.motion.start(motion::QUICK, now) {
+    pub fn body_arrived(&mut self, id: &str, height: Option<f32>, now: Instant) {
+        if !self.message_fades.contains_key(id)
+            && let Some(fade) = self.motion.start(motion::QUICK, now)
+        {
+            let height = height.map(|height| (height, Transition::new(now, motion::SLIDE)));
             self.bodies
-                .entry(id.to_string())
-                .and_modify(|(old, whole)| {
-                    if !*whole {
-                        *old = fade;
-                    }
-                })
-                .or_insert((fade, false));
+                .insert(id.to_string(), BodyArrival { fade, height });
         }
     }
 
@@ -1193,38 +1202,65 @@ impl InboxMotion {
         }
         self.arrival_frame = None;
         if let Some(fade) = self.motion.start(motion::FADE, now) {
-            self.bodies
-                .extend(self.messages_pending.drain().map(|id| (id, (fade, true))));
+            for id in self.messages_pending.drain() {
+                self.bodies.remove(&id);
+                self.message_fades.insert(id, fade);
+            }
         } else {
             self.messages_pending.clear();
         }
         true
     }
 
-    /// Opacity for each body or card still settling in, by message id.
-    pub fn arrival_alphas(&self, now: Instant, whole_card: bool) -> HashMap<String, f32> {
-        let mut alphas: HashMap<_, _> = self
-            .bodies
+    /// Opacity of each body still settling in, by message id.
+    pub fn body_alphas(&self, now: Instant) -> HashMap<String, f32> {
+        self.bodies
             .iter()
-            .filter(|(_, (_, whole))| *whole == whole_card)
-            .map(|(id, (fade, _))| {
-                let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
+            .map(|(id, body)| {
+                let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, body.fade.progress(now));
                 (id.clone(), alpha)
             })
-            .collect();
-        if whole_card {
-            let pending_alpha = match self.arrival_frame {
-                Some(_) if self.motion.enabled() => motion::ARRIVE_FROM,
-                Some(_) => 1.0,
-                None => 0.0,
-            };
-            alphas.extend(
-                self.messages_pending
-                    .iter()
-                    .map(|id| (id.clone(), pending_alpha)),
-            );
-        }
-        alphas
+            .collect()
+    }
+
+    pub fn card_alphas(&self, now: Instant) -> HashMap<String, f32> {
+        let pending_alpha = match self.arrival_frame {
+            Some(_) if self.motion.enabled() => motion::ARRIVE_FROM,
+            Some(_) => 1.0,
+            None => 0.0,
+        };
+        self.message_fades
+            .iter()
+            .map(|(id, fade)| {
+                (id.clone(), motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now)))
+            })
+            .chain(self.messages_pending.iter().map(|id| (id.clone(), pending_alpha)))
+            .collect()
+    }
+
+    pub fn body_heights(&self, now: Instant) -> HashMap<String, (f32, f32)> {
+        self.bodies
+            .iter()
+            .filter_map(|(id, body)| {
+                let (from, growth) = body.height?;
+                // A sync batch can grow several cards above the reader at
+                // once. Use the same gentler curve as a long scroll glide.
+                Some((
+                    id.clone(),
+                    (from, motion::ease_out_quad(growth.linear(now))),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn has_body_growth(&self) -> bool {
+        self.bodies.values().any(|body| body.height.is_some())
+    }
+
+    pub fn body_growth_running(&self, now: Instant) -> bool {
+        self.bodies
+            .values()
+            .any(|body| body.height.is_some_and(|(_, growth)| growth.running(now)))
     }
 
     /// History and recipients can open together with `q` or separately by
@@ -1741,7 +1777,7 @@ mod tests {
         let uncovered = (gpui::size(gpui::px(1200.), gpui::px(780.)), 1.0);
         motion.message_arrived("reply");
         assert!(motion.stage_arriving_messages(None).is_none());
-        assert_eq!(motion.arrival_alphas(now, true)["reply"], 0.0);
+        assert_eq!(motion.card_alphas(now)["reply"], 0.0);
 
         let old_frame = motion.stage_arriving_messages(Some(tiled)).unwrap();
         let resized_frame = motion.stage_arriving_messages(Some(uncovered)).unwrap();
@@ -1750,20 +1786,20 @@ mod tests {
         assert!(!motion.reveal_arriving_messages(uncovered, old_frame, presented));
         assert!(!motion.tick(presented));
         assert_eq!(
-            motion.arrival_alphas(presented, true)["reply"],
+            motion.card_alphas(presented)["reply"],
             motion::ARRIVE_FROM
         );
 
         let callback = later(presented, 40);
         assert!(motion.reveal_arriving_messages(uncovered, resized_frame, callback));
         assert_eq!(
-            motion.arrival_alphas(callback, true)["reply"],
+            motion.card_alphas(callback)["reply"],
             motion::ARRIVE_FROM
         );
         let halfway = later(callback, 60);
         assert!(motion.tick(halfway));
         assert!(
-            (motion::ARRIVE_FROM..1.0).contains(&motion.arrival_alphas(halfway, true)["reply"])
+            (motion::ARRIVE_FROM..1.0).contains(&motion.card_alphas(halfway)["reply"])
         );
         assert!(!motion.tick(later(callback, 120)));
     }
@@ -2168,10 +2204,10 @@ mod tests {
         motion.observe(&session, (false, true), now);
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
-        motion.body_arrived("a", now);
+        motion.body_arrived("a", None, now);
         session.quotes_open.insert("a".into());
         session.recipients_open.insert("a".into());
-        assert!(motion.arrival_alphas(now, false).is_empty());
+        assert!(motion.body_alphas(now).is_empty());
         let shown = motion.disclosures(&session, now);
         assert!(shown.quotes.is_empty() && shown.recipients.is_empty());
         assert!(!motion.tick(now));
@@ -2182,16 +2218,16 @@ mod tests {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
         let now = Instant::now();
-        motion.body_arrived("a", now);
+        motion.body_arrived("a", None, now);
         session.quotes_open.insert("b".into());
         session.recipients_open.insert("b".into());
-        assert_eq!(motion.arrival_alphas(now, false)["a"], motion::ARRIVE_FROM);
+        assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);
         let opening = motion.disclosures(&session, now);
         assert_eq!(opening.quotes["b"], 0.0);
         assert_eq!(opening.recipients["b"], 0.0);
 
         let mid = later(now, 40);
-        let alpha = motion.arrival_alphas(mid, false)["a"];
+        let alpha = motion.body_alphas(mid)["a"];
         assert!(alpha > motion::ARRIVE_FROM && alpha < 1.0, "{alpha}");
         assert!(motion.tick(mid));
         let shown = motion.disclosures(&session, mid);
@@ -2201,7 +2237,7 @@ mod tests {
         // The body is in after QUICK; both disclosures keep moving until SLIDE.
         let after = later(now, 90);
         assert!(motion.tick(after));
-        assert!(!motion.arrival_alphas(after, false).contains_key("a"));
+        assert!(!motion.body_alphas(after).contains_key("a"));
         assert!(motion.disclosures(&session, after).quotes["b"] > 0.9);
 
         let close = later(now, 130);

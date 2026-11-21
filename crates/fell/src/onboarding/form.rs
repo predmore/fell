@@ -459,10 +459,8 @@ impl Form {
                 ));
             }
             if port(&endpoint.port).is_none() {
-                self.issues.push(Issue::input(
-                    Field::Port(service),
-                    "Enter a port from 1 to 65535.",
-                ));
+                self.issues
+                    .push(Issue::input(Field::Port(service), "Port must be 1–65535."));
             }
         }
         if !self.issues.is_empty() {

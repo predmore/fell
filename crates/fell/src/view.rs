@@ -10,8 +10,9 @@ mod help;
 mod notification_actions;
 mod search;
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
@@ -68,7 +69,7 @@ use crate::ui_trace::UiTrace;
 use crate::worker::Worker;
 
 use self::agent_notes::NoteVisit;
-use self::disclosure::disclosure;
+use self::disclosure::{GrowingMessage, disclosure};
 
 pub fn run(demo: bool, trace_start: Option<Instant>) {
     fell_core::diagnostic!(INFO, "Opening inbox");
@@ -610,8 +611,15 @@ struct Inbox {
     setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
     first_preview: FirstPreview,
     first_sync: bool,
+    status_label: Option<StatusLabel>,
+    status_exit: Option<(StatusLabel, Transition)>,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
+    // Keep the extra scroll range on the first preview thread after input,
+    // so taking over the reader cannot clamp the viewport and jump.
+    preview_padding: bool,
+    preview_laid_out: bool,
+    preview_card_height: Rc<Cell<gpui::Pixels>>,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
     agents_scroll: ScrollHandle,
@@ -831,6 +839,8 @@ impl Inbox {
             setup_exit: None,
             first_preview: FirstPreview::Off,
             first_sync: false,
+            status_label: None,
+            status_exit: None,
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -838,6 +848,9 @@ impl Inbox {
             theme,
             list_scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
+            preview_padding: false,
+            preview_laid_out: false,
+            preview_card_height: Rc::default(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
             agents_scroll: ScrollHandle::new(),
@@ -1565,7 +1578,7 @@ impl Inbox {
                     quotes: self.session.quotes_open.clone(),
                     recipients: self.session.recipients_open.clone(),
                     arrival: self.motion.arrival(self.frame_now),
-                    alphas: self.motion.arrival_alphas(self.frame_now, false),
+                    alphas: self.motion.body_alphas(self.frame_now),
                     disclosures,
                 }));
             }
@@ -2270,16 +2283,27 @@ impl Inbox {
                             false
                         } else if same {
                             inbox.keep_shown_text(&mut view);
-                            let bottom = inbox.conversation_at_bottom();
+                            let preview = inbox.reveal == Reveal::Preview;
+                            let bottom = preview || inbox.conversation_at_bottom();
+                            let padding = inbox.preview_padding;
+                            let laid_out = inbox.preview_laid_out;
                             inbox.invalidate_conversation_layout();
-                            inbox.session.refresh_messages(view, bottom)
+                            inbox.preview_padding = padding;
+                            inbox.preview_laid_out = laid_out;
+                            let follow = inbox.session.refresh_messages(view, bottom);
+                            if preview {
+                                inbox.land_on_first_preview();
+                            }
+                            follow && !preview
                         } else {
                             inbox.invalidate_conversation_layout();
                             inbox.reveal = Reveal::Waiting;
                             inbox.motion.show_thread(&mut inbox.session, view);
                             // Keep the initial header landing while the
                             // preview's pending bodies fill in.
-                            if automatic || inbox.session.cursor_awaits_body() {
+                            if automatic {
+                                inbox.land_on_first_preview();
+                            } else if inbox.session.cursor_awaits_body() {
                                 inbox.landing.hold_opening(
                                     inbox
                                         .session
@@ -2350,7 +2374,7 @@ impl Inbox {
                         && old.body_state == fell_core::BodyState::Pending
                         && old.body_state != new.body_state
                 });
-        if downloaded {
+        if downloaded && self.reveal != Reveal::Preview {
             self.reveal.body_changed(
                 self.conv_layout_current
                     && present::conversation_fits(f32::from(self.conv_scroll.max_offset().height)),
@@ -3600,6 +3624,10 @@ impl Inbox {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let started = Instant::now();
+        if self.reveal == Reveal::Preview {
+            self.reader_took_over(false);
+            cx.notify();
+        }
         if self.session.search_editing() && self.search_edit_key(event, started, cx) {
             cx.stop_propagation();
             // Prepare the edited field as soon as input dispatch has
@@ -3986,6 +4014,11 @@ impl Inbox {
         self.note_visit = None;
         self.instant_conversation_scroll = false;
         self.sent_arrival_anchor = None;
+        self.preview_padding = false;
+        self.preview_laid_out = false;
+        if self.reveal == Reveal::Preview {
+            self.reveal = Reveal::Waiting;
+        }
         self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
@@ -3993,18 +4026,23 @@ impl Inbox {
 
     fn apply_body_refresh(&mut self, now: Instant) -> Option<ScrollAnchor> {
         // Let a keyboard glide finish in the geometry it was calculated from.
-        if self.motion.conv_glide.is_some() || self.body_refresh.is_empty() {
+        if self.motion.conv_glide.is_some() {
+            return None;
+        }
+        if self.body_refresh.is_empty() && !self.motion.has_body_growth() {
             return None;
         }
         let refresh = std::mem::take(&mut self.body_refresh);
-        self.conversation_revision = self.conversation_revision.wrapping_add(1);
-        if self.reveal.pending() || !refresh.rich.is_empty() {
+        if !refresh.is_empty() {
+            self.conversation_revision = self.conversation_revision.wrapping_add(1);
+        }
+        if !refresh.rich.is_empty() {
             self.reveal.body_changed(false);
         }
         if self.reveal.pending() {
             self.release_landing();
         }
-        let anchor = if self.conv_layout_current {
+        let anchor = if self.conv_layout_current && self.reveal != Reveal::Preview {
             self.reveal.body_anchor(
                 &self.conv_scroll,
                 self.session.message_cursor,
@@ -4013,25 +4051,47 @@ impl Inbox {
         } else {
             None
         };
+        if refresh.is_empty() {
+            return anchor;
+        }
         let selected = self.session.message_cursor;
         let rich_arrived = self
             .session
             .messages
             .get(selected)
             .is_some_and(|message| refresh.rich.contains_key(&message.id));
-        refresh.apply(&mut self.session, &mut self.motion, now);
+        let layout_current = self.conv_layout_current;
+        let scroll = &self.conv_scroll;
+        let padded_last = self
+            .preview_padding
+            .then(|| self.session.messages.len().saturating_sub(1));
+        let height = |index| {
+            if !layout_current {
+                return None;
+            }
+            let height = if padded_last == Some(index) {
+                self.preview_card_height.get()
+            } else {
+                scroll.bounds_for_item(index)?.size.height
+            };
+            (height > px(0.)).then(|| f32::from(height))
+        };
+        refresh.apply(&mut self.session, &mut self.motion, now, height);
         if rich_arrived && self.session.reveal_matching_quote(selected) {
             self.land_on_reader();
         }
         anchor
     }
 
-    /// The frame after bodies were filled in laid them out: glide to the
-    /// reader's message if its start is out of view. Nothing moves when it
-    /// shows already.
+    /// Once the new bodies are laid out, glide to the reader's message
+    /// if it is clipped. The first-run preview follows its growing cards
+    /// directly through its per-frame landing.
     fn reveal_reader(&mut self, window: &mut Window) {
         match self.reveal {
-            Reveal::Waiting | Reveal::Following(RevealPhase::Idle) | Reveal::Reading { .. } => {}
+            Reveal::Waiting
+            | Reveal::Preview
+            | Reveal::Following(RevealPhase::Idle)
+            | Reveal::Reading { .. } => {}
             Reveal::Following(RevealPhase::Laying) => {
                 self.reveal = Reveal::Following(RevealPhase::Ready);
                 window.request_animation_frame();
@@ -4047,10 +4107,9 @@ impl Inbox {
                 let view = self.conv_scroll.bounds();
                 let offset = f32::from(self.conv_scroll.offset().y);
                 let max = f32::from(self.conv_scroll.max_offset().height);
-                if let Some(to) = present::offset_to_show_start(
-                    f32::from(item.top()),
-                    f32::from(view.top()),
-                    f32::from(view.bottom()),
+                if let Some(to) = present::offset_to_show_message(
+                    (item.top().into(), item.bottom().into()),
+                    (view.top().into(), view.bottom().into()),
                     offset,
                     max,
                 ) {
@@ -4080,6 +4139,26 @@ impl Inbox {
                 .get(self.session.message_cursor)
                 .map(|message| message.id.as_str()),
         );
+    }
+
+    fn land_on_first_preview(&mut self) {
+        self.preview_padding = !self.session.messages.is_empty();
+        if self.preview_padding {
+            self.reveal = Reveal::Preview;
+            self.session.message_cursor = self.session.messages.len() - 1;
+            self.land_on_reader();
+        }
+    }
+
+    /// A narrow inbox can receive its first preview while the reader is
+    /// hidden. Opening that pane still gets its initial landing after the
+    /// key takes over, including the frame that learns its viewport height.
+    fn first_preview_layout(&mut self, visible: bool) -> Option<ScrollAnchor> {
+        if !visible || !self.preview_padding || self.preview_laid_out {
+            return None;
+        }
+        self.preview_laid_out = self.conv_scroll.bounds().size.height > px(0.);
+        Some(ScrollAnchor::landing(&self.session, self.reveal))
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
@@ -4443,7 +4522,7 @@ impl Render for Inbox {
             card_fit(&self.session, &picker_choices, &self.theme, window),
             now,
         );
-        if self.body_refresh.is_empty() {
+        if self.body_refresh.is_empty() && !self.motion.body_growth_running(now) {
             self.reveal_reader(window);
         }
         let layout_anchor = || {
@@ -4535,6 +4614,7 @@ impl Render for Inbox {
         }
         let returning = self.note_return(now);
         let viewing_note = visiting && returning.is_none();
+        let first_preview_layout = self.first_preview_layout(panes.1);
         let anchor = if viewing_note {
             // Keep the note's top while message bodies finish loading.
             if self.motion.conv_glide.is_none() {
@@ -4543,7 +4623,7 @@ impl Render for Inbox {
             }
             None
         } else {
-            arrival_anchor.or_else(|| self.hold_landing()).or_else(|| {
+            arrival_anchor.or_else(|| self.hold_landing()).or(first_preview_layout).or_else(|| {
                 anchor.or(note_anchor).map(|mut anchor| {
                     anchor.y -= band_delta;
                     anchor
@@ -4581,8 +4661,13 @@ impl Render for Inbox {
             note_expanded_in_band: !self.session.agent_notes.collapsed,
             hide_message_cursor: self.note_pin.eligible() && !self.message_selected(),
             return_glide: returning.map(|(_, glide)| glide),
-            alphas: self.motion.arrival_alphas(now, false),
-            card_alphas: self.motion.arrival_alphas(now, true),
+            card_alphas: self.motion.card_alphas(now),
+            alphas: self.motion.body_alphas(now),
+            heights: self.motion.body_heights(now),
+            preview_padding: self.preview_padding.then(|| PreviewPadding {
+                viewport: self.conv_scroll.bounds().size.height,
+                newest_height: self.preview_card_height.clone(),
+            }),
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
@@ -4598,6 +4683,13 @@ impl Render for Inbox {
             &self.motion.motion,
             now,
         );
+        let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
+            let selected = self.session.reply_target().filter(|_| {
+                self.open_thread.is_some() && self.open_thread == self.session.cursor_id
+            });
+            selected.and_then(|target| checks.for_message(&target.id))
+        });
+        let (label, label_exit) = self.status_label(reply_check, width, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
             | self.note_view.running()
@@ -4608,6 +4700,7 @@ impl Render for Inbox {
                 .is_some_and(|visit| visit.returning.is_some())
             | verify_pin
             | setup_frame.is_some()
+            | label_exit.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4702,12 +4795,6 @@ impl Render for Inbox {
         let subject = self.shown_subject();
         let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
         let cached_search_rows = self.search_rows_for(animating);
-        let reply_check = cx.try_global::<ReplyChecks>().and_then(|checks| {
-            let selected = self.session.reply_target().filter(|_| {
-                self.open_thread.is_some() && self.open_thread == self.session.cursor_id
-            });
-            selected.and_then(|target| checks.for_message(&target.id))
-        });
         let background = theme.background;
         let root = shell(
             theme,
@@ -4729,7 +4816,7 @@ impl Render for Inbox {
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
                 },
-                reply_check,
+                status_labels: (label, label_exit),
             },
             width,
             (list_width, split_width),
@@ -4810,7 +4897,7 @@ struct Shown {
     reader: ReaderLayout,
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
-    reply_check: Option<ReplyCheck>,
+    status_labels: (StatusLabel, Option<(StatusLabel, f32)>),
 }
 
 struct LeavingReader {
@@ -4861,6 +4948,8 @@ struct ConvFrame {
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
+    heights: HashMap<String, (f32, f32)>,
+    preview_padding: Option<PreviewPadding>,
     disclosures: Disclosures,
     /// The message held at its previous viewport position, or at the top on open.
     anchor: Option<ScrollAnchor>,
@@ -4889,6 +4978,24 @@ impl ConvFrame {
     }
 }
 
+struct PreviewPadding {
+    viewport: gpui::Pixels,
+    newest_height: Rc<Cell<gpui::Pixels>>,
+}
+
+impl PreviewPadding {
+    fn wrap_newest(&self, card: gpui::AnyElement) -> gpui::AnyElement {
+        let height = self.newest_height.clone();
+        // The difference between the pane and the card becomes space after
+        // the card in the same layout pass, even while the body is growing.
+        div()
+            .min_h(self.viewport)
+            .child(card)
+            .on_children_prepainted(move |bounds, _, _| height.set(bounds[0].size.height))
+            .into_any_element()
+    }
+}
+
 /// Observe GPUI's scroll offset before and after it handles a wheel event.
 /// The observer is painted before the scroll pane, so it runs after that
 /// pane in the bubble phase. Clamping here uses its current layout.
@@ -4906,7 +5013,10 @@ fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -
                     let over_reader = showing && scroll.bounds().contains(&event.position);
                     let moved = clamped_offset(&scroll) != before;
                     let _ = inbox.update(cx, |inbox, cx| {
-                        if over_reader && inbox.session.overlay == Overlay::None {
+                        if inbox.reveal == Reveal::Preview && inbox.session.overlay == Overlay::None
+                        {
+                            inbox.reader_took_over(false);
+                        } else if over_reader && inbox.session.overlay == Overlay::None {
                             if !moved {
                                 return;
                             }
@@ -4956,7 +5066,7 @@ fn shell(
         reader,
         cached_preview,
         list,
-        reply_check,
+        status_labels,
     } = shown;
     let frames = conv.frames.clone();
     let same_scope = session.search.is_none()
@@ -5231,7 +5341,7 @@ fn shell(
             &theme,
             session,
             status,
-            reply_check,
+            status_labels,
             width,
             window,
         ))
@@ -7004,6 +7114,7 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
 const CONVERSATION_RULE_PX: f32 = 2.;
 const CONVERSATION_PAD_PX: f32 = 20.;
 const CONVERSATION_BOTTOM_PX: f32 = 28.;
+const MESSAGE_GAP_PX: f32 = 8.;
 const MESSAGE_PAD_PX: f32 = 8.;
 const COLLAPSED_GAP_PX: f32 = 12.;
 const COLLAPSED_NARROW_GAP_PX: f32 = 8.;
@@ -7252,7 +7363,13 @@ impl BodyRefresh {
         self.messages.is_none() && self.rich.is_empty()
     }
 
-    fn apply(self, session: &mut Session, motion: &mut InboxMotion, now: Instant) {
+    fn apply(
+        self,
+        session: &mut Session,
+        motion: &mut InboxMotion,
+        now: Instant,
+        height: impl Fn(usize) -> Option<f32>,
+    ) {
         let mut rich = self.rich;
         if let Some(mut messages) = self.messages {
             for message in &mut messages {
@@ -7263,16 +7380,20 @@ impl BodyRefresh {
             let changed = present::bodies_filled(&session.messages, &messages)
                 .expect("a queued reread keeps the same message order");
             for index in changed {
-                motion.body_arrived(&messages[index].id, now);
+                let old_height = session.messages[index]
+                    .expanded
+                    .then(|| height(index))
+                    .flatten();
+                motion.body_arrived(&messages[index].id, old_height, now);
             }
             session.refresh_same_messages(messages);
         } else {
-            for message in &mut session.messages {
+            for (index, message) in session.messages.iter_mut().enumerate() {
                 if let Some(ready) = rich.remove(&message.id)
                     && ready != message.rich
                 {
                     if message.expanded {
-                        motion.body_arrived(&message.id, now);
+                        motion.body_arrived(&message.id, height(index), now);
                     }
                     message.rich = ready;
                 }
@@ -7352,7 +7473,7 @@ fn conversation(
     let hold = frame
         .anchor
         .filter(|_| leaving.is_none() && scroll.is_some() && chip_probe.is_none())
-        .map(|anchor| MessageProbes::new(anchor, shown.len()));
+        .map(|anchor| MessageProbes::new(anchor, shown.len(), frame.return_glide));
     let collapsed_rows = OnceCell::new();
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     // Short subjects keep their one-line measure in both modes.
@@ -7360,6 +7481,7 @@ fn conversation(
         let style = conversation_line_style(window, theme, px(theme.ui_px + 11.0));
         line_px_with_style(window, &style, &subject, FontWeight::BOLD).ceil() + 4.0
     });
+    let padding = frame.preview_padding.as_ref().filter(|_| scroll.is_some());
     let messages: Vec<_> = shown
         .iter()
         .enumerate()
@@ -7405,6 +7527,23 @@ fn conversation(
             } else {
                 block
             };
+            let block = match frame.heights.get(&message.id) {
+                Some(&(from, progress)) if progress < 1.0 && message.expanded => GrowingMessage {
+                    inner: block,
+                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                    from,
+                    progress,
+                    gap: px(MESSAGE_GAP_PX),
+                }
+                .into_any_element(),
+                _ => block,
+            };
+            let block =
+                if let Some(padding) = padding.filter(|_| index + 1 == shown.len()) {
+                    padding.wrap_newest(block)
+                } else {
+                    block
+                };
             match &hold {
                 Some(probes) => probes.wrap(index, block),
                 None => block,
@@ -7509,8 +7648,8 @@ fn conversation(
                 scroll,
                 hold,
                 chip_probe,
+                padding.map(|padding| padding.viewport),
                 arrival,
-                frame.return_glide,
                 frame.frames.clone(),
                 )
             }
@@ -7536,11 +7675,24 @@ fn conversation_body(
     scroll: Option<ScrollHandle>,
     hold: Option<MessageProbes>,
     chip_probe: Option<LayoutSlot>,
+    preview_viewport: Option<gpui::Pixels>,
     arrival: f32,
-    return_glide: Option<LandingGlide>,
     frames: Option<SharedFrameLog>,
 ) -> gpui::AnyElement {
+    let bottom = px(if preview_viewport.is_some() {
+        0.
+    } else {
+        CONVERSATION_BOTTOM_PX
+    });
+    let resize = preview_viewport.zip(scroll.clone());
     let body = div()
+        .when_some(resize, |body, (height, scroll)| {
+            body.on_children_prepainted(move |_, window, _| {
+                if scroll.bounds().size.height != height {
+                    window.request_animation_frame();
+                }
+            })
+        })
         .id("conversation-scroll")
         .flex_1()
         .min_h(px(0.))
@@ -7549,14 +7701,12 @@ fn conversation_body(
             None => body.overflow_hidden(),
         })
         .px(px(CONVERSATION_PAD_PX))
-        .pb(px(CONVERSATION_BOTTOM_PX))
+        .pb(bottom)
         .when(arrival < 1.0, |body| body.opacity(arrival))
         .children(children)
         .into_any_element();
     match (scroll, hold, chip_probe) {
-        (Some(scroll), Some(hold), _) => hold
-            .hold(body, scroll, px(CONVERSATION_BOTTOM_PX), return_glide, frames)
-            .into_any_element(),
+        (Some(scroll), Some(hold), _) => hold.hold(body, scroll, bottom, frames).into_any_element(),
         (Some(scroll), _, Some(probe)) => {
             LandingHold::reveal(body, scroll, probe, frames).into_any_element()
         }
@@ -7943,7 +8093,7 @@ fn expanded_message(
         .id(gpui::ElementId::named_usize("message", index))
         .px(px(MESSAGE_PAD_PX))
         .py(px(10.))
-        .mb(px(8.))
+        .mb(px(MESSAGE_GAP_PX))
         .relative()
         .child(
             div()
@@ -8652,6 +8802,82 @@ fn recipient_lines(
         .into_any_element()
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct StatusLabel {
+    text: String,
+    color: u32,
+}
+
+impl StatusLabel {
+    fn new(theme: &Theme, session: &Session, reply_check: Option<ReplyCheck>, width: f32) -> Self {
+        let (text, color) = match reply_check {
+            Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
+            Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
+            Some(ReplyCheck::Unavailable) => {
+                let key = keymap::binding_text(&session.keymap, Action::SyncNow);
+                let label = if width < present::NARROW_WIDTH {
+                    format!("Retry Reply-To · {key}")
+                } else {
+                    format!("Reply-To unavailable · {key} to retry")
+                };
+                (label, theme.error)
+            }
+            Some(ReplyCheck::Verified) => (
+                format!(
+                    "Reply-To verified · {} to reply",
+                    keymap::binding_text(&session.keymap, Action::Reply)
+                ),
+                theme.accent,
+            ),
+            None => (
+                session.sync.status(),
+                if session.sync.is_error() {
+                    theme.error
+                } else {
+                    theme.dimmed
+                },
+            ),
+        };
+        Self { text, color }
+    }
+
+    fn draw(self) -> gpui::Div {
+        div()
+            .whitespace_nowrap()
+            .text_color(rgb(self.color))
+            .child(self.text)
+    }
+}
+
+impl Inbox {
+    fn status_label(
+        &mut self,
+        reply_check: Option<ReplyCheck>,
+        width: f32,
+        now: Instant,
+    ) -> (StatusLabel, Option<(StatusLabel, f32)>) {
+        let next = StatusLabel::new(&self.theme, &self.session, reply_check, width);
+        if self.status_label.as_ref() != Some(&next) {
+            let old = self.status_label.replace(next.clone());
+            // When progress advances twice inside a fade, depart from the
+            // label with the greater opacity on the last frame.
+            let old = match self.status_exit.take() {
+                Some((leaving, fade)) if fade.progress(now) < 0.5 => Some(leaving),
+                _ => old,
+            };
+            self.status_exit = old.zip(self.motion.motion.start(motion::FADE, now));
+        }
+        let outgoing = self.status_exit.as_ref().and_then(|(prior, fade)| {
+            fade.running(now)
+                .then(|| (prior.clone(), fade.progress(now)))
+        });
+        if outgoing.is_none() {
+            self.status_exit = None;
+        }
+        (next, outgoing)
+    }
+}
+
 /// Mode, sync state and one notice. At rest there are no key hints
 /// (docs/ux.md, Quiet): the right side shows only what the reader is
 /// typing, a count or a chord's prefix, while which-key lists the rest.
@@ -8659,7 +8885,7 @@ fn status_bar(
     theme: &Theme,
     session: &Session,
     status: StatusMotion,
-    reply_check: Option<ReplyCheck>,
+    (label, outgoing): (StatusLabel, Option<(StatusLabel, f32)>),
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -8691,57 +8917,18 @@ fn status_bar(
     let outage = session.worker_outage();
     let sync_hint =
         outage.map(|_| keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog));
-    let (sync_label, sync_color) = if let Some(worker) = outage {
-        (worker.outage_notice().to_string(), theme.error)
-    } else {
-        match reply_check {
-            Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
-            Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
-            Some(ReplyCheck::Unavailable) => {
-                let key = keymap::binding_text(&session.keymap, Action::SyncNow);
-                let label = if width < present::NARROW_WIDTH {
-                    format!("Retry Reply-To · {key}")
-                } else {
-                    format!("Reply-To unavailable · {key} to retry")
-                };
-                (label, theme.error)
-            }
-            Some(ReplyCheck::Verified) => (
-                format!(
-                    "Reply-To verified · {} to reply",
-                    keymap::binding_text(&session.keymap, Action::Reply)
-                ),
-                theme.accent,
-            ),
-            None => (
-                session.sync.status(),
-                if session.sync.is_error() {
-                    theme.error
-                } else {
-                    theme.dimmed
-                },
-            ),
-        }
-    };
-    // Reserve a stable slot through routine sync passes. Progress and
-    // recovery guidance can use more space when they have more to say.
-    let steady_sync = outage.is_none()
-        && reply_check.is_none()
-        && matches!(
-            session.sync,
-            SyncKind::Connecting
-                | SyncKind::Syncing { progress: None, .. }
-                | SyncKind::Synced { .. }
-        );
-    let sync_width = if steady_sync {
-        bar_px(window, "synced just now · 0000 new", size, ui)
-    } else {
-        bar_px(window, &sync_label, size, ui)
-    };
     let details = outage.is_none() && session.detail_text().is_some();
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
+    let sync_width = if let Some(worker) = outage {
+        bar_px(window, worker.outage_notice(), size, ui)
+    } else {
+        let sync_width = bar_px(window, &label.text, size, ui);
+        outgoing.as_ref().map_or(sync_width, |(old, progress)| {
+            motion::lerp(bar_px(window, &old.text, size, ui), sync_width, *progress)
+        })
+    };
     let dot = bar_px(window, "·", size, ui);
     let mut used = 28.0 + 2.0 * 12.0 + 2.0;
     used += bar_px(window, session.mode_label(), size, mono) + dot;
@@ -8783,6 +8970,28 @@ fn status_bar(
                 text.relative().top(px(motion::snap(dy, scale)))
             })
             .child(status_text(text, hint, theme))
+    };
+    let draw_sync = || {
+        if let Some(worker) = outage {
+            div()
+                .text_color(rgb(theme.error))
+                .opacity(status.sync_opacity)
+                .child(status_text(
+                    worker.outage_notice().to_string(),
+                    sync_hint.as_deref().map(|key| (key, " for log")),
+                    theme,
+                ))
+        } else {
+            match &outgoing {
+                Some((old, progress)) => div()
+                    .relative()
+                    .w(px(sync_width))
+                    .overflow_hidden()
+                    .child(label.clone().draw().opacity(*progress))
+                    .child(old.clone().draw().absolute().inset_0().opacity(1.0 - progress)),
+                None => label.clone().draw().opacity(status.sync_opacity),
+            }
+        }
     };
     let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
@@ -8830,25 +9039,7 @@ fn status_bar(
         )
         .when(!narrow, |bar| {
             bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
-                .child(
-                    div()
-                        .flex_none()
-                        .when(steady_sync, |slot| {
-                            slot.w(px(sync_width))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                        })
-                        .text_color(rgb(sync_color))
-                        .when(status.sync_opacity < 1.0, |label| {
-                            label.opacity(status.sync_opacity)
-                        })
-                        .child(status_text(
-                            sync_label.clone(),
-                            sync_hint.as_deref().map(|key| (key, " for log")),
-                            theme,
-                        )),
-                )
+                .child(draw_sync().flex_none())
         })
         .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
@@ -8883,18 +9074,8 @@ fn status_bar(
                             .inset_0()
                             .flex()
                             .items_center()
-                            .opacity(status.sync * status.sync_opacity)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(rgb(sync_color))
-                                    .child(status_text(
-                                        sync_label,
-                                        sync_hint.as_deref().map(|key| (key, " for log")),
-                                        theme,
-                                    )),
-                            ),
+                            .opacity(status.sync)
+                            .child(draw_sync().min_w_0().truncate()),
                     )
                 })
                 .when_some(text, |cell, (toast, opacity, dy)| {
@@ -10261,7 +10442,9 @@ mod tests {
         use std::path::PathBuf;
         use std::rc::Rc;
 
-        use super::{MessageProbes, ReaderLanding, ScrollAnchor, conversation_body};
+        use super::{
+            MessageProbes, PreviewPadding, ReaderLanding, ScrollAnchor, conversation_body,
+        };
         use gpui::{App, Context, IntoElement, Render, ScrollHandle, Window, div, prelude::*, px};
 
         let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
@@ -10278,7 +10461,8 @@ mod tests {
             heights: &'static [f32],
             automatic: bool,
             pending: bool,
-            expected_header: usize,
+            expected_header: Option<usize>,
+            newest_height: Rc<Cell<gpui::Pixels>>,
             scroll: ScrollHandle,
         }
 
@@ -10290,11 +10474,11 @@ mod tests {
                     .flex()
                     .children(self.0.iter().enumerate().map(|(index, case)| {
                         let mut landing = ReaderLanding::default();
-                        if case.automatic {
-                            landing.hold_opening(Some("newest"));
-                        } else {
-                            landing.hold(Some("newest"));
-                        }
+                        landing.hold(Some("newest"));
+                        let padding = case.automatic.then(|| PreviewPadding {
+                            viewport: px(300.),
+                            newest_height: case.newest_height.clone(),
+                        });
                         let anchor = landing
                             .anchor(
                                 Some("newest"),
@@ -10306,13 +10490,19 @@ mod tests {
                                 false,
                             )
                             .unwrap();
-                        let probes = MessageProbes::new(anchor, case.heights.len());
+                        let probes = MessageProbes::new(anchor, case.heights.len(), None);
                         let cards = case
                             .heights
                             .iter()
                             .enumerate()
                             .map(|(index, height)| {
                                 let card = div().h(px(*height)).mb(px(8.)).into_any_element();
+                                let card = match &padding {
+                                    Some(padding) if index + 1 == case.heights.len() => {
+                                        padding.wrap_newest(card)
+                                    }
+                                    _ => card,
+                                };
                                 probes.wrap(index, card)
                             })
                             .collect();
@@ -10327,6 +10517,7 @@ mod tests {
                                 Some(case.scroll.clone()),
                                 Some(probes),
                                 None,
+                                padding.map(|padding| padding.viewport),
                                 1.,
                                 None,
                             ))
@@ -10342,10 +10533,11 @@ mod tests {
                     cx.new(|_| {
                         Landings(
                             [
-                                (&[160., 90., 200., 80.][..], true, false, 2),
-                                (&[160., 90., 200., 68.][..], false, true, 2),
-                                (&[60., 80.][..], true, false, 0),
-                                (&[160., 400.][..], true, false, 1),
+                                (&[160., 90., 200., 80.][..], true, false, Some(3)),
+                                (&[160., 90., 200., 68.][..], false, true, Some(2)),
+                                (&[60., 80.][..], true, false, Some(1)),
+                                (&[160., 400.][..], true, false, Some(1)),
+                                (&[60., 280., 40.][..], false, true, None),
                             ]
                             .into_iter()
                             .map(|(heights, automatic, pending, expected_header)| Case {
@@ -10354,6 +10546,7 @@ mod tests {
                                 pending,
                                 expected_header,
                                 scroll: ScrollHandle::new(),
+                                newest_height: Rc::default(),
                             })
                             .collect(),
                         )
@@ -10372,15 +10565,28 @@ mod tests {
                                 window.draw(cx).clear();
                                 for case in &entity.read(cx).0 {
                                     let view = case.scroll.bounds();
-                                    let header =
-                                        case.scroll.bounds_for_item(case.expected_header).unwrap();
                                     let newest = case
                                         .scroll
                                         .bounds_for_item(case.heights.len() - 1)
                                         .unwrap();
                                     let offset = case.scroll.offset().y;
-                                    assert_eq!(header.top() + offset, view.top());
-                                    assert!(newest.top() + offset < view.bottom());
+                                    if let Some(header) = case.expected_header {
+                                        let header = case.scroll.bounds_for_item(header).unwrap();
+                                        assert_eq!(header.top() + offset, view.top());
+                                    } else {
+                                        assert_eq!(offset, -case.scroll.max_offset().height);
+                                        assert_eq!(offset, px(-124.));
+                                    }
+                                    let height = *case.heights.last().unwrap();
+                                    if case.automatic {
+                                        assert_eq!(case.newest_height.get(), px(height));
+                                    }
+                                    if px(height) <= view.size.height {
+                                        assert!(
+                                            newest.top() + offset + px(height) <= view.bottom()
+                                        );
+                                    }
+                                    assert!(newest.top() + offset >= view.top());
                                     assert!(offset >= -case.scroll.max_offset().height);
                                 }
                                 completed.set(true);

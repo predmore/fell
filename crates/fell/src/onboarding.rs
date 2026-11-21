@@ -41,8 +41,9 @@ enum Control {
     Inline,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Bridge {
+    #[default]
     Checking,
     Listening,
     Offline,
@@ -370,7 +371,9 @@ impl Onboarding {
                     config,
                     result,
                 };
-                if returning_to_fields && view.motion.enabled() {
+                if returning_to_fields
+                    && (view.motion.enabled() || view.form.checks == [Check::Failed; 2])
+                {
                     // Paint both final sign-in results before the test page
                     // gives way to the field that needs attention.
                     view.checked = Some(check);

@@ -117,6 +117,8 @@ pub(super) fn clamped_offset(scroll: &ScrollHandle) -> Pixels {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reveal {
     Waiting,
+    /// First-run preview follows the newest header as its thread fills in.
+    Preview,
     Following(RevealPhase),
     /// Hold a selected message after message navigation, or the first visible
     /// message after scrolling.
@@ -202,13 +204,22 @@ fn offset_to_header(
         return target.max(limit);
     }
 
-    // Start on the closest earlier header that still shows the selected
-    // message. A long intervening body may leave no such header reachable.
+    // Start on the closest earlier header that still shows the whole
+    // selected message, or its start when it cannot fit in the pane.
+    let fits = item.size.height <= view.size.height;
     headers
         .iter()
         .rev()
         .map(|header| offset_to_hold(view, *header, y))
-        .find(|offset| *offset >= limit && *offset < px(0.) && item.top() + *offset < view.bottom())
+        .find(|offset| {
+            *offset >= limit
+                && *offset < px(0.)
+                && if fits {
+                    item.bottom() + *offset <= view.bottom()
+                } else {
+                    item.top() + *offset < view.bottom()
+                }
+        })
         .unwrap_or(limit)
 }
 
@@ -230,12 +241,13 @@ pub(super) type LayoutSlot = Rc<Cell<Option<LayoutId>>>;
 /// that determine the scroll div's max offset, including its last card.
 pub(super) struct MessageProbes {
     anchor: ScrollAnchor,
+    glide: Option<LandingGlide>,
     selected: LayoutSlot,
     headers: Vec<LayoutSlot>,
 }
 
 impl MessageProbes {
-    pub fn new(anchor: ScrollAnchor, count: usize) -> Self {
+    pub fn new(anchor: ScrollAnchor, count: usize, glide: Option<LandingGlide>) -> Self {
         let headers: Vec<_> = if anchor.snap_headers {
             (0..count).map(|_| LayoutSlot::default()).collect()
         } else {
@@ -244,6 +256,7 @@ impl MessageProbes {
         let selected = headers.get(anchor.index).cloned().unwrap_or_default();
         Self {
             anchor,
+            glide,
             selected,
             headers,
         }
@@ -269,7 +282,6 @@ impl MessageProbes {
         inner: AnyElement,
         scroll: ScrollHandle,
         bottom_padding: Pixels,
-        glide: Option<LandingGlide>,
         frames: Option<SharedFrameLog>,
     ) -> LandingHold {
         LandingHold {
@@ -279,7 +291,7 @@ impl MessageProbes {
             bottom_padding,
             scroll,
             y: Some(self.anchor.y),
-            glide,
+            glide: self.glide,
             frames,
         }
     }
@@ -580,6 +592,20 @@ mod tests {
         assert_eq!(
             offset_to_header(view, newest, px(0.), &[oldest, newest], px(28.)),
             px(-176.),
+        );
+    }
+
+    #[test]
+    fn header_landing_uses_the_limit_when_an_earlier_header_cuts_off_newest_mail() {
+        let view = vertical_bounds(0., 300.);
+        let cards = [
+            vertical_bounds(0., 60.),
+            vertical_bounds(68., 280.),
+            vertical_bounds(356., 40.),
+        ];
+        assert_eq!(
+            offset_to_header(view, cards[2], px(0.), &cards, px(28.)),
+            px(-124.),
         );
     }
 
