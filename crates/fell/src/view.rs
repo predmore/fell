@@ -3445,7 +3445,7 @@ impl Render for Inbox {
         shell(
             theme,
             &self.session,
-            &self.motion,
+            &mut self.motion,
             now,
             Shown {
                 subject,
@@ -3573,7 +3573,7 @@ fn observe_wheel(scroll: ScrollHandle, showing: bool, cx: &mut Context<Inbox>) -
 fn shell(
     theme: Theme,
     session: &Session,
-    motion: &InboxMotion,
+    motion: &mut InboxMotion,
     now: Instant,
     shown: Shown,
     width: f32,
@@ -3843,7 +3843,6 @@ fn fit_folder_path(
         .or_else(|| fit(&format!("…/{leaf}")))
 }
 
-#[derive(PartialEq)]
 struct HeaderAccount {
     name: Option<SharedString>,
     email: Option<SharedString>,
@@ -3881,7 +3880,7 @@ impl HeaderAccount {
         }
     }
 
-    fn render(self, theme: &Theme, gap: f32, email_opacity: f32) -> gpui::Div {
+    fn render(self, theme: &Theme, gap: f32, [name_opacity, email_opacity]: [f32; 2]) -> gpui::Div {
         div()
             .flex_none()
             .flex()
@@ -3893,6 +3892,7 @@ impl HeaderAccount {
                     .whitespace_nowrap()
                     .when(self.quiet, |label| label.text_color(rgb(theme.dimmed)))
                     .when(!self.quiet, |label| label.font_weight(FontWeight::SEMIBOLD))
+                    .opacity(name_opacity)
                     .child(name)
             }))
             .children(self.email.map(|email| {
@@ -3910,7 +3910,7 @@ fn header(
     theme: &Theme,
     session: &Session,
     folder: &str,
-    motion: &InboxMotion,
+    motion: &mut InboxMotion,
     now: Instant,
     width: f32,
     window: &Window,
@@ -4010,36 +4010,25 @@ fn header(
 
     let (current, current_width) =
         folder_group(folder, session.unread_threads(), motion.unread_count(now));
-    let leaving = motion.folder_header(now).map(|(old, unread, time)| {
-        let (group, width) = folder_group(old, unread, None);
-        (group, width, time)
-    });
+    let fade = motion.folder_header();
+    let leaving = fade
+        .as_ref()
+        .map(|fade| folder_group(&fade.folder, fade.unread, None));
+    let old_width = leaving.as_ref().map_or(current_width, |(_, width)| *width);
+    let (outgoing, incoming) = fade
+        .as_ref()
+        .map_or((0., 1.), |fade| fade.label_opacities(now));
     let account = HeaderAccount::fit(session, room - current_width, COUNT_GAP, &fit);
-    let (old_width, time) = leaving
-        .as_ref()
-        .map_or((current_width, 1.), |(_, w, t)| (*w, *t));
-    let old = leaving
-        .as_ref()
-        .map(|_| HeaderAccount::fit(session, room - old_width, COUNT_GAP, &fit))
-        .filter(|old| *old != account);
     // Each account fit shares its half of the fade with its folder. This
     // keeps both fits at their own widths and the right edge anchored.
-    let outgoing = motion::fade_out(2. * time);
-    let incoming = motion::ease_out_quad(2. * time - 1.);
-    let (account, account_opacity, email_opacity) = if let Some(old) = old {
-        let same_name = old.name == account.name && old.quiet == account.quiet;
-        let (shown, opacity) = if time < 0.5 {
-            (old, outgoing)
-        } else {
-            (account, incoming)
-        };
-        if same_name {
-            (shown, 1., opacity)
-        } else {
-            (shown, opacity, 1.)
-        }
+    let (account, account_opacities) = if let Some(fade) = fade {
+        let old = HeaderAccount::fit(session, room - old_width, COUNT_GAP, &fit);
+        let name_changes = old.name != account.name || old.quiet != account.quiet;
+        let email_changes = name_changes || old.email != account.email;
+        let (leaving, opacities) = fade.account_frame([name_changes, email_changes], now);
+        (if leaving { old } else { account }, opacities)
     } else {
-        (account, 1., 1.)
+        (account, [1.; 2])
     };
     let folder_slot = |group: gpui::Div, width: f32| {
         div()
@@ -4060,13 +4049,11 @@ fn header(
         .border_b(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
-        .child(
-            div().flex_1().min_w_0().flex().child(
-                account
-                    .render(theme, COUNT_GAP, email_opacity)
-                    .opacity(account_opacity),
-            ),
-        )
+        .child(div().flex_1().min_w_0().flex().child(account.render(
+            theme,
+            COUNT_GAP,
+            account_opacities,
+        )))
         .child(
             div()
                 .flex_none()
@@ -4076,7 +4063,7 @@ fn header(
                 .flex()
                 .justify_end()
                 .child(folder_slot(current, current_width).opacity(incoming))
-                .children(leaving.map(|(old, width, _)| {
+                .children(leaving.map(|(old, width)| {
                     folder_slot(old, width)
                         .absolute()
                         .right_0()
