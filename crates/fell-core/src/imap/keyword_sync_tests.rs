@@ -4,7 +4,62 @@ use crate::{FlagChange, LabelChange, MessageId, Store, sync_once};
 
 use super::sync_tests::{account, commands, config, sample_state, unused_smtp};
 use super::test_server::{TestServer, TestState, raw_message};
-use super::{decode_cursor, encode_cursor};
+use super::{decode_cursor, encode_cursor, is_reserved_keyword};
+
+#[test]
+fn reserved_keywords_match_exact_atoms_without_case() {
+    for flag in [
+        r"\Seen",
+        "$fOrWaRdEd",
+        "$MDNSent",
+        "$SubmitPending",
+        "$Submitted",
+        "$Junk",
+        "$NotJunk",
+        "$Phishing",
+        "$Important",
+        "$Draft",
+        "$Seen",
+        "$Flagged",
+        "$Answered",
+        "$Recent",
+        "$AutoSent",
+        "$CanUnsubscribe",
+        "$Followed",
+        "$HasAttachment",
+        "$HasMemo",
+        "$HasNoAttachment",
+        "$Imported",
+        "$IsTrusted",
+        "$MailFlagBit0",
+        "$MailFlagBit1",
+        "$MailFlagBit2",
+        "$MaskedEmail",
+        "$Memo",
+        "$Muted",
+        "$New",
+        "$Notify",
+        "$Unsubscribed",
+        "forwarded",
+        "redirected",
+        "JUNK",
+        "NonJunk",
+        "notjunk",
+    ] {
+        assert!(is_reserved_keyword(flag), "{flag}");
+    }
+    for label in [
+        "Travel",
+        "$Travel",
+        "$ForwardedToTeam",
+        "$ImportantProject",
+        "$MailFlagBit3",
+        "$label1",
+        "$Label5",
+    ] {
+        assert!(!is_reserved_keyword(label), "{label}");
+    }
+}
 
 fn keyword_state(with_sent_copy: bool) -> TestState {
     let mut state = sample_state();
@@ -602,6 +657,61 @@ fn changed_since_adds_and_removes_keywords_with_local_labels_and_flag_intents() 
 }
 
 #[test]
+fn reserved_imap_keywords_are_stored_without_becoming_labels() {
+    let server = TestServer::spawn(keyword_state(false));
+    set_flags(&server, "INBOX", 1, &["$Forwarded", "$Travel", "$Label1"]);
+    let acct = account("imap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let stored_flags = || {
+        store
+            .conn
+            .query_row("SELECT keywords FROM message_copies", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(stored_flags(), "$Forwarded\u{1e}$Travel\u{1e}$Label1");
+    assert_eq!(store.list_labels(&acct.id).unwrap(), ["$Label1", "$Travel"]);
+    let thread = &store.folder_threads(&acct.id, "INBOX").unwrap()[0].thread_id;
+    assert!(
+        store
+            .add_thread_label(&acct.id, thread, "$fOrWaRdEd", "agent")
+            .is_err()
+    );
+    assert!(
+        store
+            .remove_thread_label(&acct.id, thread, "Junk", "agent")
+            .is_err()
+    );
+    assert!(
+        store
+            .label_thread(&acct.id, thread, LabelChange::Add("$Junk".into()))
+            .is_err()
+    );
+
+    set_flags(&server, "INBOX", 2, &["$MDNSent", "$Travel"]);
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_flag_only(&server);
+    assert_eq!(stored_flags(), "$MDNSent\u{1e}$Travel");
+    let rows = store.folder_threads(&acct.id, "INBOX").unwrap();
+    assert_eq!(rows[0].labels, ["$Travel"]);
+    assert_eq!(store.list_labels(&acct.id).unwrap(), ["$Travel"]);
+    assert!(
+        store
+            .search(&acct.id, "label:$MDNSent")
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_keyword_survives_until_its_last_copy_loses_it() {
     let server = TestServer::spawn(keyword_state(true));
     let acct = account("imap", BackendKind::Imap);
@@ -672,12 +782,15 @@ fn the_flag_baseline_updates_an_upgraded_row_and_keeps_legacy_labels() {
         let mut delta = backend.fetch_changes(None).unwrap();
         // The old backend sent initial labels on the message only.
         delta.flags.clear();
+        delta.messages[0].labels.push("$Forwarded".into());
         store.apply_delta(&acct.id, &delta).unwrap();
         store
             .conn
             .execute_batch(
                 "ALTER TABLE message_copies DROP COLUMN keywords;
-             DROP TABLE message_keyword_labels;",
+                 DROP TABLE message_keyword_labels;
+                 DROP TABLE legacy_imap_keywords;
+                 DELETE FROM meta WHERE key = 'reserved_imap_labels_v1';",
             )
             .unwrap();
     }
@@ -689,6 +802,16 @@ fn the_flag_baseline_updates_an_upgraded_row_and_keeps_legacy_labels() {
             .unwrap()
             .unwrap()
     };
+    assert_eq!(message().labels, ["work"]);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT keywords FROM legacy_imap_keywords", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "$Forwarded"
+    );
     server.state.lock().unwrap().condstore = true;
     set_flags(&server, "INBOX", 2, &["fresh"]);
     sync_once(&acct, &backend, &store).unwrap();
@@ -713,7 +836,7 @@ fn bridge_keeps_mailbox_labels_when_copy_flags_change() {
         .iter_mut()
         .find(|entry| entry.name == "Sent")
         .unwrap()
-        .name = "Labels/Projects".into();
+        .name = "Labels/$Forwarded".into();
     let server = TestServer::spawn(state);
     let acct = account("bridge", BackendKind::Bridge);
     let backend = BridgeBackend {
@@ -726,7 +849,7 @@ fn bridge_keeps_mailbox_labels_when_copy_flags_change() {
     let id = MessageId::new("root@x");
     let before = store.message(&acct.id, &id).unwrap().unwrap();
     assert_eq!(before.folders, ["INBOX"]);
-    assert!(before.labels.iter().any(|label| label == "Projects"));
+    assert!(before.labels.iter().any(|label| label == "$Forwarded"));
 
     set_flags(&server, "INBOX", 2, &["outside"]);
     sync_once(&acct, &backend, &store).unwrap();

@@ -1233,6 +1233,48 @@ mod tests {
     use fell_core::message::Address;
     use fell_core::{AccountId, MessageHeaders, MessageId, RemoteId, ThreadId};
 
+    #[test]
+    fn imap_thread_chips_only_receive_user_labels() {
+        use fell_core::backend::FlagUpdate;
+        use fell_core::{Account, BackendKind, MailboxDelta, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let account = Account {
+            id: AccountId("imap".into()),
+            display_name: "Test".into(),
+            email: "me@example.com".into(),
+            backend_kind: BackendKind::Imap,
+        };
+        store.upsert_account(&account).unwrap();
+        let mut message = addressed("sender@example.com", &[], &[], &[]);
+        message.account_id = account.id.clone();
+        message.remote_id = RemoteId("imap:1:1:INBOX".into());
+        message.folders = vec!["INBOX".into()];
+        store
+            .apply_delta(
+                &account.id,
+                &MailboxDelta {
+                    flags: vec![FlagUpdate {
+                        remote_id: message.remote_id.clone(),
+                        unread: None,
+                        flagged: None,
+                        keywords: Some(vec![
+                            "$Forwarded".into(),
+                            "Travel".into(),
+                            "$Projects".into(),
+                        ]),
+                        modseq: None,
+                    }],
+                    messages: vec![message],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let threads = store.folder_threads(&account.id, "INBOX").unwrap();
+        let rows = thread_rows(&threads, &account.email);
+        assert_eq!(rows[0].labels, ["Travel", "$Projects"]);
+    }
+
     fn shown_message(id: &str, state: fell_core::BodyState, body: &str) -> ConvMessage {
         ConvMessage {
             id: id.into(),

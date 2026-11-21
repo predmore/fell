@@ -95,7 +95,7 @@ fn message_id_or_uid(
         })
 }
 
-pub(super) fn keyword_labels(flags: &[String]) -> Vec<String> {
+pub(super) fn keywords(flags: &[String]) -> Vec<String> {
     flags
         .iter()
         .filter(|flag| {
@@ -198,7 +198,8 @@ fn parse_message(
         .filter(|body| !body.trim().is_empty());
     let snippet = snippet(body_text.as_deref().unwrap_or(&subject));
     let unread = !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
-    let labels = keyword_labels(flags);
+    let mut labels = keywords(flags);
+    labels.retain(|keyword| !super::is_reserved_keyword(keyword));
     let arrived_via = parsed.as_ref().map(arrival_addresses).unwrap_or_default();
     let list_id = parsed.as_ref().and_then(list_id_header);
     let thread_id = ThreadId::from_message_id(&message_id);
