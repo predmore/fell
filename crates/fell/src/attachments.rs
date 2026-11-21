@@ -1,8 +1,8 @@
 //! Received files: use the MIME part cache for opens and copy bytes for saves.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -77,15 +77,17 @@ pub fn size_label(bytes: u64) -> String {
 #[derive(Clone)]
 pub struct Fetcher {
     config: Option<AccountConfig>,
+    store_path: Option<PathBuf>,
     worker: Arc<Mutex<Option<PartFetcher>>>,
 }
 
 type FetchEvents = (UnboundedReceiver<PartEvent>, CancelFetch);
 
 impl Fetcher {
-    pub fn new(config: Option<AccountConfig>) -> Self {
+    pub fn new(config: Option<AccountConfig>, store_path: Option<PathBuf>) -> Self {
         Self {
             config,
+            store_path,
             worker: Arc::new(Mutex::new(None)),
         }
     }
@@ -93,13 +95,18 @@ impl Fetcher {
     pub fn queue(&self, request: PartRequest) -> Result<FetchEvents, String> {
         let mut worker = self.worker.lock().expect("attachment fetcher lock");
         if worker.is_none() {
+            let path = self
+                .store_path
+                .clone()
+                .ok_or_else(|| "the mailbox is unavailable".to_string())?;
             let cache =
                 PartCache::open_default().map_err(|err| format!("Attachment cache: {err}"))?;
             let config = self.config.clone();
             let account = request.account_id.clone();
-            *worker = Some(PartFetcher::start(
+            *worker = Some(PartFetcher::start_for_store(
                 move || fell_core::backend_for(&account, config.as_ref()),
                 cache,
+                path,
             ));
         }
         let (send, receive) = unbounded();
@@ -135,8 +142,9 @@ pub fn downloads_dir() -> io::Result<PathBuf> {
 
 /// Copy into a private temporary file in Downloads, then publish it without
 /// replacing any file or symlink, even when another save races the name.
-pub fn save_to(cached: &CachedPart, part: &MimePart, dir: &Path) -> io::Result<PathBuf> {
-    let mut input = open_cache_file(cached)?.take(cached.size.saturating_add(1));
+pub fn save_to(cached: CachedPart, part: &MimePart, dir: &Path) -> io::Result<PathBuf> {
+    check_cache_file(&cached)?;
+    let mut input = cached.file.take(cached.size.saturating_add(1));
     fs::create_dir_all(dir)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".fell-download-")
@@ -167,21 +175,19 @@ fn collision_name(name: &str, copy: usize) -> String {
     }
 }
 
-fn open_cache_file(cached: &CachedPart) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&cached.path)?;
-    let meta = file.metadata()?;
+fn check_cache_file(cached: &CachedPart) -> io::Result<fs::Metadata> {
+    let meta = cached.file.metadata()?;
     if !meta.is_file() || meta.len() != cached.size {
         return Err(io::Error::other("the cached file changed"));
     }
-    Ok(file)
+    Ok(meta)
 }
 
-pub fn read_cached(cached: &CachedPart) -> io::Result<Vec<u8>> {
+pub fn read_cached(cached: CachedPart) -> io::Result<Vec<u8>> {
+    check_cache_file(&cached)?;
     let mut bytes = Vec::new();
-    open_cache_file(cached)?
+    cached
+        .file
         .take(cached.size.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 != cached.size {
@@ -195,16 +201,22 @@ pub enum Opened {
     Launched(Child),
 }
 
-pub fn open_cached(cached: &CachedPart, part: &MimePart, confirmed: bool) -> io::Result<Opened> {
+pub fn open_cached(cached: CachedPart, part: &MimePart, confirmed: bool) -> io::Result<Opened> {
     if !cached.path.is_absolute() {
         return Err(io::Error::other("the cache path is not absolute"));
     }
-    let file = open_cache_file(cached)?;
-    let mode = file.metadata()?.mode();
+    let inspected = check_cache_file(&cached)?;
     let mut prefix = Vec::new();
-    file.take(8192).read_to_end(&mut prefix)?;
-    if !confirmed && (mode & 0o111 != 0 || executable(part, &prefix)) {
+    (&cached.file).take(8192).read_to_end(&mut prefix)?;
+    if !confirmed && (inspected.mode() & 0o111 != 0 || executable(part, &prefix)) {
         return Ok(Opened::Confirm);
+    }
+
+    // A desktop launcher needs a path. Verify it still names the file we
+    // inspected before handing it off.
+    let current = fs::symlink_metadata(&cached.path)?;
+    if (current.dev(), current.ino()) != (inspected.dev(), inspected.ino()) {
+        return Err(io::Error::other("the cached file changed"));
     }
 
     // xdg-open receives exactly one absolute file path. Its argument is
@@ -292,6 +304,15 @@ mod tests {
         }
     }
 
+    fn cached_file(path: &Path) -> CachedPart {
+        let file = fs::File::open(path).unwrap();
+        CachedPart {
+            path: path.to_owned(),
+            size: file.metadata().unwrap().len(),
+            file,
+        }
+    }
+
     #[test]
     fn chips_use_only_the_attachment_role() {
         let attachment = part("logo.png", "image/png");
@@ -308,11 +329,8 @@ mod tests {
     #[test]
     fn saves_sanitize_the_name_and_treat_existing_files_and_symlinks_as_collisions() {
         let root = tempfile::tempdir().unwrap();
-        let cached = CachedPart {
-            path: root.path().join("cached"),
-            size: 3,
-        };
-        fs::write(&cached.path, b"new").unwrap();
+        let path = root.path().join("cached");
+        fs::write(&path, b"new").unwrap();
         let part = part(".. /Budget\\2026.pdf", "application/pdf");
         let filename = name(&part);
         assert_eq!(filename, "_Budget_2026.pdf");
@@ -322,7 +340,7 @@ mod tests {
         let link = dir.join("_Budget_2026 (1).pdf");
         symlink(dir.join("missing"), &link).unwrap();
 
-        let saved = save_to(&cached, &part, &dir).unwrap();
+        let saved = save_to(cached_file(&path), &part, &dir).unwrap();
         assert_eq!(saved, dir.join("_Budget_2026 (2).pdf"));
         assert_eq!(fs::read(&saved).unwrap(), b"new");
         assert_eq!(fs::read(dir.join(&filename)).unwrap(), b"previous");
@@ -337,15 +355,12 @@ mod tests {
     fn concurrent_saves_advance_to_distinct_available_names() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("Downloads");
-        let cached = CachedPart {
-            path: root.path().join("cached"),
-            size: 3,
-        };
-        fs::write(&cached.path, b"new").unwrap();
+        let path = root.path().join("cached");
+        fs::write(&path, b"new").unwrap();
         let part = part("notes.pdf", "application/pdf");
         let (first, second) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| save_to(&cached, &part, &dir).unwrap());
-            let second = scope.spawn(|| save_to(&cached, &part, &dir).unwrap());
+            let first = scope.spawn(|| save_to(cached_file(&path), &part, &dir).unwrap());
+            let second = scope.spawn(|| save_to(cached_file(&path), &part, &dir).unwrap());
             (first.join().unwrap(), second.join().unwrap())
         });
         let mut names = [first, second];
@@ -356,10 +371,7 @@ mod tests {
     #[test]
     fn opening_checks_names_types_and_bytes_before_launching() {
         let root = tempfile::tempdir().unwrap();
-        let mut cached = CachedPart {
-            path: root.path().join("input"),
-            size: 0,
-        };
+        let path = root.path().join("input");
         for (name, mime, bytes) in [
             (
                 "Launcher.DESKTOP",
@@ -375,10 +387,9 @@ mod tests {
                 b"\xef\xbb\xbf[Desktop Entry]\nType=Application\n",
             ),
         ] {
-            fs::write(&cached.path, bytes).unwrap();
-            cached.size = bytes.len() as u64;
+            fs::write(&path, bytes).unwrap();
             assert!(matches!(
-                open_cached(&cached, &part(name, mime), false).unwrap(),
+                open_cached(cached_file(&path), &part(name, mime), false).unwrap(),
                 Opened::Confirm
             ));
         }

@@ -141,7 +141,7 @@ async fn open(
             let part = target.part.clone();
             cx.background_executor()
                 .spawn(async move {
-                    attachments::open_cached(&cached, &part, confirmed)
+                    attachments::open_cached(cached, &part, confirmed)
                         .map_err(|err| err.to_string())
                 })
                 .await
@@ -190,7 +190,7 @@ async fn save(
                 let dir = dir.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        attachments::save_to(&cached, &part, &dir).map_err(|err| err.to_string())
+                        attachments::save_to(cached, &part, &dir).map_err(|err| err.to_string())
                     })
                     .await
             }
@@ -352,7 +352,7 @@ impl AttachmentSource {
                 && let Ok(cached) = self.fetch(this, cx, &target).await
                 && let Ok(bytes) = cx
                     .background_executor()
-                    .spawn(async move { attachments::read_cached(&cached) })
+                    .spawn(async move { attachments::read_cached(cached) })
                     .await
             {
                 remaining -= bytes.len() as u64;

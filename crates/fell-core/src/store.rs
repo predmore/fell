@@ -27,6 +27,7 @@ pub(crate) mod bodies;
 pub(crate) mod copies;
 pub(crate) mod intents;
 pub(crate) mod keywords;
+mod part_cache;
 mod roles;
 pub(crate) mod sent_bcc;
 mod sent_echo_repair;
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS messages (
     list_id TEXT,
     reply_to_line TEXT NOT NULL DEFAULT '',
     attachment_names TEXT NOT NULL DEFAULT '',
+    part_cache_stamp BLOB,
     FOREIGN KEY(account_id) REFERENCES accounts(id),
     UNIQUE (account_id, message_id)
 );
@@ -389,7 +391,14 @@ pub use bodies::cid_upgrade::{CidRepairBatch, CidRepairProgress};
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let requested = path.as_ref();
+        Self::open_mailbox(path.as_ref(), true)
+    }
+
+    pub(crate) fn open_for_part_fetch(path: &Path) -> Result<Self> {
+        Self::open_mailbox(path, false)
+    }
+
+    fn open_mailbox(requested: &Path, index: bool) -> Result<Self> {
         // The mailbox holds message text. Create it owner-only before SQLite writes.
         create_private_file(requested)?;
         // One path string per inode. A symlink or a second hard link must not
@@ -413,7 +422,9 @@ impl Store {
         store.seal_private_files()?;
         // Embeddings are filled off this thread, and only in one process.
         // A lock problem skips the indexer. Open still returns the mailbox.
-        store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
+        if index {
+            store.indexer = crate::embed::Indexer::try_spawn(&claimed.path);
+        }
         Ok(store)
     }
 
@@ -2441,10 +2452,10 @@ fn insert_new(conn: &Connection, message: &Message, fingerprint: &str) -> Result
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, starred, has_attachment, archived, snooze_until,
-            body_fingerprint, list_id, reply_to_line, attachment_names
+            body_fingerprint, list_id, reply_to_line, attachment_names, part_cache_stamp
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+            ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, randomblob(16)
          )",
         params![
             message.account_id.as_str(),
@@ -4010,6 +4021,10 @@ fn add_missing_message_columns(conn: &Connection) -> Result<()> {
         (
             "attachment_names",
             "ALTER TABLE messages ADD COLUMN attachment_names TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "part_cache_stamp",
+            "ALTER TABLE messages ADD COLUMN part_cache_stamp BLOB",
         ),
     ];
     let have = column_names(conn, "messages")?;

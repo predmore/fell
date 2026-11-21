@@ -10,7 +10,7 @@
 //!
 //! Every name here comes from untrusted mail. A cached file is named by a
 //! hash directory and [`sanitize_filename`]; nothing follows a
-//! `Content-Location`, and nothing is opened or executed.
+//! `Content-Location`, and nothing is launched or executed.
 
 use std::fs;
 use std::io::{self, Write};
@@ -29,7 +29,7 @@ use crate::embed::model_files::{
     O_NOFOLLOW, create_private_dir, create_private_dirs, create_private_file, user_id,
 };
 use crate::message::{MessageId, MimePart, PartRole, RemoteId, TransferEncoding};
-use crate::{Error, Result};
+use crate::{Error, Result, Store};
 
 /// The cache keeps at most this many bytes by default; the least recently
 /// used parts go first.
@@ -53,11 +53,13 @@ pub struct PartRequest {
 }
 
 /// A part's decoded bytes on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CachedPart {
-    /// Owner-only (0600) file named after the part. Its contents are untrusted.
+    /// Cache pathname, which can disappear on eviction or message deletion.
     pub path: PathBuf,
     pub size: u64,
+    /// Read-only handle opened under the cache lock. Its contents are untrusted.
+    pub file: fs::File,
 }
 
 /// Owner-only directory of fetched parts, trimmed to a byte cap.
@@ -107,13 +109,9 @@ impl PartCache {
         &self.root
     }
 
-    fn entry_dir(&self, request: &PartRequest) -> PathBuf {
+    fn entry_dir(&self, account: &str, message: &str, section: &str) -> PathBuf {
         let mut hash = Sha256::new();
-        for field in [
-            request.account_id.as_str(),
-            request.message_id.as_str(),
-            request.part.section.as_str(),
-        ] {
+        for field in [account, message, section] {
             hash.update(field.as_bytes());
             hash.update([0]);
         }
@@ -125,22 +123,57 @@ impl PartCache {
         self.root.join(key)
     }
 
-    fn entry_path(&self, request: &PartRequest) -> PathBuf {
-        self.entry_dir(request).join(sanitize_filename(
-            request.part.filename.as_deref(),
-            &request.part.mime_type,
-        ))
+    fn request_dir(&self, request: &PartRequest) -> PathBuf {
+        self.entry_dir(
+            request.account_id.as_str(),
+            request.message_id.as_str(),
+            &request.part.section,
+        )
+    }
+
+    fn open_dir(&self) -> io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | O_NOFOLLOW)
+            .open(&self.root)
+    }
+
+    fn lock(&self) -> io::Result<fs::File> {
+        let dir = self.open_dir()?;
+        dir.lock()?;
+        Ok(dir)
+    }
+
+    pub(crate) fn try_lock(&self) -> io::Result<Option<fs::File>> {
+        let dir = self.open_dir()?;
+        match dir.try_lock() {
+            Ok(()) => Ok(Some(dir)),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(err)) => Err(err),
+        }
+    }
+
+    pub(crate) fn remove_section(
+        &self,
+        account: &str,
+        message: &str,
+        section: &str,
+    ) -> io::Result<()> {
+        match fs::remove_dir_all(self.entry_dir(account, message, section)) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 
     /// The cached copy of `request`, when there is one. Marks it used. A
     /// file that is not the part's listed size (cut short, or changed on
     /// disk) is removed and counts as a miss.
-    pub fn lookup(&self, request: &PartRequest) -> Option<CachedPart> {
-        let dir = self.entry_dir(request);
+    fn lookup_locked(&self, request: &PartRequest) -> Option<CachedPart> {
+        let dir = self.request_dir(request);
         if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
             return None;
         }
-        let path = self.entry_path(request);
+        let path = entry_path(&dir, request);
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
@@ -159,32 +192,60 @@ impl PartCache {
         Some(CachedPart {
             path,
             size: meta.len(),
+            file,
         })
     }
 
-    /// Write `bytes` as the cached copy of `request`, then trim the cache.
-    fn store(&self, request: &PartRequest, bytes: &[u8]) -> io::Result<CachedPart> {
-        let dir = self.entry_dir(request);
+    fn store(
+        &self,
+        store: &Store,
+        request: &PartRequest,
+        stamp: [u8; 16],
+        bytes: &[u8],
+    ) -> Result<CachedPart> {
+        // A sweep cannot acknowledge a deletion until publication releases
+        // the lock. Check again in case the deletion committed during the write.
+        let lock = self.lock()?;
+        if store.cached_part_state(request)? != Some((stamp, false)) {
+            return Err(part_removed());
+        }
+        let cached = self
+            .write_locked(request, bytes)
+            .map_err(|err| Error::Backend(format!("part cache: {err}")))?;
+        if store.cached_part_state(request)? != Some((stamp, false)) {
+            store.clean_part_cache_locked(self, &lock, Some(request))?;
+            return Err(part_removed());
+        }
+        Ok(cached)
+    }
+
+    fn write_locked(&self, request: &PartRequest, bytes: &[u8]) -> io::Result<CachedPart> {
+        let dir = self.request_dir(request);
         create_private_dir(&dir)?;
-        let path = self.entry_path(request);
+        let path = entry_path(&dir, request);
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let partial = dir.join(format!(".partial-{}-{nanos}", std::process::id()));
-        let written = (|| {
+        let written: io::Result<_> = (|| {
             let mut file = create_private_file(&partial)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            fs::rename(&partial, &path)
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&partial)?;
+            fs::rename(&partial, &path)?;
+            Ok(file)
         })();
-        if let Err(err) = written {
+        let file = written.inspect_err(|_| {
             let _ = fs::remove_file(&partial);
-            return Err(err);
-        }
+        })?;
         self.trim(&dir);
         Ok(CachedPart {
             path,
             size: bytes.len() as u64,
+            file,
         })
     }
 
@@ -223,6 +284,13 @@ impl PartCache {
             }
         }
     }
+}
+
+fn entry_path(dir: &Path, request: &PartRequest) -> PathBuf {
+    dir.join(sanitize_filename(
+        request.part.filename.as_deref(),
+        &request.part.mime_type,
+    ))
 }
 
 /// When an entry was last used and how many bytes it holds. Stale partial
@@ -324,34 +392,57 @@ pub fn decode_part(encoding: TransferEncoding, raw: &[u8]) -> Vec<u8> {
     encoding.decode(raw).into_owned()
 }
 
-/// The decoded bytes of one part, from the cache or else from the first
-/// server copy that still has it at the listed size, cached on the way. Blocks on the network:
-/// call it from [`PartFetcher`] or another background thread, never the UI
-/// thread. `progress` hears encoded bytes read so far (compare with
-/// [`MimePart::encoded_size`]).
+/// Open one decoded part from the cache or download it from the first server
+/// copy that still has it at the listed size. The store checks that the part
+/// is still listed before using the cache and again before publishing a download.
+/// This can block on the network and belongs on a background thread. `progress`
+/// reports encoded bytes read so far (compare with [`MimePart::encoded_size`]).
 pub fn fetch_part(
     backend: &dyn MailBackend,
     cache: &PartCache,
+    store: &Store,
     request: &PartRequest,
     progress: &mut dyn FnMut(u64),
 ) -> Result<CachedPart> {
-    if let Some(hit) = cache.lookup(request) {
-        return Ok(hit);
-    }
-    fetch_uncached_part(backend, cache, request, &mut |fetched| {
-        progress(fetched);
-        ControlFlow::Continue(())
+    fetch_cached_part(cache, store, request, || {
+        download_part(backend, request, &mut |fetched| {
+            progress(fetched);
+            ControlFlow::Continue(())
+        })
     })
 }
 
-/// [`fetch_part`], stopped (and its session closed) when `progress`
-/// answers `Break`.
-fn fetch_uncached_part(
-    backend: &dyn MailBackend,
+fn fetch_cached_part(
     cache: &PartCache,
+    store: &Store,
+    request: &PartRequest,
+    download: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<CachedPart> {
+    let stamp = {
+        let lock = cache.lock()?;
+        let (stamp, _) = store.cached_part_state(request)?.ok_or_else(part_removed)?;
+        // A message restored before the sweep can fetch afresh once the old
+        // cache entry is gone. Check again in case it was removed meanwhile.
+        store.clean_part_cache_locked(cache, &lock, Some(request))?;
+        if store.cached_part_state(request)? != Some((stamp, false)) {
+            return Err(part_removed());
+        }
+        if let Some(hit) = cache.lookup_locked(request) {
+            return Ok(hit);
+        }
+        stamp
+    };
+
+    let bytes = download()?;
+    cache.store(store, request, stamp, &bytes)
+}
+
+/// Read and decode without writing to the cache. `Break` closes the session.
+fn download_part(
+    backend: &dyn MailBackend,
     request: &PartRequest,
     progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
-) -> Result<CachedPart> {
+) -> Result<Vec<u8>> {
     let mut differed = false;
     for copy in &request.copies {
         let Some(raw) = backend.fetch_part(
@@ -372,9 +463,7 @@ fn fetch_uncached_part(
             differed = true;
             continue;
         }
-        return cache
-            .store(request, &bytes)
-            .map_err(|err| Error::Backend(format!("part cache: {err}")));
+        return Ok(bytes);
     }
     Err(Error::Backend(if differed {
         "the server's copy of this message no longer has this part where it was listed".into()
@@ -390,6 +479,7 @@ fn fetch_uncached_part(
 pub fn prefetch_inline_parts(
     backend: &dyn MailBackend,
     cache: &PartCache,
+    store: &Store,
     requests: &[PartRequest],
 ) -> Result<Vec<(String, CachedPart)>> {
     let mut out = Vec::new();
@@ -400,7 +490,7 @@ pub fn prefetch_inline_parts(
         if request.part.role != PartRole::Inline || !request.part.mime_type.starts_with("image/") {
             continue;
         }
-        let cached = fetch_part(backend, cache, request, &mut |_| {})?;
+        let cached = fetch_part(backend, cache, store, request, &mut |_| {})?;
         out.push((cid.clone(), cached));
     }
     Ok(out)
@@ -457,9 +547,10 @@ fn cancelled() -> Error {
 }
 
 impl PartFetcher {
-    /// `backend` makes a backend for each fetch. It may resolve a password,
-    /// so it runs on the fetch thread.
-    pub fn start<F>(backend: F, cache: PartCache) -> Self
+    /// Fetch parts with the mailbox row checked on the fetch thread. A fetch
+    /// that was in flight across a deletion cannot repopulate the cache. The
+    /// backend factory runs on the fetch thread when a download is needed.
+    pub fn start_for_store<F>(backend: F, cache: PartCache, path: PathBuf) -> Self
     where
         F: Fn() -> Result<Box<dyn MailBackend + Send>> + Send + 'static,
     {
@@ -469,32 +560,19 @@ impl PartFetcher {
         let thread = std::thread::Builder::new()
             .name("fell-parts".into())
             .spawn(move || {
+                let mut store = None;
                 for (request, job, mut events) in queue {
                     let stopped = || job.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed);
-                    if stopped() {
-                        events(PartEvent::Done(Err(cancelled())));
-                        continue;
-                    }
-                    // Cached files are usable offline, including when the
-                    // configured password command is unavailable.
-                    if let Some(hit) = cache.lookup(&request) {
-                        events(PartEvent::Done(Ok(hit)));
-                        continue;
-                    }
-                    let total = request.part.encoded_size;
-                    let result = backend().and_then(|backend| {
-                        if !request.copies.is_empty() {
-                            events(PartEvent::Downloading { total });
+                    let result = (|| {
+                        if stopped() {
+                            return Err(cancelled());
                         }
-                        fetch_uncached_part(backend.as_ref(), &cache, &request, &mut |fetched| {
-                            events(PartEvent::Progress { fetched, total });
-                            if stopped() {
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
-                            }
-                        })
-                    });
+                        let store = match &store {
+                            Some(store) => store,
+                            None => store.insert(Store::open_for_part_fetch(&path)?),
+                        };
+                        fetch_one(&backend, &cache, store, &request, stopped, &mut events)
+                    })();
                     events(PartEvent::Done(result));
                 }
             })
@@ -531,6 +609,39 @@ impl PartFetcher {
     }
 }
 
+fn fetch_one(
+    backend: &impl Fn() -> Result<Box<dyn MailBackend + Send>>,
+    cache: &PartCache,
+    store: &Store,
+    request: &PartRequest,
+    stopped: impl Fn() -> bool,
+    events: &mut dyn FnMut(PartEvent),
+) -> Result<CachedPart> {
+    fetch_cached_part(cache, store, request, || {
+        let backend = backend()?;
+        let total = request.part.encoded_size;
+        if !request.copies.is_empty() {
+            events(PartEvent::Downloading { total });
+        }
+        let bytes = download_part(backend.as_ref(), request, &mut |fetched| {
+            events(PartEvent::Progress { fetched, total });
+            if stopped() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        if stopped() {
+            return Err(cancelled());
+        }
+        Ok(bytes)
+    })
+}
+
+fn part_removed() -> Error {
+    Error::Backend("the message part was removed while opening it".into())
+}
+
 impl Drop for PartFetcher {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
@@ -540,6 +651,9 @@ impl Drop for PartFetcher {
         }
     }
 }
+
+#[cfg(test)]
+mod cleanup_tests;
 
 #[cfg(test)]
 mod tests {
@@ -575,6 +689,59 @@ mod tests {
                 nested: false,
             },
             copies: vec![RemoteId("imap:1:1:INBOX".into())],
+        }
+    }
+
+    impl PartCache {
+        pub(crate) fn lookup(&self, request: &PartRequest) -> Option<CachedPart> {
+            let _lock = self.lock().unwrap();
+            self.lookup_locked(request)
+        }
+
+        pub(super) fn seed(&self, request: &PartRequest, bytes: &[u8]) -> io::Result<CachedPart> {
+            let _lock = self.lock()?;
+            self.write_locked(request, bytes)
+        }
+    }
+
+    pub(super) struct Serves<F>(pub &'static [u8], pub F);
+
+    impl<F: Fn()> MailBackend for Serves<F> {
+        fn kind(&self) -> crate::BackendKind {
+            crate::BackendKind::Imap
+        }
+
+        fn fetch_changes(
+            &self,
+            _cursor: Option<&crate::backend::SyncCursor>,
+        ) -> Result<crate::backend::MailboxDelta> {
+            unreachable!()
+        }
+
+        fn fetch_part(
+            &self,
+            _copy: &RemoteId,
+            _section: &str,
+            _encoded_size: u64,
+            progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
+        ) -> Result<Option<Vec<u8>>> {
+            (self.1)();
+            if progress(self.0.len() as u64).is_break() {
+                return Err(cancelled());
+            }
+            Ok(Some(self.0.to_vec()))
+        }
+
+        fn submit_draft(&self, _draft: crate::Draft) -> Result<crate::PendingSend> {
+            unreachable!()
+        }
+
+        fn confirm_send(
+            &self,
+            _pending: crate::PendingSend,
+            _confirmation: crate::UserSendConfirmation,
+        ) -> Result<crate::SentMessage> {
+            unreachable!()
         }
     }
 
@@ -634,13 +801,14 @@ mod tests {
 
     #[test]
     fn a_cached_part_does_not_resolve_backend_credentials_or_report_download_progress() {
-        let root = temp_root("offline-hit");
-        let cache = PartCache::open(&root, DEFAULT_CACHE_BYTES).unwrap();
-        let request = request("msg@x", "2", Some("report.pdf"));
-        let cached = cache.store(&request, b"data").unwrap();
-        let fetcher = PartFetcher::start(
+        use std::io::Read;
+
+        let (root, cache, store, request) = super::cleanup_tests::listed_fixture("offline-hit");
+        let cached = cache.seed(&request, b"data").unwrap();
+        let fetcher = PartFetcher::start_for_store(
             || Err(Error::Backend("credentials unavailable".into())),
             cache,
+            root.join("mail.db"),
         );
         let (send, receive) = mpsc::channel();
         fetcher.fetch(request, move |event| {
@@ -650,10 +818,15 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
         {
-            PartEvent::Done(Ok(hit)) => assert_eq!(hit, cached),
+            PartEvent::Done(Ok(mut hit)) => {
+                assert_eq!(hit.path, cached.path);
+                let mut bytes = Vec::new();
+                hit.file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"data");
+            }
             other => panic!("expected an offline cache hit, got {other:?}"),
         }
-        drop(fetcher);
+        drop((fetcher, store));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -664,7 +837,7 @@ mod tests {
         assert_eq!(mode(cache.root()), 0o700);
         let wanted = request("m@x", "2", Some("../report.pdf"));
         assert!(cache.lookup(&wanted).is_none());
-        let stored = cache.store(&wanted, b"%PDF").unwrap();
+        let stored = cache.seed(&wanted, b"%PDF").unwrap();
         assert_eq!(stored.path.file_name().unwrap(), "_report.pdf");
         assert_eq!(
             stored.path.parent().unwrap().parent().unwrap(),
@@ -673,7 +846,7 @@ mod tests {
         assert_eq!(mode(&stored.path), 0o600);
         assert_eq!(mode(stored.path.parent().unwrap()), 0o700);
         assert_eq!(fs::read(&stored.path).unwrap(), b"%PDF");
-        assert_eq!(cache.lookup(&wanted), Some(stored.clone()));
+        assert_eq!(cache.lookup(&wanted).unwrap().path, stored.path);
         // Another section or message is another entry.
         assert!(
             cache
@@ -701,7 +874,7 @@ mod tests {
 
         let cache = PartCache::open(root.join("real"), DEFAULT_CACHE_BYTES).unwrap();
         let wanted = request("m@x", "2", Some("a.pdf"));
-        let stored = cache.store(&wanted, b"%PDF").unwrap();
+        let stored = cache.seed(&wanted, b"%PDF").unwrap();
         // A file swapped for a symlink is a miss, never read through.
         fs::remove_file(&stored.path).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", &stored.path).unwrap();
@@ -712,58 +885,26 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
         fs::write(elsewhere.join("a.pdf"), b"planted").unwrap();
         assert!(cache.lookup(&wanted).is_none());
-        assert!(cache.store(&wanted, b"%PDF").is_err());
+        assert!(cache.seed(&wanted, b"%PDF").is_err());
         assert_eq!(fs::read(elsewhere.join("a.pdf")).unwrap(), b"planted");
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_cached_file_of_the_wrong_size_is_a_miss_and_is_refetched() {
-        struct Serves(&'static [u8]);
-        impl MailBackend for Serves {
-            fn kind(&self) -> crate::BackendKind {
-                crate::BackendKind::Imap
-            }
-            fn fetch_changes(
-                &self,
-                _cursor: Option<&crate::backend::SyncCursor>,
-            ) -> Result<crate::backend::MailboxDelta> {
-                unreachable!()
-            }
-            fn fetch_part(
-                &self,
-                _copy: &RemoteId,
-                _section: &str,
-                _encoded_size: u64,
-                _progress: &mut dyn FnMut(u64) -> ControlFlow<()>,
-            ) -> Result<Option<Vec<u8>>> {
-                Ok(Some(self.0.to_vec()))
-            }
-            fn submit_draft(&self, _draft: crate::Draft) -> Result<crate::PendingSend> {
-                unreachable!()
-            }
-            fn confirm_send(
-                &self,
-                _pending: crate::PendingSend,
-                _confirmation: crate::UserSendConfirmation,
-            ) -> Result<crate::SentMessage> {
-                unreachable!()
-            }
-        }
-        let root = temp_root("size");
-        let cache = PartCache::open(&root, DEFAULT_CACHE_BYTES).unwrap();
-        let wanted = request("m@x", "2", Some("a.pdf"));
-        let stored = cache.store(&wanted, b"%PDF").unwrap();
+        let (root, cache, store, wanted) = super::cleanup_tests::listed_fixture("size");
+        let stored = cache.seed(&wanted, b"%PDF").unwrap();
         // Cut short on disk (a crash, a full disk, a hand edit).
         fs::write(&stored.path, b"%P").unwrap();
         assert!(cache.lookup(&wanted).is_none());
         assert!(!stored.path.exists(), "the short file is removed");
         fs::write(&stored.path, b"%PDF-and-more").unwrap();
-        let backend = Serves(b"JVBERg==");
-        let fetched = fetch_part(&backend, &cache, &wanted, &mut |_| {}).unwrap();
+        let backend = Serves(b"JVBERg==", || {});
+        let fetched = fetch_part(&backend, &cache, &store, &wanted, &mut |_| {}).unwrap();
         assert_eq!(fs::read(&fetched.path).unwrap(), b"%PDF");
         assert_eq!(fetched.size, 4);
-        assert_eq!(cache.lookup(&wanted), Some(fetched));
+        assert_eq!(cache.lookup(&wanted).unwrap().path, fetched.path);
+        drop(store);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -779,8 +920,8 @@ mod tests {
         let old = sized("old@x", "old.bin", 100);
         let used = sized("used@x", "used.bin", 100);
         let new = sized("new@x", "new.bin", 100);
-        let old_at = cache.store(&old, &[1; 100]).unwrap();
-        let used_at = cache.store(&used, &[2; 100]).unwrap();
+        let old_at = cache.seed(&old, &[1; 100]).unwrap();
+        let used_at = cache.seed(&used, &[2; 100]).unwrap();
         let past = SystemTime::now() - Duration::from_secs(600);
         for path in [&old_at.path, &used_at.path] {
             fs::OpenOptions::new()
@@ -792,13 +933,13 @@ mod tests {
         }
         // Reading marks it used.
         assert!(cache.lookup(&used).is_some());
-        cache.store(&new, &[3; 100]).unwrap();
+        cache.seed(&new, &[3; 100]).unwrap();
         assert!(cache.lookup(&old).is_none(), "oldest went");
         assert!(cache.lookup(&used).is_some());
         assert!(cache.lookup(&new).is_some());
         // One part larger than the whole cap is still kept, alone.
         let huge = sized("huge@x", "huge.bin", 300);
-        cache.store(&huge, &[4; 300]).unwrap();
+        cache.seed(&huge, &[4; 300]).unwrap();
         assert!(cache.lookup(&huge).is_some());
         assert!(cache.lookup(&used).is_none() && cache.lookup(&new).is_none());
         let _ = fs::remove_dir_all(&root);

@@ -424,7 +424,7 @@ impl Inbox {
                 .as_ref()
                 .map(|config| config.account().id)
                 .unwrap_or_else(|| AccountId(String::new())),
-            attachment_fetcher: Fetcher::new(config.clone()),
+            attachment_fetcher: Fetcher::new(config.clone(), startup.path.clone().ok()),
             attachment_busy: false,
             attachment_retry: None,
             attachment_download: None,

@@ -3928,7 +3928,9 @@ fn temp_cache(tag: &str) -> (std::path::PathBuf, crate::parts::PartCache) {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&root);
-    let cache = crate::parts::PartCache::open(&root, crate::parts::DEFAULT_CACHE_BYTES).unwrap();
+    let cache =
+        crate::parts::PartCache::open(root.join("parts"), crate::parts::DEFAULT_CACHE_BYTES)
+            .unwrap();
     (root, cache)
 }
 
@@ -4050,9 +4052,10 @@ fn attachments_are_listed_on_sync_and_fetched_by_section() {
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} {section} is listed"));
             let mut heard = Vec::new();
-            let cached =
-                crate::parts::fetch_part(&backend, &cache, &request, &mut |n| heard.push(n))
-                    .unwrap();
+            let cached = crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |n| {
+                heard.push(n)
+            })
+            .unwrap();
             assert_eq!(
                 &std::fs::read(&cached.path).unwrap(),
                 bytes,
@@ -4095,14 +4098,14 @@ fn attachments_are_listed_on_sync_and_fetched_by_section() {
         .part_request(&acct.id, &crate::MessageId::new("mix@x"), "2")
         .unwrap()
         .unwrap();
-    crate::parts::fetch_part(&backend, &cache, &again, &mut |_| {}).unwrap();
+    crate::parts::fetch_part(&backend, &cache, &store, &again, &mut |_| {}).unwrap();
     assert!(commands(&server).is_empty());
 
     // Opening the related message fetches the image its HTML shows.
     let requests = store
         .part_requests(&acct.id, &crate::MessageId::new("rel@x"))
         .unwrap();
-    let inline = crate::parts::prefetch_inline_parts(&backend, &cache, &requests).unwrap();
+    let inline = crate::parts::prefetch_inline_parts(&backend, &cache, &store, &requests).unwrap();
     assert_eq!(inline.len(), 1);
     assert_eq!(inline[0].0, "logo@x");
     assert_eq!(
@@ -4133,28 +4136,37 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
     // The copy now numbers another part 2: its bytes are not handed over.
     mailbox(&mut server.state.lock().expect("state"), "INBOX").messages[0].raw =
         crate::imap::mime_fixtures::rfc2231_name("mix@x").raw;
-    let err = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).unwrap_err();
+    let err =
+        crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {}).unwrap_err();
     assert!(err.to_string().contains("where it was listed"), "{err}");
     assert!(cache.lookup(&request).is_none());
     mailbox(&mut server.state.lock().expect("state"), "INBOX")
         .messages
         .clear();
-    let err = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).unwrap_err();
+    let err =
+        crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {}).unwrap_err();
     assert!(err.to_string().contains("no server copy"), "{err}");
     assert!(cache.lookup(&request).is_none());
     // A new UIDVALIDITY is gone too, without a UID FETCH.
     mailbox(&mut server.state.lock().expect("state"), "INBOX").uidvalidity = 21;
     server.state.lock().expect("state").commands.clear();
-    assert!(crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {}).is_err());
+    assert!(crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {}).is_err());
     assert!(
         !commands(&server)
             .iter()
             .any(|line| line.contains("UID FETCH"))
     );
     // A section that is not a part number never reaches the server.
-    let mut odd = request.clone();
-    odd.part.section = "1 (FLAGS)".into();
-    assert!(crate::parts::fetch_part(&backend, &cache, &odd, &mut |_| {}).is_err());
+    assert!(
+        backend
+            .fetch_part(
+                &request.copies[0],
+                "1 (FLAGS)",
+                request.part.encoded_size,
+                &mut |_| std::ops::ControlFlow::Continue(()),
+            )
+            .is_err()
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -4163,7 +4175,7 @@ fn a_part_whose_copy_is_gone_is_an_error_and_caches_nothing() {
 fn part_server(
     fixture: &crate::imap::mime_fixtures::MimeFixture,
     ignores_window: bool,
-) -> (TestServer, ImapBackend, crate::parts::PartRequest) {
+) -> (TestServer, ImapBackend, Store, crate::parts::PartRequest) {
     let mut state = inbox_state(vec![(1, fixture.raw.clone())]);
     state.part_ignores_window = ignores_window;
     let server = TestServer::spawn(state);
@@ -4179,7 +4191,7 @@ fn part_server(
         .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
         .unwrap()
         .unwrap();
-    (server, backend, request)
+    (server, backend, store, request)
 }
 
 fn part_fetches(server: &TestServer) -> usize {
@@ -4193,7 +4205,7 @@ fn part_fetches(server: &TestServer) -> usize {
 fn a_server_that_ignores_the_window_sends_a_10_mb_part_whole() {
     let size = 10 * 1024 * 1024;
     let fixture = crate::imap::mime_fixtures::large_attachment("big@x", size);
-    let (server, backend, request) = part_server(&fixture, true);
+    let (server, backend, store, request) = part_server(&fixture, true);
     assert!(
         request.part.encoded_size > 8 * 1024 * 1024,
         "over the reply cap"
@@ -4202,7 +4214,8 @@ fn a_server_that_ignores_the_window_sends_a_10_mb_part_whole() {
     server.state.lock().expect("state").commands.clear();
     let mut heard = Vec::new();
     let cached =
-        crate::parts::fetch_part(&backend, &cache, &request, &mut |n| heard.push(n)).unwrap();
+        crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |n| heard.push(n))
+            .unwrap();
     assert_eq!(std::fs::read(&cached.path).unwrap(), fixture.bytes[0].1);
     assert_eq!(heard, [request.part.encoded_size]);
     assert_eq!(part_fetches(&server), 1, "one reply held the whole part");
@@ -4213,12 +4226,12 @@ fn a_server_that_ignores_the_window_sends_a_10_mb_part_whole() {
 fn a_part_exactly_one_window_long_is_fetched_once() {
     let fixture = crate::imap::mime_fixtures::large_attachment("big@x", 3000);
     for ignores_window in [false, true] {
-        let (server, backend, request) = part_server(&fixture, ignores_window);
+        let (server, backend, store, request) = part_server(&fixture, ignores_window);
         let window = usize::try_from(request.part.encoded_size).unwrap();
         super::part_fetch::set_window(window);
         let (root, cache) = temp_cache(if ignores_window { "exact-i" } else { "exact" });
         server.state.lock().expect("state").commands.clear();
-        let cached = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {});
+        let cached = crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {});
         super::part_fetch::set_window(2 * 1024 * 1024);
         let cached = cached.unwrap();
         assert_eq!(
@@ -4234,12 +4247,12 @@ fn a_part_exactly_one_window_long_is_fetched_once() {
         let _ = std::fs::remove_dir_all(&root);
     }
     // Smaller windows still add up to the part when the server honours them.
-    let (server, backend, request) = part_server(&fixture, false);
+    let (server, backend, store, request) = part_server(&fixture, false);
     let window = usize::try_from(request.part.encoded_size).unwrap() / 2;
     super::part_fetch::set_window(window);
     let (root, cache) = temp_cache("halves");
     server.state.lock().expect("state").commands.clear();
-    let cached = crate::parts::fetch_part(&backend, &cache, &request, &mut |_| {});
+    let cached = crate::parts::fetch_part(&backend, &cache, &store, &request, &mut |_| {});
     super::part_fetch::set_window(2 * 1024 * 1024);
     assert_eq!(
         std::fs::read(&cached.unwrap().path).unwrap(),
@@ -4269,7 +4282,9 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
         config: config(syncing.addr.port()),
         smtp: unused_smtp(),
     };
-    let store = Store::open_in_memory().unwrap();
+    let (root, cache) = temp_cache("big");
+    let store_path = root.join("mail.db");
+    let store = Store::open_for_part_fetch(&store_path).unwrap();
     sync_once(&acct, &backend, &store).unwrap();
     let request = store
         .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
@@ -4277,15 +4292,15 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
         .unwrap();
     assert_eq!(request.part.size, size as u64);
 
-    let (root, cache) = temp_cache("big");
     let part_backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(parts_server.addr.port()),
         smtp: unused_smtp(),
     };
-    let fetcher = crate::parts::PartFetcher::start(
+    let fetcher = crate::parts::PartFetcher::start_for_store(
         move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
         cache,
+        store_path,
     );
     let (events, heard) = std::sync::mpsc::channel();
     let asked = Instant::now();
@@ -4344,6 +4359,7 @@ fn a_10_mb_part_holds_up_neither_the_caller_nor_a_sync_pass() {
         .filter(|line| line.contains("BODY.PEEK[2]<"))
         .count();
     assert_eq!(windows, 7, "2 MB windows of a 13.6 MB part");
+    drop((fetcher, store));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -4362,21 +4378,23 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
         config: config(syncing.addr.port()),
         smtp: unused_smtp(),
     };
-    let store = Store::open_in_memory().unwrap();
+    let (root, cache) = temp_cache("cancel");
+    let store_path = root.join("mail.db");
+    let store = Store::open_for_part_fetch(&store_path).unwrap();
     sync_once(&acct, &backend, &store).unwrap();
     let request = store
         .part_request(&acct.id, &crate::MessageId::new("big@x"), "2")
         .unwrap()
         .unwrap();
-    let (root, cache) = temp_cache("cancel");
     let part_backend = ImapBackend {
         account_id: acct.id.clone(),
         config: config(parts_server.addr.port()),
         smtp: unused_smtp(),
     };
-    let fetcher = crate::parts::PartFetcher::start(
+    let fetcher = crate::parts::PartFetcher::start_for_store(
         move || Ok(Box::new(part_backend.clone()) as Box<dyn MailBackend + Send>),
         cache.clone(),
+        store_path,
     );
     let channel = || std::sync::mpsc::channel::<crate::parts::PartEvent>();
     let (running_events, running) = channel();
@@ -4455,6 +4473,7 @@ fn a_cancelled_part_fetch_stops_and_closes_its_session_and_drop_waits_for_it() {
             .iter()
             .any(|line| line.contains("LOGOUT"))
     );
+    drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
 
