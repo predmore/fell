@@ -37,6 +37,7 @@ pub struct Theme {
     selected_label_outline: u32,
     pub error: u32,
     pub border: u32,
+    pub input_border: u32,
     pub star: u32,
     pub ui_family: Option<String>,
     pub ui_px: f32,
@@ -184,6 +185,7 @@ fn map_palette(
         let fill = mix(bg, fg, 0.14);
         (ensure(fg, fill, TEXT_CONTRAST), fill)
     };
+    let border = mix(background, foreground, 0.16);
     Theme {
         name,
         kind,
@@ -202,7 +204,12 @@ fn map_palette(
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
-        border: mix(background, foreground, 0.16),
+        border,
+        input_border: ensure_all(
+            mix(border, foreground, 0.35),
+            &[background, surface],
+            MARK_CONTRAST,
+        ),
         // The star shows on the selected row too, so it meets AA there.
         star: ensure_all(star_raw, &[background, surface, selection], TEXT_CONTRAST),
         ui_family: fonts.ui_family.clone(),
@@ -1012,6 +1019,22 @@ mod tests {
         );
         drop(rx);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn onboarding_controls_meet_contrast_requirements() {
+        for theme in every_test_theme() {
+            let button = contrast(theme.accent, theme.background);
+            let border_on_page = contrast(theme.input_border, theme.background);
+            let border_on_input = contrast(theme.input_border, theme.surface);
+            assert!(button >= TEXT_CONTRAST, "{}", theme.name);
+            assert!(border_on_page >= MARK_CONTRAST, "{}", theme.name);
+            assert!(border_on_input >= MARK_CONTRAST, "{}", theme.name);
+            println!(
+                "{}: primary {button:.2}, input against page {border_on_page:.2}, input fill {border_on_input:.2}",
+                theme.name
+            );
+        }
     }
 
     #[test]

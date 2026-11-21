@@ -87,6 +87,21 @@ impl SyncKind {
         self.status_at(now)
     }
 
+    pub fn compact_download_status(&self) -> Option<String> {
+        let Self::Syncing {
+            progress: Some(progress),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "Downloading messages · {}/{}",
+            grouped(progress.done),
+            grouped(progress.total)
+        ))
+    }
+
     pub fn status_at(&self, now: i64) -> String {
         match self {
             Self::FixtureOffline => "fixture · offline".into(),
@@ -98,15 +113,17 @@ impl SyncKind {
                 progress,
                 new_messages,
             } => {
-                let mut status = "syncing".to_string();
-                if let Some(progress) = progress {
-                    status.push_str(&format!(
-                        " {} · {} of {}",
-                        progress.folder,
-                        grouped(progress.done),
-                        grouped(progress.total)
-                    ));
-                }
+                let mut status = progress.as_ref().map_or_else(
+                    || "syncing".into(),
+                    |progress| {
+                        format!(
+                            "{} · {} of {} messages downloaded",
+                            progress.folder,
+                            grouped(progress.done),
+                            grouped(progress.total)
+                        )
+                    },
+                );
                 if let Some(count) = new_messages.filter(|count| *count > 0) {
                     status.push_str(&format!(" · {count} new"));
                 } else if progress.is_none() {
@@ -326,7 +343,7 @@ pub struct Step {
     pub reveal_search_hit: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Banner {
     pub title: String,
     pub hint: String,
@@ -2580,7 +2597,7 @@ impl Session {
                 hint: "The folder could not be read.".into(),
             });
         }
-        if self.loading {
+        if self.loading && !matches!(self.sync, SyncKind::Connecting | SyncKind::Syncing { .. }) {
             return Some(Banner {
                 title: format!("Opening {}…", self.folder_title()),
                 hint: String::new(),
@@ -2601,15 +2618,7 @@ impl Session {
             },
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
                 title: format!("Syncing {}", self.folder_title()),
-                hint: match &self.sync {
-                    SyncKind::Syncing {
-                        new_messages: Some(count),
-                        ..
-                    } if *count > 0 => {
-                        format!("{count} messages stored · conversations appear as they arrive")
-                    }
-                    _ => "Conversations appear as they arrive".into(),
-                },
+                hint: "Conversations appear as they arrive".into(),
             },
             SyncKind::Failed(failure) => {
                 let title = match failure.kind {
@@ -2681,8 +2690,11 @@ mod tests {
             total: 31_882,
         };
         for (new_messages, expected) in [
-            (None, "syncing Inbox · 4,210 of 31,882"),
-            (Some(2), "syncing Inbox · 4,210 of 31,882 · 2 new"),
+            (None, "Inbox · 4,210 of 31,882 messages downloaded"),
+            (
+                Some(2),
+                "Inbox · 4,210 of 31,882 messages downloaded · 2 new",
+            ),
         ] {
             let syncing = SyncKind::Syncing {
                 new_messages,

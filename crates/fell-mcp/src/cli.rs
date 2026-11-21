@@ -808,14 +808,14 @@ fn revoke(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
 
 fn serve(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     let (_, store) = open_store(opts, io)?;
-    let account = opts.account.clone().unwrap_or_default();
+    let account = resolve_account(&store, opts.account.as_deref(), io)?.id;
     let agent = opts.agent.clone().unwrap_or_default();
-    let mut session =
-        Session::new(store, AccountId(account.clone()), agent.clone()).map_err(CliError::new)?;
+    let mut session = Session::new(store, account.clone(), agent.clone()).map_err(CliError::new)?;
     writeln!(
         io.err,
-        "{}: fell-mcp serving account {account} for agent {agent} (no send tool)",
-        fell_version::VERSION
+        "{}: fell-mcp serving account {} for agent {agent} (no send tool)",
+        fell_version::VERSION,
+        account.as_str()
     )?;
     // `cli_main` already holds the stdin lock in `io.input`; std's stdin
     // lock is not reentrant, so serve over the same handles.

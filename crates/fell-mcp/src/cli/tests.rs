@@ -975,6 +975,38 @@ fn help_mentions_that_there_is_no_send_tool() {
 }
 
 #[test]
+fn serve_reports_a_removed_account_before_listening() {
+    let ctx = Ctx::new();
+    let path = ctx.store();
+    let store = Store::open(&path).unwrap();
+    let mut account = store.list_accounts().unwrap().pop().unwrap();
+    store
+        .set_agent_grant(&account.id, "bot", AgentGrant::enabled(true, false, false))
+        .unwrap();
+    account.id = AccountId("mail".into());
+    store.configure_account(&account, false).unwrap();
+    let ran = ctx.run(
+        &[
+            "fell-mcp",
+            "serve",
+            "--store",
+            path.to_str().unwrap(),
+            "--account",
+            "demo",
+            "--agent",
+            "bot",
+        ],
+        "",
+        false,
+    );
+    assert_eq!(
+        ran.result.unwrap_err().to_string(),
+        "unknown account demo (this mailbox has mail)"
+    );
+    assert!(ran.out.is_empty());
+}
+
+#[test]
 fn serve_speaks_mcp_over_the_handles_it_was_given() {
     // `cli_main` holds the stdin lock for the whole run; serve must read
     // through that same handle instead of locking stdin again (which would

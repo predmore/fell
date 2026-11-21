@@ -38,10 +38,11 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, ReadDwell, Session, Step, SyncKind,
-    Toast, row_key,
+    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, ReadDwell, Session, Step,
+    SyncKind, Toast, row_key,
 };
-use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
+use crate::motion::{self, Glide, ListShift, Motion, RowMotion, Transition};
+use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
@@ -126,10 +127,24 @@ pub fn run(demo: bool, trace_start: Option<Instant>) {
     });
 }
 
-pub(crate) fn finish_onboarding(window: &mut Window, cx: &mut App) {
+pub(crate) fn finish_onboarding(
+    setup: gpui::Entity<Onboarding>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let startup = mailbox::startup();
     crate::draft_host::host_agent_drafts(cx);
-    window.replace_root(cx, |window, cx| Inbox::focused(startup, false, window, cx));
+    window.replace_root(cx, |window, cx| {
+        let mut inbox = Inbox::focused(startup, false, window, cx);
+        inbox.waiting_to_open = true;
+        let now = inbox.motion.clock.now();
+        inbox.setup_exit = inbox
+            .motion
+            .motion
+            .start(motion::FADE, now)
+            .map(|fade| (setup, fade));
+        inbox
+    });
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -301,6 +316,10 @@ struct Inbox {
     forwarding_attachments: bool,
     session: Session,
     theme: Theme,
+    setup_exit: Option<(gpui::Entity<Onboarding>, Transition)>,
+    waiting_to_open: bool,
+    last_banner: Option<Banner>,
+    banner_exit: Option<(Banner, Transition)>,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
@@ -454,6 +473,10 @@ impl Inbox {
             reveal_attachment: false,
             forwarding_attachments: false,
             session,
+            setup_exit: None,
+            waiting_to_open: false,
+            last_banner: None,
+            banner_exit: None,
             store,
             cid_repair: None,
             theme,
@@ -1089,9 +1112,10 @@ impl Inbox {
         // before starting another body-only read.
         let new_selection = open_changed && self.session.cursor_id.is_some();
         let refresh_open = open_changed || grew || waiting || intent.refresh_open;
-        if new_selection
-            || self.session.cursor_draft().is_some()
-            || (refresh_open && !follow_up_pending)
+        if !self.waiting_to_open
+            && (new_selection
+                || self.session.cursor_draft().is_some()
+                || (refresh_open && !follow_up_pending))
         {
             self.request_messages(true, cx);
         }
@@ -1522,6 +1546,8 @@ impl Inbox {
     /// A key arrived: jump every transition to its end state first.
     fn settle_motion(&mut self) {
         self.reveal.cancel_pending();
+        self.setup_exit = None;
+        self.banner_exit = None;
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
@@ -1542,6 +1568,7 @@ impl Inbox {
             self.clear_open_message();
             return;
         };
+        self.waiting_to_open = false;
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
@@ -2893,7 +2920,11 @@ impl Inbox {
             self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
             self.request_messages(true, cx);
-        } else if searching && self.session.search.is_none() {
+        } else if (searching && self.session.search.is_none())
+            || (self.waiting_to_open
+                && pane_before == Pane::List
+                && self.session.pane == Pane::Conversation)
+        {
             self.request_messages(false, cx);
         }
         if self.session.search.is_none()
@@ -3092,18 +3123,28 @@ impl Inbox {
     /// Put the reader's message at the top of the viewport and keep it
     /// there while the conversation lays out: [`LandingHold`] sets the
     /// offset from each frame's own layout, before it paints.
+    fn landing_index(&self) -> usize {
+        if self.reveal == Reveal::Waiting && present::awaiting_bodies(&self.session.messages) {
+            // Pending messages can be too short to align the newest one
+            // to the top without the scroll container clamping mid-message.
+            0
+        } else {
+            self.session.message_cursor
+        }
+    }
+
     fn land_on_reader(&mut self) {
         self.landing.hold(
             self.session
                 .messages
-                .get(self.session.message_cursor)
+                .get(self.landing_index())
                 .map(|message| message.id.as_str()),
         );
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
     fn hold_landing(&mut self) -> Option<ScrollAnchor> {
-        let index = self.session.message_cursor;
+        let index = self.landing_index();
         let current = self
             .session
             .messages
@@ -3307,10 +3348,29 @@ impl Inbox {
             search.editing = false;
             self.session.remember_search();
         }
-        if changed {
+        if changed || self.waiting_to_open {
             self.request_messages(true, cx);
         }
         self.scroll_list_to_cursor();
+    }
+}
+
+impl Inbox {
+    fn banner_fade(&mut self, now: Instant) -> Option<(Banner, f32)> {
+        let next = self.session.list_banner();
+        if next != self.last_banner {
+            let prior = std::mem::replace(&mut self.last_banner, next);
+            self.banner_exit = prior
+                .zip(self.motion.motion.start(motion::FADE, now))
+                .filter(|_| self.last_banner.is_some());
+        }
+        if let Some((banner, fade)) = &self.banner_exit
+            && fade.running(now)
+        {
+            return Some((banner.clone(), fade.progress(now)));
+        }
+        self.banner_exit = None;
+        None
     }
 }
 
@@ -3354,7 +3414,19 @@ impl Render for Inbox {
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
+        let banner_fade = self.banner_fade(now);
+        let setup_exit = self.setup_exit.as_ref().and_then(|(setup, fade)| {
+            fade.running(now).then(|| {
+                let progress = fade.progress(now);
+                let layer = setup.update(cx, |setup, cx| setup.leaving_layer(window, cx));
+                (layer, progress)
+            })
+        });
+        if setup_exit.is_none() {
+            self.setup_exit = None;
+        }
         let conv = ConvFrame {
+            waiting_to_open: self.waiting_to_open,
             alphas: self.motion.body_alphas(now),
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: self.hold_landing().or(anchor),
@@ -3366,6 +3438,8 @@ impl Render for Inbox {
         };
         self.conv_layout_current = panes.1;
         let animating = self.motion.tick(now)
+            | setup_exit.is_some()
+            | banner_fade.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | self.search_view.animating(now)
@@ -3430,7 +3504,8 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        shell(
+        let background = theme.background;
+        let root = shell(
             theme,
             &self.session,
             &mut self.motion,
@@ -3445,6 +3520,7 @@ impl Render for Inbox {
                 cached_preview,
                 cached_search_rows,
                 reply_check,
+                banner_fade,
             },
             width,
             split,
@@ -3473,7 +3549,26 @@ impl Render for Inbox {
                     .absolute()
                     .size_0(),
             )
-        })
+        });
+        if let Some((setup, progress)) = setup_exit {
+            div()
+                .relative()
+                .size_full()
+                .bg(rgb(background))
+                .child(root.opacity(motion::lerp(motion::ARRIVE_FROM, 1., progress)))
+                .child(
+                    setup
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .overflow_hidden()
+                        .opacity(1. - progress),
+                )
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 }
 
@@ -3504,11 +3599,13 @@ struct Shown {
     cached_preview: Option<(u64, gpui::AnyView)>,
     cached_search_rows: Option<(u64, gpui::AnyView)>,
     reply_check: Option<ReplyCheck>,
+    banner_fade: Option<(Banner, f32)>,
 }
 
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
+    waiting_to_open: bool,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     disclosures: Disclosures,
@@ -3587,6 +3684,7 @@ fn shell(
         cached_preview,
         cached_search_rows,
         reply_check,
+        banner_fade,
     } = shown;
     let frames = conv.frames.clone();
     let mut subject = Some(subject);
@@ -3601,7 +3699,16 @@ fn shell(
     let swapped_out = swap.map(|swap| {
         let (pane, entry) = (swap.leaving, swap.out);
         let pane = match pane {
-            Pane::List => thread_list(&theme, session, false, width, list_scroll.clone(), None, cx),
+            Pane::List => thread_list(
+                &theme,
+                session,
+                false,
+                width,
+                list_scroll.clone(),
+                None,
+                None,
+                cx,
+            ),
             Pane::Conversation => conversation(
                 &theme,
                 session,
@@ -3719,6 +3826,7 @@ fn shell(
                             if show_conv { list_width } else { width },
                             list_scroll,
                             cached_search_rows,
+                            banner_fade,
                             cx,
                         ),
                         list_entry,
@@ -4061,6 +4169,7 @@ fn header(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn thread_list(
     theme: &Theme,
     session: &Session,
@@ -4068,6 +4177,7 @@ fn thread_list(
     list_width: f32,
     scroll: UniformListScrollHandle,
     cached_results: Option<(u64, gpui::AnyView)>,
+    banner_fade: Option<(Banner, f32)>,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let mut pane = div()
@@ -4088,7 +4198,7 @@ fn thread_list(
         let count = session.threads.len();
         pane = pane.child(search::feedback(theme, search, count, cx));
         return if count == 0 {
-            pane.child(empty_state(theme, session))
+            pane.child(empty_state(theme, session, banner_fade))
         } else if let Some((revision, cached)) = cached_results {
             pane.child(
                 div()
@@ -4104,7 +4214,7 @@ fn thread_list(
         };
     }
     if session.threads.is_empty() {
-        return pane.child(empty_state(theme, session));
+        return pane.child(empty_state(theme, session, banner_fade));
     }
 
     let entity = cx.entity();
@@ -5084,31 +5194,44 @@ fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f3
     f32::from(line.width)
 }
 
-fn empty_state(theme: &Theme, session: &Session) -> gpui::Div {
+fn empty_state(theme: &Theme, session: &Session, fade: Option<(Banner, f32)>) -> gpui::Div {
     if let Some(search) = &session.search {
         return search::empty(search);
     }
-    let banner = session.list_banner();
+    let text = |banner: Banner| {
+        div()
+            .w_full()
+            .text_center()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_color(rgb(theme.foreground)).child(banner.title))
+            .child(div().text_color(rgb(theme.dimmed)).child(banner.hint))
+    };
     div()
         .flex_1()
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(6.))
         .px(px(24.))
         .child(
-            div().text_color(rgb(theme.foreground)).child(
-                banner
-                    .as_ref()
-                    .map(|item| item.title.clone())
-                    .unwrap_or_default(),
-            ),
-        )
-        .children(
-            banner
-                .filter(|item| !item.hint.is_empty())
-                .map(|item| div().text_color(rgb(theme.dimmed)).child(item.hint)),
+            div()
+                .relative()
+                .w_full()
+                .when_some(fade.as_ref(), |el, (old, progress)| {
+                    el.child(
+                        text(old.clone())
+                            .absolute()
+                            .inset_0()
+                            .opacity(1. - progress),
+                    )
+                })
+                .children(session.list_banner().map(|banner| {
+                    text(banner).opacity(fade.map_or(1., |(_, progress)| {
+                        motion::lerp(motion::ARRIVE_FROM, 1., progress)
+                    }))
+                })),
         )
 }
 
@@ -5360,6 +5483,18 @@ fn conversation(
             theme.accent,
             motion.focus_edge(session.pane, now),
         )))
+        .when(frame.waiting_to_open && subject.is_empty(), |pane| {
+            pane.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(theme.dimmed))
+                    .child("Select a conversation"),
+            )
+        })
         .when(!subject.is_empty(), |pane| {
             pane.child(
                 div()
@@ -6401,7 +6536,10 @@ fn status_bar(
             theme.accent,
         ),
         None => (
-            session.sync.status(),
+            (width < 440.)
+                .then(|| session.sync.compact_download_status())
+                .flatten()
+                .unwrap_or_else(|| session.sync.status()),
             if session.sync.is_error() {
                 theme.error
             } else {

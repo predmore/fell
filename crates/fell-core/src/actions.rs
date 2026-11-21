@@ -2107,6 +2107,37 @@ pub(crate) fn folder_was_purged(
     )?)
 }
 
+/// Local action tables are created lazily and may be absent in an older mailbox.
+pub(crate) fn remove_account_actions(conn: &Connection, account_id: &str) -> Result<()> {
+    if !action_table_exists(conn, "local_actions")? {
+        return Ok(());
+    }
+    for table in [
+        "local_action_messages",
+        "local_action_aliases",
+        "local_action_bodies",
+        "local_action_flags",
+        "local_action_parts",
+        "local_folder_tombstones",
+    ] {
+        if action_table_exists(conn, table)? {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE action_id IN (
+                    SELECT id FROM local_actions WHERE account_id = ?1
+                )"
+                ),
+                [account_id],
+            )?;
+        }
+    }
+    conn.execute(
+        "DELETE FROM local_actions WHERE account_id = ?1",
+        [account_id],
+    )?;
+    Ok(())
+}
+
 fn action_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
