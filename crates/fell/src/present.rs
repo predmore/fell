@@ -71,9 +71,10 @@ pub struct ConvMessage {
 }
 
 /// What the conversation says in place of a body it does not have.
-pub fn missing_body_line(state: fell_core::BodyState) -> Option<String> {
+pub fn missing_body_line(state: fell_core::BodyState, syncing: bool) -> Option<String> {
     match state {
         fell_core::BodyState::Stored => None,
+        fell_core::BodyState::Pending if syncing => Some("Downloading…".into()),
         fell_core::BodyState::Pending => Some("Not downloaded yet".into()),
         fell_core::BodyState::TooLarge => Some(format!(
             "Too large to download (over {} MB)",
@@ -88,6 +89,12 @@ pub fn awaiting_bodies(shown: &[ConvMessage]) -> bool {
     shown
         .iter()
         .any(|message| message.body_state == fell_core::BodyState::Pending)
+}
+
+pub fn newest_body_ready(shown: &[ConvMessage]) -> bool {
+    shown
+        .last()
+        .is_some_and(|message| message.body_state != fell_core::BodyState::Pending)
 }
 
 pub fn same_messages(shown: &[ConvMessage], read: &[ConvMessage]) -> bool {
@@ -1301,6 +1308,23 @@ mod tests {
     }
 
     #[test]
+    fn the_first_inbox_preview_opens_when_the_newest_body_is_ready() {
+        use fell_core::BodyState::{Pending, Stored, TooLarge};
+
+        assert!(!newest_body_ready(&[]));
+        let mut messages = [
+            shown_message("a", Stored, "older"),
+            shown_message("b", Pending, ""),
+        ];
+        assert!(!newest_body_ready(&messages));
+        messages[0].body_state = Pending;
+        messages[1] = shown_message("b", Stored, "newest");
+        assert!(newest_body_ready(&messages));
+        messages[1].body_state = TooLarge;
+        assert!(newest_body_ready(&messages));
+    }
+
+    #[test]
     fn a_reread_that_only_fills_bodies_is_told_apart_from_new_mail() {
         use fell_core::BodyState::{Pending, Stored};
         let shown = vec![
@@ -1375,13 +1399,17 @@ mod tests {
     #[test]
     fn a_body_not_downloaded_says_why() {
         use fell_core::BodyState::{Pending, Stored, TooLarge};
-        assert_eq!(missing_body_line(Stored), None);
+        assert_eq!(missing_body_line(Stored, true), None);
         assert_eq!(
-            missing_body_line(Pending).as_deref(),
+            missing_body_line(Pending, true).as_deref(),
+            Some("Downloading…")
+        );
+        assert_eq!(
+            missing_body_line(Pending, false).as_deref(),
             Some("Not downloaded yet")
         );
         assert_eq!(
-            missing_body_line(TooLarge).as_deref(),
+            missing_body_line(TooLarge, true).as_deref(),
             Some("Too large to download (over 32 MB)")
         );
     }

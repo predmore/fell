@@ -634,22 +634,47 @@ impl Store {
     }
 
     pub fn upsert_account(&self, account: &Account) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO accounts (id, display_name, email, backend_kind)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                email = excluded.email,
-                backend_kind = excluded.backend_kind",
-            params![
-                account.id.as_str(),
-                account.display_name,
-                account.email,
-                account.backend_kind.as_str()
-            ],
-        )?;
+        upsert_account_on(&self.conn, account)?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Install a configured account and retire the in-process demo mailbox
+    /// in the same transaction. Demo grants never follow the new account.
+    /// Return the reserved IDs of real accounts left in place.
+    pub fn configure_account(
+        &self,
+        account: &Account,
+        write_back: bool,
+    ) -> Result<Vec<&'static str>> {
+        if crate::is_demo_account(&account.id) {
+            return Err(crate::Error::Invalid(format!(
+                "Account ID {:?} is reserved for demo mail",
+                account.id.as_str()
+            )));
+        }
+        let tx = immediate_transaction(&self.conn)?;
+        crate::outbox::ensure_schema(&tx)?;
+        let mut retained = Vec::new();
+        for id in crate::backend::DEMO_ACCOUNT_IDS {
+            let demo = tx
+                .query_row(
+                    "SELECT email = ?2 AND backend_kind = 'bridge' FROM accounts WHERE id = ?1",
+                    params![id, crate::DEMO_MAILBOX_ADDRESS],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            match demo {
+                Some(true) => delete_demo_account(&tx, id)?,
+                Some(false) => retained.push(id),
+                None => {}
+            }
+        }
+        upsert_account_on(&tx, account)?;
+        crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(retained)
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
@@ -2280,6 +2305,68 @@ fn unique_tokens(raw: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn upsert_account_on(conn: &Connection, account: &Account) -> Result<()> {
+    conn.execute(
+        "INSERT INTO accounts (id, display_name, email, backend_kind)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            email = excluded.email,
+            backend_kind = excluded.backend_kind",
+        params![
+            account.id.as_str(),
+            account.display_name,
+            account.email,
+            account.backend_kind.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
+    for child in ["agent_action_messages", "agent_action_drafts"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {child} WHERE action_id IN (
+                SELECT id FROM agent_actions WHERE account_id = ?1
+            )"
+            ),
+            [id],
+        )?;
+    }
+    crate::actions::remove_account_actions(conn, id)?;
+    // Message deletes invoke the FTS, body, parts and threading triggers.
+    // The embedding change log keeps vector caches on other connections current.
+    for table in [
+        "messages",
+        "message_aliases",
+        "message_copies",
+        "copy_orphans",
+        "message_embeddings",
+        "embedding_queue",
+        "search_trigrams",
+        "search_terms",
+        "thread_dirty_ids",
+        "thread_dirty_subjects",
+        "folder_roles",
+        "mailbox_views",
+        "account_folders",
+        "sent_bcc",
+        "server_outbox",
+        "write_back_accounts",
+        "agent_grants",
+        "agent_actions",
+        "review_drafts",
+        "compose_drafts",
+        "compose_send",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
+    }
+    conn.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
+    conn.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {
@@ -4330,6 +4417,95 @@ mod tests {
             email: "o@x".into(),
             backend_kind: BackendKind::Bridge,
         }
+    }
+
+    #[test]
+    fn configure_account_preserves_real_mail_under_a_reserved_id() {
+        let store = Store::open_in_memory().unwrap();
+        let demo = Account {
+            id: AccountId("local".into()),
+            email: crate::DEMO_MAILBOX_ADDRESS.into(),
+            ..account()
+        };
+        let real = Account {
+            id: AccountId("fixture".into()),
+            ..account_b()
+        };
+        store.upsert_account(&demo).unwrap();
+        store.upsert_account(&real).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO compose_drafts (id, account_id, from_addr, to_addrs, cc_addrs,
+               bcc_addrs, subject, body, updated_unix)
+             VALUES ('draft', 'fixture', 'o@x', '', '', '', '', 'Unsent text', 0);
+             INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
+               target_folder, created_unix)
+             VALUES ('fixture', 'move', 'pending', 'message', 'Inbox', 'Archive', 0);",
+            )
+            .unwrap();
+
+        let configured = account();
+        assert_eq!(
+            store.configure_account(&configured, true).unwrap(),
+            ["fixture"]
+        );
+        assert!(store.get_account(&demo.id).unwrap().is_none());
+        assert!(store.get_account(&configured.id).unwrap().is_some());
+        assert!(store.write_back(&configured.id).unwrap());
+        assert_eq!(
+            store.get_account(&real.id).unwrap().unwrap().email,
+            real.email
+        );
+        assert_eq!(store.list_accounts().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT body FROM compose_drafts WHERE id = 'draft'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Unsent text"
+        );
+        assert_eq!(
+            store.outbox(&real.id).unwrap()[0].state,
+            crate::outbox::OutboxState::Pending
+        );
+    }
+
+    #[test]
+    fn configure_account_retires_an_old_demo_database_without_an_outbox() {
+        let path = std::env::temp_dir().join(format!("fell-legacy-demo-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let demo = Account {
+            id: AccountId("local".into()),
+            email: crate::DEMO_MAILBOX_ADDRESS.into(),
+            ..account()
+        };
+        store.upsert_account(&demo).unwrap();
+        store
+            .upsert_message(&msg_for("local", "demo@x", None, None, "Demo", "Demo body"))
+            .unwrap();
+        drop(store);
+        // Model a persisted fixture store from before write-back was installed.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch("DROP TABLE server_outbox; DROP TABLE write_back_accounts;")
+            .unwrap();
+        drop(legacy);
+
+        let store = Store::open(&path).unwrap();
+        assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+        let configured = account_b();
+        store.configure_account(&configured, true).unwrap();
+        assert!(store.get_account(&demo.id).unwrap().is_none());
+        assert!(store.list_threads(&demo.id).unwrap().is_empty());
+        assert!(store.write_back(&configured.id).unwrap());
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
     }
 
     fn msg_for(

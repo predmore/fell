@@ -315,25 +315,7 @@ impl Store {
     pub fn set_write_back(&self, account_id: &AccountId, enabled: bool) -> Result<()> {
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_schema(&tx)?;
-        let was_on = self::enabled(&tx, account_id)?;
-        tx.execute(
-            "INSERT INTO write_back_accounts (account_id, enabled) VALUES (?1, ?2)
-             ON CONFLICT(account_id) DO UPDATE SET enabled = excluded.enabled",
-            params![account_id.as_str(), i64::from(enabled)],
-        )?;
-        if !enabled {
-            if was_on {
-                tx.execute(
-                    "UPDATE write_back_accounts SET generation = generation + 1
-                     WHERE account_id = ?1",
-                    params![account_id.as_str()],
-                )?;
-            }
-            tx.execute(
-                "DELETE FROM server_outbox WHERE account_id = ?1 AND state = 'pending'",
-                params![account_id.as_str()],
-            )?;
-        }
+        set_write_back_on(&tx, account_id, enabled)?;
         tx.commit()
     }
 
@@ -358,6 +340,33 @@ impl Store {
         tx.commit()?;
         Ok(entries)
     }
+}
+
+pub(crate) fn set_write_back_on(
+    conn: &Connection,
+    account_id: &AccountId,
+    enabled: bool,
+) -> Result<()> {
+    let was_on = self::enabled(conn, account_id)?;
+    conn.execute(
+        "INSERT INTO write_back_accounts (account_id, enabled) VALUES (?1, ?2)
+         ON CONFLICT(account_id) DO UPDATE SET enabled = excluded.enabled",
+        params![account_id.as_str(), i64::from(enabled)],
+    )?;
+    if !enabled {
+        if was_on {
+            conn.execute(
+                "UPDATE write_back_accounts SET generation = generation + 1
+                 WHERE account_id = ?1",
+                params![account_id.as_str()],
+            )?;
+        }
+        conn.execute(
+            "DELETE FROM server_outbox WHERE account_id = ?1 AND state = 'pending'",
+            params![account_id.as_str()],
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {

@@ -201,6 +201,41 @@ impl Transition {
     }
 }
 
+/// Replace two layers in sequence so their text never paints over itself.
+#[derive(Clone, Copy)]
+pub struct LayerSwap {
+    outgoing: Transition,
+    incoming: Transition,
+}
+
+pub enum SwapFrame {
+    Leaving(f32),
+    Arriving(f32),
+}
+
+impl LayerSwap {
+    pub fn start(motion: Motion, now: Instant, out: Duration, arrival: Duration) -> Option<Self> {
+        Some(Self {
+            outgoing: motion.start(out, now)?,
+            incoming: Transition::new(now + out, arrival),
+        })
+    }
+
+    pub fn set_arrival_duration(&mut self, duration: Duration) {
+        self.incoming.duration = duration;
+    }
+
+    pub fn frame(self, now: Instant) -> Option<SwapFrame> {
+        if self.outgoing.running(now) {
+            Some(SwapFrame::Leaving(self.outgoing.remaining(now)))
+        } else if self.incoming.running(now) {
+            Some(SwapFrame::Arriving(self.incoming.progress(now)))
+        } else {
+            None
+        }
+    }
+}
+
 /// Eased progress of an optional transition: 1 (the end state) when there is none.
 pub fn progress(transition: Option<&Transition>, now: Instant) -> f32 {
     transition.map_or(1.0, |transition| transition.progress(now))
@@ -593,6 +628,23 @@ impl<R: Clone> ListShift<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_swap_starts_the_arrival_after_the_exit() {
+        let now = Instant::now();
+        let swap = LayerSwap::start(Motion::new(true), now, QUICK, FADE).unwrap();
+        assert!(matches!(swap.frame(now), Some(SwapFrame::Leaving(1.0))));
+        assert!(matches!(
+            swap.frame(now + QUICK - Duration::from_millis(1)),
+            Some(SwapFrame::Leaving(opacity)) if opacity < 0.01
+        ));
+        assert!(matches!(
+            swap.frame(now + QUICK),
+            Some(SwapFrame::Arriving(0.0))
+        ));
+        assert!(swap.frame(now + QUICK + FADE).is_none());
+        assert!(LayerSwap::start(Motion::new(false), now, QUICK, FADE).is_none());
+    }
 
     fn at(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)

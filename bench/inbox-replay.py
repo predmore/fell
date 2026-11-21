@@ -136,7 +136,7 @@ def replay(args):
             app_env.pop("DISPLAY")
             window = wait_for(compositor, "Weston window", window_id)
             traces = Path(env["XDG_STATE_HOME"]) / "fell" / "trace"
-            with running([args.binary, "--trace"], env=app_env, stdout=log, stderr=log) as app:
+            with running([args.binary, "--trace", "--demo"], env=app_env, stdout=log, stderr=log) as app:
                 path = wait_for(app, "trace file", lambda: next(traces.glob("*.jsonl"), None))
                 try:
                     store_event = wait_for(app, "store open result", lambda: next(

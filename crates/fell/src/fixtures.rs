@@ -12,7 +12,7 @@ pub fn fixture_account() -> Account {
     Account {
         id: AccountId("local".into()),
         display_name: "Tessa".into(),
-        email: "tessa@harbor.test".into(),
+        email: fell_core::DEMO_MAILBOX_ADDRESS.into(),
         backend_kind: BackendKind::Bridge,
     }
 }
