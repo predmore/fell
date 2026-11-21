@@ -2936,6 +2936,96 @@ fn inbox_dates_sort_by_header_or_arrival_from_the_first_rows() {
 }
 
 #[test]
+fn live_sync_repairs_skewed_dates_without_refetching_when_the_clock_catches_up() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![empty_mailbox("INBOX", 20)],
+        ..sample_state()
+    });
+    let acct = account("live-skewed-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let header_date = 1_707_512_400;
+    let behind_latest = header_date - 86_400;
+    let corrected_latest = header_date + 86_400;
+    crate::with_latest_mail_date(behind_latest, || sync_once(&acct, &backend, &store)).unwrap();
+
+    let sent = "Date: Fri, 9 Feb 2024 21:00:00 +0000\r\n";
+    let far_future = "Date: Mon, 14 Jan 2806 08:00:00 +0000\r\n";
+    let arrival = "X-Test-Internal-Date: 09-Feb-2024 22:00:00 +0000\r\n";
+    let entries = [
+        ("both", sent, arrival, header_date),
+        ("header", sent, "", header_date),
+        ("arrival", far_future, arrival, header_date + 3600),
+        ("implausible", far_future, "", 0),
+    ];
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").messages = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (id, header, arrival, _))| {
+            literal(
+                i as u32 + 1,
+                &[],
+                2,
+                format!(
+                    "From: Rowan Park <rowan@example.test>\r\nSubject: {id}\r\n\
+                     Message-ID: <{id}@example.test>\r\n{header}{arrival}\r\nSample mail."
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+
+    let date = |id| {
+        stored(&store, &acct, &format!("{id}@example.test"))
+            .unwrap()
+            .headers
+            .date_unix
+    };
+    let mut queued_during_sync = false;
+    let report = crate::with_latest_mail_date(behind_latest, || {
+        sync_with_progress(&acct, &backend, &store, &mut |_| {
+            if store.missing_internal_dates(&acct.id).unwrap().len() == 3 {
+                queued_during_sync = true;
+                // Later metadata replies no longer include the saved INTERNALDATE.
+                let mut state = server.state.lock().unwrap();
+                for message in &mut mailbox(&mut state, "INBOX").messages {
+                    message.raw = String::from_utf8_lossy(&message.raw)
+                        .replace(arrival, "")
+                        .into_bytes();
+                }
+            }
+        })
+    })
+    .unwrap();
+    assert_eq!(report.new_messages, Some(4));
+    assert!(queued_during_sync);
+    for (id, _, _, _) in entries {
+        assert_eq!(date(id), 0, "{id}");
+    }
+
+    server.state.lock().unwrap().commands.clear();
+    let report =
+        crate::with_latest_mail_date(corrected_latest, || sync_once(&acct, &backend, &store))
+            .unwrap();
+    assert_eq!(report.new_messages, Some(0));
+    assert!(report.changed);
+    for (id, _, _, expected) in entries {
+        assert_eq!(date(id), expected, "{id}");
+    }
+    assert!(store.missing_internal_dates(&acct.id).unwrap().is_empty());
+    assert!(body_fetches(&server).is_empty());
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|cmd| cmd.contains("INTERNALDATE"))
+    );
+}
+
+#[test]
 fn legacy_inbox_dates_are_repaired_without_downloading_mail_again() {
     let server = TestServer::spawn(dated_inbox());
     let acct = account("legacy-dates", BackendKind::Imap);

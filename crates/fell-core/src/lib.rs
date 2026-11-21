@@ -118,5 +118,31 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Allow for a day of clock skew in mail timestamps.
 pub(crate) fn latest_mail_date() -> i64 {
+    #[cfg(test)]
+    if let Some(latest) = TEST_LATEST_MAIL_DATE.get() {
+        return latest;
+    }
     outbox::now_unix().saturating_add(86_400)
+}
+
+pub(crate) fn plausible_future_mail_date(date: i64, latest: i64) -> bool {
+    const MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS: i64 = 30 * 86_400;
+    date > latest && date <= latest.saturating_add(MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LATEST_MAIL_DATE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_latest_mail_date<T>(latest: i64, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<i64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_LATEST_MAIL_DATE.set(self.0);
+        }
+    }
+    let _reset = Reset(TEST_LATEST_MAIL_DATE.replace(Some(latest)));
+    run()
 }

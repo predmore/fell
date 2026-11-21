@@ -3849,6 +3849,17 @@ fn account_header<'a>(name: &'a str, email: &'a str) -> (&'a str, Option<&'a str
     }
 }
 
+fn useful_header_email(email: &str, fitted: &str) -> bool {
+    if fitted == email {
+        return true;
+    }
+    let kept = fitted.strip_suffix('…').unwrap_or(fitted);
+    kept.chars().take(12).count() == 12
+        || email.rsplit_once('@').is_some_and(|(local, _)| {
+            !local.is_empty() && kept.starts_with(local) && kept.len() > local.len()
+        })
+}
+
 struct HeaderAccount {
     name: Option<SharedString>,
     email: Option<SharedString>,
@@ -3871,11 +3882,13 @@ impl HeaderAccount {
             .as_ref()
             .filter(|_| show_email && !quiet)
             .and_then(|line| {
+                let email = email?;
                 fit(
-                    email?,
+                    email,
                     room - f32::from(line.width).ceil() - gap,
                     FontWeight::NORMAL,
                 )
+                .filter(|line| useful_header_email(email, &line.text))
             });
         Self {
             name: name.map(|line| line.text),
@@ -7238,7 +7251,7 @@ mod tests {
     use super::{
         LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, account_header, collapsed_sender_budget,
         ctrl_letter, expanded_header_widths, key_from, moved_in_list, should_follow_visible,
-        unread_bar_dx, write_back_notice,
+        unread_bar_dx, useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7272,6 +7285,25 @@ mod tests {
             ("Demo Reader", Some(email))
         );
         assert_eq!(account_header("Demo Reader", ""), ("Demo Reader", None));
+    }
+
+    #[test]
+    fn header_email_keeps_a_readable_address_prefix() {
+        let email = "robin@demo.test";
+        for stub in ["…", "ro…", "robin…"] {
+            assert!(!useful_header_email(email, stub));
+        }
+        assert!(useful_header_email(email, "robin@…"));
+        assert!(useful_header_email(email, email));
+        assert!(useful_header_email("r@x.test", "r@x.test"));
+
+        let long = "abcdefghijklmnop@demo.test";
+        assert!(!useful_header_email(long, "abcdefghijk…"));
+        assert!(useful_header_email(long, "abcdefghijkl…"));
+
+        let unicode = "ééééééééééééé@demo.test";
+        assert!(!useful_header_email(unicode, "éééééé…"));
+        assert!(useful_header_email("rōbin@demo.test", "rōbin@…"));
     }
 
     #[test]

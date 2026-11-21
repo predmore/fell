@@ -2,14 +2,35 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{AccountId, MessageId, RemoteId, Result};
+use crate::backend::DeferredMailDate;
+use crate::{AccountId, MessageId, RemoteId, Result, plausible_future_mail_date};
 
-use super::{BodyRequest, Store, bodies, immediate_transaction};
+use super::{Store, bodies, immediate_transaction};
 
 const MAX_CLOCK_ATTEMPTS: i64 = 5;
 const MAX_UNCHECKED_ATTEMPTS: i64 = 5;
 const CLOCK_RETRY_SECONDS: i64 = 10 * 60;
-const MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS: i64 = 30 * 86_400;
+
+pub(super) fn queue_deferred_date(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+    date: DeferredMailDate,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO internal_date_repair
+             (account_id, message_id, previous_date_unix, deferred_arrival_unix)
+         SELECT account_id, message_id, ?3, ?4 FROM messages
+         WHERE account_id = ?1 AND message_id = ?2 AND date_unix = 0
+         ON CONFLICT(account_id, message_id) DO UPDATE SET
+             previous_date_unix = COALESCE(NULLIF(previous_date_unix, 0), excluded.previous_date_unix),
+             deferred_arrival_unix = COALESCE(
+                 MIN(deferred_arrival_unix, excluded.deferred_arrival_unix),
+                 deferred_arrival_unix, excluded.deferred_arrival_unix)",
+    )?
+    .execute(params![account.as_str(), id, date.header.unwrap_or(0), date.arrival])?;
+    Ok(())
+}
 
 pub(super) fn ensure_date_repair(conn: &Connection) -> Result<()> {
     ensure_date_repair_through(conn, crate::latest_mail_date())
@@ -86,19 +107,59 @@ pub(super) fn ensure_date_repair_through(conn: &Connection, latest: i64) -> Resu
     tx.commit()
 }
 
+pub(crate) struct DateRepairRequest {
+    message_id: MessageId,
+    pub(crate) copies: Vec<RemoteId>,
+    previous: i64,
+    saved_arrival: Option<i64>,
+}
+
+impl DateRepairRequest {
+    pub(crate) fn copies_to_fetch(&self, latest: i64) -> &[RemoteId] {
+        if date_ready_from_cache(self.previous, self.saved_arrival, self.copies.len(), latest) {
+            &[]
+        } else {
+            &self.copies
+        }
+    }
+}
+
+fn date_ready_from_cache(
+    previous: i64,
+    arrival: Option<i64>,
+    copy_count: usize,
+    latest: i64,
+) -> bool {
+    let valid = 1..=latest;
+    // A usable header wins outright. An arrival can stand on its own
+    // when there is no other copy to check and no plausible header to wait for.
+    valid.contains(&previous)
+        || (copy_count <= 1
+            && !plausible_future_mail_date(previous, latest)
+            && arrival.is_some_and(|date| valid.contains(&date)))
+}
+
 impl Store {
-    pub(crate) fn missing_internal_dates(&self, account: &AccountId) -> Result<Vec<BodyRequest>> {
+    pub(crate) fn missing_internal_dates(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<DateRepairRequest>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT message_id FROM internal_date_repair WHERE account_id = ?1
+            "SELECT message_id, previous_date_unix, deferred_arrival_unix
+             FROM internal_date_repair WHERE account_id = ?1
              ORDER BY attempts, message_id LIMIT 64",
         )?;
-        let ids = stmt.query_map([account.as_str()], |row| row.get::<_, String>(0))?;
-        ids.map(|id| {
-            let id = id?;
+        let rows = stmt.query_map([account.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.map(|row| {
+            let (id, previous, saved_arrival) = row?;
             let copies = bodies::copies_of(&self.conn, account, &id)?;
-            Ok(BodyRequest {
+            Ok(DateRepairRequest {
                 message_id: MessageId(id),
                 copies,
+                previous,
+                saved_arrival,
             })
         })
         .collect()
@@ -107,7 +168,7 @@ impl Store {
     pub(crate) fn finish_internal_dates(
         &self,
         account: &AccountId,
-        batch: &[BodyRequest],
+        batch: &[DateRepairRequest],
         checked: &HashMap<RemoteId, Option<i64>>,
         fetch_complete: bool,
         latest: i64,
@@ -118,8 +179,7 @@ impl Store {
         let tx = self.begin_sync_write()?;
         let mut changed = false;
         let valid_dates = 1..=latest;
-        let latest_plausible = latest.saturating_add(MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS);
-        let plausible_future = |date: i64| date > latest && date <= latest_plausible;
+        let plausible_future = |date| plausible_future_mail_date(date, latest);
         for request in batch {
             let id = request.message_id.as_str();
             let key = params![account.as_str(), id];
@@ -151,7 +211,8 @@ impl Store {
                 continue;
             };
             let copies = bodies::copies_of(&tx, account, id)?;
-            let unchecked = copies.iter().any(|copy| !checked.contains_key(copy));
+            let unchecked = !date_ready_from_cache(previous, saved_arrival, copies.len(), latest)
+                && copies.iter().any(|copy| !checked.contains_key(copy));
             let unchecked_attempts = unchecked_attempts
                 + i64::from(
                     fetch_complete && unchecked && unchecked_attempts < MAX_UNCHECKED_ATTEMPTS,

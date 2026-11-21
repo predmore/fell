@@ -55,7 +55,7 @@ use crate::backend::{
     RemovalKind, Settle, SyncCursor, SyncProgress,
 };
 use crate::folders::{FolderRole, FolderRoles, ListedMailbox};
-use crate::message::{Message, RemoteId};
+use crate::message::RemoteId;
 
 /// Messages held in memory before they are persisted. A larger mailbox is
 /// written in several deltas so the cursor can move before the FETCH ends.
@@ -596,7 +596,7 @@ fn catch_up(
     let mut stored_highest: Option<u32> = None;
     let mut min_unparsed: Option<u32> = None;
     let prior = &pass.prior;
-    let flush_batch = |batch: &mut Vec<Message>,
+    let flush_batch = |batch: &mut Vec<rfc822::FetchedMessage>,
                        batch_bytes: &mut usize,
                        flags: &mut Vec<FlagUpdate>,
                        highest: Option<u32>,
@@ -1069,7 +1069,7 @@ fn walk_down(
                     &row,
                     !mode.keywords,
                 );
-                header_ids.insert(row.uid, header.headers.message_id.clone());
+                header_ids.insert(row.uid, header.message.headers.message_id.clone());
                 let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, mode);
                 headers.push((header, learned));
             }
@@ -1351,7 +1351,7 @@ fn emit_walk(
     persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
     pass: &Pass<'_>,
     current: (&str, &MailboxCheckpoint),
-    messages: Vec<Message>,
+    messages: Vec<rfc822::FetchedMessage>,
     flags: Vec<FlagUpdate>,
     too_large: Vec<crate::MessageId>,
     progress: Option<SyncProgress>,
@@ -1899,7 +1899,7 @@ fn emit_progress(
     persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
     snapshot: &Snapshot<'_>,
     current: Option<(&str, &MailboxCheckpoint)>,
-    messages: Vec<Message>,
+    messages: Vec<rfc822::FetchedMessage>,
     flags: Vec<FlagUpdate>,
     removals: Vec<FolderRemoval>,
 ) -> Result<(), Error> {
@@ -1911,7 +1911,7 @@ fn emit_progress(
 fn progress_delta(
     snapshot: &Snapshot<'_>,
     current: Option<(&str, &MailboxCheckpoint)>,
-    messages: Vec<Message>,
+    fetched: Vec<rfc822::FetchedMessage>,
     flags: Vec<FlagUpdate>,
     removals: Vec<FolderRemoval>,
 ) -> MailboxDelta {
@@ -1933,8 +1933,17 @@ fn progress_delta(
         }
     }
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut messages = Vec::with_capacity(fetched.len());
+    let mut deferred_dates = HashMap::new();
+    for item in fetched {
+        if let Some(date) = item.deferred_date {
+            deferred_dates.insert(item.message.remote_id.clone(), date);
+        }
+        messages.push(item.message);
+    }
     MailboxDelta {
         messages,
+        deferred_dates,
         flags,
         cursor: Some(encode_cursor(snapshot.account_id.as_str(), &pairs)),
         removals,

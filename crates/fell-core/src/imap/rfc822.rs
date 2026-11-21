@@ -125,13 +125,18 @@ pub(crate) fn to_message(
     )
 }
 
+pub(super) struct FetchedMessage {
+    pub message: Message,
+    pub deferred_date: Option<crate::backend::DeferredMailDate>,
+}
+
 pub(super) fn fetched_message(
     account_id: &AccountId,
     mailbox: &session::Listed,
     uidvalidity: u32,
     item: &session::Fetched,
     bridge: bool,
-) -> Message {
+) -> FetchedMessage {
     let mut message = parse_message(
         account_id,
         (&mailbox.raw, &mailbox.decoded),
@@ -140,12 +145,23 @@ pub(super) fn fetched_message(
         &item.body,
         bridge,
     );
-    message.headers.date_unix = effective_date(
-        message.headers.date_unix,
-        item.internal_date,
-        crate::latest_mail_date(),
-    );
-    message
+    let latest = crate::latest_mail_date();
+    let header = message.headers.date_unix;
+    let arrival = item.internal_date;
+    message.headers.date_unix = effective_date(header, arrival, latest);
+    let deferred_date = if message.headers.date_unix == 0 {
+        let plausible = |date: &i64| crate::plausible_future_mail_date(*date, latest);
+        let header = Some(header).filter(plausible);
+        let arrival = arrival.filter(plausible);
+        (header.is_some() || arrival.is_some())
+            .then_some(crate::backend::DeferredMailDate { header, arrival })
+    } else {
+        None
+    };
+    FetchedMessage {
+        message,
+        deferred_date,
+    }
 }
 
 fn parse_message(
@@ -284,14 +300,15 @@ pub(super) fn headers_message(
     uidvalidity: u32,
     item: &session::Fetched,
     bridge: bool,
-) -> Message {
-    let mut message = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
+) -> FetchedMessage {
+    let mut fetched = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
+    let message = &mut fetched.message;
     message.snippet.clear();
     message.body_text = None;
     message.parts = None;
     message.has_attachment = false;
     message.attachment_names.clear();
-    message
+    fetched
 }
 
 /// Header names the renderer's bulk-mail check reads, matched exactly

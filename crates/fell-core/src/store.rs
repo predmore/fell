@@ -754,6 +754,12 @@ impl Store {
             }
             // A combined delta can carry the listing for these messages.
             new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
+            if let Some(date) = delta.deferred_dates.get(&message.remote_id)
+                && message.headers.date_unix == 0
+                && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
+            {
+                dates::queue_deferred_date(&tx, account_id, &id, *date)?;
+            }
         }
         let has_arrivals = !delta.messages.is_empty();
         for message_id in &delta.too_large {

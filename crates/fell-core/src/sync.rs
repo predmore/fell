@@ -82,7 +82,7 @@ pub fn sync_with_progress(
         }
         Ok(())
     })?;
-    // Repair a bounded page of legacy dates after a successful sync pass.
+    // Repair a bounded page of undated mail after a successful sync pass.
     if let Ok(changed) = repair_internal_dates(&account.id, backend, store) {
         report.changed |= changed;
     }
@@ -94,10 +94,11 @@ fn repair_internal_dates(
     backend: &dyn MailBackend,
     store: &Store,
 ) -> Result<bool> {
+    let latest = crate::latest_mail_date();
     let batch = store.missing_internal_dates(account)?;
     let copies: Vec<_> = batch
         .iter()
-        .flat_map(|request| &request.copies)
+        .flat_map(|request| request.copies_to_fetch(latest))
         .cloned()
         .collect();
     let mut checked = HashMap::new();
@@ -109,13 +110,7 @@ fn repair_internal_dates(
                 checked.insert(id.clone(), date);
             })
             .is_ok();
-    store.finish_internal_dates(
-        account,
-        &batch,
-        &checked,
-        fetch_complete,
-        crate::latest_mail_date(),
-    )
+    store.finish_internal_dates(account, &batch, &checked, fetch_complete, latest)
 }
 
 /// Cursor for walking unchecked Reply-To headers between sync passes.

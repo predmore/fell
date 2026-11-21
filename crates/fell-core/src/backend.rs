@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::account::{AccountId, BackendKind};
 use crate::account_config::AccountConfig;
 use crate::imap::ImapConfig;
@@ -121,6 +123,25 @@ pub struct MailboxView {
     pub kind: MailboxViewKind,
 }
 
+/// Dates from a fetched copy that may be usable after the local clock advances.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredMailDate {
+    pub header: Option<i64>,
+    pub arrival: Option<i64>,
+}
+
+impl DeferredMailDate {
+    pub(crate) fn merge(&mut self, later: Self) {
+        self.header = self.header.or(later.header);
+        self.arrival = self
+            .arrival
+            .zip(later.arrival)
+            .map(|(a, b)| a.min(b))
+            .or(self.arrival)
+            .or(later.arrival);
+    }
+}
+
 /// Messages, flag updates, and vanished copies to apply to the local store.
 ///
 /// Removals drop server copies only. The folders they backed come off the
@@ -129,6 +150,8 @@ pub struct MailboxView {
 #[derive(Debug, Clone, Default)]
 pub struct MailboxDelta {
     pub messages: Vec<Message>,
+    /// Clock-skew candidates for undated arrivals, keyed by server copy.
+    pub deferred_dates: HashMap<crate::RemoteId, DeferredMailDate>,
     pub flags: Vec<FlagUpdate>,
     pub links: Vec<CopyLink>,
     /// Virtual mailboxes from the latest successful LIST.
@@ -535,6 +558,13 @@ fn collect_imap(
                 }
             }
             combined.messages.append(&mut delta.messages);
+            for (id, date) in delta.deferred_dates {
+                combined
+                    .deferred_dates
+                    .entry(id)
+                    .and_modify(|saved| saved.merge(date))
+                    .or_insert(date);
+            }
             combined.flags.append(&mut delta.flags);
             combined.links.append(&mut delta.links);
             combined.too_large.append(&mut delta.too_large);
