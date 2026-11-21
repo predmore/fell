@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fell_core::{
     Account, AccountConfig, BackendKind, DroppedWrite, InboxWait, MessageId, MessageParts,
-    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, classify_sync_error,
-    fetch_message_bodies, fetch_missing_bodies, sync_with_progress,
+    ReplyToBackfill, ReplyToProgress, Store, SyncFailureKind, SyncReport, fetch_message_bodies,
+    fetch_missing_bodies, sync_with_progress,
 };
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -258,13 +258,6 @@ fn run(
 ) {
     let bridge = config.backend == BackendKind::Bridge;
     let send = |kind: SyncKind| events.unbounded_send(SyncEvent::Status(kind)).is_ok();
-    let failed = |kind: SyncFailureKind, detail: String| {
-        SyncKind::Failed(SyncFailure {
-            kind,
-            bridge,
-            detail,
-        })
-    };
 
     // Another connection may still be opening or migrating the file. Retry
     // instead of giving up on a lock.
@@ -280,10 +273,12 @@ fn run(
                 let status = if failures < OPEN_RETRIES_BEFORE_ERROR {
                     SyncKind::Connecting
                 } else {
-                    failed(
-                        SyncFailureKind::Other,
-                        format!("sync could not open the mailbox: {err}"),
-                    )
+                    SyncKind::Failed(SyncFailure {
+                        kind: SyncFailureKind::Other,
+                        bridge,
+                        detail: format!("sync could not open the mailbox: {err}"),
+                        recovery: None,
+                    })
                 };
                 if !send(status) {
                     return;
@@ -364,7 +359,7 @@ fn run(
             Err(err) => {
                 let delay = BACKOFF[failures.min(BACKOFF.len() - 1)];
                 failures += 1;
-                if !send(failed(classify_sync_error(&err), err.to_string())) {
+                if !send(SyncKind::Failed(SyncFailure::connection(&config, &err))) {
                     return;
                 }
                 delay

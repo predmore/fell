@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::ops::Range;
 
 use fell_core::compose::ReplyKind;
+use fell_core::onboarding::connection_recovery;
 use fell_core::{
-    FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey, SyncFailureKind, ThreadId,
+    AccountConfig, BackendKind, Error, FlagChange, FolderRole, FolderRoles, FolderSpan, ListKey,
+    SyncFailureKind, ThreadId, classify_sync_error,
 };
 
 use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
@@ -62,6 +64,18 @@ pub struct SyncFailure {
     /// The backend is Proton Mail Bridge, so copy can name it.
     pub bridge: bool,
     pub detail: String,
+    pub recovery: Option<&'static str>,
+}
+
+impl SyncFailure {
+    pub fn connection(config: &AccountConfig, error: &Error) -> Self {
+        Self {
+            kind: classify_sync_error(error),
+            bridge: config.backend == BackendKind::Bridge,
+            detail: error.to_string(),
+            recovery: connection_recovery(config, error),
+        }
+    }
 }
 
 impl SyncKind {
@@ -122,7 +136,8 @@ impl SyncKind {
                 SyncFailureKind::Unreachable => "offline · server unreachable".into(),
                 SyncFailureKind::LoginRejected => "offline · login rejected".into(),
                 SyncFailureKind::Password => "offline · password unavailable".into(),
-                SyncFailureKind::Tls | SyncFailureKind::Other => "offline · sync failed".into(),
+                SyncFailureKind::Tls => "offline · TLS failed".into(),
+                SyncFailureKind::Other => "offline · sync failed".into(),
             },
         }
     }
@@ -2588,20 +2603,15 @@ impl Session {
                     }
                     SyncFailureKind::LoginRejected => "The server didn't accept the login",
                     SyncFailureKind::Password => "Account password unavailable",
-                    SyncFailureKind::Tls | SyncFailureKind::Other => "Sync failed",
+                    SyncFailureKind::Tls => "Couldn't establish a secure connection",
+                    SyncFailureKind::Other => "Sync failed",
                 };
-                let fix = match failure.kind {
-                    SyncFailureKind::Unreachable if failure.bridge => {
-                        format!("Start Bridge, then {retry} to retry")
-                    }
-                    SyncFailureKind::LoginRejected => format!(
-                        "Use the IMAP username and password Bridge shows · fell account setup · {retry} retry"
-                    ),
-                    _ => format!("? details · {retry} retry"),
-                };
+                let hint = failure
+                    .recovery
+                    .map_or_else(|| format!("? details · {retry} retry"), str::to_owned);
                 Banner {
                     title: title.into(),
-                    hint: fix,
+                    hint,
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
@@ -2731,11 +2741,40 @@ mod tests {
             kind: SyncFailureKind::Unreachable,
             bridge: false,
             detail: "test timeout".into(),
+            recovery: None,
         }));
         assert_eq!(session.sync.status_at(0), "offline · server unreachable");
         let notice = session.toast.unwrap();
         assert_eq!(notice.text, "Read/star sync delayed. Retrying");
         assert!(notice.alert);
+    }
+
+    #[test]
+    fn connection_failure_banner_shows_the_recovery_hint() {
+        let config = AccountConfig::parse(
+            "backend = \"bridge\"\nemail = \"me@example.test\"\npassword_source = \"keyring\"",
+        )
+        .unwrap();
+        let mut session = session();
+        session.set_threads(Vec::new());
+
+        for (error, title, hint) in [
+            (
+                Error::Keyring(fell_core::credentials::KeyringError::Locked),
+                "Account password unavailable",
+                "Unlock your desktop keyring and try again.",
+            ),
+            (
+                Error::Tls("test certificate failure".into()),
+                "Couldn't establish a secure connection",
+                "Check the server host, port, TLS mode, and certificate, then try again.",
+            ),
+        ] {
+            session.apply_sync_status(SyncKind::Failed(SyncFailure::connection(&config, &error)));
+            let banner = session.list_banner().unwrap();
+            assert_eq!(banner.title, title);
+            assert_eq!(banner.hint, hint);
+        }
     }
 
     fn row(id: &str) -> ThreadRow {

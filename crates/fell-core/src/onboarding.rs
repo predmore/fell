@@ -86,7 +86,12 @@ pub fn connection_recovery(config: &AccountConfig, err: &Error) -> Option<&'stat
 
     if let Error::Keyring(error) = err {
         return Some(match error {
-            KeyringError::Unavailable => "Start your desktop keyring service and try again.",
+            KeyringError::Unavailable { timed_out: false } => {
+                "Start your desktop keyring service and try again."
+            }
+            KeyringError::Unavailable { timed_out: true } => {
+                "Check that your desktop keyring is responding, then try again."
+            }
             KeyringError::Locked => "Unlock your desktop keyring and try again.",
             KeyringError::Missing | KeyringError::Invalid => {
                 "Run fell account setup to save the password again."
@@ -100,11 +105,11 @@ pub fn connection_recovery(config: &AccountConfig, err: &Error) -> Option<&'stat
     let bridge = config.backend == BackendKind::Bridge;
     Some(match classify_sync_error(err) {
         SyncFailureKind::Unreachable if bridge => {
-            "Nothing is listening there. Start Proton Mail Bridge and sign in, then try again."
+            "Start Proton Mail Bridge and sign in, then try again."
         }
         SyncFailureKind::Unreachable => "The server did not answer on that host and port.",
         SyncFailureKind::LoginRejected if bridge => {
-            "Bridge refused the login. Use the IMAP username and password shown in Bridge's mailbox details."
+            "Use the IMAP username and password from Bridge's mailbox details."
         }
         SyncFailureKind::LoginRejected => {
             "Check the username and password. Some providers require an app password."
