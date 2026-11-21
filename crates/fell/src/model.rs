@@ -25,7 +25,7 @@ use crate::worker::Worker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncKind {
-    /// No account is set up, so the demo threads were loaded.
+    /// The demo mailbox was requested explicitly.
     FixtureOffline,
     /// The store already had mail and no account file is set up.
     LocalOffline,

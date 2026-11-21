@@ -27,7 +27,7 @@ use gpui::{
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, div, point,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
     prelude::*, px, rgb, size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -69,7 +69,7 @@ use crate::worker::Worker;
 use self::agent_notes::NoteVisit;
 use self::disclosure::disclosure;
 
-pub fn run(trace_start: Option<Instant>) {
+pub fn run(demo: bool, trace_start: Option<Instant>) {
     fell_core::diagnostic!(INFO, "Opening inbox");
     Application::new().run(move |cx: &mut App| {
         let trace = trace_start.and_then(|start| match UiTrace::open(start) {
@@ -92,62 +92,49 @@ pub fn run(trace_start: Option<Instant>) {
             })
             .detach();
         }
-        // Agents' drafts open in a compose window from here; see draft_host.
-        let _hub = crate::draft_host::host_agent_drafts(cx);
+        let startup = mailbox::startup();
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        let view = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Fell".into()),
-                    ..Default::default()
-                }),
-                app_id: Some("dev.predmore.fell".into()),
-                focus: true,
-                show: true,
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Fell".into()),
                 ..Default::default()
-            },
-            |window, cx| {
+            }),
+            app_id: Some("dev.predmore.fell".into()),
+            focus: true,
+            show: true,
+            ..Default::default()
+        };
+        let view = if startup.account_missing && !demo {
+            cx.open_window(options, |window, cx| {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                let view = cx.new(|cx| Inbox::new(window, cx));
-                view.update(cx, |_, cx| {
-                    let mut viewport = (window.viewport_size(), window.scale_factor());
-                    cx.observe_window_bounds(window, move |_, window, cx| {
-                        let previous = viewport;
-                        viewport = (window.viewport_size(), window.scale_factor());
-                        if viewport == previous {
-                            return;
-                        }
-                        // Lay out the new bounds as soon as configure arrives,
-                        // so the next compositor frame can present immediately.
-                        window.defer(cx, |window, cx| window.draw(cx).clear());
-                    })
-                    .detach();
-                    cx.observe_window_activation(window, |_, window, cx| {
-                        if window.is_window_active() {
-                            cx.notify();
-                        }
-                    })
-                    .detach();
-                });
-                let focus = view.read(cx).focus.clone();
-                window.focus(&focus);
-                view
-            },
-        );
+                cx.new(|cx| crate::onboarding::Onboarding::new(window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        } else {
+            crate::draft_host::host_agent_drafts(cx);
+            cx.open_window(options, |window, cx| {
+                if let Some(trace) = &trace {
+                    trace.window_created(window);
+                }
+                cx.new(|cx| Inbox::focused(startup, demo, window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        };
         match view {
             Ok(view) => {
-                cx.set_global(InboxWindow(view));
                 cx.on_window_closed(move |cx| {
-                    if cx.windows().contains(&view.into()) {
-                        let _ = view.update(cx, |inbox, _, cx| {
-                            if inbox.motion.has_pending_messages() {
-                                cx.notify();
-                            }
-                        });
+                    if cx.windows().contains(&view) {
+                        if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+                            inbox.update(cx, |inbox, cx| {
+                                if inbox.motion.has_pending_messages() {
+                                    cx.notify();
+                                }
+                            });
+                        }
                     } else if let Some(trace) = &trace {
                         trace.finish();
                     }
@@ -160,9 +147,20 @@ pub fn run(trace_start: Option<Instant>) {
     });
 }
 
-struct InboxWindow(WindowHandle<Inbox>);
+#[derive(Clone, Copy)]
+struct InboxWindow(gpui::AnyWindowHandle);
 
 impl gpui::Global for InboxWindow {}
+
+impl InboxWindow {
+    fn update(self, cx: &mut App, update: impl FnOnce(&mut Inbox, &mut Context<Inbox>)) {
+        let _ = self.0.update(cx, |root, _, cx| {
+            if let Ok(inbox) = root.downcast::<Inbox>() {
+                inbox.update(cx, update);
+            }
+        });
+    }
+}
 
 /// Put the committed copy into the inbox before the compose window closes.
 pub(crate) fn present_sent_copy(
@@ -171,10 +169,10 @@ pub(crate) fn present_sent_copy(
     message: fell_core::Message,
     rich: Rich,
 ) {
-    let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) else {
+    let Some(inbox) = cx.try_global::<InboxWindow>().copied() else {
         return;
     };
-    let _ = inbox.update(cx, |inbox, _, cx| {
+    inbox.update(cx, |inbox, cx| {
         if message.account_id != inbox.account_id {
             return;
         }
@@ -197,14 +195,20 @@ fn compose_open(cx: &App) -> bool {
 }
 
 pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
-    if let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) {
-        let _ = inbox.update(cx, |inbox, _, _| {
+    if let Some(inbox) = cx.try_global::<InboxWindow>().copied() {
+        inbox.update(cx, |inbox, _| {
             // A failed local insert can still have queued the server copy.
             if let Some(sync) = &inbox.sync {
                 sync.write_back_now();
             }
         });
     }
+}
+
+pub(crate) fn finish_onboarding(window: &mut Window, cx: &mut App) {
+    let startup = mailbox::startup();
+    crate::draft_host::host_agent_drafts(cx);
+    window.replace_root(cx, |window, cx| Inbox::focused(startup, false, window, cx));
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -653,12 +657,37 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_startup(mailbox::startup(), Some(window), cx)
+    fn focused(
+        startup: mailbox::Startup,
+        demo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inbox = Self::with_startup(startup, demo, Some(window), cx);
+        window.focus(&inbox.focus);
+        cx.set_global(InboxWindow(window.window_handle()));
+        let mut viewport = (window.viewport_size(), window.scale_factor());
+        cx.observe_window_bounds(window, move |_, window, cx| {
+            let previous = viewport;
+            viewport = (window.viewport_size(), window.scale_factor());
+            if viewport != previous {
+                // Draw at the new bounds for the next compositor frame.
+                window.defer(cx, |window, cx| window.draw(cx).clear());
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |_, window, cx| {
+            if window.is_window_active() {
+                cx.notify();
+            }
+        })
+        .detach();
+        inbox
     }
 
     fn with_startup(
         startup: mailbox::Startup,
+        demo: bool,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -670,7 +699,7 @@ impl Inbox {
         let (store, ready) = StoreClient::spawn(
             {
                 let config = config.clone();
-                move || mailbox::open_store(path.clone(), config.as_ref())
+                move || mailbox::open_store(path.clone(), config.as_ref(), demo)
             },
             notices,
         );
@@ -800,7 +829,13 @@ impl Inbox {
         .detach();
         inbox.show_crash_notice(cx);
         inbox.watch_store_restarts(store_restarts, cx);
-        inbox.watch_theme(cx);
+        theme::follow(cx, |inbox, next, cx| {
+            if inbox.theme != next {
+                inbox.theme = next;
+                inbox.row_widths.clear();
+                cx.notify();
+            }
+        });
         inbox.watch_reviews(cx);
         inbox.watch_notes(cx);
         inbox.watch_dates(cx);
@@ -2507,43 +2542,6 @@ impl Inbox {
         } else if at <= self.session.message_cursor && messages.len() > 1 {
             self.session.message_cursor += 1;
         }
-    }
-
-    /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
-    /// inotify wakes this; without it, a slow poll does.
-    fn watch_theme(&self, cx: &mut Context<Self>) {
-        let (changed, mut changes) = futures::channel::mpsc::unbounded();
-        let watching = theme::watch(changed);
-        cx.spawn(async move |this, cx| {
-            loop {
-                if watching {
-                    if changes.next().await.is_none() {
-                        break;
-                    }
-                } else {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                }
-                let next = cx
-                    .background_executor()
-                    .spawn(async { theme::load() })
-                    .await;
-                let alive = this
-                    .update(cx, |inbox, cx| {
-                        if inbox.theme != next {
-                            inbox.theme = next;
-                            inbox.row_widths.clear();
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     fn watch_dates(&self, cx: &mut Context<Self>) {

@@ -18,6 +18,7 @@ mod mailbox;
 mod model;
 mod motion;
 mod notifications;
+mod onboarding;
 mod png;
 mod present;
 mod reply_check;
@@ -38,12 +39,17 @@ use fell_core::{PendingSend, UserSendConfirmation};
 
 /// Open the inbox window.
 pub fn run() {
-    view::run(None);
+    view::run(false, None);
 }
 
 /// Open the inbox with startup and presentation tracing.
 pub fn run_traced(started: std::time::Instant) {
-    view::run(Some(started));
+    view::run(false, Some(started));
+}
+
+/// Open the inbox with fixture mail when no account is configured.
+pub fn run_demo(trace_start: Option<std::time::Instant>) {
+    view::run(true, trace_start);
 }
 
 pub use compose_ui::{ComposeView, SendFailure, ThemeKind, open_demo, send_from_editor};

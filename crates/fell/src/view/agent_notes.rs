@@ -1298,9 +1298,11 @@ mod tests {
                 split: 0.4,
                 read_dwell_ms: 0,
                 error: None,
+                account_missing: true,
                 config: None,
                 path: Ok(path),
             },
+            true,
             None,
             cx,
         )
