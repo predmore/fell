@@ -1,8 +1,9 @@
 //! RFC 822 bytes from IMAP FETCH, turned into a store message.
 //!
-//! `body_text` is the plain text search and snippets use, with HTML reduced
-//! to text. The HTML and plain parts are kept as sent in [`MessageParts`] for
-//! the conversation view; sanitizing HTML belongs to rendering, not sync.
+//! `body_text` is the plain text search uses, with HTML reduced to text.
+//! The preview of HTML-only mail follows the native document's blocks.
+//! The HTML and plain parts are kept as sent in [`MessageParts`] for the
+//! conversation view; sanitizing HTML belongs to rendering, not sync.
 //! Every other MIME part is listed by its IMAP section ([`MimePart`]); its
 //! bytes are not kept.
 
@@ -196,14 +197,15 @@ fn parse_message(
         .and_then(|message| message.body_text(0))
         .map(|body| body.into_owned())
         .filter(|body| !body.trim().is_empty());
-    let snippet = snippet(body_text.as_deref().unwrap_or(&subject));
+    let parts = parsed.as_ref().map(body_parts).unwrap_or_default();
+    let snippet = html_only_snippet(&parts)
+        .unwrap_or_else(|| snippet(body_text.as_deref().unwrap_or(&subject)));
     let unread = !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
     let mut labels = keywords(flags);
     labels.retain(|keyword| !super::is_reserved_keyword(keyword));
     let arrived_via = parsed.as_ref().map(arrival_addresses).unwrap_or_default();
     let list_id = parsed.as_ref().and_then(list_id_header);
     let thread_id = ThreadId::from_message_id(&message_id);
-    let parts = parsed.as_ref().map(body_parts).unwrap_or_default();
 
     Message {
         account_id: account_id.clone(),
@@ -781,6 +783,19 @@ fn list_id_header(message: &mail_parser::Message<'_>) -> Option<String> {
     }
 }
 
+pub(crate) fn html_only_snippet(parts: &MessageParts) -> Option<String> {
+    parts
+        .html
+        .as_deref()
+        .filter(|_| parts.plain.is_none())
+        .and_then(html_snippet)
+}
+
+pub(crate) fn html_snippet(html: &str) -> Option<String> {
+    let preview = snippet(&fell_render::html_to_document(html).plain_text());
+    (!preview.is_empty()).then_some(preview)
+}
+
 fn snippet(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut end = collapsed.len().min(160);
@@ -892,6 +907,98 @@ mod tests {
         let text = message.body_text.expect("flattened text");
         assert!(text.contains("Hello there"));
         assert!(!text.contains("<p>"));
+    }
+
+    #[test]
+    fn html_snippet_separates_blocks_and_keeps_inline_words_together() {
+        let raw = "From: Ann <ann@x>\r\n\
+                   Subject: Survey\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\r\n\
+                   <h1>From <em>the</em> field</h1><p>The latest <b>sur</b>vey.</p>\
+                   <ul><li>First route</li><li>Second route</li></ul>";
+        let (message, _) = parts_of(raw);
+        assert_eq!(
+            message.snippet,
+            "From the field The latest survey. First route Second route"
+        );
+    }
+
+    #[test]
+    fn cached_html_snippets_only_repair_block_spacing() {
+        let cases = [
+            (
+                "<div style=\"display:none\">Preheader</div><p>News today.</p>",
+                "PreheaderNews today.",
+                "PreheaderNews today.",
+            ),
+            (
+                "<img src=\"logo.png\" alt=\"Company logo\"><p>News today.</p>",
+                "News today.",
+                "News today.",
+            ),
+            (
+                "<h1>From the field</h1><p>The latest survey.</p>",
+                "From the fieldThe latest survey.",
+                "From the field The latest survey.",
+            ),
+            ("<p>News today.</p>", "News today.", "News today."),
+            ("<b>sur</b>vey", "survey", "survey"),
+        ];
+        let store = crate::Store::open_in_memory().unwrap();
+        let account = AccountId("a1".into());
+        store
+            .upsert_account(&crate::Account {
+                id: account.clone(),
+                display_name: "Reader".into(),
+                email: "reader@example.test".into(),
+                backend_kind: crate::BackendKind::Imap,
+            })
+            .unwrap();
+        let messages: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (html, old, _))| {
+                let raw = format!(
+                    "From: Ann <ann@x>\r\n\
+                     Subject: Example {i}\r\n\
+                     Message-ID: <{i}@x>\r\n\
+                     Content-Type: text/html; charset=utf-8\r\n\r\n{html}"
+                );
+                let mut message = to_message(
+                    &account,
+                    "INBOX",
+                    "INBOX",
+                    1,
+                    i as u32 + 1,
+                    &[],
+                    raw.as_bytes(),
+                );
+                // Match the snippet builder used before the block-spacing change.
+                assert_eq!(snippet(message.body_text.as_deref().unwrap()), *old);
+                message.snippet = (*old).into();
+                message
+            })
+            .collect();
+        store
+            .apply_delta(
+                &account,
+                &crate::MailboxDelta {
+                    messages: messages.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.repair_html_snippets().unwrap(), Some(true));
+        assert_eq!(store.repair_html_snippets().unwrap(), None);
+        for (message, (_, _, expected)) in messages.iter().zip(cases) {
+            let stored = store
+                .message(&account, &message.headers.message_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.snippet, expected);
+            assert_eq!(stored.body_text, message.body_text);
+        }
     }
 
     #[test]

@@ -1100,6 +1100,13 @@ impl Store {
         bodies::missing(&self.conn, account_id, limit)
     }
 
+    /// Repair one batch of cached HTML-only previews from the original parts
+    /// on the sync lane. Returns whether the batch changed previews, or
+    /// `None` after the cache is up to date.
+    pub fn repair_html_snippets(&self) -> Result<Option<bool>> {
+        bodies::repair_html_snippets(&self.conn)
+    }
+
     /// The server copies to fetch for one message with no stored body part
     /// or no part list, including one an earlier backfill could not fetch.
     /// `None` when it has both already, or no copy to fetch.
@@ -1233,14 +1240,15 @@ impl Store {
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
         // Deflate before the write lock: archive and mark-read wait on it.
-        let compressed: Vec<(&MessageId, bodies::StoredParts)> = fetched
+        let compressed: Vec<_> = fetched
             .iter()
             .map(|(message_id, parts)| {
                 let stored = parts
                     .as_ref()
                     .map(bodies::StoredParts::new)
                     .unwrap_or_default();
-                (message_id, stored)
+                let snippet = parts.as_ref().and_then(crate::imap::html_only_snippet);
+                (message_id, stored, snippet)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1251,7 +1259,7 @@ impl Store {
         )?;
         let repairs = compressed
             .iter()
-            .map(|(id, parts)| {
+            .map(|(id, parts, _)| {
                 let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
                     return Ok(None);
                 };
@@ -1268,7 +1276,7 @@ impl Store {
             .lock_wait
             .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for ((message_id, parts), repair) in compressed.iter().zip(repairs) {
+        for ((message_id, parts, snippet), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1279,6 +1287,9 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
+            if let Some(snippet) = snippet {
+                bodies::fill_fetched_html_snippet(&tx, account_id, &canonical, parts, snippet)?;
+            }
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.
                 set_attachments_from_list(&tx, account_id, &canonical, list)?;
