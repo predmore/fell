@@ -1918,6 +1918,7 @@ dependencies = [
  "image",
  "libc",
  "notify",
+ "raw-window-handle",
  "rusqlite",
  "rustls",
  "rustls-native-certs",
@@ -1929,6 +1930,8 @@ dependencies = [
  "toml 1.2.1+spec-1.1.0",
  "ureq",
  "url",
+ "wayland-client",
+ "wayland-protocols 0.32.13",
  "webkit2gtk",
  "wry",
 ]

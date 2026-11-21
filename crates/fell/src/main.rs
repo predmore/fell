@@ -6,6 +6,7 @@
 use fell::render::{self, Reader};
 use fell::{ComposeView, ThemeKind, open_demo};
 use std::ffi::OsString;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
@@ -14,6 +15,7 @@ use gpui::{
 const USAGE: &str = "\
 Usage:
   fell                         open the inbox
+  fell --trace                 record inbox startup and frame timing
   fell account setup|show|check
                                connect and test a mail account
   fell embeddings status|install|remove
@@ -34,6 +36,7 @@ Development previews:
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
     Inbox,
+    TraceInbox,
     Help,
     Version,
     Account(Vec<String>),
@@ -63,6 +66,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         _ => {}
     }
     let mut fixture = None;
+    let mut trace = false;
     let mut light = None;
     let mut compose = ComposePreview {
         light: false,
@@ -81,6 +85,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         match arg.as_str() {
             "--help" | "-h" | "help" => return Ok(Command::Help),
             "--version" | "-V" => return Ok(Command::Version),
+            "--trace" => trace = true,
             "--fixture" => match value("--fixture")? {
                 "--help" | "-h" => return Ok(Command::Help),
                 name => fixture = Some(name.to_string()),
@@ -115,6 +120,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     let light_set = light.is_some();
     let light = light.unwrap_or(false);
+    if trace {
+        return if fixture.is_none() && compose_flag.is_none() && !light_set {
+            Ok(Command::TraceInbox)
+        } else {
+            Err("--trace is for the inbox".into())
+        };
+    }
     match (fixture, compose_flag) {
         (Some(_), Some(flag)) => Err(format!("{flag} is for the compose preview, not --fixture")),
         (Some(name), None) => Ok(Command::Fixture { name, light }),
@@ -132,6 +144,7 @@ fn size_value(name: &str, raw: &str) -> Result<f32, String> {
 }
 
 fn main() {
+    let started = Instant::now();
     // `fell mcp` passes its arguments through untouched, even non-UTF-8 paths.
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     if raw.first().is_some_and(|arg| arg == "mcp") {
@@ -151,6 +164,10 @@ fn main() {
         Command::Account(args) => std::process::exit(fell::account_command(&args)),
         Command::Embeddings(args) => std::process::exit(fell::embeddings_command(&args)),
         Command::Mcp(args) => mcp(&args),
+        Command::Inbox if std::env::var_os("FELL_TRACE").is_some_and(|value| value == "1") => {
+            fell::run_traced(started);
+        }
+        Command::TraceInbox => fell::run_traced(started),
         Command::Inbox => fell::run(),
         Command::Fixture { name, light } => preview(name, light),
         Command::Compose(preview) => compose_preview(preview),
@@ -363,5 +380,12 @@ mod tests {
                 play: true
             }))
         );
+    }
+
+    #[test]
+    fn trace_opens_only_the_inbox() {
+        assert_eq!(parse(&["--trace"]), Ok(Command::TraceInbox));
+        assert!(parse(&["--trace", "--fixture", "native-personal-reply"]).is_err());
+        assert!(parse(&["--trace", "--play"]).is_err());
     }
 }

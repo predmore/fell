@@ -49,3 +49,19 @@ if options.semantic && query == "in:Archive budget meeting" {
 ```
 
 The keyword text-and-operators row and the filtered hybrid residual row should fail their budgets. A separate 150 ms delay around the shared graph invocation, timed by both the graph and end-to-end rows, should fail both ceilings. A 0.5 ms delay in `Store::open` should leave thread calibration independent of the open timing, and a thread-read delay that crosses its effective ceiling should fail that row. Remove the temporary worktree after the checks.
+
+## Replay the inbox
+
+Build the release app and seed the same synthetic mailbox used by the store benchmark. The database path for `--seed` must be new.
+
+```sh
+cargo build --locked --release -p fell
+cargo bench --locked -p fell --features bench-store --bench fell-bench -- --seed /tmp/fell-100k.db
+python3 bench/inbox-replay.py target/release/fell /tmp/fell-100k.db /tmp/fell-ui-run
+```
+
+The replay needs Python 3, `xvfb-run`, Xvfb, xauth, xdotool, and Weston with its X11 backend and kiosk shell. Fell also needs a working Vulkan driver. The script starts a fresh X server and nested Wayland compositor, backs up the fixture into a disposable store, and uses separate XDG directories. Once Fell confirms it opened the store, the script sends 200 `j` keys, opens the conversation, scrolls with `Ctrl-d`, returns to the list, archives, and undoes. Add `--search` on a build with live search to send `/` and five query characters. The new output directory keeps the trace and both process logs. The fixture must be quiescent: no process may have it open, and it must be fully checkpointed, as `--seed` leaves it. The script reads it with SQLite's immutable mode, which takes no lock and ignores frames still in the WAL, so it refuses a fixture whose `-wal` file holds frames.
+
+Startup is measured from entry to Fell's `main`. The trace reports window creation, first CPU paint, the first painted folder page, and the first confirmed Wayland presentation of each relevant stage. Presentation can be unavailable when the compositor lacks `wp_presentation`, uses an unsupported clock, or discards a commit. The replay prints sample coverage and nearest-rank p95 for both CPU paint and compositor presentation. Keyboard timing begins at the inbox handler. The synthetic store backup warms the OS page cache, and the nested compositor measures its own output.
+
+To check a runner against a calibrated tolerance, pass `--ci-factor FACTOR`. The command requires complete presentation feedback and fails when usable inbox presentation exceeds `300 ms × FACTOR` or key-to-presentation p95 exceeds `8 ms × FACTOR`. For a regression check, temporarily sleep for 30 ms on each `j` at the start of `Inbox::on_key_down` after starting its trace timer, rebuild, and run both builds against the same fixture and factor. Use a native Wayland session with `fell --trace` for supported-hardware measurements.
