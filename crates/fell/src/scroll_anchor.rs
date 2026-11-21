@@ -419,7 +419,11 @@ mod tests {
     fn a_navigation_landing_uses_fresh_bounds_after_the_glide() {
         let mut landing = ReaderLanding::default();
         landing.hold(Some("last"));
-        let target = ScrollAnchor { index: 2, y: px(0.), start_if_short: false };
+        let target = ScrollAnchor {
+            index: 2,
+            y: px(0.),
+            start_if_short: false,
+        };
         assert!(landing.anchor(Some("last"), target, true).is_none());
         let anchor = landing.anchor(Some("last"), target, false).unwrap();
         let view = vertical_bounds(50., 300.);
