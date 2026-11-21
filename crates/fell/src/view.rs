@@ -2685,8 +2685,9 @@ impl Inbox {
         window.focus(&self.focus);
         if self.session.overlay == Overlay::Help {
             let now = self.motion.clock.now();
-            self.help_scroll
-                .prepare(&self.theme, &self.session, window, now);
+            self.help_scroll.prepare(now, || {
+                help::Layout::for_window(&self.theme, &self.session, window)
+            });
             if self.help_scroll.on_key(key, &self.motion.motion, now) {
                 self.motion.end_key();
                 cx.notify();
@@ -6269,7 +6270,15 @@ fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)
                         .text_color(rgb(theme.accent))
                         .child(item.key),
                 )
-                .child(div().child(item.label))
+                .child(div().flex_1().child(item.label))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_none()
+                        .text_right()
+                        .text_color(rgb(theme.dimmed))
+                        .children(item.is_group.then_some("›")),
+                )
         }))
 }
 

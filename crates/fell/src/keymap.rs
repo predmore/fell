@@ -117,7 +117,7 @@ impl Action {
             Self::Palette => "Command palette",
             Self::Help => "Help",
             Self::About => "About Fell",
-            Self::ReopenReview => "Reopen closed review",
+            Self::ReopenReview => "Reopen agent review",
         }
     }
 
@@ -287,6 +287,7 @@ fn default_bindings() -> Vec<Binding> {
     bind(&[KeyId::Char(':')], Action::Palette, None);
     bind(&[KeyId::CtrlShiftP], Action::Palette, None);
     bind(&[KeyId::Char('?')], Action::Help, None);
+    bind(&[KeyId::Leader, KeyId::Char('?')], Action::Help, None);
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('i')],
         Action::Inbox,
@@ -379,6 +380,7 @@ pub fn match_seq(keymap: &Keymap, seq: &[KeyId]) -> SeqMatch {
 pub struct WhichItem {
     pub key: String,
     pub label: String,
+    pub is_group: bool,
 }
 
 pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
@@ -396,24 +398,27 @@ pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
     }
     groups
         .into_iter()
-        .map(|(key, bindings)| WhichItem {
-            key,
-            label: which_label(prefix, &bindings),
-        })
+        .map(|(key, bindings)| which_item(key, prefix, &bindings))
         .collect()
 }
 
-fn which_label(prefix: &[KeyId], bindings: &[&Binding]) -> String {
-    if let [binding] = bindings
+fn which_item(key: String, prefix: &[KeyId], bindings: &[&Binding]) -> WhichItem {
+    let (label, is_group) = if let [binding] = bindings
         && binding.keys.len() == prefix.len() + 1
     {
-        return binding.action.label().to_string();
+        (binding.action.label(), false)
+    } else {
+        let group = bindings
+            .iter()
+            .find_map(|binding| binding.group)
+            .unwrap_or("More");
+        (group, true)
+    };
+    WhichItem {
+        key,
+        label: label.to_owned(),
+        is_group,
     }
-    let group = bindings
-        .iter()
-        .find_map(|binding| binding.group)
-        .unwrap_or("More");
-    format!("{group}…")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -622,16 +627,34 @@ mod tests {
             root.iter()
                 .any(|item| item.key == "m" && item.label == "Move")
         );
+        assert!(
+            root.iter()
+                .any(|item| item.key == "?" && item.label == "Help" && !item.is_group)
+        );
+        assert!(
+            palette_items(&keymap, "help", &[])
+                .iter()
+                .any(|item| item.action == Action::Help && item.binding == "? · space ?")
+        );
         let leader = which_key(&keymap, &[KeyId::Leader]);
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "f" && item.label == "Folders…")
+                .any(|item| item.key == "?" && item.label == "Help" && !item.is_group)
+        );
+        assert_eq!(
+            match_seq(&keymap, &[KeyId::Leader, KeyId::Char('?')]),
+            SeqMatch::Action(Action::Help)
         );
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "t" && item.label == "Toggles…")
+                .any(|item| item.key == "f" && item.label == "Folders" && item.is_group)
+        );
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "t" && item.label == "Toggles" && item.is_group)
         );
         assert!(leader.iter().all(|item| item.key != "m"));
         let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
@@ -644,30 +667,33 @@ mod tests {
     }
 
     #[test]
-    fn which_key_marks_groups_and_shares_the_short_review_label_with_the_palette() {
+    fn which_key_marks_groups_and_shares_the_review_label_with_the_palette() {
         let keymap = Keymap::default();
         let leader = which_key(&keymap, &[KeyId::Leader]);
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "s" && item.label == "Sync now")
+                .any(|item| item.key == "s" && item.label == "Sync now" && !item.is_group)
         );
         assert!(
-            leader
-                .iter()
-                .any(|item| item.key == "a" && item.label == "Attachments / agents…")
+            leader.iter().any(|item| item.key == "a"
+                && item.label == "Attachments / agents"
+                && item.is_group)
         );
 
         let agents = which_key(&keymap, &[KeyId::Leader, KeyId::Char('a')]);
         let review = agents.iter().find(|item| item.key == "r").unwrap();
-        assert_eq!(review.label, "Reopen closed review");
+        assert_eq!(review.label, "Reopen agent review");
+        assert!(!review.is_group);
 
-        let matches = palette_items(&keymap, "agent", &[]);
-        let command = matches
-            .iter()
-            .find(|item| item.action == Action::ReopenReview)
-            .unwrap();
-        assert_eq!(command.label, review.label);
+        for query in ["agent", "closed"] {
+            let matches = palette_items(&keymap, query, &[]);
+            let command = matches
+                .iter()
+                .find(|item| item.action == Action::ReopenReview)
+                .unwrap();
+            assert_eq!(command.label, review.label);
+        }
     }
 
     #[test]

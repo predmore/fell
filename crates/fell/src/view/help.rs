@@ -2,7 +2,7 @@
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, Hsla, MouseButton, Window, div, px, rgb};
+use gpui::{Context, Div, FontWeight, Hsla, MouseButton, Pixels, Size, Window, div, px, rgb};
 
 use super::{CARD_TOP_PX, FontOpt, Inbox, conversation_line_style};
 use crate::keymap::{Action, KeyId, binding_text};
@@ -15,10 +15,6 @@ const MAX_HEIGHT: f32 = 460.;
 const INSET: f32 = 8.;
 const LEFT: f32 = 14.;
 const RIGHT: f32 = 24.;
-
-fn card_top(window: &Window) -> f32 {
-    CARD_TOP_PX.min((f32::from(window.viewport_size().height) - 150.).max(0.))
-}
 
 #[derive(Default)]
 pub(super) struct HelpScroll {
@@ -33,15 +29,10 @@ pub(super) struct HelpScroll {
 
 impl HelpScroll {
     /// An open and a scroll key can arrive before the first paint.
-    pub(super) fn prepare(
-        &mut self,
-        theme: &Theme,
-        session: &Session,
-        window: &Window,
-        now: Instant,
-    ) {
+    pub(super) fn prepare(&mut self, now: Instant, measure: impl FnOnce() -> Layout) {
         if self.page == 0 {
-            self.frame(theme, session, window, card_top(window), now, true);
+            let layout = measure();
+            self.advance(layout.page, layout.total, layout.row, now);
         }
     }
 
@@ -63,7 +54,13 @@ impl HelpScroll {
         self.wheel_remainder += rows;
         let whole = self.wheel_remainder.trunc();
         self.wheel_remainder -= whole;
-        self.scroll(whole as isize, motion, now);
+        let whole = whole as isize;
+        let before = self.target;
+        self.scroll(whole, motion, now);
+        let applied = self.target as isize - before as isize;
+        if applied != whole {
+            self.wheel_remainder = 0.;
+        }
     }
 
     fn scroll(&mut self, rows: isize, motion: &Motion, now: Instant) {
@@ -118,51 +115,9 @@ impl HelpScroll {
         if session.overlay != Overlay::Help {
             return None;
         }
-        let top = card_top(window);
-        let frame = self.frame(theme, session, window, top, now, live);
-        Some((top, card(theme, session, frame, live, cx)))
-    }
-
-    fn frame(
-        &mut self,
-        theme: &Theme,
-        session: &Session,
-        window: &Window,
-        top: f32,
-        now: Instant,
-        live: bool,
-    ) -> Frame {
-        let viewport = window.viewport_size();
-        let width = (f32::from(viewport.width) - 24.).clamp(1., MAX_WIDTH);
-        let text_width = (width - 2. - LEFT - RIGHT).max(1.);
-        let line = (theme.ui_px + 6.).ceil();
-        let stacked = text_width < 21. * theme.ui_px;
-        let row = if stacked { 2. * line } else { line + 4. };
-        let header = (theme.ui_px + 26.).ceil();
-        let height = (f32::from(viewport.height) - top - 16.).min(MAX_HEIGHT);
-        let detail = session.detail_text();
-        let detail_rows = detail.as_ref().map_or(0, |error| {
-            let style = conversation_line_style(window, theme, px(theme.ui_px));
-            window
-                .text_system()
-                .shape_text(
-                    error.clone().into(),
-                    px(theme.ui_px),
-                    &[style.to_run(error.len())],
-                    Some(px(text_width)),
-                    None,
-                )
-                .map_or(1, |lines| {
-                    lines
-                        .iter()
-                        .map(|line| line.wrap_boundaries.len() + 1)
-                        .sum()
-                })
-        });
-        let total = actions().count() + detail_rows;
-        let page = (((height - header - 2. - 2. * INSET) / row) as usize).clamp(1, total);
+        let layout = Layout::for_window(theme, session, window);
         if live {
-            self.advance(page, total, row, now);
+            self.advance(layout.page, layout.total, layout.row, now);
         }
         let moving = self.glide.is_some();
         let drawn = if moving {
@@ -170,23 +125,16 @@ impl HelpScroll {
         } else {
             self.drawn
         };
-        Frame {
-            width,
-            header,
-            row,
-            line,
-            stacked,
-            detail,
-            detail_rows,
-            page,
-            total,
-            offset: drawn.min(total.saturating_sub(page) as f32 * row),
-            moving,
-        }
+        let offset = drawn.min((layout.total - layout.page) as f32 * layout.row);
+        Some((
+            layout.top,
+            card(theme, session, layout, offset, moving, live, cx),
+        ))
     }
 }
 
-struct Frame {
+pub(super) struct Layout {
+    top: f32,
     width: f32,
     header: f32,
     row: f32,
@@ -196,33 +144,95 @@ struct Frame {
     detail_rows: usize,
     page: usize,
     total: usize,
-    offset: f32,
-    moving: bool,
+}
+
+impl Layout {
+    pub(super) fn for_window(theme: &Theme, session: &Session, window: &Window) -> Self {
+        Self::measure(
+            theme.ui_px,
+            window.viewport_size(),
+            session.detail_text(),
+            |error, width| {
+                let style = conversation_line_style(window, theme, px(theme.ui_px));
+                window
+                    .text_system()
+                    .shape_text(
+                        error.to_owned().into(),
+                        px(theme.ui_px),
+                        &[style.to_run(error.len())],
+                        Some(px(width)),
+                        None,
+                    )
+                    .map_or(1, |lines| {
+                        lines
+                            .iter()
+                            .map(|line| line.wrap_boundaries.len() + 1)
+                            .sum()
+                    })
+            },
+        )
+    }
+
+    fn measure(
+        ui_px: f32,
+        viewport: Size<Pixels>,
+        detail: Option<String>,
+        count_detail_rows: impl FnOnce(&str, f32) -> usize,
+    ) -> Self {
+        let viewport_height = f32::from(viewport.height);
+        let top = CARD_TOP_PX.min((viewport_height - 150.).max(0.));
+        let width = (f32::from(viewport.width) - 24.).clamp(1., MAX_WIDTH);
+        let text_width = (width - 2. - LEFT - RIGHT).max(1.);
+        let line = (ui_px + 6.).ceil();
+        let stacked = text_width < 21. * ui_px;
+        let row = if stacked { 2. * line } else { line + 4. };
+        let header = (ui_px + 26.).ceil();
+        let height = (viewport_height - top - 16.).min(MAX_HEIGHT);
+        let detail_rows = detail
+            .as_deref()
+            .map_or(0, |error| count_detail_rows(error, text_width));
+        let total = actions().count() + detail_rows;
+        let page = (((height - header - 2. - 2. * INSET) / row) as usize).clamp(1, total);
+        Self {
+            top,
+            width,
+            header,
+            row,
+            line,
+            stacked,
+            detail,
+            detail_rows,
+            page,
+            total,
+        }
+    }
 }
 
 fn actions() -> impl Iterator<Item = Action> {
     Action::all()
         .iter()
         .copied()
-        .filter(|a| *a != Action::About)
+        .filter(|a| !matches!(a, Action::About | Action::Help))
 }
 
 fn card(
     theme: &Theme,
     session: &Session,
-    frame: Frame,
+    layout: Layout,
+    offset: f32,
+    moving: bool,
     live: bool,
     cx: &mut Context<Inbox>,
 ) -> Div {
-    let body = frame.page as f32 * frame.row;
-    let last = (frame.total - frame.page) as f32 * frame.row;
-    let first = (frame.offset / frame.row).floor() as usize;
-    let end = ((frame.offset + body) / frame.row).ceil() as usize;
-    let action_start = first.max(frame.detail_rows);
-    let thumb = (body * frame.page as f32 / frame.total as f32).clamp(0., body);
+    let body = layout.page as f32 * layout.row;
+    let last = (layout.total - layout.page) as f32 * layout.row;
+    let first = (offset / layout.row).floor() as usize;
+    let end = ((offset + body) / layout.row).ceil() as usize;
+    let action_start = first.max(layout.detail_rows);
+    let thumb = (body * layout.page as f32 / layout.total as f32).clamp(0., body);
     div()
-        .w(px(frame.width))
-        .h(px(frame.header + body + 2. * INSET + 2.))
+        .w(px(layout.width))
+        .h(px(layout.header + body + 2. * INSET + 2.))
         .flex_none()
         .bg(rgb(theme.surface))
         .border_1()
@@ -231,7 +241,7 @@ fn card(
         .shadow_lg()
         .overflow_hidden()
         .when(live, |card| {
-            let row = frame.row;
+            let row = layout.row;
             card.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_scroll_wheel(cx.listener(
                     move |inbox, event: &gpui::ScrollWheelEvent, _, cx| {
@@ -250,7 +260,7 @@ fn card(
         })
         .child(
             div()
-                .h(px(frame.header))
+                .h(px(layout.header))
                 .px(px(LEFT))
                 .flex()
                 .items_center()
@@ -272,15 +282,18 @@ fn card(
                         .h(px(body))
                         .overflow_hidden()
                         .when_some(
-                            frame.detail.as_ref().filter(|_| first < frame.detail_rows),
+                            layout
+                                .detail
+                                .as_ref()
+                                .filter(|_| first < layout.detail_rows),
                             |rows, detail| {
                                 rows.child(
                                     div()
                                         .absolute()
                                         .left_0()
                                         .right_0()
-                                        .top(px(-frame.offset))
-                                        .line_height(px(frame.row))
+                                        .top(px(-offset))
+                                        .line_height(px(layout.row))
                                         .text_color(rgb(theme.error))
                                         .child(detail.clone()),
                                 )
@@ -291,18 +304,16 @@ fn card(
                                 .absolute()
                                 .left_0()
                                 .right_0()
-                                .top(px(action_start as f32 * frame.row - frame.offset))
+                                .top(px(action_start as f32 * layout.row - offset))
                                 .children(
                                     actions()
-                                        .skip(action_start - frame.detail_rows)
+                                        .skip(action_start - layout.detail_rows)
                                         .take(end.saturating_sub(action_start))
-                                        .map(|action| action_row(theme, session, action, &frame)),
+                                        .map(|action| action_row(theme, session, action, &layout)),
                                 ),
                         )
-                        .children((frame.moving && frame.offset > 0.).then(|| edge(theme, true)))
-                        .children(
-                            (frame.moving && frame.offset < last).then(|| edge(theme, false)),
-                        ),
+                        .children((moving && offset > 0.).then(|| edge(theme, true)))
+                        .children((moving && offset < last).then(|| edge(theme, false))),
                 )
                 .when(last > 0., |viewport| {
                     // This gutter is reserved at every scroll position.
@@ -311,32 +322,31 @@ fn card(
                             .absolute()
                             .right(px(9.))
                             .top(px(INSET))
-                            .w(px(3.))
+                            .w(px(4.))
                             .h(px(body))
                             .rounded_full()
                             .bg(rgb(theme.border))
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px((body - thumb) * (frame.offset / last)))
+                                    .top(px((body - thumb) * (offset / last)))
                                     .w_full()
                                     .h(px(thumb))
                                     .rounded_full()
-                                    .bg(rgb(theme.dimmed))
-                                    .opacity(0.72),
+                                    .bg(rgb(theme.dimmed)),
                             ),
                     )
                 }),
         )
 }
 
-fn action_row(theme: &Theme, session: &Session, action: Action, frame: &Frame) -> Div {
+fn action_row(theme: &Theme, session: &Session, action: Action, layout: &Layout) -> Div {
     div()
-        .h(px(frame.row))
+        .h(px(layout.row))
         .flex()
-        .line_height(px(frame.line))
-        .when(frame.stacked, |row| row.flex_col())
-        .when(!frame.stacked, |row| row.items_center().gap(px(12.)))
+        .line_height(px(layout.line))
+        .when(layout.stacked, |row| row.flex_col())
+        .when(!layout.stacked, |row| row.items_center().gap(px(12.)))
         .child(div().min_w_0().flex_1().truncate().child(action.label()))
         .child(
             div()
@@ -369,6 +379,24 @@ fn edge(theme: &Theme, top: bool) -> Div {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn first_scroll_key_can_page_before_paint() {
+        let now = Instant::now();
+        let motion = Motion::new(false);
+        let mut scroll = HelpScroll::default();
+        assert_eq!(scroll.page, 0);
+        let measure = || Layout::measure(13., gpui::size(px(520.), px(720.)), None, |_, _| 0);
+        scroll.prepare(now, measure);
+        let half_page = scroll.page / 2;
+        assert!(half_page > 1);
+        assert!(scroll.on_key(KeyId::Ctrl('d'), &motion, now));
+
+        let layout = measure();
+        scroll.advance(layout.page, layout.total, layout.row, now);
+        assert_eq!(scroll.target, half_page);
+        assert_eq!(scroll.drawn, half_page as f32 * layout.row);
+    }
 
     #[test]
     fn keyboard_glides_retarget_from_the_drawn_offset() {
@@ -416,5 +444,29 @@ mod tests {
         scroll.advance(16, 41, 25., now);
         assert_eq!(scroll.drawn, 400.);
         assert!(!scroll.on_key(KeyId::Escape, &motion, now));
+    }
+
+    #[test]
+    fn wheel_reverses_immediately_at_both_ends() {
+        let now = Instant::now();
+        let motion = Motion::new(false);
+        let mut scroll = HelpScroll::default();
+        scroll.advance(16, 41, 25., now);
+
+        scroll.wheel(-2.9, &motion, now);
+        assert_eq!(scroll.target, 0);
+        scroll.wheel(1., &motion, now);
+        assert_eq!(scroll.target, 1);
+
+        scroll.scroll(scroll.last as isize, &motion, now);
+        scroll.wheel(2.9, &motion, now);
+        assert_eq!(scroll.target, scroll.last);
+        scroll.wheel(-1., &motion, now);
+        assert_eq!(scroll.target, scroll.last - 1);
+
+        scroll.wheel(2.9, &motion, now);
+        assert_eq!(scroll.target, scroll.last);
+        scroll.wheel(-1., &motion, now);
+        assert_eq!(scroll.target, scroll.last - 1);
     }
 }
