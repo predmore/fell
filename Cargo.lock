@@ -1949,6 +1949,7 @@ dependencies = [
  "fell-render",
  "fs4",
  "futures-lite 2.6.1",
+ "inventory",
  "libc",
  "mail-parser",
  "miniz_oxide 0.8.9",
