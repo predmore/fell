@@ -828,6 +828,24 @@ impl Session {
             .collect()
     }
 
+    /// The selected conversation row IDs and local draft IDs, in order.
+    /// Conversation actions skip local drafts. In Drafts, a draft-only
+    /// delete discards those drafts through the editor's path.
+    pub fn split_removal_targets(&self, mut ids: Vec<String>) -> (Vec<String>, Vec<String>) {
+        let mut drafts = Vec::new();
+        ids.retain(|id| {
+            let Some(row) = self.threads.iter().find(|row| &row.id == id) else {
+                return false;
+            };
+            if let Some(draft) = &row.draft {
+                drafts.push(draft.clone());
+                return false;
+            }
+            true
+        });
+        (ids, drafts)
+    }
+
     /// The threads `y` confirmed for a permanent delete, once.
     pub fn take_purge(&mut self) -> Option<Vec<String>> {
         self.purge_ready.take()
@@ -2013,29 +2031,18 @@ impl Session {
             }
             Action::Delete | Action::Spam => {
                 self.count.clear();
-                let targets = self.action_targets();
+                let (targets, drafts) = self.split_removal_targets(self.action_targets());
                 if targets.is_empty() {
-                    self.show_toast("No conversation", true);
-                    return Step::default();
-                }
-                let drafts: Vec<_> = self
-                    .threads
-                    .iter()
-                    .filter(|row| targets.contains(&row.id))
-                    .filter_map(|row| row.draft.clone())
-                    .collect();
-                if !drafts.is_empty() {
-                    if action == Action::Delete && self.in_drafts() {
-                        if drafts.len() == targets.len() {
-                            return Step {
-                                discard: drafts,
-                                ..Step::default()
-                            };
-                        }
-                        self.show_toast("Select only local drafts to discard", true);
-                        return Step::default();
+                    if drafts.is_empty() {
+                        self.show_toast("No conversation", true);
+                    } else if action == Action::Delete && self.in_drafts() {
+                        return Step {
+                            discard: drafts,
+                            ..Step::default()
+                        };
+                    } else {
+                        self.show_toast(DRAFT_NOT_THREAD, true);
                     }
-                    self.show_toast(DRAFT_NOT_THREAD, true);
                     return Step::default();
                 }
                 if action == Action::Spam {
@@ -2867,11 +2874,9 @@ mod tests {
         assert_eq!(session.on_key(hash, 10).discard, ["c1", "r2"]);
         session.on_key(KeyId::Char('j'), 10);
         let mixed = session.on_key(hash, 10);
-        assert!(mixed.discard.is_empty() && !mixed.delete);
-        assert_eq!(
-            session.toast.as_ref().unwrap().text,
-            "Select only local drafts to discard"
-        );
+        assert!(mixed.discard.is_empty() && mixed.delete);
+        let (threads, _) = session.split_removal_targets(session.action_targets());
+        assert_eq!(threads, ["synced"]);
         session.visual = false;
         assert!(session.on_key(hash, 10).delete);
     }
@@ -3671,6 +3676,42 @@ mod tests {
         }
         assert_eq!(session.cursor_id.as_deref(), Some("e"));
         assert!(!session.visual);
+    }
+
+    #[test]
+    fn mixed_triage_selections_take_the_threads_and_leave_local_drafts() {
+        for (key, flags) in [
+            ('e', (true, false, false)),
+            ('#', (false, true, false)),
+            ('!', (false, false, true)),
+        ] {
+            for visual in [false, true] {
+                let mut session = session();
+                session.folder = "Drafts".into();
+                let mut draft = row("draft-1");
+                draft.draft = Some("c1".into());
+                session.set_threads(vec![row("a"), draft, row("b")]);
+                session.select_if_present("a");
+                if visual {
+                    for key in ['V', 'j', 'j'] {
+                        session.on_key(KeyId::Char(key), 4);
+                    }
+                } else {
+                    for id in ["a", "draft-1", "b"] {
+                        session.select_if_present(id);
+                        session.on_key(KeyId::Char('x'), 4);
+                    }
+                }
+
+                let step = session.on_key(KeyId::Char(key), 4);
+                assert_eq!((step.archive, step.delete, step.spam), flags);
+                assert!(step.discard.is_empty());
+                assert!(session.toast.is_none());
+                let (targets, drafts) = session.split_removal_targets(session.action_targets());
+                assert_eq!(targets, ["a", "b"]);
+                assert_eq!(drafts, ["c1"]);
+            }
+        }
     }
 
     #[test]

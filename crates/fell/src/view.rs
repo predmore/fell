@@ -2075,13 +2075,8 @@ impl Inbox {
     /// Remove the selected threads in this frame and select the row that
     /// takes the cursor's place.
     fn remove_threads(&mut self, ids: Vec<String>, removal: Removal, cx: &mut Context<Self>) {
-        if removal == Removal::Archive
-            && self
-                .session
-                .threads
-                .iter()
-                .any(|row| row.draft.is_some() && ids.contains(&row.id))
-        {
+        let (ids, drafts) = self.session.split_removal_targets(ids);
+        if ids.is_empty() && !drafts.is_empty() {
             self.session.show_toast(DRAFT_NOT_THREAD, true);
             return;
         }
@@ -2094,10 +2089,6 @@ impl Inbox {
                 .show_toast("The folder is still loading", false);
             return;
         }
-        let ids: Vec<String> = ids
-            .into_iter()
-            .filter(|id| self.session.threads.iter().any(|row| &row.id == id))
-            .collect();
         let Some(key) = ids.first().and_then(|first| {
             self.session
                 .threads
@@ -8042,7 +8033,7 @@ mod tests {
         use crate::fixtures::{fixture_account, seed_if_empty};
         use crate::keymap::Keymap;
         use crate::model::{Session, SyncKind};
-        use crate::present::thread_rows;
+        use crate::present::{draft_row_id, thread_rows};
         use fell_core::{FolderSpan, ListKey, Store};
 
         let store = Store::open_in_memory().unwrap();
@@ -8074,7 +8065,7 @@ mod tests {
             session.remove_thread(key.thread_id.as_str());
         }
 
-        let mut restore = |expected: &ListKey| {
+        let restore = |session: &mut Session, expected: &ListKey| {
             let (_, restored) = store.undo_with_threads(&account.id).unwrap();
             let selected = restored_folder_key(&store, &account.id, folder, &restored);
             assert_eq!(selected.as_ref(), Some(expected));
@@ -8088,13 +8079,31 @@ mod tests {
             restored
         };
         for key in keys.iter().rev() {
-            assert_eq!(restore(key), std::slice::from_ref(&key.thread_id));
+            assert_eq!(
+                restore(&mut session, key),
+                std::slice::from_ref(&key.thread_id)
+            );
         }
-        let batch = [keys[2].thread_id.clone(), keys[0].thread_id.clone()];
+        let mut draft = session.threads[0].clone();
+        draft.id = draft_row_id("unsent");
+        draft.draft = Some("unsent".into());
+        let selected = vec![
+            draft.id.clone(),
+            keys[2].thread_id.0.clone(),
+            keys[0].thread_id.0.clone(),
+        ];
+        session.threads.insert(0, draft);
+        let (batch, skipped) = session.split_removal_targets(selected);
+        assert_eq!(skipped, ["unsent"]);
+        let batch: Vec<_> = batch.into_iter().map(fell_core::ThreadId).collect();
         store.archive_threads(&account.id, &batch, folder).unwrap();
-        let restored = restore(&keys[0]);
+        let restored = restore(&mut session, &keys[0]);
         assert_eq!(restored.len(), batch.len());
         assert!(batch.iter().all(|id| restored.contains(id)));
+        assert!(matches!(
+            store.undo_with_threads(&account.id),
+            Err(fell_core::Error::Action(message)) if message == "nothing to undo"
+        ));
         assert_eq!(
             list().iter().map(ListKey::of).collect::<Vec<_>>(),
             original.iter().map(ListKey::of).collect::<Vec<_>>()
