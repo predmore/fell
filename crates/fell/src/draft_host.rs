@@ -227,26 +227,32 @@ impl DraftHome {
             return Err("The agent note changed".into());
         };
         let id = new_draft_id();
-        fell_core::Store::open(&self.store)
-            .and_then(|store| {
-                store.save_suggested_reply(
-                    &StoredCompose {
-                        id: id.clone(),
-                        account_id: account.clone(),
-                        fields: start.fields,
-                        body: String::new(),
-                        files: Vec::new(),
-                        identities: Vec::new(),
-                        owner: String::new(),
-                        reply: start.parts,
-                    },
-                    &fell_core::ThreadId(note.thread.clone()),
-                    note.id,
-                    position,
-                )
-            })
+        let store = fell_core::Store::open(&self.store).map_err(|err| err.to_string())?;
+        let action = store
+            .save_suggested_reply(
+                &StoredCompose {
+                    id: id.clone(),
+                    account_id: account.clone(),
+                    fields: start.fields,
+                    body: String::new(),
+                    files: Vec::new(),
+                    identities: Vec::new(),
+                    owner: String::new(),
+                    reply: start.parts,
+                },
+                &fell_core::ThreadId(note.thread.clone()),
+                note.id,
+                position,
+            )
             .map_err(|err| err.to_string())?;
-        self.open(hub, &id, account)?;
+        if let Err(err) = self.open(hub, &id, account) {
+            store
+                .rollback_suggested_reply(account, action)
+                .map_err(|rollback| {
+                    format!("{err}. Couldn't restore the suggestion: {rollback}")
+                })?;
+            return Err(err);
+        }
         Ok(id)
     }
 
@@ -830,6 +836,62 @@ pub(crate) mod tests {
         let reopened = DraftHub::new();
         home.open(&reopened, &id, &account.id).unwrap();
         check(&reopened, &id);
+    }
+
+    #[test]
+    fn failing_to_open_a_suggested_reply_restores_the_suggestion() {
+        use fell_core::{AgentGrant, notes::NoteDecision};
+
+        let account = me();
+        let home = temp_home("suggested-reply-failure", &account);
+        // The store write succeeds, then the draft folder cannot be created.
+        std::fs::write(&home.root, "file in place of the draft root").unwrap();
+        let store = fell_core::Store::open(&home.store).unwrap();
+        let parent = parent_message(&account);
+        let thread = store.upsert_message(&parent).unwrap();
+        store
+            .set_agent_grant(
+                &account.id,
+                "reviewer",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let note = store
+            .annotate_thread(
+                &account.id,
+                &thread,
+                "reviewer",
+                None,
+                &["reply".into()],
+                "Reviewed",
+            )
+            .unwrap();
+        let request = crate::model::NoteRequest {
+            thread: thread.0.clone(),
+            id: note.id,
+            decision: NoteDecision::Accept(0),
+            reply: true,
+        };
+        let start = fell_core::compose::start_reply(
+            fell_core::compose::ReplyKind::Reply,
+            &parent,
+            &account.email,
+            std::slice::from_ref(&account.email),
+            &fell_core::FolderRoles::default(),
+        );
+        assert!(
+            home.new_suggested_reply(&DraftHub::new(), &account.id, start, &request)
+                .is_err()
+        );
+        let notes = store.thread_notes(&account.id, &thread).unwrap();
+        assert_eq!(
+            notes[0].suggestions[0].action,
+            fell_core::notes::Suggestion::Reply
+        );
+        assert_eq!(
+            store.undo(&account.id).unwrap().kind,
+            fell_core::ActionKind::AnnotateThread
+        );
     }
 
     #[test]

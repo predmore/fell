@@ -38,7 +38,7 @@ impl ReaderLanding {
 
 impl ScrollAnchor {
     /// Capture the first message with a visible part, including a clipped top.
-    pub fn capture(scroll: &ScrollHandle) -> Option<Self> {
+    pub fn capture(scroll: &ScrollHandle, first_message: usize) -> Option<Self> {
         let view = scroll.bounds();
         // GPUI clamps wheel deltas during prepaint. Capture the position
         // the wheel would have drawn with the old content.
@@ -51,15 +51,22 @@ impl ScrollAnchor {
         } else {
             scroll.top_item()
         };
-        (start..scroll.children_count()).find_map(|index| {
+        (start.max(first_message)..scroll.children_count()).find_map(|index| {
             let item = scroll.bounds_for_item(index)?;
-            visible_top(view, offset, item).map(|y| Self { index, y })
+            visible_top(view, offset, item).map(|y| Self {
+                index: index - first_message,
+                y,
+            })
         })
     }
 
     /// Capture a selected message, which can be below the first visible one.
-    pub fn capture_message(scroll: &ScrollHandle, index: usize) -> Option<Self> {
-        let item = scroll.bounds_for_item(index)?;
+    pub fn capture_message(
+        scroll: &ScrollHandle,
+        index: usize,
+        first_message: usize,
+    ) -> Option<Self> {
+        let item = scroll.bounds_for_item(first_message + index)?;
         visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y })
     }
 }
@@ -110,18 +117,25 @@ impl Reveal {
         }
     }
 
-    pub fn body_anchor(self, scroll: &ScrollHandle, cursor: usize) -> Option<ScrollAnchor> {
+    pub fn body_anchor(
+        self,
+        scroll: &ScrollHandle,
+        cursor: usize,
+        first_message: usize,
+    ) -> Option<ScrollAnchor> {
         if self.pending() {
             return None;
         }
         if let Self::Reading { selected } = self {
-            if selected && let Some(anchor) = ScrollAnchor::capture_message(scroll, cursor) {
+            if selected
+                && let Some(anchor) = ScrollAnchor::capture_message(scroll, cursor, first_message)
+            {
                 return Some(anchor);
             }
         } else if present::conversation_fits(f32::from(scroll.max_offset().height)) {
             return None;
         }
-        ScrollAnchor::capture(scroll)
+        ScrollAnchor::capture(scroll, first_message)
     }
 }
 

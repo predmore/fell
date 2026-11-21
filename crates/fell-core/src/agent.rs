@@ -1578,6 +1578,121 @@ mod tests {
     }
 
     #[test]
+    fn purging_the_last_message_removes_note_history_and_reasons() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account("a1");
+        store.upsert_account(&account).unwrap();
+        let mut trash = message(
+            "a1",
+            "old@x",
+            None,
+            "Old mail",
+            "old",
+            false,
+            &["Trash"],
+            &[],
+            10,
+        );
+        trash.headers.proton_conversation_id = Some("123".into());
+        let thread = store.upsert_message(&trash).unwrap();
+        store
+            .set_agent_grant(
+                &account.id,
+                "reviewer",
+                AgentGrant::enabled(false, false, false).with_annotation(true),
+            )
+            .unwrap();
+        let annotate = |summary| {
+            store
+                .annotate_thread(
+                    &account.id,
+                    &thread,
+                    "reviewer",
+                    Some(summary),
+                    &[],
+                    "Private reason",
+                )
+                .unwrap()
+        };
+        annotate("Previous summary");
+        let current = annotate("Latest summary");
+
+        store
+            .resolve_thread_note(
+                &account.id,
+                &thread,
+                "Trash",
+                current.id,
+                crate::notes::NoteDecision::Dismiss,
+                false,
+            )
+            .unwrap();
+        store
+            .purge_threads(&account.id, std::slice::from_ref(&thread), "Trash")
+            .unwrap();
+        for table in [
+            "thread_summary",
+            "thread_notes",
+            "local_thread_note_actions",
+            "agent_actions",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        assert!(store.undo(&account.id).is_err());
+
+        let mut later = message(
+            "a1",
+            "later@x",
+            None,
+            "New mail",
+            "new",
+            false,
+            &["INBOX"],
+            &[],
+            20,
+        );
+        later.headers.proton_conversation_id = trash.headers.proton_conversation_id;
+        assert_eq!(store.upsert_message(&later).unwrap(), thread);
+        assert!(store.thread_notes(&account.id, &thread).unwrap().is_empty());
+    }
+
+    #[test]
+    fn annotations_filter_invisible_text_and_reject_obscured_labels_and_authors() {
+        let (store, account, thread) = seeded();
+        let grant = AgentGrant::enabled(false, false, false).with_annotation(true);
+        for name in ["reviewer", "reviewer\u{200b}"] {
+            store.set_agent_grant(&account, name, grant).unwrap();
+        }
+        let annotate = |actor: &str, summary: &str, suggestions: &[String]| {
+            store.annotate_thread(
+                &account,
+                &thread,
+                actor,
+                Some(summary),
+                suggestions,
+                "Re\u{061c}viewed",
+            )
+        };
+        let marks =
+            "\u{061c}\u{200b}\u{200c}\u{200d}\u{200f}\u{202e}\u{2060}\u{2064}\u{2069}\u{feff}";
+        let action = annotate("reviewer", &format!("One{marks}\nTwo"), &[]).unwrap();
+        assert_eq!(action.summary, "Reviewed");
+        let note = &store.thread_notes(&account, &thread).unwrap()[0];
+        assert_eq!(note.summary, "One\nTwo");
+        assert_eq!(note.actor, "reviewer");
+        for mark in marks.chars() {
+            assert!(annotate("reviewer", "summary", &[format!("label:$Important{mark}")]).is_err());
+        }
+        assert!(annotate("reviewer\u{200b}", "summary", &[]).is_err());
+    }
+
+    #[test]
     fn a_suggested_reply_saves_a_draft_only_for_the_exact_pending_note() {
         use crate::compose::{DraftFields, ReplyParts, StoredCompose};
 

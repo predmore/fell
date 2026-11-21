@@ -1336,8 +1336,7 @@ fn fit_row_line(
 ) -> RowLine {
     let line_width = |line: &gpui::ShapedLine| f32::from(line.width).ceil();
     let measure = |text: &str, kind| shape(text, kind, None).as_ref().map_or(0.0, line_width);
-    let row_room = (row_text_width(list_width) - super::agent_notes::MARKER_SLOT - ROW_GAP)
-        .max(0.0);
+    let row_room = row_text_width(list_width);
     let count = (row.message_count > 1).then(|| format!("· {}", row.message_count));
     let count_width = count
         .as_deref()
@@ -1495,6 +1494,8 @@ fn row(
         .folder
         .as_ref()
         .map(|folder| inbox.session.roles.label(folder));
+    let unread_note = inbox.session.agent_notes.unread.contains(&row.id);
+    let marker_room = if unread_note { super::agent_notes::MARKER_SLOT + ROW_GAP } else { 0.0 };
     let RowLine {
         sender_width,
         sender,
@@ -1505,7 +1506,7 @@ fn row(
         detail,
     } = fit_row_line(
         row,
-        list_width,
+        list_width - marker_room,
         folder.as_deref(),
         hit.related,
         [&dates[0], &dates[1]],
@@ -1635,11 +1636,9 @@ fn row(
                         shaped_text(line, window).w(width)
                     }),
                 ))
-                .child(super::agent_notes::marker(
-                    theme,
-                    selected,
-                    inbox.session.agent_notes.unread.contains(&row.id),
-                )),
+                .when(unread_note, |line| {
+                    line.child(super::agent_notes::marker(theme, selected))
+                }),
         )
         .child(
             div()

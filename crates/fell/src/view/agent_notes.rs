@@ -1,25 +1,24 @@
 use std::time::{Duration, Instant};
 
-use fell_core::notes::{NoteDecision, Suggestion, ThreadNote};
+use fell_core::notes::{NoteDecision, Suggestion, ThreadNote, display_safe};
+use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, FontWeight, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, div, point, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, point, px, rgb,
 };
 
-use gpui::prelude::FluentBuilder;
-
 use super::{
-    CONVERSATION_PAD_PX, Inbox, Live, MESSAGE_PAD_PX, ReadIntent, ReaderColumns, disclosure,
+    Inbox, Live, MESSAGE_PAD_PX, ReadIntent, ReaderColumns, conversation_line_style, disclosure,
 };
 use crate::keymap::{self, Action};
 use crate::model::{NoteRequest, SUGGESTIONS_QUERY, Session};
 use crate::motion::{self, Motion, Transition};
 use crate::present::{self, Pane};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 
 pub(super) const MARKER_SLOT: f32 = 12.0;
 
-pub(super) fn marker(theme: &Theme, selected: bool, unread: bool) -> gpui::Div {
+pub(super) fn marker(theme: &Theme, selected: bool) -> gpui::Div {
     let color = if selected {
         theme.on_selection
     } else {
@@ -31,35 +30,73 @@ pub(super) fn marker(theme: &Theme, selected: bool, unread: bool) -> gpui::Div {
         .flex()
         .items_center()
         .justify_center()
-        .when(unread, |slot| {
-            slot.child(
-                div()
-                    .w(px(7.))
-                    .h(px(7.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(color)),
-            )
-        })
+        .child(
+            div()
+                .w(px(7.))
+                .h(px(7.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(color)),
+        )
+}
+
+const ARRIVAL: Duration = Duration::from_millis(140);
+const DISMISSAL: Duration = Duration::from_millis(240);
+
+#[derive(Clone, Copy)]
+enum VisibilityChange {
+    Arrive,
+    Dismiss,
+    Restore,
+}
+
+#[derive(Clone, Copy)]
+struct Visibility {
+    change: VisibilityChange,
+    from: (f32, f32),
+    time: Transition,
+}
+
+impl Visibility {
+    fn sample(self, now: Instant) -> (f32, f32) {
+        let t = self.time.linear(now);
+        let grow = |progress| motion::lerp(self.from.0, 1.0, motion::ease_out(progress));
+        let fade_in = || motion::lerp(self.from.1, 1.0, motion::ease_out(2.0 * t - 1.0));
+        match self.change {
+            VisibilityChange::Arrive => (grow(t), fade_in()),
+            VisibilityChange::Dismiss => (
+                self.from.0 * (1.0 - motion::ease_out(2.0 * t - 1.0)),
+                self.from.1 * motion::fade_out(2.0 * t),
+            ),
+            VisibilityChange::Restore if self.from.0 >= 1.0 => {
+                (1.0, motion::lerp(self.from.1, 1.0, self.time.progress(now)))
+            }
+            VisibilityChange::Restore => (grow(2.0 * t), fade_in()),
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct NoteView {
     thread: Option<String>,
-    current: Option<ThreadNote>,
+    painted: Option<ThreadNote>,
+    dismissed: Option<i64>,
+    shown: bool,
     closed: bool,
-    entrance: Option<Transition>,
-    exit: Option<(ThreadNote, bool, Transition)>,
-    fold: Option<Transition>,
+    visibility: Option<Visibility>,
+    fold: Option<(f32, Transition)>,
+    previous_suggestions: Option<(ThreadNote, Transition)>,
     scroll: ScrollHandle,
 }
 
 pub(super) struct NoteFrame {
     note: ThreadNote,
     closed: bool,
-    reveal: Option<f32>,
+    details: f32,
+    height: f32,
     alpha: f32,
     leaving: bool,
+    suggestions: Option<(ThreadNote, f32)>,
     scroll: ScrollHandle,
 }
 
@@ -71,78 +108,118 @@ impl NoteView {
         closed: bool,
         motion: &Motion,
         now: Instant,
-    ) {
+    ) -> bool {
+        let was_moving =
+            self.visibility.is_some() || self.fold.is_some() || self.previous_suggestions.is_some();
         if self.thread.as_deref() != thread {
-            self.thread = thread.map(str::to_owned);
-            self.current = None;
-            self.exit = None;
-        }
-        if self.current.as_ref().map(|note| note.id) != note.map(|note| note.id) {
-            self.exit = if note.is_none() {
-                self.current
-                    .take()
-                    .zip(motion.start(motion::FADE, now))
-                    .map(|(note, exit)| (note, self.closed, exit))
-            } else {
-                None
+            *self = Self {
+                thread: thread.map(str::to_owned),
+                painted: note.cloned(),
+                shown: note.is_some(),
+                closed,
+                ..Self::default()
             };
-            self.closed = closed;
-            self.fold = None;
-            self.entrance = note.and_then(|_| motion.start(motion::FADE, now));
-            self.scroll = ScrollHandle::new();
-        } else if self.closed != closed {
-            self.closed = closed;
-            self.fold = motion.start(motion::FADE, now);
+            return false;
         }
-        self.current = note.cloned();
+        let changed = self.shown != note.is_some()
+            || note
+                .is_some_and(|note| self.painted.as_ref() != Some(note) || self.closed != closed);
+        if let Some(note) = note {
+            if !self.shown {
+                let restoring = self.dismissed == Some(note.id);
+                let from = self.visibility.map_or((0.0, 0.0), |v| v.sample(now));
+                let duration = if restoring && from.0 < 1.0 {
+                    DISMISSAL
+                } else if restoring {
+                    motion::FADE
+                } else {
+                    ARRIVAL
+                };
+                let change = if restoring {
+                    VisibilityChange::Restore
+                } else {
+                    VisibilityChange::Arrive
+                };
+                self.visibility =
+                    motion
+                        .start(duration, now)
+                        .map(|time| Visibility { change, from, time });
+                // A folded note comes back folded.
+                self.closed = closed;
+                self.fold = None;
+                self.previous_suggestions = None;
+                self.scroll = ScrollHandle::new();
+            } else if let Some(old) = &self.painted {
+                if old.id != note.id {
+                    self.visibility = None;
+                    self.fold = None;
+                    self.closed = closed;
+                    self.previous_suggestions = None;
+                    self.scroll = ScrollHandle::new();
+                } else if old.suggestions != note.suggestions {
+                    self.previous_suggestions = motion
+                        .start(motion::SLIDE, now)
+                        .map(|time| (old.clone(), time));
+                }
+            }
+            if self.closed != closed {
+                let from = self.details(now);
+                self.fold = motion.start(motion::SLIDE, now).map(|time| (from, time));
+                self.closed = closed;
+            }
+            self.shown = true;
+            self.painted = Some(note.clone());
+        } else if self.shown {
+            let from = self.visibility.map_or((1.0, 1.0), |v| v.sample(now));
+            self.dismissed = self.painted.as_ref().map(|note| note.id);
+            self.visibility = motion.start(DISMISSAL, now).map(|time| Visibility {
+                change: VisibilityChange::Dismiss,
+                from,
+                time,
+            });
+            self.shown = false;
+        }
+        self.visibility = self.visibility.filter(|v| v.time.running(now));
+        self.fold = self.fold.filter(|(_, t)| t.running(now));
         if self
-            .exit
+            .previous_suggestions
             .as_ref()
-            .is_some_and(|(_, _, exit)| !exit.running(now))
+            .is_some_and(|(_, t)| !t.running(now))
         {
-            self.exit = None;
+            self.previous_suggestions = None;
         }
+        if !self.shown && self.visibility.is_none() {
+            self.painted = None;
+        }
+        was_moving || changed
+    }
+
+    fn details(&self, now: Instant) -> f32 {
+        let to = if self.closed { 0.0 } else { 1.0 };
+        self.fold.map_or(to, |(from, time)| {
+            motion::lerp(from, to, time.progress(now))
+        })
     }
 
     pub(super) fn frame(&self, now: Instant) -> Option<NoteFrame> {
-        if let Some(note) = &self.current {
-            Some(NoteFrame {
-                note: note.clone(),
-                closed: self.closed,
-                reveal: self.fold.filter(|fold| fold.running(now)).map(|fold| {
-                    let shown = fold.progress(now);
-                    if self.closed { 1.0 - shown } else { shown }
-                }),
-                alpha: motion::progress(self.entrance.as_ref(), now),
-                leaving: false,
-                scroll: self.scroll.clone(),
-            })
-        } else {
-            self.exit.as_ref().map(|(note, closed, exit)| NoteFrame {
-                note: note.clone(),
-                closed: *closed,
-                reveal: None,
-                alpha: motion::fade_out(exit.linear(now)),
-                leaving: true,
-                scroll: self.scroll.clone(),
-            })
-        }
-    }
-
-    pub(super) fn running(&self, now: Instant) -> bool {
-        self.entrance
-            .iter()
-            .chain(self.fold.iter())
-            .any(|animation| animation.running(now))
-            || self
-                .exit
+        let (height, alpha) = self.visibility.map_or((1.0, 1.0), |v| v.sample(now));
+        Some(NoteFrame {
+            note: self.painted.clone()?,
+            closed: self.closed,
+            details: self.details(now),
+            height,
+            alpha,
+            leaving: !self.shown,
+            suggestions: self
+                .previous_suggestions
                 .as_ref()
-                .is_some_and(|(_, _, exit)| exit.running(now))
+                .map(|(note, t)| (note.clone(), t.linear(now))),
+            scroll: self.scroll.clone(),
+        })
     }
 
-    pub(super) fn settle(&mut self) {
-        self.entrance = None;
-        self.fold = None;
+    pub(super) fn running(&self) -> bool {
+        self.visibility.is_some() || self.fold.is_some() || self.previous_suggestions.is_some()
     }
 
     pub(super) fn scroll(&self, direction: i8) {
@@ -157,205 +234,297 @@ pub(super) fn slot(
     theme: &Theme,
     session: &Session,
     columns: ReaderColumns,
-    frame: Option<&NoteFrame>,
+    frame: &NoteFrame,
     live: Live,
+    window: &Window,
     cx: &mut Context<Inbox>,
-) -> impl IntoElement {
+) -> gpui::Div {
     let column = columns.card;
     let line = theme.ui_px + 3.0;
-    // The note follows the reading column, without changing the message viewport
-    // height as the column slides between its two measures.
-    let details_height = if columns.split_width.min(columns.reading_prose) < 460.0 {
-        4.0 * line
-    } else {
-        3.0 * line
-    };
-    let slot = div()
-        .h(px(details_height + line + 21.0))
-        .flex_none()
-        .px(px(CONVERSATION_PAD_PX + MESSAGE_PAD_PX))
-        .pt(px(8.0))
-        .overflow_hidden();
-    let Some(frame) = frame else { return slot };
+    let header_height = line + 14.0;
+    let width = (column.width - 21.0).max(0.0);
     let active = live.0
         && !frame.leaving
+        && frame.alpha > 0.0
         && session.pane == Pane::Conversation
         && session.note().is_some_and(|note| note.id == frame.note.id);
     let (position, total) = session.agent_notes.position();
-    let header = |collapsed| {
-        let row = div()
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .h(px(line + 6.0))
-            .child(div().flex_none().child(if collapsed { "▸" } else { "▾" }))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!(
-                        "{} · {}",
-                        frame.note.actor,
-                        if frame.note.summary.is_empty() {
-                            "suggestions"
-                        } else {
-                            "summary"
-                        },
-                    )),
-            )
-            .when(total > 1 && !frame.leaving, |row| {
-                row.child(div().flex_none().child(format!("{position}/{total}")))
-            });
-        if active {
-            row.id("toggle-agent-note")
-                .cursor_pointer()
+    let actor = display_safe(&frame.note.actor, false);
+    let summary = display_safe(&frame.note.summary, true);
+    let dimmed = rgb(theme::note_text(theme.dimmed, theme.background));
+    let kind = if summary.is_empty() {
+        "Agent suggestions"
+    } else {
+        "Agent summary"
+    };
+    let age = present::compact_relative_date(super::now_unix(), frame.note.created_unix);
+    let header = div()
+        .id("toggle-agent-note")
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .h(px(header_height))
+        .child(
+            div()
+                .flex_none()
+                .text_color(dimmed)
+                .child(if frame.closed { "▸" } else { "▾" }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(kind),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(dimmed)
+                .child(if actor.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("· {actor}")
+                }),
+        )
+        .when(total > 1 && !frame.leaving, |row| {
+            row.child(div().flex_none().child(format!("{position}/{total}")))
+        })
+        .child(div().flex_none().text_color(dimmed).child(age))
+        .when(active, |row| {
+            row.cursor_pointer()
                 .on_click(cx.listener(|inbox, _, _, cx| {
                     let before = inbox.before_step();
                     let step = inbox.session.perform(Action::ToggleAgentNote, 1);
                     inbox.apply_step(step, before, cx);
                 }))
-                .into_any_element()
-        } else {
-            row.into_any_element()
-        }
-    };
-    let closed_header = header(true);
-    let open_header = header(false);
-    let summary = div().when(!frame.note.summary.is_empty(), |text| {
-        text.child(frame.note.summary.clone())
+        });
+    let detail = (frame.details > 0.0).then(|| {
+        disclosure::reveal(
+            width,
+            frame.details,
+            1.0,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .pb(px(8.0))
+                .when(!summary.is_empty(), |body| {
+                    body.child(
+                        div()
+                            .id("agent-note-summary")
+                            .max_h(px(4.0 * line))
+                            .overflow_y_scroll()
+                            .track_scroll(&frame.scroll)
+                            .child(summary),
+                    )
+                })
+                .child(suggestions(
+                    theme,
+                    session,
+                    frame,
+                    active && !frame.closed,
+                    width,
+                    window,
+                    cx,
+                ))
+                .into_any_element(),
+        )
     });
-    let note_id = frame.note.id;
-    let clickable = active && !frame.closed;
-    let hints: Vec<_> = if live.0
-        && session.pane == Pane::Conversation
-        && (!frame.closed || frame.reveal.is_some())
-    {
-        let keys = session.note_shortcuts(&frame.note);
-        frame
-            .note
-            .suggestions
-            .iter()
-            .zip(keys)
-            .map(|(item, (_, key))| {
-                let label = match &item.action {
-                    Suggestion::Snooze(until) => {
-                        format!("Snooze {}", present::note_snooze_date(*until))
-                    }
-                    action => action.title(),
-                };
-                let key = key.map(|key| keymap::key_label(key, &session.keymap.leader_name));
-                let position = item.position;
-                div()
-                    .id(("agent-suggestion", position as usize))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .max_w_full()
-                    .min_w_0()
-                    .text_color(rgb(theme.accent))
-                    .when_some(key, |chip, key| chip.child(keycap(theme, key)))
-                    .child(div().min_w_0().truncate().child(label))
-                    .when(clickable, |chip| {
-                        chip.cursor_pointer()
-                            .on_click(cx.listener(move |inbox, _, _, cx| {
-                                if let Some(request) =
-                                    inbox.session.note_request(NoteDecision::Accept(position))
-                                    && request.id == note_id
-                                {
-                                    inbox.choose_agent_note(request, cx);
-                                }
-                            }))
-                    })
-                    .into_any_element()
-            })
-            .collect()
-    } else {
-        Vec::new()
+    let content = div()
+        .w_full()
+        .border_l(px(2.0))
+        .border_color(rgb(motion::mix(theme.background, theme.accent, 0.4)))
+        .pl(px(11.0))
+        .pr(px(8.0))
+        .text_color(rgb(theme.foreground))
+        .text_size(px(theme.ui_px - 1.0))
+        .line_height(px(line))
+        .child(header)
+        .children(detail);
+    div()
+        .flex_none()
+        .pl(px(MESSAGE_PAD_PX))
+        .child(column.place(disclosure::reveal(
+            column.width,
+            frame.height,
+            frame.alpha,
+            div().py(px(4.0)).child(content).into_any_element(),
+        )))
+}
+
+struct Chip {
+    decision: NoteDecision,
+    key: Option<String>,
+    label: String,
+    width: f32,
+    x: f32,
+    y: f32,
+}
+
+fn chip_layout(
+    session: &Session,
+    note: &ThreadNote,
+    width: f32,
+    line: f32,
+    measure: impl Fn(&str) -> f32,
+) -> Vec<Chip> {
+    let keys = session.note_shortcuts(note);
+    let mut chips: Vec<_> = note
+        .suggestions
+        .iter()
+        .zip(keys)
+        .map(|(item, (_, key))| {
+            let label = match &item.action {
+                Suggestion::Snooze(until) => {
+                    format!("Snooze {}", present::note_snooze_date(*until))
+                }
+                action => display_safe(&action.title(), false),
+            };
+            (
+                NoteDecision::Accept(item.position),
+                key.map(|key| keymap::key_label(key, &session.keymap.leader_name)),
+                label,
+            )
+        })
+        .collect();
+    if !chips.is_empty() {
+        chips.push((
+            NoteDecision::Dismiss,
+            Some(keymap::binding_text(
+                &session.keymap,
+                Action::DismissAgentNote,
+            )),
+            "Dismiss".into(),
+        ));
+    }
+    let (mut x, mut y) = (0.0, 0.0);
+    chips
+        .into_iter()
+        .map(|(decision, key, label)| {
+            let chip_width =
+                (measure(&label) + key.as_ref().map_or(0.0, |key| measure(key) + 14.0)).min(width);
+            if x > 0.0 && x + chip_width > width {
+                x = 0.0;
+                y += line + 4.0;
+            }
+            let chip = Chip {
+                decision,
+                key,
+                label,
+                width: chip_width,
+                x,
+                y,
+            };
+            x += chip_width + 12.0;
+            chip
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn suggestions(
+    theme: &Theme,
+    session: &Session,
+    frame: &NoteFrame,
+    clickable: bool,
+    width: f32,
+    window: &Window,
+    cx: &mut Context<Inbox>,
+) -> gpui::Div {
+    let line = theme.ui_px + 5.0;
+    let style = conversation_line_style(window, theme, px(theme.ui_px - 1.0));
+    let measure = |label: &str| {
+        super::line_px_with_style(window, &style, label, FontWeight::NORMAL).ceil() + 1.0
     };
-    let dismiss = (!hints.is_empty()).then(|| {
-        div()
-            .id("dismiss-agent-note")
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .child(keycap(
-                theme,
-                keymap::binding_text(&session.keymap, Action::DismissAgentNote),
-            ))
-            .child("Dismiss")
+    let layout = |note| chip_layout(session, note, width, line, measure);
+    let chips = layout(&frame.note);
+    let (previous, t) = frame
+        .suggestions
+        .as_ref()
+        .map_or((Vec::new(), 1.0), |(note, t)| (layout(note), *t));
+    let progress = motion::ease_out(t);
+    let height = |chips: &[Chip]| chips.last().map_or(0.0, |chip| chip.y + line);
+    let current_height = height(&chips);
+    let previous_height = if frame.suggestions.is_some() {
+        height(&previous)
+    } else {
+        current_height
+    };
+    let note_id = frame.note.id;
+    let mut row = div()
+        .relative()
+        .h(px(motion::lerp(previous_height, current_height, progress)));
+    for old in &previous {
+        if !chips.iter().any(|chip| chip.decision == old.decision) {
+            row = row.child(draw_chip(theme, old, line).opacity(motion::fade_out(t)));
+        }
+    }
+    for mut chip in chips {
+        let old = previous.iter().find(|old| old.decision == chip.decision);
+        if let Some(old) = old {
+            chip.x = motion::lerp(old.x, chip.x, progress);
+            chip.y = motion::lerp(old.y, chip.y, progress);
+        }
+        let decision = chip.decision;
+        let id = match decision {
+            NoteDecision::Dismiss => 0,
+            NoteDecision::Accept(position) => position as usize + 1,
+        };
+        let element = draw_chip(theme, &chip, line)
+            .id(("agent-suggestion", id))
             .when(clickable, |chip| {
                 chip.cursor_pointer()
                     .on_click(cx.listener(move |inbox, _, _, cx| {
-                        if let Some(request) = inbox.session.note_request(NoteDecision::Dismiss)
+                        if let Some(request) = inbox.session.note_request(decision)
                             && request.id == note_id
                         {
                             inbox.choose_agent_note(request, cx);
                         }
                     }))
-            })
-    });
-    let details = div()
-        .flex()
-        .flex_col()
-        .child(open_header)
-        .child(
-            div()
-                .id("agent-note-details")
-                .max_h(px(details_height))
-                .overflow_y_scroll()
-                .track_scroll(&frame.scroll)
-                .child(summary)
-                .when(!hints.is_empty(), |body| {
-                    body.child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_x(px(12.0))
-                            .gap_y(px(2.0))
-                            .mt(px(3.0))
-                            .children(hints)
-                            .children(dismiss),
-                    )
-                }),
-        )
-        .into_any_element();
-    slot.child(
-        column.place(
-            div()
-                .w_full()
-                .max_h_full()
-                .overflow_hidden()
-                .opacity(frame.alpha)
-                .border_l_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.surface))
-                .pl(px(10.0))
-                .pr(px(8.0))
-                .pb(px(3.0))
-                .text_color(rgb(theme.dimmed))
-                .text_size(px(theme.ui_px - 1.0))
-                .line_height(px(line))
-                .child(disclosure(
-                    (column.width - 19.).max(0.),
-                    !frame.closed,
-                    frame.reveal,
-                    || closed_header,
-                    || details,
-                )),
-        ),
-    )
+            });
+        row = row.child(if old.is_none() && frame.suggestions.is_some() {
+            element.opacity(progress)
+        } else {
+            element
+        });
+    }
+    row
 }
 
-fn keycap(theme: &Theme, key: String) -> gpui::Div {
+fn draw_chip(theme: &Theme, chip: &Chip, line: f32) -> gpui::Div {
+    let text = if chip.decision == NoteDecision::Dismiss {
+        theme.dimmed
+    } else {
+        theme.accent
+    };
+    div()
+        .absolute()
+        .left(px(chip.x))
+        .top(px(chip.y))
+        .w(px(chip.width))
+        .h(px(line))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .text_color(rgb(theme::note_text(text, theme.background)))
+        .when_some(chip.key.as_ref(), |chip, key| {
+            chip.child(keycap(theme, key))
+        })
+        .child(div().min_w_0().truncate().child(chip.label.clone()))
+}
+
+fn keycap(theme: &Theme, key: &str) -> gpui::Div {
     div()
         .flex_none()
         .rounded_sm()
         .px(px(4.0))
-        .bg(rgb(theme.background))
-        .text_color(rgb(theme.foreground))
-        .child(key)
+        .border_1()
+        .border_color(rgb(theme::strong_border(theme)))
+        .bg(rgb(theme.selection))
+        .text_color(rgb(theme.on_selection))
+        .child(key.to_owned())
 }
 
 impl Inbox {
@@ -375,9 +544,10 @@ impl Inbox {
                         .clone()
                         .filter(|id| Some(id) == inbox.session.cursor_id.as_ref());
                     let to_see = (inbox.session.pane == Pane::Conversation
-                        && !inbox.session.agent_notes.collapsed)
-                        .then(|| inbox.session.note().map(|note| note.id))
-                        .flatten();
+                        && !inbox.session.agent_notes.collapsed
+                        && inbox.note_in_view())
+                    .then(|| inbox.session.note().map(|note| note.id))
+                    .flatten();
                     Some((inbox.store.clone(), inbox.account_id.clone(), open, to_see))
                 }) else {
                     if this.upgrade().is_none() {
@@ -480,6 +650,26 @@ impl Inbox {
         let thread = fell_core::ThreadId(note.thread.clone());
         let id = note.id;
         let decision = note.decision;
+        let notice = match decision {
+            NoteDecision::Dismiss => "Note dismissed",
+            NoteDecision::Accept(position) => {
+                let Some(suggestion) = self.session.note().and_then(|note| {
+                    note.suggestions
+                        .iter()
+                        .find(|item| item.position == position)
+                }) else {
+                    return;
+                };
+                match suggestion.action {
+                    Suggestion::Archive => "Archived",
+                    Suggestion::Label(_) => "Label added",
+                    Suggestion::Reply => "Reply draft opened",
+                    Suggestion::Snooze(_) => "Snoozed",
+                    Suggestion::MarkRead => "Marked read",
+                    Suggestion::Star => "Starred",
+                }
+            }
+        };
         self.note_in_flight = Some(id);
         self.change_mailbox(
             move |store| {
@@ -491,14 +681,7 @@ impl Inbox {
                     Ok(_) => {
                         inbox.session.agent_notes.resolved(&note);
                         inbox.send_to_server();
-                        inbox.session.show_toast(
-                            if decision == NoteDecision::Dismiss {
-                                "Agent note dismissed"
-                            } else {
-                                "Suggestion accepted"
-                            },
-                            false,
-                        );
+                        inbox.session.show_toast(notice, false);
                         Some(ReadIntent {
                             changed: true,
                             ..ReadIntent::default()

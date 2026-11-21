@@ -786,7 +786,8 @@ impl Store {
         &self,
         account_id: &AccountId,
     ) -> Result<(LocalAction, Vec<ThreadId>)> {
-        self.undo_latest_with_threads(account_id, None)
+        self.undo_with_note(account_id)
+            .map(|(action, _, threads)| (action, threads))
     }
 
     /// Undo the given action only while it is still the account's next undo.
@@ -795,14 +796,23 @@ impl Store {
         account_id: &AccountId,
         action_id: i64,
     ) -> Result<(LocalAction, Vec<ThreadId>)> {
-        self.undo_latest_with_threads(account_id, Some(action_id))
+        self.undo_latest_with_note(account_id, Some(action_id))
+            .map(|(action, _, threads)| (action, threads))
     }
 
-    fn undo_latest_with_threads(
+    /// Undo the latest action with its note feedback and restored thread ids.
+    pub fn undo_with_note(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
+        self.undo_latest_with_note(account_id, None)
+    }
+
+    fn undo_latest_with_note(
         &self,
         account_id: &AccountId,
         expected: Option<i64>,
-    ) -> Result<(LocalAction, Vec<ThreadId>)> {
+    ) -> Result<(LocalAction, Option<&'static str>, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
@@ -892,9 +902,9 @@ impl Store {
         )?;
         expect_one(changed, "undo")?;
         // Undoing an annotation also closes its mirror in the agent log.
-        crate::notes::undo_local(&tx, account_id, action.id)?;
+        let note = crate::notes::undo_local(&tx, account_id, action.id)?;
         tx.commit()?;
-        Ok((action, restored_threads))
+        Ok((action, note, restored_threads))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.

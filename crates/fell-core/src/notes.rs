@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS local_thread_note_actions (
 );
 CREATE INDEX IF NOT EXISTS thread_note_resolutions
     ON local_thread_note_actions(note_id, operation) WHERE undone = 0;
+CREATE INDEX IF NOT EXISTS thread_note_links ON local_thread_note_actions(note_id);
 CREATE VIEW IF NOT EXISTS visible_thread_notes AS
     SELECT n.* FROM thread_notes n WHERE n.active = 1 AND NOT EXISTS (
         SELECT 1 FROM local_thread_note_actions r WHERE r.note_id = n.id AND r.operation = -2 AND r.undone = 0
@@ -88,10 +89,10 @@ impl Suggestion {
             "star" => Ok(Self::Star),
             _ => match raw.split_once(':') {
                 Some(("label", label)) if label.len() <= 80 => {
-                    let label = canonical_label(label)?;
-                    if label.chars().any(hidden_format) {
+                    if display_safe(label, false) != label {
                         return Err(Error::Invalid("invalid suggestion label".into()));
                     }
+                    let label = canonical_label(label)?;
                     Ok(Self::Label(label))
                 }
                 Some(("snooze", until)) => until
@@ -149,6 +150,11 @@ impl Store {
         suggestions: &[String],
         reason: &str,
     ) -> Result<RecordedAction> {
+        // The grant is also the note's identity. Reject invisible characters
+        // instead of silently coalescing two distinct grants.
+        if display_safe(agent, false) != agent {
+            return Err(Error::Invalid("invalid note author".into()));
+        }
         let summary = clean_text(summary.unwrap_or_default(), "summary")?;
         let reason = clean_text(reason, "reason")?;
         if reason.is_empty() {
@@ -232,14 +238,15 @@ impl Store {
             }
             if let Some(position) = row.get(4)? {
                 let raw: String = row.get(5)?;
-                notes
-                    .last_mut()
-                    .expect("note was loaded")
-                    .suggestions
-                    .push(PendingSuggestion {
-                        position,
-                        action: Suggestion::parse(&raw)?,
-                    });
+                // Older notes may contain labels we now reject. Keep the
+                // rest of the note readable and leave those actions unavailable.
+                if let Ok(action) = Suggestion::parse(&raw) {
+                    notes
+                        .last_mut()
+                        .expect("note was loaded")
+                        .suggestions
+                        .push(PendingSuggestion { position, action });
+                }
             }
         }
         Ok(notes)
@@ -385,7 +392,7 @@ pub(crate) fn accept_reply(
     thread: &ThreadId,
     note: i64,
     position: i64,
-) -> Result<()> {
+) -> Result<i64> {
     if pending_suggestion(conn, account, thread, note, position)? != Suggestion::Reply {
         return Err(Error::Action("The agent note changed".into()));
     }
@@ -396,7 +403,8 @@ pub(crate) fn accept_reply(
         ActionKind::AcceptSuggestion,
         "Suggested reply opened",
     )?;
-    link_action(conn, action.id, note, position, None)
+    link_action(conn, action.id, note, position, None)?;
+    Ok(action.id)
 }
 
 fn link_action(
@@ -414,7 +422,11 @@ fn link_action(
     Ok(())
 }
 
-pub(crate) fn undo_local(conn: &Connection, account: &AccountId, action: i64) -> Result<()> {
+pub(crate) fn undo_local(
+    conn: &Connection,
+    account: &AccountId,
+    action: i64,
+) -> Result<Option<&'static str>> {
     let link: Option<(i64, i64, Option<i64>)> = conn.query_row(
         "SELECT note_id, operation, related_agent_action FROM local_thread_note_actions WHERE action_id = ?1 AND undone = 0",
         [action], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -430,6 +442,37 @@ pub(crate) fn undo_local(conn: &Connection, account: &AccountId, action: i64) ->
             "UPDATE local_thread_note_actions SET undone = 1 WHERE action_id = ?1",
             [action],
         )?;
+        return Ok(Some(match operation {
+            ANNOTATION => "Note removed",
+            DISMISSAL => "Note restored",
+            _ => "Suggestion restored",
+        }));
+    }
+    Ok(None)
+}
+
+pub(crate) fn drop_thread(conn: &Connection, account: &str, thread: &str) -> Result<()> {
+    let ids = conn
+        .prepare_cached("SELECT id FROM thread_notes WHERE account_id = ?1 AND thread_id = ?2")?
+        .query_map(params![account, thread], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The local action schema is installed on the first action. A mailbox
+    // without notes may not have it yet, so do not touch the referencing table.
+    if ids.is_empty() {
+        return Ok(());
+    }
+    conn.prepare_cached(
+        "DELETE FROM local_thread_note_actions WHERE note_id IN (
+            SELECT id FROM thread_notes WHERE account_id = ?1 AND thread_id = ?2
+         )",
+    )?
+    .execute(params![account, thread])?;
+    conn.prepare_cached("DELETE FROM thread_notes WHERE account_id = ?1 AND thread_id = ?2")?
+        .execute(params![account, thread])?;
+    let mut actions =
+        conn.prepare_cached("DELETE FROM agent_actions WHERE id = ?1 AND kind = 'annotate'")?;
+    for id in ids {
+        actions.execute([id])?;
     }
     Ok(())
 }
@@ -471,16 +514,26 @@ fn clean_text(text: &str, field: &str) -> Result<String> {
             "{field} exceeds {MAX_NOTE_BYTES} bytes"
         )));
     }
-    Ok(text
-        .chars()
-        .filter(|c| (!c.is_control() || *c == '\n') && !hidden_format(*c))
-        .collect::<String>()
-        .trim()
-        .to_string())
+    Ok(display_safe(text, true).trim().to_string())
 }
 
-fn hidden_format(c: char) -> bool {
-    matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+/// Plain display text with control characters and invisible formatting removed.
+/// Paragraphs in notes may retain line feeds.
+pub fn display_safe(text: &str, multiline: bool) -> String {
+    text.chars()
+        .filter(|&ch| {
+            (multiline && ch == '\n')
+                || (!ch.is_control()
+                    && !matches!(
+                        ch,
+                        '\u{061c}'
+                            | '\u{200b}'..='\u{200f}'
+                            | '\u{2028}'..='\u{202e}'
+                            | '\u{2060}'..='\u{2069}'
+                            | '\u{feff}'
+                    ))
+        })
+        .collect()
 }
 
 #[cfg(test)]

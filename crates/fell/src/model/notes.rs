@@ -24,6 +24,8 @@ pub struct AgentNotes {
     notes: Vec<ThreadNote>,
     selected: usize,
     pub collapsed: bool,
+    pub shortcuts_hidden: bool,
+    dismissed: Option<(i64, bool)>,
 }
 
 impl AgentNotes {
@@ -44,13 +46,19 @@ impl AgentNotes {
         let previous = (self.thread == thread)
             .then(|| self.notes.get(self.selected).map(|note| note.id))
             .flatten();
+        if self.thread != thread {
+            self.dismissed = None;
+        }
         self.thread = thread;
         self.notes = notes;
         self.selected = previous
             .and_then(|id| self.notes.iter().position(|note| note.id == id))
             .unwrap_or(0);
-        if self.notes.get(self.selected).map(|note| note.id) != previous {
-            self.collapsed = false;
+        let current = self.notes.get(self.selected).map(|note| note.id);
+        if current != previous {
+            self.collapsed = self
+                .dismissed
+                .is_some_and(|(id, collapsed)| current == Some(id) && collapsed);
         }
         true
     }
@@ -61,6 +69,7 @@ impl AgentNotes {
         }
         match request.decision {
             NoteDecision::Dismiss => {
+                self.dismissed = Some((request.id, self.collapsed));
                 let mut notes = self.notes.clone();
                 notes.retain(|note| note.id != request.id);
                 self.update(self.thread.clone(), notes);
@@ -89,7 +98,11 @@ impl Session {
     }
 
     pub(super) fn accept_note_key(&self, key: KeyId) -> Option<NoteRequest> {
-        if !self.can_act_on_note() || self.agent_notes.collapsed || !self.count.is_empty() {
+        if !self.can_act_on_note()
+            || self.agent_notes.collapsed
+            || self.agent_notes.shortcuts_hidden
+            || !self.count.is_empty()
+        {
             return None;
         }
         let note = self.note()?;

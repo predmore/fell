@@ -332,12 +332,28 @@ impl Store {
         thread: &crate::ThreadId,
         note: i64,
         position: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let tx = crate::store::begin_immediate(&self.conn)?;
-        crate::notes::accept_reply(&tx, &draft.account_id, thread, note, position)?;
+        let action = crate::notes::accept_reply(&tx, &draft.account_id, thread, note, position)?;
         save_compose_in(&tx, draft, Some(&draft.files), None)?;
-        tx.commit()?;
         self.seal_private_files()?;
+        tx.commit()?;
+        Ok(action)
+    }
+
+    /// A draft failed to open after the suggestion was accepted. Restore only
+    /// that accept, even if another mailbox action has landed since the save.
+    pub fn rollback_suggested_reply(&self, account: &AccountId, action: i64) -> Result<()> {
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE local_actions SET undone = 1
+             WHERE id = ?1 AND account_id = ?2 AND kind = 'accept_suggestion' AND undone = 0",
+            params![action, account.as_str()],
+        )?;
+        if changed > 0 {
+            crate::notes::undo_local(&tx, account, action)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
