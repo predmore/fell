@@ -359,6 +359,65 @@ impl Inbox {
         }
     }
 
+    pub(super) fn refresh_search_snippet(&mut self, message: MessageId, cx: &mut Context<Self>) {
+        let Some(search) = &self.session.search else {
+            return;
+        };
+        let Some(generation) = search.accepted_generation() else {
+            return;
+        };
+        let Some((thread, hit)) = search.hits.iter().find(|(_, hit)| hit.message == message) else {
+            return;
+        };
+        let thread = thread.clone();
+        let query = search.effective_query().to_owned();
+        let related = hit.related;
+        let account = self.account_id.clone();
+        let id = message.clone();
+        let reply = self.store.call_search(move |store| {
+            let snippet = store.message_snippet(&account, &id).ok().flatten()?;
+            let preview = if related {
+                Ok(None)
+            } else {
+                store
+                    .search_previews(&account, &query, std::slice::from_ref(&id))
+                    .map(|mut previews| previews.remove(&id))
+            };
+            Some((snippet, preview))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some((snippet, preview))) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                let current = inbox
+                    .session
+                    .search
+                    .as_ref()
+                    .and_then(Search::accepted_generation);
+                if current != Some(generation) {
+                    inbox.refresh_search_snippet(message, cx);
+                } else {
+                    let retry = preview.is_err();
+                    if retry {
+                        inbox.search_view.preview_asked.remove(&message);
+                    } else {
+                        inbox.search_view.preview_asked.insert(message.clone());
+                    }
+                    let changed = inbox
+                        .session
+                        .set_search_snippet(generation, &thread, &message, &snippet, preview);
+                    if changed || retry {
+                        inbox.search_view.rows_previews =
+                            inbox.search_view.rows_previews.wrapping_add(1);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn cancel_search_work(&self) {
         self.search_view
             .current
@@ -831,10 +890,8 @@ impl Inbox {
             .filter_map(|index| {
                 let row = self.session.threads.get(index)?;
                 let hit = search.hits.get(&row.id)?;
-                (!hit.related
-                    && hit.preview.is_none()
-                    && self.search_view.preview_asked.insert(hit.message.clone()))
-                .then(|| (row.id.clone(), hit.message.clone()))
+                (!hit.related && self.search_view.preview_asked.insert(hit.message.clone()))
+                    .then(|| (row.id.clone(), hit.message.clone(), hit.preview.clone()))
             })
             .collect();
         if !batch.is_empty() {
@@ -847,7 +904,7 @@ impl Inbox {
     fn request_search_previews(
         &mut self,
         generation: u64,
-        batch: Vec<(String, MessageId)>,
+        batch: Vec<(String, MessageId, Option<SearchPreview>)>,
         cx: &mut Context<Self>,
     ) {
         let Some(search) = self
@@ -867,12 +924,13 @@ impl Inbox {
                 if current.load(Ordering::Relaxed) != generation {
                     return None;
                 }
-                let ids: Vec<_> = chunk.iter().map(|(_, id)| id.clone()).collect();
-                previews.extend(
-                    store
-                        .search_previews(&account, &query, &ids)
-                        .unwrap_or_default(),
-                );
+                let ids: Vec<_> = chunk.iter().map(|(_, id, _)| id.clone()).collect();
+                if let Ok(mut loaded) = store.search_previews(&account, &query, &ids) {
+                    previews.extend(ids.into_iter().map(|id| {
+                        let preview = loaded.remove(&id);
+                        (id, preview)
+                    }));
+                }
             }
             Some((batch, previews))
         });
@@ -880,9 +938,6 @@ impl Inbox {
             let Ok(Some((batch, mut previews))) = reply.await else {
                 return;
             };
-            if previews.is_empty() {
-                return;
-            }
             let _ = this.update(cx, |inbox, cx| {
                 if let Some(search) = inbox
                     .session
@@ -891,21 +946,38 @@ impl Inbox {
                     .filter(|search| search.accepted_generation() == Some(generation))
                 {
                     if !search.results_current() {
-                        for (_, id) in batch {
+                        for (_, id, _) in batch {
                             inbox.search_view.preview_asked.remove(&id);
                         }
                         // The cached list must get a chance to ask again.
                         inbox.search_view.rows_were_current = false;
                         return;
                     }
-                    for (thread, id) in batch {
-                        if let Some(hit) = search.hits.get_mut(&thread) {
-                            hit.preview = previews.remove(&id);
+                    let mut changed = false;
+                    for (thread, id, previous) in batch {
+                        if let Some(hit) = search.hits.get_mut(&thread)
+                            && hit.message == id
+                            // A repair may already have delivered a newer preview.
+                            && hit.preview == previous
+                        {
+                            match previews.remove(&id) {
+                                Some(preview) if hit.preview != preview => {
+                                    hit.preview = preview;
+                                    changed = true;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    // Retry on a later render without invalidating the row again.
+                                    inbox.search_view.preview_asked.remove(&id);
+                                }
+                            }
                         }
                     }
-                    inbox.search_view.rows_previews =
-                        inbox.search_view.rows_previews.wrapping_add(1);
-                    cx.notify();
+                    if changed {
+                        inbox.search_view.rows_previews =
+                            inbox.search_view.rows_previews.wrapping_add(1);
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -1160,8 +1232,16 @@ pub(super) fn rows(
         entity.update(app, |inbox, cx| {
             inbox.queue_search_previews(range.clone(), window, cx);
             let highlighted = inbox.session.highlighted();
+            let width = f32::from(window.viewport_size().width);
+            let (_, beside) =
+                present::visible_panes(width, inbox.session.pane, inbox.session.full_width);
+            let width = if beside {
+                list_width(width, inbox.split)
+            } else {
+                width
+            };
             range
-                .map(|index| row(&theme, inbox, index, &highlighted, cx))
+                .map(|index| row(&theme, inbox, index, &highlighted, width, window, cx))
                 .collect()
         })
     })
@@ -1170,11 +1250,165 @@ pub(super) fn rows(
     .track_scroll(scroll)
 }
 
+const ROW_GAP: f32 = 8.0;
+const MIN_SUBJECT: f32 = 72.0;
+const ROW_PAD: f32 = 14.0;
+const SENDER_GAP: f32 = 5.0;
+const STAR: &str = "★";
+
+fn row_text_width(list_width: f32) -> f32 {
+    (list_width - LIST_BORDER_PX - 2.0 * ROW_PAD).max(0.0)
+}
+
+fn detail_budget(row_room: f32, room: f32, subject: f32, minimum: f32) -> f32 {
+    (room - subject.max(MIN_SUBJECT))
+        .max(minimum)
+        .min(row_room * 0.45)
+        .min((room - MIN_SUBJECT).max(0.0))
+        .floor()
+}
+
+#[derive(Clone, Copy)]
+enum RowText {
+    Detail,
+    Subject,
+    Mark,
+}
+
+struct RowLine {
+    sender_width: f32,
+    sender: Option<gpui::ShapedLine>,
+    count: Option<String>,
+    star: Option<f32>,
+    attachment: Option<f32>,
+    subject: Option<gpui::ShapedLine>,
+    detail: [Option<gpui::ShapedLine>; 2],
+}
+
+fn fit_row_line(
+    row: &present::ThreadRow,
+    list_width: f32,
+    folder: Option<&str>,
+    related: bool,
+    dates: [&str; 2],
+    shape: impl Fn(&str, RowText, Option<f32>) -> Option<gpui::ShapedLine>,
+) -> RowLine {
+    let line_width = |line: &gpui::ShapedLine| f32::from(line.width).ceil();
+    let measure = |text: &str, kind| shape(text, kind, None).as_ref().map_or(0.0, line_width);
+    let row_room = row_text_width(list_width);
+    let count = (row.message_count > 1).then(|| format!("· {}", row.message_count));
+    let count_width = count
+        .as_deref()
+        .map_or(0.0, |count| SENDER_GAP + measure(count, RowText::Detail));
+    let sender_text = &row.spans[0].text;
+    let sender_width =
+        (measure(sender_text, RowText::Detail) + count_width).min((row_room * 0.30).floor());
+    let sender_room = (sender_width - count_width).max(0.0);
+    let sender = shape(sender_text, RowText::Detail, Some(sender_room))
+        .filter(|line| line_width(line) <= sender_room);
+    let star = row.starred.then(|| measure(STAR, RowText::Mark));
+    let attachment = row
+        .has_attachment
+        .then(|| measure(THREAD_ATTACHMENT_MARK, RowText::Mark));
+    let marks_width: f32 = star
+        .into_iter()
+        .chain(attachment)
+        .map(|width| width + ROW_GAP)
+        .sum();
+    let room = (row_room - sender_width - marks_width - 2.0 * ROW_GAP).max(0.0);
+    let subject = if row.subject.is_empty() {
+        "(No subject)"
+    } else {
+        &row.subject
+    };
+
+    // Reserve the timestamp and enough of the final folder word to
+    // distinguish sibling folders when the subject needs clipping.
+    let shape_detail = |text: &str| shape(text, RowText::Detail, None);
+    let full_date = shape_detail(dates[0]);
+    let date_with_location = |date: &str| shape_detail(&format!(" · {date}"));
+    let full_date_with_location = full_date
+        .as_ref()
+        .filter(|_| folder.is_some())
+        .and_then(|date| date_with_location(&date.text));
+    let related_prefix = if related { "Related · " } else { "" };
+    let related = if related {
+        shape_detail("Related")
+    } else {
+        None
+    };
+    let location_min = folder.map_or_else(
+        || related.as_ref().map_or(0.0, line_width),
+        |folder| {
+            let leaf = folder.rsplit('/').next().unwrap_or(folder);
+            let last = leaf.split_whitespace().next_back().unwrap_or(leaf);
+            let suffix = if last == leaf { "" } else { "…" };
+            measure(&format!("{related_prefix}{suffix}{last}"), RowText::Detail).min(120.0)
+        },
+    );
+    let detail_room = detail_budget(
+        row_room,
+        room,
+        measure(subject, RowText::Subject),
+        full_date_with_location
+            .as_ref()
+            .or(full_date.as_ref())
+            .map_or(0.0, line_width)
+            + location_min,
+    );
+    let fits_date = |line: &gpui::ShapedLine| line_width(line) <= detail_room;
+    let date = full_date.filter(fits_date).or_else(|| {
+        if dates[0] == dates[1] {
+            None
+        } else {
+            shape_detail(dates[1]).filter(fits_date)
+        }
+    });
+    let dated_location = date
+        .as_ref()
+        .and_then(|date| date_with_location(&date.text));
+    let location_room = detail_room - dated_location.as_ref().map_or(0.0, line_width);
+    let location = folder
+        .filter(|_| location_room > 0.0)
+        .and_then(|folder| {
+            fit_folder_path(
+                folder,
+                FolderFit::Search,
+                |path| {
+                    let text = format!("{related_prefix}{path}");
+                    shape(&text, RowText::Detail, Some(location_room))
+                        .filter(|line| line_width(line) <= location_room)
+                },
+                |line| line.text.strip_prefix(related_prefix).unwrap_or_default(),
+            )
+        })
+        .or_else(|| related.filter(|line| line_width(line) <= location_room));
+    let date = if location.is_some() {
+        dated_location
+    } else {
+        date
+    };
+    let detail = [location, date];
+    let subject_room = room - detail.iter().flatten().map(line_width).sum::<f32>();
+    let subject = shape(subject, RowText::Subject, Some(subject_room));
+    RowLine {
+        sender_width,
+        sender,
+        count,
+        star,
+        attachment,
+        subject,
+        detail,
+    }
+}
+
 fn row(
     theme: &Theme,
     inbox: &Inbox,
     index: usize,
     highlighted: &HashSet<String>,
+    list_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let row = &inbox.session.threads[index];
@@ -1203,13 +1437,53 @@ fn row(
         1.,
         motion::progress(inbox.search_view.arrival.as_ref(), inbox.frame_now),
     );
-    let date = present::relative_date(now_unix(), row.date_unix);
-    let detail = match &hit.folder {
-        Some(folder) if hit.related => format!("Related · {}", inbox.session.roles.label(folder)),
-        None if hit.related => "Related".to_owned(),
-        Some(folder) => format!("{} · {date}", inbox.session.roles.label(folder)),
-        None => date,
+    let size = px(theme.ui_px - 2.0);
+    let style = conversation_line_style(window, theme, size);
+    let subject_style = conversation_line_style(window, theme, px(theme.ui_px));
+    let dates = if hit.related {
+        [String::new(), String::new()]
+    } else {
+        let now = now_unix();
+        [
+            present::relative_date(now, row.date_unix),
+            present::compact_relative_date(now, row.date_unix),
+        ]
     };
+    let folder = hit
+        .folder
+        .as_ref()
+        .map(|folder| inbox.session.roles.label(folder));
+    let RowLine {
+        sender_width,
+        sender,
+        count,
+        star,
+        attachment,
+        subject,
+        detail,
+    } = fit_row_line(
+        row,
+        list_width,
+        folder.as_deref(),
+        hit.related,
+        [&dates[0], &dates[1]],
+        |text, kind, limit| {
+            let (style, weight, color) = match kind {
+                RowText::Detail => (&style, FontWeight::NORMAL, Some(dim)),
+                RowText::Subject => (&subject_style, FontWeight::SEMIBOLD, Some(foreground)),
+                RowText::Mark => (&subject_style, FontWeight::NORMAL, None),
+            };
+            match limit {
+                Some(limit) => clip_shaped(window, style, text, limit, weight, color),
+                None => shape_ui_line(window, style, text, weight, color),
+            }
+        },
+    );
+    let marks = [
+        star.map(|width| (STAR, theme.star, width)),
+        attachment.map(|width| (THREAD_ATTACHMENT_MARK, dim, width)),
+    ];
+    let snippet_room = row_text_width(list_width);
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1224,17 +1498,26 @@ fn row(
                 background_color: Some(rgb(fill).into()),
                 ..HighlightStyle::default()
             };
-            StyledText::new(text)
-                .with_highlights(highlights.into_iter().map(|range| (range, highlight)))
+            let mut style = subject_style.clone();
+            style.color = rgb(dim).into();
+            fit_highlighted_excerpt(window, &style, &text, &highlights, highlight, snippet_room)
         }
-        _ => StyledText::new(row.snippet.clone()),
+        _ => clip_shaped(
+            window,
+            &subject_style,
+            &row.snippet,
+            snippet_room,
+            FontWeight::NORMAL,
+            Some(dim),
+        ),
     };
+    let excerpt = excerpt.filter(|line| line.width <= px(snippet_room));
     div()
         .id(gpui::ElementId::named_usize("search-row", index))
         .relative()
         .h(px(ROW_PX))
         .w_full()
-        .px(px(14.))
+        .px(px(ROW_PAD))
         .flex()
         .flex_col()
         .justify_center()
@@ -1270,58 +1553,84 @@ fn row(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(ROW_GAP))
                 .child(
                     div()
                         .flex()
                         .flex_none()
-                        .max_w(gpui::relative(0.30))
+                        .w(px(sender_width))
                         .min_w_0()
                         .items_center()
-                        .gap(px(5.))
+                        .gap(px(SENDER_GAP))
                         .text_color(rgb(dim))
-                        .text_size(px(theme.ui_px - 2.0))
-                        .child(div().min_w_0().truncate().child(row.spans[0].text.clone()))
-                        .when(row.message_count > 1, |sender| {
-                            sender
-                                .child(div().flex_none().child(format!("· {}", row.message_count)))
-                        }),
+                        .text_size(size)
+                        .children(sender.map(|line| shaped_text(line, window)))
+                        .children(count.map(|count| div().flex_none().child(count))),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(if row.subject.is_empty() {
-                            "(No subject)".to_owned()
-                        } else {
-                            row.subject.clone()
-                        }),
+                        .overflow_hidden()
+                        .children(subject.map(|line| shaped_text(line, window))),
                 )
-                .when(row.starred, |line| {
-                    line.child(div().flex_none().text_color(rgb(theme.star)).child("★"))
-                })
-                .when(row.has_attachment, |line| {
-                    line.child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(dim))
-                            .child(THREAD_ATTACHMENT_MARK),
-                    )
-                })
-                .child(
+                .children(marks.into_iter().flatten().map(|(text, color, width)| {
                     div()
                         .flex_none()
-                        .max_w(gpui::relative(0.30))
-                        .truncate()
-                        .text_color(rgb(dim))
-                        .text_size(px(theme.ui_px - 2.0))
-                        .child(detail),
-                ),
+                        .w(px(width))
+                        .text_color(rgb(color))
+                        .child(text)
+                }))
+                .child(div().flex_none().flex().items_center().children(
+                    detail.into_iter().flatten().map(|line| {
+                        let width = line.width.ceil();
+                        shaped_text(line, window).w(width)
+                    }),
+                )),
         )
-        .child(div().truncate().text_color(rgb(dim)).child(excerpt))
+        .child(
+            div()
+                .overflow_hidden()
+                .children(excerpt.map(|line| paint_shaped_text(line, window, true))),
+        )
         .into_any_element()
+}
+
+fn fit_highlighted_excerpt(
+    window: &Window,
+    style: &TextStyle,
+    text: &str,
+    highlights: &[Range<usize>],
+    highlight: HighlightStyle,
+    room: f32,
+) -> Option<gpui::ShapedLine> {
+    let size = style.font_size.to_pixels(window.rem_size());
+    let matched = style.clone().highlight(highlight);
+    // Measure the actual runs, including the heavier matches, against the inner row.
+    fit_shaped_line(text, room, f32::from(size), |candidate| {
+        let end = if text.starts_with(candidate) {
+            candidate.len()
+        } else {
+            candidate.len() - '…'.len_utf8()
+        };
+        let mut runs = Vec::new();
+        let mut offset = 0;
+        for range in highlights.iter().take_while(|range| range.start < end) {
+            if range.start > offset {
+                runs.push(style.to_run(range.start - offset));
+            }
+            offset = range.end.min(end);
+            runs.push(matched.to_run(offset - range.start));
+        }
+        if offset < candidate.len() {
+            runs.push(style.to_run(candidate.len() - offset));
+        }
+        Some(
+            window
+                .text_system()
+                .shape_line(candidate.to_owned().into(), size, &runs, None),
+        )
+    })
 }
 
 fn visible_excerpt(preview: &SearchPreview) -> (String, Vec<Range<usize>>) {
@@ -1405,4 +1714,105 @@ pub(super) fn match_reason(
                 }),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_details_use_spare_width_and_reserve_room_for_the_subject() {
+        assert_eq!(detail_budget(400., 300., 110., 100.), 180.);
+        assert_eq!(detail_budget(400., 300., 155., 100.), 145.);
+        assert_eq!(detail_budget(400., 300., 270., 100.), 100.);
+        assert_eq!(detail_budget(260., 150., 270., 100.), 78.);
+    }
+
+    #[test]
+    fn narrow_search_rows_fit_compact_dates_without_crowding_the_subject() {
+        let mut row = present::ThreadRow {
+            id: "field-report".into(),
+            spans: vec![present::NameSpan {
+                text: "Regional Field Survey Coordinator".into(),
+                emphasis: true,
+            }],
+            extra: 0,
+            message_count: 1,
+            starred: false,
+            has_attachment: false,
+            date_unix: 0,
+            subject: "Field survey notes and equipment list for the west ridge".into(),
+            snippet: String::new(),
+            labels: Vec::new(),
+            warn: false,
+            unread: false,
+            draft: None,
+        };
+        // Deterministic glyph widths keep this row test independent of local fonts.
+        let shape = |text: &str, kind, room: Option<f32>| {
+            if text.is_empty() {
+                return None;
+            }
+            let glyph = match kind {
+                RowText::Detail => 7.5,
+                RowText::Subject => 8.0,
+                RowText::Mark => 14.0,
+            };
+            let text = match room {
+                Some(room) if text.chars().count() as f32 * glyph > room => {
+                    let keep = (room / glyph).floor() as usize;
+                    let head: String = text.chars().take(keep.saturating_sub(1)).collect();
+                    present::ellipsis(&head)
+                }
+                _ => text.to_owned(),
+            };
+            let mut line = gpui::ShapedLine::default();
+            Arc::get_mut(&mut *line).unwrap().width = px(text.chars().count() as f32 * glyph);
+            line.text = text.into();
+            Some(line)
+        };
+        let folder = Some("Projects/Field Operations/West Ridge Coordination");
+        for (width, dates, marked, expected) in [
+            (280.0, ["Nov 21, 2025", "11/21/25"], false, Some("11/21/25")),
+            (280.0, ["Yesterday", "Yest."], true, Some("Yest.")),
+            (245.0, ["Yesterday", "Yest."], true, None),
+            (380.0, ["Yesterday", "Yest."], false, Some("Yesterday")),
+        ] {
+            row.starred = marked;
+            row.has_attachment = marked;
+            row.message_count = if marked { 3 } else { 1 };
+            let layout = fit_row_line(&row, width, folder, false, dates, shape);
+            assert_eq!(layout.star.is_some(), marked);
+            assert_eq!(layout.attachment.is_some(), marked);
+            assert_eq!(
+                layout.detail[1]
+                    .as_ref()
+                    .map(|line| line.text.trim_start_matches(" · ")),
+                expected,
+            );
+            let sender = layout.sender.unwrap();
+            assert!(sender.text.ends_with('…'));
+            let count_width = layout.count.as_ref().map_or(0.0, |count| {
+                f32::from(shape(count, RowText::Detail, None).unwrap().width).ceil() + SENDER_GAP
+            });
+            assert!(f32::from(sender.width).ceil() + count_width <= layout.sender_width);
+            let row_room = row_text_width(width);
+            let room = row_room
+                - layout.sender_width
+                - if marked { 2.0 * (14.0 + ROW_GAP) } else { 0.0 }
+                - 2.0 * ROW_GAP;
+            let detail_width: f32 = layout
+                .detail
+                .iter()
+                .flatten()
+                .map(|line| f32::from(line.width).ceil())
+                .sum();
+            let subject = layout.subject.unwrap();
+            assert!(detail_width <= detail_budget(row_room, room, 0.0, 0.0));
+            assert!(subject.text.starts_with("Field"));
+            assert!(subject.text.ends_with('…'));
+            assert!(f32::from(subject.width) >= MIN_SUBJECT);
+            assert!(f32::from(subject.width) + detail_width <= room);
+        }
+    }
 }

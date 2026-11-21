@@ -75,6 +75,8 @@ pub enum SyncEvent {
     /// Parts were stored for mail that had none (the backfill after a
     /// pass). An open thread may have HTML to show now.
     BodiesStored,
+    /// Cached previews were rebuilt from their stored HTML.
+    SnippetsStored,
     ReplyTo(ReplyToProgress),
 }
 
@@ -297,6 +299,7 @@ fn run(
     let mut idle = true;
     let mut bodies = BodyQueue::default();
     let mut reply_to = ReplyToBackfill::default();
+    let mut snippets_repaired = false;
     loop {
         // Replay writes before the read-only pass, so it sees their results.
         // A failure here is a connection problem the pass reports.
@@ -371,6 +374,22 @@ fn run(
         bodies.new_gap();
         bodies.serve(&config, &store, &account);
         let until = Instant::now() + delay;
+        if !snippets_repaired {
+            let mut changed = false;
+            for _ in 0..BACKFILL_BATCHES_AFTER_PASS {
+                match store.repair_html_snippets() {
+                    Ok(Some(updated)) => changed |= updated,
+                    Ok(None) => {
+                        snippets_repaired = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if changed && events.unbounded_send(SyncEvent::SnippetsStored).is_err() {
+                return;
+            }
+        }
         let mut pending = if synced {
             fill_old_mail(
                 &config,

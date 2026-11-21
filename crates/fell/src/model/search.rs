@@ -613,6 +613,36 @@ impl Session {
         }
     }
 
+    pub fn set_search_snippet(
+        &mut self,
+        generation: u64,
+        thread: &str,
+        message: &MessageId,
+        snippet: &str,
+        preview: fell_core::Result<Option<SearchPreview>>,
+    ) -> bool {
+        let Some(hit) = self
+            .search
+            .as_mut()
+            .filter(|search| search.accepted_generation() == Some(generation))
+            .and_then(|search| search.hits.get_mut(thread))
+            .filter(|hit| &hit.message == message)
+        else {
+            return false;
+        };
+        let Some(row) = self.threads.iter_mut().find(|row| row.id == thread) else {
+            return false;
+        };
+        let snippet = one_line(snippet);
+        let mut changed = row.snippet != snippet;
+        row.snippet = snippet;
+        if let Ok(preview) = preview {
+            changed |= hit.preview != preview;
+            hit.preview = preview;
+        }
+        changed
+    }
+
     pub fn set_search_matches(
         &mut self,
         generation: u64,
@@ -874,6 +904,110 @@ mod tests {
         assert_eq!(session.cursor_id.as_deref(), Some("two"));
         session.on_key(KeyId::Enter, 10);
         assert_eq!(session.pane, Pane::Conversation);
+    }
+
+    #[test]
+    fn fetched_html_updates_only_its_search_row() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let source = &store.search(&account.id, "hall").unwrap().hits[0].message_id;
+        let mut mail = store.message(&account.id, source).unwrap().unwrap();
+        let id = MessageId::new("dispatch@fell.test");
+        mail.headers.message_id = id.clone();
+        mail.headers.proton_conversation_id = None;
+        mail.headers.in_reply_to = None;
+        mail.headers.references.clear();
+        mail.headers.subject = "Field dispatch".into();
+        mail.remote_id = fell_core::RemoteId("fixture:dispatch".into());
+        mail.thread_id = fell_core::ThreadId::from_message_id(&id);
+        mail.snippet = "HeadingThe invoice is ready.".into();
+        mail.body_text = None;
+        mail.parts = None;
+        store
+            .apply_delta(
+                &account.id,
+                &fell_core::MailboxDelta {
+                    messages: vec![mail],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let hit = store
+            .search(&account.id, "invoice")
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|hit| hit.message_id == id)
+            .unwrap();
+        let thread = hit.thread_id.0.clone();
+        let read_preview = || {
+            store
+                .search_previews(&account.id, "invoice", std::slice::from_ref(&id))
+                .unwrap()
+                .remove(&id)
+        };
+
+        let mut session = session();
+        session.perform(Action::Search, 10);
+        session.type_search("invoice");
+        let mut initial = reply(vec![row_hit("other", "m2"), hit], None);
+        initial.hits.get_mut(&thread).unwrap().preview = read_preview();
+        land(&mut session, initial);
+        session.select_if_present(&thread);
+        session.picked.insert("other".into());
+        let generation = session.search_generation;
+        let other = session.threads[0].clone();
+        assert_eq!(session.threads[1].snippet, "HeadingThe invoice is ready.");
+
+        store
+            .store_fetched_parts(
+                &account.id,
+                &[(
+                    id.clone(),
+                    Some(fell_core::MessageParts {
+                        html: Some("<h1>Heading</h1><p>The invoice is ready.</p>".into()),
+                        ..Default::default()
+                    }),
+                )],
+            )
+            .unwrap();
+        let snippet = store.message_snippet(&account.id, &id).unwrap().unwrap();
+        assert!(session.set_search_snippet(
+            generation,
+            &thread,
+            &id,
+            &snippet,
+            Err(fell_core::Error::Search("preview unavailable".into())),
+        ));
+        assert_eq!(session.threads[1].snippet, "Heading The invoice is ready.");
+        assert_eq!(
+            session.search.as_ref().unwrap().hits[&thread]
+                .preview
+                .as_ref()
+                .unwrap()
+                .text,
+            "HeadingThe invoice is ready."
+        );
+        assert!(session.set_search_snippet(generation, &thread, &id, &snippet, Ok(read_preview())));
+        assert_eq!(session.threads[0], other);
+        assert_eq!(session.threads[1].snippet, "Heading The invoice is ready.");
+        let search = session.search.as_ref().unwrap();
+        assert_eq!(search.query, "invoice");
+        assert_eq!(search.accepted_generation(), Some(generation));
+        assert_eq!(
+            search.hits[&thread].preview.as_ref().unwrap().text,
+            "Heading The invoice is ready."
+        );
+        assert_eq!(session.cursor_id.as_deref(), Some(thread.as_str()));
+        assert!(session.picked.contains("other"));
+        assert!(!session.set_search_snippet(
+            generation.wrapping_sub(1),
+            &thread,
+            &id,
+            "stale",
+            Ok(None)
+        ));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct Theme {
     pub on_selection: u32,
     /// Snippet and meta on a selected row. Dimmer than `on_selection`, still AA on `selection`.
     pub on_selection_dim: u32,
+    pub on_selection_accent: u32,
     pub search_match: (u32, u32),
     pub selected_search_match: (u32, u32),
     label_outline: u32,
@@ -180,6 +181,12 @@ fn map_palette(
     let on_selection_raw = color(raw, &["selection_foreground"]).unwrap_or(foreground);
     let (on_selection, on_selection_dim) = text_pair(on_selection_raw, on_selection_raw, selection);
     let accent = ensure_all(accent_raw, &[background, surface], TEXT_CONTRAST);
+    let on_selection_accent = if contrast(accent, selection) >= TEXT_CONTRAST {
+        accent
+    } else {
+        push_toward(accent, selection, TEXT_CONTRAST, on_selection)
+            .map_or(on_selection, |(color, _)| color)
+    };
     let search_match = |fg, bg| {
         let fill = mix(bg, fg, 0.14);
         (ensure(fg, fill, TEXT_CONTRAST), fill)
@@ -195,6 +202,7 @@ fn map_palette(
         selection,
         on_selection,
         on_selection_dim,
+        on_selection_accent,
         search_match: search_match(accent, background),
         selected_search_match: search_match(on_selection, selection),
         label_outline: label_outline(background, dimmed),
@@ -271,6 +279,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
         && contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.star, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST
+        && contrast(theme.on_selection_accent, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.error, theme.selection) >= TEXT_CONTRAST
         && contrast(theme.foreground, theme.background)
             >= contrast(theme.dimmed, theme.background) + 0.8
@@ -870,6 +879,9 @@ mod tests {
         );
         assert!(contrast(theme.on_selection, theme.selection) >= TEXT_CONTRAST);
         assert!(contrast(theme.on_selection_dim, theme.selection) >= TEXT_CONTRAST);
+        assert!(contrast(theme.accent, theme.selection) < TEXT_CONTRAST);
+        assert!(contrast(theme.on_selection_accent, theme.selection) >= TEXT_CONTRAST);
+        assert_ne!(theme.on_selection_accent, theme.on_selection);
         // The star on the selected row (was #945e13 on #ccd0da, 3.5:1).
         assert!(
             contrast(theme.star, theme.selection) >= TEXT_CONTRAST,

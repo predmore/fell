@@ -4224,6 +4224,64 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
 }
 
 #[test]
+fn fetching_old_html_repairs_the_snippet_after_the_cache_scan_finishes() {
+    let mut state = sample_state();
+    let paragraph = "The survey continues along the marked route. ".repeat(6);
+    let raw = format!(
+        "From: Ann <ann@x>\r\n\
+                Subject: Survey\r\n\
+                Message-ID: <html@x>\r\n\
+                Content-Type: text/html; charset=utf-8\r\n\r\n\
+                <h1>Heading</h1><p>{paragraph}</p>"
+    );
+    let inbox = mailbox(&mut state, "INBOX");
+    let html = inbox
+        .messages
+        .iter_mut()
+        .find(|message| message.uid == 4)
+        .unwrap();
+    html.raw = raw.into_bytes();
+    let server = TestServer::spawn(state);
+    let acct = account("a1", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    let expected = format!("Heading {paragraph}");
+    let expected = super::cap_snippet(&expected);
+    assert_eq!(stored(&store, &acct, "html@x").unwrap().snippet, expected);
+
+    // Recreate a pre-parts cache whose old snippet is already on the row.
+    store
+        .conn
+        .execute("DELETE FROM message_bodies WHERE message_id = 'html@x'", [])
+        .unwrap();
+    let old = format!("Heading{paragraph}");
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET snippet = ?1 WHERE message_id = 'html@x'",
+            [super::cap_snippet(&old)],
+        )
+        .unwrap();
+    while store.repair_html_snippets().unwrap().is_some() {}
+    let before = stored(&store, &acct, "html@x").unwrap();
+
+    let parts =
+        crate::fetch_message_body(&acct.id, &backend, &store, &crate::MessageId::new("html@x"))
+            .unwrap()
+            .unwrap();
+    assert!(parts.html.is_some());
+    assert_eq!(store.repair_html_snippets().unwrap(), None);
+    let after = stored(&store, &acct, "html@x").unwrap();
+    assert_eq!(after.snippet, expected);
+    assert_eq!(after.body_text, before.body_text);
+}
+
+#[test]
 fn a_new_uidvalidity_records_old_copies_without_bodies() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);

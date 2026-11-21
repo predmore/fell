@@ -998,6 +998,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The list snippet for a canonical message ID from a search hit.
+    pub fn message_snippet(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<String>> {
+        self.conn
+            .prepare_cached(
+                "SELECT snippet FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            )?
+            .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// The HTML and plain parts and bulk headers of one message, by its id
     /// or an id that collapsed into it.
     ///
@@ -1106,6 +1123,13 @@ impl Store {
     /// with the server copies to fetch them from.
     pub fn missing_bodies(&self, account_id: &AccountId, limit: usize) -> Result<Vec<BodyRequest>> {
         bodies::missing(&self.conn, account_id, limit)
+    }
+
+    /// Repair one batch of cached HTML-only previews from the original parts
+    /// on the sync lane. Returns whether the batch changed previews, or
+    /// `None` after the cache is up to date.
+    pub fn repair_html_snippets(&self) -> Result<Option<bool>> {
+        bodies::repair_html_snippets(&self.conn)
     }
 
     /// The server copies to fetch for one message with no stored body part
@@ -1240,15 +1264,16 @@ impl Store {
         account_id: &AccountId,
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
-        // Deflate before the write lock: archive and mark-read wait on it.
-        let compressed: Vec<(&MessageId, bodies::StoredParts)> = fetched
+        // Deflate and render before the write lock: archive and mark-read wait on it.
+        let compressed: Vec<_> = fetched
             .iter()
             .map(|(message_id, parts)| {
                 let stored = parts
                     .as_ref()
                     .map(bodies::StoredParts::new)
                     .unwrap_or_default();
-                (message_id, stored)
+                let full_snippet = parts.as_ref().and_then(crate::imap::html_only_snippet_text);
+                (message_id, stored, full_snippet)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1259,7 +1284,7 @@ impl Store {
         )?;
         let repairs = compressed
             .iter()
-            .map(|(id, parts)| {
+            .map(|(id, parts, _)| {
                 let Some(canonical) = canonical_id_on(&read, account_id, id)? else {
                     return Ok(None);
                 };
@@ -1276,7 +1301,7 @@ impl Store {
             .lock_wait
             .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for ((message_id, parts), repair) in compressed.iter().zip(repairs) {
+        for ((message_id, parts, full_snippet), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1287,6 +1312,15 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
+            if let Some(full_snippet) = full_snippet {
+                bodies::fill_fetched_html_snippet(
+                    &tx,
+                    account_id,
+                    &canonical,
+                    parts,
+                    full_snippet,
+                )?;
+            }
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.
                 set_attachments_from_list(&tx, account_id, &canonical, list)?;
