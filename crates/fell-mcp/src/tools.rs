@@ -697,6 +697,7 @@ fn edit_draft(session: &Session, args: &Value) -> Result<Value, String> {
                 let old = edit.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = edit.get("new").and_then(Value::as_str).unwrap_or("");
                 last = fell_core::compose::file_fallback_edit(
+                    &session.store,
                     &id,
                     &actor_name(session),
                     session.account_id.as_str(),
@@ -719,6 +720,7 @@ fn replace_draft_body(session: &Session, args: &Value) -> Result<Value, String> 
     match draft_rpc("replace_draft_body", args, Value::Object(extra)) {
         Ok(value) => Ok(value),
         Err(err) if err.contains("not running") => fell_core::compose::file_fallback_replace_body(
+            &session.store,
             &compose_id(args)?,
             &actor_name(session),
             session.account_id.as_str(),

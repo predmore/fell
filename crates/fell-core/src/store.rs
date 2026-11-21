@@ -149,6 +149,8 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_account ON agent_actions(account_id, id);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_actor_time
+ON agent_actions(account_id, actor, created_unix);
 
 CREATE TABLE IF NOT EXISTS agent_action_messages (
     action_id INTEGER NOT NULL,

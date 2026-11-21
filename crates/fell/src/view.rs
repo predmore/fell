@@ -1540,6 +1540,7 @@ impl Inbox {
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
+        self.agents_motion.settle();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }

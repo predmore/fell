@@ -1,12 +1,12 @@
 //! The Agents settings section. The shell decides where to display the card.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use fell_core::{AgentGrant, AgentSummary};
+use fell_core::AgentSummary;
 use gpui::{
     Context, Div, FontWeight, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, rgb,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative, rgb,
 };
 
 use crate::model::Overlay;
@@ -15,11 +15,16 @@ use crate::motion::{self, Motion, Transition};
 use crate::present::{display_safe, relative_date};
 use crate::theme::Theme;
 
-use super::{Inbox, now_unix};
+use super::{FontOpt, Inbox, now_unix};
+
+const ROW_HEIGHT: f32 = 82.;
+const TITLE_HEIGHT: f32 = 48.;
+const FOOTER_HEIGHT: f32 = 70.;
+const NOTICE_TIME: Duration = Duration::from_secs(3);
 
 #[derive(Default, PartialEq, Eq)]
 struct Footer {
-    question: Option<String>,
+    confirmation: Option<(String, String)>,
     notice: Option<(&'static str, bool)>,
     undo: bool,
 }
@@ -27,11 +32,14 @@ struct Footer {
 impl Footer {
     fn of(agents: &Agents) -> Self {
         Self {
-            question: agents.confirm.as_ref().map(|row| {
-                format!(
-                    "Revoke {} on {}?",
-                    display_safe(&row.agent_id),
-                    display_safe(row.account_id.as_str())
+            confirmation: agents.confirm.as_ref().map(|row| {
+                let agent = display_safe(&row.agent_id);
+                let account = agents
+                    .email(row)
+                    .map_or_else(|| "this account".into(), display_safe);
+                (
+                    format!("Revoke {agent}?"),
+                    format!("{account} access ends on its next request."),
                 )
             }),
             notice: agents.notice,
@@ -44,6 +52,8 @@ impl Footer {
 pub(super) struct AgentMotion {
     rows: Arc<Vec<AgentSummary>>,
     switches: Option<(Arc<Vec<AgentSummary>>, Transition)>,
+    selected: Option<usize>,
+    selection: Option<(usize, Transition)>,
     footer: Footer,
     footer_fade: Option<(Footer, Transition)>,
 }
@@ -63,20 +73,37 @@ impl AgentMotion {
             let before = std::mem::replace(&mut self.rows, Arc::clone(&agents.rows));
             self.switches = motion.start(motion::QUICK, now).map(|fade| (before, fade));
         }
+        let selected = (!agents.rows.is_empty()).then_some(agents.selected);
+        if self.selected != selected {
+            let previous = std::mem::replace(&mut self.selected, selected);
+            self.selection = previous.zip(motion.start(motion::FADE, now));
+        }
         let footer = Footer::of(agents);
         if self.footer != footer {
             let before = std::mem::replace(&mut self.footer, footer);
             self.footer_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
         }
-        self.switches = self
-            .switches
-            .take()
-            .filter(|(_, fade)| fade.linear(now) < 1.);
+        self.switches = self.switches.take().filter(|(_, fade)| fade.running(now));
+        self.selection = self.selection.take().filter(|(_, fade)| fade.running(now));
         self.footer_fade = self
             .footer_fade
             .take()
-            .filter(|(_, fade)| fade.linear(now) < 1.);
-        self.switches.is_some() || self.footer_fade.is_some()
+            .filter(|(_, fade)| fade.running(now));
+        self.switches.is_some() || self.selection.is_some() || self.footer_fade.is_some()
+    }
+
+    pub(super) fn settle(&mut self) {
+        self.switches = None;
+        self.selection = None;
+    }
+
+    fn selection_at(&self, index: usize, now: Instant) -> f32 {
+        let selected = self.selected == Some(index);
+        match self.selection {
+            Some((_, fade)) if selected => fade.progress(now),
+            Some((previous, fade)) if previous == index => fade.remaining(now),
+            _ => f32::from(u8::from(selected)),
+        }
     }
 }
 
@@ -103,6 +130,21 @@ impl Inbox {
                 inbox
                     .agents_scroll
                     .scroll_to_item(inbox.session.agents.selected);
+                if matches!(inbox.session.agents.notice, Some((_, false))) {
+                    inbox.dismiss_agent_notice(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dismiss_agent_notice(&self, cx: &mut Context<Self>) {
+        let generation = self.session.agents.notice_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TIME).await;
+            let _ = this.update(cx, |inbox, cx| {
+                inbox.session.agents.clear_notice(generation);
                 cx.notify();
             });
         })
@@ -120,11 +162,18 @@ pub(super) fn card(
 ) -> Div {
     let live = scroll.is_some();
     let now = now_unix();
+    let populated = !agents.rows.is_empty();
+    let list_height = if populated {
+        ROW_HEIGHT * agents.rows.len() as f32 + FOOTER_HEIGHT
+    } else {
+        ROW_HEIGHT
+    };
+    let height = TITLE_HEIGHT + list_height + 2.;
     div()
         .w(px(580.))
         .max_w_full()
         .mx(px(10.))
-        .h(px(344_f32.min(available_height.max(120.))))
+        .h(px(height.min(available_height.max(120.))))
         .bg(rgb(theme.surface))
         .border_1()
         .border_color(rgb(theme.border))
@@ -139,7 +188,7 @@ pub(super) fn card(
         .child(
             div()
                 .flex_none()
-                .h(px(48.))
+                .h(px(TITLE_HEIGHT))
                 .px(px(16.))
                 .flex()
                 .items_center()
@@ -156,16 +205,11 @@ pub(super) fn card(
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .when_some(scroll, |list, scroll| list.track_scroll(scroll))
-                .children(agents.rows.iter().enumerate().map(|(index, row)| {
-                    let previous = frame.and_then(|(motion, now)| {
-                        let (rows, fade) = motion.switches.as_ref()?;
-                        let previous = rows.get(index).filter(|old| {
-                            old.agent_id == row.agent_id && old.account_id == row.account_id
-                        })?;
-                        Some((previous.grant, motion::ease_out_quad(fade.linear(now))))
-                    });
-                    agent_row(theme, agents, row, index, now, live, previous, cx)
-                }))
+                .children(
+                    agents.rows.iter().enumerate().map(|(index, row)| {
+                        agent_row(theme, agents, row, index, now, live, frame, cx)
+                    }),
+                )
                 .when(agents.rows.is_empty(), |list| {
                     list.child(
                         div()
@@ -180,12 +224,21 @@ pub(super) fn card(
                                 "No agents connected"
                             })
                             .when(!agents.pending && agents.notice.is_none(), |hint| {
-                                hint.child(div().pt(px(6.)).child("Connect one with fell mcp add."))
+                                hint.child(
+                                    div()
+                                        .pt(px(6.))
+                                        .text_color(rgb(theme.foreground))
+                                        .font_family_opt(theme.mono_family.clone())
+                                        .text_size(px(theme.mono_px.max(theme.ui_px - 1.)))
+                                        .child("fell mcp add claude-code"),
+                                )
                             }),
                     )
                 }),
         )
-        .child(footer(theme, agents, live, frame, cx))
+        .when(populated, |card| {
+            card.child(footer(theme, agents, live, frame, cx))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,31 +249,30 @@ fn agent_row(
     index: usize,
     now: i64,
     live: bool,
-    previous: Option<(AgentGrant, f32)>,
+    frame: Option<(&AgentMotion, Instant)>,
     cx: &mut Context<Inbox>,
 ) -> Div {
     let selected = agents.selected == index;
-    let bg = if selected {
-        theme.selection
-    } else {
-        theme.surface
-    };
-    let fg = if selected {
-        theme.on_selection
-    } else {
-        theme.foreground
-    };
-    let dim = if selected {
-        theme.on_selection_dim
-    } else {
-        theme.dimmed
-    };
+    let selection = frame.map_or(f32::from(u8::from(selected)), |(motion, now)| {
+        motion.selection_at(index, now)
+    });
+    let bg = motion::mix(theme.surface, theme.selection, selection);
+    let fg = motion::mix(theme.foreground, theme.on_selection, selection);
+    let dim = motion::mix(theme.dimmed, theme.on_selection_dim, selection);
+    let previous = frame.and_then(|(motion, now)| {
+        let (rows, fade) = motion.switches.as_ref()?;
+        let previous = rows
+            .get(index)
+            .filter(|old| old.agent_id == row.agent_id && old.account_id == row.account_id)?;
+        Some((previous.grant, fade.progress(now)))
+    });
     let last_action = row.last_action_unix.map_or_else(
-        || "No recorded actions".into(),
+        || "No actions yet".into(),
         |time| format!("Last action · {}", relative_date(now, time)),
     );
+    let show_account = agents.show_accounts();
     div()
-        .h(px(82.))
+        .h(px(ROW_HEIGHT))
         .px(px(14.))
         .py(px(8.))
         .border_b(px(1.))
@@ -237,7 +289,8 @@ fn agent_row(
                     if inbox.session.overlay == Overlay::Agents
                         && inbox.session.agents.confirm.is_none()
                     {
-                        inbox.session.agents.selected = index;
+                        inbox.agents_motion.settle();
+                        inbox.session.agents.select(index);
                         cx.notify();
                     }
                 }),
@@ -247,50 +300,62 @@ fn agent_row(
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(8.))
                 .child(
                     div()
                         .min_w_0()
-                        .flex_1()
+                        .when_else(
+                            show_account,
+                            |name| name.w(relative(0.30)).flex_none(),
+                            |name| name.flex_1(),
+                        )
                         .truncate()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(display_safe(&row.agent_id)),
                 )
+                .when_some(
+                    show_account.then(|| agents.email(row).unwrap_or("")),
+                    |line, email| {
+                        line.child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(theme.ui_px - 2.))
+                                .text_color(rgb(dim))
+                                .child(display_safe(email)),
+                        )
+                    },
+                )
                 .child(
                     div()
                         .flex_none()
+                        .when(show_account, |time| {
+                            time.w(px(theme.ui_px * 7.5)).text_right().truncate()
+                        })
                         .text_size(px(theme.ui_px - 2.))
                         .text_color(rgb(dim))
                         .child(last_action),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(theme.ui_px - 2.))
-                        .text_color(rgb(dim))
-                        .child(display_safe(row.account_id.as_str())),
-                )
-                .children(Control::ALL.into_iter().map(|control| {
-                    let scope = control.scope(row.grant);
-                    let actionable = scope.is_some() || row.grant.enabled;
-                    let focused = selected
-                        && actionable
-                        && control == agents.control()
-                        && agents.confirm.is_none();
-                    let border = if focused { fg } else { bg };
-                    let label = if actionable {
-                        control.label()
-                    } else {
-                        "Revoked"
-                    };
+        .child(div().flex().items_center().gap(px(8.)).children(
+            Control::ALL.into_iter().filter_map(|control| {
+                let scope = control.scope(row.grant);
+                let actionable = scope.is_some() || row.grant.enabled;
+                if control == Control::Revoke && !selected && actionable {
+                    return None;
+                }
+                let focused = selected
+                    && actionable
+                    && control == agents.control()
+                    && agents.confirm.is_none();
+                let border = if focused { fg } else { bg };
+                let label = if actionable {
+                    control.label()
+                } else {
+                    "Revoked"
+                };
+                Some(
                     div()
                         .flex_none()
                         .h(px(27.))
@@ -304,7 +369,10 @@ fn agent_row(
                         .items_center()
                         .gap(px(4.))
                         .when(control == Control::Revoke, |button| {
-                            button.w(px((theme.ui_px * 4.5).max(67.))).justify_center()
+                            button
+                                .ml_auto()
+                                .w(px((theme.ui_px * 4.5).max(67.)))
+                                .justify_center()
                         })
                         .when(
                             live && actionable && !agents.pending && agents.confirm.is_none(),
@@ -314,6 +382,7 @@ fn agent_row(
                                     cx.listener(move |inbox, _, _, cx| {
                                         cx.stop_propagation();
                                         if inbox.session.overlay == Overlay::Agents {
+                                            inbox.agents_motion.settle();
                                             let request =
                                                 inbox.session.agents.activate(index, control);
                                             inbox.agent_button(request, cx);
@@ -324,8 +393,8 @@ fn agent_row(
                         )
                         .child(label)
                         .when_some(scope, |button, on| {
-                            let track = if on { fg } else { theme.label_outline(bg) };
-                            let to = if on { 1. } else { 0. };
+                            let outline = theme.label_outline(bg);
+                            let to = f32::from(u8::from(on));
                             let offset = previous
                                 .and_then(|(grant, progress)| {
                                     Some((control.scope(grant)?, progress))
@@ -333,6 +402,7 @@ fn agent_row(
                                 .map_or(to, |(was_on, progress)| {
                                     motion::lerp(if was_on { 1. } else { 0. }, to, progress)
                                 });
+                            let track = motion::mix(outline, fg, offset);
                             button.child(
                                 div()
                                     .w(px(18.))
@@ -340,7 +410,7 @@ fn agent_row(
                                     .rounded_full()
                                     .border_1()
                                     .border_color(rgb(track))
-                                    .bg(rgb(if on { track } else { bg }))
+                                    .bg(rgb(motion::mix(bg, fg, offset)))
                                     .p(px(1.))
                                     .flex()
                                     .items_center()
@@ -349,12 +419,13 @@ fn agent_row(
                                             .size(px(5.))
                                             .ml(px(9. * offset))
                                             .rounded_full()
-                                            .bg(rgb(if on { bg } else { track })),
+                                            .bg(rgb(motion::mix(outline, bg, offset))),
                                     ),
                             )
-                        })
-                })),
-        )
+                        }),
+                )
+            }),
+        ))
 }
 
 impl Inbox {
@@ -377,38 +448,49 @@ fn footer(
         let (before, fade) = motion.footer_fade.as_ref()?;
         Some((before, motion::fade_out(fade.linear(now))))
     });
+    let description = agents.control().description();
     div()
         .relative()
         .flex_none()
-        .h(px(48.))
+        .h(px(FOOTER_HEIGHT))
         .border_t(px(1.))
         .border_color(rgb(theme.border))
         .when_some(transition, |line, (before, alpha)| {
-            line.child(footer_content(theme, before, false, cx).opacity(alpha))
+            line.child(footer_content(theme, before, description, false, cx).opacity(alpha))
         })
         .child(
-            footer_content(theme, &Footer::of(agents), live && !agents.pending, cx)
-                .opacity(transition.map_or(1., |(_, alpha)| 1. - alpha)),
+            footer_content(
+                theme,
+                &Footer::of(agents),
+                description,
+                live && !agents.pending,
+                cx,
+            )
+            .opacity(transition.map_or(1., |(_, alpha)| 1. - alpha)),
         )
 }
 
-fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<Inbox>) -> Div {
-    let message = footer
-        .question
-        .as_ref()
-        .map(|question| (question.clone(), true))
-        .or_else(|| footer.notice.map(|(text, alert)| (text.into(), alert)));
-    let buttons: &[(&str, Option<bool>)] = if footer.question.is_some() {
+fn footer_content(
+    theme: &Theme,
+    footer: &Footer,
+    description: &str,
+    live: bool,
+    cx: &mut Context<Inbox>,
+) -> Div {
+    let (text, color) = match (&footer.confirmation, footer.notice) {
+        (Some((prompt, _)), _) => (prompt.clone(), theme.foreground),
+        (None, Some((text, true))) => (text.into(), theme.error),
+        (None, Some((text, false))) => (text.into(), theme.foreground),
+        (None, None) => (description.into(), theme.dimmed),
+    };
+    let buttons: &[(&str, Option<bool>)] = if footer.confirmation.is_some() {
         &[("Cancel", Some(false)), ("Revoke · y", Some(true))]
     } else if footer.undo {
-        &[("Undo revoke · u", None)]
+        &[("Undo revoke", None)]
     } else {
         &[]
     };
-    div()
-        .absolute()
-        .inset_0()
-        .px(px(14.))
+    let line = div()
         .flex()
         .items_center()
         .gap(px(8.))
@@ -417,11 +499,10 @@ fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<I
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .when_some(message, |label, (text, alert)| {
-                    label
-                        .text_color(rgb(if alert { theme.error } else { theme.dimmed }))
-                        .child(text)
-                }),
+                .text_size(px(theme.ui_px - 2.))
+                .line_height(px(theme.ui_px + 1.))
+                .text_color(rgb(color))
+                .child(text),
         )
         .children(buttons.iter().map(|&(label, answer)| {
             let color = if answer == Some(true) {
@@ -454,5 +535,23 @@ fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<I
                         }),
                     )
                 })
-        }))
+        }));
+    div()
+        .absolute()
+        .inset_0()
+        .px(px(14.))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(2.))
+        .child(line)
+        .when_some(footer.confirmation.as_ref(), |content, (_, consequence)| {
+            content.child(
+                div()
+                    .text_size(px(theme.ui_px - 2.))
+                    .line_height(px(theme.ui_px + 1.))
+                    .text_color(rgb(theme.foreground))
+                    .child(consequence.clone()),
+            )
+        })
 }

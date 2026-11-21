@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fell_core::{AgentGrant, AgentSummary, Store};
+use fell_core::{Account, AgentGrant, AgentSummary, Store};
 
 use crate::keymap::{Action, KeyId, PaletteItem, fuzzy};
 
@@ -33,6 +33,15 @@ impl Control {
             Self::Triage => "Toggle agent triage access",
             Self::Draft => "Toggle agent draft access",
             Self::Revoke => "Revoke agent access",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Read => "Read mail and threads.",
+            Self::Triage => "Archive, label, star, snooze, mark read. No deletes.",
+            Self::Draft => "Write drafts for review. Only you can send.",
+            Self::Revoke => "Remove all access to this account.",
         }
     }
 
@@ -91,26 +100,40 @@ pub enum Request {
 }
 
 pub enum Reply {
-    Loaded(Vec<AgentSummary>),
+    Loaded(Roster),
     Changed {
         before: AgentSummary,
         after: AgentSummary,
         kind: ChangeKind,
     },
-    Stale(Vec<AgentSummary>),
+    Stale(Roster),
+}
+
+pub struct Roster {
+    accounts: Vec<Account>,
+    rows: Vec<AgentSummary>,
+}
+
+impl Roster {
+    fn load(store: &Store) -> fell_core::Result<Self> {
+        Ok(Self {
+            accounts: store.list_accounts()?,
+            rows: store.list_agent_grants()?,
+        })
+    }
 }
 
 impl Request {
     pub fn run(self, store: &Store) -> fell_core::Result<Reply> {
         match self {
-            Self::Load => Ok(Reply::Loaded(store.list_agent_grants()?)),
+            Self::Load => Ok(Reply::Loaded(Roster::load(store)?)),
             Self::Change { row, grant, kind } => match store.update_agent_grant(&row, grant)? {
                 Some(after) => Ok(Reply::Changed {
                     before: row,
                     after,
                     kind,
                 }),
-                None => Ok(Reply::Stale(store.list_agent_grants()?)),
+                None => Ok(Reply::Stale(Roster::load(store)?)),
             },
         }
     }
@@ -119,12 +142,14 @@ impl Request {
 #[derive(Clone, Debug, Default)]
 pub struct Agents {
     pub rows: Arc<Vec<AgentSummary>>,
+    accounts: Arc<Vec<Account>>,
     pub selected: usize,
     column: usize,
     pub pending: bool,
     pub confirm: Option<AgentSummary>,
     undo: Option<(AgentSummary, AgentGrant)>,
     pub notice: Option<(&'static str, bool)>,
+    pub notice_generation: u64,
 }
 
 impl Agents {
@@ -133,13 +158,41 @@ impl Agents {
         if self.pending {
             return None;
         }
-        self.notice = None;
+        self.set_notice(None);
         self.pending = true;
         Some(Request::Load)
     }
 
     pub fn control(&self) -> Control {
         Control::ALL[self.column]
+    }
+
+    pub fn show_accounts(&self) -> bool {
+        self.accounts.len() > 1
+    }
+
+    pub fn email(&self, row: &AgentSummary) -> Option<&str> {
+        self.accounts
+            .iter()
+            .find(|account| account.id == row.account_id)
+            .map(|account| account.email.as_str())
+    }
+
+    pub fn select(&mut self, index: usize) {
+        self.selected = index;
+        if self.column >= self.controls() {
+            self.column = 0;
+        }
+    }
+
+    fn controls(&self) -> usize {
+        Control::ALL.len()
+            - usize::from(
+                !self
+                    .rows
+                    .get(self.selected)
+                    .is_some_and(|row| row.grant.enabled),
+            )
     }
 
     pub fn can_undo(&self) -> bool {
@@ -176,14 +229,14 @@ impl Agents {
         }
         match key {
             KeyId::Down | KeyId::Char('j') => {
-                self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
+                self.select((self.selected + 1).min(self.rows.len().saturating_sub(1)));
             }
-            KeyId::Up | KeyId::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyId::Home => self.selected = 0,
-            KeyId::End => self.selected = self.rows.len().saturating_sub(1),
-            KeyId::Tab => self.column = (self.column + 1) % Control::ALL.len(),
+            KeyId::Up | KeyId::Char('k') => self.select(self.selected.saturating_sub(1)),
+            KeyId::Home => self.select(0),
+            KeyId::End => self.select(self.rows.len().saturating_sub(1)),
+            KeyId::Tab => self.column = (self.column + 1) % self.controls(),
             KeyId::Right | KeyId::Char('l') => {
-                self.column = (self.column + 1).min(Control::ALL.len() - 1);
+                self.column = (self.column + 1).min(self.controls() - 1);
             }
             KeyId::Left | KeyId::Char('h') => self.column = self.column.saturating_sub(1),
             KeyId::Enter | KeyId::Space => return self.activate(self.selected, self.control()),
@@ -206,16 +259,17 @@ impl Agents {
             return None;
         }
         let row = self.rows.get(index)?.clone();
-        self.selected = index;
-        self.column = Control::ALL.iter().position(|item| *item == control)?;
-        if control == Control::Revoke {
-            if row.grant.enabled {
-                self.confirm = Some(row);
-                self.notice = None;
-            }
+        if control == Control::Revoke && !row.grant.enabled {
             return None;
         }
+        self.selected = index;
+        self.column = Control::ALL.iter().position(|item| *item == control)?;
         let grant = control.toggle(row.grant);
+        if control == Control::Revoke || !grant.enabled {
+            self.confirm = Some(row);
+            self.set_notice(None);
+            return None;
+        }
         self.change(row, grant, ChangeKind::Scope)
     }
 
@@ -243,7 +297,7 @@ impl Agents {
             return None;
         }
         self.pending = true;
-        self.notice = None;
+        self.set_notice(None);
         Some(Request::Change { row, grant, kind })
     }
 
@@ -253,7 +307,7 @@ impl Agents {
             Reply::Loaded(rows) => self.replace_rows(rows),
             Reply::Stale(rows) => {
                 self.replace_rows(rows);
-                self.notice = Some(("Access changed elsewhere. Review the updated scopes.", true));
+                self.set_notice(Some(("Access changed elsewhere", true)));
             }
             Reply::Changed {
                 before,
@@ -266,12 +320,19 @@ impl Agents {
                 {
                     *row = after.clone();
                 }
-                self.notice = match kind {
+                let notice = match kind {
                     ChangeKind::Scope => {
                         self.validate_undo();
                         None
                     }
                     ChangeKind::Revoke => {
+                        if self
+                            .rows
+                            .get(self.selected)
+                            .is_some_and(|row| same_agent(row, &after))
+                        {
+                            self.column = 0;
+                        }
                         self.undo = Some((after, before.grant));
                         Some(("Access revoked", false))
                     }
@@ -280,20 +341,34 @@ impl Agents {
                         Some(("Access restored", false))
                     }
                 };
+                self.set_notice(notice);
             }
         }
     }
 
     pub fn fail(&mut self, message: &'static str) {
         self.pending = false;
-        self.notice = Some((message, true));
+        self.set_notice(Some((message, true)));
     }
 
-    fn replace_rows(&mut self, rows: Vec<AgentSummary>) {
-        self.selected = (self.rows.get(self.selected))
+    pub fn clear_notice(&mut self, generation: u64) {
+        if self.notice_generation == generation {
+            self.set_notice(None);
+        }
+    }
+
+    fn set_notice(&mut self, notice: Option<(&'static str, bool)>) {
+        self.notice_generation = self.notice_generation.wrapping_add(1);
+        self.notice = notice;
+    }
+
+    fn replace_rows(&mut self, Roster { accounts, rows }: Roster) {
+        let selected = (self.rows.get(self.selected))
             .and_then(|prior| rows.iter().position(|row| same_agent(row, prior)))
             .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
+        self.accounts = Arc::new(accounts);
         self.rows = Arc::new(rows);
+        self.select(selected);
         self.validate_undo();
     }
 
@@ -380,11 +455,48 @@ mod tests {
         let step = session.on_key(KeyId::Char('y'), 10);
         apply(&mut session, &store, step);
         assert_eq!(read_grant(), AgentGrant::DISABLED);
+        assert_eq!(session.agents.selected, 0);
+        assert_eq!(session.agents.control(), Control::Read);
         assert!(session.agents.can_undo());
         let step = session.on_key(KeyId::Char('u'), 10);
         apply(&mut session, &store, step);
         assert_eq!(read_grant(), changed);
         assert!(!session.agents.can_undo());
+    }
+
+    #[test]
+    fn last_scope_needs_confirmation_and_uses_the_same_undo() {
+        let (store, row, mut session) = setup();
+        let grant = AgentGrant::enabled(true, false, false);
+        store
+            .set_agent_grant(&row.account_id, &row.agent_id, grant)
+            .unwrap();
+        let read_grant = || store.agent_grant(&row.account_id, &row.agent_id).unwrap();
+        let step = session.perform(Action::Agents, 10);
+        apply(&mut session, &store, step);
+
+        assert!(session.on_key(KeyId::Space, 10).agents.is_none());
+        assert!(session.agents.confirm.is_some());
+        assert_eq!(read_grant(), grant);
+        session.on_key(KeyId::Escape, 10);
+        assert!(session.agents.confirm.is_none());
+        assert_eq!(read_grant(), grant);
+
+        session.on_key(KeyId::Space, 10);
+        let step = session.on_key(KeyId::Char('y'), 10);
+        apply(&mut session, &store, step);
+        assert_eq!(read_grant(), AgentGrant::DISABLED);
+        assert_eq!(session.agents.control(), Control::Read);
+        let step = session.on_key(KeyId::Char('u'), 10);
+        apply(&mut session, &store, step);
+        assert_eq!(read_grant(), grant);
+
+        session.on_key(KeyId::Char('x'), 10);
+        let step = session.on_key(KeyId::Char('y'), 10);
+        apply(&mut session, &store, step);
+        let step = session.on_key(KeyId::Space, 10);
+        apply(&mut session, &store, step);
+        assert_eq!(read_grant(), grant);
     }
 
     #[test]

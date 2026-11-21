@@ -80,7 +80,7 @@ impl Harness {
     /// Fell may edit it.
     ///
     /// - Codex: `~/.codex/config.toml` (`$CODEX_HOME`), `[mcp_servers.NAME]`.
-    /// - Gemini CLI: `~/.gemini/settings.json` (`$GEMINI_CLI_HOME`), `mcpServers`.
+    /// - Gemini CLI: `~/.gemini/settings.json` (`GEMINI_CLI_HOME` overrides `~`), `mcpServers`.
     /// - OpenCode: `$OPENCODE_CONFIG_DIR/opencode.json`, else
     ///   `~/.config/opencode/opencode.json`, `mcp.servers` (a server under
     ///   `mcp.servers` wins over one of the same name directly under `mcp`,
