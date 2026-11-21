@@ -162,7 +162,7 @@ pub(crate) fn clip_column(inset: f32, width: f32, right: f32, child: gpui::Div) 
         .child(child.w(px(width)))
 }
 
-fn layered(
+pub(crate) fn layered(
     width: f32,
     layers: [AnyElement; 2],
     alpha: [f32; 2],

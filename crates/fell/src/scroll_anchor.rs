@@ -14,6 +14,8 @@ pub(super) struct ScrollAnchor {
     /// For an automatic or pending preview, align to a complete header
     /// when the selected message is too close to the end to align itself.
     pub snap_headers: bool,
+    /// Ease from the offset the placeholder was drawn at while its card grows.
+    pub body_scroll: Option<(Pixels, f32)>,
 }
 
 /// An explicit message jump owns its landing even if it starts with a
@@ -33,6 +35,10 @@ impl ReaderLanding {
     pub fn hold_opening(&mut self, id: Option<&str>) {
         self.hold(id);
         self.snap_headers = true;
+    }
+
+    pub fn stop_snapping(&mut self) -> bool {
+        std::mem::take(&mut self.snap_headers)
     }
 
     pub fn anchor(
@@ -55,6 +61,7 @@ impl ScrollAnchor {
             index: session.message_cursor,
             y: px(0.),
             snap_headers: reveal == Reveal::Waiting && session.cursor_awaits_body(),
+            body_scroll: None,
         }
     }
 
@@ -93,6 +100,7 @@ impl ScrollAnchor {
                     index: index - first_message,
                     y,
                     snap_headers: false,
+                    body_scroll: None,
                 })
         })
     }
@@ -104,7 +112,12 @@ impl ScrollAnchor {
         first_message: usize,
     ) -> Option<Self> {
         let item = scroll.bounds_for_item(first_message + index)?;
-        visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y, snap_headers: false })
+        visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self {
+            index,
+            y,
+            snap_headers: false,
+            body_scroll: None,
+        })
     }
 }
 
@@ -292,6 +305,7 @@ impl MessageProbes {
             scroll,
             y: Some(self.anchor.y),
             glide: self.glide,
+            body_scroll: self.anchor.body_scroll,
             frames,
         }
     }
@@ -311,6 +325,7 @@ pub(super) struct LandingHold {
     /// with the smallest scroll that brings its bounds into view.
     pub y: Option<Pixels>,
     pub glide: Option<LandingGlide>,
+    body_scroll: Option<(Pixels, f32)>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
 }
@@ -337,6 +352,7 @@ impl LandingHold {
             scroll,
             y: None,
             glide: None,
+            body_scroll: None,
             frames,
         }
     }
@@ -395,6 +411,8 @@ impl gpui::Element for LandingHold {
                         .filter_map(|probe| Some(window.layout_bounds(probe.get()?)))
                         .collect();
                     let target = offset_to_header(bounds, item, y, &headers, self.bottom_padding);
+                    let target = self.body_scroll
+                        .map_or(target, |(from, progress)| from + (target - from) * progress);
                     self.glide.map_or(target, |glide| {
                         let moving =
                             motion::lerp(f32::from(glide.from), f32::from(target), glide.progress);
@@ -573,6 +591,7 @@ mod tests {
             index: 2,
             y: px(0.),
             snap_headers: false,
+            body_scroll: None,
         };
         assert!(landing.anchor(Some("last"), target, true).is_none());
         let anchor = landing.anchor(Some("last"), target, false).unwrap();

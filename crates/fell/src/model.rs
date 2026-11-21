@@ -83,7 +83,36 @@ impl SyncFailure {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DownloadStatus {
+    pub prefix: String,
+    pub done: String,
+    pub total: String,
+    pub suffix: String,
+}
+
 impl SyncKind {
+    pub(crate) fn download_status(&self) -> Option<DownloadStatus> {
+        let Self::Syncing {
+            progress: Some(progress),
+            new_messages,
+        } = self
+        else {
+            return None;
+        };
+        let total = grouped(progress.total);
+        let suffix = match new_messages {
+            Some(count) if *count > 0 => format!(" done · {count} new"),
+            _ => " done".into(),
+        };
+        Some(DownloadStatus {
+            prefix: format!("Downloading {total} messages · "),
+            done: grouped(progress.done),
+            total,
+            suffix,
+        })
+    }
+
     pub fn status(&self) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -99,27 +128,13 @@ impl SyncKind {
             Self::FirstSync => "no account".into(),
             Self::StoreError => "mailbox error".into(),
             Self::Connecting => "connecting…".into(),
-            Self::Syncing {
-                progress,
-                new_messages,
-            } => {
-                let mut status = progress.as_ref().map_or_else(
-                    || "syncing".into(),
-                    |progress| {
-                        format!(
-                            "Downloading {} messages · {} done",
-                            grouped(progress.total),
-                            grouped(progress.done)
-                        )
-                    },
-                );
-                if let Some(count) = new_messages.filter(|count| *count > 0) {
-                    status.push_str(&format!(" · {count} new"));
-                } else if progress.is_none() {
-                    status.push('…');
-                }
-                status
-            }
+            Self::Syncing { new_messages, .. } => match self.download_status() {
+                Some(status) => format!("{}{}{}", status.prefix, status.done, status.suffix),
+                None => match new_messages {
+                    Some(count) if *count > 0 => format!("syncing · {count} new"),
+                    _ => "syncing…".into(),
+                },
+            },
             Self::Synced {
                 at, new_messages, ..
             } => {

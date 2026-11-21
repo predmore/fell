@@ -47,7 +47,7 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
+    Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
     QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
 };
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
@@ -218,7 +218,9 @@ pub(crate) fn finish_onboarding(
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.first_preview = FirstPreview::Handoff;
         inbox.first_sync = true;
+        inbox.waiting_for_first_rows = true;
         let now = inbox.motion.clock.now();
+        inbox.motion.observe_header(&inbox.list_folder, None, None, now);
         inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
             .map(|swap| (setup, swap));
         inbox
@@ -611,8 +613,8 @@ struct Inbox {
     setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
     first_preview: FirstPreview,
     first_sync: bool,
-    status_label: Option<StatusLabel>,
-    status_exit: Option<(StatusLabel, Transition)>,
+    waiting_for_first_rows: bool,
+    status_labels: StatusLabels,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     // Keep the extra scroll range on the first preview thread after input,
@@ -640,6 +642,7 @@ struct Inbox {
     reveal: Reveal,
     /// Latest body-only read, applied together with its scroll correction.
     body_refresh: BodyRefresh,
+    body_landing: Option<(gpui::Pixels, Transition)>,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
     painted_reader: Option<ReaderLayout>,
@@ -839,8 +842,8 @@ impl Inbox {
             setup_exit: None,
             first_preview: FirstPreview::Off,
             first_sync: false,
-            status_label: None,
-            status_exit: None,
+            waiting_for_first_rows: false,
+            status_labels: StatusLabels::default(),
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -866,6 +869,7 @@ impl Inbox {
             open_subject: String::new(),
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
+            body_landing: None,
             conv_layout_current: false,
             painted_reader: None,
             sent_arrival_anchor: None,
@@ -1606,6 +1610,7 @@ impl Inbox {
         for row in &rows {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
         }
+        self.waiting_for_first_rows &= rows.is_empty();
         self.session.set_page(rows, more_before, more_after, unread);
         if intent.first_sync && !switched {
             self.motion.set_unread(&self.list_folder, unread);
@@ -4072,11 +4077,19 @@ impl Inbox {
             let height = if padded_last == Some(index) {
                 self.preview_card_height.get()
             } else {
-                scroll.bounds_for_item(index)?.size.height
+                scroll.bounds_for_item(index + usize::from(self.conv_note_slot))?.size.height
             };
             (height > px(0.)).then(|| f32::from(height))
         };
         refresh.apply(&mut self.session, &mut self.motion, now, height);
+        let opened = !self.session.cursor_awaits_body() && self.landing.stop_snapping();
+        if (opened || self.reveal.pending())
+            && self.motion.body_growth_running(now)
+            && let Some(slide) = self.motion.motion.start(motion::FADE, now)
+        {
+            self.body_landing = Some((clamped_offset(&self.conv_scroll), slide));
+            self.reveal.cancel_pending();
+        }
         if rich_arrived && self.session.reveal_matching_quote(selected) {
             self.land_on_reader();
         }
@@ -4133,6 +4146,7 @@ impl Inbox {
 
     /// Hold the reader's message using each frame's own layout bounds.
     fn land_on_reader(&mut self) {
+        self.body_landing = None;
         self.landing.hold(
             self.session
                 .messages
@@ -4178,7 +4192,22 @@ impl Inbox {
 
     /// The reader took over: stop holding their message in place.
     fn release_landing(&mut self) {
+        self.body_landing = None;
         self.landing.hold(None);
+    }
+
+    fn growing_body_landing(&mut self, now: Instant) -> Option<ScrollAnchor> {
+        let (from, slide) = self.body_landing?;
+        let moving = slide.running(now) && self.motion.body_growth_running(now);
+        if !moving {
+            self.body_landing = None;
+        }
+        let mut anchor = ScrollAnchor::landing(&self.session, self.reveal);
+        anchor.snap_headers = false;
+        if moving {
+            anchor.body_scroll = Some((from, motion::ease_out_quad(slide.linear(now))));
+        }
+        Some(anchor)
     }
 
     /// Message navigation aligns the selected header using laid-out bounds.
@@ -4488,10 +4517,11 @@ impl Render for Inbox {
         } else {
             reveal_attachment
         };
+        let unread = (!self.waiting_for_first_rows).then(|| self.session.unread_threads());
         self.motion.observe_header(
             &self.list_folder,
             self.list_label.as_deref(),
-            self.session.unread_threads(),
+            unread,
             now,
         );
         let banner = self
@@ -4593,6 +4623,9 @@ impl Render for Inbox {
         let band = pin.map_or(px(0.), |pin| pin.height);
         let band_delta = band - self.note_band;
         self.note_band = band;
+        if let Some((from, _)) = &mut self.body_landing {
+            *from -= band_delta;
+        }
         let verify_pin = panes.1 && !self.conv_layout_current && self.note_pin.matches(pinnable);
         if band_delta != px(0.)
             && (band_delta < px(0.) || !scrolling_to_target || self.motion.conv_glide.is_some())
@@ -4609,7 +4642,7 @@ impl Render for Inbox {
         let arrival_anchor = self
             .note_pin
             .arrival_anchor(target_band, band, selected, now);
-        if arrival_anchor.is_some() || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
+        if (arrival_anchor.is_some() && self.body_landing.is_none()) || agent_note.as_ref().is_some_and(|frame| frame.leaving) {
             self.release_landing();
         }
         let returning = self.note_return(now);
@@ -4623,7 +4656,7 @@ impl Render for Inbox {
             }
             None
         } else {
-            arrival_anchor.or_else(|| self.hold_landing()).or(first_preview_layout).or_else(|| {
+            self.growing_body_landing(now).or(arrival_anchor).or_else(|| self.hold_landing()).or(first_preview_layout).or_else(|| {
                 anchor.or(note_anchor).map(|mut anchor| {
                     anchor.y -= band_delta;
                     anchor
@@ -4689,7 +4722,8 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        let (label, label_exit) = self.status_label(reply_check, width, now);
+        let status = StatusLabel::new(&self.theme, &self.session, reply_check, width);
+        let status_labels = self.status_labels.update(status, self.motion.motion, now);
         let animating = self.motion.tick(now)
             | waiting_for_resize
             | self.note_view.running()
@@ -4700,7 +4734,7 @@ impl Render for Inbox {
                 .is_some_and(|visit| visit.returning.is_some())
             | verify_pin
             | setup_frame.is_some()
-            | label_exit.is_some()
+            | status_labels.outgoing.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4816,7 +4850,7 @@ impl Render for Inbox {
                     leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
                 },
-                status_labels: (label, label_exit),
+                status_labels,
             },
             width,
             (list_width, split_width),
@@ -4897,7 +4931,7 @@ struct Shown {
     reader: ReaderLayout,
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
-    status_labels: (StatusLabel, Option<(StatusLabel, f32)>),
+    status_labels: StatusLabelsFrame,
 }
 
 struct LeavingReader {
@@ -5669,12 +5703,12 @@ fn header(
             .child(format!("{unread} unread"))
     };
     let folder_group =
-        |(folder, label): (&str, Option<&str>), unread, count_fade: Option<(usize, f32)>| {
+        |(folder, label): (&str, Option<&str>), unread: Option<usize>, count_fade: Option<(Option<usize>, f32)>| {
             let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
-            let count_room = count_fade.map_or_else(
-                || count_width(unread),
-                |(old, shown)| motion::lerp(count_width(old), count_width(unread), shown),
-            );
+            let (old, shown) = count_fade.unwrap_or((None, 1.));
+            let count_room = count_width(888)
+                .max(unread.map_or(0., count_width))
+                .max(old.map_or(0., count_width));
             let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
             let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
             let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
@@ -5741,8 +5775,8 @@ fn header(
                             .flex()
                             .justify_end()
                             .w(px(count_room))
-                            .child(count(unread).opacity(count_fade.map_or(1., |(_, shown)| shown)))
-                            .children(count_fade.map(|(old, shown)| {
+                            .children(unread.map(|unread| count(unread).opacity(shown)))
+                            .children(old.map(|old| {
                                 count(old).absolute().right_0().top_0().opacity(1. - shown)
                             })),
                     )
@@ -5751,7 +5785,7 @@ fn header(
         };
 
     let (current, current_width) =
-        folder_group(scope, session.unread_threads(), motion.unread_count(now));
+        folder_group(scope, motion.header_unread(), motion.unread_count(now));
     let label_header_opacity = motion.label_header_opacity(now);
     let fade = motion.folder_header();
     let leaving = fade
@@ -8802,14 +8836,34 @@ fn recipient_lines(
         .into_any_element()
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusPhase {
+    Sync(std::mem::Discriminant<SyncKind>),
+    Download,
+    Reply(ReplyCheck),
+}
+
+#[derive(Clone)]
 struct StatusLabel {
+    phase: StatusPhase,
     text: String,
+    download: Option<DownloadStatus>,
     color: u32,
 }
 
 impl StatusLabel {
     fn new(theme: &Theme, session: &Session, reply_check: Option<ReplyCheck>, width: f32) -> Self {
+        let download = reply_check
+            .is_none()
+            .then(|| session.sync.download_status())
+            .flatten();
+        let phase = if let Some(check) = reply_check {
+            StatusPhase::Reply(check)
+        } else if download.is_some() {
+            StatusPhase::Download
+        } else {
+            StatusPhase::Sync(std::mem::discriminant(&session.sync))
+        };
         let (text, color) = match reply_check {
             Some(ReplyCheck::Waiting) => ("Reply-To unverified".into(), theme.dimmed),
             Some(ReplyCheck::Checking) => ("Checking Reply-To…".into(), theme.dimmed),
@@ -8830,7 +8884,11 @@ impl StatusLabel {
                 theme.accent,
             ),
             None => (
-                session.sync.status(),
+                if download.is_some() {
+                    String::new()
+                } else {
+                    session.sync.status()
+                },
                 if session.sync.is_error() {
                     theme.error
                 } else {
@@ -8838,43 +8896,161 @@ impl StatusLabel {
                 },
             ),
         };
-        Self { text, color }
+        Self {
+            phase,
+            text,
+            download,
+            color,
+        }
     }
 
-    fn draw(self) -> gpui::Div {
-        div()
+    fn draw(
+        &self,
+        theme: &Theme,
+        size: f32,
+        window: &Window,
+        fading_count: Option<(String, f32)>,
+    ) -> (gpui::Div, f32) {
+        let ui = theme.ui_family.as_ref();
+        let label = div()
+            .flex_none()
             .whitespace_nowrap()
-            .text_color(rgb(self.color))
-            .child(self.text)
+            .text_size(px(size))
+            .text_color(rgb(self.color));
+        let Some(DownloadStatus {
+            prefix,
+            done,
+            total,
+            suffix,
+        }) = &self.download
+        else {
+            let width = bar_px(window, &self.text, size, ui).ceil();
+            return (label.child(self.text.clone()), width);
+        };
+        let mono = theme
+            .mono_family
+            .clone()
+            .unwrap_or_else(|| "monospace".into());
+        let figure_width = |text| bar_px(window, text, size, Some(&mono)).ceil();
+        let mut count_room = figure_width(total).max(figure_width(done));
+        if let Some((old, _)) = &fading_count {
+            count_room = count_room.max(figure_width(old));
+        }
+        let width = bar_px(window, prefix, size, ui).ceil()
+            + count_room
+            + bar_px(window, suffix, size, ui).ceil();
+        let shown = fading_count.as_ref().map_or(1.0, |(_, progress)| *progress);
+        let label = label
+            .flex()
+            .items_baseline()
+            .child(div().flex_none().child(prefix.clone()))
+            .child(
+                div()
+                    .relative()
+                    .w(px(count_room))
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .font_family(mono)
+                    .child(div().opacity(shown).child(done.clone()))
+                    .children(fading_count.map(|(old, progress)| {
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .opacity(1.0 - progress)
+                            .child(old)
+                    })),
+            )
+            .child(div().flex_none().child(suffix.clone()));
+        (label, width)
     }
 }
 
-impl Inbox {
-    fn status_label(
-        &mut self,
-        reply_check: Option<ReplyCheck>,
-        width: f32,
-        now: Instant,
-    ) -> (StatusLabel, Option<(StatusLabel, f32)>) {
-        let next = StatusLabel::new(&self.theme, &self.session, reply_check, width);
-        if self.status_label.as_ref() != Some(&next) {
-            let old = self.status_label.replace(next.clone());
-            // When progress advances twice inside a fade, depart from the
-            // label with the greater opacity on the last frame.
-            let old = match self.status_exit.take() {
-                Some((leaving, fade)) if fade.progress(now) < 0.5 => Some(leaving),
-                _ => old,
-            };
-            self.status_exit = old.zip(self.motion.motion.start(motion::FADE, now));
+#[derive(Default)]
+struct StatusLabels {
+    current: Option<StatusLabel>,
+    outgoing: Option<(StatusLabel, Transition)>,
+    last_count_update: Option<Instant>,
+}
+
+struct StatusLabelsFrame {
+    current: StatusLabel,
+    outgoing: Option<(StatusLabel, f32)>,
+}
+
+impl StatusLabels {
+    fn update(&mut self, next: StatusLabel, motion: Motion, now: Instant) -> StatusLabelsFrame {
+        let old = self.current.replace(next.clone());
+        if self
+            .outgoing
+            .as_ref()
+            .is_some_and(|(_, fade)| !fade.running(now))
+        {
+            self.outgoing = None;
         }
-        let outgoing = self.status_exit.as_ref().and_then(|(prior, fade)| {
-            fade.running(now)
-                .then(|| (prior.clone(), fade.progress(now)))
-        });
-        if outgoing.is_none() {
-            self.status_exit = None;
+        if let Some(old) = old {
+            if old.phase != next.phase {
+                self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
+                self.last_count_update = None;
+            } else if let (Some(old_download), Some(next_download)) =
+                (&old.download, &next.download)
+                && old_download.done != next_download.done
+            {
+                // A burst keeps updating the incoming count on the original
+                // clock. After it settles, keep following the burst directly.
+                let quiet = self
+                    .last_count_update
+                    .replace(now)
+                    .is_none_or(|last| now.duration_since(last) >= motion::FADE);
+                if quiet && self.outgoing.is_none() {
+                    self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
+                }
+            }
         }
-        (next, outgoing)
+        StatusLabelsFrame {
+            current: next,
+            outgoing: self
+                .outgoing
+                .as_ref()
+                .map(|(prior, fade)| (prior.clone(), fade.linear(now))),
+        }
+    }
+}
+
+impl StatusLabelsFrame {
+    fn fading_count(&self) -> Option<(&str, f32)> {
+        let (old, elapsed) = self.outgoing.as_ref()?;
+        let download = old.download.as_ref()?;
+        (old.phase == self.current.phase)
+            .then_some((download.done.as_str(), motion::ease_out(*elapsed)))
+    }
+
+    fn draw(&self, theme: &Theme, size: f32, window: &Window) -> (gpui::Div, f32) {
+        if let Some((old, shown)) = self.fading_count() {
+            let old = old.to_owned();
+            return self.current.draw(theme, size, window, Some((old, shown)));
+        }
+        let Some((old, elapsed)) = &self.outgoing else {
+            return self.current.draw(theme, size, window, None);
+        };
+
+        // Keep both measures while the phase changes. Only a brief, dim
+        // overlap passes through the middle of the fade.
+        let (current, width) = self.current.draw(theme, size, window, None);
+        let (old, old_width) = old.draw(theme, size, window, None);
+        let width = width.max(old_width);
+        let incoming = motion::ease_out((*elapsed - 0.45) / 0.55);
+        let outgoing = motion::fade_out(*elapsed / 0.6);
+        (
+            div()
+                .flex_none()
+                .relative()
+                .w(px(width))
+                .child(current.opacity(incoming))
+                .child(old.absolute().top_0().left_0().opacity(outgoing)),
+            width,
+        )
     }
 }
 
@@ -8885,7 +9061,7 @@ fn status_bar(
     theme: &Theme,
     session: &Session,
     status: StatusMotion,
-    (label, outgoing): (StatusLabel, Option<(StatusLabel, f32)>),
+    labels: StatusLabelsFrame,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
@@ -8914,33 +9090,46 @@ fn status_bar(
     let ui = theme.ui_family.as_ref();
     let mono = theme.mono_family.as_ref();
     let hint_opacity = status.hints;
+    let (padding, gap) = if width < 420. { (8., 6.) } else { (14., 12.) };
+    let mode_width = bar_px(window, session.mode_label(), size, mono);
+    let dot_width = bar_px(window, "·", size, ui);
     let outage = session.worker_outage();
-    let sync_hint =
-        outage.map(|_| keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog));
     let details = outage.is_none() && session.detail_text().is_some();
+    let details_width = if details {
+        gap + bar_px(window, "· ? details", size, ui)
+    } else {
+        0.
+    };
+    let sync_room = width - 2. * padding - 2. * gap - mode_width - dot_width - details_width;
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
-    let sync_width = if let Some(worker) = outage {
-        bar_px(window, worker.outage_notice(), size, ui)
-    } else {
-        let sync_width = bar_px(window, &label.text, size, ui);
-        outgoing.as_ref().map_or(sync_width, |(old, progress)| {
-            motion::lerp(bar_px(window, &old.text, size, ui), sync_width, *progress)
-        })
-    };
-    let dot = bar_px(window, "·", size, ui);
-    let mut used = 28.0 + 2.0 * 12.0 + 2.0;
-    used += bar_px(window, session.mode_label(), size, mono) + dot;
-    if !narrow {
-        used += 2.0 * 12.0 + dot + sync_width;
-        if let Some(key) = &sync_hint {
-            used += bar_px(window, &format!(" · {key} for log"), size, ui);
+    let draw_sync = |size| {
+        if let Some(worker) = outage {
+            let key = keymap::binding_text(&session.keymap, Action::OpenDiagnosticLog);
+            let text = worker.outage_notice();
+            let width = bar_px(window, &format!("{text} · {key} for log"), size, ui);
+            let label = div()
+                .text_size(px(size))
+                .whitespace_nowrap()
+                .text_color(rgb(theme.error))
+                .child(status_text(text.to_owned(), Some((&key, " for log")), theme));
+            (label, width)
+        } else {
+            labels.draw(theme, size, window)
         }
-    }
-    if details {
-        used += 12.0 + bar_px(window, "· ? details", size, ui);
-    }
+    };
+    let (label, sync_width) = draw_sync(size);
+    // The count slot is measured for every digit of the total. Tight
+    // windows give the full label room even when both numbers are long.
+    let (label, sync_width) = if sync_width > sync_room {
+        let fitted_size = (size * (sync_room - 3.).max(0.) / sync_width).max(1.);
+        draw_sync(fitted_size)
+    } else {
+        (label, sync_width)
+    };
+    let shared_width = 2. * padding + 2. * gap + mode_width + dot_width + details_width;
+    let used = shared_width + if narrow { 0. } else { sync_width + 2. * gap + dot_width };
     let scale = window.scale_factor();
     let notice_text = |toast: &Toast, opacity: f32, dy: f32| {
         let hint = toast
@@ -8971,28 +9160,8 @@ fn status_bar(
             })
             .child(status_text(text, hint, theme))
     };
-    let draw_sync = || {
-        if let Some(worker) = outage {
-            div()
-                .text_color(rgb(theme.error))
-                .opacity(status.sync_opacity)
-                .child(status_text(
-                    worker.outage_notice().to_string(),
-                    sync_hint.as_deref().map(|key| (key, " for log")),
-                    theme,
-                ))
-        } else {
-            match &outgoing {
-                Some((old, progress)) => div()
-                    .relative()
-                    .w(px(sync_width))
-                    .overflow_hidden()
-                    .child(label.clone().draw().opacity(*progress))
-                    .child(old.clone().draw().absolute().inset_0().opacity(1.0 - progress)),
-                None => label.clone().draw().opacity(status.sync_opacity),
-            }
-        }
-    };
+    let label = label.opacity(status.sync_opacity);
+    let (wide_sync, narrow_sync) = if narrow { (None, Some(label)) } else { (Some(label), None) };
     let (notice_dy, leaving_dy) = (status.notice_dy, status.leaving_dy);
     let hints = (!count.is_empty() || !hint.is_empty()).then(|| {
         div()
@@ -9018,11 +9187,11 @@ fn status_bar(
     div()
         .relative()
         .h(px(30.))
-        .px(px(14.))
+        .px(px(padding))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.))
+        .gap(px(gap))
         .border_t(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
@@ -9039,7 +9208,7 @@ fn status_bar(
         )
         .when(!narrow, |bar| {
             bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
-                .child(draw_sync().flex_none())
+                .child(wide_sync.unwrap().flex_none())
         })
         .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
@@ -9075,7 +9244,7 @@ fn status_bar(
                             .flex()
                             .items_center()
                             .opacity(status.sync)
-                            .child(draw_sync().min_w_0().truncate()),
+                            .child(narrow_sync.unwrap().min_w_0().truncate()),
                     )
                 })
                 .when_some(text, |cell, (toast, opacity, dy)| {
@@ -9091,7 +9260,7 @@ fn status_bar(
                     .absolute()
                     .top(px(0.))
                     .bottom(px(0.))
-                    .right(px(14.))
+                    .right(px(padding))
                     .flex()
                     .items_center()
                     .child(hints),
@@ -10215,6 +10384,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_second_of_frame_rate_download_ticks_keeps_the_latest_count_visible() {
+        use super::{Motion, StatusLabel, StatusLabels, StatusPhase};
+
+        let mut labels = StatusLabels::default();
+        let start = Instant::now();
+        let next = |done| StatusLabel {
+            phase: StatusPhase::Download,
+            text: String::new(),
+            download: SyncKind::Syncing {
+                new_messages: None,
+                progress: Some(fell_core::SyncProgress {
+                    folder: "Inbox".into(),
+                    total: 85,
+                    done,
+                }),
+            }
+            .download_status(),
+            color: 0,
+        };
+        for count in 0..=60 {
+            let now = start + Duration::from_secs_f64(f64::from(count) / 60.);
+            let frame = labels.update(next(count), Motion::new(true), now);
+            let current = &frame.current.download.as_ref().unwrap().done;
+            let fading = frame.fading_count();
+            let dominant = match fading {
+                Some((old, shown)) if shown < 0.5 => old,
+                _ => current,
+            };
+            assert_eq!(current, &count.to_string());
+            if count >= 3 {
+                assert_eq!(dominant, current, "frame {count}");
+            }
+            if count >= 9 {
+                assert!(fading.is_none(), "a busy stream never restarts the fade");
+            }
+        }
+        let next_burst = start + Duration::from_secs(2);
+        let frame = labels.update(next(61), Motion::new(true), next_burst);
+        assert_eq!(frame.fading_count(), Some(("60", 0.)));
+    }
+
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
         Keystroke {
             modifiers: Modifiers {
@@ -10486,6 +10697,7 @@ mod tests {
                                     index: case.heights.len() - 1,
                                     y: px(0.),
                                     snap_headers: case.pending,
+                                    body_scroll: None,
                                 },
                                 false,
                             )

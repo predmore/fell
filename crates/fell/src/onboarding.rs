@@ -39,6 +39,7 @@ enum Control {
     Next,
     Back,
     Inline,
+    ConnectionStep,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -253,6 +254,7 @@ impl Onboarding {
     fn activate(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
         let before = self.form.step;
         match control {
+            Control::ConnectionStep => {}
             Control::Provider(provider) => {
                 self.form.choose(provider);
                 self.change_step(before, Control::Field(Field::Email), cx);
@@ -346,7 +348,7 @@ impl Onboarding {
         if before != Step::Connection {
             self.feedback.begin_check(&self.form);
         }
-        self.change_step(before, Control::Back, cx);
+        self.change_step(before, Control::ConnectionStep, cx);
         let attempt = self.form.attempt;
         let (progress, mut events) = mpsc::unbounded();
         let work = cx.background_executor().spawn(async move {
@@ -440,16 +442,25 @@ impl Onboarding {
         match key.key.as_str() {
             "tab" => {
                 let controls = self.controls();
-                let current = controls
-                    .iter()
-                    .position(|control| *control == self.control)
-                    .unwrap_or(0);
                 let offset = if key.modifiers.shift {
                     controls.len() - 1
                 } else {
                     1
                 };
-                self.select(controls[(current + offset) % controls.len()]);
+                let index = controls
+                    .iter()
+                    .position(|control| *control == self.control)
+                    .map_or_else(
+                        || {
+                            if key.modifiers.shift {
+                                controls.len() - 1
+                            } else {
+                                0
+                            }
+                        },
+                        |current| (current + offset) % controls.len(),
+                    );
+                self.select(controls[index]);
                 cx.notify();
             }
             "escape" => self.back(cx),

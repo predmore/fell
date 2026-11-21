@@ -7,6 +7,7 @@ use gpui::{
 };
 
 use crate::motion::{self, ARRIVE_FROM, SwapFrame};
+use crate::view::disclosure::layered;
 
 use super::form::{Check, Issue};
 use super::{Bridge, Control, Field, Onboarding, Provider, Service, Step};
@@ -17,6 +18,11 @@ use feedback::{Actions, Connection, SaveState};
 
 type Footer = Option<AnyElement>;
 
+const STEP_WIDTH: f32 = 520.;
+const STEP_HEIGHT: f32 = 520.;
+const CHOICE_PADDING: f32 = 16.;
+const CHOICE_GAP: f32 = 12.;
+const CHOICE_ARROW: f32 = 16.;
 const SAVE_WIDTH: f32 = 164.;
 const PORT_WIDTH: f32 = 62.;
 const SECURITY_WIDTH: f32 = 116.;
@@ -116,6 +122,7 @@ impl Onboarding {
         let narrow = window.viewport_size().width < px(540.);
         let compact_footer = window.viewport_size().width < px(400.);
         let side = if narrow { 20. } else { 44. };
+        let measure = (f32::from(window.viewport_size().width) - 2. * side).clamp(1., STEP_WIDTH);
         let top = (f32::from(window.viewport_size().height) * 0.08).clamp(23., 68.);
         div()
             .text_color(rgb(theme.foreground))
@@ -126,7 +133,7 @@ impl Onboarding {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(520.))
+                    .max_w(px(STEP_WIDTH))
                     .mx_auto()
                     .child(self.progress())
                     .child(
@@ -135,18 +142,28 @@ impl Onboarding {
                             .w_full()
                             .when_some(old_layer, |el, (step, opacity)| {
                                 el.child(
-                                    self.step_layer(step, false, compact_footer, 1., cx)
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .opacity(opacity),
+                                    self.step_layer(
+                                        step,
+                                        false,
+                                        (measure, compact_footer),
+                                        (1., 0.),
+                                        cx,
+                                    )
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .opacity(opacity),
                                 )
                             })
                             .child(
-                                self.step_layer(self.form.step, live, compact_footer, pulse, cx)
-                                    .relative()
-                                    .top(px(dy))
-                                    .opacity(arrival),
+                                self.step_layer(
+                                    self.form.step,
+                                    live,
+                                    (measure, compact_footer),
+                                    (pulse, dy),
+                                    cx,
+                                )
+                                .opacity(arrival),
                             ),
                     ),
             )
@@ -156,8 +173,8 @@ impl Onboarding {
         &self,
         step: Step,
         live: bool,
-        narrow: bool,
-        pulse: f32,
+        measure: (f32, bool),
+        (pulse, dy): (f32, f32),
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         // Each painted step owns an ID scope, including the inert copy.
@@ -165,7 +182,7 @@ impl Onboarding {
         div()
             .id(("setup-step", step as usize))
             .w_full()
-            .child(self.step(step, live, narrow, pulse, cx))
+            .child(self.step(step, live, measure, (pulse, dy), cx))
     }
 
     fn progress(&self) -> Div {
@@ -193,7 +210,14 @@ impl Onboarding {
             })))
     }
 
-    fn step(&self, step: Step, live: bool, narrow: bool, pulse: f32, cx: &Context<Self>) -> Div {
+    fn step(
+        &self,
+        step: Step,
+        live: bool,
+        (measure, narrow): (f32, bool),
+        (pulse, dy): (f32, f32),
+        cx: &Context<Self>,
+    ) -> Div {
         let column = || div().flex().flex_col().gap_2();
         let (title, detail, content, footer): (&str, &str, Div, [Footer; 3]) = match step {
             Step::Provider => (
@@ -205,6 +229,7 @@ impl Onboarding {
                         "Proton Mail Bridge",
                         "Connect through the Bridge app on this computer.",
                         live,
+                        Some(measure),
                         cx,
                     ))
                     .child(self.choice(
@@ -212,6 +237,7 @@ impl Onboarding {
                         "Other IMAP account",
                         "Choose a preset or enter your server settings.",
                         live,
+                        None,
                         cx,
                     )),
                 [None, None, None],
@@ -233,6 +259,7 @@ impl Onboarding {
                                 provider.name(),
                                 desc,
                                 live,
+                                None,
                                 cx,
                             )
                         },
@@ -376,9 +403,15 @@ impl Onboarding {
         div()
             .flex()
             .flex_col()
-            .min_h(px(482.))
-            .child(heading.mb_5())
-            .child(div().flex_1().child(content))
+            .min_h(px(STEP_HEIGHT + 18. * (self.theme.ui_px - 14.).max(0.)))
+            .child(
+                div()
+                    .relative()
+                    .top(px(dy))
+                    .flex_1()
+                    .child(heading.mb_5())
+                    .child(content),
+            )
             .child(footer)
     }
 
@@ -402,6 +435,7 @@ impl Onboarding {
                     .items_center()
                     .gap_2()
                     .mt_3()
+                    .min_h(px(self.theme.ui_px + 18.))
                     .children(back)
                     .child(div().flex_1())
                     .children(secondary)
@@ -522,6 +556,7 @@ impl Onboarding {
         title: &'static str,
         detail: &'static str,
         live: bool,
+        bridge_measure: Option<f32>,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let focused = live && self.control == control;
@@ -530,8 +565,8 @@ impl Onboarding {
             .flex()
             .justify_between()
             .items_center()
-            .gap(px(12.))
-            .px(px(16.))
+            .gap(px(CHOICE_GAP))
+            .px(px(CHOICE_PADDING))
             .py_2p5()
             .border_1()
             .rounded_lg()
@@ -553,25 +588,17 @@ impl Onboarding {
                     .gap_0p5()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(self.meta(detail))
-                    .when(control == Control::Provider(Provider::Bridge), |el| {
-                        let status = self
-                            .feedback
-                            .bridge
-                            .paint(live, |bridge, live| self.bridge_status(*bridge, live, cx));
-                        // Keep the height of the wrapped offline hint even
-                        // when the listener comes up at narrow widths.
-                        el.child(
-                            div()
-                                .relative()
-                                .mt_1()
-                                .child(self.bridge_status(Bridge::Offline, false, cx).opacity(0.))
-                                .child(status.absolute().inset_0()),
-                        )
+                    .when_some(bridge_measure, |el, measure| {
+                        let width =
+                            measure - 2. * (CHOICE_PADDING + 1.) - CHOICE_GAP - CHOICE_ARROW;
+                        el.child(self.bridge_feedback(width.max(1.), live, cx))
                     }),
             )
             .child(
                 div()
                     .flex_none()
+                    .w(px(CHOICE_ARROW))
+                    .text_right()
                     .text_color(rgb(if focused {
                         self.theme.accent
                     } else {
@@ -579,6 +606,37 @@ impl Onboarding {
                     }))
                     .child("›"),
             )
+    }
+
+    fn bridge_feedback(&self, width: f32, live: bool, cx: &Context<Self>) -> Div {
+        let bridge = &self.feedback.bridge;
+        let Some(height) = self.feedback.bridge_resize else {
+            return bridge
+                .paint(live, |status, live| self.bridge_status(*status, live, cx))
+                .mt_1();
+        };
+        let (&shown, active, opacity) = bridge.visible(live);
+        let offline = shown == Bridge::Offline;
+        let online = if offline { bridge.value } else { shown };
+        let online = if online == Bridge::Offline {
+            Bridge::Listening
+        } else {
+            online
+        };
+        let layers = [
+            self.bridge_status(online, active && !offline, cx)
+                .into_any_element(),
+            self.bridge_status(Bridge::Offline, active && offline, cx)
+                .into_any_element(),
+        ];
+        let alpha = if offline {
+            [0., opacity]
+        } else {
+            [opacity, 0.]
+        };
+        div()
+            .mt_1()
+            .child(layered(width, layers, alpha, height, [true; 2]))
     }
 
     fn bridge_status(&self, bridge: Bridge, live: bool, cx: &Context<Self>) -> Div {

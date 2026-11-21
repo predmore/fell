@@ -238,14 +238,19 @@ impl<T: PartialEq> Change<T> {
         self.frame.is_some()
     }
 
-    pub fn paint(&self, live: bool, draw: impl Fn(&T, bool) -> Div) -> Div {
+    pub fn visible(&self, live: bool) -> (&T, bool, f32) {
         match (&self.frame, &self.swap) {
             (Some(SwapFrame::Leaving(opacity)), Some((old, _, from))) => {
-                draw(old, false).opacity(opacity * from)
+                (old, false, opacity * from)
             }
-            (Some(SwapFrame::Arriving(progress)), _) => draw(&self.value, live).opacity(*progress),
-            _ => draw(&self.value, live),
+            (Some(SwapFrame::Arriving(progress)), _) => (&self.value, live, *progress),
+            _ => (&self.value, live, 1.),
         }
+    }
+
+    pub fn paint(&self, live: bool, draw: impl Fn(&T, bool) -> Div) -> Div {
+        let (value, live, opacity) = self.visible(live);
+        draw(value, live).opacity(opacity)
     }
 }
 
@@ -283,6 +288,8 @@ impl<T: PartialEq> Change<Option<T>> {
 #[derive(Default)]
 pub(in crate::onboarding) struct Feedback {
     pub(super) bridge: Change<Bridge>,
+    bridge_height: Option<(f32, Transition)>,
+    pub(super) bridge_resize: Option<f32>,
     pub(super) connection: Change<Connection>,
     pub(super) checks: [Change<Check>; 2],
     pub(super) bridge_offline: [Change<bool>; 2],
@@ -302,6 +309,8 @@ pub(in crate::onboarding) struct Feedback {
 impl Feedback {
     pub fn settle(&mut self) {
         self.bridge.settle();
+        self.bridge_height = None;
+        self.bridge_resize = None;
         self.connection.settle();
         for action in self
             .connection_actions
@@ -390,7 +399,21 @@ impl Feedback {
     }
 
     pub fn refresh(&mut self, form: &Form, bridge: Bridge, motion: Motion, now: Instant) -> bool {
-        self.bridge.replace(bridge, motion, now);
+        let offline = |status| if status == Bridge::Offline { 1. } else { 0. };
+        if offline(bridge) != offline(self.bridge.value) {
+            let from = self
+                .bridge_height
+                .map_or(offline(self.bridge.value), |(from, height)| {
+                    motion::lerp(from, offline(self.bridge.value), height.progress(now))
+                });
+            self.bridge_height = motion.start(motion::FADE, now).map(|height| (from, height));
+        }
+        self.bridge
+            .update(bridge, motion, now, motion::FADE, motion::FADE);
+        self.bridge_height = self.bridge_height.filter(|(_, height)| height.running(now));
+        self.bridge_resize = self
+            .bridge_height
+            .map(|(from, height)| motion::lerp(from, offline(bridge), height.progress(now)));
         if form.step == Step::Connection {
             let state = if form.connected() {
                 Connection::Verified
@@ -471,6 +494,7 @@ impl Feedback {
         }
 
         let mut active = self.bridge.tick(now)
+            | self.bridge_resize.is_some()
             | self.connection.tick(now)
             | self.save_title.tick(now)
             | self.save_subtitle.tick(now)
