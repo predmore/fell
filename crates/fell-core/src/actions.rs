@@ -36,7 +36,7 @@ use crate::folders::FolderRole;
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::keywords::{self, LabelEdit, LabelHistory};
-use crate::store::{Store, ThreadSummary};
+use crate::store::{Store, ThreadSummary, views};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
@@ -287,21 +287,27 @@ impl Store {
         let from_folder = canonical_folder(from_folder)?;
         let roles = self.folder_roles(account_id)?;
         let archive = roles.archive_name().to_string();
-        if from_folder.eq_ignore_ascii_case(&archive) {
+        if from_folder.eq_ignore_ascii_case(&archive) && !roles.is_view(&from_folder) {
             return Err(Error::Action(format!(
                 "archive moves messages into {}",
                 roles.label(&archive)
             )));
         }
-        let server = Some((from_folder.as_str(), archive.as_str(), &roles));
-        self.apply_thread(account_id, thread_id, ActionKind::Archive, server, |rows| {
-            let plans = plan_relocate(rows, &from_folder, &archive);
-            if plans.is_empty() {
-                return Err(Error::Action(format!("no messages in {from_folder}")));
-            }
-            let summary = format!("archived {} from {from_folder}", plans.len());
-            Ok((summary, plans))
-        })
+        let server = Some((archive.as_str(), &roles));
+        self.apply_thread(
+            account_id,
+            thread_id,
+            ActionKind::Archive,
+            server,
+            |tx, rows| {
+                let plans = plan_relocate(tx, account_id, rows, &from_folder, &archive, &roles)?;
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {from_folder}")));
+                }
+                let summary = format!("archived {} from {from_folder}", plans.len());
+                Ok((summary, plans))
+            },
+        )
     }
 
     /// Move `from_folder` to `to_folder` on messages in the thread that have it.
@@ -321,15 +327,21 @@ impl Store {
             return Err(Error::Action("move needs a different folder".into()));
         }
         let roles = self.folder_roles(account_id)?;
-        let server = Some((from_folder.as_str(), to_folder.as_str(), &roles));
-        self.apply_thread(account_id, thread_id, ActionKind::Move, server, |rows| {
-            let plans = plan_relocate(rows, &from_folder, &to_folder);
-            if plans.is_empty() {
-                return Err(Error::Action(format!("no messages in {from_folder}")));
-            }
-            let summary = format!("moved {} from {from_folder} to {to_folder}", plans.len());
-            Ok((summary, plans))
-        })
+        let server = Some((to_folder.as_str(), &roles));
+        self.apply_thread(
+            account_id,
+            thread_id,
+            ActionKind::Move,
+            server,
+            |tx, rows| {
+                let plans = plan_relocate(tx, account_id, rows, &from_folder, &to_folder, &roles)?;
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {from_folder}")));
+                }
+                let summary = format!("moved {} from {from_folder} to {to_folder}", plans.len());
+                Ok((summary, plans))
+            },
+        )
     }
 
     /// Add or remove `change` on every message in the thread that needs it.
@@ -347,7 +359,7 @@ impl Store {
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_thread(account_id, thread_id, ActionKind::Label, None, |rows| {
+        self.apply_thread(account_id, thread_id, ActionKind::Label, None, |_, rows| {
             let plans = plan_label(rows, adding, &label);
             if plans.is_empty() {
                 let message = if adding {
@@ -388,7 +400,7 @@ impl Store {
             std::slice::from_ref(thread_id),
             ActionKind::Delete,
             None,
-            |rows| {
+            |_, rows| {
                 let plans = plan_expunge(rows, &from_folder);
                 if plans.is_empty() {
                     return Err(Error::Action(format!("no messages in {from_folder}")));
@@ -418,15 +430,21 @@ impl Store {
             return Err(Error::Action("already in Trash".into()));
         }
         let trash = roles.name(FolderRole::Trash).to_string();
-        let server = Some((from_folder.as_str(), trash.as_str(), &roles));
-        self.apply_threads(account_id, threads, ActionKind::Delete, server, |rows| {
-            let plans = plan_relocate(rows, &from_folder, &trash);
-            if plans.is_empty() {
-                return Err(Error::Action(format!("no messages in {from_folder}")));
-            }
-            let summary = format!("deleted {} from {from_folder}", plans.len());
-            Ok((summary, plans))
-        })
+        let server = Some((trash.as_str(), &roles));
+        self.apply_threads(
+            account_id,
+            threads,
+            ActionKind::Delete,
+            server,
+            |tx, rows| {
+                let plans = plan_relocate(tx, account_id, rows, &from_folder, &trash, &roles)?;
+                if plans.is_empty() {
+                    return Err(Error::Action(format!("no messages in {from_folder}")));
+                }
+                let summary = format!("deleted {} from {from_folder}", plans.len());
+                Ok((summary, plans))
+            },
+        )
     }
 
     /// `!`: move `from_folder` to the account's Junk folder on the messages
@@ -449,9 +467,9 @@ impl Store {
         } else {
             (ActionKind::Spam, roles.name(FolderRole::Junk).to_string())
         };
-        let server = Some((from_folder.as_str(), to.as_str(), &roles));
-        self.apply_threads(account_id, threads, kind, server, |rows| {
-            let plans = plan_relocate(rows, &from_folder, &to);
+        let server = Some((to.as_str(), &roles));
+        self.apply_threads(account_id, threads, kind, server, |tx, rows| {
+            let plans = plan_relocate(tx, account_id, rows, &from_folder, &to, &roles)?;
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
             }
@@ -507,14 +525,21 @@ impl Store {
                 (true, false) => FolderRole::Junk,
                 (false, _) => FolderRole::Trash,
             });
-            let planned = plan_relocate(&load_thread(&tx, account, thread)?, &from, to);
+            if roles.is_view(to) {
+                return Err(Error::Action(format!("{} is a view", roles.label(to))));
+            }
+            let planned = plan_relocate(
+                &tx,
+                account,
+                &load_thread(&tx, account, thread)?,
+                &from,
+                to,
+                &roles,
+            )?;
             if planned.is_empty() {
                 return Err(Error::Action(format!("no messages in {from}")));
             }
-            routes
-                .entry((from, to))
-                .or_default()
-                .extend(planned.iter().map(|plan| plan.before.message_id.clone()));
+            add_routes(&mut routes, to, &planned);
             plans.extend(planned);
         }
         if plans.is_empty() {
@@ -527,9 +552,7 @@ impl Store {
         };
         let summary = format!("{verb} {} messages", plans.len());
         let action = record_and_apply(&tx, account, kind, &summary, &plans)?;
-        for ((from, to), ids) in routes {
-            crate::outbox::queue_moves(&tx, account, action.id, &ids, &from, to, &roles)?;
-        }
+        queue_routes(&tx, account, &action, routes, &roles)?;
         tx.commit()?;
         Ok(action)
     }
@@ -556,7 +579,7 @@ impl Store {
                 "permanent delete only removes mail from Trash".into(),
             ));
         }
-        self.apply_threads(account_id, threads, ActionKind::Purge, None, |rows| {
+        self.apply_threads(account_id, threads, ActionKind::Purge, None, |_, rows| {
             let plans = plan_expunge(rows, &trash_folder);
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {trash_folder}")));
@@ -767,8 +790,8 @@ impl Store {
         account_id: &AccountId,
         thread_id: &ThreadId,
         kind: ActionKind,
-        server: Option<(&str, &str, &crate::folders::FolderRoles)>,
-        plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
+        server: Option<(&str, &crate::folders::FolderRoles)>,
+        plans_for: impl FnOnce(&Connection, &[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
         self.apply_threads(
             account_id,
@@ -787,8 +810,8 @@ impl Store {
         account_id: &AccountId,
         threads: &[ThreadId],
         kind: ActionKind,
-        server: Option<(&str, &str, &crate::folders::FolderRoles)>,
-        plans_for: impl FnOnce(&[SavedRow]) -> Result<(String, Vec<Planned>)>,
+        server: Option<(&str, &crate::folders::FolderRoles)>,
+        plans_for: impl FnOnce(&Connection, &[SavedRow]) -> Result<(String, Vec<Planned>)>,
     ) -> Result<LocalAction> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
@@ -803,17 +826,21 @@ impl Store {
         if rows.is_empty() {
             return Err(Error::Action("no such thread".into()));
         }
-        let (summary, plans) = plans_for(&rows)?;
+        if let Some((to, roles)) = server
+            && roles.is_view(to)
+            && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
+        {
+            return Err(Error::Action(format!("{} is a view", roles.label(to))));
+        }
+        let (summary, plans) = plans_for(&tx, &rows)?;
         if plans.is_empty() {
             return Err(Error::Action("nothing to change".into()));
         }
         let action = record_and_apply(&tx, account_id, kind, &summary, &plans)?;
-        if let Some((from, to, roles)) = server {
-            let moved: Vec<String> = plans
-                .iter()
-                .map(|plan| plan.before.message_id.clone())
-                .collect();
-            crate::outbox::queue_moves(&tx, account_id, action.id, &moved, from, to, roles)?;
+        if let Some((to, roles)) = server {
+            let mut routes = BTreeMap::new();
+            add_routes(&mut routes, to, &plans);
+            queue_routes(&tx, account_id, &action, routes, roles)?;
         }
         tx.commit()?;
         Ok(action)
@@ -1330,10 +1357,40 @@ fn expect_one(changed: usize, message_id: &str) -> Result<()> {
     }
 }
 
-fn plan_relocate(rows: &[SavedRow], from: &str, to: &str) -> Vec<Planned> {
+fn plan_relocate(
+    conn: &Connection,
+    account: &AccountId,
+    rows: &[SavedRow],
+    from: &str,
+    to: &str,
+    roles: &crate::folders::FolderRoles,
+) -> Result<Vec<Planned>> {
+    let from_view = roles.is_view(from);
     let mut plans = Vec::new();
     for row in rows {
-        let Some(next) = relocate(&split_tokens(&row.folders), from, to) else {
+        let folders = split_tokens(&row.folders);
+        let source = if from_view {
+            if !views::in_scope(conn, account, &row.message_id, from)? {
+                continue;
+            }
+            // Prefer the received copy so a separate sent reply or copy stays put.
+            let Some(folder) = folders
+                .iter()
+                .filter(|f| !roles.is_view(f))
+                .min_by_key(|f| match roles.role_of(f) {
+                    Some(FolderRole::Inbox) => 0,
+                    None => 1,
+                    Some(FolderRole::Archive) => 2,
+                    _ => 3,
+                })
+            else {
+                continue;
+            };
+            folder
+        } else {
+            from
+        };
+        let Some(next) = relocate(&folders, source, to) else {
             continue;
         };
         plans.push(Planned {
@@ -1343,7 +1400,35 @@ fn plan_relocate(rows: &[SavedRow], from: &str, to: &str) -> Vec<Planned> {
             remove_row: false,
         });
     }
-    plans
+    Ok(plans)
+}
+
+fn add_routes<'a>(
+    routes: &mut BTreeMap<(String, &'a str), Vec<String>>,
+    to: &'a str,
+    plans: &[Planned],
+) {
+    for plan in plans {
+        for from in removed_folders(plan) {
+            routes
+                .entry((from, to))
+                .or_default()
+                .push(plan.before.message_id.clone());
+        }
+    }
+}
+
+fn queue_routes(
+    conn: &Connection,
+    account: &AccountId,
+    action: &LocalAction,
+    routes: BTreeMap<(String, &str), Vec<String>>,
+    roles: &crate::folders::FolderRoles,
+) -> Result<()> {
+    for ((from, to), ids) in routes {
+        crate::outbox::queue_moves(conn, account, action.id, &ids, &from, to, roles)?;
+    }
+    Ok(())
 }
 
 fn plan_expunge(rows: &[SavedRow], folder: &str) -> Vec<Planned> {
@@ -1828,7 +1913,7 @@ pub(crate) fn message_for_delta(conn: &Connection, message: &Message) -> Result<
     Ok(Some(updated))
 }
 
-fn tombstoned_folders(
+pub(crate) fn tombstoned_folders(
     conn: &Connection,
     account_id: &AccountId,
     message_id: &str,

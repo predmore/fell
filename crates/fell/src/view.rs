@@ -2006,7 +2006,7 @@ impl Inbox {
         let account = self.account_id.clone();
         let thread = ThreadId(id.clone());
         let key = self.selected_key();
-        if self.session.search.is_none() {
+        if self.session.search.is_none() && !self.session.roles.is_view(&folder) {
             self.take_out_of_list(std::slice::from_ref(&id), cx);
         }
         self.change_mailbox(
@@ -2056,7 +2056,7 @@ impl Inbox {
         };
         let to = destination.clone();
         let key = self.selected_key();
-        if self.session.search.is_none() {
+        if self.session.search.is_none() && !self.session.roles.is_view(&from) {
             self.take_out_of_list(std::slice::from_ref(&id), cx);
         }
         self.change_mailbox(
@@ -2147,7 +2147,9 @@ impl Inbox {
         let threads: Vec<ThreadId> = ids.iter().cloned().map(ThreadId).collect();
         self.session.picked.clear();
         self.session.visual = false;
-        self.take_out_of_list(&ids, cx);
+        if !roles.is_view(&folder) {
+            self.take_out_of_list(&ids, cx);
+        }
         self.change_mailbox(
             move |store| {
                 match removal {
@@ -3358,6 +3360,8 @@ impl Render for Inbox {
         self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
         self.motion
+            .observe_header(&self.list_folder, self.session.unread_threads(), now);
+        self.motion
             .fit_card(card_fit(&self.session, &self.theme, window), now);
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
@@ -3706,14 +3710,7 @@ fn shell(
         })
         .child(match &session.search {
             Some(search) => search::header(&theme, search, width, window, cx),
-            None => header(
-                &theme,
-                session,
-                &folder,
-                motion.unread_count(now),
-                width,
-                window,
-            ),
+            None => header(&theme, session, &folder, motion, now, width, window),
         })
         .child(
             div()
@@ -3820,22 +3817,26 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
         .opacity(entry.opacity)
 }
 
-/// The header. `count_fade` is the unread count being replaced and how far
-/// the new one has faded in over it.
 fn header(
     theme: &Theme,
     session: &Session,
     folder: &str,
-    count_fade: Option<(usize, f32)>,
+    motion: &InboxMotion,
+    now: Instant,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
     const PAD: f32 = 16.;
-    const GAP: f32 = 14.;
+    const FOLDER_GAP: f32 = 24.;
+    const COUNT_GAP: f32 = 14.;
+    const ACCOUNT_MIN: f32 = 88.;
 
-    let unread = session.unread_threads();
-    let drafts = session.roles.is(FolderRole::Drafts, folder);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
+    let room = (width - 2. * PAD - FOLDER_GAP).max(0.);
+    let fit = |text: &str, room: f32, weight| {
+        clip_shaped(window, &style, text, room.floor(), weight, None)
+            .filter(|line| f32::from(line.width).ceil() <= room)
+    };
     let count_width = |unread| {
         line_px_with_style(
             window,
@@ -3845,32 +3846,6 @@ fn header(
         )
         .ceil()
     };
-    let count_room = count_fade.map_or_else(
-        || count_width(unread),
-        |(old, shown)| motion::lerp(count_width(old), count_width(unread), shown),
-    );
-    let name_room = (width - 2. * PAD - GAP - if drafts { 0. } else { GAP + count_room }).max(0.);
-    // Let a long folder use at most half the space available to the two names.
-    let (folder_labels, folder_used) = header_labels(
-        window,
-        &style,
-        theme,
-        &session.roles.label(folder),
-        session.folder_detail(folder).as_deref(),
-        name_room * 0.5,
-        6.,
-    );
-    let email =
-        (session.account_email != session.account_name).then_some(session.account_email.as_str());
-    let (account_labels, _) = header_labels(
-        window,
-        &style,
-        theme,
-        &session.account_name,
-        email,
-        name_room - folder_used,
-        GAP,
-    );
     let count = |unread: usize| {
         div()
             .flex_none()
@@ -3882,13 +3857,120 @@ fn header(
             }))
             .child(format!("{unread} unread"))
     };
+    let folder_group = |folder: &str, unread, count_fade: Option<(usize, f32)>| {
+        let drafts = session.roles.is(FolderRole::Drafts, folder);
+        let count_room = count_fade.map_or_else(
+            || count_width(unread),
+            |(old, shown)| motion::lerp(count_width(old), count_width(unread), shown),
+        );
+        let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
+        let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
+        let label = session.roles.label(folder);
+        let mut name = fit(&label, name_room, FontWeight::SEMIBOLD);
+        if name.as_ref().is_none_or(|line| line.text != label)
+            && let Some((first, rest)) = label.split_once('/')
+        {
+            let leaf = rest.rsplit('/').next().unwrap_or(rest);
+            let prefix = format!("{first}/…/");
+            let shortened = format!("{prefix}{leaf}");
+            let leaf_only = format!("…/{leaf}");
+            name = fit(&shortened, name_room, FontWeight::SEMIBOLD)
+                .filter(|line| {
+                    line.text
+                        .strip_prefix(&prefix)
+                        .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
+                })
+                .or_else(|| fit(&leaf_only, name_room, FontWeight::SEMIBOLD));
+        }
+        let name_width = name
+            .as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil());
+        let detail = session
+            .folder_detail(folder)
+            .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
+        let detail_space = detail
+            .as_ref()
+            .map_or(0., |line| 6. + f32::from(line.width).ceil());
+        let group = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(COUNT_GAP))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .children(name.map(|line| {
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(line.text)
+                    }))
+                    .children(detail.map(|line| {
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme.dimmed))
+                            .child(line.text)
+                    })),
+            )
+            .when(!drafts, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .relative()
+                        .flex()
+                        .justify_end()
+                        .w(px(count_room))
+                        .child(count(unread).opacity(count_fade.map_or(1., |(_, shown)| shown)))
+                        .children(count_fade.map(|(old, shown)| {
+                            count(old).absolute().right_0().top_0().opacity(1. - shown)
+                        })),
+                )
+            });
+        (group, name_width + detail_space + count_space)
+    };
+
+    let (current, current_width) =
+        folder_group(folder, session.unread_threads(), motion.unread_count(now));
+    let leaving = motion.folder_header(now).map(|(old, unread, shown)| {
+        let (group, width) = folder_group(old, unread, None);
+        (group, width, shown)
+    });
+    let group_width = leaving
+        .as_ref()
+        .map_or(current_width, |(_, old_width, shown)| {
+            motion::lerp(current_width.max(*old_width), current_width, *shown)
+        });
+
+    let account_room = room - group_width;
+    let account = session.account_name.trim();
+    let email = session.account_email.as_str();
+    let (account, detail) = if account.is_empty() || account.eq_ignore_ascii_case(email) {
+        (email, None)
+    } else {
+        (account, (!email.is_empty()).then_some(email))
+    };
+    let full = fit(account, account_room, FontWeight::SEMIBOLD).filter(|line| line.text == account);
+    let quiet = full.is_none();
+    let account = full.or_else(|| fit(account, account_room, FontWeight::NORMAL));
+    let detail = account.as_ref().and_then(|line| {
+        fit(
+            detail?,
+            account_room - f32::from(line.width).ceil() - COUNT_GAP,
+            FontWeight::NORMAL,
+        )
+    });
+
     div()
         .h(px(44.))
         .px(px(PAD))
         .flex()
-        .flex_row()
         .items_center()
-        .gap(px(GAP))
+        .gap(px(FOLDER_GAP))
         .border_b(px(1.))
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
@@ -3897,79 +3979,45 @@ fn header(
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
-                .child(account_labels),
+                .flex()
+                .items_baseline()
+                .gap(px(COUNT_GAP))
+                .children(account.map(|line| {
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .when(quiet, |label| label.text_color(rgb(theme.dimmed)))
+                        .when(!quiet, |label| label.font_weight(FontWeight::SEMIBOLD))
+                        .child(line.text)
+                }))
+                .children(detail.map(|line| {
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme.dimmed))
+                        .child(line.text)
+                })),
         )
-        .child(folder_labels)
-        // Drafts are not mail to read: no count there.
-        .when(!drafts, |row| {
-            row.child(match count_fade {
-                // Right-aligned on each other, so the number changes in
-                // place, in a box that eases from one width to the other so
-                // the folder name beside it moves rather than jumps.
-                Some((old, shown)) => div()
-                    .flex_none()
-                    .relative()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .w(px(count_room))
-                    .child(count(unread).opacity(shown))
-                    .child(
-                        count(old)
-                            .absolute()
-                            .top(px(0.))
-                            .right(px(0.))
-                            .opacity(1.0 - shown),
+        .child(
+            div()
+                .flex_none()
+                .w(px(group_width))
+                .relative()
+                .flex()
+                .justify_end()
+                .child(
+                    current.opacity(
+                        leaving
+                            .as_ref()
+                            .map_or(1., |(_, _, shown)| motion::lerp(0.4, 1., *shown)),
                     ),
-                None => div().flex_none().w(px(count_room)).child(count(unread)),
-            })
-        })
-}
-
-/// Fit the name first and use the rest of its group for the secondary label.
-fn header_labels(
-    window: &Window,
-    style: &TextStyle,
-    theme: &Theme,
-    name: &str,
-    detail: Option<&str>,
-    room: f32,
-    gap: f32,
-) -> (gpui::Div, f32) {
-    let fit = |text: &str, room: f32, weight| {
-        clip_shaped(window, style, text, room, weight, None)
-            .filter(|line| f32::from(line.width).ceil() <= room)
-    };
-    let name = fit(name, room.floor(), FontWeight::SEMIBOLD);
-    let name_width = name
-        .as_ref()
-        .map_or(0., |line| f32::from(line.width).ceil());
-    let detail = detail.and_then(|text| fit(text, room - name_width - gap, FontWeight::NORMAL));
-    let used = name_width
-        + detail
-            .as_ref()
-            .map_or(0., |line| gap + f32::from(line.width).ceil());
-    let labels = div()
-        .flex_none()
-        .flex()
-        .items_baseline()
-        .gap(px(gap))
-        .w(px(used))
-        .children(name.map(|line| {
-            div()
-                .flex_none()
-                .whitespace_nowrap()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(line.text)
-        }))
-        .children(detail.map(|line| {
-            div()
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(theme.dimmed))
-                .child(line.text)
-        }));
-    (labels, used)
+                )
+                .children(
+                    leaving.map(|(old, _, shown)| {
+                        old.absolute().right_0().top_0().opacity(1. - shown)
+                    }),
+                ),
+        )
 }
 
 fn thread_list(
@@ -4546,7 +4594,7 @@ fn label_chip(
     let outline = match (warn, selected) {
         (true, _) => theme.error,
         (false, true) => theme::mix(theme.selection, dim, 0.35),
-        (false, false) => theme.border,
+        (false, false) => theme::mix(theme.background, dim, 0.5),
     };
     div()
         .flex_none()
@@ -6396,6 +6444,7 @@ const PALETTE_ROW_PAD: f32 = 10.0;
 const ABOUT_ROW_PAD_Y: f32 = 7.0;
 const ABOUT_ROW_GAP: f32 = 2.0;
 const PICKER_ROW_PX: f32 = 34.0;
+const PICKER_GROUP_GAP: f32 = 8.0;
 /// Where the palette, folder picker and help card sit below the window's top.
 const CARD_TOP_PX: f32 = 72.0;
 
@@ -6411,10 +6460,17 @@ fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
             });
             (rows_px.sum(), PALETTE_MAX_PX)
         }
-        Overlay::Folders => (
-            session.folder_choices().len() as f32 * PICKER_ROW_PX,
-            PICKER_MAX_PX,
-        ),
+        Overlay::Folders => {
+            let choices = session.folder_choices();
+            let dividers = choices
+                .windows(2)
+                .filter(|pair| separates_folder_views(session, &pair[0], &pair[1]))
+                .count();
+            (
+                choices.len() as f32 * PICKER_ROW_PX + dividers as f32 * (PICKER_GROUP_GAP + 1.),
+                PICKER_MAX_PX,
+            )
+        }
         _ => return None,
     };
     Some(present::card_height(
@@ -6664,6 +6720,16 @@ fn about(theme: &Theme, cx: &mut Context<Inbox>) -> gpui::Div {
         )
 }
 
+fn separates_folder_views(session: &Session, first: &str, second: &str) -> bool {
+    let view = |folder| {
+        matches!(
+            session.roles.role_of(folder),
+            Some(FolderRole::All | FolderRole::Flagged)
+        )
+    };
+    view(first) != view(second)
+}
+
 fn folder_picker(
     theme: &Theme,
     session: &Session,
@@ -6733,7 +6799,7 @@ fn folder_picker(
                     } else {
                         theme.dimmed
                     };
-                    div()
+                    let row = div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(PICKER_ROW_PX))
                         .mx(px(4.))
@@ -6778,7 +6844,22 @@ fn folder_picker(
                                 .text_ellipsis()
                                 .text_color(rgb(detail_color))
                                 .child(name)
-                        }))
+                        }));
+                    let divider =
+                        index > 0 && separates_folder_views(session, &choices[index - 1], &name);
+                    div()
+                        .flex_none()
+                        .when(divider, |group| {
+                            group.child(
+                                div()
+                                    .mx(px(14.))
+                                    .h(px(PICKER_GROUP_GAP + 1.))
+                                    .flex()
+                                    .items_center()
+                                    .child(div().w_full().h(px(1.)).bg(rgb(theme.border))),
+                            )
+                        })
+                        .child(row)
                 })),
         )
 }

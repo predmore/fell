@@ -25,6 +25,7 @@ pub(crate) use reply_to::fetch_reply_to;
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
     CidReferences, attachment_names, has_attachment, is_bidi_control, parts_from_raw,
@@ -691,14 +692,12 @@ fn catch_up(
         }
         let raw_len = item.body.len();
         pending_flags.extend(arrival_flags(uidvalidity, &escaped, &item, mode));
-        batch.push(rfc822::to_message(
+        batch.push(rfc822::fetched_message(
             account_id,
-            &mailbox.raw,
-            &mailbox.decoded,
+            mailbox,
             uidvalidity,
-            item.uid,
-            &item.flags,
-            &item.body,
+            &item,
+            !mode.keywords,
         ));
         batch_bytes += raw_len;
         if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -831,7 +830,14 @@ fn catch_up(
         flags.extend(refreshed);
     }
     let tracked = if clean && !walking {
-        track_removals(session, mailbox, seen, prior_checkpoint, &plan)?
+        track_removals(
+            session,
+            mailbox,
+            seen,
+            prior_checkpoint,
+            &plan,
+            !mode.keywords,
+        )?
     } else {
         Tracked {
             removals: Vec::new(),
@@ -1059,12 +1065,10 @@ fn walk_down(
             if !row.skipped && !row.body_missing {
                 let header = rfc822::headers_message(
                     pass.account_id,
-                    &mailbox.raw,
-                    &mailbox.decoded,
+                    mailbox,
                     checkpoint.uidvalidity,
-                    row.uid,
-                    &row.flags,
-                    &row.body,
+                    &row,
+                    !mode.keywords,
                 );
                 header_ids.insert(row.uid, header.headers.message_id.clone());
                 let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, mode);
@@ -1147,14 +1151,12 @@ fn walk_down(
                     }
                     batch_bytes += item.body.len();
                     body_flags.extend(arrival_flags(checkpoint.uidvalidity, &escaped, &item, mode));
-                    batch.push(rfc822::to_message(
+                    batch.push(rfc822::fetched_message(
                         pass.account_id,
-                        &mailbox.raw,
-                        &mailbox.decoded,
+                        mailbox,
                         checkpoint.uidvalidity,
-                        item.uid,
-                        &item.flags,
-                        &item.body,
+                        &item,
+                        !mode.keywords,
                     ));
                     // Bodies show as they come, whether or not the fetch ends.
                     if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -1250,6 +1252,7 @@ fn walk_down(
         seen,
         pass.prior.get(&mailbox.raw),
         &FetchPlan::Full,
+        !mode.keywords,
     )?;
     checkpoint.floor = None;
     checkpoint.pruned = tracked.pruned;
@@ -1320,7 +1323,7 @@ fn walk_flags(
     escaped: &str,
     mode: FlagMode<'_>,
 ) -> Result<Option<Vec<FlagUpdate>>, Error> {
-    let Some((uids, _)) = list_mailbox(session, mailbox, seen, false)? else {
+    let Some((uids, _)) = list_mailbox(session, mailbox, seen, false, !mode.keywords)? else {
         return Ok(None);
     };
     let mut flags = Vec::with_capacity(uids.len());
@@ -1396,6 +1399,7 @@ fn track_removals(
     seen: Seen,
     checkpoint: Option<&MailboxCheckpoint>,
     plan: &FetchPlan,
+    bridge: bool,
 ) -> Result<Tracked, Error> {
     let escaped = escape_mailbox(&mailbox.raw);
     let removal = |kind| FolderRemoval {
@@ -1438,7 +1442,7 @@ fn track_removals(
         });
     }
     let discover = carried.is_none() && checkpoint.is_some();
-    let Some((present, found)) = list_mailbox(session, mailbox, seen, discover)? else {
+    let Some((present, found)) = list_mailbox(session, mailbox, seen, discover, bridge)? else {
         return Ok(Tracked {
             removals,
             pruned: carried,
@@ -1502,6 +1506,7 @@ fn list_mailbox(
     mailbox: &session::Listed,
     seen: Seen,
     discover: bool,
+    bridge: bool,
 ) -> Result<Option<Listing>, Error> {
     let page = if discover { FOUND_PAGE } else { LIST_PAGE };
     let mut present = Vec::new();
@@ -1510,12 +1515,17 @@ fn list_mailbox(
     while first <= seen.exists {
         let last = first.saturating_add(page - 1).min(seen.exists);
         let listed = if discover {
-            session.fetch_message_ids(first, last).map(|rows| {
+            session.fetch_message_ids(first, last, bridge).map(|rows| {
                 rows.map(|rows| {
                     let mut uids = Vec::with_capacity(rows.len());
                     for (uid, headers) in rows {
-                        let id =
-                            rfc822::copy_message_id(&mailbox.raw, seen.uidvalidity, uid, &headers);
+                        let id = rfc822::copy_message_id(
+                            &mailbox.raw,
+                            seen.uidvalidity,
+                            uid,
+                            &headers,
+                            bridge,
+                        );
                         found.push((uid, id));
                         uids.push(uid);
                     }
@@ -1607,7 +1617,11 @@ fn stream_bodies(
         FetchPlan::Full => (1, None, false),
         FetchPlan::HighWater { start } => (*start, None, false),
     };
-    if discover || mode.view.is_some() || !copies.stored(start, u32::MAX)?.is_empty() {
+    if discover
+        || !mode.keywords
+        || mode.view.is_some()
+        || !copies.stored(start, u32::MAX)?.is_empty()
+    {
         return flags_then_bodies(
             session,
             (start, changed_since),
@@ -1681,7 +1695,7 @@ fn flags_then_bodies(
     let mut first_missing: Option<u32> = None;
     for (index, chunk) in wanted.chunks(UIDS_PER_FETCH).enumerate() {
         let unresolved;
-        let chunk = if mode.view.is_some() {
+        let chunk = if mode.view.is_some() || !mode.keywords {
             let Some(_) = projections::link(
                 session,
                 mailbox,

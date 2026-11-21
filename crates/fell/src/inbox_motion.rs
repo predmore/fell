@@ -164,6 +164,8 @@ pub struct InboxMotion {
     last_unread: Option<(String, usize)>,
     /// The count it replaced in the same folder, fading out under the new one.
     unread_out: Option<(usize, Transition)>,
+    /// The previous folder name and count leave together.
+    folder_out: Option<((String, usize), Transition)>,
     quotes: DisclosureMotion,
     recipients: DisclosureMotion,
 }
@@ -269,6 +271,7 @@ impl InboxMotion {
             recipients: DisclosureMotion::default(),
             last_unread: None,
             unread_out: None,
+            folder_out: None,
         }
     }
 
@@ -400,17 +403,6 @@ impl InboxMotion {
             self.last_layout = layout;
         }
         self.last_panes = panes;
-
-        // The unread count cross-fades when a thread turns read or unread.
-        // A new folder's count is another number, not this one changing.
-        let unread = (session.folder.clone(), session.unread_threads());
-        if let Some((folder, old)) = &self.last_unread
-            && *folder == unread.0
-            && *old != unread.1
-        {
-            self.unread_out = start(motion::FADE).map(|fade| (*old, fade));
-        }
-        self.last_unread = Some(unread);
 
         if session.cursor_id != self.last_selected {
             // The new row is highlighted at once; only the old one fades.
@@ -551,6 +543,7 @@ impl InboxMotion {
         running |= self.card_glide.is_some();
         running |= keep_with(&mut self.selection_out, now);
         running |= keep_with(&mut self.unread_out, now);
+        running |= keep_with(&mut self.folder_out, now);
         if self.pane.is_some_and(|(t, _)| !t.running(now)) {
             self.pane = None;
         }
@@ -590,6 +583,31 @@ impl InboxMotion {
         self.list
             .as_ref()
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
+    }
+
+    /// Observe the folder whose page actually supplied the count.
+    pub fn observe_header(&mut self, folder: &str, unread: usize, now: Instant) {
+        let Some((previous, count)) = &mut self.last_unread else {
+            self.last_unread = Some((folder.to_owned(), unread));
+            return;
+        };
+        if previous != folder {
+            let old = (std::mem::replace(previous, folder.to_owned()), *count);
+            self.folder_out = self.motion.start(motion::FADE, now).map(|fade| (old, fade));
+            self.unread_out = None;
+        } else if *count != unread && self.folder_out.is_none() {
+            self.unread_out = self
+                .motion
+                .start(motion::FADE, now)
+                .map(|fade| (*count, fade));
+        }
+        *count = unread;
+    }
+
+    pub fn folder_header(&self, now: Instant) -> Option<(&str, usize, f32)> {
+        self.folder_out
+            .as_ref()
+            .map(|((folder, unread), fade)| (folder.as_str(), *unread, fade.progress(now)))
     }
 
     /// The header's unread count being replaced: the old count and how far
@@ -800,11 +818,11 @@ mod tests {
         let mut session = session();
         session.unread_count = 3;
         let now = Instant::now();
-        motion.observe(&session, (true, true), now);
+        motion.observe_header(&session.folder, session.unread_count, now);
         assert_eq!(motion.unread_count(now), None);
         // Opened a thread: 3 → 2 in the same folder.
         session.unread_count = 2;
-        motion.observe(&session, (true, true), now);
+        motion.observe_header(&session.folder, session.unread_count, now);
         assert_eq!(motion.unread_count(now), Some((3, 0.0)));
         let (old, mid) = motion.unread_count(later(now, 60)).unwrap();
         assert_eq!(old, 3);
@@ -813,20 +831,26 @@ mod tests {
         assert_eq!(motion.unread_count(later(now, 120)), None);
         // A key mid-fade shows the new count alone.
         session.unread_count = 1;
-        motion.observe(&session, (true, true), later(now, 200));
+        motion.observe_header(&session.folder, session.unread_count, later(now, 200));
         assert!(motion.unread_count(later(now, 210)).is_some());
         motion.settle(later(now, 210));
         assert_eq!(motion.unread_count(later(now, 210)), None);
-        // Another folder's count does not fade from this one.
+        // On a folder switch the old name and its count fade as a pair.
         session.folder = "Archive".into();
         session.unread_count = 7;
-        motion.observe(&session, (true, true), later(now, 300));
+        motion.observe_header(&session.folder, session.unread_count, later(now, 300));
         assert_eq!(motion.unread_count(later(now, 300)), None);
+        assert_eq!(
+            motion.folder_header(later(now, 300)),
+            Some(("INBOX", 1, 0.0))
+        );
+        motion.tick(later(now, 420));
+        assert_eq!(motion.folder_header(later(now, 420)), None);
         // Nor with motion reduced.
         let mut reduced = InboxMotion::new(Motion::new(false));
-        reduced.observe(&session, (true, true), now);
+        reduced.observe_header(&session.folder, session.unread_count, now);
         session.unread_count = 6;
-        reduced.observe(&session, (true, true), now);
+        reduced.observe_header(&session.folder, session.unread_count, now);
         assert_eq!(reduced.unread_count(now), None);
     }
 

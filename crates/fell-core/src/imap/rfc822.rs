@@ -19,7 +19,7 @@ use crate::message::{
 };
 use crate::threading::ThreadId;
 
-use super::escape_mailbox;
+use super::{escape_mailbox, session};
 
 const PROTON_CONVERSATION_HEADERS: &[&str] = &[
     "X-Pm-Conversation-Id",
@@ -42,29 +42,51 @@ pub(super) fn copy_message_id(
     uidvalidity: u32,
     uid: u32,
     headers: &[u8],
+    bridge: bool,
 ) -> MessageId {
     let parsed = MessageParser::new().parse_headers(headers);
-    message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid)
+    message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid, bridge)
 }
 
-/// Whether Fell made the id from a UID because the message has no
-/// Message-ID header ([`message_id_or_uid`]). Such an id cannot be searched
-/// for on the server.
-pub(crate) fn is_uid_message_id(message_id: &str) -> bool {
-    message_id.starts_with("uid.") && message_id.ends_with("@imap.fell")
+/// Whether there is no RFC Message-ID for write-back recovery to search for.
+pub(super) fn is_synthetic_message_id(message_id: &str) -> bool {
+    is_bridge_message_id(message_id)
+        || (message_id.starts_with("uid.") && message_id.ends_with("@imap.fell"))
 }
 
-/// The Message-ID header, or one made from the UID when there is none.
+pub(super) fn is_bridge_message_id(message_id: &str) -> bool {
+    message_id.starts_with("bridge.") && message_id.ends_with("@imap.fell")
+}
+
+/// Bridge identifies the same message across mailboxes even when the RFC header is absent.
 fn message_id_or_uid(
     parsed: Option<&mail_parser::Message<'_>>,
     mailbox_raw: &str,
     uidvalidity: u32,
     uid: u32,
+    bridge: bool,
 ) -> MessageId {
     parsed
         .and_then(|message| message.message_id())
         .filter(|id| !id.is_empty())
         .map(MessageId::new)
+        .or_else(|| {
+            if !bridge {
+                return None;
+            }
+            let id = parsed?
+                .headers()
+                .get("X-Pm-Internal-Id")?
+                .value()
+                .as_text()?
+                .trim();
+            // The Bridge identifier is case-sensitive and has URL-safe characters.
+            (!id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_=".contains(&b)))
+            .then(|| MessageId::new(format!("bridge.{id}@imap.fell")))
+        })
         .unwrap_or_else(|| {
             MessageId::new(format!(
                 "uid.{uidvalidity}.{uid}.{}@imap.fell",
@@ -83,6 +105,7 @@ pub(super) fn keyword_labels(flags: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn to_message(
     account_id: &AccountId,
     mailbox_raw: &str,
@@ -92,8 +115,43 @@ pub(crate) fn to_message(
     flags: &[String],
     raw: &[u8],
 ) -> Message {
+    parse_message(
+        account_id,
+        (mailbox_raw, folder),
+        (uidvalidity, uid),
+        flags,
+        raw,
+        false,
+    )
+}
+
+pub(super) fn fetched_message(
+    account_id: &AccountId,
+    mailbox: &session::Listed,
+    uidvalidity: u32,
+    item: &session::Fetched,
+    bridge: bool,
+) -> Message {
+    parse_message(
+        account_id,
+        (&mailbox.raw, &mailbox.decoded),
+        (uidvalidity, item.uid),
+        &item.flags,
+        &item.body,
+        bridge,
+    )
+}
+
+fn parse_message(
+    account_id: &AccountId,
+    (mailbox_raw, folder): (&str, &str),
+    (uidvalidity, uid): (u32, u32),
+    flags: &[String],
+    raw: &[u8],
+    bridge: bool,
+) -> Message {
     let parsed = MessageParser::new().parse(raw);
-    let message_id = message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid);
+    let message_id = message_id_or_uid(parsed.as_ref(), mailbox_raw, uidvalidity, uid, bridge);
     let in_reply_to = parsed.as_ref().and_then(|message| {
         message
             .in_reply_to()
@@ -196,24 +254,14 @@ pub(crate) fn to_message(
 /// and the fetch of the whole message fills them in place. The attachment
 /// marker waits for the body too: telling a file from an inline image needs
 /// the HTML.
-pub(crate) fn headers_message(
+pub(super) fn headers_message(
     account_id: &AccountId,
-    mailbox_raw: &str,
-    folder: &str,
+    mailbox: &session::Listed,
     uidvalidity: u32,
-    uid: u32,
-    flags: &[String],
-    header: &[u8],
+    item: &session::Fetched,
+    bridge: bool,
 ) -> Message {
-    let mut message = to_message(
-        account_id,
-        mailbox_raw,
-        folder,
-        uidvalidity,
-        uid,
-        flags,
-        header,
-    );
+    let mut message = fetched_message(account_id, mailbox, uidvalidity, item, bridge);
     message.snippet.clear();
     message.body_text = None;
     message.parts = None;

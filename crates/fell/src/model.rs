@@ -748,7 +748,9 @@ impl Session {
             .unwrap_or(&self.folder);
         all.into_iter()
             .filter(|name| {
-                if self.folder_intent == FolderIntent::Move && name.eq_ignore_ascii_case(from) {
+                if self.folder_intent == FolderIntent::Move
+                    && (name.eq_ignore_ascii_case(from) || self.roles.is_view(name))
+                {
                     return false;
                 }
                 if query.is_empty() {

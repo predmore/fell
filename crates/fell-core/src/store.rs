@@ -49,7 +49,9 @@ pub(crate) fn listed_folder_roles(
         return Ok(None);
     };
     Ok(Some(
-        roles.with_bridge_names(views::is_bridge(conn, account)?),
+        roles
+            .with_bridge_names(views::is_bridge(conn, account)?)
+            .with_views(views::move_exclusions(conn, account)?),
     ))
 }
 
@@ -758,7 +760,7 @@ impl Store {
         let mut linked = false;
         for link in &delta.links {
             if let Some(copy) = crate::imap::parse_remote_id(&link.flags.remote_id.0)
-                && copies::link(&tx, account_id, &copy, &link.message_id)?
+                && copies::link_arrival(&tx, account_id, &copy, &link.message_id)?
             {
                 linked = true;
                 apply_flag(&tx, account_id, &link.flags, bridge)?;
@@ -1564,7 +1566,8 @@ impl Store {
             return Ok(found);
         }
         Ok(FolderRoles::from_names(&self.folder_names(account_id)?)
-            .with_bridge_names(views::is_bridge(&self.conn, account_id)?))
+            .with_bridge_names(views::is_bridge(&self.conn, account_id)?)
+            .with_views(views::move_exclusions(&self.conn, account_id)?))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.

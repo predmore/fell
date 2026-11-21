@@ -54,7 +54,35 @@ pub(crate) fn scope_names(conn: &Connection, account_id: &AccountId) -> Result<V
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub(super) fn has_view(conn: &Connection, account_id: &AccountId, mailbox: &str) -> Result<bool> {
+pub(super) fn move_exclusions(conn: &Connection, account: &AccountId) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT folder FROM mailbox_views WHERE account_id = ?1 ORDER BY folder",
+    )?;
+    let rows = stmt.query_map([account.as_str()], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A move from a view applies only to messages shown in that scope.
+pub(crate) fn in_scope(
+    conn: &Connection,
+    account: &AccountId,
+    message_id: &str,
+    folder: &str,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM messages m
+         WHERE m.account_id = ?1 AND m.message_id = ?2
+           AND instr(lower(char(30) || ({}) || char(30)), lower(char(30) || ?3 || char(30))) > 0)",
+        scopes("m")
+    );
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row(params![account.as_str(), message_id, folder], |row| {
+            row.get(0)
+        })?)
+}
+
+pub(crate) fn has_view(conn: &Connection, account_id: &AccountId, mailbox: &str) -> Result<bool> {
     Ok(conn
         .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM mailbox_views WHERE account_id = ?1 AND mailbox = ?2)",

@@ -472,13 +472,11 @@ fn handle(
                     let _ = write.write_all(format!("{tag} NO no mailbox\r\n").as_bytes());
                     continue;
                 };
-                if !rest
-                    .to_ascii_uppercase()
-                    .contains("HEADER.FIELDS (MESSAGE-ID)")
-                {
+                let upper = rest.to_ascii_uppercase();
+                let Some((field, prefixes)) = selected_headers(&upper) else {
                     let _ = write.write_all(format!("{tag} BAD unsupported fetch\r\n").as_bytes());
                     continue;
-                }
+                };
                 let range = rest.split_whitespace().next().unwrap_or("").to_string();
                 let count = mailbox.messages.len() as u32;
                 for (index, message) in mailbox.messages.iter().enumerate() {
@@ -486,10 +484,10 @@ fn handle(
                     if !uid_in_range(seq, &range, count) {
                         continue;
                     }
-                    let header = message_id_header(&message.raw);
+                    let header = header_fields(&message.raw, prefixes);
                     let _ = write.write_all(
                         format!(
-                            "* {seq} FETCH (UID {} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n",
+                            "* {seq} FETCH (UID {} BODY[HEADER.FIELDS ({field})] {{{}}}\r\n",
                             message.uid,
                             header.len()
                         )
@@ -589,17 +587,11 @@ fn handle(
                         );
                         continue;
                     }
-                    if let Some((field, prefix)) =
-                        [("REPLY-TO", "reply-to:"), ("MESSAGE-ID", "message-id:")]
-                            .into_iter()
-                            .find(|(field, _)| {
-                                upper_cmd.contains(&format!("BODY.PEEK[HEADER.FIELDS ({field})]"))
-                            })
-                    {
+                    if let Some((field, prefixes)) = selected_headers(&upper_cmd) {
                         if matches!(message.body_form, BodyForm::Omitted | BodyForm::Absent) {
                             continue;
                         }
-                        let header = header_fields(&message.raw, prefix);
+                        let header = header_fields(&message.raw, prefixes);
                         let literal = match message.body_form {
                             BodyForm::Nil => "NIL".to_string(),
                             _ => format!("{{{}}}", header.len()),
@@ -1080,17 +1072,31 @@ fn is_special_use(flag: &str) -> bool {
 }
 
 fn message_id_header(raw: &[u8]) -> Vec<u8> {
-    header_fields(raw, "message-id:")
+    header_fields(raw, &["message-id:"])
 }
 
-/// A selected header and its continuations, as HEADER.FIELDS returns it.
-fn header_fields(raw: &[u8], field: &str) -> Vec<u8> {
+fn selected_headers(command: &str) -> Option<(&'static str, &'static [&'static str])> {
+    [
+        ("REPLY-TO", &["reply-to:"][..]),
+        ("MESSAGE-ID", &["message-id:"][..]),
+        (
+            "MESSAGE-ID X-PM-INTERNAL-ID",
+            &["message-id:", "x-pm-internal-id:"][..],
+        ),
+    ]
+    .into_iter()
+    .find(|(names, _)| command.contains(&format!("BODY.PEEK[HEADER.FIELDS ({names})]")))
+}
+
+/// Selected headers and their continuations, as HEADER.FIELDS returns them.
+fn header_fields(raw: &[u8], fields: &[&str]) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut out = String::new();
     let mut keep = false;
     for line in text.split("\r\n").take_while(|line| !line.is_empty()) {
         if !line.starts_with([' ', '\t']) {
-            keep = line.to_ascii_lowercase().starts_with(field);
+            let lower = line.to_ascii_lowercase();
+            keep = fields.iter().any(|field| lower.starts_with(field));
         }
         if keep {
             out.push_str(line);

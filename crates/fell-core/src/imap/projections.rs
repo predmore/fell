@@ -100,24 +100,35 @@ pub(super) fn link(
 ) -> Result<Option<Vec<u32>>> {
     let mut uids = Vec::new();
     let mut links = Vec::new();
-    let stop = session.uid_fetch_each(range, None, session::FetchItems::MessageId, |item| {
-        if !includes(item.uid) {
-            return Ok(());
-        }
-        uids.push(item.uid);
-        if !item.skipped && !item.body_missing && !rfc822::is_deleted(&item.flags) {
-            links.push(CopyLink {
-                message_id: rfc822::copy_message_id(
+    let stop = session.uid_fetch_each(
+        range,
+        None,
+        session::FetchItems::MessageId {
+            bridge: !mode.keywords,
+        },
+        |item| {
+            if !includes(item.uid) {
+                return Ok(());
+            }
+            uids.push(item.uid);
+            if !item.skipped && !item.body_missing && !rfc822::is_deleted(&item.flags) {
+                let message_id = rfc822::copy_message_id(
                     &mailbox.raw,
                     copies.uidvalidity,
                     item.uid,
                     &item.body,
-                ),
-                flags: flag_update(copies.uidvalidity, copies.mailbox, &item, mode),
-            });
-        }
-        Ok(())
-    })?;
+                    !mode.keywords,
+                );
+                if mode.view.is_some() || rfc822::is_bridge_message_id(message_id.as_str()) {
+                    links.push(CopyLink {
+                        message_id,
+                        flags: flag_update(copies.uidvalidity, copies.mailbox, &item, mode),
+                    });
+                }
+            }
+            Ok(())
+        },
+    )?;
     if !matches!(stop, session::FetchStop::Done) {
         return Ok(None);
     }

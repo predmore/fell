@@ -553,6 +553,34 @@ pub(super) fn link(
     Ok(true)
 }
 
+/// Attach a newly discovered copy and add a physical folder when it is live.
+pub(super) fn link_arrival(
+    conn: &Connection,
+    account: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+    id: &MessageId,
+) -> Result<bool> {
+    if !link(conn, account, copy, id)? {
+        return Ok(false);
+    }
+    if !super::views::has_view(conn, account, &copy.mailbox)?
+        && let Some((stored, _)) = find_stored(conn, account, id)?
+    {
+        let mut folders = split_field(&stored.folders);
+        if !folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(&copy.folder))
+            && !crate::actions::tombstoned_folders(conn, account, &stored.canonical_id)?
+                .iter()
+                .any(|folder| folder.eq_ignore_ascii_case(&copy.folder))
+        {
+            folders.push(copy.folder.clone());
+            write_folders(conn, account, &stored, &folders)?;
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn drop_copy(
     conn: &Connection,
     account_id: &AccountId,

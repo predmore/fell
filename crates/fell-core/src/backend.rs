@@ -98,7 +98,7 @@ pub struct FetchedReplyTo {
 /// UID range; answers the stored UIDs in that range, ascending.
 pub type KnownCopies<'a> = dyn Fn(&str, u32, (u32, u32)) -> Result<Vec<u32>> + 'a;
 
-/// A header from a virtual mailbox that can attach a copy to an existing row.
+/// A header that can attach a server copy to an existing row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyLink {
     pub message_id: crate::MessageId,
