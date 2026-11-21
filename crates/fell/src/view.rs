@@ -313,8 +313,6 @@ struct Inbox {
     body_refresh: BodyRefresh,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
-    /// Thread `m` just moved. `u` selects it again when it returns to this folder.
-    moved_thread: Option<ListKey>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// The folder the rows on screen came from. `session.folder` changes on
@@ -453,7 +451,6 @@ impl Inbox {
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
             conv_layout_current: false,
-            moved_thread: None,
             sync: None,
             list_folder: FolderRole::Inbox.default_name().into(),
             read_in_flight: false,
@@ -1425,11 +1422,16 @@ impl Inbox {
             .enumerate()
             .map(|(index, row)| (row.id.as_str(), index))
             .collect();
-        // Every row on screen kept its slot (rows read above it, the view
-        // scrolled by as much): nothing moved, and a shift still running
-        // (a landing's fade) carries on.
+        let reach = self.list_viewport().unwrap_or(640.0);
+        // Keep the current shift if all drawn rows stayed in place and no
+        // row arrived below them in the viewport (undo at the end of a list).
+        let end = self.session.threads.len() as f32 * ROW_PX;
+        let same_visible_end = drawn.last().is_some_and(|last| {
+            let old_end = last.slot + ROW_PX;
+            old_end >= reach || end + offset <= old_end + 0.5
+        });
         let kept = !replace
-            && !drawn.is_empty()
+            && same_visible_end
             && drawn.iter().all(|old| {
                 slots
                     .get(old.row.id.as_str())
@@ -1451,10 +1453,8 @@ impl Inbox {
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
         carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
-        let reach = self.list_viewport().unwrap_or(640.0);
         // Rows of a list this one replaced that sat below its last row:
         // nothing arrives over them, so they fade out where they were.
-        let end = self.session.threads.len() as f32 * ROW_PX;
         let below = drawn
             .into_iter()
             .map(|old| {
@@ -1999,58 +1999,6 @@ impl Inbox {
         .detach();
     }
 
-    /// Move messages in the folder on screen to Archive. A Sent copy stays in
-    /// Sent. The row leaves the list at once and the row in its place is
-    /// selected, so a second `e` archives that one.
-    fn archive_current(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.session.cursor_id.clone() else {
-            self.session.show_toast("No conversation", true);
-            return;
-        };
-        if self.session.cursor_draft().is_some() {
-            self.session.show_toast(DRAFT_NOT_THREAD, true);
-            return;
-        }
-        if !self.session.threads.iter().any(|thread| thread.id == id) {
-            self.session.show_toast("No conversation", true);
-            return;
-        }
-        let Some(folder) = self.action_folder(&id) else {
-            return;
-        };
-        let account = self.account_id.clone();
-        let thread = ThreadId(id.clone());
-        let key = self.selected_key();
-        if self.session.search.is_none() && !self.session.roles.is_view(&folder) {
-            self.take_out_of_list(std::slice::from_ref(&id), cx);
-        }
-        self.change_mailbox(
-            move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
-            move |inbox, result| match result {
-                Ok(()) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = key;
-                    inbox.session.show_toast("Archived · u", false);
-                    inbox.send_to_server();
-                    Some(ReadIntent {
-                        changed: true,
-                        ..ReadIntent::default()
-                    })
-                }
-                Err(err) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.session.show_toast(archive_failure(&err), true);
-                    Some(ReadIntent {
-                        changed: true,
-                        select: key,
-                        ..ReadIntent::default()
-                    })
-                }
-            },
-            cx,
-        );
-    }
-
     fn apply_move(&mut self, destination: String, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
@@ -2079,7 +2027,6 @@ impl Inbox {
             move |inbox, result| match result {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = key;
                     let label = inbox.session.folder_text(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
                     inbox.send_to_server();
@@ -2110,10 +2057,19 @@ impl Inbox {
         }
     }
 
-    /// `#`, `!`, or a confirmed permanent delete on `ids` (the selection,
-    /// or the selected row). They leave the list in this frame, as an
-    /// archived row does, and the row after them is selected.
+    /// Remove the selected threads in this frame and select the row that
+    /// takes the cursor's place.
     fn remove_threads(&mut self, ids: Vec<String>, removal: Removal, cx: &mut Context<Self>) {
+        if removal == Removal::Archive
+            && self
+                .session
+                .threads
+                .iter()
+                .any(|row| row.draft.is_some() && ids.contains(&row.id))
+        {
+            self.session.show_toast(DRAFT_NOT_THREAD, true);
+            return;
+        }
         if self.session.search.is_some() {
             self.remove_search_threads(ids, removal, cx);
             return;
@@ -2141,6 +2097,7 @@ impl Inbox {
         let folder = self.list_folder.clone();
         let count = ids.len();
         let done_text = match removal {
+            Removal::Archive => archived_notice(count),
             Removal::Delete => moved_notice(
                 count,
                 &self.session.folder_text(roles.name(FolderRole::Trash)),
@@ -2162,12 +2119,14 @@ impl Inbox {
         let threads: Vec<ThreadId> = ids.iter().cloned().map(ThreadId).collect();
         self.session.picked.clear();
         self.session.visual = false;
+        self.session.anchor_id = None;
         if !roles.is_view(&folder) {
             self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
             move |store| {
                 match removal {
+                    Removal::Archive => store.archive_threads(&account, &threads, &folder),
                     Removal::Delete => store.delete_threads(&account, &threads, &folder),
                     Removal::Spam => store.spam_threads(&account, &threads, &folder),
                     Removal::Purge => store.purge_threads(&account, &threads, &folder),
@@ -2180,9 +2139,6 @@ impl Inbox {
                 }
                 match result {
                     Ok(()) => {
-                        // Undo finds the first of them again; nothing
-                        // comes back after a permanent delete.
-                        inbox.moved_thread = (removal != Removal::Purge).then_some(key);
                         inbox.session.show_toast(done_text, false);
                         inbox.send_to_server();
                         Some(ReadIntent {
@@ -2191,7 +2147,12 @@ impl Inbox {
                         })
                     }
                     Err(err) => {
-                        inbox.session.show_toast(err.to_string(), true);
+                        let message = if removal == Removal::Archive {
+                            archive_failure(&err)
+                        } else {
+                            err.to_string()
+                        };
+                        inbox.session.show_toast(message, true);
                         Some(ReadIntent {
                             changed: true,
                             select: Some(key),
@@ -2220,8 +2181,7 @@ impl Inbox {
         self.issue_fetch(cx);
     }
 
-    /// List position of the selected row, so undo can find it again even
-    /// after it scrolled out of the loaded rows.
+    /// List position of the selected row, to recover it if a move fails.
     fn selected_key(&self) -> Option<ListKey> {
         let id = self.session.cursor_id.as_ref()?;
         self.session
@@ -2233,10 +2193,16 @@ impl Inbox {
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
+        let folder = self.session.folder.clone();
+        let reading = folder.clone();
         self.change_mailbox(
-            move |store| store.undo(&account),
-            |inbox, result| match result {
-                Ok(action) => {
+            move |store| {
+                let (action, restored) = store.undo_with_threads(&account)?;
+                let select = restored_folder_key(store, &account, &reading, &restored);
+                Ok((action, restored, select))
+            },
+            move |inbox, result| match result {
+                Ok((action, restored, select)) => {
                     if action.kind == fell_core::ActionKind::DiscardDrafts {
                         inbox.session.show_toast(action.summary, false);
                         return Some(ReadIntent {
@@ -2246,17 +2212,10 @@ impl Inbox {
                     }
                     inbox.session.show_toast("Undone", false);
                     inbox.send_to_server();
-                    // Read and star leave the thread where it is; the thread
-                    // `m` or `e` took away waits for its own undo.
-                    let select = if action.kind.is_flag() {
-                        None
-                    } else {
-                        inbox.moved_thread.take()
-                    };
-                    if inbox.session.search.is_some() {
-                        inbox.search_view.prefer =
-                            select.as_ref().map(|key| key.thread_id.0.clone());
+                    if inbox.session.search.is_some() && !restored.is_empty() {
+                        inbox.search_view.prefer = restored;
                     }
+                    let select = select.filter(|_| inbox.session.folder == folder);
                     Some(ReadIntent {
                         changed: true,
                         select,
@@ -2795,7 +2754,6 @@ impl Inbox {
             message: self.session.message_cursor,
             thread: self.session.cursor_id.clone(),
             folder: self.session.folder.clone(),
-            pane: self.session.pane,
             searching: self.session.search.is_some(),
             search_generation: self.session.search_generation,
             help_open: self.session.overlay == Overlay::Help,
@@ -2807,7 +2765,6 @@ impl Inbox {
             message: message_before,
             thread: thread_before,
             folder: folder_before,
-            pane: pane_before,
             searching,
             search_generation,
             help_open,
@@ -2854,7 +2811,8 @@ impl Inbox {
             self.read_after(read, cx);
         }
         if step.archive {
-            self.archive_current(cx);
+            let ids = self.session.action_targets();
+            self.remove_threads(ids, Removal::Archive, cx);
         }
         if step.delete {
             let ids = self.session.action_targets();
@@ -2931,15 +2889,6 @@ impl Inbox {
             self.arm_which(cx);
         }
         let thread_moved = self.session.cursor_id != thread_before;
-        // The reader moved in the list, or came back to it: a box left wide
-        // when a row turned read eases back now, with this key's own glide
-        // or slide, never on a timer while they read.
-        if moved_in_list(
-            (thread_before.as_deref(), pane_before),
-            (self.session.cursor_id.as_deref(), self.session.pane),
-        ) {
-            self.row_widths.relax();
-        }
         if thread_moved && !search_changed {
             // Rows the selection moved by, when both rows are on the list.
             let moved = thread_before
@@ -3319,8 +3268,6 @@ impl Inbox {
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
         if changed || self.session.pane != Pane::List {
             self.session.cancel_read_delay();
-            // A click in the list is a move in it, as `j` is.
-            self.row_widths.relax();
         }
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
@@ -4446,12 +4393,11 @@ fn thread_list(
                         // Where the row was before the list changed, and the
                         // rows that left from under it.
                         let top = index as f32 * ROW_PX + offset;
-                        let below = inbox
-                            .session
-                            .threads
-                            .get(index + 1)
-                            .map(|next| (next.id.as_str(), top + ROW_PX));
-                        let mut moving = shift.row(&row.id, top, below, now);
+                        let below = inbox.session.threads[index + 1..]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, next)| (next.id.as_str(), top + (i + 1) as f32 * ROW_PX));
+                        let mut moving = shift.row(&row.id, top, ROW_PX, below, now);
                         moving.dy = motion::snap(moving.dy, window.scale_factor());
                         let reach = if index == last { f32::INFINITY } else { ROW_PX };
                         // Ghosts are kept in content pixels, so they scroll.
@@ -4550,18 +4496,11 @@ fn still_frame(row: &ThreadRow, window: &Window) -> RowFrame {
     RowFrame::still(natural, row.unread, row.starred)
 }
 
-/// The reader moved the list's cursor, or came back to the list (`Esc`,
-/// `h`, a click): given the thread cursor and pane before and after.
-fn moved_in_list(before: (Option<&str>, Pane), after: (Option<&str>, Pane)) -> bool {
-    before.0 != after.0 || (before.1 != Pane::List && after.1 == Pane::List)
-}
-
-/// The cursors, folder and pane before a key ([`Inbox::before_step`]).
+/// The cursors, folder and search state before a key ([`Inbox::before_step`]).
 struct StepBefore {
     message: usize,
     thread: Option<String>,
     folder: String,
-    pane: Pane,
     searching: bool,
     search_generation: u64,
     help_open: bool,
@@ -7711,9 +7650,25 @@ fn folder_picker(
         )
 }
 
-/// What `#`, `!`, and a confirmed permanent delete do to the threads.
+/// Land on the first restored row in the current folder's order. Use the
+/// store's current keys so undo can land outside the loaded window too.
+fn restored_folder_key(
+    store: &fell_core::Store,
+    account: &fell_core::AccountId,
+    folder: &str,
+    threads: &[ThreadId],
+) -> Option<ListKey> {
+    threads
+        .iter()
+        .filter_map(|id| store.folder_key_of(account, folder, id).ok().flatten())
+        .min()
+}
+
+/// How a triage action takes threads out of the current folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Removal {
+    /// To Archive.
+    Archive,
     /// To Trash.
     Delete,
     /// To Spam, or from Spam to the inbox.
@@ -7727,6 +7682,13 @@ fn moved_notice(count: usize, to: &str) -> String {
     match count {
         1 => format!("Moved to {to} · u"),
         n => format!("Moved {n} to {to} · u"),
+    }
+}
+
+fn archived_notice(count: usize) -> String {
+    match count {
+        1 => "Archived · u".into(),
+        n => format!("Archived {n} · u"),
     }
 }
 
@@ -8018,6 +7980,71 @@ mod tests {
     }
 
     #[test]
+    fn archive_undo_selects_each_restored_row_and_the_first_of_a_batch() {
+        use super::restored_folder_key;
+        use crate::fixtures::{fixture_account, seed_if_empty};
+        use crate::keymap::Keymap;
+        use crate::model::{Session, SyncKind};
+        use crate::present::thread_rows;
+        use fell_core::{FolderSpan, ListKey, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let account = fixture_account();
+        store.upsert_account(&account).unwrap();
+        seed_if_empty(&store, &account).unwrap();
+        let folder = "INBOX";
+        let list = || {
+            store
+                .folder_page(&account.id, folder, &FolderSpan::Top { rows: 100 })
+                .unwrap()
+                .threads
+        };
+        let original = list();
+        let mut session = Session::new(
+            "Demo",
+            &account.email,
+            SyncKind::FixtureOffline,
+            Keymap::default(),
+        );
+        session.set_threads(thread_rows(&original, &account.email));
+        let keys: Vec<_> = original.iter().skip(2).take(3).map(ListKey::of).collect();
+        session.select_if_present(keys[0].thread_id.as_str());
+        for key in &keys {
+            assert_eq!(session.cursor_id.as_deref(), Some(key.thread_id.as_str()));
+            store
+                .archive_thread(&account.id, &key.thread_id, folder)
+                .unwrap();
+            session.remove_thread(key.thread_id.as_str());
+        }
+
+        let mut restore = |expected: &ListKey| {
+            let (_, restored) = store.undo_with_threads(&account.id).unwrap();
+            let selected = restored_folder_key(&store, &account.id, folder, &restored);
+            assert_eq!(selected.as_ref(), Some(expected));
+            let page = list();
+            session.set_threads(thread_rows(&page, &account.email));
+            assert!(session.select_if_present(selected.unwrap().thread_id.as_str()));
+            assert_eq!(
+                session.cursor_id.as_deref(),
+                Some(expected.thread_id.as_str())
+            );
+            restored
+        };
+        for key in keys.iter().rev() {
+            assert_eq!(restore(key), std::slice::from_ref(&key.thread_id));
+        }
+        let batch = [keys[2].thread_id.clone(), keys[0].thread_id.clone()];
+        store.archive_threads(&account.id, &batch, folder).unwrap();
+        let restored = restore(&keys[0]);
+        assert_eq!(restored.len(), batch.len());
+        assert!(batch.iter().all(|id| restored.contains(id)));
+        assert_eq!(
+            list().iter().map(ListKey::of).collect::<Vec<_>>(),
+            original.iter().map(ListKey::of).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn collapsed_sender_budget_keeps_room_for_the_preview() {
         assert_eq!(collapsed_sender_budget(379., 11., 11., 44.), 140.);
         assert_eq!(collapsed_sender_budget(185., 18.2, 17.1, 72.), 113.);
@@ -8166,60 +8193,6 @@ mod tests {
             assert_eq!(reading.card.width, reading.prose.width);
             assert!(reading.wide.width >= reading.prose.width);
         }
-    }
-
-    /// After each key, whether a box left wide relaxes: only a key that
-    /// moves the list's cursor or comes back to the list.
-    #[test]
-    fn only_moving_in_the_list_relaxes_a_wide_row() {
-        use crate::keymap::Keymap;
-        use crate::model::{Session, SyncKind};
-        use crate::present::{NameSpan, ThreadRow};
-        let row = |id: &str| ThreadRow {
-            id: id.into(),
-            spans: vec![NameSpan {
-                text: id.into(),
-                emphasis: true,
-            }],
-            extra: 0,
-            message_count: 1,
-            starred: false,
-            has_attachment: false,
-            date_unix: 0,
-            subject: id.into(),
-            snippet: "snippet".into(),
-            labels: vec![],
-            warn: false,
-            unread: true,
-            draft: None,
-        };
-        let mut session = Session::new("A", "a@x", SyncKind::FixtureOffline, Keymap::default());
-        session.set_threads(vec![row("a"), row("b"), row("c")]);
-        let mut press = |key: KeyId| {
-            let before = (session.cursor_id.clone(), session.pane);
-            session.on_key(key, 10);
-            moved_in_list(
-                (before.0.as_deref(), before.1),
-                (session.cursor_id.as_deref(), session.pane),
-            )
-        };
-        // Opening, `U` and `s` leave the row where the reader is looking.
-        assert!(!press(KeyId::Enter));
-        assert!(!press(KeyId::Char('U')));
-        assert!(!press(KeyId::Char('s')));
-        // `j` in the conversation moves between messages, not threads.
-        assert!(!press(KeyId::Char('j')));
-        // Back to the list, then down it.
-        assert!(press(KeyId::Escape));
-        assert!(press(KeyId::Char('j')));
-        assert!(press(KeyId::Char('k')));
-        // Any other move of the list cursor: `G`, `gg`, a page.
-        assert!(press(KeyId::Char('G')));
-        assert!(!press(KeyId::Char('g')));
-        assert!(press(KeyId::Char('g')));
-        // Open, then back with `h`.
-        assert!(!press(KeyId::Enter));
-        assert!(press(KeyId::Char('h')));
     }
 
     #[test]

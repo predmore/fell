@@ -32,7 +32,7 @@ use crate::account::AccountId;
 use crate::embed::{
     dequeue_message, enqueue_message, invalidate_message_embedding, remove_message_embedding,
 };
-use crate::folders::FolderRole;
+use crate::folders::{FolderRole, FolderRoles};
 use crate::message::{Message, encode_addresses};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::store::keywords::{self, LabelEdit, LabelHistory};
@@ -294,37 +294,27 @@ impl Store {
         thread_id: &ThreadId,
         from_folder: &str,
     ) -> Result<LocalAction> {
+        self.archive_threads(account_id, std::slice::from_ref(thread_id), from_folder)
+    }
+
+    /// Archive a selection from the same folder as one undo entry.
+    pub fn archive_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        from_folder: &str,
+    ) -> Result<LocalAction> {
         let from_folder = canonical_folder(from_folder)?;
         let roles = self.folder_roles(account_id)?;
-        let archive = roles.archive_name().to_string();
-        if from_folder.eq_ignore_ascii_case(&archive) && !roles.is_view(&from_folder) {
-            return Err(Error::Action(format!(
-                "archive moves messages into {}",
-                roles.label(&archive)
-            )));
-        }
-        let server = Some((archive.as_str(), &roles));
-        self.apply_thread(
+        let archive = roles.archive_name();
+        check_archive_route(&roles, &from_folder)?;
+        self.apply_threads(
             account_id,
-            thread_id,
+            threads,
             ActionKind::Archive,
-            server,
+            Some((archive, &roles)),
             |tx, rows| {
-                let plans = plan_relocate(
-                    tx,
-                    account_id,
-                    rows,
-                    &from_folder,
-                    &archive,
-                    &roles,
-                    ActionKind::Archive,
-                )?;
-                if plans.is_empty() {
-                    if roles.is_view(&from_folder) {
-                        return Err(Error::Action("already archived".into()));
-                    }
-                    return Err(Error::Action(format!("no messages in {from_folder}")));
-                }
+                let plans = plan_archive(tx, account_id, rows, &from_folder, &roles)?;
                 let summary = format!("archived {} from {from_folder}", plans.len());
                 Ok((summary, plans))
             },
@@ -528,7 +518,7 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<LocalAction> {
-        self.relocate_scoped_threads(account, targets, false)
+        self.relocate_scoped_threads(account, targets, ActionKind::Delete)
     }
 
     /// Move results to Junk, or out of Junk to Inbox, in one undo entry.
@@ -537,14 +527,23 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
     ) -> Result<LocalAction> {
-        self.relocate_scoped_threads(account, targets, true)
+        self.relocate_scoped_threads(account, targets, ActionKind::Spam)
+    }
+
+    /// Archive results from their respective source folders in one undo entry.
+    pub fn archive_scoped_threads(
+        &self,
+        account: &AccountId,
+        targets: &[(ThreadId, String)],
+    ) -> Result<LocalAction> {
+        self.relocate_scoped_threads(account, targets, ActionKind::Archive)
     }
 
     fn relocate_scoped_threads(
         &self,
         account: &AccountId,
         targets: &[(ThreadId, String)],
-        spam: bool,
+        kind: ActionKind,
     ) -> Result<LocalAction> {
         self.require_account(account)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
@@ -559,32 +558,31 @@ impl Store {
                 continue;
             }
             let from = canonical_folder(folder)?;
-            if !spam && roles.is(FolderRole::Trash, &from) {
+            if kind == ActionKind::Delete && roles.is(FolderRole::Trash, &from) {
                 return Err(Error::Action("already in Trash".into()));
             }
             let junk = roles.is(FolderRole::Junk, &from);
             only_junk &= junk;
-            let to = roles.name(match (spam, junk) {
-                (true, true) => FolderRole::Inbox,
-                (true, false) => FolderRole::Junk,
-                (false, _) => FolderRole::Trash,
-            });
-            if roles.is_view(to) {
+            let to = match kind {
+                ActionKind::Archive => {
+                    check_archive_route(&roles, &from)?;
+                    roles.archive_name()
+                }
+                ActionKind::Spam if junk => roles.name(FolderRole::Inbox),
+                ActionKind::Spam => roles.name(FolderRole::Junk),
+                _ => roles.name(FolderRole::Trash),
+            };
+            if roles.is_view(to)
+                && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
+            {
                 return Err(Error::Action(format!("{} is a view", roles.label(to))));
             }
-            let planned = plan_relocate(
-                &tx,
-                account,
-                &load_thread(&tx, account, thread)?,
-                &from,
-                to,
-                &roles,
-                if spam {
-                    ActionKind::Spam
-                } else {
-                    ActionKind::Delete
-                },
-            )?;
+            let rows = load_thread(&tx, account, thread)?;
+            let planned = if kind == ActionKind::Archive {
+                plan_archive(&tx, account, &rows, &from, &roles)?
+            } else {
+                plan_relocate(&tx, account, &rows, &from, to, &roles, kind)?
+            };
             if planned.is_empty() {
                 return Err(Error::Action(format!("no messages in {from}")));
             }
@@ -594,10 +592,11 @@ impl Store {
         if plans.is_empty() {
             return Err(Error::Action("no conversation".into()));
         }
-        let (kind, verb) = match (spam, only_junk) {
-            (false, _) => (ActionKind::Delete, "deleted"),
-            (true, true) => (ActionKind::NotSpam, "moved out of spam"),
-            (true, false) => (ActionKind::Spam, "changed spam status for"),
+        let (kind, verb) = match kind {
+            ActionKind::Archive => (kind, "archived"),
+            ActionKind::Spam if only_junk => (ActionKind::NotSpam, "moved out of spam"),
+            ActionKind::Spam => (kind, "changed spam status for"),
+            _ => (kind, "deleted"),
         };
         let summary = format!("{verb} {} messages", plans.len());
         let action = record_and_apply(&tx, account, kind, &summary, &plans)?;
@@ -707,12 +706,22 @@ impl Store {
     /// Restore the latest reversible local action on this account. For a
     /// draft discard, the returned summary describes the restore outcome.
     pub fn undo(&self, account_id: &AccountId) -> Result<LocalAction> {
+        self.undo_with_threads(account_id).map(|(action, _)| action)
+    }
+
+    /// Undo the latest local action and return the current ids of any
+    /// threads restored by a folder change.
+    pub fn undo_with_threads(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<(LocalAction, Vec<ThreadId>)> {
         self.require_account(account_id)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
         let Some(mut action) = latest_open_action(&tx, account_id)? else {
             return Err(Error::Action("nothing to undo".into()));
         };
+        let mut restored_threads = Vec::new();
         if action.kind == ActionKind::DiscardDrafts {
             let (restored, confirmed) = crate::compose::undo_discard(&tx, account_id, action.id)?;
             action.summary = match (restored, confirmed) {
@@ -733,8 +742,13 @@ impl Store {
                 LabelHistory::Local,
             )?;
         } else {
+            let mut seen = HashSet::new();
             for row in &load_snapshots(&tx, action.id)? {
-                restore_row(&tx, account_id, row)?;
+                if let Some(thread) = restore_row(&tx, account_id, row)?
+                    && seen.insert(thread.clone())
+                {
+                    restored_threads.push(thread);
+                }
             }
             flags::undo(&tx, account_id, &action)?;
             views::restore_all(&tx, account_id, action.id)?;
@@ -767,7 +781,7 @@ impl Store {
         )?;
         expect_one(changed, "undo")?;
         tx.commit()?;
-        Ok(action)
+        Ok((action, restored_threads))
     }
 
     /// Threads with at least one message in `folder`, newest activity first.
@@ -896,6 +910,42 @@ impl Store {
         tx.commit()?;
         Ok(action)
     }
+}
+
+fn check_archive_route(roles: &FolderRoles, from: &str) -> Result<()> {
+    let archive = roles.archive_name();
+    if from.eq_ignore_ascii_case(archive) && !roles.is_view(from) {
+        return Err(Error::Action(format!(
+            "archive moves messages into {}",
+            roles.label(archive)
+        )));
+    }
+    Ok(())
+}
+
+fn plan_archive(
+    conn: &Connection,
+    account: &AccountId,
+    rows: &[SavedRow],
+    from: &str,
+    roles: &FolderRoles,
+) -> Result<Vec<Planned>> {
+    let plans = plan_relocate(
+        conn,
+        account,
+        rows,
+        from,
+        roles.archive_name(),
+        roles,
+        ActionKind::Archive,
+    )?;
+    if plans.is_empty() {
+        if roles.is_view(from) {
+            return Err(Error::Action("already archived".into()));
+        }
+        return Err(Error::Action(format!("no messages in {from}")));
+    }
+    Ok(plans)
 }
 
 fn ensure_action_schema(conn: &Connection) -> Result<()> {
@@ -1164,7 +1214,11 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
     Ok(())
 }
 
-fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -> Result<()> {
+fn restore_row(
+    conn: &Connection,
+    account_id: &AccountId,
+    snapshot: &Snapshot,
+) -> Result<Option<ThreadId>> {
     let saved = &snapshot.row;
     let filtered;
     let saved =
@@ -1199,7 +1253,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
                  WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id.as_str(), saved.message_id],
             )?;
-            return Ok(());
+            return Ok(Some(ThreadId(saved.thread_id.clone())));
         }
         let folders = join_tokens(&invert_tokens(
             &split_tokens(&current.folders),
@@ -1215,11 +1269,11 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
         )?;
         expect_one(changed, &saved.message_id)?;
         sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
-        return Ok(());
+        return Ok(Some(ThreadId(current.thread_id)));
     }
     if let Some(canonical_id) = live_alias_target(conn, account_id, &saved.message_id)? {
         let Some(current) = load_one(conn, account_id, &canonical_id)? else {
-            return Ok(());
+            return Ok(None);
         };
         // The snapshot is the other copy. Put its folders and labels back on
         // the survivor and reattach the alias. Subject, body, and unread stay.
@@ -1255,7 +1309,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             folder: saved.folders.clone(),
         });
         restore_aliases(conn, account_id, &canonical_id, &aliases)?;
-        return Ok(());
+        return Ok(Some(ThreadId(current.thread_id)));
     }
     insert_message_row(conn, account_id, saved)?;
     restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
@@ -1264,7 +1318,7 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
     }
     let terms = terms_of(saved);
     sync_terms(conn, account_id.as_str(), &HashSet::new(), &terms)?;
-    Ok(())
+    Ok(Some(ThreadId(saved.thread_id.clone())))
 }
 
 /// Put back the parts a removed row had, replacing any a later sync wrote
@@ -2383,6 +2437,18 @@ mod tests {
             [vec![FOLDER_INBOX], vec![FOLDER_SENT]]
         );
         assert_eq!(folders_of(&store, &second), [vec![FOLDER_INBOX]]);
+
+        let action = store.archive_scoped_threads(&owner, &targets).unwrap();
+        assert_eq!(
+            folders_of(&store, &first),
+            [vec![FOLDER_INBOX], vec![FOLDER_ARCHIVE]]
+        );
+        assert_eq!(folders_of(&store, &second), [vec![FOLDER_ARCHIVE]]);
+        let (undone, restored) = store.undo_with_threads(&owner).unwrap();
+        assert_eq!(undone, action);
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(&first));
+        assert!(restored.contains(&second));
 
         let invalid = [
             (first.clone(), FOLDER_SENT.into()),

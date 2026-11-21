@@ -27,7 +27,7 @@ pub(super) struct SearchView {
     accepted: Arc<AtomicU64>,
     completion_revision: Arc<AtomicU64>,
     pub(super) folder_revision: u64,
-    pub(super) prefer: Option<String>,
+    pub(super) prefer: Vec<ThreadId>,
     preview_key: Option<PreviewKey>,
     preview_revision: u64,
     rows_key: Option<RowsKey>,
@@ -305,7 +305,7 @@ impl Inbox {
             self.search_view
                 .completion_revision
                 .fetch_add(1, Ordering::Relaxed);
-            self.search_view.prefer = None;
+            self.search_view.prefer.clear();
             if searching {
                 self.search_view.folder_scroll = Some(std::mem::replace(
                     &mut self.list_scroll,
@@ -450,9 +450,9 @@ impl Inbox {
                 .show_toast("No folder for a selected match", true);
             return;
         };
-        let key = self.selected_key();
         let account = self.account_id.clone();
         let done = match removal {
+            Removal::Archive => archived_notice(scopes.len()),
             Removal::Delete => format!(
                 "Moved to {}",
                 self.session
@@ -468,6 +468,7 @@ impl Inbox {
             .and_then(Search::accepted_generation);
         self.change_mailbox(
             move |store| match removal {
+                Removal::Archive => store.archive_scoped_threads(&account, &scopes),
                 Removal::Delete => store.delete_scoped_threads(&account, &scopes),
                 Removal::Spam => store.spam_scoped_threads(&account, &scopes),
                 Removal::Purge => store.purge_scoped_threads(&account, &scopes),
@@ -484,7 +485,6 @@ impl Inbox {
                         inbox.session.visual = false;
                         inbox.session.anchor_id = None;
                     }
-                    inbox.moved_thread = if removal == Removal::Purge { None } else { key };
                     inbox.session.show_toast(done, false);
                     inbox.send_to_server();
                     Some(ReadIntent {
@@ -493,7 +493,12 @@ impl Inbox {
                     })
                 }
                 Err(err) => {
-                    inbox.session.show_toast(err.to_string(), true);
+                    let message = if removal == Removal::Archive {
+                        archive_failure(&err)
+                    } else {
+                        err.to_string()
+                    };
+                    inbox.session.show_toast(message, true);
                     None
                 }
             },
@@ -723,8 +728,15 @@ impl Inbox {
                     cx.notify();
                     return;
                 }
-                if let Some(preferred) = self.search_view.prefer.take() {
-                    self.session.select_if_present(&preferred);
+                let preferred = std::mem::take(&mut self.search_view.prefer);
+                if !preferred.is_empty()
+                    && let Some(row) = self
+                        .session
+                        .threads
+                        .iter()
+                        .find(|row| preferred.iter().any(|id| id.as_str() == row.id))
+                {
+                    self.session.cursor_id = Some(row.id.clone());
                 }
                 let search = self.session.search.as_ref().unwrap();
                 self.search_view

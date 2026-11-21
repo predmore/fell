@@ -516,13 +516,14 @@ impl<R: Clone> ListShift<R> {
     }
 
     /// How to draw row `id`, whose slot now starts at `top` (viewport
-    /// pixels). `below`: the next row's id and slot top, so a row put back
-    /// between two others opens with the gap instead of being covered.
-    pub fn row(
+    /// pixels). `below` holds the following rows' ids and slot tops in
+    /// order, so restored rows appear as the list makes room for them.
+    pub fn row<'a>(
         &mut self,
         id: &str,
         top: f32,
-        below: Option<(&str, f32)>,
+        height: f32,
+        below: impl IntoIterator<Item = (&'a str, f32)>,
         now: Instant,
     ) -> RowMotion {
         let p = self.transition.progress(now);
@@ -533,17 +534,26 @@ impl<R: Clone> ListShift<R> {
                 reveal: 1.0,
             },
             None => {
-                // The row below came down from above: this row was put in
-                // between (undo, new mail), and it grows with the gap it
-                // sits in.
-                let opening = below
-                    .and_then(|(next, next_top)| self.resolve(next, next_top))
-                    .is_some_and(|dy| dy < -0.5);
-                if opening {
+                // Consecutive restored rows share the gap opened by the
+                // first surviving row below them. Reveal each slot only
+                // as that row passes it.
+                let reach = self.reach + height;
+                let opening = (!self.replaced)
+                    .then(|| {
+                        below
+                            .into_iter()
+                            .take_while(|(_, next_top)| *next_top - top <= reach)
+                            .find_map(|(next, next_top)| {
+                                self.resolve(next, next_top).map(|dy| (next_top, dy))
+                            })
+                    })
+                    .flatten();
+                if let Some((next_top, dy)) = opening.filter(|(_, dy)| *dy < -0.5) {
+                    let gap = next_top - top + dy * (1.0 - p);
                     RowMotion {
                         dy: 0.0,
                         opacity: p,
-                        reveal: p,
+                        reveal: (gap / height).clamp(0.0, 1.0),
                     }
                 } else {
                     // Arriving in a slot nothing slides into (another
@@ -748,8 +758,8 @@ mod tests {
             false,
             start,
         );
-        assert_eq!(shift.row("a", 0.0, None, start), RowMotion::STILL);
-        let c = shift.row("c", 68.0, None, start);
+        assert_eq!(shift.row("a", 0.0, 68.0, None, start), RowMotion::STILL);
+        let c = shift.row("c", 68.0, 68.0, None, start);
         assert_eq!(
             c,
             RowMotion {
@@ -764,9 +774,12 @@ mod tests {
         assert_eq!(ghosts[0].0, "b");
         assert_eq!(ghosts[0].1, 0.0);
         assert!(shift.running(at(start, 60)));
-        let mid = shift.row("c", 68.0, None, at(start, 60));
+        let mid = shift.row("c", 68.0, 68.0, None, at(start, 60));
         assert!(mid.dy > 0.0 && mid.dy < 68.0);
-        assert_eq!(shift.row("c", 68.0, None, at(start, 120)), RowMotion::STILL);
+        assert_eq!(
+            shift.row("c", 68.0, 68.0, None, at(start, 120)),
+            RowMotion::STILL
+        );
         assert!(shift.ghosts_in(68.0, 68.0, at(start, 120)).is_empty());
         assert!(!shift.running(at(start, 120)));
     }
@@ -784,16 +797,22 @@ mod tests {
             start,
         )
         .unwrap();
-        assert_eq!(shift.row("new", 0.0, None, start).opacity, ARRIVE_FROM);
         assert_eq!(
-            shift.row("far", 900.0, None, start),
+            shift.row("new", 0.0, 68.0, None, start).opacity,
+            ARRIVE_FROM
+        );
+        assert_eq!(
+            shift.row("far", 900.0, 68.0, None, start),
             RowMotion {
                 dy: 0.0,
                 opacity: ARRIVE_FROM,
                 reveal: 1.0,
             }
         );
-        assert_eq!(shift.row("new", 0.0, None, at(start, 80)).opacity, 1.0);
+        assert_eq!(
+            shift.row("new", 0.0, 68.0, None, at(start, 80)).opacity,
+            1.0
+        );
     }
 
     #[test]
@@ -801,22 +820,41 @@ mod tests {
         let start = Instant::now();
         // Undo puts b back between a and c: c was at 68 and now sits at 136.
         let mut shift = shift(&[("a", 0.0), ("c", 68.0)], &[], vec![], false, start);
-        let b = shift.row("b", 68.0, Some(("c", 136.0)), start);
+        let b = shift.row("b", 68.0, 68.0, Some(("c", 136.0)), start);
         assert_eq!(b.reveal, 0.0, "closed while c still covers its slot");
         assert_eq!(b.opacity, 0.0, "it grows with its gap");
         let mid = at(start, 40);
-        let b = shift.row("b", 68.0, Some(("c", 136.0)), mid);
-        let c = shift.row("c", 136.0, None, mid);
+        let b = shift.row("b", 68.0, 68.0, Some(("c", 136.0)), mid);
+        let c = shift.row("c", 136.0, 68.0, None, mid);
         // The part of b that shows ends where c is drawn.
         assert!((68.0 + 68.0 * b.reveal - (136.0 + c.dy)).abs() < 0.01);
         assert_eq!(
             shift
-                .row("b", 68.0, Some(("c", 136.0)), at(start, 120))
+                .row("b", 68.0, 68.0, Some(("c", 136.0)), at(start, 120))
                 .reveal,
             1.0
         );
         // A row added at the end has nothing to make room for.
-        assert_eq!(shift.row("d", 204.0, None, start).reveal, 1.0);
+        assert_eq!(shift.row("d", 204.0, 68.0, None, start).reveal, 1.0);
+    }
+
+    #[test]
+    fn consecutive_restored_rows_reveal_only_the_space_the_list_opens() {
+        let start = Instant::now();
+        let slots = [("b", 68.0), ("c", 136.0), ("d", 204.0), ("e", 272.0)];
+        let mut shift = shift(&[("a", 0.0), ("e", 68.0)], &[], vec![], false, start);
+
+        for ms in [0, 8, 16, 40, 80, 120] {
+            let now = at(start, ms);
+            let mut revealed = 0.0;
+            for (index, (id, top)) in slots[..3].iter().copied().enumerate() {
+                let row = shift.row(id, top, 68.0, slots[index + 1..].iter().copied(), now);
+                revealed += row.reveal * 68.0;
+                assert_eq!(row.dy, 0.0);
+            }
+            let next = shift.row("e", 272.0, 68.0, None, now);
+            assert!((revealed - (272.0 + next.dy - 68.0)).abs() < 0.01);
+        }
     }
 
     #[test]
@@ -824,7 +862,10 @@ mod tests {
         let start = Instant::now();
         let mut replaced = shift(&[("a", 0.0)], &[("a", 0.0)], vec![], false, start);
         assert!(replaced.ghosts_in(0.0, 68.0, start).is_empty());
-        assert_eq!(replaced.row("x", 0.0, None, start).opacity, ARRIVE_FROM);
+        assert_eq!(
+            replaced.row("x", 0.0, 68.0, None, start).opacity,
+            ARRIVE_FROM
+        );
     }
 
     #[test]
@@ -845,7 +886,7 @@ mod tests {
             let now = at(start, ms);
             for (i, (id, top)) in rows.iter().enumerate() {
                 let below = rows.get(i + 1).map(|(id, top)| (*id, *top));
-                let drawn = switched.row(id, *top, below, now);
+                let drawn = switched.row(id, *top, 68.0, below, now);
                 assert!(drawn.opacity >= ARRIVE_FROM, "{id} at {ms} ms: {drawn:?}");
                 assert!(drawn.opacity >= last[i], "never dims again");
                 assert_eq!((drawn.dy, drawn.reveal), (0.0, 1.0));
@@ -960,13 +1001,22 @@ mod tests {
         // The rows landed at `start`, but the first frame that draws them
         // comes 90 ms later, longer than the whole fade.
         let first = at(start, 90);
-        assert_eq!(switched.row("x", 0.0, None, first).opacity, ARRIVE_FROM);
+        assert_eq!(
+            switched.row("x", 0.0, 68.0, None, first).opacity,
+            ARRIVE_FROM
+        );
         assert!(switched.running(first), "the fade has only begun");
-        let mid = switched.row("x", 0.0, None, at(start, 110)).opacity;
+        let mid = switched.row("x", 0.0, 68.0, None, at(start, 110)).opacity;
         assert!(mid > ARRIVE_FROM && mid < 1.0, "{mid}");
         // A row drawn later than the first one joins the same fade.
-        assert_eq!(switched.row("y", 68.0, None, at(start, 110)).opacity, mid);
-        assert_eq!(switched.row("x", 0.0, None, at(start, 170)).opacity, 1.0);
+        assert_eq!(
+            switched.row("y", 68.0, 68.0, None, at(start, 110)).opacity,
+            mid
+        );
+        assert_eq!(
+            switched.row("x", 0.0, 68.0, None, at(start, 170)).opacity,
+            1.0
+        );
         assert!(!switched.running(at(start, 170)));
     }
 
@@ -990,7 +1040,7 @@ mod tests {
             at(start, 20),
         );
         assert!(switched.ghosts_in(0.0, 1000.0, at(start, 20)).is_empty());
-        let b = switched.row("b", 0.0, None, at(start, 20));
+        let b = switched.row("b", 0.0, 68.0, None, at(start, 20));
         assert_eq!(b.dy, 0.0, "a shared row fades in with the rest");
         assert!(b.opacity < 1.0);
     }
@@ -1011,7 +1061,7 @@ mod tests {
         let fading = switched.ghosts_in(68.0, f32::INFINITY, start);
         assert_eq!(fading.len(), 2);
         assert!(fading.iter().all(|(_, _, opacity)| *opacity == 1.0));
-        let row = switched.row("s1", 0.0, None, start);
+        let row = switched.row("s1", 0.0, 68.0, None, start);
         assert!(row.opacity < 1.0, "Sent's rows arrive");
         let mid = switched.ghosts_in(68.0, f32::INFINITY, at(start, 60));
         assert!(
@@ -1034,8 +1084,8 @@ mod tests {
         let start = Instant::now();
         // New mail above the viewport: the list scrolled by the same amount.
         let mut shift = shift(&[("a", 0.0), ("b", 68.0)], &[], vec![], false, start);
-        shift.row("a", 0.0, None, start);
-        shift.row("b", 68.0, None, start);
+        shift.row("a", 0.0, 68.0, None, start);
+        shift.row("b", 68.0, 68.0, None, start);
         assert!(shift.is_still());
     }
 
@@ -1049,7 +1099,7 @@ mod tests {
             false,
             start,
         );
-        first.row("c", 0.0, None, start);
+        first.row("c", 0.0, 68.0, None, start);
         let mid = at(start, 30);
         let offset = first.offset_of("c", 0.0, mid);
         assert!(offset > 0.0 && offset < 68.0);
@@ -1086,7 +1136,7 @@ mod tests {
             false,
             later,
         );
-        let drawn = second.row("c", 0.0, None, later);
+        let drawn = second.row("c", 0.0, 68.0, None, later);
         assert!((drawn.dy - (68.0 + c)).abs() < 0.01, "no snap: {drawn:?}");
     }
 
