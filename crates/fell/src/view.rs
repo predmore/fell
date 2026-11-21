@@ -52,12 +52,29 @@ use crate::sync_worker::{self, SyncEvent, SyncHandle};
 use crate::text_cut;
 use crate::text_render::BodyBlock;
 use crate::theme::{self, Theme};
+use crate::ui_trace::UiTrace;
 
 use self::disclosure::disclosure;
 
-pub fn run() {
+pub fn run(trace_start: Option<Instant>) {
     eprintln!("{}: opening inbox", fell_version::VERSION);
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
+        let trace = trace_start.and_then(|start| match UiTrace::open(start) {
+            Ok(trace) => Some(trace),
+            Err(error) => {
+                eprintln!("fell: could not open UI trace: {error}");
+                None
+            }
+        });
+        if let Some(trace) = &trace {
+            cx.set_global(trace.clone());
+            let trace = trace.clone();
+            cx.on_app_quit(move |_| {
+                trace.finish();
+                std::future::ready(())
+            })
+            .detach();
+        }
         // Agents' drafts open in a compose window from here; see draft_host.
         let _hub = crate::draft_host::host_agent_drafts(cx);
         let (width, height) = window_size();
@@ -75,14 +92,27 @@ pub fn run() {
                 ..Default::default()
             },
             |window, cx| {
+                if let Some(trace) = &trace {
+                    trace.window_created(window);
+                }
                 let view = cx.new(Inbox::new);
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus);
                 view
             },
         );
-        if view.is_err() {
-            eprintln!("fell: could not open a window");
+        match view {
+            Ok(view) => {
+                if let Some(trace) = trace {
+                    cx.on_window_closed(move |cx| {
+                        if !cx.windows().contains(&view.into()) {
+                            trace.finish();
+                        }
+                    })
+                    .detach();
+                }
+            }
+            Err(_) => eprintln!("fell: could not open a window"),
         }
         cx.activate(true);
     });
@@ -492,6 +522,9 @@ impl Inbox {
         sync_with: Option<(AccountConfig, std::path::PathBuf)>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(trace) = cx.try_global::<UiTrace>() {
+            trace.store_opened(opened.error.as_deref());
+        }
         self.account_id = opened.account.id.clone();
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();
@@ -891,6 +924,9 @@ impl Inbox {
                 return;
             }
         };
+        if let Some(trace) = cx.try_global::<UiTrace>() {
+            trace.folder_ready();
+        }
         self.session.clear_query_fault(QueryFault::Folder);
         // The person's drafts first, as the editor has them right now. They
         // sit above the folder's first row, so they show only when the rows
@@ -2674,6 +2710,9 @@ impl Inbox {
         if key == KeyId::Char('y') && event.is_held {
             return;
         }
+        let trace = cx
+            .try_global::<UiTrace>()
+            .map(|trace| (trace.clone(), Instant::now()));
         if let Some(log) = &self.frames {
             log.borrow_mut().key(started, event.keystroke.unparse());
         }
@@ -2710,6 +2749,9 @@ impl Inbox {
         };
         self.session.clear_toast();
         let step = self.session.on_key(key, page);
+        if let Some((trace, started)) = trace {
+            trace.key(started, step.action.map_or("Inbox input", Action::label));
+        }
         self.apply_step(step, before, cx);
         cx.stop_propagation();
     }
@@ -3408,6 +3450,13 @@ impl Render for Inbox {
                 )
                 .absolute()
                 .size_0(),
+            )
+        })
+        .when_some(cx.try_global::<UiTrace>().cloned(), |root, trace| {
+            root.child(
+                gpui::canvas(|_, _, _| (), move |_, _, window, _| trace.painted(window))
+                    .absolute()
+                    .size_0(),
             )
         })
     }

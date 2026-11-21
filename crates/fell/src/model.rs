@@ -275,6 +275,7 @@ pub struct ReadDwell {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
+    pub action: Option<Action>,
     pub reload_threads: bool,
     pub reload_messages: bool,
     pub arm_which: bool,
@@ -1584,7 +1585,10 @@ impl Session {
                     return step;
                 }
                 if let Some(action) = self.keymap.attachment_action(key) {
-                    return self.run(action, page_rows);
+                    return Step {
+                        action: Some(action),
+                        ..self.run(action, page_rows)
+                    };
                 }
             }
             match key {
@@ -1638,6 +1642,7 @@ impl Session {
                 // Everything the action asked for, so a new Step field cannot
                 // be dropped here (sync_now was, so `space s` did nothing).
                 step = Step {
+                    action: Some(action),
                     arm_which: true,
                     ..self.run(action, page_rows)
                 };
@@ -1734,7 +1739,7 @@ impl Session {
 
     pub fn confirm_palette(&mut self, item: PaletteItem, page_rows: usize) -> Step {
         self.overlay = Overlay::None;
-        match item.search {
+        let step = match item.search {
             Some(query) => self.apply_input(|session| {
                 let step = session.start_search(Some(query));
                 session.search.as_mut().unwrap().editing = false;
@@ -1742,6 +1747,10 @@ impl Session {
                 step
             }),
             None => self.perform(item.action, page_rows),
+        };
+        Step {
+            action: Some(item.action),
+            ..step
         }
     }
 
@@ -3720,6 +3729,19 @@ mod tests {
         session.cancel_pending_keys();
         assert!(session.toast.is_none());
         assert!(!session.on_key(KeyId::Char('y'), 4).purge);
+    }
+
+    #[test]
+    fn palette_enter_reports_the_action_it_runs() {
+        let mut session = session();
+        session.cursor_id = Some("a".into());
+        session.on_key(KeyId::Char(':'), 4);
+        for ch in "archive".chars() {
+            session.on_key(KeyId::Char(ch), 4);
+        }
+        let step = session.on_key(KeyId::Enter, 4);
+        assert_eq!(step.action, Some(Action::Archive));
+        assert!(step.archive);
     }
 
     #[test]
