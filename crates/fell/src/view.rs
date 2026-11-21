@@ -1903,12 +1903,9 @@ impl Inbox {
         done: impl FnOnce(&mut Self, Result<T, fell_core::Error>) -> Option<ReadIntent> + 'static,
         cx: &mut Context<Self>,
     ) {
-        let searching = self.session.search.is_some();
-        if searching && self.session.refresh_search() {
-            // Retain the current view while the write runs. It will be
-            // reread once the store can see the change.
-            self.cancel_search_work();
-        }
+        // Retain the current view while the write runs. It will be
+        // reread once the store can see the change.
+        self.begin_search_refresh(cx);
         let reply = self.store.call(change);
         cx.spawn(async move |this, cx| {
             let Ok(result) = reply.await else {
@@ -2110,7 +2107,7 @@ impl Inbox {
         let folder = self.list_folder.clone();
         let count = ids.len();
         let done_text = match removal {
-            Removal::Archive => archived_notice(count),
+            Removal::Archive => archived_notice(count, count),
             Removal::Delete => moved_notice(
                 count,
                 &self.session.folder_text(roles.name(FolderRole::Trash)),
@@ -5105,54 +5102,33 @@ fn thread_line_two(
         Some(subject_color),
     );
     let shaped_w = subject.as_ref().map_or(0.0, |line| f32::from(line.width));
-    let (visible_w, snippet_x) = row_widths::line_two(box_w, shaped_w);
-    let draw_snippet = |x: f32, width: f32, opacity| {
-        let line = clip_shaped(
-            window,
-            &style,
-            &row.snippet,
-            width,
-            FontWeight::NORMAL,
-            Some(snippet_color),
-        )?;
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(x))
-                .w(px((text_width - x).max(24.0)))
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .opacity(opacity)
-                .child(shaped_text(line, window)),
-        )
-    };
-    let fade = frame.snippet_fade.and_then(|fade| {
-        let old = clip_shaped(
-            window,
-            &style,
-            &row.subject,
-            fade.old_room.min(max_subject),
-            row_weight(true),
-            None,
-        )?;
-        let (_, old_x) = row_widths::line_two(fade.old_box.min(max_subject), old.width.into());
-        (old_x > snippet_x).then_some((old_x, fade))
-    });
-    let outgoing =
-        fade.and_then(|(x, fade)| draw_snippet(x, (text_width - x).max(24.0), fade.outgoing));
+    let (subject_x, visible_w, snippet_x) = row_widths::line_two(box_w, room, shaped_w);
     let snippet_w = (text_width - room.min(shaped_w) - row_widths::SUBJECT_GAP).max(24.0);
-    let incoming = draw_snippet(
-        snippet_x,
+    let snippet = clip_shaped(
+        window,
+        &style,
+        &row.snippet,
         snippet_w,
-        fade.map_or(1.0, |(_, fade)| fade.incoming),
-    );
+        FontWeight::NORMAL,
+        Some(snippet_color),
+    )
+    .map(|line| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(snippet_x))
+            .w(px((text_width - snippet_x).max(24.0)))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .child(shaped_text(line, window))
+    });
     let subject = subject.map(|line| {
         let clipped = (shaped_w.min(room) - visible_w).clamp(0.0, 1.0);
         div()
             .relative()
+            .left(px(subject_x))
             .flex_none()
             .w(px(visible_w))
             .overflow_hidden()
@@ -5186,8 +5162,7 @@ fn thread_line_two(
         .items_center()
         .overflow_hidden()
         .children(subject)
-        .children(outgoing)
-        .children(incoming)
+        .children(snippet)
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
@@ -7768,10 +7743,11 @@ fn moved_notice(count: usize, to: &str) -> String {
     }
 }
 
-fn archived_notice(count: usize) -> String {
-    match count {
-        1 => "Archived · u".into(),
-        n => format!("Archived {n} · u"),
+fn archived_notice(count: usize, selected: usize) -> String {
+    if count == 1 && selected == 1 {
+        "Archived · u".into()
+    } else {
+        format!("Archived {count} · u")
     }
 }
 

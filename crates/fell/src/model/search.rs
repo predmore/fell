@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use fell_core::{MessageId, SearchField, SearchHit, SearchLocation, SearchMatch, SearchPreview};
 
@@ -9,6 +10,8 @@ use super::{Fetch, Pending, Session, Step, Toast};
 use crate::keymap::KeyId;
 use crate::present::{ConvMessage, NameSpan, Pane, Rich, ThreadRow, display_name, one_line};
 use crate::text_render::BodyBlock;
+
+pub const REFRESH_FEEDBACK_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug)]
 pub(super) struct FolderList {
@@ -40,6 +43,7 @@ pub struct Search {
     requested: String,
     accepted: Option<(u64, String)>,
     dirty: bool,
+    pub refresh_started: Option<Instant>,
     pub matches: Vec<SearchMatch>,
     matches_for: Option<(u64, String)>,
 }
@@ -190,6 +194,13 @@ impl Search {
 
     pub fn results_current(&self) -> bool {
         !self.pending && self.error.is_none()
+    }
+
+    pub fn show_pending_feedback(&self, now: Instant) -> bool {
+        self.pending
+            && self
+                .refresh_started
+                .is_none_or(|start| now.duration_since(start) >= REFRESH_FEEDBACK_DELAY)
     }
 
     pub fn effective_query(&self) -> &str {
@@ -367,6 +378,7 @@ impl Session {
             self.search_generation = self.search_generation.wrapping_add(1);
             search.requested = query;
             search.error = None;
+            search.refresh_started = None;
             search.pending = !search.requested.is_empty()
                 && (search.dirty
                     || search
@@ -393,7 +405,7 @@ impl Session {
         self.update_search_completion()
     }
 
-    pub fn refresh_search(&mut self) -> bool {
+    pub fn refresh_search(&mut self, now: Instant) -> bool {
         let Some(search) = self
             .search
             .as_mut()
@@ -402,6 +414,17 @@ impl Session {
             return false;
         };
         self.search_generation = self.search_generation.wrapping_add(1);
+        // Keep the count for a short same-query refresh. A second request
+        // after a mailbox write inherits the time spent waiting for it.
+        if search.error.is_none()
+            && !search.hits.is_empty()
+            && search
+                .accepted
+                .as_ref()
+                .is_some_and(|(_, accepted)| *accepted == search.requested)
+        {
+            search.refresh_started.get_or_insert(now);
+        }
         search.pending = true;
         search.dirty = true;
         true
@@ -560,6 +583,7 @@ impl Session {
             let search = self.search.as_mut().unwrap();
             self.deferred_read = None;
             search.pending = false;
+            search.refresh_started = None;
             search.error = Some(Toast {
                 text: one_line(&error),
                 alert: true,
@@ -585,6 +609,7 @@ impl Session {
         }
         let search = self.search.as_mut().unwrap();
         search.pending = false;
+        search.refresh_started = None;
         search.dirty = false;
         search.error = None;
         search.correction = reply.correction.take();
@@ -1039,6 +1064,35 @@ mod tests {
     }
 
     #[test]
+    fn a_same_query_refresh_keeps_the_count_for_300_ms() {
+        let mut session = session();
+        session.on_key(KeyId::Char('/'), 10);
+        session.type_search("hall");
+        let start = Instant::now();
+        let pending_feedback = |session: &Session, ms| {
+            session
+                .search
+                .as_ref()
+                .unwrap()
+                .show_pending_feedback(start + Duration::from_millis(ms))
+        };
+        assert!(pending_feedback(&session, 0));
+        land(&mut session, reply(vec![row_hit("one", "m1")], None));
+
+        assert!(session.refresh_search(start));
+        assert!(!session.search_results_current());
+        assert!(!pending_feedback(&session, 0));
+        assert!(session.refresh_search(start + Duration::from_millis(100)));
+        assert!(!pending_feedback(&session, 299));
+        assert!(pending_feedback(&session, 300));
+
+        session.type_search(" venue");
+        assert!(pending_feedback(&session, 150));
+        land(&mut session, reply(vec![row_hit("two", "m2")], None));
+        assert!(!pending_feedback(&session, 300));
+    }
+
+    #[test]
     fn read_dwell_waits_for_search_to_confirm_the_open_folder() {
         for (folder, mark_read) in [("INBOX", true), ("Archive", false)] {
             let mut session = session();
@@ -1054,7 +1108,7 @@ mod tests {
             session.on_key(KeyId::Enter, 10);
             let dwell = session.on_key(KeyId::Enter, 10).read_after.unwrap();
             assert!(session.on_key(KeyId::Char('s'), 10).flags.is_some());
-            assert!(session.refresh_search());
+            assert!(session.refresh_search(Instant::now()));
 
             assert_eq!(session.read_after_dwell(dwell), None);
             assert!(session.threads[0].unread);

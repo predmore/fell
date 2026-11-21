@@ -10,7 +10,7 @@ use fell_core::{MessageId, SearchPreview, Store};
 use gpui::{HighlightStyle, StyledText};
 
 use super::*;
-use crate::model::search::{CompletionField, Search, SearchReply};
+use crate::model::search::{CompletionField, REFRESH_FEEDBACK_DELAY, Search, SearchReply};
 
 const PREVIEW_BATCH: usize = 32;
 const SUGGESTION_LIMIT: usize = 4;
@@ -353,8 +353,7 @@ impl Inbox {
     }
 
     pub(super) fn refresh_search(&mut self, cx: &mut Context<Self>) {
-        if self.session.refresh_search() {
-            self.cancel_search_work();
+        if self.begin_search_refresh(cx) {
             self.request_search(cx);
         }
     }
@@ -416,6 +415,32 @@ impl Inbox {
             });
         })
         .detach();
+    }
+
+    pub(super) fn begin_search_refresh(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        if !self.session.refresh_search(now) {
+            return false;
+        }
+        self.cancel_search_work();
+        if self.session.search.as_ref().unwrap().refresh_started == Some(now) {
+            let timer = cx.background_executor().timer(REFRESH_FEEDBACK_DELAY);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |inbox, cx| {
+                    if inbox
+                        .session
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.refresh_started == Some(now))
+                    {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        true
     }
 
     pub(super) fn cancel_search_work(&self) {
@@ -480,7 +505,7 @@ impl Inbox {
                     let role_label =
                         |role| inbox.session.folder_text(inbox.session.roles.name(role));
                     let done = match removal {
-                        Removal::Archive => archived_notice(count),
+                        Removal::Archive => archived_notice(count, ids.len()),
                         Removal::Delete => moved_notice(count, &role_label(FolderRole::Trash)),
                         Removal::Spam if action.kind == fell_core::ActionKind::NotSpam => {
                             moved_notice(count, &role_label(FolderRole::Inbox))
@@ -1131,11 +1156,12 @@ pub(super) fn feedback(
         .correction
         .as_ref()
         .filter(|_| search.results_current());
+    let show_pending = search.show_pending_feedback(Instant::now());
     let line = if let Some(correction) = correction {
         Some((format!("Did you mean {correction}?"), true))
     } else if let Some(value) = suggestion {
         Some((format!("Complete with {value}"), true))
-    } else if search.pending {
+    } else if show_pending {
         Some((
             (if count > 0 {
                 "Searching… · showing previous results"
@@ -1178,7 +1204,7 @@ pub(super) fn feedback(
                 .items_center()
                 .text_color(rgb(if accept { theme.accent } else { theme.dimmed }))
                 .child(div().flex_1().min_w_0().truncate().child(label))
-                .when(search.pending && suggestion.is_some(), |row| {
+                .when(show_pending && suggestion.is_some(), |row| {
                     row.child(
                         div()
                             .flex_none()
