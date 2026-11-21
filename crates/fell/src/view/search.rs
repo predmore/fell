@@ -1162,15 +1162,7 @@ pub(super) fn feedback(
     } else if let Some(value) = suggestion {
         Some((format!("Complete with {value}"), true))
     } else if show_pending {
-        Some((
-            (if count > 0 {
-                "Searching… · showing previous results"
-            } else {
-                "Searching…"
-            })
-            .to_owned(),
-            false,
-        ))
+        Some(("Searching…".to_owned(), false))
     } else if search.error.is_some() && count > 0 {
         Some(("Showing previous results".to_owned(), false))
     } else if count > 0 {

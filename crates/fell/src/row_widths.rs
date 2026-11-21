@@ -255,12 +255,12 @@ impl RowWidths {
 }
 
 /// The subject's offset and visible width, and the start of the snippet.
-/// While the box shrinks, align the shorter subject to the moving edge
-/// so the gap stays fixed as both pieces of text slide left.
+/// The subject stays left-aligned. When the box shrinks, its surplus
+/// width briefly opens the gap before the snippet settles.
 pub fn line_two(box_width: f32, room: f32, shaped_width: f32) -> (f32, f32, f32) {
-    let subject_x = (box_width - room).max(0.0);
     let subject_w = box_width.min(shaped_width);
-    (subject_x, subject_w, subject_x + subject_w + SUBJECT_GAP)
+    let surplus = (box_width - room).max(0.0);
+    (0.0, subject_w, subject_w + surplus + SUBJECT_GAP)
 }
 
 #[cfg(test)]
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn the_measured_subject_to_snippet_gap_holds_in_both_directions() {
+    fn the_subject_stays_left_aligned_and_the_snippet_settles_at_the_gap() {
         let mut widths = RowWidths::default();
         let start = Instant::now();
         draw(&mut widths, "t1", false, start);
@@ -351,13 +351,22 @@ mod tests {
             let from = snippet_x(draw(&mut widths, "t1", !unread, key));
             let to = natural(unread) + SUBJECT_GAP;
             let mut previous = from;
+            let mut previous_gap = from - natural(unread);
             for ms in 0..=120 {
                 let frame = draw(&mut widths, "t1", unread, at(key, ms));
                 assert_eq!(frame.bold, unread, "{ms} ms");
                 let (subject_x, visible, snippet) =
                     line_two(frame.subject_w, frame.subject_room, natural(frame.bold));
+                assert_eq!(subject_x, 0.0, "{ms} ms");
                 let gap = snippet - (subject_x + visible);
-                assert!((gap - SUBJECT_GAP).abs() < 0.01, "{ms} ms: {gap} px");
+                if unread {
+                    assert!((gap - SUBJECT_GAP).abs() < 0.01, "{ms} ms: {gap} px");
+                } else {
+                    assert!(
+                        gap <= previous_gap && gap >= SUBJECT_GAP,
+                        "{ms} ms: {gap} px"
+                    );
+                }
                 if ms == 0 {
                     assert_eq!(from, snippet);
                 } else if unread {
@@ -371,8 +380,10 @@ mod tests {
                     assert!((0.75 * total..total).contains(&distance));
                 }
                 previous = snippet;
+                previous_gap = gap;
             }
             assert_eq!(previous, to);
+            assert_eq!(previous_gap, SUBJECT_GAP);
         }
     }
 

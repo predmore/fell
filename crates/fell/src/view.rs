@@ -5068,8 +5068,7 @@ fn names(
         .child(line)
 }
 
-/// Line two: the subject and the snippet. `background` is the row's fill
-/// this frame, which the clipped subject's edge fades into.
+/// Line two: the subject and the snippet. Clipped edges fade into the row fill.
 fn thread_line_two(
     theme: &Theme,
     row: &ThreadRow,
@@ -5104,6 +5103,7 @@ fn thread_line_two(
     let shaped_w = subject.as_ref().map_or(0.0, |line| f32::from(line.width));
     let (subject_x, visible_w, snippet_x) = row_widths::line_two(box_w, room, shaped_w);
     let snippet_w = (text_width - room.min(shaped_w) - row_widths::SUBJECT_GAP).max(24.0);
+    let snippet_visible_w = (text_width - snippet_x).max(0.0);
     let snippet = clip_shaped(
         window,
         &style,
@@ -5113,16 +5113,22 @@ fn thread_line_two(
         Some(snippet_color),
     )
     .map(|line| {
+        // The final ellipsis can slide past the edge while the subject box
+        // shrinks. Fade that edge until the shaped snippet fits again.
+        let clipped = (f32::from(line.width) - snippet_visible_w).clamp(0.0, 1.0);
         div()
             .absolute()
             .top_0()
             .bottom_0()
             .left(px(snippet_x))
-            .w(px((text_width - snippet_x).max(24.0)))
+            .w(px(snippet_visible_w))
             .flex()
             .items_center()
             .overflow_hidden()
             .child(shaped_text(line, window))
+            .when(!frame.bold && clipped > 0.0, |snippet| {
+                snippet.child(row_text_edge_fade(background, snippet_visible_w, clipped))
+            })
     });
     let subject = subject.map(|line| {
         let clipped = (shaped_w.min(room) - visible_w).clamp(0.0, 1.0);
@@ -5134,22 +5140,7 @@ fn thread_line_two(
             .overflow_hidden()
             .child(shaped_text(line, window))
             .when(clipped > 0.0, |subject| {
-                let solid = gpui::Hsla::from(rgb(background));
-                let clear = gpui::Hsla { a: 0.0, ..solid };
-                subject.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .right_0()
-                        .w(px(row_widths::SUBJECT_FADE.min(visible_w)))
-                        .opacity(clipped)
-                        .bg(gpui::linear_gradient(
-                            90.,
-                            gpui::linear_color_stop(clear, 0.),
-                            gpui::linear_color_stop(solid, 1.),
-                        )),
-                )
+                subject.child(row_text_edge_fade(background, visible_w, clipped))
             })
     });
     // Keep line two at a fixed height while the snippet fills in.
@@ -5163,6 +5154,23 @@ fn thread_line_two(
         .overflow_hidden()
         .children(subject)
         .children(snippet)
+}
+
+fn row_text_edge_fade(background: u32, width: f32, opacity: f32) -> gpui::Div {
+    let solid = gpui::Hsla::from(rgb(background));
+    let clear = gpui::Hsla { a: 0.0, ..solid };
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(row_widths::SUBJECT_FADE.min(width)))
+        .opacity(opacity)
+        .bg(gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(clear, 0.),
+            gpui::linear_color_stop(solid, 1.),
+        ))
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
@@ -7918,7 +7926,7 @@ mod tests {
     use super::{
         FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX,
         ReaderColumns, account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, fit_folder_path, key_from, message_content_width, moved_in_list,
+        expanded_header_widths, fit_folder_path, key_from, message_content_width,
         picker_card_height, should_follow_visible, unread_bar_dx, useful_header_email,
         write_back_notice,
     };
