@@ -21,7 +21,7 @@ use fell_core::{
 };
 use futures::StreamExt;
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, FontWeight, HighlightStyle, InteractiveElement,
+    App, Application, AvailableSpace, Bounds, Context, FocusHandle, FontWeight, HighlightStyle, InteractiveElement,
     IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement,
     Render, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
     StyledText, TextStyle, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
@@ -41,8 +41,8 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, LabelEdit, Overlay, QueryFault, ReadDwell, Session,
-    Step, SyncKind, Toast, row_key,
+    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
+    QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
@@ -267,7 +267,13 @@ impl PendingLabels {
         }
     }
 
-    fn land(&mut self, read: u64, rows: &mut [ThreadRow], mut labels: Option<&mut Vec<String>>) {
+    fn land(
+        &mut self,
+        read: u64,
+        rows: &mut [ThreadRow],
+        mut labels: Option<&mut Vec<String>>,
+        scope: Option<&str>,
+    ) {
         // Keep later edits behind any still pending earlier edit, since they
         // can toggle the same chip and completion callbacks can land apart.
         while self
@@ -278,7 +284,9 @@ impl PendingLabels {
             self.edits.pop_front();
         }
         for pending in &self.edits {
-            pending.edit.apply(rows);
+            if pending.edit.add || scope != Some(&pending.edit.name) {
+                pending.edit.apply(rows);
+            }
             if let Some(labels) = labels.as_deref_mut() {
                 pending.edit.include_name(labels);
             }
@@ -437,6 +445,7 @@ struct Inbox {
     body_refresh: BodyRefresh,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
+    painted_reader: Option<ReaderLayout>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// The folder the rows on screen came from. `session.folder` changes on
@@ -444,6 +453,9 @@ struct Inbox {
     /// move act on this one, the list the reader sees.
     list_folder: String,
     list_label: Option<String>,
+    /// Visible label rows as they looked in the last list prepaint.
+    painted_label_rows: Vec<LeavingRow>,
+    leaving_rows: Option<Arc<[LeavingRow]>>,
     /// Paint-only reader when the last rows leave a label list.
     leaving_reader: Option<Arc<LeavingReader>>,
     /// One folder read at a time is on the store thread.
@@ -465,6 +477,7 @@ struct Inbox {
     /// cannot paint the old state back. Only the latest write clears it.
     pending_flags: std::collections::HashMap<String, (u64, bool, bool)>,
     pending_labels: PendingLabels,
+    label_targets_read: u64,
     /// Bumped by every read or star write.
     flag_gen: u64,
     /// Names and subject widths of the rows on screen, kept so a row
@@ -590,9 +603,12 @@ impl Inbox {
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
             conv_layout_current: false,
+            painted_reader: None,
             sync: None,
             list_folder: FolderRole::Inbox.default_name().into(),
             list_label: None,
+            painted_label_rows: Vec::new(),
+            leaving_rows: None,
             leaving_reader: None,
             read_in_flight: false,
             refresh_in_flight: false,
@@ -602,6 +618,7 @@ impl Inbox {
             pending_removals: std::collections::HashSet::new(),
             pending_flags: std::collections::HashMap::new(),
             pending_labels: PendingLabels::default(),
+            label_targets_read: 0,
             flag_gen: 0,
             row_widths: RowWidths::new(motion),
             conv_gen: Arc::new(AtomicU64::new(0)),
@@ -1181,7 +1198,7 @@ impl Inbox {
             return;
         }
         self.pending_labels
-            .land(self.read_gen, &mut rows, labels.as_mut());
+            .land(self.read_gen, &mut rows, labels.as_mut(), label.as_deref());
         if let Some(labels) = labels {
             self.session.set_labels(labels);
         }
@@ -1189,6 +1206,10 @@ impl Inbox {
         self.list_label = label;
         if switched {
             self.session.forget_window();
+            self.session
+                .picked
+                .retain(|id| rows.iter().any(|row| &row.id == id));
+            self.painted_label_rows.clear();
             self.row_widths.clear();
             if let Some(id) = &self.session.cursor_id
                 && !rows.iter().any(|row| &row.id == id)
@@ -1208,23 +1229,32 @@ impl Inbox {
             && !had_store_rows;
         if emptied {
             let full_width = self.motion.list_emptied(now);
+            if !full_width && self.motion.motion.enabled() {
+                self.leaving_rows = Some(std::mem::take(&mut self.painted_label_rows).into());
+            }
             if self.motion.motion.enabled()
                 && self.conv_layout_current
                 && self.open_thread.is_some()
+                && let Some(layout) = self.painted_reader
             {
                 self.leaving_reader = Some(Arc::new(LeavingReader {
                     subject: self.shown_subject(),
                     messages: std::mem::take(&mut self.session.messages),
                     offset: f32::from(clamped_offset(&self.conv_scroll)),
                     full_width,
+                    layout,
+                    quotes: self.session.quotes_open.clone(),
+                    recipients: self.session.recipients_open.clone(),
                 }));
             }
             self.session.pane = Pane::List;
             self.session.full_width = false;
             self.motion.list_glide = None;
+            self.motion.list = None;
         } else if switched || !rows.is_empty() {
             self.motion.cancel_empty_list();
             self.leaving_reader = None;
+            self.leaving_rows = None;
         }
         let before_id = self.session.cursor_id.clone();
         let before_index = before_id
@@ -1279,7 +1309,7 @@ impl Inbox {
             }
             present::Landing::Jump => self.scroll_list_to_cursor(),
         }
-        if switched || had_rows || !self.session.threads.is_empty() {
+        if !emptied && (switched || had_rows || !self.session.threads.is_empty()) {
             self.start_list_shift(drawn, switched, intent.select.is_some());
         }
         if self.list_label.is_some() {
@@ -1434,7 +1464,7 @@ impl Inbox {
                                         &row_theme,
                                         &chunk[index],
                                         index,
-                                        look,
+                                        &look,
                                         text_width,
                                         window,
                                         cx,
@@ -2425,9 +2455,36 @@ impl Inbox {
             .map(row_key)
     }
 
+    fn read_label_targets(&mut self, cx: &mut Context<Self>) {
+        self.label_targets_read += 1;
+        let generation = self.label_targets_read;
+        let account = self.account_id.clone();
+        let ids = self.session.label_target_ids().to_vec();
+        let reply = self
+            .store
+            .call(move |store| store.thread_labels(&account, &ids));
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = reply.await else { return };
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.label_targets_read == generation {
+                    inbox
+                        .session
+                        .load_label_targets(result.map_err(|err| err.to_string()));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn apply_labels(&mut self, edit: LabelEdit, cx: &mut Context<Self>) {
         let now = self.motion.clock.now();
-        self.session.label_rows(&edit);
+        // A row losing the label it is listed under keeps that chip up to
+        // the frame it leaves. Other lists show the edit immediately.
+        let leaving_scope = !edit.add
+            && self.list_label.as_deref() == Some(&edit.name)
+            && self.session.search.is_none();
+        self.session.label_rows(&edit, leaving_scope);
         let pending = self.pending_labels.start(edit.clone());
         for row in self
             .session
@@ -2441,10 +2498,22 @@ impl Inbox {
         let threads: Vec<_> = edit.ids.into_iter().map(ThreadId).collect();
         let label = present::display_safe(&edit.name);
         let count = threads.len();
-        let notice = if edit.add {
-            format!("Applied “{label}” to {count}")
+        let target = if count == 1 {
+            match self
+                .session
+                .label_target_subject()
+                .map(present::display_safe)
+            {
+                Some(subject) if !subject.trim().is_empty() => format!("“{subject}”"),
+                _ => "1 conversation".into(),
+            }
         } else {
-            format!("Removed “{label}” from {count}")
+            format!("{count} conversations")
+        };
+        let notice = if edit.add {
+            format!("Applied “{label}” to {target}")
+        } else {
+            format!("Removed “{label}” from {target}")
         };
         let change = if edit.add {
             fell_core::LabelChange::Add(edit.name)
@@ -3116,6 +3185,9 @@ impl Inbox {
         if let Some(edit) = step.labels {
             self.apply_labels(edit, cx);
         }
+        if step.read_label_targets {
+            self.read_label_targets(cx);
+        }
         if step.undo {
             self.apply_undo(cx);
         }
@@ -3642,6 +3714,28 @@ impl Render for Inbox {
         self.want_bodies(cx);
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);
+        let list_width = list_width(width, self.split);
+        let split_width = if panes.1 && width >= present::NARROW_WIDTH {
+            list_width + SPLITTER_PX
+        } else {
+            0.0
+        };
+        let reading = self.motion.reading_progress(now);
+        let scale = window.scale_factor();
+        let reader = ReaderLayout {
+            columns: ReaderColumns::new(
+                width,
+                split_width,
+                self.motion.reading_target(),
+                reading,
+                scale,
+            )
+            .with_reflow(reflow),
+            left: ReaderColumns::pane_left(split_width, reading, scale),
+            focus: self.motion.focus_edge(self.session.pane, now),
+            message_cursor: self.session.message_cursor,
+        };
+        self.painted_reader = panes.1.then_some(reader);
         let reveal_attachment = if reflow.is_some() && reveal_attachment {
             self.reveal_attachment = true;
             false
@@ -3667,37 +3761,20 @@ impl Render for Inbox {
         let exit = self.motion.empty_list_exit(now);
         if exit == 0.0 {
             self.leaving_reader = None;
+            self.leaving_rows = None;
         }
-        let ghosts = if exit > 0.0 && self.session.threads.is_empty() {
-            let offset = -self.list_offset() - ROW_PX;
-            let text_width = row_text_width(if panes.1 {
-                list_width(width, self.split)
-            } else {
-                width
-            });
-            self.motion
-                .list
-                .as_ref()
-                .into_iter()
-                .flat_map(|shift| shift.ghosts_in(offset, f32::INFINITY, now))
-                .enumerate()
-                .map(|(index, (row, top, opacity))| {
-                    ghost_row(
-                        &self.theme,
-                        (row, top - ROW_PX, opacity),
-                        index,
-                        text_width,
-                        0.0,
-                        window,
-                        cx,
-                    )
-                })
-                .collect()
+        if !panes.0 {
+            self.painted_label_rows.clear();
+        }
+        let picker_choices = if self.session.overlay == Overlay::Folders {
+            self.session.picker_choices()
         } else {
             Vec::new()
         };
-        self.motion
-            .fit_card(card_fit(&self.session, &self.theme, window), now);
+        self.motion.fit_card(
+            card_fit(&self.session, &picker_choices, &self.theme, window),
+            now,
+        );
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
@@ -3748,7 +3825,6 @@ impl Render for Inbox {
         let list_scroll = self.list_scroll.clone();
         let conv_scroll = self.conv_scroll.clone();
         let focus = self.focus.clone();
-        let split = self.split;
         let card = self
             .motion
             .card_height(now)
@@ -3763,7 +3839,7 @@ impl Render for Inbox {
             layer.swap(&mut self.session);
         }
         let viewport_height = f32::from(window.viewport_size().height);
-        let mut overlay_card = |session: &Session, motion, live, label_target: Option<String>| {
+        let mut overlay_card = |session: &Session, motion, live, picker: (&[PickerChoice], Option<String>)| {
             let help = self
                 .help_scroll
                 .card(&theme, session, window, now, live, cx);
@@ -3775,7 +3851,7 @@ impl Render for Inbox {
                 live,
                 &self.palette_scroll,
                 &self.folder_scroll,
-                label_target,
+                picker,
                 help,
                 (session.overlay == Overlay::Agents).then(|| {
                     agents::card(
@@ -3798,7 +3874,7 @@ impl Render for Inbox {
                     &self.session,
                     (opacity, 0.0),
                     false,
-                    layer.label_target.clone(),
+                    (&layer.picker_choices, layer.label_target.clone()),
                 )
                 .into_any_element(),
             );
@@ -3809,7 +3885,7 @@ impl Render for Inbox {
                 &self.session,
                 self.motion.overlay(now),
                 true,
-                self.session.label_target(),
+                (&picker_choices, self.session.label_target()),
             )
         });
         let warm = self.warm_layer(width, panes, animating, window, cx);
@@ -3835,16 +3911,17 @@ impl Render for Inbox {
                 warm,
                 active_overlay,
                 conv,
+                reader,
                 cached_preview,
                 list: ListContent {
                     banner,
-                    ghosts,
+                    leaving: self.leaving_rows.clone().map(|rows| (rows, exit)),
                     cached_results: cached_search_rows,
                 },
                 reply_check,
             },
             width,
-            split,
+            (list_width, split_width),
             list_scroll,
             conv_scroll,
             focus,
@@ -3899,6 +3976,7 @@ struct Shown {
     label: Option<String>,
     /// What the conversation's bodies animate this frame.
     conv: ConvFrame,
+    reader: ReaderLayout,
     cached_preview: Option<(u64, gpui::AnyView)>,
     list: ListContent,
     reply_check: Option<ReplyCheck>,
@@ -3909,12 +3987,31 @@ struct LeavingReader {
     messages: Vec<ConvMessage>,
     offset: f32,
     full_width: bool,
+    layout: ReaderLayout,
+    quotes: HashSet<String>,
+    recipients: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ReaderLayout {
+    columns: ReaderColumns,
+    left: f32,
+    focus: f32,
+    message_cursor: usize,
+}
+
+struct LeavingRow {
+    row: ThreadRow,
+    index: usize,
+    look: RowLook,
+    top: f32,
+    motion: RowMotion,
 }
 
 #[derive(Default)]
 struct ListContent {
     banner: Option<(Banner, f32)>,
-    ghosts: Vec<gpui::AnyElement>,
+    leaving: Option<(Arc<[LeavingRow]>, f32)>,
     cached_results: Option<(u64, gpui::AnyView)>,
 }
 
@@ -3978,7 +4075,7 @@ fn shell(
     now: Instant,
     shown: Shown,
     width: f32,
-    split: f32,
+    (list_width, split_width): (f32, f32),
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     focus: FocusHandle,
@@ -3986,20 +4083,7 @@ fn shell(
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let (show_list, show_conv) = present::visible_panes(width, session.pane, session.full_width);
-    let list_width = list_width(width, split);
     let beside = show_conv && width >= present::NARROW_WIDTH;
-    let split_width = if beside {
-        list_width + SPLITTER_PX
-    } else {
-        0.0
-    };
-    let reading = motion.reading_progress(now);
-    let scale = window.scale_factor();
-    let split_space = if beside {
-        ReaderColumns::pane_left(split_width, reading, scale)
-    } else {
-        0.0
-    };
     let list_entry = motion.pane_entry(Pane::List, now);
     let conv_entry = motion.pane_entry(Pane::Conversation, now);
     let status = motion.status(session, now);
@@ -4011,6 +4095,7 @@ fn shell(
         warm,
         active_overlay,
         conv,
+        reader,
         cached_preview,
         list,
         reply_check,
@@ -4156,7 +4241,7 @@ fn shell(
                 .overflow_hidden()
                 .children(warm)
                 .children(swapped_out.into_iter().flatten())
-                .when(show_list || split_space > 0.0, |row| {
+                .when(show_list || reader.left > 0.0, |row| {
                     let list = thread_list(
                         &theme,
                         session,
@@ -4171,7 +4256,7 @@ fn shell(
                             div()
                                 .relative()
                                 .flex_none()
-                                .w(px(split_space))
+                                .w(px(reader.left))
                                 .overflow_hidden()
                                 .child(
                                     div()
@@ -4233,14 +4318,7 @@ fn shell(
                             motion,
                             now,
                             Some(conv_scroll),
-                            ReaderColumns::new(
-                                width,
-                                split_width,
-                                motion.reading_target(),
-                                reading,
-                                scale,
-                            )
-                            .with_reflow(motion.reading_reflow(now)),
+                            reader.columns,
                             Live(conv.preview_current && !session.search_editing()),
                             &conv,
                             window,
@@ -4249,28 +4327,33 @@ fn shell(
                         conv_entry,
                     ))
                 })
-                .when(
-                    !show_conv
-                        && conv
-                            .leaving
-                            .as_ref()
-                            .is_some_and(|(reader, _)| reader.full_width),
-                    |row| {
-                        row.child(div().absolute().top_0().left_0().size_full().flex().child(
-                            conversation(
-                                &theme,
-                                session,
-                                String::new(),
-                                motion,
-                                now,
-                                None,
-                                ReaderColumns::split(width),
-                                Live(false),
-                                &conv,
-                                window,
-                                cx,
-                            ),
-                        ))
+                .when_some(
+                    conv.leaving
+                        .as_ref()
+                        .filter(|(reader, _)| !show_conv && reader.full_width),
+                    |row, (reader, _)| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .left(px(reader.layout.left))
+                                .flex()
+                                .child(conversation(
+                                    &theme,
+                                    session,
+                                    String::new(),
+                                    motion,
+                                    now,
+                                    None,
+                                    reader.layout.columns,
+                                    Live(false),
+                                    &conv,
+                                    window,
+                                    cx,
+                                )),
+                        )
                     },
                 ),
         )
@@ -4811,7 +4894,15 @@ fn thread_list(
                     .banner
                     .map(|(banner, opacity)| empty_state(theme, banner).opacity(opacity)),
             )
-            .children(content.ghosts);
+            .when_some(content.leaving, |pane, (rows, opacity)| {
+                pane.child(leaving_label_rows(
+                    theme.clone(),
+                    rows,
+                    opacity,
+                    row_text_width(list_width),
+                    cx,
+                ))
+            });
     }
 
     let entity = cx.entity();
@@ -4836,6 +4927,8 @@ fn thread_list(
                 // The list also asks for row 0 alone to measure a row's
                 // height; only the rows it draws count as on screen.
                 let drawn = range.len() > 1 || inbox.session.threads.len() == 1;
+                let capture = drawn && inbox.list_label.is_some();
+                let mut painted = Vec::new();
                 if drawn {
                     let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
                     inbox.row_widths.keep_drawn(range.clone(), ids);
@@ -4870,58 +4963,69 @@ fn thread_list(
                             previous_labels,
                         };
                         let element =
-                            thread_row(&theme_for_rows, &row, index, look, text_width, window, cx);
-                        let Some(shift) = inbox.motion.list.as_mut() else {
-                            return element;
-                        };
-                        // Where the row was before the list changed, and the
-                        // rows that left from under it.
+                            thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
                         let top = index as f32 * ROW_PX + offset;
-                        let below = inbox.session.threads[index + 1..]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, next)| (next.id.as_str(), top + (i + 1) as f32 * ROW_PX));
-                        let mut moving = shift.row(&row.id, top, ROW_PX, below, now);
-                        moving.dy = motion::snap(moving.dy, window.scale_factor());
-                        let reach = if index == last { f32::INFINITY } else { ROW_PX };
-                        // Ghosts are kept in content pixels, so they scroll.
-                        let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
-                        // GPUI only asks for in-view slots. Paint rows still
-                        // moving across an edge from the nearest drawn slot.
-                        let extra = shift.overscan(ROW_PX);
-                        let above = (drawn && index == visible.start)
-                            .then(|| visible.start.saturating_sub(extra)..visible.start);
-                        let below = (drawn && index + 1 == visible.end)
-                            .then(|| visible.end..(visible.end + extra).min(last + 1));
-                        let overflow = above
-                            .into_iter()
-                            .chain(below)
-                            .flatten()
-                            .filter_map(|outside| {
-                                let row = &inbox.session.threads[outside];
-                                let slot = outside as f32 * ROW_PX + offset;
-                                let painted =
-                                    shift.visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
-                                let dy = motion::snap(painted - top, window.scale_factor());
-                                let look = RowLook {
-                                    selected: highlighted.contains(&row.id),
-                                    fading: None,
-                                    ghost: true,
-                                    bar_dx,
-                                    frame: still_frame(row, window),
-                                    previous_labels: None,
-                                };
-                                Some(slot_layer(dy, 1.0).child(thread_row(
-                                    &theme_for_rows,
-                                    row,
-                                    outside,
-                                    look,
-                                    text_width,
-                                    window,
-                                    cx,
-                                )))
-                            })
-                            .collect::<Vec<_>>();
+                        let (moving, ghosts, overflow) = if let Some(shift) =
+                            inbox.motion.list.as_mut()
+                        {
+                            let below = inbox.session.threads[index + 1..]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, next)| (next.id.as_str(), top + (i + 1) as f32 * ROW_PX));
+                            let mut moving = shift.row(&row.id, top, ROW_PX, below, now);
+                            moving.dy = motion::snap(moving.dy, window.scale_factor());
+                            let reach = if index == last { f32::INFINITY } else { ROW_PX };
+                            // Ghosts are kept in content pixels, so they scroll.
+                            let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
+                            // GPUI only asks for in-view slots. Paint rows still
+                            // moving across an edge from the nearest drawn slot.
+                            let extra = shift.overscan(ROW_PX);
+                            let above = (drawn && index == visible.start)
+                                .then(|| visible.start.saturating_sub(extra)..visible.start);
+                            let below = (drawn && index + 1 == visible.end)
+                                .then(|| visible.end..(visible.end + extra).min(last + 1));
+                            let overflow = above
+                                .into_iter()
+                                .chain(below)
+                                .flatten()
+                                .filter_map(|outside| {
+                                    let row = &inbox.session.threads[outside];
+                                    let slot = outside as f32 * ROW_PX + offset;
+                                    let painted =
+                                        shift.visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
+                                    let dy = motion::snap(painted - top, window.scale_factor());
+                                    let look = RowLook {
+                                        selected: highlighted.contains(&row.id),
+                                        fading: None,
+                                        ghost: true,
+                                        bar_dx,
+                                        frame: still_frame(row, window),
+                                        previous_labels: None,
+                                    };
+                                    Some(slot_layer(dy, 1.0).child(thread_row(
+                                        &theme_for_rows,
+                                        row,
+                                        outside,
+                                        &look,
+                                        text_width,
+                                        window,
+                                        cx,
+                                    )))
+                                })
+                                .collect::<Vec<_>>();
+                            (moving, ghosts, overflow)
+                        } else {
+                            (RowMotion::STILL, Vec::new(), Vec::new())
+                        };
+                        if capture {
+                            painted.push(LeavingRow {
+                                row,
+                                index,
+                                look,
+                                top,
+                                motion: moving,
+                            });
+                        }
                         if moving == RowMotion::STILL && ghosts.is_empty() && overflow.is_empty() {
                             return element;
                         }
@@ -4962,6 +5066,9 @@ fn thread_list(
                             .into_any_element()
                     })
                     .collect();
+                if capture {
+                    inbox.painted_label_rows = painted;
+                }
                 // A row that turned read, unread or starred this frame
                 // needs the next one; render keeps asking while it moves.
                 if inbox.row_widths.running(now) {
@@ -4975,6 +5082,59 @@ fn thread_list(
     .min_h(px(0.))
     .track_scroll(scroll);
     pane.child(rows)
+}
+
+/// Shape the leaving rows during list prepaint, where the same font and
+/// text size are inherited as in the uniform list.
+fn leaving_label_rows(
+    theme: Theme,
+    rows: Arc<[LeavingRow]>,
+    opacity: f32,
+    text_width: f32,
+    cx: &mut Context<Inbox>,
+) -> impl IntoElement {
+    let entity = cx.entity();
+    gpui::canvas(
+        move |bounds, window, app| {
+            let mut layer = entity.update(app, |_, cx| {
+                div()
+                    .size_full()
+                    .relative()
+                    .opacity(opacity)
+                    .children(rows.iter().map(|frame| {
+                        let look = RowLook {
+                            ghost: true,
+                            ..frame.look.clone()
+                        };
+                        moving_row_layer(frame.top, frame.motion, window).child(thread_row(
+                            &theme,
+                            &frame.row,
+                            frame.index,
+                            &look,
+                            text_width,
+                            window,
+                            cx,
+                        ))
+                    }))
+                    .into_any_element()
+            });
+            layer.layout_as_root(
+                size(
+                    AvailableSpace::Definite(bounds.size.width),
+                    AvailableSpace::Definite(bounds.size.height),
+                ),
+                window,
+                app,
+            );
+            layer.prepaint_at(bounds.origin, window, app);
+            layer
+        },
+        |_, mut layer, window, app| layer.paint(window, app),
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 /// The list's width beside the conversation in a window `width` wide.
@@ -5000,6 +5160,15 @@ fn slot_layer(dy: f32, opacity: f32) -> gpui::Div {
         .opacity(opacity)
 }
 
+fn moving_row_layer(top: f32, motion: RowMotion, window: &Window) -> gpui::Div {
+    slot_layer(top + motion.dy, motion.opacity).when(motion.reveal < 1.0, |layer| {
+        // Only the part of the gap that has opened shows, so the rows
+        // sliding down never cover it.
+        let shown = motion::snap(ROW_PX * motion.reveal, window.scale_factor());
+        layer.h(px(shown)).overflow_hidden()
+    })
+}
+
 /// Paint a row that left, at its last position and with no input handlers.
 fn ghost_row(
     theme: &Theme,
@@ -5019,7 +5188,9 @@ fn ghost_row(
         previous_labels: None,
     };
     slot_layer(motion::snap(top, window.scale_factor()), opacity)
-        .child(thread_row(theme, &row, index, look, text_width, window, cx))
+        .child(thread_row(
+            theme, &row, index, &look, text_width, window, cx,
+        ))
         .into_any_element()
 }
 
@@ -5043,6 +5214,7 @@ struct StepBefore {
 }
 
 /// How a thread row is drawn.
+#[derive(Clone)]
 struct RowLook {
     selected: bool,
     /// The selection just left this row: how much of its highlight shows.
@@ -5072,7 +5244,7 @@ fn thread_row(
     theme: &Theme,
     row: &ThreadRow,
     index: usize,
-    look: RowLook,
+    look: &RowLook,
     text_width: f32,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -5145,7 +5317,7 @@ fn thread_row(
                     (frame, background),
                     selected,
                     text_width,
-                    look.previous_labels,
+                    look.previous_labels.as_ref(),
                     window,
                 ))
                 .child(thread_line_two(
@@ -5169,7 +5341,7 @@ fn thread_line_one(
     (frame, background): (RowFrame, u32),
     selected: bool,
     text_width: f32,
-    previous_labels: Option<(Vec<String>, f32)>,
+    previous_labels: Option<&(Vec<String>, f32)>,
     window: &Window,
 ) -> gpui::Div {
     let dim = if selected {
@@ -5296,7 +5468,7 @@ fn thread_label_group(
     background: u32,
     dim: u32,
     room: f32,
-    previous: Option<(Vec<String>, f32)>,
+    previous: Option<&(Vec<String>, f32)>,
     window: &Window,
 ) -> Option<(gpui::Div, f32)> {
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
@@ -5375,7 +5547,7 @@ fn thread_label_group(
     };
     let (width, group) = layout(&row.labels);
     if let Some((previous, shown)) = previous {
-        let (old_width, old_group) = layout(&previous);
+        let (old_width, old_group) = layout(previous);
         let transition_width = old_width.max(width);
         if transition_width > 0.0 {
             return Some((
@@ -5384,7 +5556,7 @@ fn thread_label_group(
                     .flex_none()
                     .w(px(transition_width))
                     .h(px(LABEL_CHIP_PX))
-                    .child(group.opacity(shown))
+                    .child(group.opacity(*shown))
                     .child(
                         old_group
                             .absolute()
@@ -6240,8 +6412,23 @@ fn conversation(
 ) -> gpui::Stateful<gpui::Div> {
     // The card under the cursor shows it as much as the pane is focused,
     // so on Enter and Esc its background turns with the focus edge.
-    let focus = motion.focus_edge(session.pane, now);
     let leaving = frame.leaving.as_ref();
+    let (columns, focus, message_cursor) = leaving.map_or_else(
+        || {
+            (
+                columns,
+                motion.focus_edge(session.pane, now),
+                session.message_cursor,
+            )
+        },
+        |(reader, _)| {
+            (
+                reader.layout.columns,
+                reader.layout.focus,
+                reader.layout.message_cursor,
+            )
+        },
+    );
     let (subject, shown, opacity) = match leaving {
         Some((reader, exit)) => (reader.subject.clone(), reader.messages.as_slice(), *exit),
         None => (subject, session.messages.as_slice(), 1.0),
@@ -6268,11 +6455,7 @@ fn conversation(
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            let cursor = if session.message_cursor == index {
-                focus
-            } else {
-                0.0
-            };
+            let cursor = if message_cursor == index { focus } else { 0.0 };
             let block = if message.expanded {
                 let fill = expanded_card_fill(theme, cursor);
                 expanded_message(
@@ -6829,7 +7012,10 @@ fn expanded_message(
                         recipient_lines(
                             theme,
                             line,
-                            session.recipients_are_open(&message.id),
+                            frame.leaving.as_ref().map_or_else(
+                                || session.recipients_are_open(&message.id),
+                                |(reader, _)| reader.recipients.contains(&message.id),
+                            ),
                             frame.disclosures.recipients.get(&message.id).copied(),
                             index,
                             width,
@@ -6868,9 +7054,18 @@ fn expanded_message(
             theme,
             message,
             FoldView {
-                open: session.is_open(&message.id),
+                open: frame.leaving.as_ref().map_or_else(
+                    || session.is_open(&message.id),
+                    |(reader, _)| reader.quotes.contains(&message.id),
+                ),
                 columns,
-                name_key: index == session.message_cursor,
+                name_key: index
+                    == frame
+                        .leaving
+                        .as_ref()
+                        .map_or(session.message_cursor, |(reader, _)| {
+                            reader.layout.message_cursor
+                        }),
                 focused: cursor,
                 fill,
                 index,
@@ -7798,7 +7993,12 @@ const CARD_TOP_PX: f32 = 72.0;
 /// How tall the open palette or folder picker should be to hold its items
 /// (its border, the 44 px query line and 4 px above and below the rows),
 /// up to its maximum and the window. `None` for any other overlay.
-fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
+fn card_fit(
+    session: &Session,
+    choices: &[PickerChoice],
+    theme: &Theme,
+    window: &Window,
+) -> Option<f32> {
     let room = f32::from(window.viewport_size().height) - CARD_TOP_PX - 16.0;
     match session.overlay {
         Overlay::Palette => {
@@ -7808,18 +8008,14 @@ fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
             });
             Some(present::card_height(rows_px.sum(), PALETTE_MAX_PX, room))
         }
-        Overlay::Folders if session.folder_intent == crate::model::FolderIntent::Label => {
-            let rows = (session.labels.len() + 1).clamp(4, 9);
-            Some(present::card_height(rows as f32 * PICKER_ROW_PX, PICKER_MAX_PX, room))
+        Overlay::Folders => {
+            let empty_label = choices.is_empty()
+                && matches!(session.folder_intent, FolderIntent::Label | FolderIntent::LabelList);
+            Some(picker_card_height(
+                choices.iter().map(|choice| choice.divider).chain(empty_label.then_some(false)),
+                room,
+            ))
         }
-        Overlay::Folders if session.folder_intent == crate::model::FolderIntent::LabelList => {
-            let rows = session.picker_choices().len().max(1);
-            Some(present::card_height(rows as f32 * PICKER_ROW_PX, PICKER_MAX_PX, room))
-        }
-        Overlay::Folders => Some(picker_card_height(
-            session.picker_choices().iter().map(|choice| choice.divider),
-            room,
-        )),
         _ => None,
     }
 }
@@ -7886,7 +8082,7 @@ fn overlay(
     live: bool,
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
-    label_target: Option<String>,
+    picker: (&[PickerChoice], Option<String>),
     help: Option<(f32, gpui::Div)>,
     agents: Option<gpui::Div>,
     window: &Window,
@@ -7920,7 +8116,7 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, folder_scroll, label_target, window, cx)
+            Overlay::Folders => folder_picker(theme, session, folder_scroll, picker, window, cx)
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
@@ -8097,14 +8293,13 @@ fn folder_picker(
     theme: &Theme,
     session: &Session,
     scroll: &ScrollHandle,
-    label_target: Option<String>,
+    (choices, label_target): (&[PickerChoice], Option<String>),
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
-    let choices = session.picker_choices();
     let labeling = matches!(
         session.folder_intent,
-        crate::model::FolderIntent::Label | crate::model::FolderIntent::LabelList
+        FolderIntent::Label | FolderIntent::LabelList
     );
     let selected = session.folder_index;
     let query = session.folder_query.trim().to_ascii_lowercase();
@@ -8149,23 +8344,25 @@ fn folder_picker(
                 .child(
                     div()
                         .flex_none()
-                        .text_color(rgb(
-                            if session.folder_intent == crate::model::FolderIntent::Move {
-                                theme.accent
-                            } else {
-                                theme.dimmed
-                            },
-                        ))
+                        .text_color(rgb(if session.folder_intent == FolderIntent::Move {
+                            theme.accent
+                        } else {
+                            theme.dimmed
+                        }))
                         .child(session.folder_prompt()),
                 )
-                .children(label_target.map(|target| {
-                    div()
-                        .max_w(px(PICKER_PX / 2.0))
-                        .min_w_0()
-                        .truncate()
-                        .text_color(rgb(theme.dimmed))
-                        .child(format!("· {}", present::display_safe(&target)))
-                }))
+                .when_some(label_target, |prompt, target| {
+                    prompt
+                        .child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
+                        .child(
+                            div()
+                                .max_w(px(PICKER_PX / 2.0))
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(theme.dimmed))
+                                .child(present::display_safe(&target)),
+                        )
+                })
                 .child(
                     div()
                         .min_w_0()
@@ -8184,8 +8381,11 @@ fn folder_picker(
                 .my(px(present::CARD_ROW_INSET_PX))
                 .children((labeling && choices.is_empty()).then(|| {
                     div()
+                        .h(px(PICKER_ROW_PX))
+                        .flex_none()
+                        .flex()
+                        .items_center()
                         .px(px(14.))
-                        .py(px(8.))
                         .text_color(rgb(theme.dimmed))
                         .child(if session.folder_query.is_empty() {
                             "No labels yet"
@@ -8193,7 +8393,7 @@ fn folder_picker(
                             "No matching labels"
                         })
                 }))
-                .children(choices.into_iter().enumerate().map(|(index, choice)| {
+                .children(choices.iter().enumerate().map(|(index, choice)| {
                     let label = present::display_safe(&choice.title);
                     let room = label_room
                         - if session.folder_intent == crate::model::FolderIntent::Label {
@@ -8208,7 +8408,7 @@ fn folder_picker(
                     } else {
                         fit_folder_path(&label, FolderFit::Picker(&query), clip, |line| &line.text)
                     };
-                    let detail = choice.detail;
+                    let detail = choice.detail.clone();
                     let detail_color = if index == selected {
                         theme.on_selection_dim
                     } else {
@@ -8250,22 +8450,19 @@ fn folder_picker(
                         )
                         .gap(px(8.))
                         .overflow_hidden()
-                        .when(
-                            labeling && session.folder_intent == crate::model::FolderIntent::Label,
-                            |row| {
-                                row.child(
-                                    div()
-                                        .w(px(16.))
-                                        .flex_none()
-                                        .text_color(rgb(if index == selected {
-                                            theme.on_selection
-                                        } else {
-                                            theme.accent
-                                        }))
-                                        .children(choice.mark),
-                                )
-                            },
-                        )
+                        .when(session.folder_intent == FolderIntent::Label, |row| {
+                            row.child(
+                                div()
+                                    .w(px(16.))
+                                    .flex_none()
+                                    .text_color(rgb(if index == selected {
+                                        theme.on_selection
+                                    } else {
+                                        theme.accent
+                                    }))
+                                    .children(choice.mark),
+                            )
+                        })
                         .children(label.map(|line| {
                             let matched = folder_match(&line.text, &query);
                             let highlight = HighlightStyle {
@@ -8653,7 +8850,7 @@ mod tests {
         let first = pending.start(add.clone());
         let mut rows = [row("a"), row("b")];
         let mut names = Vec::new();
-        pending.land(7, &mut rows, Some(&mut names));
+        pending.land(7, &mut rows, Some(&mut names), None);
         assert_eq!(rows[0].labels, ["field notes"]);
         assert!(rows[1].labels.is_empty());
         assert_eq!(names, ["field notes"]);
@@ -8662,18 +8859,20 @@ mod tests {
         pending.finish(second, Some(8));
         // A callback for the later edit may arrive first. Its removal
         // still wins over the older optimistic add on the same row.
-        pending.land(9, &mut rows, None);
+        pending.land(9, &mut rows, None, None);
         assert!(rows[0].labels.is_empty());
         pending.finish(first, Some(9));
 
         let mut lagged = [row("a")];
         lagged[0].labels.push("field notes".into());
-        pending.land(9, &mut lagged, None);
+        pending.land(9, &mut lagged, None, Some("field notes"));
+        assert_eq!(lagged[0].labels, ["field notes"]);
+        pending.land(9, &mut lagged, None, None);
         assert!(lagged[0].labels.is_empty());
 
         let mut current = [row("a")];
         let mut current_names = Vec::new();
-        pending.land(10, &mut current, Some(&mut current_names));
+        pending.land(10, &mut current, Some(&mut current_names), None);
         assert!(pending.edits.is_empty());
         assert!(current[0].labels.is_empty());
         assert!(current_names.is_empty());

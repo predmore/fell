@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 use std::time::Duration;
 
@@ -42,6 +42,12 @@ pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
 pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
+
+#[derive(Clone, Debug, Default)]
+pub struct ThreadLabels {
+    pub subject: String,
+    pub labels: HashSet<String>,
+}
 
 pub(crate) fn listed_folder_roles(
     conn: &Connection,
@@ -978,6 +984,39 @@ impl Store {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Read the label union for each selected thread, whether it is in the
+    /// current folder page or outside it. Use message rows so a dirty thread
+    /// summary cannot leave the selection showing stale membership.
+    pub fn thread_labels(
+        &self,
+        account: &AccountId,
+        ids: &[String],
+    ) -> Result<HashMap<String, ThreadLabels>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.thread_id, m.subject, m.labels
+             FROM json_each(?2) AS selected
+             CROSS JOIN messages m
+             WHERE m.account_id = ?1 AND m.thread_id = selected.value
+             ORDER BY m.date_unix, m.rowid",
+        )?;
+        let mut rows = stmt.query(params![
+            account.as_str(),
+            serde_json::json!(ids).to_string()
+        ])?;
+        let mut result = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let thread = match result.entry(row.get(0)?) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(ThreadLabels {
+                    subject: row.get(1)?,
+                    ..ThreadLabels::default()
+                }),
+            };
+            thread.labels.extend(split_field(&row.get::<_, String>(2)?));
+        }
+        Ok(result)
     }
 
     pub fn thread_messages(

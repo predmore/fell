@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::keymap::KeyId;
-use crate::model::{Banner, FolderIntent, Overlay, Session, Toast};
+use crate::model::{Banner, FolderIntent, Overlay, PickerChoice, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
 use crate::present::{ConvMessage, Pane, ThreadRow};
 use crate::worker::Worker;
@@ -104,6 +104,7 @@ pub struct Layer {
     agents: Option<crate::model::agents::Agents>,
     palette_from_agents: bool,
     pub label_target: Option<String>,
+    pub picker_choices: Vec<PickerChoice>,
 }
 
 impl Layer {
@@ -119,6 +120,11 @@ impl Layer {
             agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
             palette_from_agents: session.palette_from_agents,
             label_target: session.label_target(),
+            picker_choices: if session.overlay == Overlay::Folders {
+                session.picker_choices()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -446,6 +452,8 @@ impl InboxMotion {
             if session.overlay == Overlay::None {
                 // Gone for input at once; only its pixels fade.
                 self.overlay = None;
+                self.card_to = self.card_height(now);
+                self.card_glide = None;
                 self.overlay_out = self
                     .last_layer
                     .clone()
@@ -805,6 +813,11 @@ impl InboxMotion {
 
     /// Start the last-row exit and report whether the reader occupied the window.
     pub fn list_emptied(&mut self, now: Instant) -> bool {
+        self.pane = None;
+        self.pane_out = None;
+        self.reading_slide = None;
+        self.reading_list_fade = None;
+        self.reading_reflow = None;
         self.empty_list = self
             .motion
             .start(motion::FADE, now)
@@ -1051,7 +1064,17 @@ mod tests {
     fn the_last_label_rows_leave_before_the_empty_message_fades_in() {
         let now = Instant::now();
         let mut motions = InboxMotion::new(Motion::new(true));
-        motions.list_emptied(now);
+        let mut session = session();
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        assert!(motions.reading_sliding());
+        assert!(motions.list_emptied(now));
+        session.pane = Pane::List;
+        session.full_width = false;
+        motions.observe(&session, (true, false), now);
+        assert!(!motions.reading_sliding());
+        assert!(motions.pane_swap((true, false), now).is_none());
         let banner = Banner {
             title: "No conversations in Work".into(),
             hint: String::new(),

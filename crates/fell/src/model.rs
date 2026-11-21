@@ -3,7 +3,7 @@
 pub mod agents;
 pub mod search;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::ops::Range;
@@ -309,6 +309,13 @@ pub struct PickerChoice {
     pub divider: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct LabelSelection {
+    ids: Vec<String>,
+    subject: Option<String>,
+    counts: Option<HashMap<String, usize>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlagEdit {
     /// Thread ids, in list order.
@@ -339,6 +346,7 @@ pub struct Step {
     pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
+    pub read_label_targets: bool,
     pub labels: Option<LabelEdit>,
     /// `u` restores the latest local action.
     pub undo: bool,
@@ -464,6 +472,7 @@ pub struct Session {
     pub folder_query: String,
     pub folder_index: usize,
     pub folder_intent: FolderIntent,
+    label_selection: LabelSelection,
     pub toast: Option<Toast>,
     pub startup_crash_notice: Option<Toast>,
     /// Counts notices shown; see [`Session::toast_generation`].
@@ -554,6 +563,7 @@ impl Session {
             folder_query: String::new(),
             folder_index: 0,
             folder_intent: FolderIntent::Go,
+            label_selection: LabelSelection::default(),
             toast: None,
             startup_crash_notice: None,
             worker_outages: HashSet::new(),
@@ -643,16 +653,51 @@ impl Session {
         if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
             return None;
         }
-        let targets = self.action_targets();
-        match targets.as_slice() {
+        match self.label_selection.ids.as_slice() {
             [] => None,
-            [id] => self
-                .threads
-                .iter()
-                .find(|row| &row.id == id)
-                .map(|row| row.subject.clone()),
-            _ => Some(format!("{} conversations", targets.len())),
+            [_] => self.label_selection.subject.clone(),
+            ids => Some(format!("{} conversations", ids.len())),
         }
+    }
+
+    pub fn label_target_ids(&self) -> &[String] {
+        &self.label_selection.ids
+    }
+
+    pub fn label_target_subject(&self) -> Option<&str> {
+        self.label_selection.subject.as_deref()
+    }
+
+    pub fn load_label_targets(
+        &mut self,
+        result: Result<HashMap<String, fell_core::store::ThreadLabels>, String>,
+    ) {
+        if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
+            return;
+        }
+        let targets = match result {
+            Ok(targets) if targets.len() == self.label_selection.ids.len() => targets,
+            result => {
+                self.overlay = Overlay::None;
+                self.show_toast(
+                    result
+                        .err()
+                        .unwrap_or_else(|| "A selected conversation is no longer available".into()),
+                    true,
+                );
+                return;
+            }
+        };
+        if let [id] = self.label_selection.ids.as_slice() {
+            self.label_selection.subject = Some(targets[id].subject.clone());
+        }
+        let mut counts = HashMap::new();
+        for thread in targets.into_values() {
+            for label in thread.labels {
+                *counts.entry(label).or_insert(0) += 1;
+            }
+        }
+        self.label_selection.counts = Some(counts);
     }
 
     pub fn record_startup_error(&mut self, error: String) {
@@ -910,28 +955,24 @@ impl Session {
             .filter_map(|name| Some((keymap::fuzzy_score(&folded, name)?, name)))
             .collect();
         names.sort_by(|(a, name_a), (b, name_b)| b.cmp(a).then_with(|| name_a.cmp(name_b)));
-        let targets: HashSet<_> = if applying {
-            self.action_targets().into_iter().collect()
-        } else {
-            HashSet::new()
-        };
-        let mut counts = std::collections::HashMap::new();
-        for row in self.threads.iter().filter(|row| targets.contains(&row.id)) {
-            for label in &row.labels {
-                *counts.entry(label.as_str()).or_insert(0) += 1;
-            }
-        }
         let mut choices: Vec<_> = names
             .into_iter()
             .map(|(_, name)| {
-                let count = counts.get(name.as_str()).copied().unwrap_or(0);
+                let count = self
+                    .label_selection
+                    .counts
+                    .as_ref()
+                    .filter(|_| applying)
+                    .and_then(|counts| counts.get(name))
+                    .copied()
+                    .unwrap_or(0);
                 PickerChoice {
                     name: name.clone(),
                     title: name.clone(),
                     detail: None,
                     mark: match count {
                         0 => None,
-                        n if n == targets.len() => Some("✓"),
+                        n if n == self.label_selection.ids.len() => Some("✓"),
                         _ => Some("−"),
                     },
                     divider: false,
@@ -984,9 +1025,11 @@ impl Session {
         }
     }
 
-    pub fn label_rows(&mut self, edit: &LabelEdit) {
+    pub fn label_rows(&mut self, edit: &LabelEdit, leaving_scope: bool) {
         edit.include_name(&mut self.labels);
-        edit.apply(&mut self.threads);
+        if !leaving_scope {
+            edit.apply(&mut self.threads);
+        }
     }
 
     pub fn highlighted(&self) -> HashSet<String> {
@@ -1033,15 +1076,23 @@ impl Session {
                 .map(|row| row.id.clone())
                 .collect();
         }
+        let picked = self.loaded_picks();
+        if picked.is_empty() {
+            self.threads
+                .iter()
+                .find(|thread| Some(&thread.id) == self.cursor_id.as_ref())
+                .map(|thread| thread.id.clone())
+                .into_iter()
+                .collect()
+        } else {
+            picked
+        }
+    }
+
+    fn loaded_picks(&self) -> Vec<String> {
         self.threads
             .iter()
-            .filter(|thread| {
-                if self.picked.is_empty() {
-                    Some(&thread.id) == self.cursor_id.as_ref()
-                } else {
-                    self.picked.contains(&thread.id)
-                }
-            })
+            .filter(|thread| self.picked.contains(&thread.id))
             .map(|thread| thread.id.clone())
             .collect()
     }
@@ -1062,6 +1113,23 @@ impl Session {
             true
         });
         (ids, drafts)
+    }
+
+    fn label_targets(&self) -> Vec<String> {
+        if self.visual || self.picked.is_empty() {
+            return self.action_targets();
+        }
+        let mut targets = self.loaded_picks();
+        let loaded: HashSet<_> = targets.iter().collect();
+        let mut off_page: Vec<_> = self
+            .picked
+            .iter()
+            .filter(|id| !loaded.contains(id))
+            .cloned()
+            .collect();
+        off_page.sort_unstable();
+        targets.extend(off_page);
+        targets
     }
 
     /// The threads `y` confirmed for a permanent delete, once.
@@ -1129,8 +1197,10 @@ impl Session {
             // selected when it does (see [`Session::settle`]).
             self.cursor_id = self.threads.first().map(|thread| thread.id.clone());
         }
-        self.picked
-            .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+        if !self.more_before && !self.more_after {
+            self.picked
+                .retain(|id| self.threads.iter().any(|thread| &thread.id == id));
+        }
         if self.visual && !self.visual_span_survived(&old_ids, previous.as_deref()) {
             self.visual = false;
             self.anchor_id = None;
@@ -2068,6 +2138,9 @@ impl Session {
 
     /// Enter or a click on the highlighted folder.
     pub fn confirm_folder(&mut self) -> Step {
+        if self.folder_intent == FolderIntent::Label && self.label_selection.counts.is_none() {
+            return Step::default();
+        }
         let choices = self.picker_choices();
         let Some(chosen) = choices.get(self.folder_index) else {
             if matches!(
@@ -2093,14 +2166,23 @@ impl Session {
                     ..Step::default()
                 }
             }
-            FolderIntent::Label => Step {
-                labels: Some(LabelEdit {
-                    ids: self.action_targets(),
+            FolderIntent::Label => {
+                let edit = LabelEdit {
+                    ids: self.label_selection.ids.clone(),
                     name: chosen.name.clone(),
                     add: chosen.mark != Some("✓"),
-                }),
-                ..Step::default()
-            },
+                };
+                if edit.add || self.label_scope.as_deref() != Some(&edit.name) {
+                    self.visual = false;
+                    self.anchor_id = None;
+                }
+                // When rows leave their own label list, keep its visual
+                // range until the new page lands so it fades with the rows.
+                Step {
+                    labels: Some(edit),
+                    ..Step::default()
+                }
+            }
             FolderIntent::LabelList => Step {
                 reload_threads: self.go_label(&chosen.name),
                 ..Step::default()
@@ -2279,7 +2361,7 @@ impl Session {
             Action::Label | Action::LabelList => {
                 self.count.clear();
                 if action == Action::Label {
-                    let targets = self.action_targets();
+                    let targets = self.label_targets();
                     if targets.is_empty() {
                         self.show_toast("No conversation", true);
                         return step;
@@ -2292,6 +2374,16 @@ impl Session {
                         self.show_toast(DRAFT_NOT_THREAD, true);
                         return step;
                     }
+                    let subject = (targets.len() == 1)
+                        .then(|| self.threads.iter().find(|row| row.id == targets[0]))
+                        .flatten()
+                        .map(|row| row.subject.clone());
+                    self.label_selection = LabelSelection {
+                        ids: targets,
+                        subject,
+                        counts: None,
+                    };
+                    step.read_label_targets = true;
                 }
                 self.folder_intent = if action == Action::Label {
                     FolderIntent::Label
@@ -3363,6 +3455,24 @@ mod tests {
         }
     }
 
+    fn load_test_label_targets(session: &mut Session) {
+        let ids = session.label_target_ids();
+        session.load_label_targets(Ok(session
+            .threads
+            .iter()
+            .filter(|row| ids.contains(&row.id))
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    fell_core::store::ThreadLabels {
+                        subject: row.subject.clone(),
+                        labels: row.labels.iter().cloned().collect(),
+                    },
+                )
+            })
+            .collect()));
+    }
+
     #[test]
     fn label_picker_creates_adds_and_removes_through_the_palette_and_keys() {
         let mut session = session();
@@ -3372,6 +3482,7 @@ mod tests {
             .find(|item| item.action == Action::Label)
             .unwrap();
         session.confirm_palette(item, 10);
+        load_test_label_targets(&mut session);
         type_picker(&mut session, "drev");
         assert_eq!(session.picker_choices()[0].name, "Design review");
         let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
@@ -3383,16 +3494,18 @@ mod tests {
                 add: true
             }
         );
-        session.label_rows(&add);
+        session.label_rows(&add, false);
 
         session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
         assert_eq!(session.picker_choices()[0].mark, Some("✓"));
         let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
         assert_eq!(remove, LabelEdit { add: false, ..add });
-        session.label_rows(&remove);
+        session.label_rows(&remove, false);
         assert!(session.threads[0].labels.is_empty());
 
         session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
         type_picker(&mut session, "Client notes");
         assert_eq!(
             session.picker_choices()[0].title,
@@ -3400,7 +3513,7 @@ mod tests {
         );
         let create = session.on_key(KeyId::Enter, 10).labels.unwrap();
         assert!(create.add);
-        session.label_rows(&create);
+        session.label_rows(&create, false);
         assert_eq!(session.threads[0].labels, ["Client notes"]);
 
         session.on_key(KeyId::Char('g'), 10);
@@ -3420,11 +3533,13 @@ mod tests {
         for key in ['V', 'j', 'j', 'l'] {
             session.on_key(KeyId::Char(key), 10);
         }
+        load_test_label_targets(&mut session);
         assert_eq!(session.picker_choices()[0].mark, Some("−"));
         let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
         assert_eq!(add.ids, ["a", "b", "c"]);
         assert!(add.add);
-        session.label_rows(&add);
+        assert!(!session.visual);
+        session.label_rows(&add, false);
         for row in &session.threads[..3] {
             assert_eq!(row.labels, ["review"]);
         }
@@ -3433,11 +3548,12 @@ mod tests {
         for key in ['x', 'k', 'k', 'x', 'j', 'l'] {
             session.on_key(KeyId::Char(key), 10);
         }
+        load_test_label_targets(&mut session);
         assert_eq!(session.picker_choices()[0].mark, Some("✓"));
         let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
         assert_eq!(remove.ids, ["a", "c"]);
         assert!(!remove.add);
-        session.label_rows(&remove);
+        session.label_rows(&remove, false);
         assert!(session.threads[0].labels.is_empty());
         assert_eq!(session.threads[1].labels, ["review"]);
         assert!(session.threads[2].labels.is_empty());
@@ -3445,10 +3561,85 @@ mod tests {
     }
 
     #[test]
+    fn label_picker_toggles_a_selection_across_loaded_pages() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let threads = store.list_threads(&account.id).unwrap();
+        let first = &threads[0].thread_id;
+        let last = &threads.last().unwrap().thread_id;
+        store
+            .label_thread(
+                &account.id,
+                first,
+                fell_core::LabelChange::Add("Review".into()),
+            )
+            .unwrap();
+        let mut session = session();
+        session.labels = vec!["Review".into()];
+        session.set_page(vec![row(first.as_str())], false, true, 2);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row(last.as_str())], true, false, 2);
+        session.on_key(KeyId::Char('x'), 10);
+
+        for (mark, add) in [(Some("−"), true), (Some("✓"), false)] {
+            assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+            assert!(session.on_key(KeyId::Enter, 10).labels.is_none());
+            let ids = session.label_target_ids();
+            assert_eq!(ids, [last.as_str(), first.as_str()]);
+            session.load_label_targets(Ok(store.thread_labels(&account.id, ids).unwrap()));
+            assert_eq!(session.picker_choices()[0].mark, mark);
+            let edit = session.on_key(KeyId::Enter, 10).labels.unwrap();
+            assert_eq!(edit.ids, [last.as_str(), first.as_str()]);
+            assert_eq!(edit.add, add);
+            let change = if add {
+                fell_core::LabelChange::Add(edit.name)
+            } else {
+                fell_core::LabelChange::Remove(edit.name)
+            };
+            store
+                .label_threads(&account.id, &[first.clone(), last.clone()], change)
+                .unwrap();
+        }
+        assert!(
+            store
+                .thread_labels(&account.id, session.label_target_ids())
+                .unwrap()
+                .values()
+                .all(|thread| !thread.labels.contains("Review"))
+        );
+    }
+
+    #[test]
+    fn a_closing_label_picker_keeps_its_checked_row() {
+        let mut motion = crate::inbox_motion::InboxMotion::new(crate::motion::Motion::new(true));
+        let mut session = session();
+        session.labels.push("work".into());
+        session.threads[0].labels.push("work".into());
+        session.perform(Action::Label, 10);
+        load_test_label_targets(&mut session);
+        type_picker(&mut session, "work");
+        let now = std::time::Instant::now();
+        motion.observe(&session, (true, true), now);
+        assert!(!session.confirm_folder().labels.unwrap().add);
+        session.set_labels(Vec::new());
+        motion.observe(&session, (true, true), now);
+
+        let (layer, _) = motion.closing_overlay(now).unwrap();
+        layer.swap(&mut session);
+        assert_eq!(session.folder_query, "work");
+        assert_eq!(session.folder_index, 0);
+        assert_eq!(layer.picker_choices.len(), 1);
+        assert_eq!(layer.picker_choices[0].title, "work");
+        assert_eq!(layer.picker_choices[0].mark, Some("✓"));
+    }
+
+    #[test]
     fn label_picker_filters_five_hundred_names() {
         let mut session = session();
         session.labels = (0..500).map(|i| format!("Project {i:03}")).collect();
         session.on_key(KeyId::Char('l'), 10);
+        load_test_label_targets(&mut session);
         let mut slowest = std::time::Duration::ZERO;
         for key in "p427".chars() {
             let start = std::time::Instant::now();
