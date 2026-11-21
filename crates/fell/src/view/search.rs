@@ -10,7 +10,7 @@ use fell_core::{MessageId, SearchPreview, Store};
 use gpui::{HighlightStyle, StyledText};
 
 use super::*;
-use crate::model::search::{CompletionField, Search, SearchReply};
+use crate::model::search::{CompletionField, REFRESH_FEEDBACK_DELAY, Search, SearchReply};
 
 const PREVIEW_BATCH: usize = 32;
 const SUGGESTION_LIMIT: usize = 4;
@@ -27,7 +27,7 @@ pub(super) struct SearchView {
     accepted: Arc<AtomicU64>,
     completion_revision: Arc<AtomicU64>,
     pub(super) folder_revision: u64,
-    pub(super) prefer: Option<String>,
+    pub(super) prefer: Vec<ThreadId>,
     preview_key: Option<PreviewKey>,
     preview_revision: u64,
     rows_key: Option<RowsKey>,
@@ -305,7 +305,7 @@ impl Inbox {
             self.search_view
                 .completion_revision
                 .fetch_add(1, Ordering::Relaxed);
-            self.search_view.prefer = None;
+            self.search_view.prefer.clear();
             if searching {
                 self.search_view.folder_scroll = Some(std::mem::replace(
                     &mut self.list_scroll,
@@ -353,8 +353,7 @@ impl Inbox {
     }
 
     pub(super) fn refresh_search(&mut self, cx: &mut Context<Self>) {
-        if self.session.refresh_search() {
-            self.cancel_search_work();
+        if self.begin_search_refresh(cx) {
             self.request_search(cx);
         }
     }
@@ -418,6 +417,32 @@ impl Inbox {
         .detach();
     }
 
+    pub(super) fn begin_search_refresh(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        if !self.session.refresh_search(now) {
+            return false;
+        }
+        self.cancel_search_work();
+        if self.session.search.as_ref().unwrap().refresh_started == Some(now) {
+            let timer = cx.background_executor().timer(REFRESH_FEEDBACK_DELAY);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |inbox, cx| {
+                    if inbox
+                        .session
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.refresh_started == Some(now))
+                    {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        true
+    }
+
     pub(super) fn cancel_search_work(&self) {
         self.search_view
             .current
@@ -444,23 +469,13 @@ impl Inbox {
         let Some(scopes) = self
             .session
             .search_scopes(&ids)
-            .filter(|scopes| !scopes.is_empty())
+            .filter(|scopes| removal != Removal::Purge || scopes.len() == ids.len())
         else {
             self.session
                 .show_toast("No folder for a selected match", true);
             return;
         };
-        let key = self.selected_key();
         let account = self.account_id.clone();
-        let done = match removal {
-            Removal::Delete => format!(
-                "Moved to {}",
-                self.session
-                    .folder_text(self.session.roles.name(FolderRole::Trash))
-            ),
-            Removal::Spam => "Spam status updated".to_owned(),
-            Removal::Purge => "Removed from Fell".to_owned(),
-        };
         let accepted = self
             .session
             .search
@@ -468,12 +483,15 @@ impl Inbox {
             .and_then(Search::accepted_generation);
         self.change_mailbox(
             move |store| match removal {
+                Removal::Archive => store.archive_scoped_threads(&account, &scopes),
                 Removal::Delete => store.delete_scoped_threads(&account, &scopes),
                 Removal::Spam => store.spam_scoped_threads(&account, &scopes),
-                Removal::Purge => store.purge_scoped_threads(&account, &scopes),
+                Removal::Purge => store
+                    .purge_scoped_threads(&account, &scopes)
+                    .map(|action| (action, scopes.len())),
             },
             move |inbox, result| match result {
-                Ok(_) => {
+                Ok((action, count)) => {
                     if inbox
                         .session
                         .search
@@ -484,7 +502,18 @@ impl Inbox {
                         inbox.session.visual = false;
                         inbox.session.anchor_id = None;
                     }
-                    inbox.moved_thread = if removal == Removal::Purge { None } else { key };
+                    let role_label =
+                        |role| inbox.session.folder_text(inbox.session.roles.name(role));
+                    let done = match removal {
+                        Removal::Archive => archived_notice(count, ids.len()),
+                        Removal::Delete => moved_notice(count, &role_label(FolderRole::Trash)),
+                        Removal::Spam if action.kind == fell_core::ActionKind::NotSpam => {
+                            moved_notice(count, &role_label(FolderRole::Inbox))
+                        }
+                        Removal::Spam if count == 1 => "Spam status updated".to_owned(),
+                        Removal::Spam => format!("Updated spam status for {count} conversations"),
+                        Removal::Purge => "Removed from Fell".to_owned(),
+                    };
                     inbox.session.show_toast(done, false);
                     inbox.send_to_server();
                     Some(ReadIntent {
@@ -493,7 +522,12 @@ impl Inbox {
                     })
                 }
                 Err(err) => {
-                    inbox.session.show_toast(err.to_string(), true);
+                    let message = if removal == Removal::Archive {
+                        archive_failure(&err)
+                    } else {
+                        err.to_string()
+                    };
+                    inbox.session.show_toast(message, true);
                     None
                 }
             },
@@ -723,8 +757,15 @@ impl Inbox {
                     cx.notify();
                     return;
                 }
-                if let Some(preferred) = self.search_view.prefer.take() {
-                    self.session.select_if_present(&preferred);
+                let preferred = std::mem::take(&mut self.search_view.prefer);
+                if !preferred.is_empty()
+                    && let Some(row) = self
+                        .session
+                        .threads
+                        .iter()
+                        .find(|row| preferred.iter().any(|id| id.as_str() == row.id))
+                {
+                    self.session.cursor_id = Some(row.id.clone());
                 }
                 let search = self.session.search.as_ref().unwrap();
                 self.search_view
@@ -1115,20 +1156,13 @@ pub(super) fn feedback(
         .correction
         .as_ref()
         .filter(|_| search.results_current());
+    let show_pending = search.show_pending_feedback(Instant::now());
     let line = if let Some(correction) = correction {
         Some((format!("Did you mean {correction}?"), true))
     } else if let Some(value) = suggestion {
         Some((format!("Complete with {value}"), true))
-    } else if search.pending {
-        Some((
-            (if count > 0 {
-                "Searching… · showing previous results"
-            } else {
-                "Searching…"
-            })
-            .to_owned(),
-            false,
-        ))
+    } else if show_pending {
+        Some(("Searching…".to_owned(), false))
     } else if search.error.is_some() && count > 0 {
         Some(("Showing previous results".to_owned(), false))
     } else if count > 0 {
@@ -1162,7 +1196,7 @@ pub(super) fn feedback(
                 .items_center()
                 .text_color(rgb(if accept { theme.accent } else { theme.dimmed }))
                 .child(div().flex_1().min_w_0().truncate().child(label))
-                .when(search.pending && suggestion.is_some(), |row| {
+                .when(show_pending && suggestion.is_some(), |row| {
                     row.child(
                         div()
                             .flex_none()

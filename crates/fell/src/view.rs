@@ -183,6 +183,18 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
+async fn finish_mailbox_change<T>(
+    reply: futures::channel::oneshot::Receiver<fell_core::Result<T>>,
+    done: impl FnOnce(fell_core::Result<T>),
+) {
+    let result = reply.await.unwrap_or_else(|_| {
+        Err(fell_core::Error::Action(
+            "Could not update this mailbox".into(),
+        ))
+    });
+    done(result);
+}
+
 /// Use one notice so a flag failure and a move failure can both be seen.
 fn write_back_notice(
     session: &Session,
@@ -313,8 +325,6 @@ struct Inbox {
     body_refresh: BodyRefresh,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
-    /// Thread `m` just moved. `u` selects it again when it returns to this folder.
-    moved_thread: Option<ListKey>,
     /// Background sync for the account file. `None` for the demo mailbox.
     sync: Option<SyncHandle>,
     /// The folder the rows on screen came from. `session.folder` changes on
@@ -327,8 +337,11 @@ struct Inbox {
     refresh_in_flight: bool,
     /// Bumped by every folder read. A read the user superseded is dropped.
     read_gen: u64,
-    /// Asked for while a read was in flight. Issued when it lands.
+    /// Asked for while a read or undo was in flight. Issued when it lands.
     read_wanted: Option<ReadIntent>,
+    /// An in-flight read can already see rows restored on the store thread.
+    /// Wait for the undo reply so those rows arrive with their selection.
+    undos_in_flight: usize,
     /// Threads taken out of the list whose archive or move has not landed.
     /// A read that started before the write cannot paint them back.
     pending_removals: std::collections::HashSet<String>,
@@ -453,13 +466,13 @@ impl Inbox {
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
             conv_layout_current: false,
-            moved_thread: None,
             sync: None,
             list_folder: FolderRole::Inbox.default_name().into(),
             read_in_flight: false,
             refresh_in_flight: false,
             read_gen: 0,
             read_wanted: None,
+            undos_in_flight: 0,
             pending_removals: std::collections::HashSet::new(),
             pending_flags: std::collections::HashMap::new(),
             flag_gen: 0,
@@ -759,12 +772,15 @@ impl Inbox {
         // starts now on the interactive lane, and the refresh is dropped
         // when it lands. This read sees everything the refresh would have.
         let supersede = self.read_in_flight && self.refresh_in_flight && !intent.is_refresh();
-        if self.read_in_flight && !supersede {
+        if self.undos_in_flight > 0 || (self.read_in_flight && !supersede) {
             self.read_wanted = Some(match self.read_wanted.take() {
                 Some(earlier) => earlier.merge(intent),
                 None => intent,
             });
             return;
+        }
+        if let Some(earlier) = self.read_wanted.take() {
+            intent = earlier.merge(intent);
         }
         // An interactive read that replaces a refresh picks up its body reread.
         intent.refresh_open |= supersede;
@@ -844,9 +860,9 @@ impl Inbox {
             self.store.call(read)
         };
         cx.spawn(async move |this, cx| {
-            let Ok(result) = reply.await else {
-                return;
-            };
+            let result = reply
+                .await
+                .unwrap_or_else(|_| Err("Could not read this folder".into()));
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.read_gen == generation {
                     let log = inbox.frames.clone();
@@ -880,8 +896,9 @@ impl Inbox {
         // A user action (switch, archive, move, undo) since this read started
         // makes it stale. Skip it and read again with both intents, so the
         // list never flashes a folder or a row the user already left.
-        let stale =
-            folder != self.session.folder || wanted.as_ref().is_some_and(|next| !next.is_refresh());
+        let stale = self.undos_in_flight > 0
+            || folder != self.session.folder
+            || wanted.as_ref().is_some_and(|next| !next.is_refresh());
         if stale {
             let merged = match wanted {
                 Some(next) => intent.merge(next),
@@ -1022,8 +1039,11 @@ impl Inbox {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
         }
         self.session.set_page(rows, more_before, more_after, unread);
-        if let Some(key) = &intent.select {
-            self.session.select_if_present(&key.thread_id.0);
+        if let Some(key) = &intent.select
+            && self.session.select_if_present(key.thread_id.as_str())
+            && self.session.cursor_id != before_id
+        {
+            self.motion.land_selection(self.session.cursor_id.clone());
         }
         let after_index = self
             .session
@@ -1054,7 +1074,7 @@ impl Inbox {
             }
             present::Landing::Jump => self.scroll_list_to_cursor(),
         }
-        self.start_list_shift(drawn, switched);
+        self.start_list_shift(drawn, switched, intent.select.is_some());
         if self.warmed_folder.as_deref() != Some(self.list_folder.as_str()) {
             self.warm_bottom(more_after, cx);
         }
@@ -1393,18 +1413,22 @@ impl Inbox {
             .motion
             .painted_list_offset()
             .unwrap_or_else(|| self.list_offset());
-        let first = ((-offset / ROW_PX).floor() as i64 - 2).max(0) as usize;
-        let last = (((-offset + view) / ROW_PX).ceil() as i64 + 2).max(0) as usize;
+        let first = ((-offset / ROW_PX).floor() as usize).saturating_sub(2);
+        let last = ((-offset + view) / ROW_PX).ceil() as usize + 2;
+        let overscan = self.motion.list.as_ref().map_or(0, |s| s.overscan(ROW_PX));
         let rows = &self.session.threads;
-        (first.min(rows.len())..last.min(rows.len()))
-            .map(|index| {
+        (first.saturating_sub(overscan)..(last + overscan).min(rows.len()))
+            .filter_map(|index| {
                 let row = &rows[index];
                 let slot = index as f32 * ROW_PX + offset;
-                Drawn {
-                    top: slot + self.motion.row_offset(&row.id, slot, now),
-                    slot,
-                    row: row.clone(),
-                }
+                let top = slot + self.motion.row_offset(&row.id, slot, now);
+                ((first..last).contains(&index) || (top < view && top + ROW_PX > 0.0)).then(|| {
+                    Drawn {
+                        top,
+                        slot,
+                        row: row.clone(),
+                    }
+                })
             })
             .collect()
     }
@@ -1413,7 +1437,7 @@ impl Inbox {
     /// Rows among them that left the list fade out where they were, and
     /// scroll with the list from there. `replace`: the list is another
     /// folder's; it fades in and nothing of the old one lingers.
-    fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool) {
+    fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool, reveal_selection: bool) {
         let now = self.motion.clock.now();
         // Ghosts keep their place in the list's content, as of the offset
         // the next frame draws at.
@@ -1425,11 +1449,16 @@ impl Inbox {
             .enumerate()
             .map(|(index, row)| (row.id.as_str(), index))
             .collect();
-        // Every row on screen kept its slot (rows read above it, the view
-        // scrolled by as much): nothing moved, and a shift still running
-        // (a landing's fade) carries on.
+        let reach = self.list_viewport().unwrap_or(640.0);
+        // Keep the current shift if all drawn rows stayed in place and no
+        // row arrived below them in the viewport (undo at the end of a list).
+        let end = self.session.threads.len() as f32 * ROW_PX;
+        let same_visible_end = drawn.last().is_some_and(|last| {
+            let old_end = last.slot + ROW_PX;
+            old_end >= reach || end + offset <= old_end + 0.5
+        });
         let kept = !replace
-            && !drawn.is_empty()
+            && same_visible_end
             && drawn.iter().all(|old| {
                 slots
                     .get(old.row.id.as_str())
@@ -1451,10 +1480,8 @@ impl Inbox {
         // A row that is back (a quick undo) stops fading where it was.
         let mut carried = self.motion.carried_ghosts();
         carried.retain(|ghost| !ids.contains_key(ghost.row.id.as_str()));
-        let reach = self.list_viewport().unwrap_or(640.0);
         // Rows of a list this one replaced that sat below its last row:
         // nothing arrives over them, so they fade out where they were.
-        let end = self.session.threads.len() as f32 * ROW_PX;
         let below = drawn
             .into_iter()
             .map(|old| {
@@ -1472,7 +1499,14 @@ impl Inbox {
             replace,
             now,
         )
-        .map(|shift| shift.fading_below(below));
+        .map(|shift| {
+            let shift = shift.fading_below(below);
+            if reveal_selection && !replace {
+                shift.show_restored_selection()
+            } else {
+                shift
+            }
+        });
     }
 
     /// Move each glide one frame along, and end the ones that arrived.
@@ -1881,32 +1915,29 @@ impl Inbox {
         done: impl FnOnce(&mut Self, Result<T, fell_core::Error>) -> Option<ReadIntent> + 'static,
         cx: &mut Context<Self>,
     ) {
-        let searching = self.session.search.is_some();
-        if searching && self.session.refresh_search() {
-            // Retain the current view while the write runs. It will be
-            // reread once the store can see the change.
-            self.cancel_search_work();
-        }
+        // Retain the current view while the write runs. It will be
+        // reread once the store can see the change.
+        self.begin_search_refresh(cx);
         let reply = self.store.call(change);
         cx.spawn(async move |this, cx| {
-            let Ok(result) = reply.await else {
-                return;
-            };
-            let _ = this.update(cx, |inbox, cx| {
-                let after = done(inbox, result);
-                if inbox.session.search.is_some() {
-                    let select = after
-                        .as_ref()
-                        .and_then(|intent| intent.select.as_ref())
-                        .map(|key| key.thread_id.0.clone());
-                    inbox.refresh_saved_search_folder(select, cx);
-                    inbox.refresh_search(cx);
-                }
-                if let Some(after) = after {
-                    inbox.request_threads(after, cx);
-                }
-                cx.notify();
-            });
+            finish_mailbox_change(reply, |result| {
+                let _ = this.update(cx, |inbox, cx| {
+                    let after = done(inbox, result);
+                    if inbox.session.search.is_some() {
+                        let select = after
+                            .as_ref()
+                            .and_then(|intent| intent.select.as_ref())
+                            .map(|key| key.thread_id.0.clone());
+                        inbox.refresh_saved_search_folder(select, cx);
+                        inbox.refresh_search(cx);
+                    }
+                    if let Some(after) = after {
+                        inbox.request_threads(after, cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .await;
         })
         .detach();
     }
@@ -1999,58 +2030,6 @@ impl Inbox {
         .detach();
     }
 
-    /// Move messages in the folder on screen to Archive. A Sent copy stays in
-    /// Sent. The row leaves the list at once and the row in its place is
-    /// selected, so a second `e` archives that one.
-    fn archive_current(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.session.cursor_id.clone() else {
-            self.session.show_toast("No conversation", true);
-            return;
-        };
-        if self.session.cursor_draft().is_some() {
-            self.session.show_toast(DRAFT_NOT_THREAD, true);
-            return;
-        }
-        if !self.session.threads.iter().any(|thread| thread.id == id) {
-            self.session.show_toast("No conversation", true);
-            return;
-        }
-        let Some(folder) = self.action_folder(&id) else {
-            return;
-        };
-        let account = self.account_id.clone();
-        let thread = ThreadId(id.clone());
-        let key = self.selected_key();
-        if self.session.search.is_none() && !self.session.roles.is_view(&folder) {
-            self.take_out_of_list(std::slice::from_ref(&id), cx);
-        }
-        self.change_mailbox(
-            move |store| store.archive_thread(&account, &thread, &folder).map(|_| ()),
-            move |inbox, result| match result {
-                Ok(()) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = key;
-                    inbox.session.show_toast("Archived · u", false);
-                    inbox.send_to_server();
-                    Some(ReadIntent {
-                        changed: true,
-                        ..ReadIntent::default()
-                    })
-                }
-                Err(err) => {
-                    inbox.pending_removals.remove(&id);
-                    inbox.session.show_toast(archive_failure(&err), true);
-                    Some(ReadIntent {
-                        changed: true,
-                        select: key,
-                        ..ReadIntent::default()
-                    })
-                }
-            },
-            cx,
-        );
-    }
-
     fn apply_move(&mut self, destination: String, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.session.show_toast("No conversation", true);
@@ -2079,7 +2058,6 @@ impl Inbox {
             move |inbox, result| match result {
                 Ok(()) => {
                     inbox.pending_removals.remove(&id);
-                    inbox.moved_thread = key;
                     let label = inbox.session.folder_text(&destination);
                     inbox.session.show_toast(format!("Moved to {label}"), false);
                     inbox.send_to_server();
@@ -2110,10 +2088,14 @@ impl Inbox {
         }
     }
 
-    /// `#`, `!`, or a confirmed permanent delete on `ids` (the selection,
-    /// or the selected row). They leave the list in this frame, as an
-    /// archived row does, and the row after them is selected.
+    /// Remove the selected threads in this frame and select the row that
+    /// takes the cursor's place.
     fn remove_threads(&mut self, ids: Vec<String>, removal: Removal, cx: &mut Context<Self>) {
+        let (ids, drafts) = self.session.split_removal_targets(ids);
+        if ids.is_empty() && !drafts.is_empty() {
+            self.session.show_toast(DRAFT_NOT_THREAD, true);
+            return;
+        }
         if self.session.search.is_some() {
             self.remove_search_threads(ids, removal, cx);
             return;
@@ -2123,10 +2105,6 @@ impl Inbox {
                 .show_toast("The folder is still loading", false);
             return;
         }
-        let ids: Vec<String> = ids
-            .into_iter()
-            .filter(|id| self.session.threads.iter().any(|row| &row.id == id))
-            .collect();
         let Some(key) = ids.first().and_then(|first| {
             self.session
                 .threads
@@ -2141,6 +2119,7 @@ impl Inbox {
         let folder = self.list_folder.clone();
         let count = ids.len();
         let done_text = match removal {
+            Removal::Archive => archived_notice(count, count),
             Removal::Delete => moved_notice(
                 count,
                 &self.session.folder_text(roles.name(FolderRole::Trash)),
@@ -2162,12 +2141,14 @@ impl Inbox {
         let threads: Vec<ThreadId> = ids.iter().cloned().map(ThreadId).collect();
         self.session.picked.clear();
         self.session.visual = false;
+        self.session.anchor_id = None;
         if !roles.is_view(&folder) {
             self.take_out_of_list(&ids, cx);
         }
         self.change_mailbox(
             move |store| {
                 match removal {
+                    Removal::Archive => store.archive_threads(&account, &threads, &folder),
                     Removal::Delete => store.delete_threads(&account, &threads, &folder),
                     Removal::Spam => store.spam_threads(&account, &threads, &folder),
                     Removal::Purge => store.purge_threads(&account, &threads, &folder),
@@ -2180,9 +2161,6 @@ impl Inbox {
                 }
                 match result {
                     Ok(()) => {
-                        // Undo finds the first of them again; nothing
-                        // comes back after a permanent delete.
-                        inbox.moved_thread = (removal != Removal::Purge).then_some(key);
                         inbox.session.show_toast(done_text, false);
                         inbox.send_to_server();
                         Some(ReadIntent {
@@ -2191,7 +2169,12 @@ impl Inbox {
                         })
                     }
                     Err(err) => {
-                        inbox.session.show_toast(err.to_string(), true);
+                        let message = if removal == Removal::Archive {
+                            archive_failure(&err)
+                        } else {
+                            err.to_string()
+                        };
+                        inbox.session.show_toast(message, true);
                         Some(ReadIntent {
                             changed: true,
                             select: Some(key),
@@ -2214,14 +2197,13 @@ impl Inbox {
             self.session.remove_thread(id);
         }
         self.scroll_list_to_cursor();
-        self.start_list_shift(drawn, false);
+        self.start_list_shift(drawn, false, false);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
     }
 
-    /// List position of the selected row, so undo can find it again even
-    /// after it scrolled out of the loaded rows.
+    /// List position of the selected row, to recover it if a move fails.
     fn selected_key(&self) -> Option<ListKey> {
         let id = self.session.cursor_id.as_ref()?;
         self.session
@@ -2233,44 +2215,50 @@ impl Inbox {
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         let account = self.account_id.clone();
+        let folder = self.session.folder.clone();
+        let reading = folder.clone();
+        self.undos_in_flight += 1;
         self.change_mailbox(
-            move |store| store.undo(&account),
-            |inbox, result| match result {
-                Ok(action) => {
-                    if action.kind == fell_core::ActionKind::DiscardDrafts {
-                        inbox.session.show_toast(action.summary, false);
-                        return Some(ReadIntent {
+            move |store| {
+                let (action, restored) = store.undo_with_threads(&account)?;
+                let select = restored_folder_key(store, &account, &reading, &restored);
+                Ok((action, restored, select))
+            },
+            move |inbox, result| {
+                inbox.undos_in_flight -= 1;
+                match result {
+                    Ok((action, restored, select)) => {
+                        if action.kind == fell_core::ActionKind::DiscardDrafts {
+                            inbox.session.show_toast(action.summary, false);
+                            return Some(ReadIntent {
+                                changed: true,
+                                ..ReadIntent::default()
+                            });
+                        }
+                        inbox.session.show_toast("Undone", false);
+                        inbox.send_to_server();
+                        if inbox.session.search.is_some() && !restored.is_empty() {
+                            inbox.search_view.prefer = restored;
+                        }
+                        let select = select.filter(|_| inbox.session.folder == folder);
+                        Some(ReadIntent {
                             changed: true,
+                            select,
                             ..ReadIntent::default()
-                        });
+                        })
                     }
-                    inbox.session.show_toast("Undone", false);
-                    inbox.send_to_server();
-                    // Read and star leave the thread where it is; the thread
-                    // `m` or `e` took away waits for its own undo.
-                    let select = if action.kind.is_flag() {
-                        None
-                    } else {
-                        inbox.moved_thread.take()
-                    };
-                    if inbox.session.search.is_some() {
-                        inbox.search_view.prefer =
-                            select.as_ref().map(|key| key.thread_id.0.clone());
+                    Err(err) => {
+                        let raw = err.to_string();
+                        if raw == "nothing to undo" {
+                            inbox.session.show_toast("Nothing to undo", false);
+                        } else {
+                            inbox.session.show_toast(raw, true);
+                        }
+                        // Resume any folder read held while the undo ran.
+                        (inbox.undos_in_flight == 0 && !inbox.read_in_flight)
+                            .then(|| inbox.read_wanted.take())
+                            .flatten()
                     }
-                    Some(ReadIntent {
-                        changed: true,
-                        select,
-                        ..ReadIntent::default()
-                    })
-                }
-                Err(err) => {
-                    let raw = err.to_string();
-                    if raw == "nothing to undo" {
-                        inbox.session.show_toast("Nothing to undo", false);
-                    } else {
-                        inbox.session.show_toast(raw, true);
-                    }
-                    None
                 }
             },
             cx,
@@ -2795,7 +2783,6 @@ impl Inbox {
             message: self.session.message_cursor,
             thread: self.session.cursor_id.clone(),
             folder: self.session.folder.clone(),
-            pane: self.session.pane,
             searching: self.session.search.is_some(),
             search_generation: self.session.search_generation,
             help_open: self.session.overlay == Overlay::Help,
@@ -2807,7 +2794,6 @@ impl Inbox {
             message: message_before,
             thread: thread_before,
             folder: folder_before,
-            pane: pane_before,
             searching,
             search_generation,
             help_open,
@@ -2854,7 +2840,8 @@ impl Inbox {
             self.read_after(read, cx);
         }
         if step.archive {
-            self.archive_current(cx);
+            let ids = self.session.action_targets();
+            self.remove_threads(ids, Removal::Archive, cx);
         }
         if step.delete {
             let ids = self.session.action_targets();
@@ -2931,15 +2918,6 @@ impl Inbox {
             self.arm_which(cx);
         }
         let thread_moved = self.session.cursor_id != thread_before;
-        // The reader moved in the list, or came back to it: a box left wide
-        // when a row turned read eases back now, with this key's own glide
-        // or slide, never on a timer while they read.
-        if moved_in_list(
-            (thread_before.as_deref(), pane_before),
-            (self.session.cursor_id.as_deref(), self.session.pane),
-        ) {
-            self.row_widths.relax();
-        }
         if thread_moved && !search_changed {
             // Rows the selection moved by, when both rows are on the list.
             let moved = thread_before
@@ -3319,8 +3297,6 @@ impl Inbox {
         let changed = self.session.cursor_id.as_deref() != Some(id.as_str());
         if changed || self.session.pane != Pane::List {
             self.session.cancel_read_delay();
-            // A click in the list is a move in it, as `j` is.
-            self.row_widths.relax();
         }
         self.session.cursor_id = Some(id);
         self.session.pane = Pane::List;
@@ -4401,6 +4377,7 @@ fn thread_list(
                 let text_width = row_text_width(list_width);
                 let now = inbox.frame_now;
                 let offset = inbox.list_offset();
+                let viewport = inbox.list_viewport().unwrap_or(0.0);
                 let last = inbox.session.threads.len().saturating_sub(1);
                 let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
                 // The list also asks for row 0 alone to measure a row's
@@ -4410,6 +4387,7 @@ fn thread_list(
                     let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
                     inbox.row_widths.keep_drawn(range.clone(), ids);
                 }
+                let visible = range.clone();
                 let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -4446,17 +4424,52 @@ fn thread_list(
                         // Where the row was before the list changed, and the
                         // rows that left from under it.
                         let top = index as f32 * ROW_PX + offset;
-                        let below = inbox
-                            .session
-                            .threads
-                            .get(index + 1)
-                            .map(|next| (next.id.as_str(), top + ROW_PX));
-                        let mut moving = shift.row(&row.id, top, below, now);
+                        let below = inbox.session.threads[index + 1..]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, next)| (next.id.as_str(), top + (i + 1) as f32 * ROW_PX));
+                        let mut moving = shift.row(&row.id, top, ROW_PX, below, now);
                         moving.dy = motion::snap(moving.dy, window.scale_factor());
                         let reach = if index == last { f32::INFINITY } else { ROW_PX };
                         // Ghosts are kept in content pixels, so they scroll.
                         let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
-                        if moving == RowMotion::STILL && ghosts.is_empty() {
+                        // GPUI only asks for in-view slots. Paint rows still
+                        // moving across an edge from the nearest drawn slot.
+                        let extra = shift.overscan(ROW_PX);
+                        let above = (drawn && index == visible.start)
+                            .then(|| visible.start.saturating_sub(extra)..visible.start);
+                        let below = (drawn && index + 1 == visible.end)
+                            .then(|| visible.end..(visible.end + extra).min(last + 1));
+                        let overflow = above
+                            .into_iter()
+                            .chain(below)
+                            .flatten()
+                            .filter_map(|outside| {
+                                let row = &inbox.session.threads[outside];
+                                let slot = outside as f32 * ROW_PX + offset;
+                                let painted =
+                                    shift.visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
+                                let dy = motion::snap(painted - top, window.scale_factor());
+                                let look = RowLook {
+                                    selected: highlighted.contains(&row.id),
+                                    fading: None,
+                                    ghost: true,
+                                    bar_dx,
+                                    frame: still_frame(row, window),
+                                    previous_labels: None,
+                                };
+                                Some(slot_layer(dy, 1.0).child(thread_row(
+                                    &theme_for_rows,
+                                    row,
+                                    outside,
+                                    look,
+                                    text_width,
+                                    window,
+                                    cx,
+                                )))
+                            })
+                            .collect::<Vec<_>>();
+                        if moving == RowMotion::STILL && ghosts.is_empty() && overflow.is_empty() {
                             return element;
                         }
                         let ghosts: Vec<_> = ghosts
@@ -4482,26 +4495,26 @@ fn thread_list(
                                 ))
                             })
                             .collect();
+                        let layer = if moving.reveal.is_some() {
+                            let shown = moving.visible_height(ROW_PX, window.scale_factor());
+                            // The selected slot is highlighted as soon as
+                            // it opens. Its content fades in on top.
+                            slot_layer(moving.dy, 1.0)
+                                .h(px(shown))
+                                .overflow_hidden()
+                                .when(selected, |layer| layer.bg(rgb(theme_for_rows.selection)))
+                                .child(slot_layer(0.0, moving.opacity).child(element))
+                        } else {
+                            slot_layer(moving.dy, moving.opacity).child(element)
+                        };
                         div()
                             .id(gpui::ElementId::named_usize("thread-slot", index))
                             .relative()
                             .h(px(ROW_PX))
                             .w_full()
                             .children(ghosts)
-                            .child(
-                                slot_layer(moving.dy, moving.opacity)
-                                    .when(moving.reveal < 1.0, |layer| {
-                                        // Only the part of the gap that has
-                                        // opened shows, so the rows sliding
-                                        // down never cover it.
-                                        let shown = motion::snap(
-                                            ROW_PX * moving.reveal,
-                                            window.scale_factor(),
-                                        );
-                                        layer.h(px(shown)).overflow_hidden()
-                                    })
-                                    .child(element),
-                            )
+                            .child(layer)
+                            .children(overflow)
                             .into_any_element()
                     })
                     .collect();
@@ -4550,18 +4563,11 @@ fn still_frame(row: &ThreadRow, window: &Window) -> RowFrame {
     RowFrame::still(natural, row.unread, row.starred)
 }
 
-/// The reader moved the list's cursor, or came back to the list (`Esc`,
-/// `h`, a click): given the thread cursor and pane before and after.
-fn moved_in_list(before: (Option<&str>, Pane), after: (Option<&str>, Pane)) -> bool {
-    before.0 != after.0 || (before.1 != Pane::List && after.1 == Pane::List)
-}
-
-/// The cursors, folder and pane before a key ([`Inbox::before_step`]).
+/// The cursors, folder and search state before a key ([`Inbox::before_step`]).
 struct StepBefore {
     message: usize,
     thread: Option<String>,
     folder: String,
-    pane: Pane,
     searching: bool,
     search_generation: u64,
     help_open: bool,
@@ -5074,8 +5080,7 @@ fn names(
         .child(line)
 }
 
-/// Line two: the subject and the snippet. `background` is the row's fill
-/// this frame, which the snippet's edge fades into.
+/// Line two: the subject and the snippet. Clipped edges fade into the row fill.
 fn thread_line_two(
     theme: &Theme,
     row: &ThreadRow,
@@ -5094,15 +5099,23 @@ fn thread_line_two(
     } else {
         theme.foreground
     };
-    // The box is drawn where it is now (it eases while it grows or
-    // relaxes); its text and the snippet are cut where it is going, so
-    // they do not change from frame to frame.
-    let (box_w, _) = row_widths::line_two(frame.subject_w, text_width);
-    let (room, rest_x) = row_widths::line_two(frame.subject_room, text_width);
-    let snippet_w = (text_width - rest_x).max(24.0);
-    // Shaped once here and drawn from that shaping: a row that comes into
-    // view shapes each of its two texts at most twice.
+    let max_subject = row_widths::SUBJECT_MAX.min(text_width);
+    let box_w = frame.subject_w.min(max_subject);
+    let room = frame.subject_room.min(max_subject);
+    // Shape at the new weight once and reveal it through the moving box.
     let style = window.text_style();
+    let subject = clip_shaped(
+        window,
+        &style,
+        &row.subject,
+        room,
+        row_weight(frame.bold),
+        Some(subject_color),
+    );
+    let shaped_w = subject.as_ref().map_or(0.0, |line| f32::from(line.width));
+    let (subject_x, visible_w, snippet_x) = row_widths::line_two(box_w, room, shaped_w);
+    let snippet_w = (text_width - room.min(shaped_w) - row_widths::SUBJECT_GAP).max(24.0);
+    let snippet_visible_w = (text_width - snippet_x).max(0.0);
     let snippet = clip_shaped(
         window,
         &style,
@@ -5110,42 +5123,37 @@ fn thread_line_two(
         snippet_w,
         FontWeight::NORMAL,
         Some(snippet_color),
-    );
-    let subject = (!row.subject.is_empty()).then(|| {
-        let shaped = clip_shaped(
-            window,
-            &style,
-            &row.subject,
-            room,
-            row_weight(frame.bold),
-            Some(subject_color),
-        );
-        div()
-            .relative()
-            .flex_none()
-            .w(px(box_w))
-            .overflow_hidden()
-            .children(shaped.map(|line| shaped_text(line, window)))
-    });
-    // A relaxing box carries the snippet, cut for where it is going, past
-    // the end of the line: its last pixels fade into the row instead of
-    // showing half a letter.
-    let edge = frame.edge_fade();
-    let edge_fade = (edge > 0.0).then(|| {
-        let solid = gpui::Hsla::from(rgb(background));
-        let clear = gpui::Hsla { a: 0.0, ..solid };
+    )
+    .map(|line| {
+        // The final ellipsis can slide past the edge while the subject box
+        // shrinks. Fade that edge until the shaped snippet fits again.
+        let clipped = (f32::from(line.width) - snippet_visible_w).clamp(0.0, 1.0);
         div()
             .absolute()
-            .top(px(0.))
-            .bottom(px(0.))
-            .right(px(0.))
-            .w(px(row_widths::EDGE_FADE))
-            .opacity(edge)
-            .bg(gpui::linear_gradient(
-                90.,
-                gpui::linear_color_stop(clear, 0.),
-                gpui::linear_color_stop(solid, 1.),
-            ))
+            .top_0()
+            .bottom_0()
+            .left(px(snippet_x))
+            .w(px(snippet_visible_w))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .child(shaped_text(line, window))
+            .when(!frame.bold && clipped > 0.0, |snippet| {
+                snippet.child(row_text_edge_fade(background, snippet_visible_w, clipped))
+            })
+    });
+    let subject = subject.map(|line| {
+        let clipped = (shaped_w.min(room) - visible_w).clamp(0.0, 1.0);
+        div()
+            .relative()
+            .left(px(subject_x))
+            .flex_none()
+            .w(px(visible_w))
+            .overflow_hidden()
+            .child(shaped_text(line, window))
+            .when(clipped > 0.0, |subject| {
+                subject.child(row_text_edge_fade(background, visible_w, clipped))
+            })
     });
     // Keep line two at a fixed height while the snippet fills in.
     div()
@@ -5155,17 +5163,26 @@ fn thread_line_two(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(row_widths::SUBJECT_GAP))
         .overflow_hidden()
         .children(subject)
-        .children(snippet.map(|line| {
-            div()
-                .flex_none()
-                .w(px((text_width - box_w - row_widths::SUBJECT_GAP).max(24.0)))
-                .overflow_hidden()
-                .child(shaped_text(line, window))
-        }))
-        .children(edge_fade)
+        .children(snippet)
+}
+
+fn row_text_edge_fade(background: u32, width: f32, opacity: f32) -> gpui::Div {
+    let solid = gpui::Hsla::from(rgb(background));
+    let clear = gpui::Hsla { a: 0.0, ..solid };
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(row_widths::SUBJECT_FADE.min(width)))
+        .opacity(opacity)
+        .bg(gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(clear, 0.),
+            gpui::linear_color_stop(solid, 1.),
+        ))
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
@@ -7711,9 +7728,25 @@ fn folder_picker(
         )
 }
 
-/// What `#`, `!`, and a confirmed permanent delete do to the threads.
+/// Land on the first restored row in the current folder's order. Use the
+/// store's current keys so undo can land outside the loaded window too.
+fn restored_folder_key(
+    store: &fell_core::Store,
+    account: &fell_core::AccountId,
+    folder: &str,
+    threads: &[ThreadId],
+) -> Option<ListKey> {
+    threads
+        .iter()
+        .filter_map(|id| store.folder_key_of(account, folder, id).ok().flatten())
+        .min()
+}
+
+/// How a triage action takes threads out of the current folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Removal {
+    /// To Archive.
+    Archive,
     /// To Trash.
     Delete,
     /// To Spam, or from Spam to the inbox.
@@ -7727,6 +7760,14 @@ fn moved_notice(count: usize, to: &str) -> String {
     match count {
         1 => format!("Moved to {to} · u"),
         n => format!("Moved {n} to {to} · u"),
+    }
+}
+
+fn archived_notice(count: usize, selected: usize) -> String {
+    if count == 1 && selected == 1 {
+        "Archived · u".into()
+    } else {
+        format!("Archived {count} · u")
     }
 }
 
@@ -7897,7 +7938,7 @@ mod tests {
     use super::{
         FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX,
         ReaderColumns, account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, fit_folder_path, key_from, message_content_width, moved_in_list,
+        expanded_header_widths, fit_folder_path, key_from, message_content_width,
         picker_card_height, should_follow_visible, unread_bar_dx, useful_header_email,
         write_back_notice,
     };
@@ -7906,6 +7947,22 @@ mod tests {
     use crate::motion;
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
+
+    #[test]
+    fn a_dropped_mailbox_reply_still_runs_failure_completion() {
+        let (sender, reply) = futures::channel::oneshot::channel::<fell_core::Result<()>>();
+        drop(sender);
+
+        let mut outcome = None;
+        futures::executor::block_on(super::finish_mailbox_change(reply, |result| {
+            outcome = Some(result);
+        }));
+
+        assert!(matches!(
+            outcome,
+            Some(Err(fell_core::Error::Action(message))) if message == "Could not update this mailbox"
+        ));
+    }
 
     #[test]
     fn folder_labels_keep_the_leaf_and_filter_match_in_view() {
@@ -8015,6 +8072,127 @@ mod tests {
         let unicode = "ééééééééééééé@demo.test";
         assert!(!useful_header_email(unicode, "éééééé…"));
         assert!(useful_header_email("rōbin@demo.test", "rōbin@…"));
+    }
+
+    #[test]
+    fn archive_undo_selects_each_restored_row_and_the_first_of_a_batch() {
+        use super::{ListShift, Motion, ROW_PX, restored_folder_key};
+        use crate::fixtures::{fixture_account, seed_if_empty};
+        use crate::keymap::{KeyId, Keymap};
+        use crate::model::{Session, SyncKind};
+        use crate::present::{draft_row_id, thread_rows};
+        use fell_core::{FolderSpan, ListKey, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let account = fixture_account();
+        store.upsert_account(&account).unwrap();
+        seed_if_empty(&store, &account).unwrap();
+        let folder = "INBOX";
+        let list = || {
+            store
+                .folder_page(&account.id, folder, &FolderSpan::Top { rows: 100 })
+                .unwrap()
+                .threads
+        };
+        let original = list();
+        let mut session = Session::new(
+            "Demo",
+            &account.email,
+            SyncKind::FixtureOffline,
+            Keymap::default(),
+        );
+        session.set_threads(thread_rows(&original, &account.email));
+        let keys: Vec<_> = original.iter().skip(2).take(3).map(ListKey::of).collect();
+        session.select_if_present(keys[0].thread_id.as_str());
+        for key in &keys {
+            assert_eq!(session.cursor_id.as_deref(), Some(key.thread_id.as_str()));
+            store
+                .archive_thread(&account.id, &key.thread_id, folder)
+                .unwrap();
+            session.remove_thread(key.thread_id.as_str());
+        }
+
+        let restore = |session: &mut Session, expected: &ListKey| {
+            let before = session
+                .threads
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id.clone(), index as f32 * ROW_PX))
+                .collect();
+            assert!(session.on_key(KeyId::Char('u'), 10).undo);
+            let (_, restored) = store.undo_with_threads(&account.id).unwrap();
+            let selected = restored_folder_key(&store, &account.id, folder, &restored);
+            assert_eq!(selected.as_ref(), Some(expected));
+            let page = list();
+            session.set_threads(thread_rows(&page, &account.email));
+            assert!(session.select_if_present(selected.unwrap().thread_id.as_str()));
+            assert_eq!(
+                session.cursor_id.as_deref(),
+                Some(expected.thread_id.as_str())
+            );
+            let cursor = session.cursor_index();
+            let cursor_id = session.cursor_id.as_deref().unwrap();
+            assert!(session.highlighted().contains(cursor_id));
+            let top = cursor as f32 * ROW_PX;
+            let below = session
+                .threads
+                .iter()
+                .enumerate()
+                .skip(cursor + 1)
+                .map(|(index, row)| (row.id.as_str(), index as f32 * ROW_PX));
+            let first = std::time::Instant::now();
+            let mut shift = ListShift::<()>::start(
+                &Motion::new(true),
+                before,
+                vec![],
+                vec![],
+                640.0,
+                false,
+                first,
+            )
+            .unwrap()
+            .show_restored_selection();
+            let row = shift.row(cursor_id, top, ROW_PX, below, first);
+            assert!(
+                row.reveal.is_some(),
+                "an adjacent survivor makes room for the row"
+            );
+            let highlight = row.visible_height(ROW_PX, 1.0);
+            assert!(highlight > 0.0, "first-frame highlight: {highlight}");
+            restored
+        };
+        for key in keys.iter().rev() {
+            assert_eq!(
+                restore(&mut session, key),
+                std::slice::from_ref(&key.thread_id)
+            );
+        }
+        let mut draft = session.threads[0].clone();
+        draft.id = draft_row_id("unsent");
+        draft.draft = Some("unsent".into());
+        let selected = vec![
+            draft.id.clone(),
+            keys[2].thread_id.0.clone(),
+            keys[1].thread_id.0.clone(),
+            keys[0].thread_id.0.clone(),
+        ];
+        session.threads.insert(0, draft);
+        let (batch, skipped) = session.split_removal_targets(selected);
+        assert_eq!(skipped, ["unsent"]);
+        let batch: Vec<_> = batch.into_iter().map(fell_core::ThreadId).collect();
+        store.archive_threads(&account.id, &batch, folder).unwrap();
+        session.set_threads(thread_rows(&list(), &account.email));
+        let restored = restore(&mut session, &keys[0]);
+        assert_eq!(restored.len(), batch.len());
+        assert!(batch.iter().all(|id| restored.contains(id)));
+        assert!(matches!(
+            store.undo_with_threads(&account.id),
+            Err(fell_core::Error::Action(message)) if message == "nothing to undo"
+        ));
+        assert_eq!(
+            list().iter().map(ListKey::of).collect::<Vec<_>>(),
+            original.iter().map(ListKey::of).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -8166,60 +8344,6 @@ mod tests {
             assert_eq!(reading.card.width, reading.prose.width);
             assert!(reading.wide.width >= reading.prose.width);
         }
-    }
-
-    /// After each key, whether a box left wide relaxes: only a key that
-    /// moves the list's cursor or comes back to the list.
-    #[test]
-    fn only_moving_in_the_list_relaxes_a_wide_row() {
-        use crate::keymap::Keymap;
-        use crate::model::{Session, SyncKind};
-        use crate::present::{NameSpan, ThreadRow};
-        let row = |id: &str| ThreadRow {
-            id: id.into(),
-            spans: vec![NameSpan {
-                text: id.into(),
-                emphasis: true,
-            }],
-            extra: 0,
-            message_count: 1,
-            starred: false,
-            has_attachment: false,
-            date_unix: 0,
-            subject: id.into(),
-            snippet: "snippet".into(),
-            labels: vec![],
-            warn: false,
-            unread: true,
-            draft: None,
-        };
-        let mut session = Session::new("A", "a@x", SyncKind::FixtureOffline, Keymap::default());
-        session.set_threads(vec![row("a"), row("b"), row("c")]);
-        let mut press = |key: KeyId| {
-            let before = (session.cursor_id.clone(), session.pane);
-            session.on_key(key, 10);
-            moved_in_list(
-                (before.0.as_deref(), before.1),
-                (session.cursor_id.as_deref(), session.pane),
-            )
-        };
-        // Opening, `U` and `s` leave the row where the reader is looking.
-        assert!(!press(KeyId::Enter));
-        assert!(!press(KeyId::Char('U')));
-        assert!(!press(KeyId::Char('s')));
-        // `j` in the conversation moves between messages, not threads.
-        assert!(!press(KeyId::Char('j')));
-        // Back to the list, then down it.
-        assert!(press(KeyId::Escape));
-        assert!(press(KeyId::Char('j')));
-        assert!(press(KeyId::Char('k')));
-        // Any other move of the list cursor: `G`, `gg`, a page.
-        assert!(press(KeyId::Char('G')));
-        assert!(!press(KeyId::Char('g')));
-        assert!(press(KeyId::Char('g')));
-        // Open, then back with `h`.
-        assert!(!press(KeyId::Enter));
-        assert!(press(KeyId::Char('h')));
     }
 
     #[test]

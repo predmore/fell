@@ -828,6 +828,24 @@ impl Session {
             .collect()
     }
 
+    /// The selected conversation row IDs and local draft IDs, in order.
+    /// Conversation actions skip local drafts. In Drafts, a draft-only
+    /// delete discards those drafts through the editor's path.
+    pub fn split_removal_targets(&self, mut ids: Vec<String>) -> (Vec<String>, Vec<String>) {
+        let mut drafts = Vec::new();
+        ids.retain(|id| {
+            let Some(row) = self.threads.iter().find(|row| &row.id == id) else {
+                return false;
+            };
+            if let Some(draft) = &row.draft {
+                drafts.push(draft.clone());
+                return false;
+            }
+            true
+        });
+        (ids, drafts)
+    }
+
     /// The threads `y` confirmed for a permanent delete, once.
     pub fn take_purge(&mut self) -> Option<Vec<String>> {
         self.purge_ready.take()
@@ -2013,29 +2031,18 @@ impl Session {
             }
             Action::Delete | Action::Spam => {
                 self.count.clear();
-                let targets = self.action_targets();
+                let (targets, drafts) = self.split_removal_targets(self.action_targets());
                 if targets.is_empty() {
-                    self.show_toast("No conversation", true);
-                    return Step::default();
-                }
-                let drafts: Vec<_> = self
-                    .threads
-                    .iter()
-                    .filter(|row| targets.contains(&row.id))
-                    .filter_map(|row| row.draft.clone())
-                    .collect();
-                if !drafts.is_empty() {
-                    if action == Action::Delete && self.in_drafts() {
-                        if drafts.len() == targets.len() {
-                            return Step {
-                                discard: drafts,
-                                ..Step::default()
-                            };
-                        }
-                        self.show_toast("Select only local drafts to discard", true);
-                        return Step::default();
+                    if drafts.is_empty() {
+                        self.show_toast("No conversation", true);
+                    } else if action == Action::Delete && self.in_drafts() {
+                        return Step {
+                            discard: drafts,
+                            ..Step::default()
+                        };
+                    } else {
+                        self.show_toast(DRAFT_NOT_THREAD, true);
                     }
-                    self.show_toast(DRAFT_NOT_THREAD, true);
                     return Step::default();
                 }
                 if action == Action::Spam {
@@ -2051,13 +2058,12 @@ impl Session {
                     };
                     let trash = scopes
                         .iter()
-                        .filter(|(_, folder)| self.roles.is(FolderRole::Trash, folder))
-                        .count();
-                    if trash != 0 && trash != scopes.len() {
-                        self.show_toast("Select Trash results separately to remove them", true);
+                        .all(|(_, folder)| self.roles.is(FolderRole::Trash, folder));
+                    if trash && scopes.len() != targets.len() {
+                        self.show_toast("No folder for a selected match", true);
                         return step;
                     }
-                    trash != 0
+                    trash
                 } else {
                     self.in_trash()
                 };
@@ -2353,7 +2359,7 @@ impl Session {
     /// `U` (`star` false) or `s` on the targets. All already unread (or
     /// starred) turns it off; otherwise every target gets it.
     fn toggle_flag(&mut self, star: bool) -> Step {
-        let ids = self.flag_targets();
+        let mut ids = self.flag_targets();
         if ids.is_empty() {
             let text = if self.cursor_draft().is_some() {
                 DRAFT_NOT_THREAD
@@ -2363,9 +2369,13 @@ impl Session {
             self.show_toast(text, true);
             return Step::default();
         }
-        if self.search.is_some() && self.search_scopes(&ids).is_none() {
-            self.show_toast("No folder for a selected match", true);
-            return Step::default();
+        let multiple_selected = ids.len() > 1;
+        if self.search.is_some() {
+            ids.retain(|id| self.search_source(id).is_some());
+            if ids.is_empty() {
+                self.show_toast("No folder for a selected match", true);
+                return Step::default();
+            }
         }
         let rows: Vec<&ThreadRow> = self
             .threads
@@ -2385,7 +2395,7 @@ impl Session {
         };
         let count = ids.len();
         // The selection was the operand: it is used up, as in vim.
-        if count > 1 {
+        if multiple_selected {
             self.visual = false;
             self.anchor_id = None;
             self.picked.clear();
@@ -2867,11 +2877,9 @@ mod tests {
         assert_eq!(session.on_key(hash, 10).discard, ["c1", "r2"]);
         session.on_key(KeyId::Char('j'), 10);
         let mixed = session.on_key(hash, 10);
-        assert!(mixed.discard.is_empty() && !mixed.delete);
-        assert_eq!(
-            session.toast.as_ref().unwrap().text,
-            "Select only local drafts to discard"
-        );
+        assert!(mixed.discard.is_empty() && mixed.delete);
+        let (threads, _) = session.split_removal_targets(session.action_targets());
+        assert_eq!(threads, ["synced"]);
         session.visual = false;
         assert!(session.on_key(hash, 10).delete);
     }
@@ -3671,6 +3679,42 @@ mod tests {
         }
         assert_eq!(session.cursor_id.as_deref(), Some("e"));
         assert!(!session.visual);
+    }
+
+    #[test]
+    fn mixed_triage_selections_take_the_threads_and_leave_local_drafts() {
+        for (key, flags) in [
+            ('e', (true, false, false)),
+            ('#', (false, true, false)),
+            ('!', (false, false, true)),
+        ] {
+            for visual in [false, true] {
+                let mut session = session();
+                session.folder = "Drafts".into();
+                let mut draft = row("draft-1");
+                draft.draft = Some("c1".into());
+                session.set_threads(vec![row("a"), draft, row("b")]);
+                session.select_if_present("a");
+                if visual {
+                    for key in ['V', 'j', 'j'] {
+                        session.on_key(KeyId::Char(key), 4);
+                    }
+                } else {
+                    for id in ["a", "draft-1", "b"] {
+                        session.select_if_present(id);
+                        session.on_key(KeyId::Char('x'), 4);
+                    }
+                }
+
+                let step = session.on_key(KeyId::Char(key), 4);
+                assert_eq!((step.archive, step.delete, step.spam), flags);
+                assert!(step.discard.is_empty());
+                assert!(session.toast.is_none());
+                let (targets, drafts) = session.split_removal_targets(session.action_targets());
+                assert_eq!(targets, ["a", "b"]);
+                assert_eq!(drafts, ["c1"]);
+            }
+        }
     }
 
     #[test]
