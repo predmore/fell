@@ -110,7 +110,7 @@ impl Render for CachedPreview {
                     &inbox.motion,
                     inbox.frame_now,
                     Some(inbox.conv_scroll.clone()),
-                    width,
+                    ReaderColumns::split(width),
                     Live(false),
                     &frame,
                     window,
