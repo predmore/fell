@@ -39,7 +39,7 @@ use crate::outbox::{
 use crate::store::{Store, copies::CopyFlags};
 
 use super::ImapConfig;
-use super::rfc822::{copy_message_id, is_uid_message_id};
+use super::rfc822::{copy_message_id, is_synthetic_message_id};
 use super::session::{FlagReply, Placed, WriteError, WriteSession};
 
 /// Refusals (or "not on the server yet") before a row is dropped.
@@ -407,6 +407,25 @@ impl Pass<'_> {
         else {
             return self.retry(index, DropReason::NotFound, "folder is not on the server");
         };
+        let roles = self.store.folder_roles(self.account_id)?;
+        for (folder, raw) in [
+            (&entry.source_folder, &source),
+            (&entry.target_folder, &target),
+        ] {
+            if roles.is_view(folder)
+                || crate::store::views::has_view(
+                    self.store.connection(),
+                    self.account_id,
+                    &super::escape_mailbox(raw),
+                )?
+            {
+                return self.drop_row(
+                    index,
+                    DropReason::Refused,
+                    "virtual mailbox cannot be moved",
+                );
+            }
+        }
         let uidvalidity = match self.select(session, &source)? {
             Ok(uidvalidity) => uidvalidity,
             Err(message) => return self.retry(index, DropReason::Refused, &message),
@@ -556,7 +575,7 @@ impl Pass<'_> {
     ) -> Result<Option<(u32, u32)>, Stop> {
         let entries = self.entries;
         let entry = &entries[row];
-        if is_uid_message_id(&entry.message_id) {
+        if is_synthetic_message_id(&entry.message_id) {
             return Ok(None);
         }
         let Some(&Some((bound_uidvalidity, uidnext))) = self.bounds.get(&entry.id) else {
@@ -593,7 +612,7 @@ impl Pass<'_> {
             .iter()
             .filter(|(uid, header)| {
                 candidates.contains(uid)
-                    && copy_message_id(target, uidvalidity, *uid, header).as_str()
+                    && copy_message_id(target, uidvalidity, *uid, header, false).as_str()
                         == entry.message_id
             })
             .map(|(uid, _)| *uid)

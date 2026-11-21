@@ -417,9 +417,7 @@ mod tests {
                 token: "after-the-end".into(),
             }),
             settle: crate::backend::Settle::All,
-            roles: None,
-            progress: None,
-            too_large: Vec::new(),
+            ..MailboxDelta::default()
         };
         store.apply_delta(&account_id, &end).unwrap();
 

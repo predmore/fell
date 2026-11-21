@@ -50,7 +50,7 @@ pub struct ConvMessage {
     /// prepared with: a forward's subject keeps its history open, and a
     /// logo named for the sender draws no `Image blocked` line.
     pub mail_headers: Vec<(String, String)>,
-    pub folders: String,
+    pub folders: Vec<String>,
     pub date_unix: i64,
     pub snippet: String,
     /// The stored text: what a message with no HTML part paints.
@@ -577,9 +577,9 @@ pub fn draft_conversation(draft: &DraftSummary, me: &str, now: i64) -> Vec<ConvM
         // row's chip says what to do, in the error colour; here, only why,
         // so the warning is said once.
         message.folders = if draft.maybe_sent {
-            "may have been sent".into()
+            vec!["may have been sent".into()]
         } else {
-            String::new()
+            Vec::new()
         };
         message.expanded = true;
         // The markdown the person wrote, styled as the compose window and
@@ -796,6 +796,7 @@ pub fn conversation(
                 folders: message
                     .folders
                     .iter()
+                    .filter(|folder| !roles.is_view(folder))
                     // A message in Drafts is a draft: "Draft", unless the
                     // reader is in Drafts, where every row is one.
                     .filter_map(|folder| {
@@ -807,8 +808,7 @@ pub fn conversation(
                             Some("Draft".to_string())
                         }
                     })
-                    .collect::<Vec<_>>()
-                    .join(" · "),
+                    .collect(),
                 date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
                 body: render_stored_body(
@@ -1239,7 +1239,7 @@ mod tests {
             sender: "Ada".into(),
             email: "ada@x".into(),
             mail_headers: Vec::new(),
-            folders: "Inbox".into(),
+            folders: vec!["Inbox".into()],
             date_unix: 0,
             snippet: body.into(),
             body: render_stored_body(Some(body).filter(|text| !text.is_empty()), body, ""),
@@ -1421,7 +1421,7 @@ mod tests {
         let line = shown[0].recipients.as_ref().unwrap();
         assert!(line.short.contains("Ada Lovelace"), "{line:?}");
         // Inside Drafts, every row is a draft: the header doesn't say so.
-        assert_eq!(shown[0].folders, "");
+        assert!(shown[0].folders.is_empty());
     }
 
     fn draft(body: &str) -> DraftSummary {
@@ -1494,7 +1494,7 @@ mod tests {
         assert_eq!(row.labels, vec!["check Sent"]);
         assert!(row.warn);
         let shown = draft_conversation(&maybe, "me@example.com", 2_000);
-        assert_eq!(shown[0].folders, "may have been sent");
+        assert_eq!(shown[0].folders, ["may have been sent"]);
     }
 
     #[test]
@@ -1954,16 +1954,37 @@ mod tests {
         assert!(!messages[0].expanded);
         assert!(!messages[1].expanded);
         assert!(messages[2].expanded);
-        assert_eq!(messages[1].folders, "Sent");
+        assert_eq!(messages[1].folders, ["Sent"]);
         // A draft says so beside the mail it answers, but not inside
         // Drafts, where every row is a draft.
         let roles = FolderRoles::from_names(&["INBOX".into(), "Drafts".into()]);
         let thread = [message("a", false, "INBOX"), message("d", false, "Drafts")];
         let from_inbox = conversation(&thread, "me@x", &roles, &[], "INBOX");
-        assert_eq!(from_inbox[1].folders, "Draft");
+        assert_eq!(from_inbox[1].folders, ["Draft"]);
         let from_drafts = conversation(&thread, "me@x", &roles, &[], "Drafts");
-        assert_eq!(from_drafts[0].folders, "Inbox");
-        assert_eq!(from_drafts[1].folders, "");
+        assert_eq!(from_drafts[0].folders, ["Inbox"]);
+        assert!(from_drafts[1].folders.is_empty());
+    }
+
+    #[test]
+    fn conversation_folder_line_excludes_labels() {
+        let mut message = addressed("sender@example.com", &[], &[], &[]);
+        message.labels = vec!["A".into(), "Projects/2026".into()];
+        let roles = FolderRoles::default();
+        let folders = vec!["INBOX".into(), "Trips/November".into()];
+        message.folders = folders.clone();
+        let reader = conversation(
+            std::slice::from_ref(&message),
+            "",
+            &roles,
+            &folders,
+            "All Mail",
+        );
+        assert_eq!(reader[0].folders, ["Inbox", "Trips/November"]);
+
+        message.folders.clear();
+        let reader = conversation(&[message], "", &roles, &folders, "All Mail");
+        assert!(reader[0].folders.is_empty());
     }
 
     fn addressed(

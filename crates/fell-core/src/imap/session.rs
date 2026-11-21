@@ -99,11 +99,20 @@ pub(super) enum FetchItems {
     /// `UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]`: enough for a list row and
     /// threading, before the body is fetched.
     Headers,
+    /// Identity headers, to link copies without their bodies.
+    MessageId { bridge: bool },
     /// The original Reply-To header only, for legacy rows.
     ReplyTo,
 }
 
 const REPLY_TO_SECTION: &str = "HEADER.FIELDS (REPLY-TO)";
+fn identity_section(bridge: bool) -> &'static str {
+    if bridge {
+        "HEADER.FIELDS (MESSAGE-ID X-PM-INTERNAL-ID)"
+    } else {
+        "HEADER.FIELDS (MESSAGE-ID)"
+    }
+}
 
 /// A UID and the header bytes fetched for it.
 pub(super) type HeaderRow = (u32, Vec<u8>);
@@ -322,10 +331,15 @@ impl Session {
         items: FetchItems,
         mut on_fetched: impl FnMut(Fetched) -> Result<(), Error>,
     ) -> Result<FetchStop, Error> {
+        let identity;
         let body = match items {
             FetchItems::Flags => "",
             FetchItems::Bodies => " BODY.PEEK[]",
             FetchItems::Headers => " RFC822.SIZE BODY.PEEK[HEADER]",
+            FetchItems::MessageId { bridge } => {
+                identity = format!(" BODY.PEEK[{}]", identity_section(bridge));
+                &identity
+            }
             FetchItems::ReplyTo => " BODY.PEEK[HEADER.FIELDS (REPLY-TO)]",
         };
         // CHANGEDSINCE already requests MODSEQ implicitly. Other FETCHes
@@ -375,6 +389,9 @@ impl Session {
             }
             let fetched = match items {
                 FetchItems::Bodies | FetchItems::Headers => parse_fetch(&text, literals),
+                FetchItems::MessageId { bridge } => {
+                    parse_fetch_with_section(&text, literals, Some(identity_section(bridge)))
+                }
                 FetchItems::ReplyTo => {
                     parse_fetch_with_section(&text, literals, Some(REPLY_TO_SECTION))
                 }
@@ -423,8 +440,12 @@ impl Session {
         &mut self,
         first: u32,
         last: u32,
+        bridge: bool,
     ) -> Result<Option<Vec<HeaderRow>>, Error> {
-        let cmd = format!("FETCH {first}:{last} (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])");
+        let cmd = format!(
+            "FETCH {first}:{last} (UID BODY.PEEK[{}])",
+            identity_section(bridge)
+        );
         let lines = match self.command("FETCH", &cmd) {
             Ok(reply) => reply.untagged,
             Err(Error::Backend(message)) if message.contains("FETCH failed:") => {

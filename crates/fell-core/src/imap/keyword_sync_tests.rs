@@ -725,12 +725,8 @@ fn bridge_keeps_mailbox_labels_when_copy_flags_change() {
     sync_once(&acct, &backend, &store).unwrap();
     let id = MessageId::new("root@x");
     let before = store.message(&acct.id, &id).unwrap().unwrap();
-    assert!(
-        before
-            .folders
-            .iter()
-            .any(|folder| folder == "Labels/Projects")
-    );
+    assert_eq!(before.folders, ["INBOX"]);
+    assert!(before.labels.iter().any(|label| label == "Projects"));
 
     set_flags(&server, "INBOX", 2, &["outside"]);
     sync_once(&acct, &backend, &store).unwrap();

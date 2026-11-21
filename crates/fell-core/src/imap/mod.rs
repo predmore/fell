@@ -10,6 +10,7 @@
 
 mod bodies;
 mod part_fetch;
+mod projections;
 mod reply_to;
 mod rfc822;
 mod session;
@@ -24,11 +25,14 @@ pub(crate) use reply_to::fetch_reply_to;
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
     CidReferences, attachment_names, has_attachment, is_bidi_control, parts_from_raw,
 };
 
+#[cfg(test)]
+mod bridge_sync_tests;
 #[cfg(test)]
 mod first_sync_tests;
 #[cfg(test)]
@@ -48,8 +52,8 @@ use std::fmt;
 use crate::Error;
 use crate::account::AccountId;
 use crate::backend::{
-    FlagUpdate, FolderRemoval, KnownCopies, MailboxDelta, RemovalKind, Settle, SyncCursor,
-    SyncProgress,
+    CopyLink, FlagUpdate, FolderRemoval, KnownCopies, MailboxDelta, MailboxView, MailboxViewKind,
+    RemovalKind, Settle, SyncCursor, SyncProgress,
 };
 use crate::folders::{FolderRole, FolderRoles, ListedMailbox};
 use crate::message::{Message, RemoteId};
@@ -278,11 +282,19 @@ pub(crate) fn fetch_imap(
             .cmp(&right.decoded)
             .then_with(|| left.raw.cmp(&right.raw))
     });
-    let roles = listed_roles(&mailboxes, &config.folder_overrides);
+    let views = projections::listed(&mailboxes, !keywords);
+    let roles = listed_roles(&mailboxes, &config.folder_overrides, !keywords, &views);
+    let prior = decode_cursor(cursor);
     // Roles first, so `gs` and archive find the right folder while the
     // first pass is still reading mail.
     persist(MailboxDelta {
         roles: Some(roles.clone()),
+        views: Some(views.values().cloned().collect()),
+        removals: if keywords {
+            Vec::new()
+        } else {
+            projections::missing_legacy(&mailboxes, &prior)
+        },
         ..MailboxDelta::default()
     })?;
     let mut pass = Pass {
@@ -290,7 +302,7 @@ pub(crate) fn fetch_imap(
         listed: &mailboxes,
         known,
         keywords,
-        prior: decode_cursor(cursor).into_iter().collect(),
+        prior: prior.into_iter().collect(),
         done: HashMap::new(),
         // Every mailbox was read to the end, so a copy moved on the server
         // has arrived wherever it went.
@@ -301,8 +313,13 @@ pub(crate) fn fetch_imap(
     let mut visited: HashSet<usize> = HashSet::new();
     // Mailboxes whose first sync has older mail left to read.
     let mut walking: HashSet<usize> = HashSet::new();
-    for (index, reach) in visit_order(&mailboxes, &roles) {
+    for (index, reach) in visit_order(&mailboxes, &roles, &views) {
         let mailbox = &mailboxes[index];
+        let view = views.get(&mailbox.raw);
+        let flags = FlagMode {
+            keywords,
+            view: view.map(|view| &view.kind),
+        };
         let first = visited.insert(index);
         if !first && !walking.contains(&index) {
             continue;
@@ -331,12 +348,16 @@ pub(crate) fn fetch_imap(
                 .done
                 .get(&mailbox.raw)
                 .is_some_and(|checkpoint| checkpoint.uidvalidity != examined.uidvalidity);
-        if (first || renumbered) && !catch_up(&mut pass, &mut session, mailbox, &examined, persist)?
+        if (first || renumbered)
+            && !catch_up(&mut pass, &mut session, mailbox, &examined, flags, persist)?
         {
             walking.remove(&index);
             continue;
         }
-        let folder = roles.label(&mailbox.decoded);
+        let folder = match flags.view {
+            Some(MailboxViewKind::Label(label)) => label.clone(),
+            _ => roles.label(&mailbox.decoded),
+        };
         let walked = walk_down(
             &mut pass,
             &mut session,
@@ -345,6 +366,7 @@ pub(crate) fn fetch_imap(
                 folder: &folder,
                 examined: &examined,
                 reach,
+                flags,
             },
             persist,
         )?;
@@ -413,7 +435,11 @@ enum Reach {
 /// sync is read newest first a stretch at a time: the newest Inbox mail,
 /// then the newest Sent (so replies thread), then the rest of the Inbox,
 /// then the newest of every other folder, then everything older.
-fn visit_order(listed: &[session::Listed], roles: &FolderRoles) -> Vec<(usize, Reach)> {
+fn visit_order(
+    listed: &[session::Listed],
+    roles: &FolderRoles,
+    views: &HashMap<String, MailboxView>,
+) -> Vec<(usize, Reach)> {
     let sizes = windows();
     // A server that marks some folders but not Sent still has one: the
     // name table's, so replies thread as early as with a marked one.
@@ -445,6 +471,7 @@ fn visit_order(listed: &[session::Listed], roles: &FolderRoles) -> Vec<(usize, R
     let mut order: Vec<(u8, usize)> = listed
         .iter()
         .enumerate()
+        .filter(|(_, mailbox)| !views.contains_key(&mailbox.raw))
         .map(|(index, mailbox)| (rank(mailbox), index))
         .collect();
     order.sort();
@@ -460,6 +487,18 @@ fn visit_order(listed: &[session::Listed], roles: &FolderRoles) -> Vec<(usize, R
     visits.extend(pick(&|rank| rank == 0, Reach::All));
     visits.extend(pick(&|rank| rank >= 2, Reach::Head(sizes.other_head)));
     visits.extend(pick(&|rank| rank >= 1, Reach::All));
+    // Ordinary folders have all had a chance to supply the body. All
+    // Mail is last, including after Starred and the label mailboxes.
+    let mut projected: Vec<_> = listed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mailbox)| {
+            let view = views.get(&mailbox.raw)?;
+            Some((view.kind == MailboxViewKind::All, index))
+        })
+        .collect();
+    projected.sort_unstable();
+    visits.extend(projected.into_iter().map(|(_, index)| (index, Reach::All)));
     visits
 }
 
@@ -473,11 +512,18 @@ fn catch_up(
     session: &mut session::Session,
     mailbox: &session::Listed,
     examined: &session::Examined,
+    mode: FlagMode<'_>,
     persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<bool, Error> {
     let account_id = pass.account_id;
     let mailboxes = pass.listed;
-    let previous_owned = pass.prior.get(&mailbox.raw).cloned();
+    let prior_checkpoint = pass.prior.get(&mailbox.raw);
+    let projected = mode.view.is_some();
+    // Old checkpoints treated virtual mailboxes as folders. Revisit their
+    // headers and flags once to establish membership from the server.
+    let previous_owned = prior_checkpoint
+        .filter(|checkpoint| checkpoint.projected == projected)
+        .cloned();
     let same_validity = previous_owned
         .as_ref()
         .is_some_and(|prev| prev.uidvalidity == examined.uidvalidity);
@@ -499,6 +545,8 @@ fn catch_up(
                 pruned: None,
                 floor: Some(next),
                 keyword_baseline: pass.keywords,
+                projected,
+                star_baseline: !pass.keywords,
             },
         );
         return Ok(true);
@@ -515,6 +563,11 @@ fn catch_up(
             || previous_owned
                 .as_ref()
                 .is_some_and(|prev| prev.keyword_baseline));
+    let star_baseline = !pass.keywords
+        && (!same_validity
+            || previous_owned
+                .as_ref()
+                .is_some_and(|prev| prev.star_baseline));
     let plan = plan_fetch(previous_owned.as_ref(), examined);
     // High-water body fetches ignore UIDs already at the checkpoint.
     // CHANGEDSINCE results are kept so an older flag update is applied.
@@ -569,6 +622,8 @@ fn catch_up(
             pruned: carried_pruned,
             floor,
             keyword_baseline,
+            projected,
+            star_baseline,
         };
         emit_progress(
             persist,
@@ -592,14 +647,20 @@ fn catch_up(
         known: pass.known,
     };
     let done = &pass.done;
-    let stop = stream_bodies(session, &plan, &copies, |streamed| {
+    let stop = stream_bodies(session, &plan, &copies, mailbox, mode, |streamed| {
         let item = match streamed {
+            Streamed::Linked(links) => {
+                return persist(MailboxDelta {
+                    links,
+                    ..MailboxDelta::default()
+                });
+            }
             Streamed::Stored(item) => {
                 let uid = item.uid;
                 if seen_through.is_none_or(|floor| uid > floor) {
                     stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                 }
-                pending_flags.push(flag_update(uidvalidity, &escaped, &item, pass.keywords));
+                pending_flags.push(flag_update(uidvalidity, &escaped, &item, mode));
                 if pending_flags.len() >= BATCH_FLAGS {
                     flush_batch(
                         &mut batch,
@@ -612,7 +673,7 @@ fn catch_up(
                 }
                 return Ok(());
             }
-            Streamed::Deleted { uid } => {
+            Streamed::BodyUnneeded { uid } => {
                 if seen_through.is_none_or(|floor| uid > floor) {
                     stored_highest = Some(stored_highest.map_or(uid, |top| top.max(uid)));
                 }
@@ -630,15 +691,13 @@ fn catch_up(
             return Ok(());
         }
         let raw_len = item.body.len();
-        pending_flags.extend(arrival_flags(uidvalidity, &escaped, &item, pass.keywords));
-        batch.push(rfc822::to_message(
+        pending_flags.extend(arrival_flags(uidvalidity, &escaped, &item, mode));
+        batch.push(rfc822::fetched_message(
             account_id,
-            &mailbox.raw,
-            &mailbox.decoded,
+            mailbox,
             uidvalidity,
-            item.uid,
-            &item.flags,
-            &item.body,
+            &item,
+            !mode.keywords,
         ));
         batch_bytes += raw_len;
         if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -696,7 +755,7 @@ fn catch_up(
             Ok(rows) => {
                 flags.extend(
                     rows.iter()
-                        .map(|item| flag_update(uidvalidity, &escaped, item, pass.keywords)),
+                        .map(|item| flag_update(uidvalidity, &escaped, item, mode)),
                 );
             }
             Err(err) if uid_fetch_refused(&err) || untagged_overflow(&err) => {
@@ -755,8 +814,30 @@ fn catch_up(
         uidnext,
         exists,
     };
+    // Bridge can report changes to older stars without a MODSEQ. Keep this
+    // sweep to star evidence so it does not touch the read-state logic.
+    if !pass.keywords
+        && !walking
+        && same_validity
+        && highest_modseq.is_none()
+        && previous_owned.as_ref().is_some_and(|prev| prev.uid > 0)
+        && !matches!(plan, FetchPlan::Full)
+        && let Some(mut refreshed) = walk_flags(session, mailbox, seen, &escaped, mode)?
+    {
+        for flag in &mut refreshed {
+            flag.unread = None;
+        }
+        flags.extend(refreshed);
+    }
     let tracked = if clean && !walking {
-        track_removals(session, mailbox, seen, previous_owned.as_ref(), &plan)?
+        track_removals(
+            session,
+            mailbox,
+            seen,
+            prior_checkpoint,
+            &plan,
+            !mode.keywords,
+        )?
     } else {
         Tracked {
             removals: Vec::new(),
@@ -775,6 +856,8 @@ fn catch_up(
         pruned: tracked.pruned,
         floor,
         keyword_baseline,
+        projected,
+        star_baseline,
     };
     emit_progress(
         persist,
@@ -785,7 +868,7 @@ fn catch_up(
         tracked.removals,
     )?;
     if clean && !walking {
-        upgrade_keyword_baseline(pass, session, mailbox, seen, &mut current, persist)?;
+        upgrade_flag_baseline(pass, session, mailbox, seen, &mut current, persist)?;
     }
     pass.done.insert(mailbox.raw.clone(), current);
     Ok(walking)
@@ -798,6 +881,7 @@ struct Walking<'a> {
     folder: &'a str,
     examined: &'a session::Examined,
     reach: Reach,
+    flags: FlagMode<'a>,
 }
 
 /// How [`walk_down`] ended.
@@ -838,6 +922,7 @@ fn walk_down(
         folder,
         examined,
         reach,
+        flags: mode,
     } = walking;
     let Some(mut checkpoint) = pass.done.get(&mailbox.raw).cloned() else {
         return Ok(Walked::Stopped);
@@ -897,21 +982,49 @@ fn walk_down(
             continue;
         }
         let high = floor - 1;
+        let mut resolved = Vec::new();
+        let range = format!("{low}:{high}");
+        let header_set = if mode.view.is_some() {
+            let found = projections::link(
+                session,
+                mailbox,
+                &copies,
+                &range,
+                mode,
+                |uid| (low..=high).contains(&uid),
+                |links| {
+                    persist(MailboxDelta {
+                        links,
+                        ..MailboxDelta::default()
+                    })
+                },
+            )?;
+            let Some(found) = found else {
+                pass.complete = false;
+                return Ok(Walked::Stopped);
+            };
+            resolved = copies.stored(low, high)?;
+            let wanted: Vec<_> = found
+                .into_iter()
+                .filter(|uid| resolved.binary_search(uid).is_err())
+                .collect();
+            (!wanted.is_empty()).then(|| uid_set(&wanted))
+        } else {
+            Some(range)
+        };
         let mut rows: Vec<session::Fetched> = Vec::new();
-        let stop = session.uid_fetch_each(
-            &format!("{low}:{high}"),
-            None,
-            session::FetchItems::Headers,
-            |item| {
-                if (low..=high).contains(&item.uid) {
-                    rows.push(item);
-                }
-                Ok(())
-            },
-        )?;
-        if !matches!(stop, session::FetchStop::Done) {
-            pass.complete = false;
-            return Ok(Walked::Stopped);
+        if let Some(set) = header_set {
+            let stop =
+                session.uid_fetch_each(&set, None, session::FetchItems::Headers, |item| {
+                    if (low..=high).contains(&item.uid) {
+                        rows.push(item);
+                    }
+                    Ok(())
+                })?;
+            if !matches!(stop, session::FetchStop::Done) {
+                pass.complete = false;
+                return Ok(Walked::Stopped);
+            }
         }
         rows.sort_by_key(|row| row.uid);
         rows.dedup_by_key(|row| row.uid);
@@ -923,14 +1036,16 @@ fn walk_down(
             Err(err) if untagged_overflow(&err) => None,
             Err(err) => return Err(err),
         };
-        if !listed.is_some_and(|uids| {
-            uids.iter()
-                .all(|uid| rows.binary_search_by_key(uid, |row| row.uid).is_ok())
-        }) {
+        let Some(listed) = listed.filter(|uids| {
+            uids.iter().all(|uid| {
+                resolved.binary_search(uid).is_ok()
+                    || rows.binary_search_by_key(uid, |row| row.uid).is_ok()
+            })
+        }) else {
             pass.complete = false;
             return Ok(Walked::Stopped);
-        }
-        let in_window = rows.len() as u32;
+        };
+        let in_window = listed.len() as u32;
         let stored = copies.stored(low, high)?;
         let mut flags = Vec::new();
         let mut headers = Vec::new();
@@ -941,12 +1056,7 @@ fn walk_down(
         let mut wanted: Vec<(u32, u32)> = Vec::new();
         for row in rows.into_iter().rev() {
             if stored.binary_search(&row.uid).is_ok() {
-                flags.push(flag_update(
-                    checkpoint.uidvalidity,
-                    &escaped,
-                    &row,
-                    pass.keywords,
-                ));
+                flags.push(flag_update(checkpoint.uidvalidity, &escaped, &row, mode));
                 continue;
             }
             if rfc822::is_deleted(&row.flags) {
@@ -955,15 +1065,13 @@ fn walk_down(
             if !row.skipped && !row.body_missing {
                 let header = rfc822::headers_message(
                     pass.account_id,
-                    &mailbox.raw,
-                    &mailbox.decoded,
+                    mailbox,
                     checkpoint.uidvalidity,
-                    row.uid,
-                    &row.flags,
-                    &row.body,
+                    &row,
+                    !mode.keywords,
                 );
                 header_ids.insert(row.uid, header.headers.message_id.clone());
-                let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, pass.keywords);
+                let learned = arrival_flags(checkpoint.uidvalidity, &escaped, &row, mode);
                 headers.push((header, learned));
             }
             wanted.push((row.uid, row.size.unwrap_or(0)));
@@ -1042,20 +1150,13 @@ fn walk_down(
                         return Ok(());
                     }
                     batch_bytes += item.body.len();
-                    body_flags.extend(arrival_flags(
-                        checkpoint.uidvalidity,
-                        &escaped,
-                        &item,
-                        pass.keywords,
-                    ));
-                    batch.push(rfc822::to_message(
+                    body_flags.extend(arrival_flags(checkpoint.uidvalidity, &escaped, &item, mode));
+                    batch.push(rfc822::fetched_message(
                         pass.account_id,
-                        &mailbox.raw,
-                        &mailbox.decoded,
+                        mailbox,
                         checkpoint.uidvalidity,
-                        item.uid,
-                        &item.flags,
-                        &item.body,
+                        &item,
+                        !mode.keywords,
                     ));
                     // Bodies show as they come, whether or not the fetch ends.
                     if batch.len() >= batch_message_limit() || batch_bytes >= BATCH_BYTES {
@@ -1131,7 +1232,7 @@ fn walk_down(
     // read every flag once more. Keep floor=1 on failure so the next pass
     // retries this sweep without downloading the windows again.
     let flags = if examined.highest_modseq.is_none() {
-        let Some(flags) = walk_flags(session, mailbox, seen, &escaped, pass.keywords)? else {
+        let Some(flags) = walk_flags(session, mailbox, seen, &escaped, mode)? else {
             pass.complete = false;
             return Ok(Walked::Stopped);
         };
@@ -1151,6 +1252,7 @@ fn walk_down(
         seen,
         pass.prior.get(&mailbox.raw),
         &FetchPlan::Full,
+        !mode.keywords,
     )?;
     checkpoint.floor = None;
     checkpoint.pruned = tracked.pruned;
@@ -1165,14 +1267,14 @@ fn walk_down(
         flags,
         tracked.removals,
     )?;
-    upgrade_keyword_baseline(pass, session, mailbox, seen, &mut checkpoint, persist)?;
+    upgrade_flag_baseline(pass, session, mailbox, seen, &mut checkpoint, persist)?;
     pass.done.insert(mailbox.raw.clone(), checkpoint);
     Ok(Walked::Finished)
 }
 
-/// A cursor from before keyword tracking can already be at HIGHESTMODSEQ.
-/// Read FLAGS for every UID once after the ordinary sync records the copies.
-fn upgrade_keyword_baseline(
+/// A legacy cursor can already be at HIGHESTMODSEQ without keyword or
+/// Bridge star membership on its rows. Read FLAGS for every UID once.
+fn upgrade_flag_baseline(
     pass: &Pass<'_>,
     session: &mut session::Session,
     mailbox: &session::Listed,
@@ -1180,17 +1282,26 @@ fn upgrade_keyword_baseline(
     checkpoint: &mut MailboxCheckpoint,
     persist: &mut dyn FnMut(MailboxDelta) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    if pass.keywords
-        && !checkpoint.keyword_baseline
-        && let Some(mut flags) =
-            walk_flags(session, mailbox, seen, &escape_mailbox(&mailbox.raw), true)?
+    let keywords = pass.keywords && !checkpoint.keyword_baseline;
+    let stars = !pass.keywords && !checkpoint.star_baseline && checkpoint.modseq.is_some();
+    if (keywords || stars)
+        && let Some(mut flags) = walk_flags(
+            session,
+            mailbox,
+            seen,
+            &escape_mailbox(&mailbox.raw),
+            FlagMode {
+                keywords,
+                view: None,
+            },
+        )?
     {
-        // Revisions still guard keyword observations. Leave read state and
-        // pending flag intents to the ordinary delta for this mailbox.
+        // Leave read state to the ordinary delta for this mailbox.
         for flag in &mut flags {
             flag.unread = None;
         }
-        checkpoint.keyword_baseline = true;
+        checkpoint.keyword_baseline |= keywords;
+        checkpoint.star_baseline |= stars;
         emit_progress(
             persist,
             &pass.snapshot(),
@@ -1210,9 +1321,9 @@ fn walk_flags(
     mailbox: &session::Listed,
     seen: Seen,
     escaped: &str,
-    keywords: bool,
+    mode: FlagMode<'_>,
 ) -> Result<Option<Vec<FlagUpdate>>, Error> {
-    let Some((uids, _)) = list_mailbox(session, mailbox, seen, false)? else {
+    let Some((uids, _)) = list_mailbox(session, mailbox, seen, false, !mode.keywords)? else {
         return Ok(None);
     };
     let mut flags = Vec::with_capacity(uids.len());
@@ -1230,7 +1341,7 @@ fn walk_flags(
         }
         flags.extend(
             rows.iter()
-                .map(|row| flag_update(seen.uidvalidity, escaped, row, keywords)),
+                .map(|row| flag_update(seen.uidvalidity, escaped, row, mode)),
         );
     }
     Ok(Some(flags))
@@ -1288,6 +1399,7 @@ fn track_removals(
     seen: Seen,
     checkpoint: Option<&MailboxCheckpoint>,
     plan: &FetchPlan,
+    bridge: bool,
 ) -> Result<Tracked, Error> {
     let escaped = escape_mailbox(&mailbox.raw);
     let removal = |kind| FolderRemoval {
@@ -1330,7 +1442,7 @@ fn track_removals(
         });
     }
     let discover = carried.is_none() && checkpoint.is_some();
-    let Some((present, found)) = list_mailbox(session, mailbox, seen, discover)? else {
+    let Some((present, found)) = list_mailbox(session, mailbox, seen, discover, bridge)? else {
         return Ok(Tracked {
             removals,
             pruned: carried,
@@ -1394,6 +1506,7 @@ fn list_mailbox(
     mailbox: &session::Listed,
     seen: Seen,
     discover: bool,
+    bridge: bool,
 ) -> Result<Option<Listing>, Error> {
     let page = if discover { FOUND_PAGE } else { LIST_PAGE };
     let mut present = Vec::new();
@@ -1402,12 +1515,17 @@ fn list_mailbox(
     while first <= seen.exists {
         let last = first.saturating_add(page - 1).min(seen.exists);
         let listed = if discover {
-            session.fetch_message_ids(first, last).map(|rows| {
+            session.fetch_message_ids(first, last, bridge).map(|rows| {
                 rows.map(|rows| {
                     let mut uids = Vec::with_capacity(rows.len());
                     for (uid, headers) in rows {
-                        let id =
-                            rfc822::copy_message_id(&mailbox.raw, seen.uidvalidity, uid, &headers);
+                        let id = rfc822::copy_message_id(
+                            &mailbox.raw,
+                            seen.uidvalidity,
+                            uid,
+                            &headers,
+                            bridge,
+                        );
                         found.push((uid, id));
                         uids.push(uid);
                     }
@@ -1464,13 +1582,14 @@ impl Copies<'_> {
 
 /// One message a sync fetch reports.
 enum Streamed {
+    /// Message-ID headers that can link virtual copies to an existing row.
+    Linked(Vec<CopyLink>),
     /// Not stored yet: fetched with its body.
     Fetched(session::Fetched),
     /// Stored already: only its flags were fetched.
     Stored(session::Fetched),
-    /// Not stored and flagged `\Deleted`: dropped either way, so its body
-    /// was not fetched.
-    Deleted { uid: u32 },
+    /// A deleted copy or a virtual copy that can reuse a stored body.
+    BodyUnneeded { uid: u32 },
 }
 
 /// Report every message `plan` covers, fetching a body only for a UID the
@@ -1487,21 +1606,30 @@ fn stream_bodies(
     session: &mut session::Session,
     plan: &FetchPlan,
     copies: &Copies<'_>,
+    mailbox: &session::Listed,
+    mode: FlagMode<'_>,
     mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
 ) -> Result<session::FetchStop, Error> {
-    let start = match plan {
+    let (start, changed_since, discover) = match plan {
         FetchPlan::Idle => return Ok(session::FetchStop::Done),
-        FetchPlan::ChangedSince(modseq) => {
-            return flags_then_bodies(session, 1, Some(*modseq), copies, on_fetched);
-        }
-        FetchPlan::Discover { start } => {
-            return flags_then_bodies(session, *start, None, copies, on_fetched);
-        }
-        FetchPlan::Full => 1,
-        FetchPlan::HighWater { start } => *start,
+        FetchPlan::ChangedSince(modseq) => (1, Some(*modseq), true),
+        FetchPlan::Discover { start } => (*start, None, true),
+        FetchPlan::Full => (1, None, false),
+        FetchPlan::HighWater { start } => (*start, None, false),
     };
-    if !copies.stored(start, u32::MAX)?.is_empty() {
-        return flags_then_bodies(session, start, None, copies, on_fetched);
+    if discover
+        || !mode.keywords
+        || mode.view.is_some()
+        || !copies.stored(start, u32::MAX)?.is_empty()
+    {
+        return flags_then_bodies(
+            session,
+            (start, changed_since),
+            copies,
+            mailbox,
+            mode,
+            on_fetched,
+        );
     }
     session.uid_fetch_each(
         &format!("{start}:*"),
@@ -1518,11 +1646,13 @@ fn stream_bodies(
 /// did not deliver, so the checkpoint stays below it.
 fn flags_then_bodies(
     session: &mut session::Session,
-    start: u32,
-    changed_since: Option<u64>,
+    range: (u32, Option<u64>),
     copies: &Copies<'_>,
+    mailbox: &session::Listed,
+    mode: FlagMode<'_>,
     mut on_fetched: impl FnMut(Streamed) -> Result<(), Error>,
 ) -> Result<session::FetchStop, Error> {
+    let (start, changed_since) = range;
     let mut rows = Vec::new();
     let listed = session.uid_fetch_each(
         &format!("{start}:*"),
@@ -1554,7 +1684,7 @@ fn flags_then_bodies(
             on_fetched(Streamed::Stored(item))?;
         } else if rfc822::is_deleted(&item.flags) {
             // Not stored either way, so its body is not worth the bytes.
-            on_fetched(Streamed::Deleted { uid })?;
+            on_fetched(Streamed::BodyUnneeded { uid })?;
         } else {
             wanted.push(uid);
         }
@@ -1564,6 +1694,38 @@ fn flags_then_bodies(
     // lowest such UID, as when a fetch stops early.
     let mut first_missing: Option<u32> = None;
     for (index, chunk) in wanted.chunks(UIDS_PER_FETCH).enumerate() {
+        let unresolved;
+        let chunk = if mode.view.is_some() || !mode.keywords {
+            let Some(_) = projections::link(
+                session,
+                mailbox,
+                copies,
+                &uid_set(chunk),
+                mode,
+                |uid| chunk.binary_search(&uid).is_ok(),
+                |links| on_fetched(Streamed::Linked(links)),
+            )?
+            else {
+                return Ok(session::FetchStop::Truncated {
+                    min_skipped_uid: lowest([first_missing, chunk.first().copied(), cut.flatten()]),
+                });
+            };
+            let stored = copies.stored(chunk[0], chunk[chunk.len() - 1])?;
+            for &uid in chunk.iter().filter(|uid| stored.binary_search(uid).is_ok()) {
+                on_fetched(Streamed::BodyUnneeded { uid })?;
+            }
+            unresolved = chunk
+                .iter()
+                .copied()
+                .filter(|uid| stored.binary_search(uid).is_err())
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                continue;
+            }
+            unresolved.as_slice()
+        } else {
+            chunk
+        };
         let mut delivered = HashSet::with_capacity(chunk.len());
         let stop =
             session.uid_fetch_each(&uid_set(chunk), None, session::FetchItems::Bodies, |item| {
@@ -1617,11 +1779,17 @@ fn uid_set(uids: &[u32]) -> String {
 }
 
 /// Flag evidence from one server copy.
+#[derive(Clone, Copy)]
+struct FlagMode<'a> {
+    keywords: bool,
+    view: Option<&'a MailboxViewKind>,
+}
+
 fn flag_update(
     uidvalidity: u32,
     escaped: &str,
     item: &session::Fetched,
-    keywords: bool,
+    mode: FlagMode<'_>,
 ) -> FlagUpdate {
     let uid = item.uid;
     FlagUpdate {
@@ -1632,12 +1800,20 @@ fn flag_update(
                 .iter()
                 .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
         ),
-        flagged: Some(
+        flagged: item.flags_present.then(|| {
             item.flags
                 .iter()
-                .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
-        ),
-        keywords: (keywords && item.flags_present).then(|| rfc822::keyword_labels(&item.flags)),
+                .any(|flag| flag.eq_ignore_ascii_case("\\Flagged"))
+        }),
+        keywords: match mode.view {
+            Some(MailboxViewKind::Label(label)) => Some(
+                (!rfc822::is_deleted(&item.flags))
+                    .then(|| label.clone())
+                    .into_iter()
+                    .collect(),
+            ),
+            _ => (mode.keywords && item.flags_present).then(|| rfc822::keyword_labels(&item.flags)),
+        },
         modseq: item.modseq,
     }
 }
@@ -1648,12 +1824,16 @@ fn arrival_flags(
     uidvalidity: u32,
     escaped: &str,
     item: &session::Fetched,
-    keywords: bool,
+    mode: FlagMode<'_>,
 ) -> Option<FlagUpdate> {
-    if item.modseq.is_none() && !(keywords && item.flags_present) {
+    let mut update = flag_update(uidvalidity, escaped, item, mode);
+    if item.modseq.is_none()
+        && update.flagged.is_none()
+        && update.keywords.is_none()
+        && !matches!(mode.view, Some(MailboxViewKind::Starred))
+    {
         return None;
     }
-    let mut update = flag_update(uidvalidity, escaped, item, keywords);
     if item.modseq.is_none() {
         update.unread = None;
     }
@@ -1714,6 +1894,8 @@ fn progress_delta(
         roles: None,
         progress: None,
         too_large: Vec::new(),
+        links: Vec::new(),
+        views: None,
     }
 }
 
@@ -1728,8 +1910,35 @@ fn untagged_overflow(err: &Error) -> bool {
     matches!(err, Error::Backend(message) if message.contains("exceeded") && message.contains("untagged"))
 }
 
-fn listed_roles(listed: &[session::Listed], overrides: &[(FolderRole, String)]) -> FolderRoles {
-    FolderRoles::detect(&listed_mailboxes(listed), overrides)
+fn listed_roles(
+    listed: &[session::Listed],
+    overrides: &[(FolderRole, String)],
+    bridge: bool,
+    views: &HashMap<String, MailboxView>,
+) -> FolderRoles {
+    let detected = FolderRoles::detect(&listed_mailboxes(listed), overrides);
+    if !bridge {
+        return detected;
+    }
+    // Bridge's named views are still available when LIST marks a different
+    // special-use mailbox. Keep server and configured roles when present.
+    let mut roles: Vec<_> = detected.iter().cloned().collect();
+    for mailbox in listed {
+        let role = match views.get(&mailbox.raw).map(|view| &view.kind) {
+            Some(MailboxViewKind::All) => FolderRole::All,
+            Some(MailboxViewKind::Starred) => FolderRole::Flagged,
+            _ => continue,
+        };
+        if !roles.iter().any(|folder| folder.role == role) {
+            roles.push(crate::folders::RoleFolder {
+                role,
+                name: mailbox.decoded.clone(),
+                raw: mailbox.raw.clone(),
+                source: crate::folders::RoleSource::Name,
+            });
+        }
+    }
+    FolderRoles::new(roles).with_bridge_names(true)
 }
 
 fn listed_mailboxes(listed: &[session::Listed]) -> Vec<ListedMailbox> {
@@ -1884,6 +2093,10 @@ pub struct MailboxCheckpoint {
     /// This UIDVALIDITY started with keyword tracking or finished its
     /// upgrade sweep. Older cursors and Bridge cursors omit the marker.
     pub keyword_baseline: bool,
+    /// This mailbox has been synced as a view, with per-copy membership.
+    pub projected: bool,
+    /// Bridge's older `\Flagged` values have been applied to the rows.
+    pub star_baseline: bool,
 }
 
 /// Decode a sync cursor written by [`encode_cursor`].
@@ -1946,11 +2159,19 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 None => return Vec::new(),
             },
         };
-        let keyword_baseline = match parts.next() {
-            None => false,
-            Some("keywords") => true,
-            Some(_) => return Vec::new(),
-        };
+        let mut keyword_baseline = false;
+        let mut projected = false;
+        let mut star_baseline = false;
+        if let Some(markers) = parts.next() {
+            for marker in markers.split('+') {
+                match marker {
+                    "keywords" if !keyword_baseline => keyword_baseline = true,
+                    "view" if !projected => projected = true,
+                    "stars" if !star_baseline => star_baseline = true,
+                    _ => return Vec::new(),
+                }
+            }
+        }
         if parts.next().is_some() {
             return Vec::new();
         }
@@ -1964,6 +2185,8 @@ pub fn decode_cursor(cursor: Option<&SyncCursor>) -> Vec<(String, MailboxCheckpo
                 pruned,
                 floor,
                 keyword_baseline,
+                projected,
+                star_baseline,
             },
         ));
     }
@@ -2004,11 +2227,20 @@ pub fn encode_cursor(account_key: &str, mailboxes: &[(String, MailboxCheckpoint)
         if let Some(floor) = checkpoint.floor {
             token.push('\t');
             token.push_str(&floor.to_string());
-        } else if checkpoint.keyword_baseline {
+        } else if checkpoint.keyword_baseline || checkpoint.projected || checkpoint.star_baseline {
             token.push_str("\t-");
         }
-        if checkpoint.keyword_baseline {
-            token.push_str("\tkeywords");
+        let mut separator = '\t';
+        for (enabled, marker) in [
+            (checkpoint.keyword_baseline, "keywords"),
+            (checkpoint.projected, "view"),
+            (checkpoint.star_baseline, "stars"),
+        ] {
+            if enabled {
+                token.push(separator);
+                token.push_str(marker);
+                separator = '+';
+            }
         }
     }
     SyncCursor {
@@ -2101,6 +2333,8 @@ mod tests {
                     pruned: None,
                     floor: None,
                     keyword_baseline: true,
+                    projected: true,
+                    star_baseline: true,
                 },
             ),
             (
@@ -2113,6 +2347,8 @@ mod tests {
                     pruned: None,
                     floor: None,
                     keyword_baseline: false,
+                    projected: false,
+                    star_baseline: false,
                 },
             ),
         ];
@@ -2133,6 +2369,8 @@ mod tests {
                 pruned: Some((12, 77)),
                 floor: None,
                 keyword_baseline: false,
+                projected: false,
+                star_baseline: false,
             },
         )];
         let cursor = encode_cursor("acct", &mailboxes);

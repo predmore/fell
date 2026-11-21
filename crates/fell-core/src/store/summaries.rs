@@ -391,13 +391,16 @@ struct Membership {
 
 /// Summary of one thread from its messages, or `None` when it has none.
 fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summary>> {
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT rowid, subject, snippet, date_unix, unread, folders, archived, starred,
-                has_attachment, from_email, from_name, labels
-         FROM messages
+                has_attachment, from_email, from_name, labels, ({}),
+                CASE WHEN folders = '' AND NOT archived THEN {} ELSE 0 END
+         FROM messages m
          WHERE account_id = ?1 AND thread_id = ?2
          ORDER BY date_unix ASC, rowid ASC",
-    )?;
+        super::views::scopes("m"),
+        super::views::has_view_copy("m"),
+    ))?;
     let mut rows = stmt.query(params![account, thread])?;
     let mut summary: Option<Summary> = None;
     let mut participants: Vec<String> = Vec::new();
@@ -417,6 +420,8 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
         let from_email: String = row.get(9)?;
         let from_name: Option<String> = row.get(10)?;
         let label_field: String = row.get(11)?;
+        let views: Option<String> = row.get(12)?;
+        let has_view_copy: bool = row.get(13)?;
 
         participants.push(format!(
             "{}\u{1f}{from_email}",
@@ -429,8 +434,15 @@ fn compute(conn: &Connection, account: &str, thread: &str) -> Result<Option<Summ
             .into_iter()
             .map(|name| (name.to_ascii_lowercase(), Some(name)))
             .collect();
-        if folder_field.is_empty() && !archived {
+        if folder_field.is_empty() && !archived && !has_view_copy {
             names.push(("inbox".into(), None));
+        }
+        if let Some(views) = views {
+            names.extend(
+                split_field(&views)
+                    .into_iter()
+                    .map(|name| (name.to_ascii_lowercase(), None)),
+            );
         }
         for (pos, (key, display)) in names.into_iter().enumerate() {
             match at.get(&key) {

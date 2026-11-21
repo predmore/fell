@@ -430,7 +430,7 @@ pub(crate) fn queue_moves(
     roles: &FolderRoles,
 ) -> Result<()> {
     ensure_schema(conn)?;
-    if !enabled(conn, account_id)? {
+    if roles.is_view(from) || roles.is_view(to) || !enabled(conn, account_id)? {
         return Ok(());
     }
     let target = raw_name(conn, account_id, roles, to)?;

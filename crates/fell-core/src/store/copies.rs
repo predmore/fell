@@ -25,7 +25,8 @@ use crate::message::{Message, MessageId};
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 
 use super::{
-    canonical_id_on, delete_stored, find_stored, join_tokens, split_field, take_local_state,
+    Arrival, canonical_id_on, delete_stored, find_stored, join_tokens, split_field,
+    take_local_state,
 };
 
 const COPIES_SCHEMA: &str = "
@@ -128,7 +129,7 @@ pub(crate) fn observe_flags(
     source: FlagSource,
 ) -> Result<bool> {
     let (sync, seen_handled, before_store) = match source {
-        FlagSource::Sync => (true, true, None),
+        FlagSource::Sync => (true, flags.seen.is_some(), None),
         FlagSource::Replay {
             seen_handled,
             before_store,
@@ -227,6 +228,14 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
             copy.folder
         ],
     )?;
+    if message.folders.is_empty() {
+        super::views::retire_restore(
+            conn,
+            &message.account_id,
+            &stored.canonical_id,
+            &copy.folder,
+        )?;
+    }
     Ok(())
 }
 
@@ -413,7 +422,7 @@ pub(super) fn apply_removals(
                     }
                 }
                 for (validity, uid) in doomed {
-                    drop_copy(conn, account_id, &removal.mailbox, validity, uid, uid)?;
+                    changed |= drop_copy(conn, account_id, &removal.mailbox, validity, uid, uid)?;
                 }
                 if *sweep {
                     sweep_folder(conn, account_id, removal, *uidvalidity)?;
@@ -424,7 +433,7 @@ pub(super) fn apply_removals(
                 ranges,
             } => {
                 for (low, high) in ranges {
-                    drop_copy(
+                    changed |= drop_copy(
                         conn,
                         account_id,
                         &removal.mailbox,
@@ -506,47 +515,118 @@ fn record_found(
     uid: u32,
     message_id: &MessageId,
 ) -> Result<()> {
-    // A copy sync never stored (oversized, flagged deleted, removed here) has
-    // no row to back.
-    let Some(row) = canonical_id_on(conn, account_id, message_id)? else {
-        return Ok(());
-    };
-    conn.prepare_cached(
-        "INSERT OR IGNORE INTO message_copies
-            (account_id, mailbox, uidvalidity, uid, message_id, folder)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?
-    .execute(params![
-        account_id.as_str(),
-        removal.mailbox,
-        uidvalidity,
-        uid,
-        row,
-        removal.folder
-    ])?;
+    link(
+        conn,
+        account_id,
+        &crate::imap::RemoteCopy {
+            mailbox: removal.mailbox.clone(),
+            folder: removal.folder.clone(),
+            uidvalidity,
+            uid,
+        },
+        message_id,
+    )?;
     Ok(())
 }
 
-fn drop_copy(
+/// Attach a mailbox UID to an existing row by Message-ID (including aliases).
+pub(super) fn link(
+    conn: &Connection,
+    account_id: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+    message_id: &MessageId,
+) -> Result<bool> {
+    // A copy sync never stored (oversized, flagged deleted, removed here) has
+    // no row to back.
+    let Some(row) = canonical_id_on(conn, account_id, message_id)? else {
+        return Ok(false);
+    };
+    let inserted = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO message_copies
+            (account_id, mailbox, uidvalidity, uid, message_id, folder)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(params![
+            account_id.as_str(),
+            copy.mailbox,
+            copy.uidvalidity,
+            copy.uid,
+            row,
+            copy.folder
+        ])?;
+    if inserted != 0 && super::views::has_view(conn, account_id, &copy.mailbox)? {
+        super::views::retire_restore(conn, account_id, &row, &copy.folder)?;
+        super::views::refresh_message(conn, account_id, &row)?;
+    }
+    Ok(true)
+}
+
+/// Attach a newly discovered copy and add a physical folder when it is live.
+pub(super) fn link_arrival(
+    conn: &Connection,
+    account: &AccountId,
+    copy: &crate::imap::RemoteCopy,
+    id: &MessageId,
+) -> Result<bool> {
+    if !link(conn, account, copy, id)? {
+        return Ok(false);
+    }
+    if !super::views::has_view(conn, account, &copy.mailbox)?
+        && let Some((stored, _)) = find_stored(conn, account, id)?
+    {
+        let mut folders = split_field(&stored.folders);
+        if !folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(&copy.folder))
+            && !crate::actions::tombstoned_folders(conn, account, &stored.canonical_id)?
+                .iter()
+                .any(|folder| folder.eq_ignore_ascii_case(&copy.folder))
+        {
+            folders.push(copy.folder.clone());
+            write_folders(conn, account, &stored, &folders)?;
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn drop_copy(
     conn: &Connection,
     account_id: &AccountId,
     mailbox: &str,
     uidvalidity: u32,
     low: u32,
     high: u32,
-) -> Result<()> {
+) -> Result<bool> {
     conn.execute(
         "INSERT OR IGNORE INTO copy_orphans (account_id, message_id, folder)
          SELECT account_id, message_id, folder FROM message_copies
          WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid BETWEEN ?4 AND ?5",
         params![account_id.as_str(), mailbox, uidvalidity, low, high],
     )?;
-    conn.execute(
+    let virtual_mailbox = super::views::has_view(conn, account_id, mailbox)?;
+    if virtual_mailbox {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO thread_summary_dirty (account_id, thread_id)
+             SELECT m.account_id, m.thread_id FROM message_copies c
+             JOIN messages m ON m.account_id = c.account_id AND m.message_id = c.message_id
+             WHERE c.account_id = ?1 AND c.mailbox = ?2 AND c.uidvalidity = ?3
+               AND c.uid BETWEEN ?4 AND ?5",
+        )?
+        .execute(params![
+            account_id.as_str(),
+            mailbox,
+            uidvalidity,
+            low,
+            high
+        ])?;
+    }
+    let dropped = conn.execute(
         "DELETE FROM message_copies
          WHERE account_id = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid BETWEEN ?4 AND ?5",
         params![account_id.as_str(), mailbox, uidvalidity, low, high],
     )?;
-    Ok(())
+    Ok(virtual_mailbox && dropped > 0)
 }
 
 /// Rows in folder `?2` with no copy in mailbox `?3` under UIDVALIDITY `?4`.
@@ -669,12 +749,16 @@ pub(super) fn settle(conn: &Connection, account_id: &AccountId, settle: Settle) 
     let mut changed = false;
     let mut deleted = HashSet::new();
     let mut checked_keywords = HashSet::new();
+    let bridge = !queued.is_empty() && super::views::is_bridge(conn, account_id)?;
     for (message_id, folder) in queued {
         if deleted.contains(&message_id) {
             continue;
         }
         if checked_keywords.insert(message_id.clone()) {
             changed |= super::keywords::reconcile(conn, account_id, &message_id, &[], true)?;
+            if bridge {
+                changed |= reconcile_star(conn, account_id, &message_id)?;
+            }
         }
         let done = settle_one(conn, account_id, &message_id, &folder, settle, &mut changed)?;
         match done {
@@ -734,34 +818,52 @@ fn settle_one(
         .filter(|token| token.as_str() != folder)
         .cloned()
         .collect();
-    if kept.len() == tokens.len() {
-        return Ok(Outcome::Done);
-    }
     // Asked again at the next settle, once the move has placed its copy.
-    if moving_into(conn, account_id, &stored.canonical_id, folder)? {
+    if kept.len() != tokens.len() && moving_into(conn, account_id, &stored.canonical_id, folder)? {
         return Ok(Outcome::Wait);
     }
     if kept.is_empty() {
-        let any_copy: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM message_copies WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
-                params![account_id.as_str(), stored.canonical_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if any_copy.is_some() {
+        let (any_copy, ordinary): (bool, bool) = conn
+            .prepare_cached(
+                "SELECT COUNT(*) != 0 OR EXISTS (
+                    SELECT 1 FROM local_all_mail_restores r
+                    WHERE r.account_id = ?1 AND r.message_id = ?2
+                 ), COUNT(*) != COUNT(v.mailbox)
+             FROM message_copies c LEFT JOIN mailbox_views v
+               ON v.account_id = c.account_id AND v.mailbox = c.mailbox
+             WHERE c.account_id = ?1 AND c.message_id = ?2",
+            )?
+            .query_row(params![account_id.as_str(), stored.canonical_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        if ordinary {
             // Still on the server under a folder the row no longer lists
             // (a local action took it off). Keep the last folder.
             return Ok(Outcome::Done);
         }
-        if settle != Settle::All {
-            return Ok(Outcome::Wait);
+        if !any_copy {
+            if settle != Settle::All {
+                return Ok(Outcome::Wait);
+            }
+            delete_stored(conn, account_id, &MessageId(stored.canonical_id.clone()))?;
+            *changed = true;
+            return Ok(Outcome::Deleted);
         }
-        delete_stored(conn, account_id, &MessageId(stored.canonical_id.clone()))?;
-        *changed = true;
-        return Ok(Outcome::Deleted);
     }
-    let folders = join_tokens(&kept);
+    *changed |= write_folders(conn, account_id, &stored, &kept)?;
+    Ok(Outcome::Done)
+}
+
+pub(super) fn write_folders(
+    conn: &Connection,
+    account_id: &AccountId,
+    stored: &Arrival,
+    folders: &[String],
+) -> Result<bool> {
+    let folders = join_tokens(folders);
+    if folders == stored.folders {
+        return Ok(false);
+    }
     let indexed = |folders: &str| {
         terms_for_indexed(IndexedText {
             subject: &stored.subject,
@@ -782,8 +884,33 @@ fn settle_one(
         params![folders, account_id.as_str(), stored.canonical_id],
     )?;
     sync_terms(conn, account_id.as_str(), &old_terms, &new_terms)?;
-    *changed = true;
-    Ok(Outcome::Done)
+    Ok(true)
+}
+
+/// A positive observation on any live copy supplies a star. A pending
+/// change made in Fell wins until the existing write-back path settles it.
+pub(super) fn reconcile_star(
+    conn: &Connection,
+    account_id: &AccountId,
+    message_id: &str,
+) -> Result<bool> {
+    let changed = conn
+        .prepare_cached(
+            "WITH observed(star) AS (
+             SELECT MAX(CASE v.kind WHEN 'starred' THEN 1 ELSE c.flagged END)
+             FROM message_copies c LEFT JOIN mailbox_views v
+               ON v.account_id = c.account_id AND v.mailbox = c.mailbox
+             WHERE c.account_id = ?1 AND c.message_id = ?2
+         )
+         UPDATE messages SET starred = (SELECT star FROM observed)
+         WHERE account_id = ?1 AND message_id = ?2 AND starred != (SELECT star FROM observed)
+           AND NOT EXISTS (
+               SELECT 1 FROM local_flag_intents
+               WHERE account_id = ?1 AND message_id = ?2 AND starred IS NOT NULL
+           )",
+        )?
+        .execute(params![account_id.as_str(), message_id])?;
+    Ok(changed != 0)
 }
 
 /// A write-back row not yet settled moves the message into `folder`.

@@ -748,7 +748,9 @@ impl Session {
             .unwrap_or(&self.folder);
         all.into_iter()
             .filter(|name| {
-                if self.folder_intent == FolderIntent::Move && name.eq_ignore_ascii_case(from) {
+                if self.folder_intent == FolderIntent::Move
+                    && (name.eq_ignore_ascii_case(from) || self.roles.is_view(name))
+                {
                     return false;
                 }
                 if query.is_empty() {
@@ -2899,13 +2901,13 @@ mod tests {
         session.toggle_open(0);
 
         let mut read = pending;
-        read.folders = "Inbox, Archive".into();
+        read.folders = vec!["Inbox".into(), "Archive".into()];
         assert_eq!(
             crate::present::bodies_filled(&session.messages, std::slice::from_ref(&read)),
             Some(vec![])
         );
         session.refresh_same_messages(vec![read]);
-        assert_eq!(session.messages[0].folders, "Inbox, Archive");
+        assert_eq!(session.messages[0].folders, ["Inbox", "Archive"]);
         assert_eq!(
             session.messages[0].body_state,
             fell_core::BodyState::Pending
@@ -4810,7 +4812,7 @@ mod tests {
             },
             sender: "Jon".into(),
             email: "jon@x".into(),
-            folders: "Inbox".into(),
+            folders: vec!["Inbox".into()],
             date_unix: 0,
             snippet: "snip".into(),
             body: crate::text_render::render_stored_body(Some("body"), "snip", ""),

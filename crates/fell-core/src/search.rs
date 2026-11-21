@@ -29,6 +29,7 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::account::AccountId;
 use crate::message::{MessageId, decode_addresses};
+use crate::store::views;
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
@@ -104,11 +105,17 @@ pub(crate) fn locations(
     hits: &[SearchHit],
 ) -> Result<HashMap<MessageId, SearchLocation>> {
     let inbox = roles.name(crate::FolderRole::Inbox);
-    let mut preferred = parse_query(query)?.folders;
-    let use_open_folder = preferred.is_empty();
-    if use_open_folder {
-        preferred.extend([current_folder.to_owned(), inbox.to_owned()]);
-    }
+    let requested = parse_query(query)?.folders;
+    let use_open_folder = requested.is_empty();
+    let preferred = if use_open_folder {
+        vec![current_folder.to_owned(), inbox.to_owned()]
+    } else {
+        let catalog = folder_catalog(conn, account)?;
+        requested
+            .iter()
+            .flat_map(|name| matching_folders(&catalog, name).map(|folder| folder.name.clone()))
+            .collect()
+    };
     let preferred: Vec<_> = preferred
         .into_iter()
         .map(|name| {
@@ -116,6 +123,10 @@ pub(crate) fn locations(
             (name, folded)
         })
         .collect();
+    let scopes = views::scopes("m");
+    let has_view_copy = views::has_view_copy("m");
+    let starred_scopes = views::scopes("f");
+    let starred_has_view_copy = views::has_view_copy("f");
     let mut locations = HashMap::with_capacity(hits.len());
     for chunk in hits.chunks(128) {
         let marks = std::iter::repeat_n("?", chunk.len())
@@ -126,7 +137,9 @@ pub(crate) fn locations(
                     (SELECT group_concat(f.folder_key, char(30)) FROM thread_folders f
                      WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.unread = 1),
                     (SELECT group_concat(
-                        CASE WHEN f.folders = '' AND f.archived = 0 THEN ? ELSE f.folders END,
+                        CASE WHEN f.folders = '' AND f.archived = 0 AND NOT ({starred_has_view_copy})
+                             THEN ? ELSE f.folders END
+                        || char(30) || COALESCE(({starred_scopes}), ''),
                         char(30))
                      FROM messages f
                      WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id AND f.starred = 1),
@@ -135,7 +148,8 @@ pub(crate) fn locations(
                      WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id),
                     EXISTS (SELECT 1 FROM messages f
                             WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id
-                              AND f.has_attachment = 1)
+                              AND f.has_attachment = 1),
+                    ({scopes}), ({has_view_copy})
              FROM messages m
              WHERE m.account_id = ? AND m.message_id IN ({marks})"
         );
@@ -146,8 +160,11 @@ pub(crate) fn locations(
         let mut rows = stmt.query(params_from_iter(params))?;
         while let Some(row) = rows.next()? {
             let mut folders = crate::store::split_field(&row.get::<_, String>(1)?);
-            if folders.is_empty() && !row.get::<_, bool>(2)? {
+            if folders.is_empty() && !row.get::<_, bool>(2)? && !row.get::<_, bool>(11)? {
                 folders.push(inbox.to_owned());
+            }
+            if let Some(scopes) = row.get::<_, Option<String>>(10)? {
+                folders.extend(crate::store::split_field(&scopes));
             }
             let fallback = if use_open_folder {
                 folders.first()
@@ -206,6 +223,76 @@ pub enum SearchField {
     Label,
     Sender,
     Recipient,
+}
+
+struct SearchFolder {
+    name: String,
+    folded: String,
+    label: String,
+    is_view: bool,
+}
+
+fn folder_catalog(conn: &Connection, account: &AccountId) -> Result<Vec<SearchFolder>> {
+    let names = crate::store::message_folder_names(conn, account)?;
+    let scopes = views::scope_names(conn, account)?;
+    let roles = crate::store::listed_folder_roles(conn, account)?;
+    Ok(names
+        .into_iter()
+        .map(|name| (name, false))
+        .chain(scopes.into_iter().map(|name| (name, true)))
+        .map(|(name, is_view)| SearchFolder {
+            label: roles
+                .as_ref()
+                .map_or_else(|| name.clone(), |roles| roles.label(&name)),
+            folded: name.to_lowercase(),
+            name,
+            is_view,
+        })
+        .collect())
+}
+
+fn matching_folders<'a>(
+    catalog: &'a [SearchFolder],
+    name: &str,
+) -> impl Iterator<Item = &'a SearchFolder> {
+    let folded = name.to_lowercase();
+    let use_name = catalog.iter().any(|folder| folder.folded == folded);
+    catalog.iter().filter(move |folder| {
+        if use_name {
+            folder.folded == folded
+        } else {
+            folder.label.to_lowercase() == folded
+        }
+    })
+}
+
+pub(crate) fn folder_suggestions(
+    conn: &Connection,
+    account: &AccountId,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let catalog = folder_catalog(conn, account)?;
+    let prefix = prefix.to_lowercase();
+    let mut seen = HashSet::new();
+    Ok(catalog
+        .iter()
+        .filter_map(|folder| {
+            let use_label = folder.label.to_lowercase().starts_with(&prefix)
+                && matching_folders(&catalog, &folder.label)
+                    .all(|matched| matched.folded == folder.folded);
+            if use_label {
+                Some(&folder.label)
+            } else if folder.folded.starts_with(&prefix) {
+                Some(&folder.name)
+            } else {
+                None
+            }
+        })
+        .filter(|name| seen.insert(name.to_lowercase()))
+        .take(limit)
+        .cloned()
+        .collect())
 }
 
 pub(crate) fn previews(
@@ -836,21 +923,18 @@ fn resolve_folders(conn: &Connection, account: &AccountId, parsed: &mut ParsedQu
     if parsed.folders.is_empty() {
         return Ok(());
     }
-    // Resolve Unicode spelling against the folder summaries once. The
-    // message query can then use SQLite's ASCII fold on stored identities.
-    let names: Vec<_> = crate::store::message_folder_names(conn, account)?
-        .into_iter()
-        .map(|name| (name.to_lowercase(), name.to_ascii_lowercase()))
-        .collect();
+    // Resolve display names and Unicode spelling once. The message query
+    // can then use SQLite's ASCII fold on the stored identities.
+    let catalog = folder_catalog(conn, account)?;
     parsed.folder_keys = parsed
         .folders
         .iter()
         .map(|folder| {
-            let folded = folder.to_lowercase();
-            names
-                .iter()
-                .filter(|(name, _)| *name == folded)
-                .map(|(_, key)| format!("\u{1e}{key}\u{1e}"))
+            matching_folders(&catalog, folder)
+                .map(|folder| {
+                    let key = folder.name.to_ascii_lowercase();
+                    (format!("\u{1e}{key}\u{1e}"), folder.is_view)
+                })
                 .collect()
         })
         .collect();
@@ -874,11 +958,19 @@ fn append_filters(sql: &mut String, params: &mut Vec<Value>, parsed: &ParsedQuer
     }
     for keys in &parsed.folder_keys {
         sql.push_str(" AND (");
-        for (index, key) in keys.iter().enumerate() {
+        for (index, (key, is_view)) in keys.iter().enumerate() {
             if index > 0 {
                 sql.push_str(" OR ");
             }
-            sql.push_str("instr(char(30) || lower(m.folders) || char(30), ?) > 0");
+            sql.push_str("instr(char(30) || lower(");
+            if *is_view {
+                sql.push('(');
+                sql.push_str(&views::scopes("m"));
+                sql.push(')');
+            } else {
+                sql.push_str("m.folders");
+            }
+            sql.push_str(") || char(30), ?) > 0");
             params.push(Value::Text(key.clone()));
         }
         sql.push(')');
@@ -1222,7 +1314,7 @@ struct ParsedQuery {
     to: Vec<String>,
     subject: Vec<String>,
     folders: Vec<String>,
-    folder_keys: Vec<Vec<String>>,
+    folder_keys: Vec<Vec<(String, bool)>>,
     labels: Vec<String>,
     has_attachment: bool,
     is_unread: bool,

@@ -21,7 +21,7 @@ pub struct FlagUpdate {
     pub remote_id: crate::RemoteId,
     /// `None` for an arrival whose read state is in the message itself.
     pub unread: Option<bool>,
-    /// Server star evidence for replay. Sync still only applies unread to the row.
+    /// Server star evidence. The displayed star also considers the other copies.
     pub flagged: Option<bool>,
     /// A generic IMAP copy's complete keyword list. `None` means no keyword evidence.
     pub keywords: Option<Vec<String>>,
@@ -98,9 +98,27 @@ pub struct FetchedReplyTo {
 /// UID range; answers the stored UIDs in that range, ascending.
 pub type KnownCopies<'a> = dyn Fn(&str, u32, (u32, u32)) -> Result<Vec<u32>> + 'a;
 
-/// For a one-shot fetch with no store: every copy found gets its body fetched.
-fn no_known_copies(_mailbox: &str, _uidvalidity: u32, _range: (u32, u32)) -> Result<Vec<u32>> {
-    Ok(Vec::new())
+/// A header that can attach a server copy to an existing row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyLink {
+    pub message_id: crate::MessageId,
+    pub flags: FlagUpdate,
+}
+
+/// How an IMAP mailbox contributes to the local mail lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxViewKind {
+    All,
+    Starred,
+    Label(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxView {
+    /// Escaped, as remote IDs spell it.
+    pub mailbox: String,
+    pub folder: String,
+    pub kind: MailboxViewKind,
 }
 
 /// Messages, flag updates, and vanished copies to apply to the local store.
@@ -112,6 +130,9 @@ fn no_known_copies(_mailbox: &str, _uidvalidity: u32, _range: (u32, u32)) -> Res
 pub struct MailboxDelta {
     pub messages: Vec<Message>,
     pub flags: Vec<FlagUpdate>,
+    pub links: Vec<CopyLink>,
+    /// Virtual mailboxes from the latest successful LIST.
+    pub views: Option<Vec<MailboxView>>,
     pub cursor: Option<SyncCursor>,
     pub removals: Vec<FolderRemoval>,
     pub settle: Settle,
@@ -445,17 +466,53 @@ fn collect_imap(
     cursor: Option<&SyncCursor>,
     keywords: bool,
 ) -> Result<MailboxDelta> {
+    use std::cell::RefCell;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
     let mut combined = MailboxDelta::default();
+    let mut filled = HashSet::new();
+    let known = RefCell::new(HashMap::<(String, u32), BTreeSet<u32>>::new());
     crate::imap::fetch_imap(
         account_id,
         config,
         cursor,
-        &no_known_copies,
+        &|mailbox, uidvalidity, (low, high)| {
+            Ok(known
+                .borrow()
+                .get(&(mailbox.to_string(), uidvalidity))
+                .map(|uids| uids.range(low..=high).copied().collect())
+                .unwrap_or_default())
+        },
         keywords,
         |mut delta| {
+            let mut known = known.borrow_mut();
+            let mut record = |id: &crate::RemoteId| {
+                if let Some(copy) = crate::imap::parse_remote_id(&id.0) {
+                    known
+                        .entry((copy.mailbox, copy.uidvalidity))
+                        .or_default()
+                        .insert(copy.uid);
+                }
+            };
+            for message in &delta.messages {
+                if message.parts.is_some() || message.body_text.is_some() {
+                    filled.insert(message.headers.message_id.clone());
+                    record(&message.remote_id);
+                }
+            }
+            for link in &delta.links {
+                if filled.contains(&link.message_id) {
+                    record(&link.flags.remote_id);
+                }
+            }
             combined.messages.append(&mut delta.messages);
             combined.flags.append(&mut delta.flags);
+            combined.links.append(&mut delta.links);
+            combined.too_large.append(&mut delta.too_large);
             combined.removals.append(&mut delta.removals);
+            if delta.views.is_some() {
+                combined.views = delta.views;
+            }
             if delta.settle != Settle::Later {
                 combined.settle = delta.settle;
             }

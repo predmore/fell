@@ -33,6 +33,8 @@ pub struct Theme {
     pub on_selection_dim: u32,
     pub search_match: (u32, u32),
     pub selected_search_match: (u32, u32),
+    label_outline: u32,
+    selected_label_outline: u32,
     pub error: u32,
     pub border: u32,
     pub star: u32,
@@ -60,6 +62,23 @@ impl Theme {
     pub fn is_light(&self) -> bool {
         luminance(self.background) > 0.4
     }
+
+    pub(crate) fn label_outline(&self, background: u32) -> u32 {
+        if background == self.background {
+            self.label_outline
+        } else if background == self.selection {
+            self.selected_label_outline
+        } else {
+            label_outline(background, self.dimmed)
+        }
+    }
+}
+
+fn label_outline(background: u32, text: u32) -> u32 {
+    push_toward(background, background, MARK_CONTRAST, text).map_or_else(
+        || ensure(background, background, MARK_CONTRAST),
+        |(color, _)| color,
+    )
 }
 
 /// Read the active Omarchy theme, or the built-in theme that follows the desktop.
@@ -178,6 +197,8 @@ fn map_palette(
         on_selection_dim,
         search_match: search_match(accent, background),
         selected_search_match: search_match(on_selection, selection),
+        label_outline: label_outline(background, dimmed),
+        selected_label_outline: label_outline(selection, on_selection),
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
@@ -979,6 +1000,25 @@ mod tests {
             }
             // Still a rule, not text: quieter than the dimmed text.
             assert!(contrast(border, theme.background) <= contrast(theme.dimmed, theme.background));
+        }
+    }
+
+    #[test]
+    fn label_outlines_reach_mark_contrast_on_every_stock_theme() {
+        for theme in every_test_theme() {
+            let plain = contrast(theme.label_outline(theme.background), theme.background);
+            let selected = contrast(theme.label_outline(theme.selection), theme.selection);
+            assert!(
+                plain >= MARK_CONTRAST && selected >= MARK_CONTRAST,
+                "{}: {plain:.3} and {selected:.3}",
+                theme.name
+            );
+            if matches!(theme.name.as_str(), "tokyo-night" | "catppuccin-latte") {
+                eprintln!(
+                    "{}: {plain:.3} unselected, {selected:.3} selected",
+                    theme.name
+                );
+            }
         }
     }
 }

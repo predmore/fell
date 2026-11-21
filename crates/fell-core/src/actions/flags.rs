@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{ActionKind, LocalAction, now_unix};
 use crate::account::AccountId;
-use crate::store::{Store, intents, split_field};
+use crate::store::{Store, intents, split_field, views};
 use crate::threading::ThreadId;
 use crate::{Error, Result};
 
@@ -71,6 +71,7 @@ struct Row {
     archived: bool,
     unread: bool,
     starred: bool,
+    has_view_copy: bool,
 }
 
 impl Store {
@@ -218,7 +219,7 @@ fn plan(
 /// Whether `row` shows in `folder`. A message with no folder that is not
 /// archived is in the Inbox, as the folder list counts it.
 fn in_folder(row: &Row, folder: &str) -> bool {
-    if row.folders.is_empty() && !row.archived {
+    if row.folders.is_empty() && !row.archived && !row.has_view_copy {
         return folder.eq_ignore_ascii_case(super::FOLDER_INBOX);
     }
     let aliases = crate::folder_aliases(folder);
@@ -229,7 +230,7 @@ fn in_folder(row: &Row, folder: &str) -> bool {
 }
 
 fn in_source_folder(row: &Row, folder: &str, inbox: &str) -> bool {
-    if row.folders.is_empty() && !row.archived {
+    if row.folders.is_empty() && !row.archived && !row.has_view_copy {
         return folder.eq_ignore_ascii_case(inbox);
     }
     row.folders
@@ -238,18 +239,26 @@ fn in_source_folder(row: &Row, folder: &str, inbox: &str) -> bool {
 }
 
 fn load_flags(conn: &Connection, account_id: &AccountId, thread: &ThreadId) -> Result<Vec<Row>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT message_id, folders, archived, unread, starred FROM messages
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT message_id, folders, archived, unread, starred, ({}), {}
+         FROM messages m
          WHERE account_id = ?1 AND thread_id = ?2
          ORDER BY date_unix ASC, rowid ASC",
-    )?;
+        views::scopes("m"),
+        views::has_view_copy("m"),
+    ))?;
     let rows = stmt.query_map(params![account_id.as_str(), thread.0], |row| {
+        let mut folders = split_field(&row.get::<_, String>(1)?);
+        if let Some(scopes) = row.get::<_, Option<String>>(5)? {
+            folders.extend(split_field(&scopes));
+        }
         Ok(Row {
             message_id: row.get(0)?,
-            folders: split_field(&row.get::<_, String>(1)?),
+            folders,
             archived: row.get::<_, i64>(2)? != 0,
             unread: row.get::<_, i64>(3)? != 0,
             starred: row.get::<_, i64>(4)? != 0,
+            has_view_copy: row.get(6)?,
         })
     })?;
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -275,6 +284,31 @@ fn set_flags(
     Ok(())
 }
 
+/// Save a star as part of a folder action's undo entry. A deleted row
+/// needs the snapshot too, since restoring its message initializes flags.
+pub(super) fn snapshot_star(
+    conn: &Connection,
+    account: &AccountId,
+    action_id: i64,
+    message_id: &str,
+    clear: bool,
+) -> Result<()> {
+    let saved = conn.execute(
+        "INSERT INTO local_action_flags (action_id, message_id, unread, starred)
+         SELECT ?1, message_id, unread, starred FROM messages
+         WHERE account_id = ?2 AND message_id = ?3 AND starred",
+        params![action_id, account.as_str(), message_id],
+    )?;
+    if clear && saved != 0 {
+        conn.execute(
+            "UPDATE messages SET starred = 0 WHERE account_id = ?1 AND message_id = ?2",
+            params![account.as_str(), message_id],
+        )?;
+        intents::record(conn, account, message_id, None, Some(false))?;
+    }
+    Ok(())
+}
+
 /// Restore the flag the action changed, alongside its local intent. The
 /// other flag may have changed independently since the action was recorded.
 pub(super) fn undo(conn: &Connection, account_id: &AccountId, action: &LocalAction) -> Result<()> {
@@ -292,7 +326,7 @@ pub(super) fn undo(conn: &Connection, account_id: &AccountId, action: &LocalActi
         })?
         .collect::<rusqlite::Result<_>>()?
     };
-    if saved.is_empty() {
+    if saved.is_empty() && action.kind.is_flag() {
         return Err(Error::Action("action has no messages".into()));
     }
     let restore_unread = matches!(action.kind, ActionKind::Read | ActionKind::Unread);
