@@ -731,10 +731,16 @@ fn names_outside_the_imap_keyword_grammar_stay_local() {
 }
 
 #[test]
-fn early_keyword_edit_replays_and_undoes_when_its_first_copy_arrives() {
-    let fx = Fixture::new();
+fn early_keyword_edit_replays_and_undoes_for_every_copy_in_order() {
+    let fx = Fixture::with(Store::open_in_memory().unwrap(), flag_state(false));
     let account = &fx.account.id;
     let thread = fx.thread("INBOX", "Alpha");
+    let copies = [("INBOX", 4), (ESCAPED_FOLDER, 12), (ESCAPED_FOLDER, 9)];
+    let server_has_label = |value| {
+        for (folder, uid) in copies {
+            assert_eq!(fx.flags(folder, uid).contains(&"Review".into()), value);
+        }
+    };
     let mut message = fx
         .store
         .thread_messages(account, &thread)
@@ -745,7 +751,7 @@ fn early_keyword_edit_replays_and_undoes_when_its_first_copy_arrives() {
     store.upsert_account(&fx.account).unwrap();
     store.upsert_message(&message).unwrap();
     store.set_write_back(account, true).unwrap();
-    let action = store
+    let added = store
         .label_thread(account, &thread, crate::LabelChange::Add("Review".into()))
         .unwrap();
     let outbox = store.outbox(account).unwrap();
@@ -754,19 +760,48 @@ fn early_keyword_edit_replays_and_undoes_when_its_first_copy_arrives() {
 
     let replay = || replay_outbox(&fx.backend.config, account, &store).unwrap();
     assert_eq!(replay().waiting, 1);
-    assert!(!fx.flags("INBOX", 1).contains(&"Review".into()));
+    server_has_label(false);
     sync_once(&fx.account, &fx.backend, &store).unwrap();
-    store
-        .connection()
-        .execute("UPDATE server_outbox SET retry_unix = 0", [])
+    // A later edit must wait for the earlier write on all three copies,
+    // including those whose rows are only inserted when replay starts.
+    let removed = store
+        .label_thread(
+            account,
+            &thread,
+            crate::LabelChange::Remove("Review".into()),
+        )
         .unwrap();
+    fx.clear_commands();
     assert_eq!(replay().waiting, 0);
-    assert_eq!(store.outbox(account).unwrap()[0].uid, Some(1));
-    assert!(fx.flags("INBOX", 1).contains(&"Review".into()));
+    let expected: Vec<_> = ['+', '-']
+        .into_iter()
+        .flat_map(|sign| {
+            copies
+                .into_iter()
+                .map(move |(_, uid)| format!("UID STORE {uid} {sign}FLAGS.SILENT (Review)"))
+        })
+        .collect();
+    assert_eq!(fx.stores(), expected);
+    let early_rows: Vec<_> = store
+        .outbox(account)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.action_id == Some(added.id))
+        .collect();
+    assert_eq!(early_rows.len(), copies.len());
+    assert!(
+        early_rows
+            .iter()
+            .all(|row| row.state == OutboxState::Done && row.sent)
+    );
+    server_has_label(false);
 
-    assert_eq!(store.undo(account).unwrap().id, action.id);
+    assert_eq!(store.undo(account).unwrap().id, removed.id);
     assert_eq!(replay().waiting, 0);
-    assert!(!fx.flags("INBOX", 1).contains(&"Review".into()));
+    server_has_label(true);
+    assert_eq!(store.undo(account).unwrap().id, added.id);
+    assert_eq!(replay().waiting, 0);
+    server_has_label(false);
 }
 
 #[test]

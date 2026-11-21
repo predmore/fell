@@ -132,41 +132,52 @@ pub(crate) fn copies(
     .collect()
 }
 
-/// Persist the first available copy before sending a UID-less keyword row,
-/// so recovery and undo continue to address the same copy.
-pub(crate) fn bind_keyword_copy(
-    store: &Store,
+/// Expand early keyword edits before replay takes its queue snapshot. Keep
+/// the original row's position for every copy so later edits and moves
+/// cannot overtake part of the write.
+pub(crate) fn bind_keyword_copies(
+    conn: &Connection,
     account: &AccountId,
-    entry: &mut OutboxEntry,
-) -> Result<Option<LabelCopy>> {
-    let tx = crate::store::immediate_transaction(store.connection())?;
-    let copy = copies(&tx, account, &entry.message_id)?.into_iter().next();
-    let Some((folder, raw, validity, uid)) = copy.as_ref() else {
-        return Ok(None);
-    };
-    let bound = tx.execute(
-        "UPDATE server_outbox
-         SET source_folder = ?4, source_mailbox = ?5, uidvalidity = ?6, uid = ?7
-         WHERE account_id = ?1 AND id = ?2 AND generation = ?3 AND state = 'pending'
-           AND source_mailbox IS NULL AND sent = 0",
-        params![
-            account.as_str(),
-            entry.id,
-            entry.generation,
-            folder,
-            raw,
-            validity,
-            uid
-        ],
-    )? != 0;
-    tx.commit()?;
-    if bound {
-        entry.source_folder.clone_from(folder);
-        entry.source_mailbox = Some(raw.clone());
-        entry.uidvalidity = Some(*validity);
-        entry.uid = Some(*uid);
+    generation: i64,
+) -> Result<()> {
+    let mut waiting = conn.prepare_cached(
+        "SELECT id, message_id FROM server_outbox
+         WHERE account_id = ?1 AND generation = ?2 AND kind = 'keyword' AND state = 'pending'
+           AND source_mailbox IS NULL AND uidvalidity IS NULL AND uid IS NULL AND sent = 0",
+    )?;
+    let waiting = waiting
+        .query_map(params![account.as_str(), generation], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if waiting.is_empty() {
+        return Ok(());
     }
-    Ok(copy.filter(|_| bound))
+    let mut bind = conn.prepare_cached(
+        "UPDATE server_outbox
+         SET source_folder = ?2, source_mailbox = ?3, uidvalidity = ?4, uid = ?5,
+             attempts = 0, retry_unix = 0, error = ''
+         WHERE id = ?1",
+    )?;
+    let mut add = conn.prepare_cached(
+        "INSERT INTO server_outbox
+            (account_id, kind, state, action_id, message_id, source_folder, source_mailbox,
+             uidvalidity, uid, target_folder, created_unix, generation, flag_value, keyword_parent)
+         SELECT account_id, kind, state, action_id, message_id, ?2, ?3, ?4, ?5,
+                target_folder, created_unix, generation, flag_value, id
+         FROM server_outbox WHERE id = ?1",
+    )?;
+    for (id, message) in waiting {
+        let copies = copies(conn, account, &message)?;
+        let Some(((folder, raw, validity, uid), rest)) = copies.split_first() else {
+            continue;
+        };
+        bind.execute(params![id, folder, raw, validity, uid])?;
+        for (folder, raw, validity, uid) in rest {
+            add.execute(params![id, folder, raw, validity, uid])?;
+        }
+    }
+    Ok(())
 }
 
 // Local and agent logs have separate counters. Agent action IDs use the

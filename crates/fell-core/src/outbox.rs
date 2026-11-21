@@ -104,7 +104,9 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     flag_base INTEGER,
     -- An earlier flag write may have reached the server. Recover its result
     -- before replaying the replacement, without sending the old value again.
-    flag_superseded INTEGER NOT NULL DEFAULT 0
+    flag_superseded INTEGER NOT NULL DEFAULT 0,
+    -- Extra copies bound from an early keyword edit replay with that edit.
+    keyword_parent INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -114,6 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_server_outbox_message ON server_outbox(account_id
 
 /// Columns added after the tables first shipped on a branch build.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("server_outbox", "keyword_parent", "INTEGER"),
     (
         "write_back_accounts",
         "generation",
@@ -841,13 +844,14 @@ pub(crate) fn unfinished(store: &Store, account_id: &AccountId) -> Result<Vec<Ou
         params![account_id.as_str(), now_unix() - KEEP_SETTLED_SECS],
     )?;
     let generation = generation(&tx, account_id)?;
+    labels::bind_keyword_copies(&tx, account_id, generation)?;
     let entries = select_entries(
         &tx,
         &format!(
             "SELECT {ENTRY_COLS} FROM server_outbox
              WHERE account_id = ?1 AND state = 'pending'
                AND generation = {generation}
-             ORDER BY id"
+             ORDER BY COALESCE(keyword_parent, id), id"
         ),
         account_id,
     )?;

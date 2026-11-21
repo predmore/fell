@@ -75,16 +75,11 @@ impl Pass<'_> {
                 (entry.source_folder.clone(), raw, validity, uid)
             }
             (None, None, None) => {
-                let Some(copy) =
-                    labels::bind_keyword_copy(self.store, self.account_id, &mut entry)?
-                else {
-                    return self.retry(
-                        index,
-                        DropReason::NotFound,
-                        "waiting for a server copy to label",
-                    );
-                };
-                copy
+                return self.retry(
+                    index,
+                    DropReason::NotFound,
+                    "waiting for a server copy to label",
+                );
             }
             _ => {
                 return self.drop_row(

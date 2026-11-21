@@ -274,13 +274,30 @@ fn step_index(cursor: usize, len: usize, motion: Motion) -> usize {
     }
 }
 
-/// Read, unread, or star on threads. The rows already show it; the view
-/// writes it to the store.
+/// One label change on the selected threads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabelEdit {
     pub ids: Vec<String>,
     pub name: String,
     pub add: bool,
+}
+
+impl LabelEdit {
+    pub fn include_name(&self, names: &mut Vec<String>) {
+        if self.add && !names.contains(&self.name) {
+            names.push(self.name.clone());
+        }
+    }
+
+    pub fn apply(&self, rows: &mut [ThreadRow]) {
+        for row in rows.iter_mut().filter(|row| self.ids.contains(&row.id)) {
+            if self.add && !row.labels.contains(&self.name) {
+                row.labels.push(self.name.clone());
+            } else if !self.add {
+                row.labels.retain(|label| label != &self.name);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -968,18 +985,8 @@ impl Session {
     }
 
     pub fn label_rows(&mut self, edit: &LabelEdit) {
-        if edit.add && !self.labels.contains(&edit.name) {
-            self.labels.push(edit.name.clone());
-        }
-        for row in &mut self.threads {
-            if edit.ids.contains(&row.id) {
-                if edit.add && !row.labels.contains(&edit.name) {
-                    row.labels.push(edit.name.clone());
-                } else if !edit.add {
-                    row.labels.retain(|label| label != &edit.name);
-                }
-            }
-        }
+        edit.include_name(&mut self.labels);
+        edit.apply(&mut self.threads);
     }
 
     pub fn highlighted(&self) -> HashSet<String> {

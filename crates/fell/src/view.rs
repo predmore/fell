@@ -9,7 +9,7 @@ mod help;
 mod search;
 
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
@@ -41,8 +41,8 @@ use crate::mail_body::{
 };
 use crate::mailbox;
 use crate::model::{
-    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, Overlay, QueryFault, ReadDwell, Session, Step,
-    SyncKind, Toast, row_key,
+    Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, LabelEdit, Overlay, QueryFault, ReadDwell, Session,
+    Step, SyncKind, Toast, row_key,
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
@@ -201,6 +201,89 @@ async fn finish_mailbox_change<T>(
         ))
     });
     done(result);
+}
+
+/// Return the visible page's edges, or request a restart for an empty label
+/// window. A page hidden by pending removals waits for their follow-up read.
+fn prepare_list_rows(
+    rows: &mut Vec<ThreadRow>,
+    unread: &mut usize,
+    pending_removals: Option<&HashSet<String>>,
+    edges: (bool, bool),
+    label: bool,
+) -> Option<(bool, bool)> {
+    let had_rows = !rows.is_empty();
+    if label && !had_rows && (edges.0 || edges.1) {
+        return None;
+    }
+    if let Some(pending) = pending_removals {
+        rows.retain(|row| {
+            let hidden = pending.contains(&row.id);
+            if hidden && row.unread {
+                *unread = unread.saturating_sub(1);
+            }
+            !hidden
+        });
+    }
+    if label && had_rows && rows.is_empty() {
+        // A waiting cursor motion would otherwise request a page again.
+        return Some((false, false));
+    }
+    Some(edges)
+}
+
+#[derive(Default)]
+struct PendingLabels {
+    next: u64,
+    edits: VecDeque<PendingLabel>,
+}
+
+struct PendingLabel {
+    id: u64,
+    edit: LabelEdit,
+    /// A read started through this generation could predate the commit.
+    through: Option<u64>,
+}
+
+impl PendingLabels {
+    fn start(&mut self, edit: LabelEdit) -> u64 {
+        self.next += 1;
+        let id = self.next;
+        self.edits.push_back(PendingLabel {
+            id,
+            edit,
+            through: None,
+        });
+        id
+    }
+
+    fn finish(&mut self, id: u64, committed_through: Option<u64>) {
+        if let Some(through) = committed_through {
+            if let Some(pending) = self.edits.iter_mut().find(|edit| edit.id == id) {
+                pending.through = Some(through);
+            }
+        } else {
+            self.edits.retain(|edit| edit.id != id);
+        }
+    }
+
+    fn land(&mut self, read: u64, rows: &mut [ThreadRow], mut labels: Option<&mut Vec<String>>) {
+        // Keep later edits behind any still pending earlier edit, since they
+        // can toggle the same chip and completion callbacks can land apart.
+        while self
+            .edits
+            .front()
+            .is_some_and(|edit| edit.through.is_some_and(|through| read > through))
+        {
+            self.edits.pop_front();
+        }
+        for pending in &self.edits {
+            pending.edit.apply(rows);
+            if let Some(labels) = labels.as_deref_mut() {
+                pending.edit.include_name(labels);
+            }
+        }
+    }
 }
 
 /// Use one notice so a flag failure and a move failure can both be seen.
@@ -381,6 +464,7 @@ struct Inbox {
     /// `(write, unread, starred)`. A read that started before the write
     /// cannot paint the old state back. Only the latest write clears it.
     pending_flags: std::collections::HashMap<String, (u64, bool, bool)>,
+    pending_labels: PendingLabels,
     /// Bumped by every read or star write.
     flag_gen: u64,
     /// Names and subject widths of the rows on screen, kept so a row
@@ -517,6 +601,7 @@ impl Inbox {
             undos_in_flight: 0,
             pending_removals: std::collections::HashSet::new(),
             pending_flags: std::collections::HashMap::new(),
+            pending_labels: PendingLabels::default(),
             flag_gen: 0,
             row_widths: RowWidths::new(motion),
             conv_gen: Arc::new(AtomicU64::new(0)),
@@ -1006,7 +1091,7 @@ impl Inbox {
             more_after,
             mut unread,
             names,
-            labels,
+            mut labels,
             followed,
             drafts,
             roles,
@@ -1040,18 +1125,16 @@ impl Inbox {
             self.session.folders = names;
         }
         self.session.roles = roles;
-        if let Some(labels) = labels {
-            self.session.set_labels(labels);
-        }
         let switched = folder != self.list_folder || label != self.list_label;
+        let had_store_rows = !rows.is_empty();
+        let edges = prepare_list_rows(
+            &mut rows,
+            &mut unread,
+            (!switched).then_some(&self.pending_removals),
+            (more_before, more_after),
+            label.is_some(),
+        );
         if !switched {
-            // A read from before the write still counts the rows taken out.
-            let hidden_unread = rows
-                .iter()
-                .filter(|row| row.unread && self.pending_removals.contains(&row.id))
-                .count();
-            unread = unread.saturating_sub(hidden_unread);
-            rows.retain(|row| !self.pending_removals.contains(&row.id));
             for row in &mut rows {
                 let Some(&(_, now_unread, starred)) = self.pending_flags.get(&row.id) else {
                     continue;
@@ -1067,7 +1150,7 @@ impl Inbox {
                 row.starred = starred;
             }
         }
-        if label.is_some() && rows.is_empty() && (more_before || more_after) {
+        let Some((more_before, more_after)) = edges else {
             self.request_threads(
                 ReadIntent {
                     fetch: Fetch {
@@ -1079,10 +1162,11 @@ impl Inbox {
                 cx,
             );
             return;
-        }
+        };
         // New mail moved the selected thread outside the rows read (they do
         // not reach the top of the folder). Read the rows around it, as undo
         // does, instead of selecting whichever row took its place.
+        let followed = followed.filter(|key| !self.pending_removals.contains(&key.thread_id.0));
         if !switched
             && intent.select.is_none()
             && let Some(key) = self.session.moved_selection(&rows, followed)
@@ -1095,6 +1179,11 @@ impl Inbox {
                 cx,
             );
             return;
+        }
+        self.pending_labels
+            .land(self.read_gen, &mut rows, labels.as_mut());
+        if let Some(labels) = labels {
+            self.session.set_labels(labels);
         }
         self.list_folder = folder;
         self.list_label = label;
@@ -1112,7 +1201,11 @@ impl Inbox {
         let now = self.motion.clock.now();
         let drawn = self.drawn_rows(now);
         let had_rows = !self.session.threads.is_empty();
-        let emptied = !switched && self.list_label.is_some() && had_rows && rows.is_empty();
+        let emptied = !switched
+            && self.list_label.is_some()
+            && had_rows
+            && rows.is_empty()
+            && !had_store_rows;
         if emptied {
             let full_width = self.motion.list_emptied(now);
             if self.motion.motion.enabled()
@@ -2332,9 +2425,10 @@ impl Inbox {
             .map(row_key)
     }
 
-    fn apply_labels(&mut self, edit: crate::model::LabelEdit, cx: &mut Context<Self>) {
+    fn apply_labels(&mut self, edit: LabelEdit, cx: &mut Context<Self>) {
         let now = self.motion.clock.now();
         self.session.label_rows(&edit);
+        let pending = self.pending_labels.start(edit.clone());
         for row in self
             .session
             .threads
@@ -2360,6 +2454,9 @@ impl Inbox {
         self.change_mailbox(
             move |store| store.label_threads(&account, &threads, change),
             move |inbox, result| {
+                inbox
+                    .pending_labels
+                    .finish(pending, result.is_ok().then_some(inbox.read_gen));
                 match result {
                     Ok(_) => {
                         inbox.session.show_toast(notice, false);
@@ -8521,6 +8618,102 @@ mod tests {
         assert_eq!(picker_card_height([false, true].into_iter(), 692.), 131.);
     }
 
+    fn row(id: &str) -> super::ThreadRow {
+        use crate::present::NameSpan;
+        super::ThreadRow {
+            id: id.into(),
+            spans: vec![NameSpan {
+                text: id.into(),
+                emphasis: true,
+            }],
+            extra: 0,
+            message_count: 1,
+            starred: false,
+            has_attachment: false,
+            date_unix: 0,
+            subject: id.into(),
+            snippet: "snippet".into(),
+            labels: vec![],
+            warn: false,
+            unread: true,
+            draft: None,
+        }
+    }
+
+    #[test]
+    fn optimistic_label_edits_survive_stale_pages_until_the_commit_is_read() {
+        use super::{LabelEdit, PendingLabels};
+
+        let mut pending = PendingLabels::default();
+        let add = LabelEdit {
+            ids: vec!["a".into()],
+            name: "field notes".into(),
+            add: true,
+        };
+        let first = pending.start(add.clone());
+        let mut rows = [row("a"), row("b")];
+        let mut names = Vec::new();
+        pending.land(7, &mut rows, Some(&mut names));
+        assert_eq!(rows[0].labels, ["field notes"]);
+        assert!(rows[1].labels.is_empty());
+        assert_eq!(names, ["field notes"]);
+
+        let second = pending.start(LabelEdit { add: false, ..add });
+        pending.finish(second, Some(8));
+        // A callback for the later edit may arrive first. Its removal
+        // still wins over the older optimistic add on the same row.
+        pending.land(9, &mut rows, None);
+        assert!(rows[0].labels.is_empty());
+        pending.finish(first, Some(9));
+
+        let mut lagged = [row("a")];
+        lagged[0].labels.push("field notes".into());
+        pending.land(9, &mut lagged, None);
+        assert!(lagged[0].labels.is_empty());
+
+        let mut current = [row("a")];
+        let mut current_names = Vec::new();
+        pending.land(10, &mut current, Some(&mut current_names));
+        assert!(pending.edits.is_empty());
+        assert!(current[0].labels.is_empty());
+        assert!(current_names.is_empty());
+    }
+
+    #[test]
+    fn a_page_hidden_by_pending_removals_does_not_request_another_read() {
+        use super::{HashSet, prepare_list_rows};
+        use crate::keymap::Keymap;
+        use crate::model::{Session, SyncKind};
+
+        let mut session = Session::new("A", "a@x", SyncKind::FixtureOffline, Keymap::default());
+        session.set_page(vec![row("a"), row("b")], false, true, 3);
+        session.remove_thread("a");
+        session.remove_thread("b");
+        assert!(session.take_fetch().is_some(), "the initial lookahead");
+        let removals = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        for _ in 0..2 {
+            let mut rows = vec![row("a"), row("b")];
+            let mut unread = 3;
+            let (before, after) =
+                prepare_list_rows(&mut rows, &mut unread, Some(&removals), (false, true), true)
+                    .expect("the store page still had rows");
+            assert!(rows.is_empty());
+            assert_eq!(unread, 1);
+            session.set_page(rows, before, after, unread);
+            assert!(!session.has_fetch(), "wait for the removal's own read");
+        }
+        assert_eq!(
+            prepare_list_rows(
+                &mut Vec::new(),
+                &mut 1,
+                Some(&removals),
+                (true, false),
+                true,
+            ),
+            None
+        );
+    }
+
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
         Keystroke {
             modifiers: Modifiers {
@@ -8838,6 +9031,41 @@ mod tests {
             assert_eq!(reading.card.width, reading.prose.width);
             assert!(reading.wide.width >= reading.prose.width);
         }
+    }
+
+    /// After each key, whether a box left wide relaxes: only a key that
+    /// moves the list's cursor or comes back to the list.
+    #[test]
+    fn only_moving_in_the_list_relaxes_a_wide_row() {
+        use crate::keymap::Keymap;
+        use crate::model::{Session, SyncKind};
+        let mut session = Session::new("A", "a@x", SyncKind::FixtureOffline, Keymap::default());
+        session.set_threads(vec![row("a"), row("b"), row("c")]);
+        let mut press = |key: KeyId| {
+            let before = (session.cursor_id.clone(), session.pane);
+            session.on_key(key, 10);
+            moved_in_list(
+                (before.0.as_deref(), before.1),
+                (session.cursor_id.as_deref(), session.pane),
+            )
+        };
+        // Opening, `U` and `s` leave the row where the reader is looking.
+        assert!(!press(KeyId::Enter));
+        assert!(!press(KeyId::Char('U')));
+        assert!(!press(KeyId::Char('s')));
+        // `j` in the conversation moves between messages, not threads.
+        assert!(!press(KeyId::Char('j')));
+        // Back to the list, then down it.
+        assert!(press(KeyId::Escape));
+        assert!(press(KeyId::Char('j')));
+        assert!(press(KeyId::Char('k')));
+        // Any other move of the list cursor: `G`, `gg`, a page.
+        assert!(press(KeyId::Char('G')));
+        assert!(!press(KeyId::Char('g')));
+        assert!(press(KeyId::Char('g')));
+        // Open, then back with `h`.
+        assert!(!press(KeyId::Enter));
+        assert!(press(KeyId::Char('h')));
     }
 
     #[test]
