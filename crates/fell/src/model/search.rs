@@ -593,6 +593,7 @@ impl Session {
                 text: one_line(&error),
                 alert: true,
                 hint: None,
+                label: None,
             });
             return true;
         }

@@ -18,7 +18,7 @@ use fell_core::{
 
 use crate::attachments::{Request as AttachmentRequest, Target as AttachmentTarget};
 use crate::keymap::{self, Action, KeyId, Keymap, PaletteItem, SeqMatch, WhichItem};
-use crate::present::{ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
+use crate::present::{self, ConvMessage, NOTICE_DOT, Pane, ThreadRow, display_safe, merge_folders};
 use crate::worker::Worker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +178,7 @@ pub struct Toast {
     pub text: String,
     pub alert: bool,
     pub hint: Option<(String, &'static str)>,
+    pub label: Option<present::LabelNotice>,
 }
 
 impl Toast {
@@ -186,6 +187,7 @@ impl Toast {
             text: text.into(),
             alert: false,
             hint: Some((key, suffix)),
+            label: None,
         }
     }
 }
@@ -585,6 +587,16 @@ impl Session {
             text: text.into(),
             alert,
             hint: None,
+            label: None,
+        });
+    }
+
+    pub fn show_label_toast(&mut self, notice: present::LabelNotice) {
+        self.set_toast(Toast {
+            text: notice.fit(f32::INFINITY, |_| 0.0),
+            alert: false,
+            hint: None,
+            label: Some(notice),
         });
     }
 
@@ -676,28 +688,30 @@ impl Session {
             return;
         }
         let targets = match result {
-            Ok(targets) if targets.len() == self.label_selection.ids.len() => targets,
-            result => {
+            Ok(targets) => targets,
+            Err(error) => {
                 self.overlay = Overlay::None;
-                self.show_toast(
-                    result
-                        .err()
-                        .unwrap_or_else(|| "A selected conversation is no longer available".into()),
-                    true,
-                );
+                self.show_toast(error, true);
                 return;
             }
         };
-        if let [id] = self.label_selection.ids.as_slice() {
-            self.label_selection.subject = Some(targets[id].subject.clone());
+        let selection = &mut self.label_selection;
+        selection.ids.retain(|id| targets.contains_key(id));
+        if selection.ids.is_empty() {
+            self.overlay = Overlay::None;
+            self.show_toast("A selected conversation is no longer available", true);
+            return;
+        }
+        if let [id] = selection.ids.as_slice() {
+            selection.subject = Some(targets[id].subject.clone());
         }
         let mut counts = HashMap::new();
-        for thread in targets.into_values() {
-            for label in thread.labels {
-                *counts.entry(label).or_insert(0) += 1;
+        for id in &selection.ids {
+            for label in &targets[id].labels {
+                *counts.entry(label.clone()).or_insert(0) += 1;
             }
         }
-        self.label_selection.counts = Some(counts);
+        selection.counts = Some(counts);
     }
 
     pub fn record_startup_error(&mut self, error: String) {
@@ -2361,16 +2375,13 @@ impl Session {
             Action::Label | Action::LabelList => {
                 self.count.clear();
                 if action == Action::Label {
-                    let targets = self.label_targets();
+                    let mut targets = self.label_targets();
                     if targets.is_empty() {
                         self.show_toast("No conversation", true);
                         return step;
                     }
-                    if self
-                        .threads
-                        .iter()
-                        .any(|row| row.draft.is_some() && targets.contains(&row.id))
-                    {
+                    targets.retain(|id| !present::is_draft_row_id(id));
+                    if targets.is_empty() {
                         self.show_toast(DRAFT_NOT_THREAD, true);
                         return step;
                     }
@@ -3608,6 +3619,55 @@ mod tests {
                 .values()
                 .all(|thread| !thread.labels.contains("Review"))
         );
+    }
+
+    #[test]
+    fn label_picker_skips_an_off_page_draft_in_a_mixed_selection() {
+        let mut session = session();
+        let draft_id = present::draft_row_id("local");
+        let mut draft = row(&draft_id);
+        draft.draft = Some("local".into());
+        session.set_page(vec![draft], false, true, 0);
+        assert!(!session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row("a")], true, false, 0);
+        assert!(session.picked.contains(&draft_id));
+        assert!(!session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.toast.as_ref().unwrap().text, DRAFT_NOT_THREAD);
+
+        session.on_key(KeyId::Char('x'), 10);
+        session.labels = vec!["Review".into()];
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.label_target_ids(), ["a"]);
+        load_test_label_targets(&mut session);
+        assert_eq!(session.on_key(KeyId::Enter, 10).labels.unwrap().ids, ["a"]);
+    }
+
+    #[test]
+    fn label_picker_uses_the_remaining_target_when_a_marked_thread_is_gone() {
+        let store = fell_core::Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        crate::fixtures::seed_if_empty(&store, &account).unwrap();
+        let threads = store.list_threads(&account.id).unwrap();
+        let remaining = &threads[0];
+        let mut session = session();
+        session.labels = vec!["Review".into()];
+        session.set_page(vec![row("purged")], false, true, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        session.set_page(vec![row(remaining.thread_id.as_str())], true, false, 0);
+        session.on_key(KeyId::Char('x'), 10);
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        let targets = store
+            .thread_labels(&account.id, session.label_target_ids())
+            .unwrap();
+        let subject = targets[remaining.thread_id.as_str()].subject.clone();
+        assert_eq!(targets.len(), 1);
+        session.load_label_targets(Ok(targets));
+        assert_eq!(session.label_target_subject(), Some(subject.as_str()));
+        let edit = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(edit.ids, [remaining.thread_id.as_str()]);
+        assert!(edit.add);
     }
 
     #[test]

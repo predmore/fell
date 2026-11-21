@@ -23,7 +23,6 @@ pub const SELECTION_FROM: f32 = 0.6;
 /// The folder label and count leaving the header as a pair.
 pub struct FolderHeaderFade {
     pub folder: String,
-    pub label: Option<String>,
     pub unread: usize,
     banner: Option<Banner>,
     fade: Transition,
@@ -244,9 +243,11 @@ pub struct InboxMotion {
     /// The count it replaced in the same folder, fading out under the new one.
     unread_out: Option<(usize, Transition)>,
     folder_out: Option<FolderHeaderFade>,
+    /// A label scope changes its heading in the same frame as its rows.
+    label_header_in: Option<Transition>,
     last_banner: Option<Banner>,
     /// The rows and reader leave before the empty message comes in.
-    empty_list: Option<(Transition, Transition)>,
+    empty_list: Option<(Transition, Transition, bool)>,
     quotes: DisclosureMotion,
     recipients: DisclosureMotion,
 }
@@ -358,6 +359,7 @@ impl InboxMotion {
             last_unread: None,
             unread_out: None,
             folder_out: None,
+            label_header_in: None,
             last_banner: None,
             empty_list: None,
         }
@@ -621,13 +623,17 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
-        if self.empty_list.is_some_and(|(exit, _)| !exit.running(now)) {
+        if self
+            .empty_list
+            .is_some_and(|(exit, _, _)| !exit.running(now))
+        {
             self.empty_list = None;
         }
         self.bodies.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
         self.unread_out = None;
+        self.label_header_in = None;
         Settled {
             list: list.map(|glide| glide.to),
             conversation: conversation.map(|glide| glide.to),
@@ -705,9 +711,10 @@ impl InboxMotion {
             self.folder_out = None;
         }
         running |= self.folder_out.is_some();
+        running |= keep(&mut self.label_header_in, now);
         if self
             .empty_list
-            .is_some_and(|(_, enter)| !enter.running(now))
+            .is_some_and(|(_, enter, _)| !enter.running(now))
         {
             self.empty_list = None;
         }
@@ -772,10 +779,16 @@ impl InboxMotion {
             let old_folder = std::mem::replace(previous, folder.to_owned());
             let old_label = std::mem::replace(previous_label, label.map(str::to_owned));
             let old = self.folder_out.take();
+            if old_label.is_some() || label.is_some() {
+                self.label_header_in = self.motion.start(motion::FADE, now);
+                self.unread_out = None;
+                *count = unread;
+                return;
+            }
+            self.label_header_in = None;
             self.folder_out = self.motion.start(motion::FADE, now).map(|fade| {
                 let mut next = FolderHeaderFade {
                     folder: old_folder,
-                    label: old_label,
                     unread: *count,
                     banner: self.last_banner.clone(),
                     fade,
@@ -789,7 +802,6 @@ impl InboxMotion {
                     next.folder_from = opacity;
                     if leaving {
                         next.folder = old.folder;
-                        next.label = old.label;
                         next.unread = old.unread;
                         next.banner = old.banner;
                         next.folder_from *= old.folder_from;
@@ -811,6 +823,12 @@ impl InboxMotion {
         self.folder_out.as_mut()
     }
 
+    pub fn label_header_opacity(&self, now: Instant) -> f32 {
+        self.label_header_in.map_or(1.0, |fade| {
+            motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now))
+        })
+    }
+
     /// Start the last-row exit and report whether the reader occupied the window.
     pub fn list_emptied(&mut self, now: Instant) -> bool {
         self.pane = None;
@@ -818,11 +836,13 @@ impl InboxMotion {
         self.reading_slide = None;
         self.reading_list_fade = None;
         self.reading_reflow = None;
+        let replaces_reader = self.last_panes == (false, true);
         self.empty_list = self
             .motion
             .start(motion::FADE, now)
-            .zip(self.motion.start(motion::FADE, now + motion::FADE));
-        self.last_panes == (false, true)
+            .zip(self.motion.start(motion::FADE, now + motion::FADE))
+            .map(|(exit, enter)| (exit, enter, replaces_reader));
+        replaces_reader
     }
 
     pub fn cancel_empty_list(&mut self) {
@@ -830,7 +850,18 @@ impl InboxMotion {
     }
 
     pub fn empty_list_exit(&self, now: Instant) -> f32 {
-        self.empty_list.map_or(0.0, |(exit, _)| exit.remaining(now))
+        self.empty_list
+            .map_or(0.0, |(exit, _, _)| exit.remaining(now))
+    }
+
+    pub fn empty_list_pane(&self, now: Instant) -> f32 {
+        self.empty_list.map_or(1.0, |(_, enter, replaces_reader)| {
+            if replaces_reader {
+                enter.progress(now)
+            } else {
+                1.0
+            }
+        })
     }
 
     /// Keep an empty banner in step with the scope the header is showing.
@@ -849,8 +880,13 @@ impl InboxMotion {
         }
         Some((
             banner,
-            self.empty_list
-                .map_or(1.0, |(_, enter)| enter.progress(now)),
+            self.empty_list.map_or(1.0, |(_, enter, replaces_reader)| {
+                if replaces_reader {
+                    1.0
+                } else {
+                    enter.progress(now)
+                }
+            }),
         ))
     }
 
@@ -1072,9 +1108,9 @@ mod tests {
         assert!(motions.list_emptied(now));
         session.pane = Pane::List;
         session.full_width = false;
-        motions.observe(&session, (true, false), now);
+        motions.observe(&session, (true, true), now);
         assert!(!motions.reading_sliding());
-        assert!(motions.pane_swap((true, false), now).is_none());
+        assert!(motions.pane_swap((true, true), now).is_none());
         let banner = Banner {
             title: "No conversations in Work".into(),
             hint: String::new(),
@@ -1083,26 +1119,17 @@ mod tests {
         let entered = now + motion::FADE;
         assert_eq!(motions.empty_list_exit(now), 1.0);
         assert!(motions.empty_list_exit(half) > 0.0);
-        assert_eq!(
-            motions.list_banner(Some(banner.clone()), half).unwrap().1,
-            0.0
-        );
+        assert_eq!(motions.empty_list_pane(half), 0.0);
         assert_eq!(motions.empty_list_exit(entered), 0.0);
+        assert_eq!(motions.empty_list_pane(entered), 0.0);
+        let halfway_in = entered + motion::FADE / 2;
+        assert!((0.0..1.0).contains(&motions.empty_list_pane(halfway_in)));
         assert_eq!(
             motions
-                .list_banner(Some(banner.clone()), entered)
+                .list_banner(Some(banner.clone()), halfway_in)
                 .unwrap()
                 .1,
-            0.0
-        );
-        let halfway_in = entered + motion::FADE / 2;
-        assert!(
-            (0.0..1.0).contains(
-                &motions
-                    .list_banner(Some(banner.clone()), halfway_in)
-                    .unwrap()
-                    .1
-            )
+            1.0
         );
         assert!(motions.tick(halfway_in));
         let done = entered + motion::FADE;
@@ -1156,6 +1183,20 @@ mod tests {
         session.unread_count = 6;
         reduced.observe_header(&session.folder, None, session.unread_count, now);
         assert_eq!(reduced.unread_count(now), None);
+    }
+
+    #[test]
+    fn a_label_scope_hands_the_header_to_the_arriving_rows() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        motion.observe_header("INBOX", Some("Work"), 0, now);
+        motion.observe_header("INBOX", None, 5, now);
+
+        assert!(motion.folder_header().is_none());
+        assert_eq!(motion.label_header_opacity(now), motion::ARRIVE_FROM);
+        let midway = motion.label_header_opacity(now + motion::FADE / 2);
+        assert!(midway > motion::ARRIVE_FROM && midway < 1.0);
+        assert_eq!(motion.label_header_opacity(now + motion::FADE), 1.0);
     }
 
     #[test]

@@ -183,7 +183,12 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(Some(LocalAction { id, kind, summary }))
+        Ok(Some(LocalAction {
+            id,
+            kind,
+            summary,
+            label_undo_target: None,
+        }))
     }
 }
 

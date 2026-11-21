@@ -29,6 +29,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use fell_core::actions::LabelUndoTarget;
 use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
@@ -1241,7 +1242,6 @@ impl Inbox {
                     subject: self.shown_subject(),
                     messages: std::mem::take(&mut self.session.messages),
                     offset: f32::from(clamped_offset(&self.conv_scroll)),
-                    full_width,
                     layout,
                     quotes: self.session.quotes_open.clone(),
                     recipients: self.session.recipients_open.clone(),
@@ -1459,6 +1459,7 @@ impl Inbox {
                                         bar_dx: 0.0,
                                         frame: still_frame(&chunk[index], window),
                                         previous_labels: None,
+                                        label_scope: None,
                                     };
                                     thread_row(
                                         &row_theme,
@@ -2479,8 +2480,6 @@ impl Inbox {
 
     fn apply_labels(&mut self, edit: LabelEdit, cx: &mut Context<Self>) {
         let now = self.motion.clock.now();
-        // A row losing the label it is listed under keeps that chip up to
-        // the frame it leaves. Other lists show the edit immediately.
         let leaving_scope = !edit.add
             && self.list_label.as_deref() == Some(&edit.name)
             && self.session.search.is_none();
@@ -2496,24 +2495,16 @@ impl Inbox {
         }
         let account = self.account_id.clone();
         let threads: Vec<_> = edit.ids.into_iter().map(ThreadId).collect();
-        let label = present::display_safe(&edit.name);
         let count = threads.len();
-        let target = if count == 1 {
-            match self
+        let notice = present::LabelNotice {
+            verb: if edit.add { "Applied" } else { "Removed" },
+            label: present::display_safe(&edit.name),
+            relation: if edit.add { "to" } else { "from" },
+            subject: self
                 .session
                 .label_target_subject()
-                .map(present::display_safe)
-            {
-                Some(subject) if !subject.trim().is_empty() => format!("“{subject}”"),
-                _ => "1 conversation".into(),
-            }
-        } else {
-            format!("{count} conversations")
-        };
-        let notice = if edit.add {
-            format!("Applied “{label}” to {target}")
-        } else {
-            format!("Removed “{label}” from {target}")
+                .map(present::display_safe),
+            count,
         };
         let change = if edit.add {
             fell_core::LabelChange::Add(edit.name)
@@ -2528,7 +2519,7 @@ impl Inbox {
                     .finish(pending, result.is_ok().then_some(inbox.read_gen));
                 match result {
                     Ok(_) => {
-                        inbox.session.show_toast(notice, false);
+                        inbox.session.show_label_toast(notice);
                         inbox.send_to_server();
                     }
                     Err(err) => inbox.session.show_toast(err.to_string(), true),
@@ -2564,19 +2555,37 @@ impl Inbox {
                                 ..ReadIntent::default()
                             });
                         }
-                        let notice = if action.kind == fell_core::ActionKind::Label {
-                            let summary = present::display_safe(&action.summary);
-                            if let Some(label) = summary.strip_prefix("added label ") {
-                                format!("Undid applying “{label}”")
-                            } else if let Some(label) = summary.strip_prefix("removed label ") {
-                                format!("Undid removing “{label}”")
-                            } else {
-                                "Undid label edit".into()
-                            }
+                        if let Some(target) = action.label_undo_target {
+                            let (count, subject) = match target {
+                                LabelUndoTarget::Conversation(subject) => {
+                                    (1, Some(present::display_safe(&subject)))
+                                }
+                                LabelUndoTarget::Conversations(count) => (count, None),
+                            };
+                            let (verb, label, relation) =
+                                action.summary.strip_prefix("removed label ").map_or_else(
+                                    || {
+                                        (
+                                            "Removed",
+                                            action
+                                                .summary
+                                                .strip_prefix("added label ")
+                                                .unwrap_or(&action.summary),
+                                            "from",
+                                        )
+                                    },
+                                    |label| ("Restored", label, "on"),
+                                );
+                            inbox.session.show_label_toast(present::LabelNotice {
+                                verb,
+                                label: present::display_safe(label),
+                                relation,
+                                subject,
+                                count,
+                            });
                         } else {
-                            "Undone".into()
-                        };
-                        inbox.session.show_toast(notice, false);
+                            inbox.session.show_toast("Undone", false);
+                        }
                         inbox.send_to_server();
                         if inbox.session.search.is_some() && !restored.is_empty() {
                             inbox.search_view.prefer = restored;
@@ -3986,7 +3995,6 @@ struct LeavingReader {
     subject: String,
     messages: Vec<ConvMessage>,
     offset: f32,
-    full_width: bool,
     layout: ReaderLayout,
     quotes: HashSet<String>,
     recipients: HashSet<String>,
@@ -4101,6 +4109,7 @@ fn shell(
         reply_check,
     } = shown;
     let frames = conv.frames.clone();
+    let empty_list_pane = motion.empty_list_pane(now);
     let mut subject = Some(subject);
     // A narrow window's pane that a key just swapped out stays beneath the
     // one coming in, where it was, full width. The incoming pane is drawn
@@ -4267,7 +4276,7 @@ fn shell(
                                         .w(px(split_width))
                                         .flex()
                                         .flex_row()
-                                        .opacity(motion.reading_list_opacity(now))
+                                        .opacity(motion.reading_list_opacity(now) * empty_list_pane)
                                         .child(list)
                                         .child(splitter(&theme, cx)),
                                 )
@@ -4284,10 +4293,10 @@ fn shell(
                                 }),
                         )
                     } else {
-                        row.child(entering(list, list_entry))
+                        row.child(entering(list.opacity(empty_list_pane), list_entry))
                     }
                 })
-                .when(show_conv, |row| {
+                .when(show_conv && conv.leaving.is_none(), |row| {
                     if let Some((revision, preview)) = cached_preview {
                         let pane = div()
                             .id(("cached-search-conversation", revision))
@@ -4327,35 +4336,30 @@ fn shell(
                         conv_entry,
                     ))
                 })
-                .when_some(
-                    conv.leaving
-                        .as_ref()
-                        .filter(|(reader, _)| !show_conv && reader.full_width),
-                    |row, (reader, _)| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .right_0()
-                                .left(px(reader.layout.left))
-                                .flex()
-                                .child(conversation(
-                                    &theme,
-                                    session,
-                                    String::new(),
-                                    motion,
-                                    now,
-                                    None,
-                                    reader.layout.columns,
-                                    Live(false),
-                                    &conv,
-                                    window,
-                                    cx,
-                                )),
-                        )
-                    },
-                ),
+                .when_some(conv.leaving.as_ref(), |row, (reader, _)| {
+                    row.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .left(px(reader.layout.left))
+                            .flex()
+                            .child(conversation(
+                                &theme,
+                                session,
+                                String::new(),
+                                motion,
+                                now,
+                                None,
+                                reader.layout.columns,
+                                Live(false),
+                                &conv,
+                                window,
+                                cx,
+                            )),
+                    )
+                }),
         )
         .child(status_bar(
             &theme,
@@ -4772,14 +4776,15 @@ fn header(
 
     let (current, current_width) =
         folder_group(scope, session.unread_threads(), motion.unread_count(now));
+    let label_header_opacity = motion.label_header_opacity(now);
     let fade = motion.folder_header();
     let leaving = fade
         .as_ref()
-        .map(|fade| folder_group((&fade.folder, fade.label.as_deref()), fade.unread, None));
+        .map(|fade| folder_group((&fade.folder, None), fade.unread, None));
     let old_width = leaving.as_ref().map_or(current_width, |(_, width)| *width);
     let (outgoing, incoming) = fade
         .as_ref()
-        .map_or((0., 1.), |fade| fade.label_opacities(now));
+        .map_or((0., label_header_opacity), |fade| fade.label_opacities(now));
     let fit_account = |folder_width| {
         HeaderAccount::fit(
             session,
@@ -4961,6 +4966,7 @@ fn thread_list(
                             bar_dx,
                             frame,
                             previous_labels,
+                            label_scope: inbox.list_label.clone(),
                         };
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
@@ -5037,7 +5043,7 @@ fn thread_list(
                                     ghost,
                                     index,
                                     text_width,
-                                    bar_dx,
+                                    (bar_dx, inbox.list_label.clone()),
                                     window,
                                     cx,
                                 )
@@ -5175,7 +5181,7 @@ fn ghost_row(
     (row, top, opacity): (ThreadRow, f32, f32),
     index: usize,
     text_width: f32,
-    bar_dx: f32,
+    (bar_dx, label_scope): (f32, Option<String>),
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
@@ -5186,6 +5192,7 @@ fn ghost_row(
         bar_dx,
         frame: still_frame(&row, window),
         previous_labels: None,
+        label_scope,
     };
     slot_layer(motion::snap(top, window.scale_factor()), opacity)
         .child(thread_row(
@@ -5226,6 +5233,7 @@ struct RowLook {
     /// Its weight, star and subject box this frame.
     frame: RowFrame,
     previous_labels: Option<(Vec<String>, f32)>,
+    label_scope: Option<String>,
 }
 
 /// The list's left border, which the unread bars sit just inside.
@@ -5317,7 +5325,7 @@ fn thread_row(
                     (frame, background),
                     selected,
                     text_width,
-                    look.previous_labels.as_ref(),
+                    look,
                     window,
                 ))
                 .child(thread_line_two(
@@ -5341,7 +5349,7 @@ fn thread_line_one(
     (frame, background): (RowFrame, u32),
     selected: bool,
     text_width: f32,
-    previous_labels: Option<&(Vec<String>, f32)>,
+    look: &RowLook,
     window: &Window,
 ) -> gpui::Div {
     let dim = if selected {
@@ -5371,7 +5379,7 @@ fn thread_line_one(
         - STAR_SLOT
         - 2.0 * THREAD_LINE_GAP)
         .max(0.0);
-    let labels = if row.labels.is_empty() && previous_labels.is_none() {
+    let labels = if row.labels.is_empty() && look.previous_labels.is_none() {
         None
     } else {
         thread_label_group(
@@ -5379,8 +5387,10 @@ fn thread_line_one(
             row,
             background,
             dim,
-            (room * 0.40 - THREAD_LINE_GAP).max(0.0),
-            previous_labels,
+            // Leave enough for the sender without stranding space on rows
+            // whose names already fit in a short span.
+            (room - (room * 0.4).min(80.0) - THREAD_LINE_GAP).max(0.0),
+            look,
             window,
         )
     };
@@ -5468,12 +5478,16 @@ fn thread_label_group(
     background: u32,
     dim: u32,
     room: f32,
-    previous: Option<&(Vec<String>, f32)>,
+    look: &RowLook,
     window: &Window,
 ) -> Option<(gpui::Div, f32)> {
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
     let outline = theme.label_outline(background);
     let layout = |labels: &[String]| {
+        let labels: Vec<_> = labels
+            .iter()
+            .filter(|label| Some(label.as_str()) != look.label_scope.as_deref())
+            .collect();
         let mut width = 0.0;
         let mut chips = Vec::new();
         let overflow = |hidden| format!("+{hidden}");
@@ -5546,7 +5560,7 @@ fn thread_label_group(
         (width, group)
     };
     let (width, group) = layout(&row.labels);
-    if let Some((previous, shown)) = previous {
+    if let Some((previous, shown)) = &look.previous_labels {
         let (old_width, old_group) = layout(previous);
         let transition_width = old_width.max(width);
         if transition_width > 0.0 {
@@ -7697,6 +7711,7 @@ fn status_bar(
     // prefix), entering or leaving, so its text never re-flows as it fades.
     // Those keys fade under it at the right.
     let noticed = status.notice.is_some() || status.leaving.is_some();
+    let show_sync = !noticed || width >= present::NARROW_WIDTH;
     let notice_opacity = status
         .notice
         .iter()
@@ -7756,12 +7771,14 @@ fn status_bar(
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
-    let mut used = 28.0 + 4.0 * 12.0;
-    used += bar_px(window, session.mode_label(), size, mono)
-        + bar_px(window, &sync_label, size, ui)
-        + 2.0 * bar_px(window, "·", size, ui);
-    if let Some(key) = &sync_hint {
-        used += bar_px(window, &format!(" · {key} for log"), size, ui);
+    let dot = bar_px(window, "·", size, ui);
+    let mut used = 28.0 + 2.0 * 12.0 + 2.0;
+    used += bar_px(window, session.mode_label(), size, mono) + dot;
+    if show_sync {
+        used += 2.0 * 12.0 + dot + bar_px(window, &sync_label, size, ui);
+        if let Some(key) = &sync_hint {
+            used += bar_px(window, &format!(" · {key} for log"), size, ui);
+        }
     }
     if details {
         used += 12.0 + bar_px(window, "· ? details", size, ui);
@@ -7775,11 +7792,11 @@ fn status_bar(
         let tail_width = hint.map_or(0.0, |(key, suffix)| {
             bar_px(window, &format!(" · {key}{suffix}"), size, ui)
         });
-        let min_width = if hint.is_some() { 0.0 } else { 80.0 };
-        let text = present::fit_notice(
-            &toast.text,
-            (width - used - tail_width).max(min_width),
-            |text| bar_px(window, text, size, ui),
+        let room = (width - used - tail_width).max(0.0);
+        let measure = |text: &str| bar_px(window, text, size, ui);
+        let text = toast.label.as_ref().map_or_else(
+            || present::fit_notice(&toast.text, room, measure),
+                |label| label.fit(room, measure),
         );
         div()
             .overflow_hidden()
@@ -7831,19 +7848,22 @@ fn status_bar(
                 }))
                 .child(session.mode_label().to_string()),
         )
-        .child(div().text_color(rgb(theme.dimmed)).child("·"))
-        .child(
-            div()
-                .text_color(rgb(sync_color))
-                .when(status.sync_opacity < 1.0, |label| {
-                    label.opacity(status.sync_opacity)
-                })
-                .child(status_text(
-                    sync_label,
-                    sync_hint.as_deref().map(|key| (key, " for log")),
-                    theme,
-                )),
-        )
+        .when(show_sync, |bar| {
+            bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(sync_color))
+                        .when(status.sync_opacity < 1.0, |label| {
+                            label.opacity(status.sync_opacity)
+                        })
+                        .child(status_text(
+                            sync_label,
+                            sync_hint.as_deref().map(|key| (key, " for log")),
+                            theme,
+                        )),
+                )
+        })
         .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
@@ -8302,11 +8322,13 @@ fn folder_picker(
         FolderIntent::Label | FolderIntent::LabelList
     );
     let selected = session.folder_index;
-    let query = session.folder_query.trim().to_ascii_lowercase();
+    let match_query = session.folder_query.trim().to_ascii_lowercase();
     let inset = if labeling { 24.0 } else { 0.0 };
     let width = PICKER_PX.min((f32::from(window.viewport_size().width) - inset).max(0.0));
     let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
+    let prompt_dim = theme::ensure_all(theme.dimmed, &[theme.surface], 4.8);
+    let query = present::display_safe(&session.folder_query);
     div()
         .w(px(width))
         .max_w_full()
@@ -8347,7 +8369,7 @@ fn folder_picker(
                         .text_color(rgb(if session.folder_intent == FolderIntent::Move {
                             theme.accent
                         } else {
-                            theme.dimmed
+                            prompt_dim
                         }))
                         .child(session.folder_prompt()),
                 )
@@ -8365,11 +8387,15 @@ fn folder_picker(
                 })
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
                         .min_w_0()
-                        .truncate()
-                        .child(present::display_safe(&session.folder_query)),
-                )
-                .child(div().flex_none().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))),
+                        .when(!query.is_empty(), |field| {
+                            field.child(div().min_w_0().truncate().child(query))
+                        })
+                        .child(div().flex_none().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))),
+                ),
         )
         .child(
             div()
@@ -8406,7 +8432,7 @@ fn folder_picker(
                     let label = if labeling {
                         clip(&label)
                     } else {
-                        fit_folder_path(&label, FolderFit::Picker(&query), clip, |line| &line.text)
+                        fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| &line.text)
                     };
                     let detail = choice.detail.clone();
                     let detail_color = if index == selected {
@@ -8464,7 +8490,7 @@ fn folder_picker(
                             )
                         })
                         .children(label.map(|line| {
-                            let matched = folder_match(&line.text, &query);
+                            let matched = folder_match(&line.text, &match_query);
                             let highlight = HighlightStyle {
                                 color: Some(
                                     rgb(if index == selected {

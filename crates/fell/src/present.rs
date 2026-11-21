@@ -475,6 +475,10 @@ pub fn draft_row_id(id: &str) -> String {
     format!("draft:{id}")
 }
 
+pub fn is_draft_row_id(id: &str) -> bool {
+    id.starts_with("draft:")
+}
+
 /// What an original no longer in the mailbox reads as, after "In reply
 /// to", in the drafts list and in the compose window.
 pub const REPLY_GONE: &str = "a message not in this mailbox";
@@ -1105,6 +1109,50 @@ fn utc_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     (year, month, day, hour, minute, wday)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelNotice {
+    pub verb: &'static str,
+    pub label: String,
+    pub relation: &'static str,
+    pub subject: Option<String>,
+    pub count: usize,
+}
+
+impl LabelNotice {
+    pub fn fit(&self, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
+        let prefix = format!("{} “{}” {} ", self.verb, self.label, self.relation);
+        if let Some(subject) = self.subject.as_deref().filter(|s| !s.trim().is_empty()) {
+            let before = format!("{prefix}“");
+            let full = format!("{before}{subject}”");
+            if measure(&full) <= max_px {
+                return full;
+            }
+            if let Some(short) = shorten_words(subject, &before, "”", max_px, &measure) {
+                return short;
+            }
+            let short = cut_to(subject, &before, "”", max_px, &measure);
+            if measure(&short) <= max_px {
+                return short;
+            }
+        }
+        let suffix = if self.count == 1 {
+            format!("” {} 1 conversation", self.relation)
+        } else {
+            format!("” {} {} conversations", self.relation, self.count)
+        };
+        let before = format!("{} “", self.verb);
+        let full = format!("{before}{}{suffix}", self.label);
+        if measure(&full) <= max_px {
+            return full;
+        }
+        let short = cut_to(&self.label, &before, &suffix, max_px, &measure);
+        if measure(&short) <= max_px {
+            return short;
+        }
+        cut_to(&full, "", "", max_px, &measure)
+    }
+}
+
 /// Fit a notice to `max_px`, as `measure` sizes text. The quoted name
 /// gives up whole words first. If even one word does not fit, the clauses
 /// between the outcome and the closing key go next, last first, and the
@@ -1144,7 +1192,7 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
         }
     }
     let text = parts.join(NOTICE_DOT);
-    match quoted_span(&text) {
+    let fitted = match quoted_span(&text) {
         Some((open, close)) => {
             let before = &text[..open + '\u{201c}'.len_utf8()];
             let after = &text[close..];
@@ -1152,6 +1200,11 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
             cut_to(name, before, after, max_px, &measure)
         }
         None => cut_to(&text, "", "", max_px, &measure),
+    };
+    if measure(&fitted) <= max_px {
+        fitted
+    } else {
+        cut_to(&text, "", "", max_px, &measure)
     }
 }
 
@@ -1172,7 +1225,17 @@ fn shorten_name(text: &str, max_px: f32, measure: &impl Fn(&str) -> f32) -> Opti
     let (open, close) = quoted_span(text)?;
     let before = &text[..open + '\u{201c}'.len_utf8()];
     let after = &text[close..];
-    let name = text[before.len()..close].trim_end_matches('…');
+    shorten_words(&text[before.len()..close], before, after, max_px, measure)
+}
+
+fn shorten_words(
+    name: &str,
+    before: &str,
+    after: &str,
+    max_px: f32,
+    measure: &impl Fn(&str) -> f32,
+) -> Option<String> {
+    let name = name.trim_end_matches('…');
     let words: Vec<&str> = name.split_whitespace().collect();
     (1..words.len())
         .rev()
@@ -1744,6 +1807,40 @@ mod tests {
         // Not even one word fits: the name is cut, the key stays.
         let fitted = fit_notice(notice, 33.0, width);
         assert!(fitted.ends_with("\u{201d} · space a r reopen"), "{fitted}");
+    }
+
+    #[test]
+    fn label_notices_keep_the_label_and_closing_quote_in_a_440_px_window() {
+        // Padding, gaps, and the mode and separator still occupy the bar.
+        let room = 440.0 - 28.0 - 24.0 - 48.0 - 8.0 - 2.0;
+        let width = |text: &str| text.chars().count() as f32 * 8.0;
+        let mut notice = LabelNotice {
+            verb: "Removed",
+            label: "travel".into(),
+            relation: "from",
+            subject: Some("Tickets to the annual meeting in the harbour".into()),
+            count: 1,
+        };
+        assert_eq!(
+            notice.fit(room, width),
+            "Removed “travel” from “Tickets to the…”"
+        );
+        notice.verb = "Restored";
+        notice.relation = "on";
+        let restored = notice.fit(room, width);
+        assert!(restored.starts_with("Restored “travel” on “Tickets"));
+        assert!(restored.ends_with("…”"));
+        assert!(width(&restored) <= room);
+
+        notice.verb = "Applied";
+        notice.label = "field notes".into();
+        notice.relation = "to";
+        notice.subject = None;
+        notice.count = 2;
+        assert_eq!(
+            notice.fit(room, width),
+            "Applied “field notes” to 2 conversations"
+        );
     }
 
     fn person(name: &str, email: &str) -> fell_core::Participant {

@@ -161,6 +161,14 @@ pub struct LocalAction {
     pub id: i64,
     pub kind: ActionKind,
     pub summary: String,
+    /// Set by undo for a label edit, from the message snapshots it restores.
+    pub label_undo_target: Option<LabelUndoTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelUndoTarget {
+    Conversation(String),
+    Conversations(usize),
 }
 
 /// What [`LocalAction`] changed.
@@ -729,6 +737,19 @@ impl Store {
         } else if action.kind.is_flag() {
             flags::undo(&tx, account_id, &action)?;
         } else if action.kind == ActionKind::Label {
+            let (count, subject): (i64, String) = tx.query_row(
+                "SELECT COUNT(DISTINCT thread_id), COALESCE((
+                     SELECT subject FROM local_action_messages
+                     WHERE action_id = ?1 ORDER BY date_unix, message_id LIMIT 1
+                 ), '') FROM local_action_messages WHERE action_id = ?1",
+                [action.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            action.label_undo_target = Some(if count == 1 {
+                LabelUndoTarget::Conversation(subject)
+            } else {
+                LabelUndoTarget::Conversations(count as usize)
+            });
             keywords::undo_label_action(
                 &tx,
                 account_id,
@@ -1098,6 +1119,7 @@ fn insert_local_action(
         id: conn.last_insert_rowid(),
         kind,
         summary: summary.to_string(),
+        label_undo_target: None,
     })
 }
 
@@ -1211,6 +1233,7 @@ fn latest_open_action(conn: &Connection, account_id: &AccountId) -> Result<Optio
             id,
             kind: ActionKind::parse(&kind)?,
             summary,
+            label_undo_target: None,
         })
     })
     .transpose()
@@ -2951,7 +2974,12 @@ mod tests {
         assert!(subjects(&store, "a1", "label:keep").is_empty());
         assert_eq!(term_df(&store, "a1", "keep"), 0);
 
-        assert_eq!(store.undo(&account("a1")).unwrap().summary, removed.summary);
+        let restored = store.undo(&account("a1")).unwrap();
+        assert_eq!(restored.summary, removed.summary);
+        assert_eq!(
+            restored.label_undo_target,
+            Some(LabelUndoTarget::Conversation("Hello".into()))
+        );
         let rows = messages(&store, "a1", &thread);
         assert_eq!(rows[0].labels, vec!["keep", "work"]);
         assert_eq!(rows[1].labels, vec!["work"]);
