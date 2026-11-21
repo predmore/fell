@@ -548,7 +548,13 @@ impl Inbox {
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let me = self.session.account_email.clone();
+        let label_scope = self.session.label_scope.clone();
         let reply = self.store.call_background(move |store| {
+            if let Some(label) = label_scope {
+                let (page, _) = store.label_page(&account, &label, &span, None)?;
+                let rows = present::thread_rows(&page.threads, &me);
+                return Ok((rows, page, Vec::new(), select));
+            }
             let span = select
                 .as_ref()
                 .and_then(|id| {

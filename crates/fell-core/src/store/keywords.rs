@@ -444,6 +444,10 @@ pub(crate) fn undo_label_action(
     if is_reserved_keyword(edit.label()) && is_imap(conn, account_id)? {
         return Ok(());
     }
+    let outbox_action = match history {
+        LabelHistory::Local => action_id,
+        LabelHistory::Agent => -action_id,
+    };
     let (_, snapshots, _) = history.tables();
     let mut stmt = conn.prepare(&format!(
         "SELECT message_id, labels, label_was_keyword FROM {snapshots}
@@ -458,8 +462,21 @@ pub(crate) fn undo_label_action(
     })?;
     for row in rows {
         let (id, before, was_keyword) = row?;
-        if let Some((stored, _)) = find_stored(conn, account_id, &MessageId(id))? {
-            undo_edit(conn, account_id, &stored, edit, &before, was_keyword)?;
+        if let Some((stored, _)) = find_stored(conn, account_id, &MessageId(id.clone()))? {
+            if crate::outbox::labels::undo(conn, account_id, outbox_action, &id)? {
+                let label = edit.label();
+                let mut visible = split_field(&stored.labels);
+                if let LabelEdit::Removed(_) = edit {
+                    if !visible.iter().any(|name| name == label) {
+                        visible.push(label.to_owned());
+                    }
+                } else {
+                    visible.retain(|name| name != label);
+                }
+                write_labels(conn, account_id, &stored, &join_tokens(&visible))?;
+            } else {
+                undo_edit(conn, account_id, &stored, edit, &before, was_keyword)?;
+            }
         }
     }
     Ok(())

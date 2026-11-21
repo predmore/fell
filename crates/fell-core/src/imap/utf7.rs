@@ -1,6 +1,35 @@
 //! IMAP modified UTF-7 (RFC 3501). Mailbox names on the wire stay encoded.
 //! The store records the decoded name.
 
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+
+pub(super) fn encode_modified_utf7(input: &str) -> String {
+    let mut pending = Vec::new();
+    let mut encoded = String::new();
+    for ch in input.chars().chain(std::iter::once(' ')) {
+        if !((' '..='~').contains(&ch)) {
+            pending.extend(
+                ch.encode_utf16(&mut [0; 2])
+                    .iter()
+                    .flat_map(|unit| unit.to_be_bytes()),
+            );
+            continue;
+        }
+        if !pending.is_empty() {
+            encoded.push('&');
+            encoded.push_str(&STANDARD_NO_PAD.encode(&pending).replace('/', ","));
+            encoded.push('-');
+            pending.clear();
+        }
+        encoded.push(ch);
+        if ch == '&' {
+            encoded.push('-');
+        }
+    }
+    encoded.pop(); // Sentinel flushes the final non-ASCII run.
+    encoded
+}
+
 pub(super) fn decode_modified_utf7(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::new();

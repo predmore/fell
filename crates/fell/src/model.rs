@@ -168,6 +168,8 @@ pub enum FolderIntent {
     Go,
     /// `m` moves the open thread out of the folder on screen.
     Move,
+    Label,
+    LabelList,
 }
 
 /// One-line result of the last move or undo. The next key clears it.
@@ -275,6 +277,22 @@ fn step_index(cursor: usize, len: usize, motion: Motion) -> usize {
 /// Read, unread, or star on threads. The rows already show it; the view
 /// writes it to the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelEdit {
+    pub ids: Vec<String>,
+    pub name: String,
+    pub add: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerChoice {
+    pub name: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub mark: Option<&'static str>,
+    pub divider: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlagEdit {
     /// Thread ids, in list order.
     pub ids: Vec<String>,
@@ -304,6 +322,7 @@ pub struct Step {
     pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
     pub apply_move: bool,
+    pub labels: Option<LabelEdit>,
     /// `u` restores the latest local action.
     pub undo: bool,
     /// `e` archives the open thread out of the folder on screen.
@@ -362,6 +381,8 @@ pub struct Session {
     pub account_email: String,
     pub folder: String,
     pub folders: Vec<String>,
+    pub label_scope: Option<String>,
+    pub labels: Vec<String>,
     /// Which folder is Sent, Drafts, Archive and the rest on this account.
     pub roles: FolderRoles,
     /// The loaded part of the folder list: a run of rows in list order.
@@ -511,6 +532,8 @@ impl Session {
             recent_searches: Vec::new(),
             palette_query: String::new(),
             palette_index: 0,
+            label_scope: None,
+            labels: Vec::new(),
             folder_query: String::new(),
             folder_index: 0,
             folder_intent: FolderIntent::Go,
@@ -594,6 +617,8 @@ impl Session {
         match self.folder_intent {
             FolderIntent::Move => "Move to",
             FolderIntent::Go => "Folder",
+            FolderIntent::Label => "Label",
+            FolderIntent::LabelList => "Go to label",
         }
     }
 
@@ -636,7 +661,9 @@ impl Session {
     }
 
     pub fn folder_title(&self) -> String {
-        self.roles.label(&self.folder)
+        self.label_scope
+            .clone()
+            .unwrap_or_else(|| self.roles.label(&self.folder))
     }
 
     /// `folder`'s own name, shown dimmed beside its title in the header,
@@ -657,7 +684,7 @@ impl Session {
 
     /// The folder on screen is the account's drafts folder.
     pub fn in_drafts(&self) -> bool {
-        self.roles.is(FolderRole::Drafts, &self.folder)
+        self.label_scope.is_none() && self.roles.is(FolderRole::Drafts, &self.folder)
     }
 
     /// The compose draft the selected row stands for, in the drafts list.
@@ -809,6 +836,134 @@ impl Session {
                         .contains(&query.to_ascii_lowercase())
             })
             .collect()
+    }
+
+    pub fn picker_choices(&self) -> Vec<PickerChoice> {
+        if matches!(
+            self.folder_intent,
+            FolderIntent::Label | FolderIntent::LabelList
+        ) {
+            return self.label_choices();
+        }
+        let mut last_view = None;
+        self.folder_choices()
+            .into_iter()
+            .map(|name| {
+                let is_view = matches!(
+                    self.roles.role_of(&name),
+                    Some(FolderRole::All | FolderRole::Flagged)
+                );
+                let divider = last_view
+                    .replace(is_view)
+                    .is_some_and(|last| last != is_view);
+                PickerChoice {
+                    title: self.roles.label(&name),
+                    detail: self.folder_detail(&name),
+                    mark: None,
+                    name,
+                    divider,
+                }
+            })
+            .collect()
+    }
+
+    fn label_choices(&self) -> Vec<PickerChoice> {
+        let query = self.folder_query.trim();
+        let applying = self.folder_intent == FolderIntent::Label;
+        let folded = keymap::fuzzy_query(query);
+        let mut names: Vec<_> = self
+            .labels
+            .iter()
+            .filter_map(|name| Some((keymap::fuzzy_score(&folded, name)?, name)))
+            .collect();
+        names.sort_by(|(a, name_a), (b, name_b)| b.cmp(a).then_with(|| name_a.cmp(name_b)));
+        let targets: HashSet<_> = if applying {
+            self.action_targets().into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        let mut counts = std::collections::HashMap::new();
+        for row in self.threads.iter().filter(|row| targets.contains(&row.id)) {
+            for label in &row.labels {
+                *counts.entry(label.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut choices: Vec<_> = names
+            .into_iter()
+            .map(|(_, name)| {
+                let count = counts.get(name.as_str()).copied().unwrap_or(0);
+                PickerChoice {
+                    name: name.clone(),
+                    title: name.clone(),
+                    detail: None,
+                    mark: match count {
+                        0 => None,
+                        n if n == targets.len() => Some("✓"),
+                        _ => Some("−"),
+                    },
+                    divider: false,
+                }
+            })
+            .collect();
+        if applying
+            && !query.is_empty()
+            && !self
+                .labels
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(query))
+        {
+            choices.push(PickerChoice {
+                name: query.to_string(),
+                title: format!("Create label “{query}”"),
+                detail: None,
+                mark: Some("+"),
+                divider: !choices.is_empty(),
+            });
+        }
+        choices
+    }
+
+    pub fn set_labels(&mut self, labels: Vec<String>) {
+        if self.labels == labels {
+            return;
+        }
+        let picker_open = self.overlay == Overlay::Folders
+            && matches!(
+                self.folder_intent,
+                FolderIntent::Label | FolderIntent::LabelList
+            );
+        let selected = picker_open
+            .then(|| {
+                self.label_choices()
+                    .get(self.folder_index)
+                    .map(|choice| choice.name.clone())
+            })
+            .flatten();
+        self.labels = labels;
+        if picker_open {
+            self.folder_index = selected
+                .and_then(|name| {
+                    self.label_choices()
+                        .iter()
+                        .position(|choice| choice.name == name)
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn label_rows(&mut self, edit: &LabelEdit) {
+        if edit.add && !self.labels.contains(&edit.name) {
+            self.labels.push(edit.name.clone());
+        }
+        for row in &mut self.threads {
+            if edit.ids.contains(&row.id) {
+                if edit.add && !row.labels.contains(&edit.name) {
+                    row.labels.push(edit.name.clone());
+                } else if !edit.add {
+                    row.labels.retain(|label| label != &edit.name);
+                }
+            }
+        }
     }
 
     pub fn highlighted(&self) -> HashSet<String> {
@@ -1848,7 +2003,6 @@ impl Session {
     }
 
     fn folder_key(&mut self, key: KeyId) -> Step {
-        let len = self.folder_choices().len();
         match key {
             KeyId::Escape => {
                 self.overlay = Overlay::None;
@@ -1862,6 +2016,7 @@ impl Session {
                 Step::default()
             }
             KeyId::Up | KeyId::Ctrl('p') | KeyId::Ctrl('k') => {
+                let len = self.picker_choices().len();
                 if len > 0 {
                     self.folder_index = if self.folder_index == 0 {
                         len - 1
@@ -1872,6 +2027,7 @@ impl Session {
                 Step::default()
             }
             KeyId::Down | KeyId::Ctrl('n') | KeyId::Ctrl('j') => {
+                let len = self.picker_choices().len();
                 if len > 0 {
                     self.folder_index = (self.folder_index + 1) % len;
                 }
@@ -1893,8 +2049,14 @@ impl Session {
 
     /// Enter or a click on the highlighted folder.
     pub fn confirm_folder(&mut self) -> Step {
-        let choices = self.folder_choices();
-        let Some(chosen) = choices.get(self.folder_index).cloned() else {
+        let choices = self.picker_choices();
+        let Some(chosen) = choices.get(self.folder_index) else {
+            if matches!(
+                self.folder_intent,
+                FolderIntent::Label | FolderIntent::LabelList
+            ) {
+                return Step::default();
+            }
             self.overlay = Overlay::None;
             self.folder_query.clear();
             self.folder_intent = FolderIntent::Go;
@@ -1906,14 +2068,26 @@ impl Session {
         self.folder_intent = FolderIntent::Go;
         match intent {
             FolderIntent::Move => {
-                self.pending_move = Some(chosen);
+                self.pending_move = Some(chosen.name.clone());
                 Step {
                     apply_move: true,
                     ..Step::default()
                 }
             }
+            FolderIntent::Label => Step {
+                labels: Some(LabelEdit {
+                    ids: self.action_targets(),
+                    name: chosen.name.clone(),
+                    add: chosen.mark != Some("✓"),
+                }),
+                ..Step::default()
+            },
+            FolderIntent::LabelList => Step {
+                reload_threads: self.go_label(&chosen.name),
+                ..Step::default()
+            },
             FolderIntent::Go => Step {
-                reload_threads: self.go_folder(&chosen),
+                reload_threads: self.go_folder(&chosen.name),
                 ..Step::default()
             },
         }
@@ -1954,6 +2128,7 @@ impl Session {
                     | Action::Sent
                     | Action::Drafts
                     | Action::FolderPicker
+                    | Action::LabelList
                     | Action::Palette
                     | Action::Help
                     | Action::About
@@ -1993,6 +2168,16 @@ impl Session {
             )
         {
             self.count.clear();
+            return step;
+        }
+        if self.label_scope.is_some()
+            && matches!(
+                action,
+                Action::Move | Action::Archive | Action::Delete | Action::Spam
+            )
+        {
+            self.count.clear();
+            self.show_toast("Choose a folder to move mail", false);
             return step;
         }
         match action {
@@ -2071,6 +2256,32 @@ impl Session {
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(&self.folder))
                     .unwrap_or(0);
+            }
+            Action::Label | Action::LabelList => {
+                self.count.clear();
+                if action == Action::Label {
+                    let targets = self.action_targets();
+                    if targets.is_empty() {
+                        self.show_toast("No conversation", true);
+                        return step;
+                    }
+                    if self
+                        .threads
+                        .iter()
+                        .any(|row| row.draft.is_some() && targets.contains(&row.id))
+                    {
+                        self.show_toast(DRAFT_NOT_THREAD, true);
+                        return step;
+                    }
+                }
+                self.folder_intent = if action == Action::Label {
+                    FolderIntent::Label
+                } else {
+                    FolderIntent::LabelList
+                };
+                self.overlay = Overlay::Folders;
+                self.folder_query.clear();
+                self.folder_index = 0;
             }
             Action::Move => {
                 self.count.clear();
@@ -2580,10 +2791,21 @@ impl Session {
     fn go_folder(&mut self, folder: &str) -> bool {
         self.count.clear();
         self.end_search();
-        if self.folder == folder {
+        let was_label = self.label_scope.take().is_some();
+        if self.folder == folder && !was_label {
             return false;
         }
         self.folder = folder.to_string();
+        self.forget_window();
+        true
+    }
+
+    fn go_label(&mut self, label: &str) -> bool {
+        self.end_search();
+        if self.label_scope.as_deref() == Some(label) {
+            return false;
+        }
+        self.label_scope = Some(label.into());
         self.forget_window();
         true
     }
@@ -3102,6 +3324,114 @@ mod tests {
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         session.set_threads(vec![row("a"), row("b"), row("c"), row("d"), row("e")]);
         session
+    }
+
+    fn type_picker(session: &mut Session, text: &str) {
+        for ch in text.chars() {
+            let key = if ch == ' ' {
+                KeyId::Space
+            } else {
+                KeyId::Char(ch)
+            };
+            session.on_key(key, 10);
+        }
+    }
+
+    #[test]
+    fn label_picker_creates_adds_and_removes_through_the_palette_and_keys() {
+        let mut session = session();
+        session.labels = vec!["Design review".into(), "Travel".into()];
+        let item = keymap::palette_items(&session.keymap, "apply label", &[])
+            .into_iter()
+            .find(|item| item.action == Action::Label)
+            .unwrap();
+        session.confirm_palette(item, 10);
+        type_picker(&mut session, "drev");
+        assert_eq!(session.picker_choices()[0].name, "Design review");
+        let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(
+            add,
+            LabelEdit {
+                ids: vec!["a".into()],
+                name: "Design review".into(),
+                add: true
+            }
+        );
+        session.label_rows(&add);
+
+        session.on_key(KeyId::Char('l'), 10);
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+        let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(remove, LabelEdit { add: false, ..add });
+        session.label_rows(&remove);
+        assert!(session.threads[0].labels.is_empty());
+
+        session.on_key(KeyId::Char('l'), 10);
+        type_picker(&mut session, "Client notes");
+        assert_eq!(
+            session.picker_choices()[0].title,
+            "Create label “Client notes”"
+        );
+        let create = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert!(create.add);
+        session.label_rows(&create);
+        assert_eq!(session.threads[0].labels, ["Client notes"]);
+
+        session.on_key(KeyId::Char('g'), 10);
+        assert!(session.which_items().iter().any(|item| item.key == "l"));
+        session.on_key(KeyId::Char('l'), 10);
+        assert!(session.on_key(KeyId::Enter, 10).reload_threads);
+        assert_eq!(session.label_scope.as_deref(), Some("Client notes"));
+        assert!(session.perform(Action::Inbox, 10).reload_threads);
+        assert_eq!(session.label_scope, None);
+    }
+
+    #[test]
+    fn label_picker_fills_a_mixed_visual_range_and_removes_from_marked_rows() {
+        let mut session = session();
+        session.labels = vec!["review".into()];
+        session.threads[0].labels.push("review".into());
+        for key in ['V', 'j', 'j', 'l'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        assert_eq!(session.picker_choices()[0].mark, Some("−"));
+        let add = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(add.ids, ["a", "b", "c"]);
+        assert!(add.add);
+        session.label_rows(&add);
+        for row in &session.threads[..3] {
+            assert_eq!(row.labels, ["review"]);
+        }
+
+        session.on_key(KeyId::Escape, 10);
+        for key in ['x', 'k', 'k', 'x', 'j', 'l'] {
+            session.on_key(KeyId::Char(key), 10);
+        }
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+        let remove = session.on_key(KeyId::Enter, 10).labels.unwrap();
+        assert_eq!(remove.ids, ["a", "c"]);
+        assert!(!remove.add);
+        session.label_rows(&remove);
+        assert!(session.threads[0].labels.is_empty());
+        assert_eq!(session.threads[1].labels, ["review"]);
+        assert!(session.threads[2].labels.is_empty());
+        assert!(session.on_key(KeyId::Char('u'), 10).undo);
+    }
+
+    #[test]
+    fn label_picker_filters_five_hundred_names() {
+        let mut session = session();
+        session.labels = (0..500).map(|i| format!("Project {i:03}")).collect();
+        session.on_key(KeyId::Char('l'), 10);
+        let mut slowest = std::time::Duration::ZERO;
+        for key in "p427".chars() {
+            let start = std::time::Instant::now();
+            session.on_key(KeyId::Char(key), 10);
+            std::hint::black_box(session.picker_choices());
+            slowest = slowest.max(start.elapsed());
+        }
+        eprintln!("500 labels, slowest model keystroke: {slowest:?}");
+        assert_eq!(session.picker_choices()[0].name, "Project 427");
     }
 
     fn attachment_message(expanded: bool) -> ConvMessage {

@@ -1014,6 +1014,61 @@ pub(super) fn thread_list(
     })
 }
 
+pub(super) fn label_page(
+    conn: &Connection,
+    account: &AccountId,
+    label: &str,
+    span: &FolderSpan,
+    follow: Option<&ThreadId>,
+) -> Result<(FolderPage, Option<ListKey>)> {
+    in_one_snapshot(conn, || {
+        let mut rows = label_rows(
+            conn,
+            account,
+            label,
+            &ListFilter::default(),
+            None,
+            usize::MAX,
+        )?;
+        let unread = rows.iter().filter(|row| row.unread).count();
+        let followed = follow
+            .and_then(|id| rows.iter().find(|row| &row.thread_id == id))
+            .map(ListKey::of);
+        let (start, end) = match span {
+            FolderSpan::Top { rows: count } => (0, (*count).min(rows.len())),
+            FolderSpan::Bottom { rows: count } => (rows.len().saturating_sub(*count), rows.len()),
+            FolderSpan::Window {
+                first,
+                last,
+                before,
+                after,
+            } => {
+                let start = first.as_ref().map_or(0, |first| {
+                    rows.partition_point(|row| ListKey::of(row) < *first.min(last))
+                        .saturating_sub(*before)
+                });
+                let end = rows
+                    .partition_point(|row| ListKey::of(row) <= *last)
+                    .saturating_add(*after)
+                    .min(rows.len());
+                (start, end)
+            }
+        };
+        let more_after = end < rows.len();
+        rows.truncate(end);
+        rows.drain(..start);
+        Ok((
+            FolderPage {
+                threads: rows,
+                more_before: start != 0,
+                more_after,
+                unread,
+            },
+            followed,
+        ))
+    })
+}
+
 /// Threads carrying `label`, in list order. Label tokens sit in
 /// `thread_summary.labels`, which has no index, so this reads every summary
 /// in the account and sorts the matches.

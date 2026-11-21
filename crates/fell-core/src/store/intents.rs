@@ -175,7 +175,11 @@ pub(crate) fn clear_flag(
     let column = match kind {
         OutboxKind::Seen => "unread",
         OutboxKind::Flagged => "starred",
-        OutboxKind::Move => return Err(crate::Error::Action("move has no flag intent".into())),
+        OutboxKind::Move | OutboxKind::Keyword | OutboxKind::BridgeLabel => {
+            return Err(crate::Error::Action(
+                "write has no system flag intent".into(),
+            ));
+        }
     };
     conn.execute(
         &format!("UPDATE local_flag_intents SET {column} = NULL WHERE account_id = ?1 AND message_id = ?2"),

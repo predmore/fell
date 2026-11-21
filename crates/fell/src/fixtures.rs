@@ -425,7 +425,7 @@ fn fixture_messages(account: &Account) -> Vec<Message> {
             name: "Ada",
             email: "ada@harbor.test",
             subject: "Labels are not folders",
-            body: "A chip on the row, not a sidebar. l will edit them later.",
+            body: "A chip on the row, not a sidebar. Labels are ready to try.",
             ago: 8 * 86_400,
             unread: false,
             folders: &["INBOX"],

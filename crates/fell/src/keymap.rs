@@ -52,6 +52,8 @@ pub enum Action {
     SaveAllAttachments,
     RetryAttachment,
     FolderPicker,
+    Label,
+    LabelList,
     Search,
     NextHit,
     PreviousHit,
@@ -104,6 +106,8 @@ impl Action {
             Self::SaveAllAttachments => "Save all attachments",
             Self::RetryAttachment => "Retry attachment action",
             Self::FolderPicker => "Choose folder",
+            Self::Label => "Apply or remove label",
+            Self::LabelList => "Go to label",
             Self::Search => "Search mail",
             Self::NextHit => "Next search hit",
             Self::PreviousHit => "Previous search hit",
@@ -136,7 +140,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 45] = [
+const ALL_ACTIONS: [Action; 47] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -160,6 +164,8 @@ const ALL_ACTIONS: [Action; 45] = [
     Action::SaveAllAttachments,
     Action::RetryAttachment,
     Action::FolderPicker,
+    Action::Label,
+    Action::LabelList,
     Action::Search,
     Action::NextHit,
     Action::PreviousHit,
@@ -280,6 +286,12 @@ fn default_bindings() -> Vec<Binding> {
         Action::FolderPicker,
         Some("Go"),
     );
+    bind(&[KeyId::Char('l')], Action::Label, None);
+    bind(
+        &[KeyId::Char('g'), KeyId::Char('l')],
+        Action::LabelList,
+        Some("Go"),
+    );
     bind(&[KeyId::Char('c')], Action::Compose, None);
     bind(&[KeyId::Char('r')], Action::Reply, None);
     bind(&[KeyId::Char('R')], Action::ReplyAll, None);
@@ -329,6 +341,16 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('f')],
         Action::FolderPicker,
+        Some("Folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('l')],
+        Action::LabelList,
+        Some("Folders"),
+    );
+    bind(
+        &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('L')],
+        Action::Label,
         Some("Folders"),
     );
     bind(
@@ -606,28 +628,40 @@ fn parse_leader(value: &str) -> Result<(KeyId, String), String> {
 }
 
 pub(crate) fn fuzzy(query: &str, label: &str) -> Option<i32> {
-    let query: Vec<char> = query.chars().flat_map(|ch| ch.to_lowercase()).collect();
+    fuzzy_score(&fuzzy_query(query), label)
+}
+
+pub(crate) fn fuzzy_query(query: &str) -> Vec<char> {
+    query.chars().flat_map(char::to_lowercase).collect()
+}
+
+pub(crate) fn fuzzy_score(query: &[char], label: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
-    let label: Vec<char> = label.chars().flat_map(|ch| ch.to_lowercase()).collect();
     let mut score = 0;
     let mut qi = 0;
-    let mut prev: Option<usize> = None;
-    for (index, ch) in label.iter().enumerate() {
-        if qi < query.len() && ch == &query[qi] {
+    let mut previous = None;
+    let mut consecutive = false;
+    for ch in label.chars().flat_map(char::to_lowercase) {
+        let matches = ch == query[qi];
+        if matches {
             score += 10;
-            if prev == Some(index.wrapping_sub(1)) {
+            if consecutive {
                 score += 8;
             }
-            if index == 0 || !label[index - 1].is_ascii_alphanumeric() {
+            if previous.is_none_or(|ch: char| !ch.is_ascii_alphanumeric()) {
                 score += 6;
             }
-            prev = Some(index);
             qi += 1;
+            if qi == query.len() {
+                return Some(score);
+            }
         }
+        previous = Some(ch);
+        consecutive = matches;
     }
-    if qi == query.len() { Some(score) } else { None }
+    None
 }
 
 #[cfg(test)]

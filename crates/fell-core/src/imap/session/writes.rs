@@ -58,6 +58,58 @@ impl WriteSession {
         self.session.has_cap("MOVE")
     }
 
+    pub(in crate::imap) fn has_uid_expunge(&self) -> bool {
+        self.session.has_cap("UIDPLUS") || self.session.has_cap("IMAP4REV2")
+    }
+
+    pub(in crate::imap) fn gmail_labels(&self) -> bool {
+        self.session.has_cap("X-GM-EXT-1")
+    }
+
+    pub(in crate::imap) fn create_label_mailbox(&mut self, raw: &str) -> Result<(), WriteError> {
+        let name = quote_imap(raw).map_err(WriteError::Refused)?;
+        self.run("CREATE", &format!("CREATE {name}")).map(|_| ())
+    }
+
+    pub(in crate::imap) fn keyword(
+        &mut self,
+        uid: u32,
+        keyword: &str,
+    ) -> Result<Option<bool>, WriteError> {
+        let reply = self.run("UID FETCH", &format!("UID FETCH {uid} (UID FLAGS)"))?;
+        Ok(reply
+            .untagged
+            .iter()
+            .filter_map(|line| parse_flags(&line.text))
+            .find(|flags| flags.uid == uid)
+            .map(|flags| {
+                flags
+                    .flags
+                    .iter()
+                    .any(|flag| flag.eq_ignore_ascii_case(keyword))
+            }))
+    }
+
+    pub(in crate::imap) fn set_keyword(
+        &mut self,
+        uid: u32,
+        keyword: &str,
+        value: bool,
+    ) -> Result<(), WriteError> {
+        let sign = if value { '+' } else { '-' };
+        self.run(
+            "UID STORE",
+            &format!("UID STORE {uid} {sign}FLAGS.SILENT ({keyword})"),
+        )
+        .map(|_| ())
+    }
+
+    /// Expunge a single UID inside the already verified label mailbox.
+    pub(in crate::imap) fn expunge_uid(&mut self, uid: u32) -> Result<(), WriteError> {
+        self.run("UID EXPUNGE", &format!("UID EXPUNGE {uid}"))
+            .map(|_| ())
+    }
+
     pub(in crate::imap) fn list(&mut self) -> Result<Vec<Listed>, Error> {
         self.session.list_selectable()
     }
@@ -172,9 +224,25 @@ impl WriteSession {
         uids: &[u32],
         target: &str,
     ) -> Result<Placed, WriteError> {
-        let target = quote_imap(target).map_err(|err| WriteError::Refused(err.to_string()))?;
-        let reply = self.run("UID MOVE", &format!("UID MOVE {} {target}", uid_set(uids)))?;
-        // RFC 6851 sends COPYUID in an untagged OK before the expunges.
+        self.transfer("UID MOVE", uids, target)
+    }
+
+    pub(in crate::imap) fn uid_copy(
+        &mut self,
+        uid: u32,
+        target: &str,
+    ) -> Result<Placed, WriteError> {
+        self.transfer("UID COPY", &[uid], target)
+    }
+
+    fn transfer(
+        &mut self,
+        command: &str,
+        uids: &[u32],
+        target: &str,
+    ) -> Result<Placed, WriteError> {
+        let target = quote_imap(target).map_err(WriteError::Refused)?;
+        let reply = self.run(command, &format!("{command} {} {target}", uid_set(uids)))?;
         Ok(reply
             .untagged
             .iter()
