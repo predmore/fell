@@ -796,6 +796,7 @@ pub fn conversation(
                 folders: message
                     .folders
                     .iter()
+                    .filter(|folder| !roles.is_view(folder))
                     // A message in Drafts is a draft: "Draft", unless the
                     // reader is in Drafts, where every row is one.
                     .filter_map(|folder| {
@@ -807,7 +808,6 @@ pub fn conversation(
                             Some("Draft".to_string())
                         }
                     })
-                    .chain(message.labels.iter().cloned())
                     .collect(),
                 date_unix: message.headers.date_unix,
                 snippet: one_line(&message.snippet),
@@ -1964,6 +1964,27 @@ mod tests {
         let from_drafts = conversation(&thread, "me@x", &roles, &[], "Drafts");
         assert_eq!(from_drafts[0].folders, ["Inbox"]);
         assert!(from_drafts[1].folders.is_empty());
+    }
+
+    #[test]
+    fn conversation_folder_line_excludes_labels() {
+        let mut message = addressed("sender@example.com", &[], &[], &[]);
+        message.labels = vec!["A".into(), "Projects/2026".into()];
+        let roles = FolderRoles::default();
+        let folders = vec!["INBOX".into(), "Trips/November".into()];
+        message.folders = folders.clone();
+        let reader = conversation(
+            std::slice::from_ref(&message),
+            "",
+            &roles,
+            &folders,
+            "All Mail",
+        );
+        assert_eq!(reader[0].folders, ["Inbox", "Trips/November"]);
+
+        message.folders.clear();
+        let reader = conversation(&[message], "", &roles, &folders, "All Mail");
+        assert!(reader[0].folders.is_empty());
     }
 
     fn addressed(

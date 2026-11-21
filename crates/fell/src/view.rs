@@ -3881,8 +3881,9 @@ impl HeaderAccount {
         }
     }
 
-    fn render(self, theme: &Theme, gap: f32) -> gpui::Div {
+    fn render(self, theme: &Theme, gap: f32, email_opacity: f32) -> gpui::Div {
         div()
+            .flex_none()
             .flex()
             .items_baseline()
             .gap(px(gap))
@@ -3899,6 +3900,7 @@ impl HeaderAccount {
                     .flex_none()
                     .whitespace_nowrap()
                     .text_color(rgb(theme.dimmed))
+                    .opacity(email_opacity)
                     .child(email)
             }))
     }
@@ -4020,18 +4022,25 @@ fn header(
         .as_ref()
         .map(|_| HeaderAccount::fit(session, room - old_width, COUNT_GAP, &fit))
         .filter(|old| *old != account);
-    // Reserve the wider folder slot until both fades finish. The account's
-    // paint clip moves before a wider folder enters, or after it has left.
-    const FOLDER_EXIT: f32 = 60. / 120.;
-    const FOLDER_ENTER: f32 = 40. / 120.;
-    let clip = if current_width > old_width {
-        motion::ease_out(time / FOLDER_ENTER)
+    // Each account fit shares its half of the fade with its folder. This
+    // keeps both fits at their own widths and the right edge anchored.
+    let outgoing = motion::fade_out(2. * time);
+    let incoming = motion::ease_out_quad(2. * time - 1.);
+    let (account, account_opacity, email_opacity) = if let Some(old) = old {
+        let same_name = old.name == account.name && old.quiet == account.quiet;
+        let (shown, opacity) = if time < 0.5 {
+            (old, outgoing)
+        } else {
+            (account, incoming)
+        };
+        if same_name {
+            (shown, 1., opacity)
+        } else {
+            (shown, opacity, 1.)
+        }
     } else {
-        motion::ease_out((time - FOLDER_EXIT) / (1. - FOLDER_EXIT))
+        (account, 1., 1.)
     };
-    let account_width = room - motion::lerp(old_width, current_width, clip);
-    let account_fade = old.as_ref().map_or(1., |_| motion::ease_out(time));
-    let folder_in = motion::ease_out((time - FOLDER_ENTER) / (1. - FOLDER_ENTER));
     let folder_slot = |group: gpui::Div, width: f32| {
         div()
             .flex_none()
@@ -4052,20 +4061,10 @@ fn header(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
         .child(
-            div().flex_1().min_w_0().relative().flex().child(
-                div()
-                    .w(px(account_width.max(0.)))
-                    .flex_none()
-                    .relative()
-                    .overflow_hidden()
-                    .child(account.render(theme, COUNT_GAP).opacity(account_fade))
-                    .children(old.map(|old| {
-                        old.render(theme, COUNT_GAP)
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .opacity(1. - account_fade)
-                    })),
+            div().flex_1().min_w_0().flex().child(
+                account
+                    .render(theme, COUNT_GAP, email_opacity)
+                    .opacity(account_opacity),
             ),
         )
         .child(
@@ -4076,13 +4075,13 @@ fn header(
                 .overflow_hidden()
                 .flex()
                 .justify_end()
-                .child(folder_slot(current, current_width).opacity(folder_in))
-                .children(leaving.map(|(old, width, time)| {
+                .child(folder_slot(current, current_width).opacity(incoming))
+                .children(leaving.map(|(old, width, _)| {
                     folder_slot(old, width)
                         .absolute()
                         .right_0()
                         .top_0()
-                        .opacity(1. - motion::ease_out(time / FOLDER_EXIT))
+                        .opacity(outgoing)
                 })),
         )
 }
@@ -4463,15 +4462,14 @@ fn thread_line_one(
     } else {
         0.0
     };
-    // The sender, spacer, star, and date need three gaps. Optional metadata
-    // and the label group each need one more. Reserve metadata first so the
-    // same sender span fits both with and without labels.
+    // The leading group, star, and date need two gaps. Inside the group,
+    // optional metadata and labels each need one gap after the previous item.
     let room = (text_width
         - date_width
         - count_width
         - attachment_width
         - STAR_SLOT
-        - 3.0 * THREAD_LINE_GAP)
+        - 2.0 * THREAD_LINE_GAP)
         .max(0.0);
     let sender_limit = room.min(text_width * 0.60).floor();
     let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
@@ -4496,26 +4494,33 @@ fn thread_line_one(
         .gap(px(THREAD_LINE_GAP))
         .min_w(px(0.))
         .overflow_hidden()
-        .child(sender)
-        .when_some(count, |line, count| {
-            line.child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(dim))
-                    .text_size(px(size))
-                    .child(count),
-            )
-        })
-        .when(row.has_attachment, |line| {
-            line.child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(dim))
-                    .child(THREAD_ATTACHMENT_MARK),
-            )
-        })
-        .children(labels)
-        .child(div().flex_1().min_w(px(0.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(THREAD_LINE_GAP))
+                .child(sender)
+                .when_some(count, |line, count| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(dim))
+                            .text_size(px(size))
+                            .child(count),
+                    )
+                })
+                .when(row.has_attachment, |line| {
+                    line.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(dim))
+                            .child(THREAD_ATTACHMENT_MARK),
+                    )
+                })
+                .children(labels),
+        )
         // A fixed slot every row keeps, so starring never moves the line.
         // The star fades in as it grows to full size, and out as it shrinks.
         .child(
@@ -4589,9 +4594,9 @@ fn thread_label_group(
                     .trim_end_matches('…')
                     .chars()
                     .filter(|c| !c.is_whitespace())
-                    .take(3)
+                    .take(5)
                     .count()
-                    < 3;
+                    < 5;
             if chip_width > budget + LABEL_CHIP_CHROME || too_short {
                 break;
             }
@@ -5636,36 +5641,40 @@ fn expanded_message_header(
             .map_or(0., |line| f32::from(line.width).ceil())
     };
     let folder_width = (room - line_width(&sender) - line_width(&email)).max(0.);
-    let mut folders = message
+    let folders = message
         .folders
         .iter()
         .map(|folder| present::display_safe(folder))
         .collect::<Vec<_>>();
-    let full = folders.join(" · ");
-    let folders = if line_px_with_style(window, &style, &full, FontWeight::NORMAL) <= folder_width {
-        full
-    } else {
-        for path in &mut folders {
-            if let Some((first, rest)) = path.split_once('/')
-                && let Some((_, leaf)) = rest.rsplit_once('/')
-            {
-                *path = format!("{first}/…/{leaf}");
-            }
-            if let Some(line) = fit_folder_path(path, |text| {
-                fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed)
-            }) {
-                *path = line.text.to_string();
-            }
-        }
-        folders.join(" · ")
-    };
-    let folders = fit(
-        &style,
-        &folders,
-        folder_width,
-        FontWeight::NORMAL,
-        theme.dimmed,
-    );
+    let fit_folders =
+        |text: &str| fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed);
+    let fit_whole = |text: &str| fit_folders(text).filter(|line| line.text == text);
+    let folders = fit_whole(&folders.join(" · "))
+        .or_else(|| {
+            let shortened = folders
+                .iter()
+                .map(|path| match path.split_once('/') {
+                    Some((first, rest)) if rest.contains('/') => {
+                        let leaf = rest.rsplit('/').next().unwrap_or(rest);
+                        format!("{first}/…/{leaf}")
+                    }
+                    _ => path.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            fit_whole(&shortened)
+        })
+        .or_else(|| {
+            let leaves = folders
+                .iter()
+                .map(|path| match path.rsplit_once('/') {
+                    Some((_, leaf)) => format!("…/{leaf}"),
+                    None => path.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            fit_folders(&leaves)
+        });
     div()
         .flex()
         .items_center()

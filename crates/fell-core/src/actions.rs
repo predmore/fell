@@ -581,7 +581,7 @@ impl Store {
             if planned.is_empty() {
                 return Err(Error::Action(format!("no messages in {from}")));
             }
-            add_routes(&mut routes, to, roles.name(FolderRole::Trash), &planned);
+            add_routes(&mut routes, to, &planned);
             plans.extend(planned);
         }
         if plans.is_empty() {
@@ -883,7 +883,7 @@ impl Store {
         let action = record_and_apply(&tx, account_id, kind, &summary, &plans)?;
         if let Some((to, roles)) = server {
             let mut routes = BTreeMap::new();
-            add_routes(&mut routes, to, roles.name(FolderRole::Trash), &plans);
+            add_routes(&mut routes, to, &plans);
             queue_routes(&tx, account_id, &action, routes, roles)?;
         }
         tx.commit()?;
@@ -1504,7 +1504,7 @@ fn plan_view_relocation(
         for (folder, projected) in copies {
             if projected {
                 view.hidden.push(folder);
-            } else if !folder.eq_ignore_ascii_case(roles.name(FolderRole::Trash)) {
+            } else if !folder.eq_ignore_ascii_case(to) {
                 view.server_only_folders.push(folder);
             }
         }
@@ -1531,19 +1531,15 @@ fn plan_view_relocation(
 fn add_routes<'a>(
     routes: &mut BTreeMap<(String, &'a str), Vec<String>>,
     to: &'a str,
-    trash: &'a str,
     plans: &[Planned],
 ) {
     for plan in plans {
-        for from in removed_folders(plan) {
+        for from in removed_folders(plan)
+            .into_iter()
+            .chain(plan.view.server_only_folders.iter().cloned())
+        {
             routes
                 .entry((from, to))
-                .or_default()
-                .push(plan.before.message_id.clone());
-        }
-        for from in &plan.view.server_only_folders {
-            routes
-                .entry((from.clone(), trash))
                 .or_default()
                 .push(plan.before.message_id.clone());
         }

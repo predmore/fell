@@ -643,7 +643,8 @@ fn bridge_view_actions_change_every_real_folder_and_undo_restores_the_views() {
     }
 
     // A real copy can still be tracked even if its folder is already gone
-    // from the local row. Deleting that view-only row still queues the moves.
+    // from the local row. Both actions still move each real copy to their
+    // destination while hiding the row from All Mail.
     store
         .connection()
         .execute(
@@ -651,23 +652,30 @@ fn bridge_view_actions_change_every_real_folder_and_undo_restores_the_views() {
             [],
         )
         .unwrap();
-    let inbox_thread = inbox().thread_id;
-    store
-        .delete_threads(&acct.id, &[inbox_thread], "All Mail")
-        .unwrap();
-    let mut copies: Vec<_> = store
-        .outbox(&acct.id)
-        .unwrap()
-        .into_iter()
-        .filter(|entry| entry.kind == crate::outbox::OutboxKind::Move)
-        .map(|entry| {
-            assert_eq!(entry.target_folder, "Trash");
-            entry.source_folder
-        })
-        .collect();
-    copies.sort_unstable();
-    assert_eq!(copies, ["Folders/Trips", "INBOX"]);
-    store.undo(&acct.id).unwrap();
+    let selected = [inbox().thread_id];
+    for target in ["Spam", "Trash"] {
+        assert!(inbox().folders.is_empty());
+        if target == "Spam" {
+            store.spam_threads(&acct.id, &selected, "All Mail").unwrap();
+        } else {
+            store
+                .delete_threads(&acct.id, &selected, "All Mail")
+                .unwrap();
+        }
+        let mut copies: Vec<_> = store
+            .outbox(&acct.id)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == crate::outbox::OutboxKind::Move)
+            .map(|entry| {
+                assert_eq!(entry.target_folder, target);
+                entry.source_folder
+            })
+            .collect();
+        copies.sort_unstable();
+        assert_eq!(copies, ["Folders/Trips", "INBOX"]);
+        store.undo(&acct.id).unwrap();
+    }
 
     // If sync already saw the All Mail copy go, undo still restores the
     // view immediately. The next observed real copy takes over again.
