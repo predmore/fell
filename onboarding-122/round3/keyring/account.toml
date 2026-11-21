@@ -1,0 +1,12 @@
+# Fell mail account. Keep this file private (mode 0600).
+backend = "bridge"
+email = "robin@demo.test"
+name = "Robin Ellis"
+username = "robin@demo.test"
+password_source = "keyring"
+host = "127.0.0.1"
+port = 1143
+security = "starttls"
+smtp_host = "127.0.0.1"
+smtp_port = 1025
+smtp_security = "starttls"
