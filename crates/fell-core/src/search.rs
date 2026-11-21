@@ -944,7 +944,30 @@ fn semantic_threads(
     let Some(query) = ready.embed_query(&text) else {
         return Ok(Vec::new());
     };
-    let allowed = if has_filters(parsed) {
+    let filtered = has_filters(parsed);
+    // With common filters, checking the best candidates by message id can
+    // fill the result without reading every message in the account. Bound
+    // this probe so a selective filter still takes the bulk path below.
+    // Header MATCH operators can scan FTS postings on each lookup, so keep
+    // those on the bulk path from the start.
+    if filtered && parsed.from.is_empty() && parsed.to.is_empty() && parsed.subject.is_empty() {
+        reached(Step::Filtered);
+        let mut nearest = ready
+            .index
+            .nearest(account_id.as_str(), &query, None)
+            .map(|(message_id, _)| message_id);
+        let hits = semantic_hits(
+            conn,
+            account_id,
+            parsed,
+            &mut nearest,
+            SEMANTIC_PROBE_BATCHES,
+        )?;
+        if hits.len() == semantic::SEMANTIC_THREADS || nearest.next().is_none() {
+            return Ok(hits);
+        }
+    }
+    let allowed = if filtered {
         let ids = filtered_message_ids(conn, account_id, parsed)?;
         Some(
             ready
@@ -959,15 +982,25 @@ fn semantic_threads(
         .index
         .nearest(account_id.as_str(), &query, allowed.as_deref())
         .map(|(message_id, _)| message_id);
+    semantic_hits(conn, account_id, parsed, &mut nearest, usize::MAX)
+}
+
+fn semantic_hits<'a>(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    nearest: &mut impl Iterator<Item = &'a str>,
+    batches: usize,
+) -> Result<Vec<SearchHit>> {
     reached(Step::Scanned);
     let mut threads = HashSet::new();
     let mut hits = Vec::new();
-    loop {
+    for _ in 0..batches {
         // Read one batch at a time. A run of near-identical replies
         // may all belong to one thread.
         let batch: Vec<_> = nearest.by_ref().take(SEMANTIC_LOOKUP_BATCH).collect();
         if batch.is_empty() {
-            return Ok(hits);
+            break;
         }
         let mut found = semantic_rows(conn, account_id, parsed, &batch)?;
         for message_id in batch {
@@ -983,6 +1016,7 @@ fn semantic_threads(
             }
         }
     }
+    Ok(hits)
 }
 
 /// Every message of the account that passes the query's operators, ignoring
@@ -1001,6 +1035,8 @@ fn filtered_message_ids(
 
 /// One batch of candidates in the message lookup.
 const SEMANTIC_LOOKUP_BATCH: usize = 100;
+/// Most common filters have enough matches in the first few batches.
+const SEMANTIC_PROBE_BATCHES: usize = 4;
 
 /// The hits for `messages`, by message id, with the query's operators applied.
 fn semantic_rows(
@@ -1068,7 +1104,7 @@ fn filtered_select(
 pub(crate) enum Step {
     /// The vector matrix was brought up to date.
     Refreshed,
-    /// The operators ran and chose which rows the scan may use.
+    /// The scan is about to run, with preliminary operator matches if needed.
     Filtered,
     /// The scan chose its messages; their rows are read next.
     Scanned,

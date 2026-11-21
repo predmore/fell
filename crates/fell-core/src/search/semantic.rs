@@ -334,7 +334,9 @@ impl VectorIndex {
     pub(crate) fn refresh(&mut self, conn: &Connection) -> Result<()> {
         let tx = Snapshot::begin(conn)?;
         let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT MIN(seq), MAX(seq) FROM embedding_changes",
+            // Separate subqueries let SQLite seek to the ends of the log.
+            "SELECT (SELECT MIN(seq) FROM embedding_changes),
+                    (SELECT MAX(seq) FROM embedding_changes)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
