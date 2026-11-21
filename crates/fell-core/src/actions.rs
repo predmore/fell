@@ -2050,10 +2050,11 @@ fn insert_message_row(conn: &Connection, account_id: &AccountId, row: &SavedRow)
             in_reply_to, references_header, from_name, from_email, subject,
             date_unix, snippet, body_text, unread, folders, labels, arrived_via,
             to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line,
-            attachment_names, body_fingerprint
+            attachment_names, body_fingerprint, part_cache_stamp
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+            randomblob(16)
          )",
         params_from_iter(values),
     )?;

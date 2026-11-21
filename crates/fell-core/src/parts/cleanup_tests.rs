@@ -94,7 +94,7 @@ fn sync_settle_cleans_current_and_retired_sections_in_only_the_deleted_account()
             },
         )
         .unwrap();
-    assert!(store.cached_part_stamp(&target_parts[0]).unwrap().is_none());
+    assert!(store.cached_part_state(&target_parts[0]).unwrap().is_none());
     store.clean_part_cache(&cache).unwrap();
     for removed in [current, retired, old_name] {
         assert!(!removed.path.parent().unwrap().exists());
@@ -186,6 +186,48 @@ fn a_rolled_back_delete_keeps_its_cache_and_a_committed_purge_retries_after_reop
 }
 
 #[test]
+fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
+    let (root, cache, store) = open_fixture("rewrite-during-fetch");
+    let mut target = message("a1", "rewrite@x", "INBOX", 1);
+    target.parts.as_mut().unwrap().html = Some("<p>Original</p>".into());
+    store.upsert_message(&target).unwrap();
+    let part = listed_parts(&store, &target).remove(0);
+    let worker = PartFetcher::start_for_store(
+        || Ok(Box::new(Serves(b"ZGF0YQ=="))), // "data"
+        cache.clone(),
+        root.join("mail.db"),
+    );
+    let (entered, downloading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let timeout = Duration::from_secs(10);
+    worker.fetch(part.clone(), move |event| match event {
+        PartEvent::Progress { .. } => {
+            entered.send(()).unwrap();
+            paused.recv_timeout(timeout).unwrap();
+        }
+        PartEvent::Done(value) => done.send(value).unwrap(),
+        PartEvent::Downloading { .. } => {}
+    });
+    downloading.recv_timeout(timeout).unwrap();
+    let rewritten = "<p>Rewritten</p>";
+    target.parts.as_mut().unwrap().html = Some(rewritten.into());
+    store.upsert_message(&target).unwrap();
+    let body = store
+        .message_body(&target.account_id, &target.headers.message_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(body.html.as_deref(), Some(rewritten));
+
+    resume.send(()).unwrap();
+    let published = result.recv_timeout(timeout).unwrap().unwrap();
+    assert_eq!(fs::read(&published.path).unwrap(), b"data");
+    assert_eq!(cache.lookup(&part), Some(published));
+    drop((worker, store));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
     let (root, cache, store) = open_fixture("cleanup-during-fetch");
     let mut target = message("a1", "expunge@x", "Trash", 1);
@@ -235,6 +277,10 @@ fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
     assert_eq!(fs::read(&new_hit.path).unwrap(), b"fresh");
 
     store.clean_part_cache(&cache).unwrap();
+    assert!(matches!(
+        store.cached_part_state(&parts[0]).unwrap(),
+        Some((_, false))
+    ));
     resume.send(()).unwrap();
     let error = result.recv_timeout(timeout).unwrap().unwrap_err();
     assert_eq!(error.to_string(), part_removed().to_string());

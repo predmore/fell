@@ -591,19 +591,19 @@ fn fetch_one(
     stopped: impl Fn() -> bool,
     events: &mut dyn FnMut(PartEvent),
 ) -> Result<CachedPart> {
-    let stamp = if let Some(store) = store {
+    let publication = if let Some(store) = store {
         let lock = cache.lock()?;
-        let stamp = store.cached_part_stamp(request)?.ok_or_else(part_removed)?;
+        let (stamp, _) = store.cached_part_state(request)?.ok_or_else(part_removed)?;
         // A message restored before the sweep can fetch afresh once the old
         // cache entry is gone. Check again in case it was removed meanwhile.
         store.clean_part_cache_locked(cache, &lock, Some(request))?;
-        if store.cached_part_stamp(request)? != Some(stamp) {
+        if store.cached_part_state(request)? != Some((stamp, false)) {
             return Err(part_removed());
         }
         if let Some(hit) = cache.lookup(request) {
             return Ok(hit);
         }
-        Some(stamp)
+        Some((store, stamp))
     } else {
         if let Some(hit) = cache.lookup(request) {
             return Ok(hit);
@@ -628,16 +628,16 @@ fn fetch_one(
     if stopped() {
         return Err(cancelled());
     }
-    if let Some(store) = store {
+    if let Some((store, stamp)) = publication {
         // Network I/O never holds the cache lock. Serializing publication
         // and cleanup keeps an unlink from being acknowledged ahead of a
         // write that was already publishing when the delete committed.
         let lock = cache.lock()?;
-        if store.cached_part_stamp(request)? != stamp {
+        if store.cached_part_state(request)? != Some((stamp, false)) {
             return Err(part_removed());
         }
         let cached = write_cached_part(cache, request, &bytes)?;
-        if store.cached_part_stamp(request)? != stamp {
+        if store.cached_part_state(request)? != Some((stamp, false)) {
             store.clean_part_cache_locked(cache, &lock, Some(request))?;
             return Err(part_removed());
         }

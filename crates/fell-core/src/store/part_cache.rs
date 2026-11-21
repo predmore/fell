@@ -5,7 +5,6 @@ use std::fs::File;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 
 use crate::parts::{DEFAULT_CACHE_BYTES, PartCache, PartRequest};
-use crate::store::PartStamp;
 use crate::{Result, Store};
 
 pub(super) const SCHEMA: &str = "
@@ -128,15 +127,18 @@ impl Store {
         failure.map_or(Ok(()), |err| Err(err.into()))
     }
 
-    /// Exact row, never an alias. A delete followed by a restore assigns a
-    /// fresh body stamp, even when SQLite reuses the same message rowid.
-    pub(crate) fn cached_part_stamp(&self, request: &PartRequest) -> Result<Option<PartStamp>> {
+    /// Message row stamp and pending cleanup flag for the exact section.
+    /// The stamp catches a delete and restore even after cleanup is acknowledged.
+    pub(crate) fn cached_part_state(
+        &self,
+        request: &PartRequest,
+    ) -> Result<Option<([u8; 16], bool)>> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT coalesce(s.stamp, zeroblob(16))
+                "SELECT coalesce(m.part_cache_stamp, zeroblob(16)), c.pending IS 1
                  FROM message_parts p JOIN messages m USING (account_id, message_id)
-                 LEFT JOIN message_body_stamps s USING (account_id, message_id)
+                 LEFT JOIN part_cache_sections c USING (account_id, message_id, section)
                  WHERE p.account_id = ?1 AND p.message_id = ?2 AND p.section = ?3",
             )?
             .query_row(
@@ -145,7 +147,7 @@ impl Store {
                     request.message_id.as_str(),
                     request.part.section,
                 ],
-                |row| row.get(0).map(PartStamp),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
     }
