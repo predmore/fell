@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::keymap::KeyId;
-use crate::model::{FolderIntent, Overlay, Session, Toast};
+use crate::model::{Banner, FolderIntent, Overlay, Session, Toast};
 use crate::motion::{self, Ghost, Glide, ListShift, Motion, Transition};
 use crate::present::{ConvMessage, Pane, ThreadRow};
 
@@ -24,6 +24,7 @@ pub struct FolderHeaderFade {
     pub folder: String,
     pub label: Option<String>,
     pub unread: usize,
+    banner: Option<Banner>,
     fade: Transition,
     folder_from: f32,
     /// The account name and email can keep different opacities.
@@ -98,6 +99,7 @@ pub struct Layer {
     folder_query: String,
     folder_index: usize,
     folder_intent: FolderIntent,
+    pub label_target: Option<String>,
 }
 
 impl Layer {
@@ -110,6 +112,7 @@ impl Layer {
             folder_query: session.folder_query.clone(),
             folder_index: session.folder_index,
             folder_intent: session.folder_intent,
+            label_target: session.label_target(),
         }
     }
 
@@ -216,6 +219,9 @@ pub struct InboxMotion {
     /// The count it replaced in the same folder, fading out under the new one.
     unread_out: Option<(usize, Transition)>,
     folder_out: Option<FolderHeaderFade>,
+    last_banner: Option<Banner>,
+    /// The rows and reader leave before the empty message comes in.
+    empty_list: Option<(Transition, Transition)>,
     quotes: DisclosureMotion,
     recipients: DisclosureMotion,
 }
@@ -322,6 +328,8 @@ impl InboxMotion {
             last_unread: None,
             unread_out: None,
             folder_out: None,
+            last_banner: None,
+            empty_list: None,
         }
     }
 
@@ -429,7 +437,7 @@ impl InboxMotion {
         // threshold shows its panes at once.
         let layout = (session.pane, session.full_width);
         if layout != self.last_layout {
-            if panes != self.last_panes {
+            if panes != self.last_panes && self.empty_list.is_none() {
                 let entering = match (self.last_panes, panes) {
                     ((_, false), (_, true)) | ((true, true), (false, true)) => {
                         Some(Pane::Conversation)
@@ -521,6 +529,9 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
+        if self.empty_list.is_some_and(|(exit, _)| !exit.running(now)) {
+            self.empty_list = None;
+        }
         self.bodies.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
@@ -601,6 +612,13 @@ impl InboxMotion {
             self.folder_out = None;
         }
         running |= self.folder_out.is_some();
+        if self
+            .empty_list
+            .is_some_and(|(_, enter)| !enter.running(now))
+        {
+            self.empty_list = None;
+        }
+        running |= self.empty_list.is_some();
         if self.pane.is_some_and(|(t, _)| !t.running(now)) {
             self.pane = None;
         }
@@ -663,6 +681,7 @@ impl InboxMotion {
                     folder: old_folder,
                     label: old_label,
                     unread: *count,
+                    banner: self.last_banner.clone(),
                     fade,
                     folder_from: 1.0,
                     account_from: [1.0; 2],
@@ -676,6 +695,7 @@ impl InboxMotion {
                         next.folder = old.folder;
                         next.label = old.label;
                         next.unread = old.unread;
+                        next.banner = old.banner;
                         next.folder_from *= old.folder_from;
                     }
                 }
@@ -693,6 +713,44 @@ impl InboxMotion {
 
     pub fn folder_header(&mut self) -> Option<&mut FolderHeaderFade> {
         self.folder_out.as_mut()
+    }
+
+    /// Start the last-row exit and report whether the reader occupied the window.
+    pub fn list_emptied(&mut self, now: Instant) -> bool {
+        self.empty_list = self
+            .motion
+            .start(motion::FADE, now)
+            .zip(self.motion.start(motion::FADE, now + motion::FADE));
+        self.last_panes == (false, true)
+    }
+
+    pub fn cancel_empty_list(&mut self) {
+        self.empty_list = None;
+    }
+
+    pub fn empty_list_exit(&self, now: Instant) -> f32 {
+        self.empty_list.map_or(0.0, |(exit, _)| exit.remaining(now))
+    }
+
+    /// Keep an empty banner in step with the scope the header is showing.
+    pub fn list_banner(&mut self, banner: Option<Banner>, now: Instant) -> Option<(Banner, f32)> {
+        self.last_banner.clone_from(&banner);
+        let banner = banner?;
+        if let Some(fade) = &self.folder_out {
+            let (leaving, opacity) = fade.phase(now);
+            if leaving {
+                return fade
+                    .banner
+                    .clone()
+                    .map(|old| (old, opacity * fade.folder_from));
+            }
+            return Some((banner, opacity));
+        }
+        Some((
+            banner,
+            self.empty_list
+                .map_or(1.0, |(_, enter)| enter.progress(now)),
+        ))
     }
 
     /// The header's unread count being replaced: the old count and how far
@@ -888,6 +946,46 @@ mod tests {
 
     fn later(now: Instant, ms: u64) -> Instant {
         now + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn the_last_label_rows_leave_before_the_empty_message_fades_in() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        motions.list_emptied(now);
+        let banner = Banner {
+            title: "No conversations in Work".into(),
+            hint: String::new(),
+        };
+        let half = now + motion::FADE / 2;
+        let entered = now + motion::FADE;
+        assert_eq!(motions.empty_list_exit(now), 1.0);
+        assert!(motions.empty_list_exit(half) > 0.0);
+        assert_eq!(
+            motions.list_banner(Some(banner.clone()), half).unwrap().1,
+            0.0
+        );
+        assert_eq!(motions.empty_list_exit(entered), 0.0);
+        assert_eq!(
+            motions
+                .list_banner(Some(banner.clone()), entered)
+                .unwrap()
+                .1,
+            0.0
+        );
+        let halfway_in = entered + motion::FADE / 2;
+        assert!(
+            (0.0..1.0).contains(
+                &motions
+                    .list_banner(Some(banner.clone()), halfway_in)
+                    .unwrap()
+                    .1
+            )
+        );
+        assert!(motions.tick(halfway_in));
+        let done = entered + motion::FADE;
+        assert!(!motions.tick(done));
+        assert_eq!(motions.list_banner(Some(banner), done).unwrap().1, 1.0);
     }
 
     fn notice_opacity(motion: &InboxMotion, session: &Session, now: Instant) -> Option<f32> {

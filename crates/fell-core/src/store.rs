@@ -39,6 +39,7 @@ mod write_lock;
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
+pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 pub(crate) fn listed_folder_roles(

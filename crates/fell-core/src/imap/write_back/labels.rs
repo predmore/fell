@@ -35,10 +35,17 @@ impl Pass<'_> {
         let Some(label) = entry.target_folder.strip_prefix("Labels/") else {
             return Err(Error::Action("invalid Bridge label mailbox".into()).into());
         };
-        if label.is_empty() {
-            return Err(Error::Action("empty Bridge label".into()).into());
+        if !labels::bridge_label_name(label) {
+            return self.drop_row(index, DropReason::Refused, "invalid Bridge label name");
         }
         let copies = labels::copies(self.store.connection(), self.account_id, &entry.message_id)?;
+        if copies.is_empty() && !entry.sent {
+            return self.retry(
+                index,
+                DropReason::NotFound,
+                "waiting for a server copy to label",
+            );
+        }
         if add {
             self.copy_into_label(session, index, entry, &copies)
         } else {
@@ -53,6 +60,9 @@ impl Pass<'_> {
         mut entry: OutboxEntry,
         add: bool,
     ) -> Result<(), Stop> {
+        if !labels::keyword_atom(&entry.target_folder) {
+            return self.drop_row(index, DropReason::Refused, "invalid IMAP keyword");
+        }
         if session.gmail_labels() {
             return self.drop_row(
                 index,
@@ -60,40 +70,54 @@ impl Pass<'_> {
                 "Gmail labels use a separate protocol",
             );
         }
-        let (Some(raw), Some(validity), Some(uid)) =
-            (entry.source_mailbox.clone(), entry.uidvalidity, entry.uid)
-        else {
-            return Err(Error::Action("keyword write needs its server copy".into()).into());
+        let copy = match (entry.source_mailbox.clone(), entry.uidvalidity, entry.uid) {
+            (Some(raw), Some(validity), Some(uid)) => {
+                (entry.source_folder.clone(), raw, validity, uid)
+            }
+            (None, None, None) => {
+                let Some(copy) =
+                    labels::bind_keyword_copy(self.store, self.account_id, &mut entry)?
+                else {
+                    return self.retry(
+                        index,
+                        DropReason::NotFound,
+                        "waiting for a server copy to label",
+                    );
+                };
+                copy
+            }
+            _ => {
+                return self.drop_row(
+                    index,
+                    DropReason::NotFound,
+                    "incomplete keyword copy identity",
+                );
+            }
         };
-        if self.store_unconfirmed(&raw, validity, uid) {
+        let (_, raw, validity, uid) = &copy;
+        if self.store_unconfirmed(raw, *validity, *uid) {
             return Ok(());
         }
-        if !self.select_label_copy(session, index, &raw, validity)? {
+        if !self.select_label_copy(session, index, raw, *validity)? {
             return Ok(());
         }
-        match session.keyword(uid, &entry.target_folder) {
+        // FETCH also recovers a STORE that took effect before a lost reply.
+        match session.keyword(*uid, &entry.target_folder) {
             Ok(Some(value)) if value == add => {
                 let applied = if entry.sent {
-                    Applied::Keyword
+                    Applied::Keyword(&copy)
                 } else {
-                    return self.finish_label(index, &entry, Applied::Unchanged);
+                    Applied::Unchanged
                 };
-                let copy = (entry.source_folder.clone(), raw, validity, uid);
-                return self.finish_label(index, &entry, applied(&copy));
+                return self.finish_label(index, &entry, applied);
             }
             Ok(Some(_)) => {}
             Ok(None) => return self.drop_row(index, DropReason::NotFound, "keyword copy is gone"),
             Err(err) => return self.label_error(index, err, false),
         }
-        if !self.mark_label_sent(&mut entry, (0, 0))? {
-            self.settled[index] = true;
-            return Ok(());
-        }
-        match session.set_keyword(uid, &entry.target_folder, add) {
-            Ok(()) => {
-                let copy = (entry.source_folder.clone(), raw, validity, uid);
-                self.finish_label(index, &entry, Applied::Keyword(&copy))
-            }
+        self.permit_label_step(&mut entry)?;
+        match session.set_keyword(*uid, &entry.target_folder, add) {
+            Ok(()) => self.finish_label(index, &entry, Applied::Keyword(&copy)),
             Err(err) => self.label_error(index, err, true),
         }
     }
@@ -145,10 +169,7 @@ impl Pass<'_> {
         if !self.select_label_copy(session, index, source, *validity)? {
             return Ok(());
         }
-        if !self.mark_label_sent(&mut entry, before)? {
-            self.settled[index] = true;
-            return Ok(());
-        }
+        self.mark_label_sent(&mut entry, before)?;
         let placed = match session.uid_copy(*uid, &target) {
             Ok(placed) => placed,
             Err(err) => return self.label_error(index, err, true),
@@ -201,15 +222,24 @@ impl Pass<'_> {
             if !self.select_label_copy(session, index, raw, *validity)? {
                 return Ok(());
             }
-            if !self.mark_label_sent(&mut entry, (0, 0))? {
-                self.settled[index] = true;
-                return Ok(());
-            }
-            if let Err(err) = session.set_keyword(*uid, "\\Deleted", true) {
-                return self.label_error(index, err, false);
-            }
-            if let Err(err) = session.expunge_uid(*uid) {
-                return self.label_error(index, err, false);
+            // A previous pass may have marked this UID deleted or expunged
+            // it before its reply arrived. Either way, continue with the
+            // remaining copies after reconciling this one.
+            match session.keyword(*uid, "\\Deleted") {
+                Ok(Some(deleted)) => {
+                    if !deleted {
+                        self.permit_label_step(&mut entry)?;
+                        if let Err(err) = session.mark_deleted(*uid) {
+                            return self.label_error(index, err, false);
+                        }
+                    }
+                    self.permit_label_step(&mut entry)?;
+                    if let Err(err) = session.expunge_uid(*uid) {
+                        return self.label_error(index, err, false);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => return self.label_error(index, err, false),
             }
             labels::finish(self.store, self.account_id, &entry, Applied::Removed(copy))?;
         }
@@ -231,16 +261,26 @@ impl Pass<'_> {
         Ok(false)
     }
 
-    fn mark_label_sent(
-        &mut self,
-        entry: &mut OutboxEntry,
-        before: (u32, u32),
-    ) -> Result<bool, Stop> {
+    fn mark_label_sent(&mut self, entry: &mut OutboxEntry, before: (u32, u32)) -> Result<(), Stop> {
         (self.before_send)();
         let marked = outbox::mark_sent(self.store, self.account_id, &[entry.id], before)?;
-        entry.sent |= !marked.is_empty();
+        if marked.is_empty() {
+            return Err(Stop::Stale);
+        }
+        entry.sent = true;
         self.bounds.extend(marked.iter().copied());
-        Ok(!marked.is_empty())
+        Ok(())
+    }
+
+    fn permit_label_step(&mut self, entry: &mut OutboxEntry) -> Result<(), Stop> {
+        if !entry.sent {
+            return self.mark_label_sent(entry, (0, 0));
+        }
+        (self.before_send)();
+        if labels::pending(self.store, self.account_id, entry.id)?.is_none() {
+            return Err(Stop::Stale);
+        }
+        Ok(())
     }
 
     fn finish_label(

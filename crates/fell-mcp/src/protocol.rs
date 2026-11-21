@@ -1035,6 +1035,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_labels_outside_server_name_rules_stay_local() {
+        for (backend_kind, names) in [
+            (BackendKind::Imap, &["a\\Deleted", "x \\Seen", "foo)"][..]),
+            (BackendKind::Bridge, &["Labels/../INBOX"][..]),
+        ] {
+            let (mut session, thread) = session_with(AgentGrant::enabled(true, true, false), "bot");
+            let account = Account {
+                backend_kind,
+                ..account("a1")
+            };
+            session.store.upsert_account(&account).unwrap();
+            session.store.set_write_back(&account.id, true).unwrap();
+            init(&mut session);
+            for name in names {
+                let result = tool_json(&call(
+                    &mut session,
+                    "label",
+                    json!({ "thread_id": thread.as_str(), "label": name, "mode": "add" }),
+                ));
+                assert_eq!(result["changed"], true);
+            }
+            let labels = session.store.list_labels(&account.id).unwrap();
+            assert!(
+                names
+                    .iter()
+                    .all(|name| labels.iter().any(|label| label == *name))
+            );
+            assert!(session.store.outbox(&account.id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn read_thread_tells_a_body_not_downloaded_from_an_empty_one() {
         let (mut session, thread) = session_with(AgentGrant::enabled(true, false, false), "bot");
         // Rows a first sync listed from their headers: one still waiting

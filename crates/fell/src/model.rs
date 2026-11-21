@@ -583,6 +583,22 @@ impl Session {
         }
     }
 
+    pub fn label_target(&self) -> Option<String> {
+        if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
+            return None;
+        }
+        let targets = self.action_targets();
+        match targets.as_slice() {
+            [] => None,
+            [id] => self
+                .threads
+                .iter()
+                .find(|row| &row.id == id)
+                .map(|row| row.subject.clone()),
+            _ => Some(format!("{} conversations", targets.len())),
+        }
+    }
+
     pub fn record_startup_error(&mut self, error: String) {
         self.startup_error = Some(error);
     }
@@ -1353,16 +1369,12 @@ impl Session {
         }
     }
 
-    pub fn is_open(&self, index: usize) -> bool {
-        self.messages
-            .get(index)
-            .is_some_and(|message| self.quotes_open.contains(&message.id))
+    pub fn is_open(&self, message_id: &str) -> bool {
+        self.quotes_open.contains(message_id)
     }
 
-    pub fn recipients_are_open(&self, index: usize) -> bool {
-        self.messages
-            .get(index)
-            .is_some_and(|message| self.recipients_open.contains(&message.id))
+    pub fn recipients_are_open(&self, message_id: &str) -> bool {
+        self.recipients_open.contains(message_id)
     }
 
     fn select_index(&mut self, index: usize) -> bool {
@@ -2792,7 +2804,7 @@ impl Session {
         self.which_visible = self.keymap.which_key_ms == 0 && !self.chord.is_empty();
     }
 
-    pub fn list_banner(&self) -> Option<Banner> {
+    pub fn list_banner(&self, folder: &str, label: Option<&str>) -> Option<Banner> {
         if !self.threads.is_empty() {
             return None;
         }
@@ -2808,6 +2820,11 @@ impl Session {
                 hint: String::new(),
             });
         }
+        let title = || {
+            label
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.roles.label(folder))
+        };
         let retry = keymap::binding_text(&self.keymap, Action::SyncNow);
         Some(match &self.sync {
             SyncKind::FirstSync => Banner {
@@ -2822,7 +2839,7 @@ impl Session {
                 hint: "? details".into(),
             },
             SyncKind::Connecting | SyncKind::Syncing { .. } => Banner {
-                title: format!("Syncing {}", self.folder_title()),
+                title: format!("Syncing {}", title()),
                 hint: match &self.sync {
                     SyncKind::Syncing {
                         new_messages: Some(count),
@@ -2856,7 +2873,7 @@ impl Session {
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. }
-                if self.in_drafts() =>
+                if label.is_none() && self.roles.is(FolderRole::Drafts, folder) =>
             {
                 Banner {
                     title: "No drafts".into(),
@@ -2867,7 +2884,7 @@ impl Session {
                 }
             }
             SyncKind::FixtureOffline | SyncKind::LocalOffline | SyncKind::Synced { .. } => Banner {
-                title: format!("No conversations in {}", self.folder_title()),
+                title: format!("No conversations in {}", title()),
                 hint: String::new(),
             },
         })
@@ -3012,7 +3029,9 @@ mod tests {
             ),
         ] {
             session.apply_sync_status(SyncKind::Failed(SyncFailure::connection(&config, &error)));
-            let banner = session.list_banner().unwrap();
+            let banner = session
+                .list_banner(&session.folder, session.label_scope.as_deref())
+                .unwrap();
             assert_eq!(banner.title, title);
             assert_eq!(banner.hint, hint);
         }
@@ -3142,9 +3161,9 @@ mod tests {
             session.messages[0].body_state,
             fell_core::BodyState::Pending
         );
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
         assert!(!session.refresh_messages(session.messages.clone(), true));
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
     }
 
     #[test]
@@ -4330,17 +4349,32 @@ mod tests {
         let mut session = session();
         session.threads.clear();
         session.folder = "Archive".into();
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert!(banner.title.contains("Archive"));
         assert!(banner.hint.is_empty());
+        // A navigation key can change the requested scope before its page lands.
+        assert_eq!(
+            session
+                .list_banner("INBOX", Some("field notes"))
+                .unwrap()
+                .title,
+            "No conversations in field notes"
+        );
+
         // An empty drafts list says how to start one.
         session.folder = "Drafts".into();
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert_eq!(banner.title, "No drafts");
         assert!(banner.hint.starts_with("c compose"), "{}", banner.hint);
         assert!(banner.hint.contains("gi"));
         session.sync = SyncKind::FirstSync;
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert!(banner.hint.contains("fell account setup"));
     }
 
@@ -4405,7 +4439,9 @@ mod tests {
         session.threads.clear();
         session.sync = SyncKind::LocalOffline;
         session.fail_query(QueryFault::Folder, "database is locked".into());
-        let banner = session.list_banner().unwrap();
+        let banner = session
+            .list_banner(&session.folder, session.label_scope.as_deref())
+            .unwrap();
         assert_eq!(banner.title, "database is locked");
         assert!(!banner.title.contains("No conversations"));
     }
@@ -4465,8 +4501,8 @@ mod tests {
         // disclosures while the reader is at the bottom of the same message.
         assert!(!session.refresh_messages(vec![first.clone(), last.clone()], true));
         assert_eq!(session.message_cursor, 1);
-        assert!(session.is_open(1));
-        assert!(session.recipients_are_open(1));
+        assert!(session.is_open(&session.messages[1].id));
+        assert!(session.recipients_are_open(&session.messages[1].id));
         assert!(!session.messages[0].expanded);
 
         let reply = empty_message(true);
@@ -4490,15 +4526,15 @@ mod tests {
         session.set_messages(vec![first.clone(), second.clone()]);
         session.message_cursor = 0;
         session.toggle_open(0);
-        assert!(session.is_open(0));
+        assert!(session.is_open(&session.messages[0].id));
         // Sync puts a new message before the one that was opened.
         let newcomer = empty_message(true);
         session.refresh_messages(vec![newcomer, first.clone(), second], false);
-        assert!(!session.is_open(0));
-        assert!(session.is_open(1));
+        assert!(!session.is_open(&session.messages[0].id));
+        assert!(session.is_open(&session.messages[1].id));
         // The opened message leaves the thread: nothing else opens in its place.
         session.refresh_messages(vec![empty_message(true)], false);
-        assert!(!session.is_open(0));
+        assert!(!session.is_open(&session.messages[0].id));
     }
 
     #[test]
@@ -4507,13 +4543,22 @@ mod tests {
             Session::new("Caleb", "me@x", SyncKind::FixtureOffline, Keymap::default());
         session.set_messages(vec![empty_message(true)]);
         session.toggle_recipients(0);
-        assert!(session.recipients_are_open(0));
-        assert!(!session.is_open(0), "quoted text stays closed");
+        assert!(session.recipients_are_open(&session.messages[0].id));
+        assert!(
+            !session.is_open(&session.messages[0].id),
+            "quoted text stays closed"
+        );
         session.toggle_recipients(0);
         session.toggle_open(0);
-        assert!(session.recipients_are_open(0) && session.is_open(0));
+        assert!(
+            session.recipients_are_open(&session.messages[0].id)
+                && session.is_open(&session.messages[0].id)
+        );
         session.toggle_open(0);
-        assert!(!session.recipients_are_open(0) && !session.is_open(0));
+        assert!(
+            !session.recipients_are_open(&session.messages[0].id)
+                && !session.is_open(&session.messages[0].id)
+        );
     }
 
     #[test]
