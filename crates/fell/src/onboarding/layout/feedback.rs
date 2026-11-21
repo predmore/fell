@@ -144,7 +144,7 @@ impl Action {
     }
 }
 
-pub(super) type Actions = [Change<Option<Action>>; 3];
+pub(super) type Actions = [Change<Option<Action>>; 2];
 
 impl Connection {
     fn actions(self) -> [Option<Action>; 3] {
@@ -234,7 +234,7 @@ impl<T: PartialEq> Change<T> {
         self.frame.is_some()
     }
 
-    fn visible(&self, live: bool) -> (&T, bool, f32) {
+    pub(super) fn visible(&self, live: bool) -> (&T, bool, f32) {
         match (&self.frame, &self.swap) {
             (Some(SwapFrame::Leaving(opacity)), Some((old, _, from))) => {
                 (old, false, opacity * from)
@@ -247,6 +247,24 @@ impl<T: PartialEq> Change<T> {
     pub fn paint(&self, live: bool, draw: impl Fn(&T, bool) -> Div) -> Div {
         let (value, live, opacity) = self.visible(live);
         draw(value, live).opacity(opacity)
+    }
+}
+
+impl Change<Bridge> {
+    pub(super) fn layers(&self) -> Option<(Bridge, [f32; 2], f32)> {
+        let (old, _, from) = self.swap.as_ref()?;
+        Some(match self.frame.as_ref()? {
+            SwapFrame::Leaving(alpha) => {
+                let from = motion::lerp(motion::ARRIVE_FROM, 1., *from);
+                let shown = motion::lerp(motion::ARRIVE_FROM, from, *alpha);
+                (*old, [shown, 0.], 0.)
+            }
+            SwapFrame::Arriving(progress) => (
+                *old,
+                [0., motion::lerp(motion::ARRIVE_FROM, 1., *progress)],
+                *progress,
+            ),
+        })
     }
 }
 
@@ -310,12 +328,14 @@ pub(super) type ServerIssues = [Option<Issue>; 3];
 
 #[derive(Default)]
 pub(in crate::onboarding) struct Feedback {
-    pub(super) bridge: Crossfade<Bridge>,
+    pub(super) bridge: Change<Bridge>,
     pub(super) connection: Change<Connection>,
     pub(super) checks: [Change<Check>; 2],
     pub(super) bridge_offline: [Change<bool>; 2],
     pub(super) connection_actions: Actions,
     pub(super) save_actions: Actions,
+    pub(super) primary: Option<Action>,
+    pub(super) primary_label: Crossfade<Option<&'static str>>,
     pub(super) save_title: Change<&'static str>,
     pub(super) save_subtitle: Change<&'static str>,
     pub(super) save_note: Change<SaveState>,
@@ -330,6 +350,7 @@ pub(in crate::onboarding) struct Feedback {
 impl Feedback {
     pub fn settle(&mut self) {
         self.bridge.settle();
+        self.primary_label.settle();
         self.connection.settle();
         for action in self
             .connection_actions
@@ -439,7 +460,20 @@ impl Feedback {
     }
 
     pub fn refresh(&mut self, form: &Form, bridge: Bridge, motion: Motion, now: Instant) -> bool {
-        let bridge_active = self.bridge.update(bridge, motion, now);
+        self.bridge
+            .update(bridge, motion, now, motion::QUICK, motion::QUICK);
+        let mut primary = match form.step {
+            Step::Identity => Some(Action::new(
+                Control::Next,
+                if form.needs_servers() {
+                    "Continue"
+                } else {
+                    "Test connection"
+                },
+            )),
+            Step::Servers => Some(Action::new(Control::Next, "Test connection")),
+            _ => None,
+        };
         if form.step == Step::Connection {
             let state = if form.connected() {
                 Connection::Verified
@@ -451,7 +485,9 @@ impl Feedback {
                 Connection::Testing
             };
             self.connection.replace(state, motion, now);
-            for (action, value) in self.connection_actions.iter_mut().zip(state.actions()) {
+            let [back, secondary, next] = state.actions();
+            primary = next;
+            for (action, value) in self.connection_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);
             }
             for (index, check) in self.checks.iter_mut().enumerate() {
@@ -471,11 +507,9 @@ impl Feedback {
             self.save_title.replace(title, motion, now);
             self.save_subtitle.replace(subtitle, motion, now);
             self.save_note.replace(state, motion, now);
-            for (action, value) in self
-                .save_actions
-                .iter_mut()
-                .zip(save_actions(&form.storage))
-            {
+            let [back, secondary, next] = save_actions(&form.storage);
+            primary = next;
+            for (action, value) in self.save_actions.iter_mut().zip([back, secondary]) {
                 action.update_optional(value, false, motion, now);
             }
             let disabled = matches!(form.storage, Storage::Saving { .. });
@@ -486,6 +520,10 @@ impl Feedback {
                     .map(|fade| (self.back_amount, fade));
             }
         }
+        self.primary = primary;
+        let primary_active =
+            self.primary_label
+                .update(primary.map(|action| action.label), motion, now);
         if self.back_tint.is_some_and(|(_, fade)| !fade.running(now)) {
             self.back_tint = None;
         }
@@ -521,7 +559,8 @@ impl Feedback {
             server_active |= self.servers[service as usize].update(issues, motion, now);
         }
 
-        let mut active = bridge_active
+        let mut active = self.bridge.tick(now)
+            | primary_active
             | server_active
             | self.connection.tick(now)
             | self.save_title.tick(now)
@@ -547,6 +586,26 @@ impl Feedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_hint_swap_keeps_one_hint_visible() {
+        let now = Instant::now();
+        let mut hint = Change::<Bridge>::default();
+        hint.update(
+            Bridge::Offline,
+            Motion::new(true),
+            now,
+            motion::QUICK,
+            motion::QUICK,
+        );
+        for elapsed in 0..160 {
+            hint.tick(now + Duration::from_millis(elapsed));
+            let (_, alpha, _) = hint.layers().unwrap();
+            let incoming = usize::from(elapsed >= 80);
+            assert!(alpha[incoming] >= motion::ARRIVE_FROM);
+            assert_eq!(alpha[1 - incoming], 0.);
+        }
+    }
 
     #[test]
     fn replaced_text_fades_in_only_after_the_old_text_leaves() {

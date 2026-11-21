@@ -97,7 +97,8 @@ pub struct StatusMotion {
 struct BodyArrival {
     fade: Transition,
     height: Option<(f32, Transition)>,
-    placeholder: bool,
+    /// Whether the outgoing pending label said the body was downloading.
+    placeholder: Option<bool>,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -266,7 +267,6 @@ pub struct InboxMotion {
     last_unread: Option<(String, Option<String>, Option<usize>)>,
     /// The count it replaced in the same folder, fading out under the new one.
     unread_fade: motion::NumberFade<Option<usize>>,
-    pub inbox_sync_total: Option<u32>,
     folder_out: Option<FolderHeaderFade>,
     /// A label scope changes its heading in the same frame as its rows.
     label_header_in: Option<Transition>,
@@ -397,7 +397,6 @@ impl InboxMotion {
             recipients: DisclosureMotion::default(),
             last_unread: None,
             unread_fade: motion::NumberFade::default(),
-            inbox_sync_total: None,
             folder_out: None,
             label_header_in: None,
             last_banner: None,
@@ -1128,8 +1127,14 @@ impl InboxMotion {
 
     /// Fade a body in under an already drawn header. When its card changes
     /// height, both the text and the height share the full fade.
-    pub fn body_arrived(&mut self, id: &str, height: Option<f32>, pending: bool, now: Instant) {
-        let duration = if height.is_some() {
+    pub fn body_arrived(
+        &mut self,
+        id: &str,
+        height: Option<f32>,
+        placeholder: Option<bool>,
+        now: Instant,
+    ) {
+        let duration = if height.is_some() || placeholder.is_some() {
             motion::FADE
         } else {
             motion::QUICK
@@ -1143,7 +1148,7 @@ impl InboxMotion {
                 BodyArrival {
                     fade,
                     height,
-                    placeholder: pending && height.is_some(),
+                    placeholder,
                 },
             );
         }
@@ -1227,10 +1232,8 @@ impl InboxMotion {
                 } else {
                     body.fade.progress(now)
                 };
-                let alpha = if body.placeholder {
-                    // Open enough space for the new body before its first
-                    // line replaces the downloading label.
-                    motion::ease_out_quad((shown - 0.55) / 0.45)
+                let alpha = if body.placeholder.is_some() {
+                    shown
                 } else {
                     motion::lerp(motion::ARRIVE_FROM, 1.0, shown)
                 };
@@ -1254,7 +1257,14 @@ impl InboxMotion {
             .collect()
     }
 
-    pub fn body_heights(&self, now: Instant) -> HashMap<String, (f32, f32, bool)> {
+    pub fn body_placeholders(&self) -> HashMap<String, bool> {
+        self.bodies
+            .iter()
+            .filter_map(|(id, body)| Some((id.clone(), body.placeholder?)))
+            .collect()
+    }
+
+    pub fn body_heights(&self, now: Instant) -> HashMap<String, (f32, f32)> {
         self.bodies
             .iter()
             .filter_map(|(id, body)| {
@@ -1263,11 +1273,7 @@ impl InboxMotion {
                 // once. Use the same gentler curve as a long scroll glide.
                 Some((
                     id.clone(),
-                    (
-                        from,
-                        motion::ease_out_quad(growth.linear(now)),
-                        body.placeholder,
-                    ),
+                    (from, motion::ease_out_quad(growth.linear(now))),
                 ))
             })
             .collect()
@@ -2253,7 +2259,7 @@ mod tests {
         motion.observe(&session, (false, true), now);
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
-        motion.body_arrived("a", None, false, now);
+        motion.body_arrived("a", None, None, now);
         session.quotes_open.insert("a".into());
         session.recipients_open.insert("a".into());
         assert!(motion.body_alphas(now).is_empty());
@@ -2267,7 +2273,7 @@ mod tests {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
         let now = Instant::now();
-        motion.body_arrived("a", None, false, now);
+        motion.body_arrived("a", None, None, now);
         session.quotes_open.insert("b".into());
         session.recipients_open.insert("b".into());
         assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);

@@ -23,10 +23,8 @@ const STEP_HEIGHT: f32 = 520.;
 const CHOICE_PADDING: f32 = 16.;
 const CHOICE_GAP: f32 = 12.;
 const CHOICE_ARROW: f32 = 16.;
-const SAVE_WIDTH: f32 = 164.;
-const CONNECTION_WIDTH: f32 = 112.;
 const PORT_WIDTH: f32 = 62.;
-const SECURITY_WIDTH: f32 = 116.;
+const SECURITY_WIDTH: f32 = 92.;
 const FIELD_GAP: f32 = 8.;
 
 fn focus_ring(accent: u32, radius: f32) -> Div {
@@ -166,7 +164,8 @@ impl Onboarding {
                                 (pulse, dy),
                                 (arrival, if shared_back { 1. } else { arrival }),
                                 cx,
-                            )),
+                            ))
+                            .children(self.primary_button(window, live, cx)),
                     ),
             )
     }
@@ -233,7 +232,7 @@ impl Onboarding {
         cx: &Context<Self>,
     ) -> Div {
         let column = || div().flex().flex_col().gap_2();
-        let (title, detail, content, footer): (&str, &str, Div, [Footer; 3]) = match step {
+        let (title, detail, content, footer): (&str, &str, Div, [Footer; 2]) = match step {
             Step::Provider => (
                 "Connect your mail",
                 "Choose how Fell connects to your mailbox.",
@@ -254,7 +253,7 @@ impl Onboarding {
                         None,
                         cx,
                     )),
-                [None, None, None],
+                [None, None],
             ),
             Step::Preset => {
                 let descriptions = [
@@ -278,7 +277,7 @@ impl Onboarding {
                             )
                         },
                     )),
-                    self.footer("Back", None, None, live, cx),
+                    self.footer("Back", None, live, cx),
                 )
             }
             Step::Identity => {
@@ -324,7 +323,6 @@ impl Onboarding {
                     self.footer(
                         "Back",
                         (!more).then_some((Control::Servers, "Edit servers")),
-                        Some(if more { "Continue" } else { "Test connection" }),
                         live,
                         cx,
                     ),
@@ -338,7 +336,7 @@ impl Onboarding {
                         .into_iter()
                         .map(|service| self.server(service, measure, live, cx)),
                 ),
-                self.footer("Back", None, Some("Test connection"), live, cx),
+                self.footer("Back", None, live, cx),
             ),
             Step::Connection => (
                 "",
@@ -346,9 +344,9 @@ impl Onboarding {
                 column().children(
                     Service::ALL
                         .into_iter()
-                        .map(|service| self.check_row(service, pulse)),
+                        .map(|service| self.check_row(service, pulse, measure)),
                 ),
-                [None, None, None],
+                [None, None],
             ),
             Step::Done => (
                 "",
@@ -375,7 +373,7 @@ impl Onboarding {
                             SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ),
-                [None, None, None],
+                [None, None],
             ),
         };
         let heading = match step {
@@ -432,13 +430,14 @@ impl Onboarding {
 
     fn footer_rows(
         &self,
-        [back, secondary, primary]: [Footer; 3],
+        [back, secondary]: [Footer; 2],
         stacked: bool,
         (opacity, back_opacity): (f32, f32),
     ) -> Div {
         let faded = |element: AnyElement, alpha| div().flex_none().opacity(alpha).child(element);
+        let beside_primary = self.feedback.primary.is_some() && !stacked && secondary.is_some();
         let mut secondary = secondary.map(|el| faded(el, opacity));
-        if back.is_none() && secondary.is_none() && primary.is_none() {
+        if back.is_none() && secondary.is_none() {
             return div();
         }
         div()
@@ -461,7 +460,9 @@ impl Onboarding {
                     .children(back.map(|el| faded(el, back_opacity)))
                     .child(div().flex_1())
                     .children(secondary)
-                    .children(primary.map(|el| faded(el, opacity))),
+                    .when(beside_primary, |row| {
+                        row.child(div().w(px(10. * self.theme.ui_px)).flex_none())
+                    }),
             )
     }
 
@@ -499,39 +500,15 @@ impl Onboarding {
         saving: bool,
         live: bool,
         cx: &Context<Self>,
-    ) -> [Footer; 3] {
+    ) -> [Footer; 2] {
         std::array::from_fn(|index| {
-            if !saving && index == 2 {
-                let slot = &actions[index];
-                return slot.value.map(|action| {
-                    self.button_shell(
-                        action.control,
-                        action.label,
-                        true,
-                        (live, action.enabled),
-                        cx,
-                    )
-                    .w(px(CONNECTION_WIDTH))
-                    .text_center()
-                    .child(slot.paint(false, |label, _| {
-                        div().children(label.map(|label| label.label))
-                    }))
-                    .into_any_element()
-                });
-            }
             if saving && index == 1 {
                 return Some(
                     self.feedback
                         .save_note
                         .paint(live, |state, live| {
                             div().when(state.inline_available(), |el| {
-                                el.child(self.button(
-                                    Control::Inline,
-                                    "Save in file…",
-                                    false,
-                                    live,
-                                    cx,
-                                ))
+                                el.child(self.button(Control::Inline, "Save in file…", live, cx))
                             })
                         })
                         .flex_none()
@@ -542,15 +519,11 @@ impl Onboarding {
                 actions[index]
                     .paint(live, |action, live| {
                         div().children(action.map(|action| {
-                            let primary = index == 2;
                             let back = index == 0 && saving;
                             let enabled = action.enabled
                                 && (!back
                                     || !matches!(self.form.storage, super::Storage::Saving { .. }));
-                            self.button(action.control, action.label, primary, live && enabled, cx)
-                                .when(primary && saving, |button| {
-                                    button.w(px(SAVE_WIDTH)).text_center()
-                                })
+                            self.button(action.control, action.label, live && enabled, cx)
                                 .when(back, |button| {
                                     button.text_color(rgb(motion::mix(
                                         self.theme.foreground,
@@ -570,23 +543,16 @@ impl Onboarding {
         &self,
         back: &str,
         secondary: Option<(Control, &str)>,
-        primary: Option<&str>,
         live: bool,
         cx: &Context<Self>,
-    ) -> [Footer; 3] {
+    ) -> [Footer; 2] {
         [
             Some(
-                self.button(Control::Back, back, false, live, cx)
+                self.button(Control::Back, back, live, cx)
                     .into_any_element(),
             ),
-            secondary.map(|(control, label)| {
-                self.button(control, label, false, live, cx)
-                    .into_any_element()
-            }),
-            primary.map(|label| {
-                self.button(Control::Next, label, true, live, cx)
-                    .into_any_element()
-            }),
+            secondary
+                .map(|(control, label)| self.button(control, label, live, cx).into_any_element()),
         ]
     }
 
@@ -651,15 +617,15 @@ impl Onboarding {
     fn bridge_feedback(&self, width: f32, live: bool, cx: &Context<Self>) -> Div {
         let bridge = &self.feedback.bridge;
         let current = self.bridge_status(bridge.value, live, cx);
-        let Some((old, shown)) = bridge.frame else {
+        let Some((old, alphas, height)) = bridge.layers() else {
             return current.mt_1();
         };
         let old = self.bridge_status(old, false, cx);
         div().mt_1().child(layered(
             width,
             [old.into_any_element(), current.into_any_element()],
-            [1. - shown, shown],
-            shown,
+            alphas,
+            height,
             [true; 2],
         ))
     }
@@ -721,12 +687,66 @@ impl Onboarding {
         &self,
         control: Control,
         label: &str,
-        primary: bool,
         live: bool,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        self.button_shell(control, label, primary, (live, true), cx)
+        self.button_shell(control, label, false, (live, true), cx)
             .child(label.to_owned())
+    }
+
+    fn primary_button(&self, window: &Window, live: bool, cx: &Context<Self>) -> Option<Div> {
+        let action = self.feedback.primary?;
+        let mut style = window.text_style();
+        if let Some(family) = &self.theme.ui_family {
+            style.font_family = family.clone().into();
+        }
+        style.font_weight = FontWeight::SEMIBOLD;
+        let width = |label: &'static str| {
+            let run = style.to_run(label.len());
+            let text =
+                window
+                    .text_system()
+                    .shape_line(label.into(), px(self.theme.ui_px), &[run], None);
+            f32::from(text.width).ceil() + 26.
+        };
+        let (old, shown) = self.feedback.primary_label.frame.unwrap_or((None, 1.));
+        let new_width = width(action.label);
+        let button_width = motion::lerp(old.map_or(new_width, width), new_width, shown);
+        let label = |text, opacity| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .opacity(opacity)
+                .child(text)
+        };
+        Some(
+            div()
+                .absolute()
+                .right_0()
+                .bottom_0()
+                .h(px(self.theme.ui_px + 18.))
+                .flex()
+                .items_center()
+                .child(
+                    self.button_shell(
+                        action.control,
+                        "primary-action",
+                        true,
+                        (live, action.enabled),
+                        cx,
+                    )
+                    .relative()
+                    .w(px(button_width))
+                    .h(px(self.theme.ui_px + 18.))
+                    .child(label(action.label, if old.is_some() { shown } else { 1. }))
+                    .children(old.map(|text| label(text, 1. - shown))),
+                ),
+        )
     }
 
     fn button_shell(
@@ -747,17 +767,19 @@ impl Onboarding {
             .border_1()
             .when(control == Control::Back, |el| el.ml(px(-13.)))
             .when(primary, |el| {
-                let fill = if enabled {
-                    theme.accent
+                let (fill, text) = if enabled {
+                    (theme.accent, theme.background)
                 } else {
-                    motion::mix(theme.surface, theme.accent, 0.75)
+                    (theme.surface, theme.dimmed)
                 };
                 el.bg(rgb(fill))
-                    .text_color(rgb(theme.background))
+                    .text_color(rgb(text))
                     .font_weight(FontWeight::SEMIBOLD)
             })
             .border_color(if focused && primary {
                 rgb(theme.background).into()
+            } else if primary && !enabled {
+                rgb(theme.input_border).into()
             } else {
                 gpui::transparent_black()
             })
@@ -836,7 +858,13 @@ impl Onboarding {
             .child(
                 div()
                     .id(SharedString::from(format!("{field:?}")))
-                    .px_2p5()
+                    .map(|el| {
+                        if matches!(field, Field::Host(_) | Field::Port(_)) {
+                            el.px_1p5()
+                        } else {
+                            el.px_2p5()
+                        }
+                    })
                     .py_1p5()
                     .w_full()
                     .border_1()
@@ -953,7 +981,7 @@ impl Onboarding {
                                     .flex()
                                     .justify_between()
                                     .items_center()
-                                    .px_2p5()
+                                    .px_2()
                                     .py_1p5()
                                     .h(px(self.theme.ui_px + 20.))
                                     .border_1()
@@ -1028,14 +1056,14 @@ impl Onboarding {
             })
     }
 
-    fn check_row(&self, service: Service, pulse: f32) -> Div {
+    fn check_row(&self, service: Service, pulse: f32, measure: f32) -> Div {
         let state = &self.feedback.checks[service as usize];
+        let (offline, _, shown) = self.feedback.bridge_offline[service as usize].visible(false);
         div()
             .px_4()
             .py_3()
             .flex()
             .flex_col()
-            .gap_1()
             .bg(rgb(self.theme.surface))
             .border_1()
             .border_color(rgb(self.theme.border))
@@ -1073,15 +1101,20 @@ impl Onboarding {
                             .child(self.meta(status).whitespace_nowrap())
                     })),
             )
-            .child(
-                self.feedback.bridge_offline[service as usize]
-                    .paint(false, |offline, _| {
-                        div().when(*offline, |el| {
-                            el.child(self.error("Bridge isn't running", None))
-                        })
-                    })
-                    .min_h(px(self.theme.ui_px + 4.)),
-            )
+            .when(*offline, |card| {
+                let error = self.error("Bridge isn't running", None).pt_1();
+                if shown >= 1. {
+                    card.child(error)
+                } else {
+                    card.child(layered(
+                        (measure - 34.).max(1.),
+                        [div().into_any_element(), error.into_any_element()],
+                        [0., shown],
+                        shown,
+                        [true; 2],
+                    ))
+                }
+            })
     }
 }
 

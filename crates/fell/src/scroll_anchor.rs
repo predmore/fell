@@ -23,38 +23,22 @@ pub(super) struct ScrollAnchor {
 #[derive(Default)]
 pub(super) struct ReaderLanding {
     id: Option<String>,
-    snap_headers: bool,
 }
 
 impl ReaderLanding {
     pub fn hold(&mut self, id: Option<&str>) {
         self.id = id.map(str::to_owned);
-        self.snap_headers = false;
-    }
-
-    pub fn hold_opening(&mut self, id: Option<&str>) {
-        self.hold(id);
-        self.snap_headers = true;
-    }
-
-    pub fn snapping(&self) -> bool {
-        self.snap_headers
-    }
-
-    pub fn stop_snapping(&mut self) {
-        self.snap_headers = false;
     }
 
     pub fn anchor(
         &mut self,
         id: Option<&str>,
-        mut anchor: ScrollAnchor,
+        anchor: ScrollAnchor,
         gliding: bool,
     ) -> Option<ScrollAnchor> {
         if self.id.as_deref() != id {
             self.hold(None);
         }
-        anchor.snap_headers |= self.snap_headers;
         (!gliding && self.id.is_some()).then_some(anchor)
     }
 }
@@ -214,9 +198,9 @@ fn offset_for_body_growth(
 ) -> Pixels {
     // The cards above this header already use their eased heights. Ease
     // only the header's viewport position, then remove their full offset.
-    let target_y = item.top() - view.top() + target;
+    let target_y = item.top() + target;
     let y = from_y + (target_y - from_y) * progress;
-    offset_to_hold(view, item, y)
+    offset_to_hold(view, item, y - view.top())
 }
 
 fn offset_to_header(
@@ -591,7 +575,7 @@ mod tests {
             let ease = crate::motion::ease_out_quad(frame as f32 / 120.);
             let item = vertical_bounds(370. + 800. * ease, 100. + 600. * ease);
             let target = offset_to_hold(view, item, px(0.));
-            let offset = offset_for_body_growth(view, item, target, from_y, ease);
+            let offset = offset_for_body_growth(view, item, target, view.top() + from_y, ease);
             let y = visible_top(view, offset, item).unwrap();
             assert!(y <= previous_y, "frame {frame}: {y:?} > {previous_y:?}");
             assert!((f32::from(y) - 180. * (1. - ease)).abs() < 0.001);

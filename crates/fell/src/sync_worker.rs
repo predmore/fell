@@ -88,6 +88,7 @@ pub enum SyncEvent {
 struct PassProgress {
     last_sent: Option<Instant>,
     sent_positive: bool,
+    sent_total: bool,
 }
 
 impl PassProgress {
@@ -97,14 +98,18 @@ impl PassProgress {
         // arrival still gets through immediately; later counts share the
         // regular cadence and the final total goes in the completion event.
         let first_positive = positive && !self.sent_positive;
+        // The first header batch carries EXISTS. Publish its total even if
+        // an earlier update took the first slot in the progress cadence.
+        let first_total = report.progress.is_some() && !self.sent_total;
         let due = self
             .last_sent
             .is_none_or(|at| now.duration_since(at) >= PROGRESS_EVERY);
-        if !due && !first_positive {
+        if !due && !first_positive && !first_total {
             return None;
         }
         self.last_sent = Some(now);
         self.sent_positive |= positive;
+        self.sent_total |= report.progress.is_some();
         Some(SyncKind::Syncing {
             new_messages: report.new_messages,
             progress: report.progress.clone(),
@@ -665,6 +670,30 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn the_first_mailbox_total_is_published_between_progress_ticks() {
+        let mut pass = PassProgress::default();
+        let start = Instant::now();
+        let mut report = SyncReport {
+            new_messages: Some(61),
+            ..SyncReport::default()
+        };
+        assert!(pass.update(&report, start).is_some());
+
+        let total = fell_core::SyncProgress {
+            folder: "Inbox".into(),
+            done: 0,
+            total: 11_591,
+        };
+        report.progress = Some(total.clone());
+        let soon = start + Duration::from_millis(1);
+        assert!(matches!(
+            pass.update(&report, soon),
+            Some(SyncKind::Syncing { progress: Some(progress), .. }) if progress == total
+        ));
+        assert!(pass.update(&report, soon).is_none());
+    }
 
     #[test]
     fn arrival_after_a_copy_bypasses_the_throttle_once() {

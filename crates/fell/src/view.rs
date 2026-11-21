@@ -218,6 +218,7 @@ pub(crate) fn finish_onboarding(
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.first_preview = FirstPreview::Handoff;
         inbox.waiting_for_first_rows = true;
+        inbox.waiting_for_inbox_total = true;
         let now = inbox.motion.clock.now();
         inbox.motion.observe_header(&inbox.list_folder, None, None, now);
         inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
@@ -609,6 +610,7 @@ struct Inbox {
     setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
     first_preview: FirstPreview,
     waiting_for_first_rows: bool,
+    waiting_for_inbox_total: bool,
     status_labels: StatusLabels,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
@@ -637,6 +639,7 @@ struct Inbox {
     reveal: Reveal,
     /// Latest body-only read, applied together with its scroll correction.
     body_refresh: BodyRefresh,
+    pending_bodies: PendingBodies,
     body_landing: Option<(gpui::Pixels, Transition)>,
     /// The scroll handle has bounds for this conversation's current messages.
     conv_layout_current: bool,
@@ -705,10 +708,6 @@ struct Inbox {
     /// they scroll it. See [`Inbox::hold_landing`].
     landing: ReaderLanding,
 }
-
-/// Room kept for a body that is still being prepared: a short paragraph, so
-/// a reply does not leave a hole and a newsletter grows only downward.
-const PENDING_BODY_PX: f32 = 66.0;
 
 /// What a `G` will show, read ahead: the folder's last rows and the
 /// conversation of the last one.
@@ -837,6 +836,7 @@ impl Inbox {
             setup_exit: None,
             first_preview: FirstPreview::Off,
             waiting_for_first_rows: false,
+            waiting_for_inbox_total: false,
             status_labels: StatusLabels::default(),
             store,
             startup_crash: None,
@@ -863,6 +863,7 @@ impl Inbox {
             open_subject: String::new(),
             reveal: Reveal::Waiting,
             body_refresh: BodyRefresh::default(),
+            pending_bodies: PendingBodies::default(),
             body_landing: None,
             conv_layout_current: false,
             painted_reader: None,
@@ -1189,13 +1190,22 @@ impl Inbox {
                         if matches!(kind, SyncKind::Failed(_)) {
                             cx.global_mut::<ReplyChecks>().set_offline(true);
                         }
-                        if let SyncKind::Syncing {
+                        let active =
+                            matches!(kind, SyncKind::Connecting | SyncKind::Syncing { .. });
+                        if !active
+                            || matches!(&kind, SyncKind::Syncing {
                             progress: Some(progress),
                             ..
-                        } = &kind
-                            && progress.folder == inbox.session.roles.label("INBOX")
+                        } if progress.folder == inbox.session.roles.label("INBOX"))
                         {
-                            inbox.motion.inbox_sync_total = Some(progress.total);
+                            inbox.waiting_for_inbox_total = false;
+                        }
+                        let finishing =
+                            !active && matches!(inbox.session.sync, SyncKind::Syncing { .. });
+                        if finishing {
+                            inbox
+                                .pending_bodies
+                                .wait_for_read(inbox.conv_gen.load(Ordering::SeqCst));
                         }
                         if matches!(kind, SyncKind::Synced { .. }) {
                             cx.global_mut::<ReplyChecks>().set_offline(false);
@@ -1209,7 +1219,9 @@ impl Inbox {
                         }
                         let open_pending = inbox.first_preview.sync_changed(&kind);
                         inbox.session.apply_sync_status(kind);
-                        if wrote {
+                        if finishing && inbox.session.search.is_some() {
+                            inbox.read_selected_messages(true, cx);
+                        } else if wrote || finishing {
                             inbox.request_threads(
                                 ReadIntent {
                                     refresh_open: true,
@@ -2280,7 +2292,7 @@ impl Inbox {
                             && present::same_messages(&inbox.session.messages, &view);
                         let follow = if in_place {
                             inbox.keep_shown_text(&mut view);
-                            inbox.queue_conversation_refresh(view);
+                            inbox.queue_conversation_refresh(view, generation);
                             false
                         } else if same {
                             inbox.keep_shown_text(&mut view);
@@ -2292,6 +2304,7 @@ impl Inbox {
                             inbox.preview_padding = padding;
                             inbox.preview_laid_out = laid_out;
                             let follow = inbox.session.refresh_messages(view, bottom);
+                            inbox.finish_body_refresh(generation, true);
                             if preview {
                                 inbox.land_on_first_preview();
                             }
@@ -2300,18 +2313,14 @@ impl Inbox {
                             inbox.invalidate_conversation_layout();
                             inbox.reveal = Reveal::Waiting;
                             inbox.motion.show_thread(&mut inbox.session, view);
+                            inbox.finish_body_refresh(generation, false);
                             // Keep the initial header landing while the
                             // preview's pending bodies fill in.
-                            if automatic {
+                            if automatic
+                                || (inbox.session.cursor_awaits_body()
+                                    && inbox.pending_bodies.downloading(&inbox.session.sync))
+                            {
                                 inbox.land_on_first_preview();
-                            } else if inbox.session.cursor_awaits_body() {
-                                inbox.landing.hold_opening(
-                                    inbox
-                                        .session
-                                        .messages
-                                        .get(inbox.session.message_cursor)
-                                        .map(|message| message.id.as_str()),
-                                );
                             } else {
                                 inbox.land_on_reader();
                             }
@@ -2360,7 +2369,7 @@ impl Inbox {
         }
     }
 
-    fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>) {
+    fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>, generation: u64) {
         // Newly downloaded bodies can push the latest message below a short
         // pane. An already scrollable pane keeps the reader where they are.
         let downloaded =
@@ -2375,13 +2384,13 @@ impl Inbox {
                         && old.body_state == fell_core::BodyState::Pending
                         && old.body_state != new.body_state
                 });
-        if downloaded && self.reveal != Reveal::Preview {
+        if downloaded && self.reveal != Reveal::Preview && self.body_landing.is_none() {
             self.reveal.body_changed(
                 self.conv_layout_current
                     && present::conversation_fits(f32::from(self.conv_scroll.max_offset().height)),
             );
         }
-        self.body_refresh.messages = Some(messages);
+        self.body_refresh.messages = Some((messages, generation));
         // The new store read already consulted the cache at its accepted revision.
         self.body_refresh.rich.clear();
     }
@@ -2414,7 +2423,8 @@ impl Inbox {
         let messages = self
             .body_refresh
             .messages
-            .as_deref()
+            .as_ref()
+            .map(|(messages, _)| messages.as_slice())
             .unwrap_or(&self.session.messages);
         if messages.iter().any(|message| {
             message.id == id && matches!(message.rich, Rich::Pending | Rich::Missing)
@@ -4037,7 +4047,7 @@ impl Inbox {
         if !refresh.is_empty() {
             self.conversation_revision = self.conversation_revision.wrapping_add(1);
         }
-        if !refresh.rich.is_empty() {
+        if !refresh.rich.is_empty() && self.body_landing.is_none() {
             self.reveal.body_changed(false);
         }
         if self.reveal.pending() {
@@ -4077,22 +4087,44 @@ impl Inbox {
             };
             (height > px(0.)).then(|| f32::from(height))
         };
-        refresh.apply(&mut self.session, &mut self.motion, now, height);
-        let opened = !self.session.cursor_awaits_body() && self.landing.snapping();
-        if (opened || self.reveal.pending())
+        let generation = refresh.messages.as_ref().map(|(_, generation)| *generation);
+        let downloading = self.pending_bodies.downloading(&self.session.sync);
+        refresh.apply(
+            &mut self.session,
+            &mut self.motion,
+            now,
+            height,
+            downloading,
+        );
+        if let Some(generation) = generation {
+            self.finish_body_refresh_at(generation, true, now);
+        }
+        if self.reveal.pending()
             && self.motion.body_growth_running(now)
             && layout_current
-            && let Some(placeholder) = ScrollAnchor::capture_message(scroll, selected, usize::from(self.conv_note_slot))
-            && let Some(slide) = self.motion.motion.start(motion::FADE, now)
+            && let Some(placeholder) = ScrollAnchor::capture_message(&self.conv_scroll, selected, usize::from(self.conv_note_slot))
+            && let Some(slide) = self.motion.motion.start(motion::PANE, now)
         {
-            self.landing.stop_snapping();
-            self.body_landing = Some((placeholder.y, slide));
+            self.body_landing = Some((self.conv_scroll.bounds().top() + placeholder.y, slide));
             self.reveal.cancel_pending();
         }
         if rich_arrived && self.session.reveal_matching_quote(selected) {
             self.land_on_reader();
         }
         anchor
+    }
+
+    fn finish_body_refresh(&mut self, generation: u64, crossfade: bool) {
+        let now = self.motion.clock.now();
+        self.finish_body_refresh_at(generation, crossfade, now);
+    }
+
+    fn finish_body_refresh_at(&mut self, generation: u64, crossfade: bool, now: Instant) {
+        let animate = crossfade
+            && !matches!(self.session.sync, SyncKind::Syncing { .. })
+            && present::awaiting_bodies(&self.session.messages);
+        self.pending_bodies
+            .applied(generation, animate, self.motion.motion, now);
     }
 
     /// Once the new bodies are laid out, glide to the reader's message
@@ -4197,7 +4229,7 @@ impl Inbox {
 
     fn growing_body_landing(&mut self, now: Instant) -> Option<ScrollAnchor> {
         let (from, slide) = self.body_landing?;
-        let moving = slide.running(now) && self.motion.body_growth_running(now);
+        let moving = slide.running(now);
         if !moving {
             self.body_landing = None;
         }
@@ -4516,7 +4548,10 @@ impl Render for Inbox {
         } else {
             reveal_attachment
         };
-        let unread = (!self.waiting_for_first_rows).then(|| self.session.unread_threads());
+        let waiting_for_total = self.waiting_for_inbox_total
+            && self.session.roles.is(FolderRole::Inbox, &self.list_folder);
+        let unread = (!self.waiting_for_first_rows && !waiting_for_total)
+            .then(|| self.session.unread_threads());
         self.motion.observe_header(
             &self.list_folder,
             self.list_label.as_deref(),
@@ -4622,9 +4657,6 @@ impl Render for Inbox {
         let band = pin.map_or(px(0.), |pin| pin.height);
         let band_delta = band - self.note_band;
         self.note_band = band;
-        if let Some((from, _)) = &mut self.body_landing {
-            *from -= band_delta;
-        }
         let verify_pin = panes.1 && !self.conv_layout_current && self.note_pin.matches(pinnable);
         if band_delta != px(0.)
             && (band_delta < px(0.) || !scrolling_to_target || self.motion.conv_glide.is_some())
@@ -4685,8 +4717,20 @@ impl Render for Inbox {
                 .detach();
             }
         }
+        let preview_padding = self.preview_padding.then(|| PreviewPadding {
+            // The previous scroll bounds can still belong to a different
+            // thread, or be empty when a narrow reader has never opened.
+            // Start with an upper bound and trim the slack after layout.
+            viewport: if self.preview_laid_out {
+                self.conv_scroll.bounds().size.height
+            } else {
+                window.viewport_size().height
+            },
+            newest_height: self.preview_card_height.clone(),
+        });
         let conv = ConvFrame {
-            syncing: matches!(self.session.sync, SyncKind::Syncing { .. }),
+            syncing: self.pending_bodies.downloading(&self.session.sync),
+            missing_fade: self.pending_bodies.fade(now),
             agent_note,
             pin,
             note_details_only,
@@ -4696,10 +4740,8 @@ impl Render for Inbox {
             card_alphas: self.motion.card_alphas(now),
             alphas: self.motion.body_alphas(now),
             heights: self.motion.body_heights(now),
-            preview_padding: self.preview_padding.then(|| PreviewPadding {
-                viewport: self.conv_scroll.bounds().size.height,
-                newest_height: self.preview_card_height.clone(),
-            }),
+            outgoing_placeholders: self.motion.body_placeholders(),
+            preview_padding,
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
@@ -4735,6 +4777,8 @@ impl Render for Inbox {
             | setup_frame.is_some()
             | status_labels.outgoing.is_some()
             | status_labels.count_fade.is_some()
+            | self.body_landing.is_some()
+            | conv.missing_fade.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4979,10 +5023,12 @@ struct ConvFrame {
     hide_message_cursor: bool,
     return_glide: Option<LandingGlide>,
     syncing: bool,
+    missing_fade: Option<f32>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
-    heights: HashMap<String, (f32, f32, bool)>,
+    heights: HashMap<String, (f32, f32)>,
+    outgoing_placeholders: HashMap<String, bool>,
     preview_padding: Option<PreviewPadding>,
     disclosures: Disclosures,
     /// The message held at its previous viewport position, or at the top on open.
@@ -5686,8 +5732,9 @@ fn header(
     let count_text = |unread| format!("{} unread", grouped(unread));
     let count_width =
         |text: &str| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
-    let inbox_total = motion.inbox_sync_total;
-    let count = |unread: usize| {
+    let count = |unread: usize, room: f32| {
+        let text = count_text(unread);
+        let required = count_width(&text);
         div()
             .flex_none()
             .whitespace_nowrap()
@@ -5697,29 +5744,31 @@ fn header(
                 theme.dimmed
             }))
             .font(figures.font())
-            .child(count_text(unread))
+            .when(required > room, |count| {
+                count.text_size(px(theme.ui_px * room / required))
+            })
+            .child(text)
     };
-    let folder_group = |(folder, label): (&str, Option<&str>),
-                        unread: Option<usize>,
-                        count_fade: Option<(Option<usize>, f32)>| {
-        let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
-        let (old, shown) = count_fade.unwrap_or((None, 1.));
-        let bound = if label.is_none() && session.roles.is(FolderRole::Inbox, folder) {
-            inbox_total.map_or(888, |total| (total as usize).max(888))
-        } else {
-            888
-        };
-        let measure = |unread| count_width(&count_text(unread));
-        let count_room = count_width(&count_text(bound).replace(|c: char| c.is_ascii_digit(), "8"))
-            .max(unread.map_or(0., measure))
-            .max(old.map_or(0., measure));
-        let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
-        let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-        let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
-        let name = if label.is_some() {
-            fit(&title, name_room, FontWeight::SEMIBOLD)
-        } else {
-            fit_folder_path(
+    let folder_group =
+        |(folder, label): (&str, Option<&str>), unread: Option<usize>, count_fade: Option<(Option<usize>, f32)>| {
+            let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
+            let (old, shown) = count_fade.unwrap_or((None, 1.));
+            let inbox = label.is_none() && session.roles.is(FolderRole::Inbox, folder);
+            let measure = |unread| count_width(&count_text(unread));
+            let count_room = if inbox {
+                inbox_count_room(count_width)
+            } else {
+                measure(888)
+                    .max(unread.map_or(0., measure))
+                    .max(old.map_or(0., measure))
+            };
+            let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
+            let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
+            let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
+            let name = if label.is_some() {
+                fit(&title, name_room, FontWeight::SEMIBOLD)
+            } else {
+                fit_folder_path(
                 &title,
                 FolderFit::Header,
                 |path| {
@@ -5733,60 +5782,76 @@ fn header(
                     )
                 },
                 |line| &line.text,
-            )
-        };
-        let name_width = name
-            .as_ref()
-            .map_or(0., |line| f32::from(line.width).ceil());
-        let detail = label
-            .map(|_| "Label".into())
-            .or_else(|| session.folder_detail(folder))
-            .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
-        let detail_space = detail
-            .as_ref()
-            .map_or(0., |line| 6. + f32::from(line.width).ceil());
-        let group = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(COUNT_GAP))
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(6.))
-                    .children(name.map(|line| {
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(line.text)
-                    }))
-                    .children(detail.map(|line| {
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_color(rgb(theme.dimmed))
-                            .child(line.text)
-                    })),
-            )
-            .when(!drafts, |row| {
-                row.child(
+                )
+            };
+            let name_width = name
+                .as_ref()
+                .map_or(0., |line| f32::from(line.width).ceil());
+            let detail = label
+                .map(|_| "Label".into())
+                .or_else(|| session.folder_detail(folder))
+                .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
+            let detail_space = detail
+                .as_ref()
+                .map_or(0., |line| 6. + f32::from(line.width).ceil());
+            let group = div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(COUNT_GAP))
+                .child(
                     div()
                         .flex_none()
-                        .relative()
                         .flex()
-                        .justify_end()
-                        .w(px(count_room))
-                        .children(unread.map(|unread| count(unread).opacity(shown)))
-                        .children(old.map(|old| {
-                            count(old).absolute().right_0().top_0().opacity(1. - shown)
+                        .items_baseline()
+                        .gap(px(6.))
+                        .children(name.map(|line| {
+                            #[cfg(test)]
+                            let text = line.text.clone();
+                            let label = div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(line.text);
+                            #[cfg(test)]
+                            let label = label.when(inbox, |label| {
+                                label.on_children_prepainted(move |bounds, _, _| {
+                                    tests::INBOX_LABEL_X.with_borrow_mut(|positions| {
+                                        positions.push((bounds[0].left(), text.clone()));
+                                    });
+                                })
+                            });
+                            label
+                        }))
+                        .children(detail.map(|line| {
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_color(rgb(theme.dimmed))
+                                .child(line.text)
                         })),
                 )
-            });
-        (group, name_width + detail_space + count_space)
-    };
+                .when(!drafts, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .relative()
+                            .flex()
+                            .when(!inbox, |count| count.justify_end())
+                            .w(px(count_room))
+                            .children(unread.map(|unread| count(unread, count_room).opacity(shown)))
+                            .children(old.map(|old| {
+                                count(old, count_room)
+                                    .absolute()
+                                    .when(inbox, |count| count.left_0())
+                                    .when(!inbox, |count| count.right_0())
+                                    .top_0()
+                                    .opacity(1. - shown)
+                            })),
+                    )
+                });
+            (group, name_width + detail_space + count_space)
+        };
 
     let (current, current_width) =
         folder_group(scope, motion.header_unread(), motion.unread_count(now));
@@ -5861,6 +5926,12 @@ fn header(
                         .opacity(outgoing)
                 })),
         )
+}
+
+/// Keep the Inbox name fixed. Six digits cover large mailboxes at the
+/// normal size, and longer labels fit within the same room.
+fn inbox_count_room(measure: impl FnOnce(&str) -> f32) -> f32 {
+    measure("888,888 unread")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7401,8 +7472,43 @@ fn collapsed_sender_budget(
 /// The latest reread and accepted HTML preparations for the open thread.
 #[derive(Default)]
 struct BodyRefresh {
-    messages: Option<Vec<ConvMessage>>,
+    messages: Option<(Vec<ConvMessage>, u64)>,
     rich: HashMap<String, Rich>,
+}
+
+#[derive(Default)]
+struct PendingBodies {
+    /// A read already in flight at the end of a pass can still be stale.
+    after: Option<u64>,
+    missing: Option<Transition>,
+}
+
+impl PendingBodies {
+    fn downloading(&self, sync: &SyncKind) -> bool {
+        matches!(sync, SyncKind::Syncing { .. }) || self.after.is_some()
+    }
+
+    fn wait_for_read(&mut self, generation: u64) {
+        self.after = Some(generation);
+        self.missing = None;
+    }
+
+    fn applied(&mut self, generation: u64, animate: bool, motion: Motion, now: Instant) {
+        if self.after.is_some_and(|after| generation > after) {
+            self.after = None;
+            self.missing = if animate {
+                motion.start(motion::FADE, now)
+            } else {
+                None
+            };
+        }
+    }
+
+    fn fade(&self, now: Instant) -> Option<f32> {
+        self.missing
+            .filter(|transition| transition.running(now))
+            .map(|transition| transition.progress(now))
+    }
 }
 
 impl BodyRefresh {
@@ -7416,9 +7522,10 @@ impl BodyRefresh {
         motion: &mut InboxMotion,
         now: Instant,
         height: impl Fn(usize) -> Option<f32>,
+        downloading: bool,
     ) {
         let mut rich = self.rich;
-        if let Some(mut messages) = self.messages {
+        if let Some((mut messages, _)) = self.messages {
             for message in &mut messages {
                 if let Some(ready) = rich.remove(&message.id) {
                     message.rich = ready;
@@ -7431,9 +7538,11 @@ impl BodyRefresh {
                     .expanded
                     .then(|| height(index))
                     .flatten();
-                let pending = session.messages[index].body_state == fell_core::BodyState::Pending
-                    && messages[index].body_state == fell_core::BodyState::Stored;
-                motion.body_arrived(&messages[index].id, old_height, pending, now);
+                let placeholder = (session.messages[index].body_state
+                    == fell_core::BodyState::Pending
+                    && messages[index].body_state != fell_core::BodyState::Pending)
+                    .then_some(downloading);
+                motion.body_arrived(&messages[index].id, old_height, placeholder, now);
             }
             session.refresh_same_messages(messages);
         } else {
@@ -7442,7 +7551,7 @@ impl BodyRefresh {
                     && ready != message.rich
                 {
                     if message.expanded {
-                        motion.body_arrived(&message.id, height(index), false, now);
+                        motion.body_arrived(&message.id, height(index), None, now);
                     }
                     message.rich = ready;
                 }
@@ -7556,16 +7665,15 @@ fn conversation(
                     cx,
                 )
             } else {
-                let body = frame.body_alpha(&message.id);
                 collapsed_message(
                     theme,
                     message,
                     index,
-                    (cursor, body),
+                    cursor,
                     columns,
                     collapsed_rows
                         .get_or_init(|| CollapsedRows::new(window, theme, columns.card.width)),
-                    frame.syncing,
+                    frame,
                     live,
                     window,
                     cx,
@@ -7577,16 +7685,14 @@ fn conversation(
                 block
             };
             let block = match frame.heights.get(&message.id) {
-                Some(&(from, progress, _)) if progress < 1.0 && message.expanded => {
-                    GrowingMessage {
-                        inner: block,
-                        width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
-                        from,
-                        progress,
-                        gap: px(MESSAGE_GAP_PX),
-                    }
-                    .into_any_element()
+                Some(&(from, progress)) if progress < 1.0 && message.expanded => GrowingMessage {
+                    inner: block,
+                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                    from,
+                    progress,
+                    gap: px(MESSAGE_GAP_PX),
                 }
+                .into_any_element(),
                 _ => block,
             };
             let block =
@@ -7816,10 +7922,10 @@ fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
-    (cursor, body): (f32, f32),
+    cursor: f32,
     columns: ReaderColumns,
     rows: &CollapsedRows,
-    syncing: bool,
+    frame: &ConvFrame,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -7827,7 +7933,8 @@ fn collapsed_message(
     let now = now_unix();
     let mut date = present::relative_date(now, message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
-    let missing = present::missing_body_line(message.body_state, syncing);
+    let (body, outgoing) = frame.body_labels(message);
+    let missing = present::missing_body_line(message.body_state, frame.syncing);
     let snippet = missing.as_deref().unwrap_or(&message.snippet);
     let measure =
         |text: &str| line_px_with_style(window, &rows.style, text, FontWeight::NORMAL).ceil();
@@ -7919,27 +8026,42 @@ fn collapsed_message(
                 }),
             )
         });
-    let leading = div()
-        .flex()
-        .items_center()
-        .gap(px(rows.gap))
-        .child(
-            div()
-                .w(px(sender_w))
-                .flex_none()
-                .whitespace_nowrap()
-                .font_weight(FontWeight::MEDIUM)
-                .children(sender.map(|line| line.text)),
-        )
-        .child(
-            div()
-                .w(px(snippet_w))
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(dimmed))
-                .when(body < 1.0, |line| line.opacity(body))
-                .children(clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text)),
-        );
+    let leading =
+        div()
+            .flex()
+            .items_center()
+            .gap(px(rows.gap))
+            .child(
+                div()
+                    .w(px(sender_w))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .font_weight(FontWeight::MEDIUM)
+                    .children(sender.map(|line| line.text)),
+            )
+            .child(
+                div()
+                    .w(px(snippet_w))
+                    .flex_none()
+                    .relative()
+                    .whitespace_nowrap()
+                    .text_color(rgb(dimmed))
+                    .child(div().opacity(body).children(
+                        clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text),
+                    ))
+                    .children(
+                        outgoing
+                            .and_then(|line| clip(&line, snippet_w, FontWeight::NORMAL))
+                            .map(|line| {
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .opacity(1. - body)
+                                    .child(line.text)
+                            }),
+                    ),
+            );
     message_date_row(
         row,
         rows.gap,
@@ -8300,20 +8422,14 @@ fn message_body(
     frame: &ConvFrame,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let alpha = frame.body_alpha(&message.id);
-    if let Some(line) = present::missing_body_line(message.body_state, frame.syncing) {
-        return missing_message_body(theme, folds.columns, &line, alpha);
-    }
-    let arriving = frame
-        .heights
-        .get(&message.id)
-        .is_some_and(|&(_, _, pending)| pending);
-    if !arriving || alpha >= 1.0 {
-        return stored_message_body(theme, message, folds, frame, alpha, cx);
-    }
-    let body = stored_message_body(theme, message, folds, frame, alpha, cx);
-    let line = present::missing_body_line(fell_core::BodyState::Pending, frame.syncing)
-        .expect("pending messages always have a placeholder");
+    let (alpha, outgoing) = frame.body_labels(message);
+    let body = match present::missing_body_line(message.body_state, frame.syncing) {
+        Some(line) => missing_message_body(theme, folds.columns, &line, alpha),
+        None => stored_message_body(theme, message, folds, frame, alpha, cx),
+    };
+    let Some(line) = outgoing else {
+        return body;
+    };
     div()
         .relative()
         .child(body)
@@ -8324,6 +8440,28 @@ fn message_body(
             1.0 - alpha,
         )))
         .into_any_element()
+}
+
+impl ConvFrame {
+    fn body_labels(&self, message: &ConvMessage) -> (f32, Option<String>) {
+        use fell_core::BodyState::Pending;
+
+        let (alpha, was_downloading) = if message.body_state == Pending
+            && !self.syncing
+            && let Some(alpha) = self.missing_fade
+        {
+            (alpha, Some(true))
+        } else {
+            (
+                self.body_alpha(&message.id),
+                self.outgoing_placeholders.get(&message.id).copied(),
+            )
+        };
+        let outgoing = was_downloading
+            .filter(|_| alpha < 1.)
+            .and_then(|downloading| present::missing_body_line(Pending, downloading));
+        (alpha, outgoing)
+    }
 }
 
 fn missing_message_body(
@@ -8363,8 +8501,10 @@ fn stored_message_body(
     }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
         Rich::Html(_) => unreachable!(),
-        Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
-        Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
+        Rich::Pending if message.body.blocks.is_empty() => {
+            return missing_message_body(theme, folds.columns, "Preparing message…", alpha);
+        }
+        Rich::Pending | Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
             let palette = mail_body::palette(theme);
@@ -8987,12 +9127,11 @@ impl StatusLabel {
         let figures = tabular_style(window, theme, size);
         let figure_width =
             |text| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
-        let count_room =
-            figure_width(done).max(fading_count.map_or(0., |(old, _)| figure_width(old)));
+        let count_room = figure_width(total)
+            .max(figure_width(done))
+            .max(fading_count.map_or(0., |(old, _)| figure_width(old)));
         let suffix_width = bar_px(window, suffix, size, ui).ceil();
-        // Keep the prefix through the whole download, even as its count
-        // gains digits. Only its fitting decision needs the wider measure.
-        let prefix_room = room - count_room.max(figure_width(total)) - suffix_width;
+        let prefix_room = room - count_room - suffix_width;
         let short;
         let prefix = if bar_px(window, prefix, size, ui).ceil() > prefix_room {
             short = format!("Downloading {total} · ");
@@ -10235,12 +10374,17 @@ impl<T: Styled> FontOpt for T {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        pub(super) static INBOX_LABEL_X: std::cell::RefCell<Vec<(gpui::Pixels, gpui::SharedString)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
     use super::{
         FIRST_PREVIEW_WAIT, FirstPreview, FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX,
         MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns, account_header, collapsed_sender_budget,
         ctrl_letter, expanded_header_flow, expanded_header_widths, fit_folder_path, key_from,
-        message_content_width, picker_card_height, should_follow_visible,
-        unread_bar_dx, useful_header_email, write_back_notice,
+        message_content_width, picker_card_height, should_follow_visible, unread_bar_dx,
+        useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::{Overlay, SyncKind};
@@ -10712,18 +10856,199 @@ mod tests {
     }
 
     #[test]
+    fn final_body_refresh_crossfades_only_bodies_still_missing() {
+        use super::{BodyRefresh, ConvFrame, InboxMotion, PendingBodies, Session};
+        use crate::{fixtures, keymap::Keymap, present};
+        use fell_core::{BodyState, FolderRoles, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let account = fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        fixtures::seed_if_empty(&store, &account).unwrap();
+        let id = &store.list_threads(&account.id).unwrap()[0].thread_id;
+        let mut stored = super::read_conversation(
+            &store,
+            &account.id,
+            id,
+            (&account.email, &FolderRoles::default(), &[], "INBOX"),
+        )
+        .unwrap()
+        .remove(0);
+        stored.expanded = true;
+        let mut missing = stored.clone();
+        missing.id = "missing@demo.test".into();
+        missing.body_state = BodyState::Pending;
+        let mut was_pending = stored.clone();
+        was_pending.body_state = BodyState::Pending;
+        let mut session = Session::new(
+            String::new(),
+            account.email,
+            SyncKind::LocalOffline,
+            Keymap::default(),
+        );
+        session.set_messages(vec![missing.clone(), was_pending]);
+
+        let now = Instant::now();
+        let mut motion = InboxMotion::new(motion::Motion::new(true));
+        let mut pending = PendingBodies::default();
+        pending.wait_for_read(7);
+        pending.applied(7, true, motion.motion, now);
+        assert!(
+            pending.downloading(&session.sync),
+            "the old read cannot settle the pass"
+        );
+        assert_eq!(
+            present::missing_body_line(missing.body_state, pending.downloading(&session.sync))
+                .as_deref(),
+            Some("Downloading…")
+        );
+        assert!(pending.fade(now).is_none());
+
+        BodyRefresh {
+            messages: Some((vec![missing, stored], 8)),
+            ..BodyRefresh::default()
+        }
+        .apply(
+            &mut session,
+            &mut motion,
+            now,
+            |_| Some(100.),
+            pending.downloading(&SyncKind::LocalOffline),
+        );
+        pending.applied(
+            8,
+            present::awaiting_bodies(&session.messages),
+            motion.motion,
+            now,
+        );
+        let frames = |at| ConvFrame {
+            syncing: pending.downloading(&session.sync),
+            missing_fade: pending.fade(at),
+            alphas: motion.body_alphas(at),
+            heights: motion.body_heights(at),
+            outgoing_placeholders: motion.body_placeholders(),
+            ..ConvFrame::default()
+        };
+        let first = frames(now);
+        let [missing, ready] = &session.messages[..] else {
+            panic!("two messages")
+        };
+        assert_eq!(
+            first.body_labels(missing),
+            (0., Some("Downloading…".into()))
+        );
+        assert_eq!(first.body_labels(ready), (0., Some("Downloading…".into())));
+        assert_eq!(first.heights[&ready.id], (100., 0.));
+        let next = frames(now + Duration::from_millis(16));
+        assert_eq!(next.body_labels(ready).0, next.heights[&ready.id].1);
+        assert!(next.body_labels(ready).0 > 0.);
+        assert!(next.body_labels(missing).0 > 0.);
+        assert!(!next.heights.contains_key(&missing.id));
+        let settled = frames(now + motion::FADE);
+        assert_eq!(settled.body_labels(missing), (1., None));
+        assert_eq!(
+            present::missing_body_line(missing.body_state, settled.syncing).as_deref(),
+            Some("Not downloaded yet")
+        );
+        assert_eq!(
+            present::missing_body_line(ready.body_state, settled.syncing),
+            None
+        );
+    }
+
+    #[test]
     #[ignore = "requires an isolated nested Wayland compositor"]
-    fn opening_landings_use_the_real_conversation_end_probe() {
-        use std::cell::Cell;
+    fn inbox_label_stays_put_with_late_total_and_growing_counts() {
+        use crate::{keymap::Keymap, model::Session};
+        use gpui::{App, Context, Render, Window, prelude::*, px};
+
+        require_nested_wayland();
+
+        struct Headers(Session, crate::theme::Theme);
+        impl Render for Headers {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let now = Instant::now();
+                div().flex().flex_col().children([360., 980.].map(|width| {
+                    let mut motion = super::InboxMotion::new(motion::Motion::new(true));
+                    div().w(px(width)).children(
+                        [
+                            None,
+                            Some(61),
+                            Some(1061),
+                            Some(7727),
+                            Some(u32::MAX as usize),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(step, unread)| {
+                            let at = now + Duration::from_millis(step as u64 * 140);
+                            motion.observe_header("INBOX", unread, at);
+                            super::header(
+                                &self.1,
+                                &self.0,
+                                "INBOX",
+                                &mut motion,
+                                at + Duration::from_millis(60),
+                                width,
+                                window,
+                            )
+                        }),
+                    )
+                }))
+            }
+        }
+
+        gpui::Application::new().run(|cx: &mut App| {
+            let window = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|_| {
+                        Headers(
+                            Session::new(
+                                "Robin Ellis",
+                                "robin@demo.test",
+                                SyncKind::LocalOffline,
+                                Keymap::default(),
+                            ),
+                            crate::theme::load(),
+                        )
+                    })
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update(|cx| {
+                    window
+                        .update(cx, |_, window, cx| {
+                            window.defer(cx, |window, cx| {
+                                INBOX_LABEL_X.with_borrow_mut(Vec::clear);
+                                window.draw(cx).clear();
+                                INBOX_LABEL_X.with_borrow(|positions| {
+                                    assert_eq!(positions.len(), 10);
+                                    for width in positions.as_chunks::<5>().0 {
+                                        assert!(width[0].0 > px(0.));
+                                        assert!(
+                                            width.iter().all(|(x, text)| *x == width[0].0
+                                                && text.as_ref() == "Inbox"),
+                                            "{width:?}"
+                                        );
+                                    }
+                                });
+                                cx.quit();
+                            });
+                        })
+                        .unwrap();
+                })
+                .unwrap();
+            })
+            .detach();
+        });
+    }
+
+    fn require_nested_wayland() {
         use std::os::unix::fs::FileTypeExt;
         use std::path::PathBuf;
-        use std::rc::Rc;
-
-        use super::{
-            MessageProbes, PreviewPadding, ReaderLanding, ScrollAnchor, conversation_body,
-        };
-        use gpui::{App, Context, IntoElement, Render, ScrollHandle, Window, div, prelude::*, px};
-
         let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
         let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
         assert_eq!(
@@ -10733,6 +11058,19 @@ mod tests {
         assert!(display.is_absolute() && display.parent() == Some(runtime.as_path()));
         assert!(display.metadata().unwrap().file_type().is_socket());
         assert!(std::env::var_os("DISPLAY").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated nested Wayland compositor"]
+    fn opening_landings_use_the_real_conversation_end_probe() {
+        use super::{
+            MessageProbes, PreviewPadding, ReaderLanding, ScrollAnchor, conversation_body,
+        };
+        use gpui::{App, Context, IntoElement, Render, ScrollHandle, Window, div, prelude::*, px};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        require_nested_wayland();
 
         struct Case {
             heights: &'static [f32],
@@ -10753,7 +11091,7 @@ mod tests {
                         let mut landing = ReaderLanding::default();
                         landing.hold(Some("newest"));
                         let padding = case.automatic.then(|| PreviewPadding {
-                            viewport: px(300.),
+                            viewport: px(340.),
                             newest_height: case.newest_height.clone(),
                         });
                         let anchor = landing
@@ -10812,7 +11150,8 @@ mod tests {
                         Landings(
                             [
                                 (&[160., 90., 200., 80.][..], true, false, Some(3)),
-                                (&[160., 90., 200., 68.][..], false, true, Some(2)),
+                                (&[160., 90., 200., 68.][..], true, false, Some(3)),
+                                (&[390., 430., 640., 230.][..], true, false, Some(3)),
                                 (&[60., 80.][..], true, false, Some(1)),
                                 (&[160., 400.][..], true, false, Some(1)),
                                 (&[60., 280., 40.][..], false, true, None),
