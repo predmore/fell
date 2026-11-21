@@ -2,6 +2,8 @@
 
 pub mod agents;
 pub mod search;
+mod notes;
+pub use notes::{AgentNotes, NoteRequest, SUGGESTIONS_QUERY};
 
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -336,6 +338,9 @@ pub struct ReadDwell {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Step {
+    pub note: Option<NoteRequest>,
+    pub note_scroll: i8,
+
     pub action: Option<Action>,
     pub reload_threads: bool,
     pub reload_messages: bool,
@@ -443,6 +448,7 @@ pub struct Session {
     pub full_width: bool,
     reading_return_pane: Pane,
     pub messages: Vec<ConvMessage>,
+    pub agent_notes: AgentNotes,
     pub message_cursor: usize,
     attachment_focus: Option<AttachmentTarget>,
     confirm_attachment: Option<(AttachmentTarget, u64)>,
@@ -541,6 +547,7 @@ impl Session {
             full_width: false,
             reading_return_pane: Pane::List,
             messages: Vec::new(),
+            agent_notes: AgentNotes::default(),
             message_cursor: 0,
             attachment_focus: None,
             confirm_attachment: None,
@@ -1952,6 +1959,14 @@ impl Session {
                     };
                 }
             }
+            if self.focused_attachment().is_none()
+                && let Some(note) = self.accept_note_key(key)
+            {
+                return Step {
+                    note: Some(note),
+                    ..Step::default()
+                };
+            }
             match key {
                 KeyId::Up => {
                     step.scroll_lines = -signed_count(self.take_count());
@@ -2301,6 +2316,7 @@ impl Session {
                     | Action::Agents
                     | Action::OpenDiagnosticLog
                     | Action::OpenCrashReport
+                    | Action::ThreadsWithSuggestions
             )
         {
             self.count.clear();
@@ -2343,6 +2359,20 @@ impl Session {
             return step;
         }
         match action {
+            Action::ThreadsWithSuggestions => {
+                let step = self.start_search(Some(SUGGESTIONS_QUERY.into()));
+                self.search.as_mut().expect("search started").editing = false;
+                return step;
+            }
+            Action::ToggleAgentNote
+            | Action::DismissAgentNote
+            | Action::NextAgentNote
+            | Action::ScrollAgentNoteDown
+            | Action::ScrollAgentNoteUp
+            | Action::AcceptAgentSuggestion => {
+                self.count.clear();
+                return self.note_action(action);
+            }
             Action::Search => return self.start_search(None),
             Action::NextHit | Action::PreviousHit => {
                 let count = self.take_count();
@@ -3825,6 +3855,59 @@ mod tests {
         }
         eprintln!("500 labels, slowest model keystroke: {slowest:?}");
         assert_eq!(session.picker_choices()[0].name, "Project 427");
+    }
+
+    #[test]
+    fn note_shortcuts_accept_only_the_shown_note_and_only_from_the_conversation() {
+        use fell_core::notes::{NoteDecision, PendingSuggestion, Suggestion, ThreadNote};
+
+        let mut session = session();
+        let shown = ThreadNote {
+            id: 41,
+            actor: "review".into(),
+            created_unix: 10,
+            summary: "A summary".into(),
+            suggestions: vec![
+                PendingSuggestion {
+                    position: 0,
+                    action: Suggestion::Label("Work".into()),
+                },
+                PendingSuggestion {
+                    position: 1,
+                    action: Suggestion::Label("Follow up".into()),
+                },
+                PendingSuggestion {
+                    position: 2,
+                    action: Suggestion::Reply,
+                },
+            ],
+        };
+        let thread = session.cursor_id.clone().unwrap();
+        session
+            .agent_notes
+            .update(Some(thread.clone()), vec![shown.clone()]);
+        assert!(session.on_key(KeyId::Char('l'), 10).note.is_none());
+        session.pane = Pane::Conversation;
+        let first = session.on_key(KeyId::Char('l'), 10).note.unwrap();
+        assert_eq!(
+            (first.id, first.decision, first.reply),
+            (41, NoteDecision::Accept(0), false)
+        );
+        let second = session.on_key(KeyId::Char('L'), 10).note.unwrap();
+        assert_eq!(second.decision, NoteDecision::Accept(1));
+        let reply = session.on_key(KeyId::Char('r'), 10).note.unwrap();
+        assert!(reply.reply);
+        session.agent_notes.resolved(&first);
+        assert_eq!(session.note().unwrap().suggestions.len(), 2);
+        session.perform(Action::ToggleAgentNote, 10);
+        assert!(session.on_key(KeyId::Char('l'), 10).note.is_none());
+        let dismiss = session.perform(Action::DismissAgentNote, 10).note.unwrap();
+        assert_eq!(dismiss.decision, NoteDecision::Dismiss);
+        session.agent_notes.resolved(&dismiss);
+        assert!(session.note().is_none());
+        session.agent_notes.update(Some(thread), vec![shown]);
+        session.cursor_id = Some("b".into());
+        assert!(session.perform(Action::DismissAgentNote, 10).note.is_none());
     }
 
     fn attachment_message(expanded: bool) -> ConvMessage {

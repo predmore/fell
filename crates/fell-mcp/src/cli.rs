@@ -17,10 +17,10 @@ fell-mcp — local MCP server for Fell
 There is no send tool. Agents are off until granted a scope.
 
 Usage:
-  fell-mcp add HARNESS [--read] [--triage] [--draft] [--write | --print]
+  fell-mcp add HARNESS [--read] [--triage] [--draft] [--annotate] [--write | --print]
   fell-mcp list
   fell-mcp revoke AGENT [--account ID]
-  fell-mcp grant  AGENT --read [--triage] [--draft] [--account ID]
+  fell-mcp grant  AGENT [--read] [--triage] [--draft] [--annotate] [--account ID]
   fell-mcp serve  --account ID --agent ID [--store PATH]
   fell-mcp --version
 
@@ -35,6 +35,7 @@ Scopes:
   --triage   label, move, archive, star, mark_read, mark_unread, snooze,
              unsnooze, and undo of those
   --draft    create_draft, list_drafts, and undo of those
+  --annotate annotate_thread and undo of agent notes
 
 Every command uses Fell's mailbox ($FELL_STORE, else
 $XDG_DATA_HOME/fell/mail.db) unless --store is given, and the only account
@@ -191,13 +192,14 @@ struct Opts {
     read: bool,
     triage: bool,
     draft: bool,
+    annotate: bool,
     write: bool,
     print: bool,
 }
 
 impl Opts {
     fn any_scope(&self) -> bool {
-        self.read || self.triage || self.draft
+        self.read || self.triage || self.draft || self.annotate
     }
 }
 
@@ -252,6 +254,7 @@ fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
             "--read" => opts.read = true,
             "--triage" => opts.triage = true,
             "--draft" => opts.draft = true,
+            "--annotate" => opts.annotate = true,
             "--write" => opts.write = true,
             "--print" => opts.print = true,
             "--store" => opts.store = Some(PathBuf::from(value("--store")?)),
@@ -297,7 +300,7 @@ fn parse(args: &[OsString]) -> Result<(Command, Opts), CliError> {
             take_agent(&mut opts)?;
             if command == Command::Grant && !opts.any_scope() {
                 return Err(CliError::new(
-                    "grant needs at least one of --read, --triage, --draft",
+                    "grant needs at least one of --read, --triage, --draft, --annotate",
                 ));
             }
             if command == Command::Revoke && opts.any_scope() {
@@ -485,6 +488,7 @@ fn scope_names(grant: AgentGrant) -> String {
         (grant.read, "read"),
         (grant.triage, "triage"),
         (grant.draft, "draft"),
+        (grant.annotate, "annotate"),
     ]
     .into_iter()
     .filter_map(|(on, name)| on.then_some(name))
@@ -560,7 +564,7 @@ fn add(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
     let (store_path, store) = open_store(opts, io)?;
     let account = resolve_account(&store, opts.account.as_deref(), io)?;
     let grant = if opts.any_scope() {
-        AgentGrant::enabled(opts.read, opts.triage, opts.draft)
+        AgentGrant::enabled(opts.read, opts.triage, opts.draft).with_annotation(opts.annotate)
     } else if io.tty {
         let read = ask(io, &format!("Let {agent} search and read your mail?"), true)?;
         let draft = ask(
@@ -751,7 +755,8 @@ fn grant(opts: &Opts, io: &mut Io<'_>) -> Result<(), CliError> {
         Some(id) => AccountId(id.clone()),
         None => resolve_account(&store, None, io)?.id,
     };
-    let grant = AgentGrant::enabled(opts.read, opts.triage, opts.draft);
+    let grant =
+        AgentGrant::enabled(opts.read, opts.triage, opts.draft).with_annotation(opts.annotate);
     store
         .set_agent_grant(&account, agent, grant)
         .map_err(store_err)?;

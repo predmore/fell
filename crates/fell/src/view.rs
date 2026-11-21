@@ -1,5 +1,6 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod agent_notes;
 mod agents;
 mod attachment_actions;
 mod attachment_chips;
@@ -469,6 +470,8 @@ struct Inbox {
     attachment_download: Option<(String, String, Download)>,
     reveal_attachment: bool,
     forwarding_attachments: bool,
+    note_view: agent_notes::NoteView,
+    note_in_flight: Option<i64>,
     session: Session,
     theme: Theme,
     list_scroll: UniformListScrollHandle,
@@ -644,6 +647,8 @@ impl Inbox {
             attachment_download: None,
             reveal_attachment: false,
             forwarding_attachments: false,
+            note_view: agent_notes::NoteView::default(),
+            note_in_flight: None,
             session,
             store,
             startup_crash: None,
@@ -711,6 +716,7 @@ impl Inbox {
         inbox.watch_store_restarts(store_restarts, cx);
         inbox.watch_theme(cx);
         inbox.watch_reviews(cx);
+        inbox.watch_notes(cx);
         inbox.watch_dates(cx);
         inbox
     }
@@ -1549,6 +1555,7 @@ impl Inbox {
                                         frame: still_frame(&chunk[index], window),
                                         previous_labels: None,
                                         label_scope: None,
+                                        unread_note: false,
                                     };
                                     thread_row(
                                         &row_theme,
@@ -1864,6 +1871,7 @@ impl Inbox {
     fn settle_motion(&mut self) {
         self.reveal.cancel_pending();
         let now = self.motion.clock.now();
+        self.note_view.settle();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
         self.agents_motion.settle();
@@ -1950,7 +1958,8 @@ impl Inbox {
                                     .unwrap_or_default(),
                             )
                         });
-                        (view, reads, matches)
+                        let notes = store.thread_notes(&account, &thread).ok();
+                        (view, reads, matches, notes)
                     })
                     .map_err(|err| err.to_string()),
             )
@@ -1967,7 +1976,7 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok((view, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
+                    Ok((view, _, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
                         // A hit may disappear between the two reads. Search
                         // has its own list, so a folder read cannot replace it.
                         inbox.clear_open_message();
@@ -1977,7 +1986,9 @@ impl Inbox {
                             inbox.refresh_search(cx);
                         }
                     }
-                    Ok((view, _, _)) if view.is_empty() && !inbox.session.messages.is_empty() => {
+                    Ok((view, _, _, _))
+                        if view.is_empty() && !inbox.session.messages.is_empty() =>
+                    {
                         // The open thread key can disappear between the folder
                         // and message reads. Keep the conversation until a
                         // folder read confirms where its messages belong.
@@ -1985,7 +1996,10 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                     }
-                    Ok((mut view, reads, matches)) => {
+                    Ok((mut view, reads, matches, notes)) => {
+                        if let Some(notes) = notes {
+                            inbox.session.agent_notes.update(Some(id.clone()), notes);
+                        }
                         inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
@@ -3069,7 +3083,12 @@ impl Inbox {
     /// `r`, `R`, `f`: start a reply, reply all, or forward of the message
     /// the model picked, and bring the compose window up on it. The parent
     /// is read on the store thread and the draft is written off this one.
-    fn start_reply(&mut self, kind: ReplyKind, cx: &mut Context<Self>) {
+    fn start_reply(
+        &mut self,
+        kind: ReplyKind,
+        suggestion: Option<crate::model::NoteRequest>,
+        cx: &mut Context<Self>,
+    ) {
         let forwarding = kind == ReplyKind::Forward;
         if forwarding && (self.forwarding_attachments || self.attachment_busy) {
             self.session
@@ -3101,6 +3120,9 @@ impl Inbox {
             );
             return;
         };
+        if let Some(note) = &suggestion {
+            self.note_in_flight = Some(note.id);
+        }
         self.session.show_toast(reply_notice(kind, &sender), false);
         self.forwarding_attachments |= forwarding;
         let notice = self.session.toast_generation();
@@ -3122,6 +3144,7 @@ impl Inbox {
             }
         });
         cx.spawn(async move |this, cx| {
+            let reply_note = suggestion.clone();
             let result = match read.await {
                 Ok(Ok((Some(mut parent), parts))) => {
                     let mut files = Vec::new();
@@ -3147,9 +3170,14 @@ impl Inbox {
                     }
                     let hub = hub.clone();
                     cx.background_executor()
-                        .spawn(
-                            async move { home.new_reply_with_files(&hub, &account, start, files) },
-                        )
+                        .spawn(async move {
+                            match reply_note {
+                                Some(note) => {
+                                    home.new_suggested_reply(&hub, &account, start, &note)
+                                }
+                                None => home.new_reply_with_files(&hub, &account, start, files),
+                            }
+                        })
                         .await
                 }
                 Ok(Ok((None, _))) => Err("the message is no longer in the mailbox".to_string()),
@@ -3162,11 +3190,18 @@ impl Inbox {
                 }
                 match result {
                     Ok(id) => {
+                        if let Some(note) = suggestion {
+                            inbox.note_in_flight = None;
+                            inbox.session.agent_notes.resolved(&note);
+                        }
                         if crate::draft_host::show_draft(&hub, &id) {
                             inbox.settle_opening_notice(notice, cx);
                         }
                     }
                     Err(err) => {
+                        if suggestion.is_some() {
+                            inbox.note_in_flight = None;
+                        }
                         let what = if kind == ReplyKind::Forward {
                             "start the forward"
                         } else {
@@ -3417,6 +3452,12 @@ impl Inbox {
             self.session
                 .show_toast("The conversation is still loading", false);
         }
+        if let Some(note) = step.note {
+            self.choose_agent_note(note, cx);
+        }
+        if step.note_scroll != 0 {
+            self.note_view.scroll(step.note_scroll);
+        }
         if step.retry_attachment {
             if let Some(request) = self.attachment_retry.clone() {
                 self.start_attachment_action(request, false, cx);
@@ -3488,7 +3529,7 @@ impl Inbox {
             self.open_draft(Some(id), cx);
         }
         if let Some(kind) = step.reply {
-            self.start_reply(kind, cx);
+            self.start_reply(kind, None, cx);
         }
         if step.sync_now {
             match &self.sync {
@@ -4046,7 +4087,19 @@ impl Render for Inbox {
             }
         };
         let anchor = anchor.or_else(layout_anchor);
+        let note = self
+            .session
+            .agent_notes
+            .current(self.open_thread.as_deref());
+        self.note_view.observe(
+            self.open_thread.as_deref(),
+            note,
+            self.session.agent_notes.collapsed,
+            &self.motion.motion,
+            now,
+        );
         let conv = ConvFrame {
+            agent_note: self.note_view.frame(now),
             alphas: self.motion.body_alphas(now),
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: self.hold_landing().or(anchor),
@@ -4064,6 +4117,7 @@ impl Render for Inbox {
             now,
         );
         let animating = self.motion.tick(now)
+            | self.note_view.running(now)
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4286,6 +4340,7 @@ struct ListContent {
 /// What the conversation's bodies show this frame beyond the session.
 #[derive(Default)]
 struct ConvFrame {
+    agent_note: Option<agent_notes::NoteFrame>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     disclosures: Disclosures,
@@ -5260,6 +5315,7 @@ fn thread_list(
                             frame,
                             previous_labels,
                             label_scope: inbox.list_label.clone(),
+                            unread_note: inbox.session.agent_notes.unread.contains(&row.id),
                         };
                         let element =
                             thread_row(&theme_for_rows, &row, index, &look, text_width, window, cx);
@@ -5301,6 +5357,7 @@ fn thread_list(
                                         frame: still_frame(row, window),
                                         previous_labels: None,
                                         label_scope: inbox.list_label.clone(),
+                                        unread_note: inbox.session.agent_notes.unread.contains(&row.id),
                                     };
                                     Some(slot_layer(dy, 1.0).child(thread_row(
                                         &theme_for_rows,
@@ -5500,6 +5557,7 @@ fn ghost_row(
         frame: still_frame(&row, window),
         previous_labels: None,
         label_scope,
+        unread_note: false,
     };
     slot_layer(motion::snap(top, window.scale_factor()), opacity)
         .child(thread_row(
@@ -5540,6 +5598,7 @@ struct RowLook {
     frame: RowFrame,
     previous_labels: Option<(Vec<String>, f32)>,
     label_scope: Option<String>,
+    unread_note: bool,
 }
 
 /// The list's left border, which the unread bars sit just inside.
@@ -5683,6 +5742,7 @@ fn thread_line_one(
         - count_width
         - attachment_width
         - STAR_SLOT
+        - agent_notes::MARKER_SLOT
         - 2.0 * THREAD_LINE_GAP)
         .max(0.0);
     let labels = if row.labels.is_empty() && look.previous_labels.is_none() {
@@ -5746,6 +5806,7 @@ fn thread_line_one(
                 })
                 .children(labels.map(|(group, _)| group)),
         )
+        .child(agent_notes::marker(theme, selected, look.unread_note).mr(px(-THREAD_LINE_GAP)))
         // A fixed slot every row keeps, so starring never moves the line.
         // The star fades in as it grows to full size, and out as it shrinks.
         .child(
@@ -6856,6 +6917,16 @@ fn conversation(
                             )),
                     ),
             )
+        })
+        .when(!session.messages.is_empty(), |pane| {
+            pane.child(agent_notes::slot(
+                theme,
+                session,
+                columns,
+                frame.agent_note.as_ref(),
+                live,
+                cx,
+            ))
         })
         .child(match leaving {
             Some((reader, _)) => div()

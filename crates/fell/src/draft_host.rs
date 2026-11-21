@@ -216,6 +216,40 @@ impl DraftHome {
         Ok(id)
     }
 
+    pub fn new_suggested_reply(
+        &self,
+        hub: &DraftHub,
+        account: &AccountId,
+        start: ReplyStart,
+        note: &crate::model::NoteRequest,
+    ) -> Result<String, String> {
+        let fell_core::notes::NoteDecision::Accept(position) = note.decision else {
+            return Err("The agent note changed".into());
+        };
+        let id = new_draft_id();
+        fell_core::Store::open(&self.store)
+            .and_then(|store| {
+                store.save_suggested_reply(
+                    &StoredCompose {
+                        id: id.clone(),
+                        account_id: account.clone(),
+                        fields: start.fields,
+                        body: String::new(),
+                        files: Vec::new(),
+                        identities: Vec::new(),
+                        owner: String::new(),
+                        reply: start.parts,
+                    },
+                    &fell_core::ThreadId(note.thread.clone()),
+                    note.id,
+                    position,
+                )
+            })
+            .map_err(|err| err.to_string())?;
+        self.open(hub, &id, account)?;
+        Ok(id)
+    }
+
     /// Make draft `id` live in `hub` as the mailbox holds it. Its folder is
     /// written from the mailbox row first: the row is Fell's own copy, while
     /// anything on the machine may have changed the folder since the draft

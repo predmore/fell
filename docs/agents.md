@@ -4,12 +4,18 @@ Fell does not build its own agent, model loop, or prompt harness. It plugs into 
 
 ## How Fell connects
 
-1. **Fell exposes mail as tools over MCP** (`fell-mcp`, stdio). Any harness can add Fell as an MCP server and get search, read, triage and draft tools within the scopes the user granted. This is the v1 surface (M4).
+1. **Fell exposes mail as tools over MCP** (`fell-mcp`, stdio). Any harness can add Fell as an MCP server and get search, read, triage, annotation, and draft tools within the scopes the user granted. This is the v1 surface (M4).
 2. **Fell hosts harnesses over ACP** (Agent Client Protocol, the open protocol Zed uses for external agents). The in-app agent panel is an ACP client: it starts the user's chosen harness as a subprocess, streams its messages and tool calls into the panel, and passes `fell-mcp` to the session as its MCP server. Where a harness has no ACP adapter, use that harness's own SDK or app-server protocol behind the same internal `AgentHost` trait. Fell never calls a model API directly for agent work.
 3. Harness choice, binary path and auth belong to the harness. Fell stores only which harness to launch and the per-agent mail scopes. Fell never sees or stores model API keys.
 4. The panel stays after v1, as in scope.md, but the design is fixed now: ACP client plus fell-mcp, and no in-house agent loop. The `AgentHost` trait lives in a UI-free crate so other front ends can reuse it.
 
 Licensing: ACP's Rust crate (`agent-client-protocol`) is Apache-2.0, so it's fine to depend on. Do not copy GPL code from Zed's agent UI.
+
+## Thread notes
+
+Grant an agent the `annotate` scope with `fell-mcp grant AGENT --annotate`. Include any other scope flags the agent should retain. The scope starts off. `annotate_thread` takes a thread ID, a reason for the action log, and a plain-text summary of up to 1,024 UTF-8 bytes, suggested actions, or both. An agent's newest note replaces its previous note on the thread.
+
+Suggestions can be `archive`, `label:NAME`, `reply`, `snooze:UNIX_SECONDS`, `mark_read`, or `star`. The conversation attributes the note to the agent and shows the keys for the user to accept a suggestion. A suggested reply opens a normal draft. Undo restores the suggestion and keeps that draft and any edits. Fell displays note text as untrusted data and only acts on a suggestion when the user accepts it.
 
 ## Email content is never trusted
 

@@ -81,6 +81,13 @@ pub enum Action {
     UndoAgentRevoke,
     OpenDiagnosticLog,
     OpenCrashReport,
+    ToggleAgentNote,
+    DismissAgentNote,
+    NextAgentNote,
+    ScrollAgentNoteDown,
+    ScrollAgentNoteUp,
+    AcceptAgentSuggestion,
+    ThreadsWithSuggestions,
 }
 
 impl Action {
@@ -140,15 +147,22 @@ impl Action {
             Self::UndoAgentRevoke => "Undo agent revoke",
             Self::OpenDiagnosticLog => "Open diagnostic log",
             Self::OpenCrashReport => "Open crash report",
+            Self::ToggleAgentNote => "Expand or collapse agent note",
+            Self::DismissAgentNote => "Dismiss agent note",
+            Self::NextAgentNote => "Next agent note",
+            Self::ScrollAgentNoteDown => "Scroll agent note down",
+            Self::ScrollAgentNoteUp => "Scroll agent note up",
+            Self::AcceptAgentSuggestion => "Accept first agent suggestion",
+            Self::ThreadsWithSuggestions => "Threads with suggestions",
         }
     }
 
     pub fn all() -> &'static [Action] {
-        &ALL_ACTIONS
+        ALL_ACTIONS
     }
 }
 
-const ALL_ACTIONS: [Action; 50] = [
+const ALL_ACTIONS: &[Action] = &[
     Action::Next,
     Action::Prev,
     Action::First,
@@ -198,6 +212,13 @@ const ALL_ACTIONS: [Action; 50] = [
     Action::Agents,
     Action::OpenDiagnosticLog,
     Action::OpenCrashReport,
+    Action::ToggleAgentNote,
+    Action::DismissAgentNote,
+    Action::NextAgentNote,
+    Action::ScrollAgentNoteDown,
+    Action::ScrollAgentNoteUp,
+    Action::AcceptAgentSuggestion,
+    Action::ThreadsWithSuggestions,
     Action::About,
 ];
 
@@ -400,6 +421,21 @@ fn default_bindings() -> Vec<Binding> {
         Action::ReopenReview,
         Some("Agents"),
     );
+    for (key, action) in [
+        ('n', Action::ToggleAgentNote),
+        ('x', Action::DismissAgentNote),
+        ('j', Action::NextAgentNote),
+        ('d', Action::ScrollAgentNoteDown),
+        ('u', Action::ScrollAgentNoteUp),
+        ('y', Action::AcceptAgentSuggestion),
+        ('t', Action::ThreadsWithSuggestions),
+    ] {
+        bind(
+            &[KeyId::Leader, KeyId::Char('a'), KeyId::Char(key)],
+            action,
+            Some("Agents"),
+        );
+    }
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,

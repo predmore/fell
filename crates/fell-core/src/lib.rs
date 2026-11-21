@@ -18,6 +18,7 @@ pub mod embed;
 pub mod folders;
 pub mod imap;
 pub mod message;
+pub mod notes;
 pub mod onboarding;
 pub mod outbox;
 pub mod parts;

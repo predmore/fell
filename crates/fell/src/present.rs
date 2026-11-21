@@ -1066,6 +1066,11 @@ pub fn local_offset(unix: i64) -> i64 {
     }
 }
 
+pub(crate) fn note_snooze_date(unix: i64) -> String {
+    let (year, month, day, hour, min, _) = local_parts(unix);
+    format!("{} {day}, {year} · {hour:02}:{min:02}", month_name(month))
+}
+
 fn local_parts(unix: i64) -> (i32, u8, u8, u8, u8, u8) {
     unsafe { local_parts_libc(unix) }.unwrap_or_else(|| utc_parts(unix))
 }

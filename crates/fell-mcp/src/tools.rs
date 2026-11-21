@@ -22,6 +22,7 @@ pub(crate) enum ToolScope {
     Read,
     Triage,
     Draft,
+    Annotate,
     Undo,
 }
 
@@ -88,6 +89,7 @@ fn is_mutation(name: &str) -> bool {
             | "mark_unread"
             | "snooze"
             | "unsnooze"
+            | "annotate_thread"
             | "create_draft"
             | "undo"
             | "edit_draft"
@@ -110,6 +112,7 @@ fn dispatch(session: &Session, name: &str, args: &Value) -> Result<Value, String
         "mark_unread" => mark_unread(session, args),
         "snooze" => snooze(session, args),
         "unsnooze" => unsnooze(session, args),
+        "annotate_thread" => annotate_thread(session, args),
         "create_draft" => create_draft(session, args),
         "list_drafts" => list_drafts(session, args),
         "get_draft" => get_draft(session, args),
@@ -476,6 +479,25 @@ fn unsnooze(session: &Session, args: &Value) -> Result<Value, String> {
     Ok(mutation_json(action))
 }
 
+fn annotate_thread(session: &Session, args: &Value) -> Result<Value, String> {
+    let thread = thread_arg(session, args)?;
+    let summary = optional_string(args, "summary")?;
+    let suggestions = string_list(args, "suggested_actions", false)?;
+    let reason = require_string(args, "reason")?;
+    let action = session
+        .store
+        .annotate_thread(
+            &session.account_id,
+            &thread,
+            &session.agent_id,
+            summary.as_deref(),
+            &suggestions,
+            &reason,
+        )
+        .map_err(store_error)?;
+    Ok(mutation_json(Some(action)))
+}
+
 fn archive(session: &Session, args: &Value) -> Result<Value, String> {
     let thread_id = thread_arg(session, args)?;
     let action = session
@@ -783,15 +805,15 @@ fn undo(session: &Session) -> Result<Value, String> {
     let Some(latest) = latest else {
         return Err("nothing to undo".into());
     };
-    let scope = if latest.kind == "draft" {
-        ToolScope::Draft
-    } else {
-        ToolScope::Triage
+    let scope = match latest.kind.as_str() {
+        "draft" => ToolScope::Draft,
+        "annotate" => ToolScope::Annotate,
+        _ => ToolScope::Triage,
     };
     authorize(session, scope)?;
     let action = session
         .store
-        .undo_actor(&session.account_id, &actor)
+        .undo_actor_action(&session.account_id, &actor, latest.id)
         .map_err(store_error)?;
     Ok(json!({
         "undone": true,
@@ -1017,7 +1039,8 @@ fn scope_ok(grant: &AgentGrant, scope: ToolScope) -> bool {
         ToolScope::Read => grant.read,
         ToolScope::Triage => grant.triage,
         ToolScope::Draft => grant.draft,
-        ToolScope::Undo => grant.triage || grant.draft,
+        ToolScope::Annotate => grant.annotate,
+        ToolScope::Undo => grant.triage || grant.draft || grant.annotate,
     }
 }
 
@@ -1026,7 +1049,8 @@ fn scope_name(scope: ToolScope) -> &'static str {
         ToolScope::Read => "read",
         ToolScope::Triage => "triage",
         ToolScope::Draft => "draft",
-        ToolScope::Undo => "triage or draft",
+        ToolScope::Annotate => "annotate",
+        ToolScope::Undo => "triage, draft, or annotate",
     }
 }
 
@@ -1350,6 +1374,36 @@ fn all_tools() -> Vec<Tool> {
             ),
         },
         Tool {
+            name: "annotate_thread",
+            description: "Leave a plain-text summary or suggestions on a thread for a person to review in Fell. Suggestions require a person to accept them. Requires the annotate scope. Logged, undoable, and rate-limited.",
+            scope: ToolScope::Annotate,
+            schema: object_schema(
+                Map::from_iter([
+                    ("thread_id".into(), prop("string", "Thread to annotate.")),
+                    (
+                        "summary".into(),
+                        json!({"type": "string", "maxLength": fell_core::notes::MAX_NOTE_BYTES, "description": "Plain text, at most 1024 UTF-8 bytes."}),
+                    ),
+                    (
+                        "suggested_actions".into(),
+                        json!({
+                            "type": "array", "maxItems": fell_core::notes::MAX_SUGGESTIONS,
+                            "items": {"type": "string"},
+                            "description": "Allowed actions: archive, label:<name>, reply, snooze:<Unix seconds>, mark_read, star."
+                        }),
+                    ),
+                    (
+                        "reason".into(),
+                        prop(
+                            "string",
+                            "Why you are leaving this note, recorded in the action log.",
+                        ),
+                    ),
+                ]),
+                &["thread_id", "reason"],
+            ),
+        },
+        Tool {
             name: "create_draft",
             description: "Save a draft in Fell for a person to review. Does not send mail and cannot confirm a send.",
             scope: ToolScope::Draft,
@@ -1488,7 +1542,7 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "undo",
-            description: "Undo this agent's latest triage action or review draft on this account. Rate-limited. Triage undos need the triage scope.",
+            description: "Undo this agent's latest triage action, review draft, or thread note on this account. Requires the original action's scope. Rate-limited.",
             scope: ToolScope::Undo,
             schema: object_schema(Map::new(), &[]),
         },
@@ -1518,6 +1572,7 @@ mod tests {
                 "mark_unread",
                 "snooze",
                 "unsnooze",
+                "annotate_thread",
                 "create_draft",
                 "list_drafts",
                 "get_draft",
