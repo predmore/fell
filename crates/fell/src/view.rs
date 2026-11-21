@@ -21,11 +21,12 @@ use fell_core::{
 };
 use futures::StreamExt;
 use gpui::{
-    App, Application, AvailableSpace, Bounds, Context, FocusHandle, FontWeight, HighlightStyle, InteractiveElement,
-    IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Render, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, TextStyle, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions, div, point, prelude::*, px, rgb, size, uniform_list,
+    App, Application, AvailableSpace, Bounds, Context, FocusHandle, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
+    size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1252,9 +1253,7 @@ impl Inbox {
             self.motion.list_glide = None;
             self.motion.list = None;
         } else if switched || !rows.is_empty() {
-            self.motion.cancel_empty_list();
-            self.leaving_reader = None;
-            self.leaving_rows = None;
+            self.cancel_empty_list_exit();
         }
         let before_id = self.session.cursor_id.clone();
         let before_index = before_id
@@ -1776,6 +1775,8 @@ impl Inbox {
         self.reveal.cancel_pending();
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
+        self.leaving_reader = None;
+        self.leaving_rows = None;
         self.row_widths.settle();
         self.agents_motion.settle();
         if let Some(y) = settled.list {
@@ -1785,6 +1786,12 @@ impl Inbox {
             let offset = self.conv_scroll.offset();
             self.conv_scroll.set_offset(point(offset.x, px(y)));
         }
+    }
+
+    fn cancel_empty_list_exit(&mut self) {
+        self.motion.cancel_empty_list();
+        self.leaving_reader = None;
+        self.leaving_rows = None;
     }
 
     /// Read the selected thread on the store thread. A read that is stale
@@ -2574,7 +2581,7 @@ impl Inbox {
                                             "from",
                                         )
                                     },
-                                    |label| ("Restored", label, "on"),
+                                    |label| ("Restored", label, "to"),
                                 );
                             inbox.session.show_label_toast(present::LabelNotice {
                                 verb,
@@ -3161,6 +3168,12 @@ impl Inbox {
         }
         if let Some(request) = step.agents.clone() {
             self.request_agent_access(request, cx);
+        }
+        if self.session.search.is_some()
+            || self.session.folder != folder_before
+            || self.session.label_scope != label_before
+        {
+            self.cancel_empty_list_exit();
         }
         let search_changed = self.after_search_step(&step, searching, search_generation, cx);
         if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
@@ -4109,7 +4122,10 @@ fn shell(
         reply_check,
     } = shown;
     let frames = conv.frames.clone();
-    let empty_list_pane = motion.empty_list_pane(now);
+    let same_scope = session.search.is_none()
+        && session.folder == folder
+        && session.label_scope.as_deref() == label.as_deref();
+    let empty_list_pane = motion.empty_list_pane(same_scope, now);
     let mut subject = Some(subject);
     // A narrow window's pane that a key just swapped out stays beneath the
     // one coming in, where it was, full width. The incoming pane is drawn
@@ -4706,20 +4722,20 @@ fn header(
                 fit(&title, name_room, FontWeight::SEMIBOLD)
             } else {
                 fit_folder_path(
-            &title,
-            FolderFit::Header,
-            |path| {
-                clip_shaped(
-                    window,
-                    &style,
-                    path,
-                    name_room.floor(),
-                    FontWeight::SEMIBOLD,
-                    None,
+                    &title,
+                    FolderFit::Header,
+                    |path| {
+                        clip_shaped(
+                            window,
+                            &style,
+                            path,
+                            name_room.floor(),
+                            FontWeight::SEMIBOLD,
+                            None,
+                        )
+                    },
+                    |line| &line.text,
                 )
-            },
-            |line| &line.text,
-        )
             };
             let name_width = name
                 .as_ref()
@@ -5390,7 +5406,7 @@ fn thread_line_one(
             // Leave enough for the sender without stranding space on rows
             // whose names already fit in a short span.
             (room - (room * 0.4).min(80.0) - THREAD_LINE_GAP).max(0.0),
-            look,
+            Some(look),
             window,
         )
     };
@@ -5478,15 +5494,16 @@ fn thread_label_group(
     background: u32,
     dim: u32,
     room: f32,
-    look: &RowLook,
+    look: Option<&RowLook>,
     window: &Window,
 ) -> Option<(gpui::Div, f32)> {
+    let label_scope = look.and_then(|look| look.label_scope.as_deref());
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
     let outline = theme.label_outline(background);
     let layout = |labels: &[String]| {
         let labels: Vec<_> = labels
             .iter()
-            .filter(|label| Some(label.as_str()) != look.label_scope.as_deref())
+            .filter(|label| Some(label.as_str()) != label_scope)
             .collect();
         let mut width = 0.0;
         let mut chips = Vec::new();
@@ -5560,7 +5577,7 @@ fn thread_label_group(
         (width, group)
     };
     let (width, group) = layout(&row.labels);
-    if let Some((previous, shown)) = &look.previous_labels {
+    if let Some((previous, shown)) = look.and_then(|look| look.previous_labels.as_ref()) {
         let (old_width, old_group) = layout(previous);
         let transition_width = old_width.max(width);
         if transition_width > 0.0 {
@@ -7711,7 +7728,7 @@ fn status_bar(
     // prefix), entering or leaving, so its text never re-flows as it fades.
     // Those keys fade under it at the right.
     let noticed = status.notice.is_some() || status.leaving.is_some();
-    let show_sync = !noticed || width >= present::NARROW_WIDTH;
+    let narrow = width < present::NARROW_WIDTH;
     let notice_opacity = status
         .notice
         .iter()
@@ -7774,7 +7791,7 @@ fn status_bar(
     let dot = bar_px(window, "·", size, ui);
     let mut used = 28.0 + 2.0 * 12.0 + 2.0;
     used += bar_px(window, session.mode_label(), size, mono) + dot;
-    if show_sync {
+    if !narrow {
         used += 2.0 * 12.0 + dot + bar_px(window, &sync_label, size, ui);
         if let Some(key) = &sync_hint {
             used += bar_px(window, &format!(" · {key} for log"), size, ui);
@@ -7848,7 +7865,7 @@ fn status_bar(
                 }))
                 .child(session.mode_label().to_string()),
         )
-        .when(show_sync, |bar| {
+        .when(!narrow, |bar| {
             bar.child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
                 .child(
                     div()
@@ -7858,7 +7875,7 @@ fn status_bar(
                             label.opacity(status.sync_opacity)
                         })
                         .child(status_text(
-                            sync_label,
+                            sync_label.clone(),
                             sync_hint.as_deref().map(|key| (key, " for log")),
                             theme,
                         )),
@@ -7867,12 +7884,15 @@ fn status_bar(
         .when(details, |bar| {
             bar.child(div().text_color(rgb(theme.error)).child("· ? details"))
         })
-        // The dot before a notice comes and goes with it.
-        .when(noticed, |bar| {
+        // In a narrow window sync and the notice share a separator and cell.
+        .when(narrow || noticed, |bar| {
             bar.child(
                 div()
+                    .flex_none()
                     .text_color(rgb(theme.dimmed))
-                    .when(notice_opacity < 1.0, |dot| dot.opacity(notice_opacity))
+                    .when(!narrow && notice_opacity < 1.0, |dot| {
+                        dot.opacity(notice_opacity)
+                    })
                     .child("·"),
             )
         })
@@ -7880,10 +7900,34 @@ fn status_bar(
             div()
                 .relative()
                 .flex_1()
+                .h_full()
                 .min_w(px(0.))
+                .flex()
+                .items_center()
                 // Air before the typed keys, so a long message never runs into them.
                 .when(!noticed, |cell| cell.pr(px(16.)))
                 .overflow_hidden()
+                .when(narrow && status.sync > 0.0, |cell| {
+                    cell.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .opacity(status.sync * status.sync_opacity)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(rgb(sync_color))
+                                    .child(status_text(
+                                        sync_label,
+                                        sync_hint.as_deref().map(|key| (key, " for log")),
+                                        theme,
+                                    )),
+                            ),
+                    )
+                })
                 .map(|cell| match (current, leaving) {
                     (Some((toast, opacity)), Some((old, gone))) => cell
                         .child(notice_text(&toast, opacity, notice_dy))
@@ -8030,9 +8074,15 @@ fn card_fit(
         }
         Overlay::Folders => {
             let empty_label = choices.is_empty()
-                && matches!(session.folder_intent, FolderIntent::Label | FolderIntent::LabelList);
+                && matches!(
+                    session.folder_intent,
+                    FolderIntent::Label | FolderIntent::LabelList
+                );
             Some(picker_card_height(
-                choices.iter().map(|choice| choice.divider).chain(empty_label.then_some(false)),
+                choices
+                    .iter()
+                    .map(|choice| choice.divider)
+                    .chain(empty_label.then_some(false)),
                 room,
             ))
         }
@@ -8040,10 +8090,7 @@ fn card_fit(
     }
 }
 
-fn picker_card_height(
-    dividers: impl DoubleEndedIterator<Item = bool>,
-    room: f32,
-) -> f32 {
+fn picker_card_height(dividers: impl DoubleEndedIterator<Item = bool>, room: f32) -> f32 {
     let capacity = room.min(PICKER_MAX_PX) - present::CARD_CHROME_PX;
     // Measure from the last row so maximum scroll lands on a row boundary.
     // Only dividers between visible rows count toward the scroll viewport.
@@ -8317,22 +8364,45 @@ fn folder_picker(
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
+    const MARGIN: f32 = 12.0;
+    const PAD: f32 = 14.0;
+    const GAP: f32 = 8.0;
+    const CARET: f32 = 2.0;
+    const CARET_GAP: f32 = 2.0;
     let labeling = matches!(
         session.folder_intent,
         FolderIntent::Label | FolderIntent::LabelList
     );
     let selected = session.folder_index;
     let match_query = session.folder_query.trim().to_ascii_lowercase();
-    let inset = if labeling { 24.0 } else { 0.0 };
+    let inset = if labeling { 2.0 * MARGIN } else { 0.0 };
     let width = PICKER_PX.min((f32::from(window.viewport_size().width) - inset).max(0.0));
     let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
     let prompt_dim = theme::ensure_all(theme.dimmed, &[theme.surface], 4.8);
+    let prompt = session.folder_prompt();
     let query = present::display_safe(&session.folder_query);
+    let target = label_target.and_then(|target| {
+        let measure = |text| line_px_with_style(window, &style, text, FontWeight::NORMAL).ceil();
+        let query_width = measure(&query) + CARET + if query.is_empty() { 0.0 } else { CARET_GAP };
+        let room =
+            width - 2.0 * (PAD + 1.0) - 3.0 * GAP - measure(prompt) - measure("·") - query_width;
+        let target = present::display_safe(&target);
+        clip_shaped(
+            window,
+            &style,
+            &target,
+            room.floor(),
+            FontWeight::NORMAL,
+            None,
+        )
+        .filter(|line| f32::from(line.width).ceil() <= room)
+        .map(|line| line.text)
+    });
     div()
         .w(px(width))
         .max_w_full()
-        .when(labeling, |card| card.mx(px(12.)))
+        .when(labeling, |card| card.mx(px(MARGIN)))
         .min_w_0()
         .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
@@ -8356,11 +8426,11 @@ fn folder_picker(
             div()
                 .flex_none()
                 .h(px(present::CARD_QUERY_PX))
-                .px(px(14.))
+                .px(px(PAD))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(GAP))
                 .border_b(px(1.))
                 .border_color(rgb(theme.border))
                 .child(
@@ -8371,30 +8441,35 @@ fn folder_picker(
                         } else {
                             prompt_dim
                         }))
-                        .child(session.folder_prompt()),
+                        .child(prompt),
                 )
-                .when_some(label_target, |prompt, target| {
+                .when_some(target, |prompt, target| {
                     prompt
                         .child(div().flex_none().text_color(rgb(theme.dimmed)).child("·"))
                         .child(
                             div()
-                                .max_w(px(PICKER_PX / 2.0))
-                                .min_w_0()
-                                .truncate()
+                                .flex_none()
+                                .whitespace_nowrap()
                                 .text_color(rgb(theme.dimmed))
-                                .child(present::display_safe(&target)),
+                                .child(target),
                         )
                 })
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(2.))
+                        .gap(px(CARET_GAP))
                         .min_w_0()
                         .when(!query.is_empty(), |field| {
                             field.child(div().min_w_0().truncate().child(query))
                         })
-                        .child(div().flex_none().w(px(2.)).h(px(16.)).bg(rgb(theme.accent))),
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(CARET))
+                                .h(px(16.))
+                                .bg(rgb(theme.accent)),
+                        ),
                 ),
         )
         .child(
@@ -8427,12 +8502,15 @@ fn folder_picker(
                         } else {
                             0.0
                         };
-                    let clip =
-                        |text| clip_shaped(window, &style, text, room, FontWeight::NORMAL, None);
+                    let clip = |text: &str| {
+                        clip_shaped(window, &style, text, room, FontWeight::NORMAL, None)
+                    };
                     let label = if labeling {
                         clip(&label)
                     } else {
-                        fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| &line.text)
+                        fit_folder_path(&label, FolderFit::Picker(&match_query), clip, |line| {
+                            &line.text
+                        })
                     };
                     let detail = choice.detail.clone();
                     let detail_color = if index == selected {

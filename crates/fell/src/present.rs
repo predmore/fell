@@ -1127,10 +1127,8 @@ impl LabelNotice {
             if measure(&full) <= max_px {
                 return full;
             }
-            if let Some(short) = shorten_words(subject, &before, "”", max_px, &measure) {
-                return short;
-            }
-            let short = cut_to(subject, &before, "”", max_px, &measure);
+            let subject = subject.replace(['“', '”'], "");
+            let short = cut_to(&subject, &before, "”", max_px, &measure);
             if measure(&short) <= max_px {
                 return short;
             }
@@ -1153,11 +1151,9 @@ impl LabelNotice {
     }
 }
 
-/// Fit a notice to `max_px`, as `measure` sizes text. The quoted name
-/// gives up whole words first. If even one word does not fit, the clauses
-/// between the outcome and the closing key go next, last first, and the
-/// name is fitted again; so the outcome and the key always stay whole and
-/// no clause is cut in the middle. Only an outcome too long alone is cut.
+/// Fit a notice to `max_px`, as `measure` sizes text. Shorten the quoted
+/// name first and remove optional middle clauses if needed. Keep the outcome
+/// and key when the quotes themselves no longer fit.
 pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> String {
     if measure(text) <= max_px {
         return text.to_string();
@@ -1165,13 +1161,33 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
     if let Some(fitted) = shorten_name(text, max_px, &measure) {
         return fitted;
     }
-    let mut parts: Vec<&str> = text.split(NOTICE_DOT).collect();
+    let span = quoted_span(text);
+    let outside_name = |at| span.is_none_or(|(open, close)| at < open || at > close);
+    let separator = if text
+        .match_indices(NOTICE_DOT)
+        .any(|(at, _)| outside_name(at))
+    {
+        NOTICE_DOT
+    } else {
+        " · "
+    };
+    let mut start = 0;
+    let mut parts: Vec<_> = text
+        .match_indices(separator)
+        .filter(|(at, _)| outside_name(*at))
+        .map(|(at, _)| {
+            let part = &text[start..at];
+            start = at + separator.len();
+            part
+        })
+        .collect();
+    parts.push(&text[start..]);
     while let Some(drop) = (1..parts.len().saturating_sub(1))
         .rev()
-        .find(|index| !parts[*index].contains('\u{201c}'))
+        .find(|index| quoted_span(parts[*index]).is_none())
     {
         parts.remove(drop);
-        let candidate = parts.join(NOTICE_DOT);
+        let candidate = parts.join(separator);
         if measure(&candidate) <= max_px {
             return candidate;
         }
@@ -1179,32 +1195,52 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
             return fitted;
         }
     }
-    // Not one word of the name fits: a stub of it says nothing, so the
-    // name goes, and the outcome and key stay whole.
-    if let Some(at) = parts.iter().position(|part| part.contains('\u{201c}'))
-        && parts.len() > 1
-    {
-        let mut without = parts.clone();
-        without.remove(at);
-        let candidate = without.join(NOTICE_DOT);
-        if measure(&candidate) <= max_px {
-            return candidate;
+    let text = parts.join(separator);
+    let without_name;
+    if let Some((open, close)) = quoted_span(&text) {
+        let name_at = open + '“'.len_utf8();
+        let name = text[name_at..close].replace(['“', '”'], "");
+        let fitted = cut_to(
+            name.trim_end_matches('…'),
+            &text[..name_at],
+            &text[close..],
+            max_px,
+            &measure,
+        );
+        if measure(&fitted) <= max_px {
+            return fitted;
+        }
+        if let Some((clause, (open, close))) = parts
+            .iter_mut()
+            .find_map(|part| quoted_span(part).map(|span| (part, span)))
+        {
+            without_name = format!(
+                "{} {}",
+                clause[..open].trim_end(),
+                clause[close + '”'.len_utf8()..].trim_start()
+            );
+            *clause = without_name.trim();
+            parts.retain(|part| !part.is_empty());
         }
     }
-    let text = parts.join(NOTICE_DOT);
-    let fitted = match quoted_span(&text) {
-        Some((open, close)) => {
-            let before = &text[..open + '\u{201c}'.len_utf8()];
-            let after = &text[close..];
-            let name = text[before.len()..close].trim_end_matches('…');
-            cut_to(name, before, after, max_px, &measure)
+    let text = parts.join(separator);
+    if measure(&text) <= max_px {
+        return text;
+    }
+    if let [outcome, key] = parts.as_slice() {
+        let fitted = cut_to(outcome, "", &format!("{separator}{key}"), max_px, &measure);
+        if measure(&fitted) <= max_px {
+            return fitted;
         }
-        None => cut_to(&text, "", "", max_px, &measure),
-    };
+        if measure(key) <= max_px {
+            return (*key).to_owned();
+        }
+    }
+    let fitted = cut_to(&text, "", "", max_px, &measure);
     if measure(&fitted) <= max_px {
         fitted
     } else {
-        cut_to(&text, "", "", max_px, &measure)
+        String::new()
     }
 }
 
@@ -1212,11 +1248,9 @@ pub fn fit_notice(text: &str, max_px: f32, measure: impl Fn(&str) -> f32) -> Str
 pub(crate) const NOTICE_DOT: &str = "  ·  ";
 
 fn quoted_span(text: &str) -> Option<(usize, usize)> {
-    text.find('\u{201c}').and_then(|open| {
-        text[open..]
-            .find('\u{201d}')
-            .map(|close| (open, open + close))
-    })
+    let open = text.find('“')?;
+    let close = text.rfind('”')?;
+    (open < close).then_some((open, close))
 }
 
 /// `text` with its quoted name cut to whole words that fit, keeping at
@@ -1225,7 +1259,8 @@ fn shorten_name(text: &str, max_px: f32, measure: &impl Fn(&str) -> f32) -> Opti
     let (open, close) = quoted_span(text)?;
     let before = &text[..open + '\u{201c}'.len_utf8()];
     let after = &text[close..];
-    shorten_words(&text[before.len()..close], before, after, max_px, measure)
+    let name = text[before.len()..close].replace(['“', '”'], "");
+    shorten_words(&name, before, after, max_px, measure)
 }
 
 fn shorten_words(
@@ -1807,6 +1842,31 @@ mod tests {
         // Not even one word fits: the name is cut, the key stays.
         let fitted = fit_notice(notice, 33.0, width);
         assert!(fitted.ends_with("\u{201d} · space a r reopen"), "{fitted}");
+        for room in [27.0, 30.0, 32.0] {
+            assert_eq!(
+                fit_notice(notice, room, width),
+                "Not sent · space a r reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shortened_cjk_notice_preserves_the_outer_quotes_and_key() {
+        let notice = "Not sent · “会議“資料”  ·  来週の予定と再確認” · gs sent";
+        let width = |text: &str| {
+            text.chars()
+                .map(|ch| if ch >= '\u{3000}' { 2.0 } else { 1.0 })
+                .sum::<f32>()
+        };
+        for room in [29.0, 33.0, 37.0] {
+            let fitted = fit_notice(notice, room, width);
+            assert!(width(&fitted) <= room, "{fitted}");
+            assert!(fitted.starts_with("Not sent · “会議"), "{fitted}");
+            assert!(fitted.ends_with("…” · gs sent"), "{fitted}");
+            assert_eq!(fitted.matches('“').count(), 1, "{fitted}");
+            assert_eq!(fitted.matches('”').count(), 1, "{fitted}");
+        }
+        assert_eq!(fit_notice(notice, 22.0, width), "Not sent · gs sent");
     }
 
     #[test]
@@ -1823,12 +1883,12 @@ mod tests {
         };
         assert_eq!(
             notice.fit(room, width),
-            "Removed “travel” from “Tickets to the…”"
+            "Removed “travel” from “Tickets to the a…”"
         );
         notice.verb = "Restored";
-        notice.relation = "on";
+        notice.relation = "to";
         let restored = notice.fit(room, width);
-        assert!(restored.starts_with("Restored “travel” on “Tickets"));
+        assert!(restored.starts_with("Restored “travel” to “Tickets"));
         assert!(restored.ends_with("…”"));
         assert!(width(&restored) <= room);
 
@@ -1840,6 +1900,12 @@ mod tests {
         assert_eq!(
             notice.fit(room, width),
             "Applied “field notes” to 2 conversations"
+        );
+        notice.verb = "Restored";
+        notice.count = 3;
+        assert_eq!(
+            notice.fit(room, width),
+            "Restored “field notes” to 3 conversations"
         );
     }
 

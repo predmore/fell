@@ -86,6 +86,8 @@ pub struct StatusMotion {
     /// How much of the key hints shows. A notice takes their room, so they
     /// fade out as it comes and back in as it leaves.
     pub hints: f32,
+    /// Sync text shares the notice's space on a narrow window.
+    pub sync: f32,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -194,6 +196,7 @@ pub struct InboxMotion {
     /// The notice that is leaving and its fade.
     toast_out: Option<(Toast, Transition)>,
     last_toast: Option<Toast>,
+    sync_fade: Option<(f32, Transition)>,
     /// The key hints fading out as a notice takes their room, and how
     /// much of them showed when it started.
     hints_out: Option<Transition>,
@@ -327,6 +330,7 @@ impl InboxMotion {
             toast_from: 0.0,
             toast_out: None,
             last_toast: None,
+            sync_fade: None,
             hints_out: None,
             hints_from: 1.0,
             last_chord: false,
@@ -378,6 +382,9 @@ impl InboxMotion {
             self.sync_in = start(motion::QUICK);
         }
         let notice = session.status_notice();
+        if notice.is_some() != self.last_toast.is_some() {
+            self.sync_fade = start(motion::FADE).map(|fade| (self.sync_opacity(now), fade));
+        }
         if notice != self.last_toast.as_ref() {
             match (notice, self.last_toast.take()) {
                 (Some(toast), old) => {
@@ -623,12 +630,7 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
-        if self
-            .empty_list
-            .is_some_and(|(exit, _, _)| !exit.running(now))
-        {
-            self.empty_list = None;
-        }
+        self.cancel_empty_list();
         self.bodies.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
@@ -686,6 +688,7 @@ impl InboxMotion {
         running |= keep(&mut self.sync_in, now);
         running |= keep(&mut self.toast_in, now);
         running |= keep_with(&mut self.toast_out, now);
+        running |= keep_with(&mut self.sync_fade, now);
         running |= keep(&mut self.hints_out, now);
         running |= keep(&mut self.which, now);
         running |= keep_with(&mut self.which_out, now);
@@ -836,6 +839,9 @@ impl InboxMotion {
         self.reading_slide = None;
         self.reading_list_fade = None;
         self.reading_reflow = None;
+        // The snapshot owns the exit. A key arriving before the next paint
+        // can skip it without starting the usual reading-mode slide.
+        self.last_layout = (Pane::List, false);
         let replaces_reader = self.last_panes == (false, true);
         self.empty_list = self
             .motion
@@ -854,9 +860,9 @@ impl InboxMotion {
             .map_or(0.0, |(exit, _, _)| exit.remaining(now))
     }
 
-    pub fn empty_list_pane(&self, now: Instant) -> f32 {
+    pub fn empty_list_pane(&self, same_scope: bool, now: Instant) -> f32 {
         self.empty_list.map_or(1.0, |(_, enter, replaces_reader)| {
-            if replaces_reader {
+            if replaces_reader && same_scope {
                 enter.progress(now)
             } else {
                 1.0
@@ -898,6 +904,13 @@ impl InboxMotion {
             .map(|(old, fade)| (*old, fade.progress(now)))
     }
 
+    fn sync_opacity(&self, now: Instant) -> f32 {
+        let target = if self.last_toast.is_some() { 0.0 } else { 1.0 };
+        self.sync_fade.map_or(target, |(from, fade)| {
+            motion::lerp(from, target, fade.progress(now))
+        })
+    }
+
     pub fn status(&self, session: &Session, now: Instant) -> StatusMotion {
         let rising = motion::progress(self.toast_in.as_ref(), now);
         let notice = session
@@ -930,6 +943,7 @@ impl InboxMotion {
             notice_dy: motion::NOTICE_RISE_PX * (1.0 - rising),
             leaving_dy: -motion::NOTICE_RISE_PX * gone,
             hints,
+            sync: self.sync_opacity(now),
         }
     }
 
@@ -1119,11 +1133,12 @@ mod tests {
         let entered = now + motion::FADE;
         assert_eq!(motions.empty_list_exit(now), 1.0);
         assert!(motions.empty_list_exit(half) > 0.0);
-        assert_eq!(motions.empty_list_pane(half), 0.0);
+        assert_eq!(motions.empty_list_pane(true, half), 0.0);
+        assert_eq!(motions.empty_list_pane(false, half), 1.0);
         assert_eq!(motions.empty_list_exit(entered), 0.0);
-        assert_eq!(motions.empty_list_pane(entered), 0.0);
+        assert_eq!(motions.empty_list_pane(true, entered), 0.0);
         let halfway_in = entered + motion::FADE / 2;
-        assert!((0.0..1.0).contains(&motions.empty_list_pane(halfway_in)));
+        assert!((0.0..1.0).contains(&motions.empty_list_pane(true, halfway_in)));
         assert_eq!(
             motions
                 .list_banner(Some(banner.clone()), halfway_in)
@@ -1135,6 +1150,91 @@ mod tests {
         let done = entered + motion::FADE;
         assert!(!motions.tick(done));
         assert_eq!(motions.list_banner(Some(banner), done).unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn slash_during_the_last_reader_exit_shows_search_immediately() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.label_scope = Some("Work".into());
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        motions.list_emptied(now);
+        session.pane = Pane::List;
+        session.full_width = false;
+
+        let halfway = now + motion::FADE / 2;
+        assert!(motions.empty_list_exit(halfway) > 0.0);
+        motions.settle(halfway);
+        session.on_key(KeyId::Char('/'), 10);
+        motions.observe(&session, (true, true), halfway);
+
+        assert!(session.search_editing());
+        assert_eq!(motions.empty_list_exit(halfway), 0.0);
+        assert_eq!(motions.empty_list_pane(false, halfway), 1.0);
+        assert_eq!(motions.reading_progress(halfway), 0.0);
+        assert_eq!(motions.reading_list_opacity(halfway), 1.0);
+    }
+
+    #[test]
+    fn enter_during_the_last_reader_exit_leaves_the_empty_list_focused() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        session.label_scope = Some("Work".into());
+        session.pane = Pane::Conversation;
+        session.full_width = true;
+        motions.observe(&session, (false, true), now);
+        motions.list_emptied(now);
+        session.pane = Pane::List;
+        session.full_width = false;
+        motions.observe(&session, (true, true), now);
+
+        let halfway = now + motion::FADE / 2;
+        assert!(motions.empty_list_exit(halfway) > 0.0);
+        motions.settle(halfway);
+        session.on_key(KeyId::Enter, 10);
+
+        assert_eq!(session.pane, Pane::List);
+        assert!(!session.full_width);
+        assert_eq!(motions.empty_list_exit(halfway), 0.0);
+        assert_eq!(motions.empty_list_pane(true, halfway), 1.0);
+    }
+
+    #[test]
+    fn narrow_sync_text_cross_fades_with_the_notice() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        assert_eq!(motions.status(&session, now).sync, 1.0);
+        session.show_toast("Removed a label", false);
+        motions.observe(&session, (true, false), now);
+        assert_eq!(motions.status(&session, now).sync, 1.0);
+
+        let halfway = now + motion::FADE / 2;
+        let during = motions.status(&session, halfway);
+        assert!((0.0..1.0).contains(&during.sync));
+        assert_eq!(during.sync + during.notice.unwrap().1, 1.0);
+        let entered = now + motion::FADE;
+        assert_eq!(motions.status(&session, entered).sync, 0.0);
+
+        session.clear_toast();
+        motions.observe(&session, (true, false), entered);
+        assert_eq!(motions.status(&session, entered).sync, 0.0);
+        let returning = motions.status(&session, entered + motion::FADE / 2);
+        assert!(returning.sync > 0.5 && returning.sync < 1.0);
+        assert!(returning.leaving.unwrap().1 > 0.0);
+        assert_eq!(motions.status(&session, entered + motion::FADE).sync, 1.0);
+
+        let mut reduced = InboxMotion::new(Motion::new(false));
+        session.show_toast("Removed a label", false);
+        reduced.observe(&session, (true, false), now);
+        assert_eq!(reduced.status(&session, now).sync, 0.0);
+        session.clear_toast();
+        reduced.observe(&session, (true, false), now);
+        assert_eq!(reduced.status(&session, now).sync, 1.0);
     }
 
     fn notice_opacity(motion: &InboxMotion, session: &Session, now: Instant) -> Option<f32> {

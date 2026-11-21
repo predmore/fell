@@ -2322,11 +2322,11 @@ impl Session {
                 if self.cursor_draft().is_some() {
                     // A draft row opens in the editor, not the reading pane.
                     step.open_draft = true;
-                } else if self.pane == Pane::List
-                    && (self.search.is_none() || self.cursor_id.is_some())
-                {
-                    self.pane = Pane::Conversation;
-                    self.opened(&mut step);
+                } else if self.pane == Pane::List {
+                    if self.cursor_id.is_some() {
+                        self.pane = Pane::Conversation;
+                        self.opened(&mut step);
+                    }
                 } else if let Some(message) = self.messages.get_mut(self.message_cursor) {
                     message.expanded = !message.expanded;
                     step.message_disclosure_changed = true;

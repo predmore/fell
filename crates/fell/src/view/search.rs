@@ -1523,7 +1523,13 @@ fn row(
         star.map(|width| (STAR, theme.star, width)),
         attachment.map(|width| (THREAD_ATTACHMENT_MARK, dim, width)),
     ];
-    let snippet_room = row_text_width(list_width);
+    let row_room = row_text_width(list_width);
+    let labels = if row.labels.is_empty() {
+        None
+    } else {
+        thread_label_group(theme, row, background, dim, row_room * 0.45, None, window)
+    };
+    let snippet_room = row_room - labels.as_ref().map_or(0.0, |(_, width)| width + ROW_GAP);
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1630,8 +1636,17 @@ fn row(
         )
         .child(
             div()
-                .overflow_hidden()
-                .children(excerpt.map(|line| paint_shaped_text(line, window, true))),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(ROW_GAP))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .children(excerpt.map(|line| paint_shaped_text(line, window, true))),
+                )
+                .children(labels.map(|(group, _)| group)),
         )
         .into_any_element()
 }
