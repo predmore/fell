@@ -85,26 +85,90 @@ Agents are off until you grant a scope. `--read` is search, read threads, list t
 
 ### Connect an agent
 
-One command per harness. It finds your mailbox and account, asks which scopes to grant (read and draft unless you say yes to triage), and prints the MCP entry for that harness. It then asks before adding the entry to the harness's config. Fell keeps a backup of the old file, leaves every other entry alone, and does not follow symlinks.
+Run the command for your harness. Fell finds your mailbox and account, asks which scopes to grant, and prints the MCP entry. If you confirm the config edit, Fell backs up any existing file before writing. For Claude Code, run the command Fell prints.
 
 ```sh
-fell mcp add claude-code   # prints a `claude mcp add --scope user …` command to run
-fell mcp add codex         # ~/.codex/config.toml, [mcp_servers.fell]
-fell mcp add gemini        # ~/.gemini/settings.json, mcpServers
-fell mcp add opencode      # ~/.config/opencode/opencode.json ($OPENCODE_CONFIG_DIR), mcp.servers
-fell mcp add goose         # ~/.config/goose/config.yaml, extensions
+fell mcp add claude-code
+fell mcp add codex
+fell mcp add gemini
+fell mcp add opencode
+fell mcp add goose
 ```
 
-`fell-mcp add …` is the same command. Pass `--read`, `--triage` or `--draft` to choose scopes without the questions, `--write` to write without asking, and `--print` to only print. `--account ID` picks an account when there is more than one, and `--agent NAME` gives the agent another name. The entry only starts `fell-mcp serve`. It has no API key, token or environment: Fell never sees model keys, and scopes live in Fell's mailbox, not in the harness config.
+Read and draft are selected by default. Add any of `--read`, `--triage`, or `--draft` to choose exactly those scopes. Use `--account ID` to choose a mailbox and `--agent NAME` for a different agent ID. Use `--print` to grant access and print the entry without editing the harness config. Passing `--write` explicitly authorizes the edit. Fell prints a pasteable entry if it cannot safely edit an existing file.
 
-Fell edits only files it can parse exactly. It prints the entry instead for Claude Code (which rewrites `~/.claude.json` while it runs), for OpenCode's `opencode.jsonc`, and for JSON with comments or YAML it cannot place safely. When it can't write, it exits non-zero and the grant stays, so pasting the printed entry is enough. If the harness saves its own file while Fell writes, Fell starts over once with the new contents, then asks you to try again.
+In Fell, press `Space a a` or search for **Agents** in the command palette. You can change individual scopes, see the last recorded triage or draft action, and revoke access with `x`, then `y` to confirm. Press `u` in Agents to restore the grant. A running session loses access on its next request.
+
+<details>
+<summary>Manual MCP entries</summary>
+
+If you're setting up by hand, first run `fell mcp grant HARNESS --account ACCOUNT --read --draft`. Use the harness name below as `HARNESS`. In the examples, replace `demo` with your account ID, and use the absolute path for your `~/.local/share/fell/mail.db` in config files. If `fell-mcp` is outside your harness's `PATH`, use its absolute path. For an AppImage, use its absolute path as the command and add `mcp` before `serve`.
+
+**Claude Code**
 
 ```sh
-fell mcp list              # agents, scopes, and when each last triaged or drafted
-fell mcp revoke codex      # immediate: running sessions get no tools from their next call
+claude mcp add --transport stdio --scope user fell -- fell-mcp serve --store "$HOME/.local/share/fell/mail.db" --account demo --agent claude-code
 ```
 
-By hand, an entry runs `fell-mcp serve --store PATH --account ACCOUNT --agent AGENT` after `fell-mcp grant AGENT --read --draft`.
+**Codex** · `~/.codex/config.toml`
+
+```toml
+[mcp_servers.fell]
+command = "fell-mcp"
+args = ["serve", "--store", "/path/to/.local/share/fell/mail.db", "--account", "demo", "--agent", "codex"]
+```
+
+**Gemini CLI** · `~/.gemini/settings.json`
+
+```json
+{
+  "mcpServers": {
+    "fell": {
+      "command": "fell-mcp",
+      "args": ["serve", "--store", "/path/to/.local/share/fell/mail.db", "--account", "demo", "--agent", "gemini"]
+    }
+  }
+}
+```
+
+**OpenCode** · `~/.config/opencode/opencode.json`
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "fell": {
+        "type": "local",
+        "command": ["fell-mcp", "serve", "--store", "/path/to/.local/share/fell/mail.db", "--account", "demo", "--agent", "opencode"]
+      }
+    }
+  }
+}
+```
+
+**Goose** · `~/.config/goose/config.yaml`
+
+```yaml
+extensions:
+  fell:
+    name: fell
+    description: Fell mail
+    type: stdio
+    cmd: fell-mcp
+    args: ["serve", "--store", "/path/to/.local/share/fell/mail.db", "--account", "demo", "--agent", "goose"]
+    enabled: true
+    envs: {}
+    timeout: 300
+```
+
+Merge the Fell entry into any existing server table or object. These entries require no credentials. Fell stores the scopes in the mailbox.
+
+</details>
+
+```sh
+fell mcp list
+fell mcp revoke codex
+```
 
 ## Nightly Linux artifacts
 

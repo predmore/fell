@@ -1,6 +1,6 @@
 use crate::account::BackendKind;
 use crate::backend::{BridgeBackend, ImapBackend, MailBackend, MailboxDelta};
-use crate::{FlagChange, LabelChange, MessageId, Store, sync_once};
+use crate::{AgentGrant, FlagChange, LabelChange, MessageId, Store, sync_once};
 
 use super::sync_tests::{account, commands, config, sample_state, unused_smtp};
 use super::test_server::{TestServer, TestState, raw_message};
@@ -324,6 +324,9 @@ fn agent_label_undo_keeps_later_server_labels() {
     sync_once(&acct, &backend, &store).unwrap();
     let thread = message().thread_id;
     store
+        .set_agent_grant(&acct.id, "bot", AgentGrant::enabled(false, true, false))
+        .unwrap();
+    store
         .add_thread_label(&acct.id, &thread, "personal", "agent:bot")
         .unwrap();
 
@@ -437,6 +440,11 @@ fn undo_readd_preserves_a_fresh_server_keyword(agent: bool, local_spelling: &str
     sync_once(&acct, &backend, &store).unwrap();
     assert_eq!(message().labels, ["triage"]);
     let thread = message().thread_id;
+    if agent {
+        store
+            .set_agent_grant(&acct.id, "bot", AgentGrant::enabled(false, true, false))
+            .unwrap();
+    }
     let readd = || {
         if agent {
             store
@@ -531,6 +539,9 @@ fn legacy_label_actions_undo_only_their_own_edits_after_reopening() {
     {
         let store = Store::open(&path).unwrap();
         sync_once(&acct, &backend, &store).unwrap();
+        store
+            .set_agent_grant(&acct.id, "bot", AgentGrant::enabled(false, true, false))
+            .unwrap();
         let thread = store.message(&acct.id, &id).unwrap().unwrap().thread_id;
         store
             .add_thread_label(&acct.id, &thread, "personal notes", "agent:bot")

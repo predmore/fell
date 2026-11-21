@@ -1,5 +1,6 @@
 //! Two-pane inbox. The window reads the local store and never talks to IMAP.
 
+mod agents;
 mod attachment_actions;
 mod attachment_chips;
 pub(crate) mod disclosure;
@@ -307,6 +308,8 @@ struct Inbox {
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
+    agents_scroll: ScrollHandle,
+    agents_motion: agents::AgentMotion,
     help_scroll: help::HelpScroll,
     search_view: search::SearchView,
     search_preview: gpui::Entity<search::CachedPreview>,
@@ -454,6 +457,8 @@ impl Inbox {
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
+            agents_scroll: ScrollHandle::new(),
+            agents_motion: agents::AgentMotion::default(),
             help_scroll: help::HelpScroll::default(),
             search_view: search::SearchView::default(),
             search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
@@ -1535,6 +1540,7 @@ impl Inbox {
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
+        self.agents_motion.settle();
         if let Some(y) = settled.list {
             self.set_list_offset(y);
         }
@@ -2801,6 +2807,9 @@ impl Inbox {
         if !help_open && self.session.overlay == Overlay::Help {
             self.help_scroll = help::HelpScroll::default();
         }
+        if let Some(request) = step.agents.clone() {
+            self.request_agent_access(request, cx);
+        }
         let search_changed = self.after_search_step(&step, searching, search_generation, cx);
         if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
             if step.reveal_attachment {
@@ -2954,6 +2963,10 @@ impl Inbox {
         }
         if self.session.overlay == Overlay::Folders {
             self.folder_scroll.scroll_to_item(self.session.folder_index);
+        }
+        if self.session.overlay == Overlay::Agents {
+            self.agents_scroll
+                .scroll_to_item(self.session.agents.selected);
         }
         self.motion.end_key();
         cx.notify();
@@ -3381,9 +3394,15 @@ impl Render for Inbox {
             preview_current: self.search_preview_current(),
         };
         self.conv_layout_current = panes.1;
+        let agents_animating = self.agents_motion.observe(
+            (self.session.overlay == Overlay::Agents).then_some(&self.session.agents),
+            &self.motion.motion,
+            now,
+        );
         let animating = self.motion.tick(now)
             | self.row_widths.running(now)
             | spin_attachment
+            | agents_animating
             | self.search_view.animating(now)
             | (self.session.overlay == Overlay::Help && self.help_scroll.running(now));
         if animating {
@@ -3413,7 +3432,8 @@ impl Render for Inbox {
             leaving.push(which_key_popup(&theme, &self.session, (opacity, 0.0)).into_any_element());
             layer.swap(&mut self.session);
         }
-        let mut overlay_card = |session: &Session, motion, live| {
+        let viewport_height = f32::from(window.viewport_size().height);
+        let mut overlay_card = |session: &Session, motion: (f32, f32), live| {
             let help = self
                 .help_scroll
                 .card(&theme, session, window, now, live, cx);
@@ -3426,6 +3446,16 @@ impl Render for Inbox {
                 &self.palette_scroll,
                 &self.folder_scroll,
                 help,
+                (session.overlay == Overlay::Agents).then(|| {
+                    agents::card(
+                        &theme,
+                        &session.agents,
+                        live.then_some(&self.agents_scroll),
+                        viewport_height - CARD_TOP_PX - 16.0,
+                        live.then_some((&self.agents_motion, now)),
+                        cx,
+                    )
+                }),
                 window,
                 cx,
             )
@@ -7347,6 +7377,7 @@ fn overlay(
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
     help: Option<(f32, gpui::Div)>,
+    agents: Option<gpui::Div>,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
@@ -7360,14 +7391,15 @@ fn overlay(
         .flex()
         .justify_center()
         .pt(px((top - drop).max(0.)))
-        .when(session.overlay == Overlay::About, |layer| {
-            layer.items_start()
-        })
+        .when(
+            matches!(session.overlay, Overlay::About | Overlay::Agents),
+            |layer| layer.items_start(),
+        )
         .when(live, |layer| {
             layer.occlude().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|inbox, _, _, cx| {
-                    inbox.session.overlay = Overlay::None;
+                    inbox.session.dismiss_overlay();
                     cx.notify();
                 }),
             )
@@ -7386,6 +7418,10 @@ fn overlay(
                 .opacity(opacity)
                 .into_any_element(),
             Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
+            Overlay::Agents => agents
+                .unwrap_or_else(div)
+                .opacity(opacity)
+                .into_any_element(),
             Overlay::None => div().into_any_element(),
         })
 }

@@ -912,7 +912,23 @@ mod tests {
         assert_eq!(draft["status"], "review");
         session
             .store
+            .set_agent_grant(
+                &session.account_id,
+                "bot",
+                AgentGrant::enabled(false, true, true),
+            )
+            .unwrap();
+        session
+            .store
             .agent_archive_thread(&session.account_id, &thread, "agent:bot")
+            .unwrap();
+        session
+            .store
+            .set_agent_grant(
+                &session.account_id,
+                "bot",
+                AgentGrant::enabled(false, false, true),
+            )
             .unwrap();
         let undo = call(&mut session, "undo", json!({}));
         assert!(tool_text(&undo).contains("lacks the triage scope"));
@@ -1102,6 +1118,14 @@ mod tests {
         let mut replacement = message("a1", "root@x", "Invoice March", &long, "billing");
         replacement.remote_id = fell_core::RemoteId("a1:root-long".into());
         session.store.upsert_message(&replacement).unwrap();
+        session
+            .store
+            .set_agent_grant(
+                &session.account_id,
+                "other",
+                AgentGrant::enabled(false, false, true),
+            )
+            .unwrap();
         session
             .store
             .create_review_draft(

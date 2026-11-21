@@ -514,6 +514,13 @@ pub(crate) mod tests {
         let account = me();
         let home = temp_home("discard-review", &account);
         let store = fell_core::Store::open(&home.store).unwrap();
+        store
+            .set_agent_grant(
+                &account.id,
+                "atlas",
+                fell_core::AgentGrant::enabled(false, false, true),
+            )
+            .unwrap();
         let hub = DraftHub::new();
         let personal = home.new_draft(&hub, &account.id, &account.email).unwrap();
         hub.with_session(&personal, |session| {
@@ -1091,6 +1098,14 @@ pub(crate) mod tests {
         assert_eq!(refused["transmitted"], false);
         // Once it is given to one, that agent reads the live draft, unsaved
         // typing included.
+        fell_core::Store::open(&home.store)
+            .unwrap()
+            .set_agent_grant(
+                &account.id,
+                "bot",
+                fell_core::AgentGrant::enabled(false, false, true),
+            )
+            .unwrap();
         hub.with_session(&id, |session| session.set_owner("agent:bot"));
         let draft = call(
             &socket,

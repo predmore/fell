@@ -51,6 +51,7 @@ pub struct AgentSummary {
     pub account_id: AccountId,
     pub grant: AgentGrant,
     pub last_action_unix: Option<i64>,
+    pub revision: i64,
 }
 
 /// One logged triage or draft action.
@@ -133,6 +134,12 @@ struct Snap {
 /// Maximum review-draft body, in Unicode scalar values.
 pub const MAX_REVIEW_DRAFT_BODY_CHARS: usize = 100_000;
 
+#[derive(Clone, Copy)]
+enum WriteScope {
+    Triage,
+    Draft,
+}
+
 impl crate::Store {
     pub fn set_agent_grant(
         &self,
@@ -173,7 +180,8 @@ impl crate::Store {
         let mut stmt = self.conn.prepare(
             "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft,
                     (SELECT MAX(a.created_unix) FROM agent_actions a
-                     WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id)
+                     WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id),
+                    g.revision
              FROM agent_grants g
              ORDER BY g.agent_id, g.account_id",
         )?;
@@ -188,6 +196,7 @@ impl crate::Store {
                     draft: row.get::<_, i64>(5)? != 0,
                 },
                 last_action_unix: row.get(6)?,
+                revision: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -197,28 +206,68 @@ impl crate::Store {
         Ok(out)
     }
 
+    /// Edit an existing row only if it is still the one the user saw.
+    /// Undo uses the revision of its revoke, so it cannot restore a grant
+    /// that was changed by another window or the CLI in the meantime.
+    pub fn update_agent_grant(
+        &self,
+        row: &AgentSummary,
+        grant: AgentGrant,
+    ) -> Result<Option<AgentSummary>> {
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE agent_grants SET enabled = ?1, can_read = ?2, can_triage = ?3, can_draft = ?4
+             WHERE agent_id = ?5 AND account_id = ?6 AND revision = ?7",
+            params![
+                grant.enabled,
+                grant.read,
+                grant.triage,
+                grant.draft,
+                row.agent_id,
+                row.account_id.as_str(),
+                row.revision,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        self.seal_private_files()?;
+        Ok(Some(AgentSummary {
+            grant,
+            revision: row.revision + 1,
+            ..row.clone()
+        }))
+    }
+
     /// The stored grant. An unknown agent on a known account is disabled.
     pub fn agent_grant(&self, account_id: &AccountId, agent_id: &str) -> Result<AgentGrant> {
         let agent_id = require_token(agent_id, "agent id")?;
         require_account(&self.conn, account_id)?;
-        let row: Option<(i64, i64, i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT enabled, can_read, can_triage, can_draft
-                 FROM agent_grants WHERE agent_id = ?1 AND account_id = ?2",
-                params![agent_id, account_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        Ok(match row {
-            None => AgentGrant::DISABLED,
-            Some((enabled, read, triage, draft)) => AgentGrant {
-                enabled: enabled != 0,
-                read: read != 0,
-                triage: triage != 0,
-                draft: draft != 0,
-            },
-        })
+        read_grant(&self.conn, account_id, agent_id)
+    }
+
+    /// Serialize a live draft operation with updates to the grant. Release
+    /// this guard before waiting for the editor or its draft writer.
+    pub(crate) fn lock_agent_draft_access(
+        &self,
+        account_id: &AccountId,
+        actor: &str,
+    ) -> Result<rusqlite::Transaction<'_>> {
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        Self::check_agent_draft_access(&tx, account_id, actor)?;
+        Ok(tx)
+    }
+
+    pub(crate) fn check_agent_draft_access(
+        tx: &rusqlite::Transaction<'_>,
+        account_id: &AccountId,
+        actor: &str,
+    ) -> Result<()> {
+        let agent_id = actor
+            .strip_prefix("agent:")
+            .ok_or_else(|| Error::Invalid("missing agent identity".into()))?;
+        check_write_grant(tx, account_id, agent_id, WriteScope::Draft)
     }
 
     pub fn list_labels(&self, account_id: &AccountId) -> Result<Vec<String>> {
@@ -477,6 +526,7 @@ impl crate::Store {
         }
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, &input.account_id)?;
+        check_actor_grant(&tx, &input.account_id, actor, WriteScope::Draft)?;
         if let Some(thread_id) = &input.thread_id {
             let messages = load_thread(&tx, &input.account_id, thread_id)?;
             if messages.is_empty() {
@@ -605,6 +655,14 @@ impl crate::Store {
         let Some(mut action) = find_open_action(&tx, account_id, actor)? else {
             return Err(Error::NothingToUndo);
         };
+        if let Some(actor) = actor {
+            let scope = if action.kind == "draft" {
+                WriteScope::Draft
+            } else {
+                WriteScope::Triage
+            };
+            check_actor_grant(&tx, account_id, actor, scope)?;
+        }
         if action.kind == "draft" {
             undo_draft(&tx, account_id, action.id)?;
         } else {
@@ -632,6 +690,7 @@ impl crate::Store {
         let actor = require_token(actor, "actor")?;
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
+        check_actor_grant(&tx, account_id, actor, WriteScope::Triage)?;
         let label_edit = matches!(kind, "label" | "unlabel")
             .then(|| LabelEdit::from_summary(&summary))
             .transpose()?;
@@ -714,6 +773,61 @@ impl crate::Store {
         self.seal_private_files()?;
         Ok(Some(action))
     }
+}
+
+fn read_grant(conn: &Connection, account: &AccountId, agent_id: &str) -> Result<AgentGrant> {
+    Ok(conn
+        .query_row(
+            "SELECT enabled, can_read, can_triage, can_draft
+             FROM agent_grants WHERE agent_id = ?1 AND account_id = ?2",
+            params![agent_id, account.as_str()],
+            |row| {
+                Ok(AgentGrant {
+                    enabled: row.get(0)?,
+                    read: row.get(1)?,
+                    triage: row.get(2)?,
+                    draft: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or(AgentGrant::DISABLED))
+}
+
+fn check_actor_grant(
+    conn: &Connection,
+    account: &AccountId,
+    actor: &str,
+    scope: WriteScope,
+) -> Result<()> {
+    // The agent: namespace identifies MCP actors. Local actions and user
+    // undo use their own actor names.
+    if let Some(agent_id) = actor.strip_prefix("agent:") {
+        check_write_grant(conn, account, agent_id, scope)?;
+    }
+    Ok(())
+}
+
+fn check_write_grant(
+    conn: &Connection,
+    account: &AccountId,
+    agent_id: &str,
+    scope: WriteScope,
+) -> Result<()> {
+    let grant = read_grant(conn, account, require_token(agent_id, "agent id")?)?;
+    if !grant.enabled {
+        return Err(Error::Invalid(format!("agent {agent_id} is disabled")));
+    }
+    let (allowed, name) = match scope {
+        WriteScope::Triage => (grant.triage, "triage"),
+        WriteScope::Draft => (grant.draft, "draft"),
+    };
+    if !allowed {
+        return Err(Error::Invalid(format!(
+            "agent {agent_id} lacks the {name} scope"
+        )));
+    }
+    Ok(())
 }
 
 impl Snap {
@@ -1212,7 +1326,10 @@ mod tests {
     }
 
     fn seeded() -> (Store, AccountId, ThreadId) {
-        let store = Store::open_in_memory().unwrap();
+        seed(Store::open_in_memory().unwrap())
+    }
+
+    fn seed(store: Store) -> (Store, AccountId, ThreadId) {
         let acct = account("a1");
         store.upsert_account(&acct).unwrap();
         let thread = store
@@ -1249,12 +1366,74 @@ mod tests {
     }
 
     #[test]
+    fn a_committed_grant_change_blocks_writes_already_authorized_by_mcp() {
+        let root = std::env::temp_dir().join(format!("fell-agent-revoke-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("mail.db");
+        let (mcp, account, thread) = seed(Store::open(&path).unwrap());
+        let settings = Store::open(&path).unwrap();
+        let enabled = AgentGrant::enabled(true, true, true);
+        let draft = ReviewDraftInput {
+            account_id: account.clone(),
+            to: vec!["reader@example.test".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Demo".into(),
+            body: "Draft for review".into(),
+            in_reply_to: None,
+            thread_id: None,
+        };
+        settings.set_agent_grant(&account, "bot", enabled).unwrap();
+        mcp.create_review_draft(draft.clone(), "agent:bot").unwrap();
+
+        for grant in [
+            AgentGrant::DISABLED,
+            AgentGrant::enabled(true, false, false),
+        ] {
+            settings.set_agent_grant(&account, "bot", enabled).unwrap();
+            assert_eq!(mcp.agent_grant(&account, "bot").unwrap(), enabled);
+            // The MCP process has passed its initial authorization. The
+            // settings connection commits before it enters the write path.
+            settings.set_agent_grant(&account, "bot", grant).unwrap();
+            let denied = |error: Error, scope: &str| {
+                let expected = if grant.enabled { scope } else { "disabled" };
+                assert!(error.to_string().contains(expected), "{error}");
+            };
+            denied(
+                mcp.agent_archive_thread(&account, &thread, "agent:bot")
+                    .unwrap_err(),
+                "triage scope",
+            );
+            denied(
+                mcp.create_review_draft(draft.clone(), "agent:bot")
+                    .unwrap_err(),
+                "draft scope",
+            );
+            denied(
+                mcp.undo_actor(&account, "agent:bot").unwrap_err(),
+                "draft scope",
+            );
+            assert!(
+                only_message(&mcp, &account, &thread)
+                    .iter()
+                    .all(|message| !message.archived)
+            );
+            assert_eq!(mcp.list_review_drafts(&account).unwrap().len(), 1);
+            let actions = mcp.list_actions(&account).unwrap();
+            assert_eq!(actions.len(), 1);
+            assert!(!actions[0].undone);
+        }
+        // The person can undo an existing draft action after revoking.
+        assert_eq!(settings.agent_undo(&account).unwrap().kind, "draft");
+    }
+
+    #[test]
     fn list_agent_grants_reports_scopes_and_the_last_action_per_agent() {
         let (store, acct, thread) = seeded();
         store.upsert_account(&account("a2")).unwrap();
         assert!(store.list_agent_grants().unwrap().is_empty());
         store
-            .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, false, true))
+            .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, true, true))
             .unwrap();
         store
             .set_agent_grant(&AccountId("a2".into()), "bot", AgentGrant::DISABLED)
@@ -1264,6 +1443,9 @@ mod tests {
             .unwrap();
         store
             .agent_archive_thread(&acct, &thread, "agent:bot")
+            .unwrap();
+        store
+            .set_agent_grant(&acct, "bot", AgentGrant::enabled(true, false, true))
             .unwrap();
         // A person's action and another agent's do not count for `bot`.
         store.mark_thread_read(&acct, &thread, "user").unwrap();
@@ -1625,6 +1807,9 @@ mod tests {
     fn agent_undo_star_preserves_the_users_read_action() {
         let (store, account_id, thread_id) = seeded();
         store
+            .set_agent_grant(&account_id, "bot", AgentGrant::enabled(false, true, false))
+            .unwrap();
+        store
             .star_thread(&account_id, &thread_id, true, "agent:bot")
             .unwrap()
             .unwrap();
@@ -1651,6 +1836,9 @@ mod tests {
     #[test]
     fn undo_actor_does_not_reverse_someone_else() {
         let (store, account_id, thread_id) = seeded();
+        store
+            .set_agent_grant(&account_id, "bot", AgentGrant::enabled(false, true, false))
+            .unwrap();
         store
             .agent_archive_thread(&account_id, &thread_id, "user")
             .unwrap();
@@ -1780,6 +1968,9 @@ mod tests {
     #[test]
     fn review_draft_is_stored_not_sent() {
         let (store, account_id, thread_id) = seeded();
+        store
+            .set_agent_grant(&account_id, "bot", AgentGrant::enabled(false, false, true))
+            .unwrap();
         let before = store
             .thread_messages(&account_id, &thread_id)
             .unwrap()
@@ -1885,6 +2076,9 @@ mod tests {
     #[test]
     fn quoted_display_name_may_contain_a_comma() {
         let (store, account_id, _) = seeded();
+        store
+            .set_agent_grant(&account_id, "bot", AgentGrant::enabled(false, false, true))
+            .unwrap();
         let recipient = "\"Doe, Jane\" <j@x.com>";
         let saved = store
             .create_review_draft(
