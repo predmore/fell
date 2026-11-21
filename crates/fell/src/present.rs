@@ -139,8 +139,13 @@ pub fn offset_to_show_start(
     if on_screen >= view_top - 0.5 && on_screen <= view_bottom - START_IN_VIEW_PX {
         return None;
     }
-    let target = (view_top - item_top).clamp(-max, 0.0);
+    let target = offset_to_message_top(item_top, view_top, max);
     ((target - offset).abs() > 0.5).then_some(target)
+}
+
+/// The message header's position in the viewport, bounded by the content.
+pub fn offset_to_message_top(item_top: f32, view_top: f32, max: f32) -> f32 {
+    (view_top - item_top).clamp(-max, 0.0)
 }
 
 /// What an expanded message paints for its body.
@@ -796,7 +801,9 @@ pub fn conversation(
                 folders: message
                     .folders
                     .iter()
-                    .filter(|folder| !roles.is_view(folder))
+                    .filter(|folder| {
+                        !roles.is_view(folder) && !folder.eq_ignore_ascii_case(viewing)
+                    })
                     // A message in Drafts is a draft: "Draft", unless the
                     // reader is in Drafts, where every row is one.
                     .filter_map(|folder| {
@@ -1311,6 +1318,17 @@ mod tests {
             offset_to_show_start(680.0, 100.0, 700.0, 0.0, 900.0),
             Some(-580.0)
         );
+    }
+
+    #[test]
+    fn a_message_jump_targets_the_header_even_if_the_message_is_visible() {
+        // Viewport starts at 100. A visible message at 340 still lands at 100.
+        assert_eq!(offset_to_message_top(340.0, 100.0, 1_200.0), -240.0);
+        // A tall message below the viewport uses the same rule.
+        assert_eq!(offset_to_message_top(900.0, 100.0, 1_200.0), -800.0);
+        // Either edge can prevent the exact alignment.
+        assert_eq!(offset_to_message_top(900.0, 100.0, 600.0), -600.0);
+        assert_eq!(offset_to_message_top(95.0, 100.0, 600.0), 0.0);
     }
 
     #[test]
@@ -1955,6 +1973,7 @@ mod tests {
         assert!(!messages[1].expanded);
         assert!(messages[2].expanded);
         assert_eq!(messages[1].folders, ["Sent"]);
+        assert!(messages[2].folders.is_empty());
         // A draft says so beside the mail it answers, but not inside
         // Drafts, where every row is a draft.
         let roles = FolderRoles::from_names(&["INBOX".into(), "Drafts".into()]);

@@ -43,10 +43,12 @@ use crate::model::{
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
+use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingHold, LayoutProbe, LayoutSlot, Reveal, RevealPhase, ScrollAnchor, clamped_offset,
+    LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase, ScrollAnchor,
+    clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -364,7 +366,7 @@ struct Inbox {
     bodies_asked: BodyAsks,
     /// The reader's message to hold at the top of the conversation until
     /// they scroll it. See [`Inbox::hold_landing`].
-    landing: Option<String>,
+    landing: ReaderLanding,
 }
 
 /// Room kept for a body that is still being prepared: a short paragraph, so
@@ -472,7 +474,7 @@ impl Inbox {
             bodies: BodyCache::default(),
             body_loads: BodyLoads::default(),
             bodies_asked: BodyAsks::default(),
-            landing: None,
+            landing: ReaderLanding::default(),
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -1236,7 +1238,7 @@ impl Inbox {
                         &self.motion,
                         now,
                         None,
-                        conv_width,
+                        ReaderColumns::split(conv_width),
                         Live(false),
                         &ConvFrame::default(),
                         window,
@@ -2937,10 +2939,6 @@ impl Inbox {
                 None => self.scroll_list_to_cursor(),
             }
         }
-        // A tall message aligns to its top when scrolled into view. Skip that
-        // unless the reader moved to another message, or a new thread loaded.
-        // Paging already moved the viewport by pixels, so it must not jump
-        // the current message back to the top.
         if step.message_disclosure_changed {
             self.reader_took_over(true);
         }
@@ -2949,7 +2947,9 @@ impl Inbox {
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
         } else if step.reveal_search_hit {
             self.scroll_conversation();
-        } else if !step.reveal_attachment && self.session.message_cursor != message_before {
+        } else if !step.reveal_attachment
+            && (step.jump_to_message || self.session.message_cursor != message_before)
+        {
             if self.session.cursor_id == thread_before {
                 self.reader_took_over(true);
                 self.glide_conversation_to_cursor();
@@ -3103,11 +3103,12 @@ impl Inbox {
     /// there while the conversation lays out: [`LandingHold`] sets the
     /// offset from each frame's own layout, before it paints.
     fn land_on_reader(&mut self) {
-        self.landing = self
-            .session
-            .messages
-            .get(self.session.message_cursor)
-            .map(|message| message.id.clone());
+        self.landing.hold(
+            self.session
+                .messages
+                .get(self.session.message_cursor)
+                .map(|message| message.id.as_str()),
+        );
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
@@ -3118,51 +3119,46 @@ impl Inbox {
             .messages
             .get(index)
             .map(|message| message.id.as_str());
-        if self.landing.as_deref() != current {
-            self.release_landing();
-        }
         self.landing
-            .as_ref()
-            .map(|_| ScrollAnchor { index, y: px(0.) })
+            .anchor(current, index, self.motion.conv_glide.is_some())
     }
 
     /// The reader took over: stop holding their message in place.
     fn release_landing(&mut self) {
-        self.landing = None;
+        self.landing.hold(None);
     }
 
-    /// `j`/`k` in the conversation: glide to the message, by the rule
-    /// GPUI's `scroll_to_item` uses, once its bounds are known.
+    /// Message navigation aligns the selected header using laid-out bounds.
     fn glide_conversation_to_cursor(&mut self) {
         let index = self.session.message_cursor;
-        let Some(item) = self.conv_scroll.bounds_for_item(index) else {
+        self.land_on_reader();
+        if self.motion.reading_sliding() {
+            return;
+        }
+        let Some(item) = self
+            .conv_layout_current
+            .then(|| self.conv_scroll.bounds_for_item(index))
+            .flatten()
+        else {
             self.scroll_conversation();
             return;
         };
         let view = self.conv_scroll.bounds();
         let offset = f32::from(self.conv_scroll.offset().y);
         let max = f32::from(self.conv_scroll.max_offset().height);
-        let (top, bottom) = (f32::from(item.top()), f32::from(item.bottom()));
-        let target = if top + offset < f32::from(view.top()) {
-            f32::from(view.top()) - top
-        } else if bottom + offset > f32::from(view.bottom()) {
-            // Show its end, but never scroll its header off the top: a
-            // message taller than the viewport is read from its start.
-            (f32::from(view.bottom()) - bottom).max(f32::from(view.top()) - top)
-        } else {
-            offset
-        };
-        self.glide_conversation(offset, target.clamp(-max, 0.0));
+        let target =
+            present::offset_to_message_top(f32::from(item.top()), f32::from(view.top()), max);
+        self.glide_conversation(offset, target);
     }
 
     /// Set the conversation's offset to `to`, gliding there from where it
     /// is drawn. `offset` is the offset the key saw.
     fn glide_conversation(&mut self, offset: f32, to: f32) {
         let from = self.motion.glide_from_conversation(offset);
-        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
         let x = self.conv_scroll.offset().x;
         self.conv_scroll.set_offset(point(x, px(to)));
         let now = self.motion.clock.now();
+        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
         self.motion.conv_glide =
             Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now)
                 .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
@@ -3342,6 +3338,7 @@ impl Render for Inbox {
         // Motion time: a frame the compositor held back moves what is
         // moving one step on, not to its end.
         let now = self.motion.clock.frame(real);
+        let previous_reading = self.motion.reading_target();
         self.frame_now = now;
         let width = f32::from(window.viewport_size().width);
         let panes = present::visible_panes(width, self.session.pane, self.session.full_width);
@@ -3366,6 +3363,17 @@ impl Render for Inbox {
         if self.body_refresh.is_empty() {
             self.reveal_newest(window);
         }
+        let layout_anchor = || {
+            if (previous_reading != self.motion.reading_target() || self.motion.reading_sliding())
+                && self.conv_layout_current
+                && self.motion.conv_glide.is_none()
+            {
+                ScrollAnchor::capture(&self.conv_scroll)
+            } else {
+                None
+            }
+        };
+        let anchor = anchor.or_else(layout_anchor);
         let conv = ConvFrame {
             alphas: self.motion.body_alphas(now),
             disclosures: self.motion.disclosures(&self.session, now),
@@ -3586,6 +3594,19 @@ fn shell(
 ) -> gpui::Stateful<gpui::Div> {
     let (show_list, show_conv) = present::visible_panes(width, session.pane, session.full_width);
     let list_width = list_width(width, split);
+    let beside = show_conv && width >= present::NARROW_WIDTH;
+    let split_width = if beside {
+        list_width + SPLITTER_PX
+    } else {
+        0.0
+    };
+    let reading = motion.reading_progress(now);
+    let scale = window.scale_factor();
+    let split_space = if beside {
+        ReaderColumns::pane_left(split_width, reading, scale)
+    } else {
+        0.0
+    };
     let list_entry = motion.pane_entry(Pane::List, now);
     let conv_entry = motion.pane_entry(Pane::Conversation, now);
     let status = motion.status(session, now);
@@ -3621,7 +3642,7 @@ fn shell(
                 motion,
                 now,
                 Some(conv_scroll.clone()),
-                width,
+                ReaderColumns::split(width),
                 // Paint only: the shield over it takes the pointer too.
                 Live(false),
                 &conv,
@@ -3722,29 +3743,53 @@ fn shell(
                 .overflow_hidden()
                 .children(warm)
                 .children(swapped_out.into_iter().flatten())
-                .when(show_list, |row| {
-                    row.child(entering(
-                        thread_list(
-                            &theme,
-                            session,
-                            show_conv,
-                            if show_conv { list_width } else { width },
-                            list_scroll,
-                            cached_search_rows,
-                            cx,
-                        ),
-                        list_entry,
-                    ))
-                })
-                .when(show_list && show_conv, |row| {
-                    row.child(splitter(&theme, cx))
+                .when(show_list || split_space > 0.0, |row| {
+                    let list = thread_list(
+                        &theme,
+                        session,
+                        beside,
+                        if beside { list_width } else { width },
+                        list_scroll,
+                        cached_search_rows,
+                        cx,
+                    );
+                    if beside {
+                        row.child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .w(px(split_space))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right_0()
+                                        .w(px(split_width))
+                                        .flex()
+                                        .flex_row()
+                                        .opacity(motion.reading_list_opacity(now))
+                                        .child(list)
+                                        .child(splitter(&theme, cx)),
+                                )
+                                .when(!show_list, |clip| {
+                                    clip.child(
+                                        div()
+                                            .id("closing-thread-list")
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .size_full()
+                                            .occlude(),
+                                    )
+                                }),
+                        )
+                    } else {
+                        row.child(entering(list, list_entry))
+                    }
                 })
                 .when(show_conv, |row| {
-                    let conv_width = if show_list {
-                        width - list_width - SPLITTER_PX
-                    } else {
-                        width
-                    };
                     if let Some((revision, preview)) = cached_preview {
                         let pane = div()
                             .id(("cached-search-conversation", revision))
@@ -3775,7 +3820,13 @@ fn shell(
                             motion,
                             now,
                             Some(conv_scroll),
-                            conv_width,
+                            ReaderColumns::new(
+                                width,
+                                split_width,
+                                motion.reading_target(),
+                                reading,
+                                scale,
+                            ),
                             Live(conv.preview_current && !session.search_editing()),
                             &conv,
                             window,
@@ -5159,6 +5210,93 @@ fn message_content_width(conv_width: f32) -> f32 {
     (conv_width - CONVERSATION_RULE_PX - 2. * (CONVERSATION_PAD_PX + MESSAGE_PAD_PX)).max(0.)
 }
 
+const READING_WIDE_PX: f32 = 1040.;
+const READING_GUTTER_PX: f32 = 48.;
+
+#[derive(Clone, Copy)]
+struct ReaderColumn {
+    width: f32,
+    inset: f32,
+}
+
+impl ReaderColumn {
+    fn place(self, child: impl IntoElement) -> gpui::Div {
+        div().ml(px(self.inset)).w(px(self.width)).child(child)
+    }
+}
+
+/// Column positions are interpolated in window coordinates. Each element
+/// uses the difference from the sliding pane's left edge as its inset.
+#[derive(Clone, Copy)]
+struct ReaderColumns {
+    header: ReaderColumn,
+    prose: ReaderColumn,
+    card: ReaderColumn,
+    wide: ReaderColumn,
+    reading_wide: f32,
+    progress: f32,
+}
+
+impl ReaderColumns {
+    fn split(width: f32) -> Self {
+        Self::new(width, 0.0, false, 0.0, 1.0)
+    }
+
+    fn pane_left(split: f32, progress: f32, scale: f32) -> f32 {
+        motion::snap(split * (1.0 - progress), scale)
+    }
+
+    fn new(window: f32, split_left: f32, reading: bool, progress: f32, scale: f32) -> Self {
+        let pane_left = Self::pane_left(split_left, progress, scale);
+        let split = message_content_width(window - split_left);
+        let full = message_content_width(window);
+        let available = message_content_width(window - pane_left);
+        let reading_prose = full.min(READING_MEASURE_PX);
+        let reading_wide = full
+            .min(READING_WIDE_PX)
+            .min((window - 2.0 * READING_GUTTER_PX).max(split));
+        // Layout uses the destination measure from the first frame. The
+        // pane clips content as the insets move and the card resizes.
+        let centered_inset = |to_width: f32| {
+            let to_left = ((full - to_width) * 0.5).round();
+            let left = motion::snap(motion::lerp(split_left, to_left, progress), scale);
+            (left - pane_left).max(0.0)
+        };
+        let inset = centered_inset(reading_prose);
+        let card = ReaderColumn {
+            width: motion::lerp(split, reading_prose, progress)
+                .round()
+                .min((available - inset).max(0.0).floor()),
+            inset,
+        };
+        let header_width = if reading { reading_prose } else { split };
+        Self {
+            header: ReaderColumn {
+                width: header_width,
+                inset,
+            },
+            prose: ReaderColumn {
+                width: header_width.min(READING_MEASURE_PX),
+                inset,
+            },
+            card,
+            wide: ReaderColumn {
+                width: if reading { reading_wide } else { split },
+                inset: centered_inset(reading_wide),
+            },
+            reading_wide,
+            progress,
+        }
+    }
+
+    fn date_column(self) -> ReaderColumn {
+        ReaderColumn {
+            width: self.card.width,
+            inset: self.card.inset + MESSAGE_PAD_PX,
+        }
+    }
+}
+
 struct CollapsedRows {
     style: TextStyle,
     align_senders: bool,
@@ -5170,14 +5308,13 @@ struct CollapsedRows {
 }
 
 impl CollapsedRows {
-    fn new(window: &Window, theme: &Theme, conv_width: f32) -> Self {
+    fn new(window: &Window, theme: &Theme, content_width: f32) -> Self {
         let style = conversation_line_style(window, theme, px(theme.ui_px));
         let measure = |text, weight| line_px_with_style(window, &style, text, weight).ceil();
         let snippet_preview = measure("mmm…", FontWeight::NORMAL);
         // Use a full date as the width reference for the pane, so a shorter
         // date or an empty preview cannot switch one row's layout.
         let date_width = measure("May 28, 2000", FontWeight::NORMAL);
-        let content_width = message_content_width(conv_width);
         let align_senders = content_width
             >= COLLAPSED_SENDER_PX + snippet_preview + date_width + 2. * COLLAPSED_GAP_PX;
         let gap = if align_senders {
@@ -5293,7 +5430,7 @@ fn conversation(
     now: Instant,
     // `None`: a copy drawn unseen, which neither scrolls nor takes the wheel.
     scroll: Option<ScrollHandle>,
-    conv_width: f32,
+    columns: ReaderColumns,
     live: Live,
     frame: &ConvFrame,
     window: &Window,
@@ -5306,6 +5443,10 @@ fn conversation(
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
+    let on_collapsed = session
+        .messages
+        .get(session.message_cursor)
+        .is_some_and(|message| !message.expanded);
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     let messages: Vec<_> = session
         .messages
@@ -5318,13 +5459,18 @@ fn conversation(
                 0.0
             };
             let block = if message.expanded {
+                let fill = motion::mix(
+                    theme.background,
+                    theme.surface,
+                    if on_collapsed { 0.4 * focus } else { cursor },
+                );
                 expanded_message(
                     theme,
                     session,
                     message,
                     index,
-                    cursor,
-                    conv_width,
+                    (cursor, fill),
+                    columns,
                     live,
                     frame,
                     chip_probe.as_ref(),
@@ -5338,7 +5484,9 @@ fn conversation(
                     message,
                     index,
                     (cursor, body),
-                    collapsed_rows.get_or_init(|| CollapsedRows::new(window, theme, conv_width)),
+                    columns,
+                    collapsed_rows
+                        .get_or_init(|| CollapsedRows::new(window, theme, columns.header.width)),
                     live,
                     window,
                     cx,
@@ -5370,12 +5518,11 @@ fn conversation(
         .border_color(rgb(motion::mix(
             theme.background,
             theme.accent,
-            motion.focus_edge(session.pane, now),
+            focus * (1.0 - columns.progress),
         )))
         .when(!subject.is_empty(), |pane| {
             pane.child(
                 div()
-                    .px(px(28.))
                     .pt(px(22.))
                     .pb(px(14.))
                     .text_size(px(theme.ui_px + 11.0))
@@ -5385,6 +5532,10 @@ fn conversation(
                     .border_color(rgb(theme.border))
                     .child(
                         div()
+                            .ml(px(CONVERSATION_PAD_PX
+                                + MESSAGE_PAD_PX
+                                + columns.header.inset))
+                            .w(px(columns.header.width))
                             .when(arrival < 1.0, |text| text.opacity(arrival))
                             .child(subject),
                     ),
@@ -5456,12 +5607,28 @@ fn conversation_line_style(window: &Window, theme: &Theme, size: gpui::Pixels) -
     style
 }
 
+/// The leading fields have already been laid out at the destination width.
+/// Clip them as the card moves so the date always has its own space.
+fn message_date_row<T: Styled + ParentElement>(
+    row: T,
+    gap: f32,
+    leading: gpui::Div,
+    date: Option<gpui::Div>,
+) -> T {
+    row.flex()
+        .items_center()
+        .gap(px(gap))
+        .child(div().flex_1().min_w_0().overflow_hidden().child(leading))
+        .children(date)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
     (cursor, body): (f32, f32),
+    columns: ReaderColumns,
     rows: &CollapsedRows,
     live: Live,
     window: &Window,
@@ -5529,16 +5696,14 @@ fn collapsed_message(
             .map_or(0., |line| f32::from(line.width).ceil())
     };
     let snippet_w = remaining - sender_w;
-    div()
+    let dates = columns.date_column();
+    let row = div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
-        .w_full()
+        .ml(px(dates.inset - MESSAGE_PAD_PX))
+        .w(px(dates.width + 2.0 * MESSAGE_PAD_PX))
         .min_w(px(0.))
         .px(px(MESSAGE_PAD_PX))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(rows.gap))
         .overflow_hidden()
         .rounded_md()
         .bg(rgb(motion::mix(theme.background, theme.selection, cursor)))
@@ -5563,7 +5728,11 @@ fn collapsed_message(
                     cx.notify();
                 }),
             )
-        })
+        });
+    let leading = div()
+        .flex()
+        .items_center()
+        .gap(px(rows.gap))
         .child(
             div()
                 .w(px(sender_w))
@@ -5580,8 +5749,12 @@ fn collapsed_message(
                 .text_color(rgb(dimmed))
                 .when(body < 1.0, |line| line.opacity(body))
                 .children(clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text)),
-        )
-        .child(
+        );
+    message_date_row(
+        row,
+        rows.gap,
+        leading,
+        Some(
             div()
                 .w(px(date_w))
                 .flex_none()
@@ -5589,14 +5762,15 @@ fn collapsed_message(
                 .text_right()
                 .text_color(rgb(dimmed))
                 .children(clip(&date, date_w, FontWeight::NORMAL).map(|line| line.text)),
-        )
-        .into_any_element()
+        ),
+    )
+    .into_any_element()
 }
 
 fn expanded_message_header(
     theme: &Theme,
     message: &ConvMessage,
-    width: f32,
+    columns: ReaderColumns,
     window: &Window,
 ) -> gpui::Div {
     const GAP: f32 = 10.;
@@ -5604,10 +5778,10 @@ fn expanded_message_header(
     let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
-    let room = (width - date_width - 3. * GAP).max(0.);
+    let room = (columns.header.width - date_width - 3. * GAP).max(0.);
     let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
         clip_shaped(window, style, text, width.floor(), weight, Some(color))
-            .filter(|line| f32::from(line.width).ceil() <= width)
+            .filter(|line| !line.text.is_empty() && f32::from(line.width).ceil() <= width)
     };
     let sender = fit(
         &sender_style,
@@ -5662,36 +5836,28 @@ fn expanded_message_header(
                 .join(" · ");
             fit_folders(&leaves)
         });
-    div()
-        .flex()
-        .items_center()
-        .gap(px(GAP))
-        // The recipient line belongs to this header, so it sits close.
-        .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
-        .child(
-            div()
-                .flex_none()
-                .children(sender.map(|line| shaped_text(line, window))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .children(email.map(|line| shaped_text(line, window))),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .children(folders.map(|line| shaped_text(line, window))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(theme.dimmed))
-                .child(date),
-        )
+    let leading = div().flex().items_center().gap(px(GAP)).children(
+        [sender, email, folders]
+            .into_iter()
+            .flatten()
+            .map(|line| shaped_text(line, window)),
+    );
+    let date = fit(
+        &sender_style,
+        &date,
+        columns.header.width,
+        FontWeight::NORMAL,
+        theme.dimmed,
+    );
+    message_date_row(
+        div()
+            .w(px(columns.date_column().width))
+            // The recipient line belongs to this header, so it sits close.
+            .pb(px(if message.recipients.is_some() { 2. } else { 8. })),
+        GAP,
+        leading,
+        date.map(|line| div().flex_none().child(shaped_text(line, window))),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5700,23 +5866,32 @@ fn expanded_message(
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    cursor: f32,
-    conv_width: f32,
+    (cursor, fill): (f32, u32),
+    columns: ReaderColumns,
     live: Live,
     frame: &ConvFrame,
     chip_probe: Option<&LayoutSlot>,
     window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
-    let body_width = message_content_width(conv_width);
+    let header_width = columns.header.width;
     let dim = theme.dimmed;
     div()
         .id(gpui::ElementId::named_usize("message", index))
         .px(px(MESSAGE_PAD_PX))
         .py(px(10.))
         .mb(px(8.))
-        .rounded_md()
-        .bg(rgb(motion::mix(theme.background, theme.surface, cursor)))
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(columns.card.inset))
+                .w(px(columns.card.width + 2.0 * MESSAGE_PAD_PX))
+                .rounded_md()
+                .bg(rgb(fill)),
+        )
         .when(live.0, |card| {
             card.on_mouse_down(
                 MouseButton::Left,
@@ -5731,37 +5906,42 @@ fn expanded_message(
                 }),
             )
         })
-        .child(expanded_message_header(theme, message, body_width, window))
-        .children(message.recipients.as_ref().map(|line| {
-            recipient_lines(
-                theme,
-                line,
-                session.recipients_are_open(index),
-                frame.disclosures.recipients.get(&message.id).copied(),
-                index,
-                body_width.min(680.),
-                live,
-                window,
-                cx,
-            )
-        }))
-        .children(
-            live.0
-                .then(|| search::match_reason(theme, session, message))
-                .flatten(),
+        .child(
+            columns.header.place(
+                div()
+                    .child(expanded_message_header(theme, message, columns, window))
+                    .children(message.recipients.as_ref().map(|line| {
+                        recipient_lines(
+                            theme,
+                            line,
+                            session.recipients_are_open(index),
+                            frame.disclosures.recipients.get(&message.id).copied(),
+                            index,
+                            header_width.min(680.),
+                            live,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .children(
+                        live.0
+                            .then(|| search::match_reason(theme, session, message))
+                            .flatten(),
+                    )
+                    // What a draft answers, under who it goes to, as in its window.
+                    .children(message.context.as_ref().map(|line| {
+                        div()
+                            .max_w(px(680.))
+                            // Close under the recipient line, as one header block.
+                            .when(message.recipients.is_some(), |line| line.mt(px(-6.)))
+                            .pb(px(10.))
+                            .text_size(px(theme.ui_px - 1.0))
+                            .text_color(rgb(dim))
+                            .truncate()
+                            .child(line.clone())
+                    })),
+            ),
         )
-        // What a draft answers, under who it goes to, as in its window.
-        .children(message.context.as_ref().map(|line| {
-            div()
-                .max_w(px(680.))
-                // Close under the recipient line, as one header block.
-                .when(message.recipients.is_some(), |line| line.mt(px(-6.)))
-                .pb(px(10.))
-                .text_size(px(theme.ui_px - 1.0))
-                .text_color(rgb(dim))
-                .truncate()
-                .child(line.clone())
-        }))
         // `q` opens every collapsed block in the message at once, so only
         // the first fold of the reader's message names the key.
         .child(message_body(
@@ -5769,9 +5949,10 @@ fn expanded_message(
             message,
             FoldView {
                 open: session.is_open(index),
-                width: body_width,
+                columns,
                 name_key: index == session.message_cursor,
                 focused: cursor,
+                fill,
                 index,
                 live: live.0,
             },
@@ -5779,9 +5960,18 @@ fn expanded_message(
             cx,
         ))
         .when(!message.attachments.is_empty(), |card| {
-            card.child(attachment_chips::row(
-                theme, session, message, index, body_width, live, frame, chip_probe, window, cx,
-            ))
+            card.child(columns.header.place(attachment_chips::row(
+                theme,
+                session,
+                message,
+                index,
+                header_width,
+                live,
+                frame,
+                chip_probe,
+                window,
+                cx,
+            )))
         })
         .into_any_element()
 }
@@ -5791,12 +5981,13 @@ fn expanded_message(
 struct FoldView {
     /// `q` has opened them.
     open: bool,
-    width: f32,
+    columns: ReaderColumns,
     /// The first fold names `q`: this is the reader's message.
     name_key: bool,
     /// How much the message shows the cursor in the focused
     /// conversation, 0 to 1: the fold `q` acts on takes the accent with it.
     focused: f32,
+    fill: u32,
     index: usize,
     /// Drawn on screen, not as an unseen copy: a click opens the fold.
     live: bool,
@@ -5817,21 +6008,34 @@ fn message_body(
 ) -> gpui::AnyElement {
     let alpha = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
     if let Some(line) = present::missing_body_line(message.body_state) {
-        return div()
-            .pb(px(8.))
-            .line_height(px(theme.ui_px * 1.45))
-            .text_color(rgb(theme.dimmed))
-            .opacity(alpha)
-            .child(line)
+        return folds
+            .columns
+            .prose
+            .place(
+                div()
+                    .pb(px(8.))
+                    .line_height(px(theme.ui_px * 1.45))
+                    .text_color(rgb(theme.dimmed))
+                    .opacity(alpha)
+                    .child(line),
+            )
             .into_any_element();
     }
     let reveal = frame.disclosures.quotes.get(&message.id).copied();
+    if let Rich::Html(body) = &message.rich {
+        return div()
+            .opacity(alpha)
+            .children(html_sections(theme, body, folds, reveal, cx))
+            .into_any_element();
+    }
     let blocks: Vec<gpui::AnyElement> = match &message.rich {
-        Rich::Html(body) => html_sections(theme, body, folds, reveal, cx),
+        Rich::Html(_) => unreachable!(),
         Rich::Pending => vec![div().h(px(PENDING_BODY_PX)).into_any_element()],
         Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
+            let palette = mail_body::palette(theme);
+            let quiet = mail_body::history_palette(theme);
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
             let mut drafts: HashMap<usize, gpui::AnyElement> = HashMap::new();
             let body = match &message.rich {
@@ -5876,7 +6080,7 @@ fn message_body(
                         .line_height(px(theme.ui_px * 1.45))
                         .map(|text| match drafts.remove(&at) {
                             Some(draft) => text.child(draft),
-                            None => text.child(texts.concat()),
+                            None => text.child(crate::render::plain_text(texts.concat(), palette)),
                         })
                         .into_any_element(),
                     Some(kind) => {
@@ -5892,13 +6096,24 @@ fn message_body(
                                 rtl: crate::render::is_right_to_left(&text),
                             },
                             folds,
+                            (
+                                ReaderColumn {
+                                    width: folds.columns.prose.width,
+                                    inset: 0.0,
+                                },
+                                folds.columns.prose.width,
+                            ),
                             reveal,
                             move || {
-                                div()
-                                    .max_w(px(READING_MEASURE_PX - HISTORY_INDENT_PX))
-                                    .line_height(line_height)
-                                    .child(text)
-                                    .into_any_element()
+                                history_rule(
+                                    div(),
+                                    crate::render::is_right_to_left(&text),
+                                    crate::theme::strong_border(theme),
+                                )
+                                .text_color(rgb(theme.dimmed))
+                                .line_height(line_height)
+                                .child(crate::render::plain_text(text, quiet))
+                                .into_any_element()
                             },
                             cx,
                         )
@@ -5907,12 +6122,12 @@ fn message_body(
                 .collect()
         }
     };
-    div().opacity(alpha).children(blocks).into_any_element()
+    folds
+        .columns
+        .prose
+        .place(div().opacity(alpha).children(blocks))
+        .into_any_element()
 }
-
-/// Longest line of mail text, about 72 characters: past it the eye loses
-/// its place going back to the next line.
-const READING_MEASURE_PX: f32 = 600.;
 
 /// A prepared HTML body, one section at a time: what the sender wrote is
 /// painted; quoted history and the signature fold to one line until `q`.
@@ -5927,6 +6142,7 @@ fn html_sections(
     let quiet = mail_body::history_palette(theme);
     let line = px(theme.ui_px * 1.45);
     let folded = &body.folded;
+    let columns = folds.columns;
     let first_fold = folded
         .sections
         .iter()
@@ -5938,11 +6154,14 @@ fn html_sections(
         .enumerate()
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
-            let width = if rtl {
-                folds.width.min(READING_MEASURE_PX)
-            } else {
-                folds.width
-            };
+            let blocks = folded.blocks(section);
+            let layout = crate::render::BlockColumn::reading(
+                (columns.wide.width, columns.wide.inset),
+                (columns.prose.width, columns.prose.inset),
+                columns.reading_wide,
+                columns.progress,
+                folds.fill,
+            );
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.
@@ -5951,37 +6170,30 @@ fn html_sections(
                 None if section.quoted => div()
                     .pt(px(8.))
                     .pb(px(16.))
-                    .when(rtl, |quote| quote.max_w(px(READING_MEASURE_PX)))
-                    .child(
-                        history_rule(div(), rtl, crate::theme::strong_border(theme))
-                            .text_color(rgb(theme.dimmed))
-                            .child(history_blocks(
-                                folded.blocks(section),
-                                None,
-                                &quiet,
-                                &body.gallery,
-                                (theme, rtl, width),
-                            )),
-                    )
+                    .child(history_section(
+                        blocks,
+                        None,
+                        &quiet,
+                        &body.gallery,
+                        (theme, rtl, layout),
+                    ))
                     .into_any_element(),
                 // A short signature shown in place ("Sent from my iPhone")
                 // is the dimmed colour, as history is.
                 None => div()
                     .pb(px(8.))
-                    .when(rtl, |open| open.max_w(px(READING_MEASURE_PX)))
                     // A paragraph's gap above it, and the dimmed colour.
                     .when(section.quiet, |quiet| {
                         quiet.pt(px(16.)).text_color(rgb(theme.dimmed))
                     })
                     .child(
                         crate::render::blocks_column_spaced(
-                            folded.blocks(section),
+                            blocks,
                             if section.quiet { &quiet } else { &palette },
                             false,
                             &body.gallery,
-                            width,
+                            layout,
                             crate::render::BLOCK_GAP,
-                            (!rtl).then_some(READING_MEASURE_PX),
                         )
                         .line_height(line),
                     )
@@ -5997,14 +6209,19 @@ fn html_sections(
                             rtl,
                         },
                         folds,
+                        (
+                            columns.prose,
+                            (columns.wide.width + columns.wide.inset)
+                                .max(columns.prose.width + columns.prose.inset),
+                        ),
                         reveal,
                         || {
-                            history_blocks(
-                                body.folded.blocks(section),
+                            history_section(
+                                blocks,
                                 Some(kind),
                                 &history,
                                 &body.gallery,
-                                (theme, rtl, width),
+                                (theme, rtl, layout),
                             )
                         },
                         cx,
@@ -6013,6 +6230,31 @@ fn html_sections(
             }
         })
         .collect()
+}
+
+fn history_section(
+    blocks: &[fell_render::Block],
+    kind: Option<fell_render::Fold>,
+    palette: &crate::render::Palette,
+    gallery: &crate::render::ImageGallery,
+    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumn),
+) -> gpui::AnyElement {
+    let (rule, layout) = layout.quote(
+        div(),
+        HISTORY_INDENT_PX,
+        2.0,
+        crate::theme::strong_border(theme),
+        rtl,
+    );
+    rule.text_color(rgb(theme.dimmed))
+        .child(history_blocks(
+            blocks,
+            kind,
+            palette,
+            gallery,
+            (theme, rtl, layout),
+        ))
+        .into_any_element()
 }
 
 /// Space between a history rule and the text it marks.
@@ -6039,7 +6281,7 @@ fn history_blocks(
     kind: Option<fell_render::Fold>,
     history: &crate::render::Palette,
     gallery: &crate::render::ImageGallery,
-    (theme, rtl, width): (&Theme, bool, f32),
+    (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumn),
 ) -> gpui::AnyElement {
     use fell_render::{Block, Fold};
     let nested = matches!(
@@ -6047,30 +6289,27 @@ fn history_blocks(
         Some(Fold::SignatureAndQuote | Fold::QuoteAndSignature)
     );
     let line_height = px(theme.ui_px * 1.4);
-    let measure = (!rtl).then_some(READING_MEASURE_PX - HISTORY_INDENT_PX);
-    let width = (width - HISTORY_INDENT_PX).max(0.);
-    let column = |run: &[Block], width: f32, measure: Option<f32>| {
-        crate::render::blocks_column_spaced(run, history, false, gallery, width, 8., measure)
+    let column = |run: &[Block], layout| {
+        crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8.)
             .line_height(line_height)
     };
     div()
         .flex()
         .flex_col()
         .gap(px(8.))
-        .children(blocks.iter().map(|block| {
-            match block {
-                Block::Quote { blocks } if nested => {
-                    history_rule(div(), rtl, crate::theme::strong_border(theme))
-                        .child(column(
-                            blocks,
-                            (width - HISTORY_INDENT_PX).max(0.),
-                            measure.map(|measure| measure - HISTORY_INDENT_PX),
-                        ))
-                        .into_any_element()
-                }
-                Block::Quote { blocks } => column(blocks, width, measure).into_any_element(),
-                other => column(std::slice::from_ref(other), width, measure).into_any_element(),
+        .children(blocks.iter().map(|block| match block {
+            Block::Quote { blocks } if nested => {
+                let (rule, nested_layout) = layout.quote(
+                    div(),
+                    HISTORY_INDENT_PX,
+                    2.0,
+                    crate::theme::strong_border(theme),
+                    rtl,
+                );
+                rule.child(column(blocks, nested_layout)).into_any_element()
             }
+            Block::Quote { blocks } => column(blocks, layout).into_any_element(),
+            other => column(std::slice::from_ref(other), layout).into_any_element(),
         }))
         .into_any_element()
 }
@@ -6125,25 +6364,25 @@ fn fold_section(
     theme: &Theme,
     label: FoldLabel,
     folds: FoldView,
+    (summary, width): (ReaderColumn, f32),
     reveal: Option<f32>,
     opened: impl FnOnce() -> gpui::AnyElement,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     disclosure(
-        folds.width,
+        width,
         folds.open,
         reveal,
-        || folded_line(theme, &label, folds, cx),
+        || {
+            summary
+                .place(folded_line(theme, &label, folds, cx))
+                .into_any_element()
+        },
         || {
             div()
                 .min_h(px(FOLD_ROW_PX))
                 .pb(px(8.))
-                .when(label.rtl, |content| content.max_w(px(READING_MEASURE_PX)))
-                .child(
-                    history_rule(div(), label.rtl, crate::theme::strong_border(theme))
-                        .text_color(rgb(theme.dimmed))
-                        .child(opened()),
-                )
+                .child(opened())
                 .into_any_element()
         },
     )
@@ -7183,8 +7422,9 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, collapsed_sender_budget, ctrl_letter, key_from, moved_in_list,
-        should_follow_visible, unread_bar_dx, write_back_notice,
+        LIST_BORDER_PX, MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns, collapsed_sender_budget,
+        ctrl_letter, key_from, message_content_width, moved_in_list, should_follow_visible,
+        unread_bar_dx, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7210,6 +7450,72 @@ mod tests {
         assert_eq!(collapsed_sender_budget(70., 18.2, 17.1, 72.), 52.);
         assert_eq!(collapsed_sender_budget(24., 18.2, 17.1, 72.), 24.);
         assert_eq!(collapsed_sender_budget(0., 18.2, 17.1, 72.), 0.);
+    }
+
+    #[test]
+    fn reading_columns_share_the_header_origin_and_stay_inside_the_window() {
+        for (width, split) in [
+            (560.0, 0.0),
+            (760.0, 0.0),
+            (880.0, 310.0),
+            (1000.0, 387.0),
+            (1500.0, 337.0),
+            (1500.0, 487.0),
+            (1920.0, 724.0),
+            (1920.0, 429.4),
+            (2400.0, 520.0),
+        ] {
+            for reading in [true, false] {
+                let end_progress = if reading { 1.0 } else { 0.0 };
+                let end = ReaderColumns::new(width, split, reading, end_progress, 2.0);
+                let end_pane = ReaderColumns::pane_left(split, end_progress, 2.0);
+                let mut previous: Option<[f32; 2]> = None;
+                for step in 0..=100 {
+                    let progress = if reading { step } else { 100 - step } as f32 / 100.0;
+                    let columns = ReaderColumns::new(width, split, reading, progress, 2.0);
+                    let pane_left = ReaderColumns::pane_left(split, progress, 2.0);
+                    let dates = columns.date_column();
+                    let [header, prose, card, wide] =
+                        [columns.header, columns.prose, columns.card, columns.wide];
+                    assert_eq!(header.inset, prose.inset);
+                    assert_eq!(dates.inset, header.inset + MESSAGE_PAD_PX);
+                    let card_right = card.inset + card.width + 2.0 * MESSAGE_PAD_PX;
+                    assert_eq!(dates.inset + dates.width, card_right - MESSAGE_PAD_PX);
+                    assert_eq!(card.width, card.width.round());
+                    assert!(
+                        pane_left + card.inset + card.width <= message_content_width(width) + 0.01
+                    );
+                    for (column, destination) in
+                        [(header, end.header), (prose, end.prose), (wide, end.wide)]
+                    {
+                        assert_eq!(column.width, destination.width);
+                        if step == 100 {
+                            assert!(
+                                pane_left + column.inset + column.width
+                                    <= message_content_width(width) + 0.51
+                            );
+                        }
+                    }
+                    let origins = [pane_left + header.inset, pane_left + wide.inset];
+                    if let Some(previous) = previous {
+                        for (index, end_inset) in
+                            [end.header.inset, end.wide.inset].into_iter().enumerate()
+                        {
+                            let end = end_pane + end_inset;
+                            assert!((origins[index] - end).abs() <= (previous[index] - end).abs());
+                        }
+                    }
+                    previous = Some(origins);
+                }
+            }
+            let reading = ReaderColumns::new(width, split, true, 1.0, 2.0);
+            assert_eq!(
+                reading.prose.width,
+                message_content_width(width).min(READING_MEASURE_PX)
+            );
+            assert_eq!(reading.card.width, reading.prose.width);
+            assert!(reading.wide.width >= reading.prose.width);
+        }
     }
 
     /// After each key, whether a box left wide relaxes: only a key that

@@ -13,6 +13,29 @@ pub(super) struct ScrollAnchor {
     pub y: Pixels,
 }
 
+/// An explicit message jump owns its landing even if it starts with a
+/// glide. Once the glide ends or a key settles it, use fresh layout bounds.
+#[derive(Default)]
+pub(super) struct ReaderLanding(Option<String>);
+
+impl ReaderLanding {
+    pub fn hold(&mut self, id: Option<&str>) {
+        self.0 = id.map(str::to_owned);
+    }
+
+    pub fn anchor(
+        &mut self,
+        id: Option<&str>,
+        index: usize,
+        gliding: bool,
+    ) -> Option<ScrollAnchor> {
+        if self.0.as_deref() != id {
+            self.hold(None);
+        }
+        (!gliding && self.0.is_some()).then_some(ScrollAnchor { index, y: px(0.) })
+    }
+}
+
 impl ScrollAnchor {
     /// Capture the first message with a visible part, including a clipped top.
     pub fn capture(scroll: &ScrollHandle) -> Option<Self> {
@@ -350,6 +373,20 @@ mod tests {
         let first = vertical_bounds(50., 200.);
         assert_eq!(offset_to_hold(view, first, px(0.)), px(0.));
         assert_eq!(offset_to_hold(view, first, px(20.)), px(0.));
+    }
+
+    #[test]
+    fn a_navigation_landing_uses_fresh_bounds_after_the_glide() {
+        let mut landing = ReaderLanding::default();
+        landing.hold(Some("last"));
+        assert!(landing.anchor(Some("last"), 2, true).is_none());
+        let anchor = landing.anchor(Some("last"), 2, false).unwrap();
+        let view = vertical_bounds(50., 300.);
+        let item = vertical_bounds(850., 400.);
+        let offset = offset_to_hold(view, item, anchor.y);
+        assert_eq!(anchor.index, 2);
+        assert_eq!(visible_top(view, offset, item), Some(px(0.)));
+        assert!(landing.anchor(Some("other"), 1, false).is_none());
     }
 
     #[test]
