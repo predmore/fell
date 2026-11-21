@@ -19,6 +19,9 @@ use super::model_files::{LocalModel, ModelError, read_verified};
 use super::wordpiece::WordPiece;
 use super::{BodyEmbedder, EmbedderId};
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
+
 type Plan = Arc<TypedRunnableModel>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
