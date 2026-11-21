@@ -49,7 +49,8 @@ use crate::model::{
     Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
     QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
 };
-use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
+use crate::motion::{self, Glide, ListShift, Motion, RowMotion, Transition};
+use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
@@ -205,10 +206,24 @@ pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
     }
 }
 
-pub(crate) fn finish_onboarding(window: &mut Window, cx: &mut App) {
+pub(crate) fn finish_onboarding(
+    setup: gpui::Entity<Onboarding>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let startup = mailbox::startup();
     crate::draft_host::host_agent_drafts(cx);
-    window.replace_root(cx, |window, cx| Inbox::focused(startup, false, window, cx));
+    window.replace_root(cx, |window, cx| {
+        let mut inbox = Inbox::focused(startup, false, window, cx);
+        inbox.waiting_to_open = true;
+        let now = inbox.motion.clock.now();
+        inbox.setup_exit = inbox
+            .motion
+            .motion
+            .start(motion::FADE, now)
+            .map(|fade| (setup, fade));
+        inbox
+    });
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -546,6 +561,8 @@ struct Inbox {
     note_generation: u64,
     session: Session,
     theme: Theme,
+    setup_exit: Option<(gpui::Entity<Onboarding>, Transition)>,
+    waiting_to_open: bool,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
@@ -764,6 +781,8 @@ impl Inbox {
             note_in_flight: None,
             note_generation: 0,
             session,
+            setup_exit: None,
+            waiting_to_open: false,
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -1558,10 +1577,11 @@ impl Inbox {
         // before starting another body-only read.
         let new_selection = open_changed && self.session.cursor_id.is_some();
         let refresh_open = open_changed || grew || waiting || intent.refresh_open;
-        if emptied
-            || new_selection
-            || self.session.cursor_draft().is_some()
-            || (refresh_open && !follow_up_pending)
+        if !self.waiting_to_open
+            && (emptied
+                || new_selection
+                || self.session.cursor_draft().is_some()
+                || (refresh_open && !follow_up_pending))
         {
             self.request_messages(true, cx);
         }
@@ -2014,6 +2034,7 @@ impl Inbox {
     /// A key goes straight to the destination while outgoing paint fades.
     fn settle_motion(&mut self) {
         self.reveal.cancel_pending();
+        self.setup_exit = None;
         let now = self.motion.clock.now();
         let settled = self.motion.settle(now);
         self.row_widths.settle();
@@ -2036,6 +2057,7 @@ impl Inbox {
             self.clear_open_message();
             return;
         };
+        self.waiting_to_open = false;
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
@@ -3732,7 +3754,11 @@ impl Inbox {
             self.request_threads(ReadIntent::default(), cx);
         } else if step.reload_messages {
             self.request_messages(true, cx);
-        } else if searching && self.session.search.is_none() {
+        } else if (searching && self.session.search.is_none())
+            || (self.waiting_to_open
+                && pane_before == Pane::List
+                && self.session.pane == Pane::Conversation)
+        {
             self.request_messages(false, cx);
         }
         if self.session.search.is_none()
@@ -3957,18 +3983,28 @@ impl Inbox {
     /// Put the reader's message at the top of the viewport and keep it
     /// there while the conversation lays out: [`LandingHold`] sets the
     /// offset from each frame's own layout, before it paints.
+    fn landing_index(&self) -> usize {
+        if self.reveal == Reveal::Waiting && present::awaiting_bodies(&self.session.messages) {
+            // Pending messages can be too short to align the newest one
+            // to the top without the scroll container clamping mid-message.
+            0
+        } else {
+            self.session.message_cursor
+        }
+    }
+
     fn land_on_reader(&mut self) {
         self.landing.hold(
             self.session
                 .messages
-                .get(self.session.message_cursor)
+                .get(self.landing_index())
                 .map(|message| message.id.as_str()),
         );
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
     fn hold_landing(&mut self) -> Option<ScrollAnchor> {
-        let index = self.session.message_cursor;
+        let index = self.landing_index();
         let current = self
             .session
             .messages
@@ -4187,7 +4223,7 @@ impl Inbox {
             search.editing = false;
             self.session.remember_search();
         }
-        if changed {
+        if changed || self.waiting_to_open {
             self.request_messages(true, cx);
         }
         self.scroll_list_to_cursor();
@@ -4436,7 +4472,18 @@ impl Render for Inbox {
                 .as_ref()
                 .is_some_and(|frame| frame.note.id == visit.note)
         });
+        let setup_exit = self.setup_exit.as_ref().and_then(|(setup, fade)| {
+            fade.running(now).then(|| {
+                let progress = fade.progress(now);
+                let layer = setup.update(cx, |setup, cx| setup.leaving_layer(window, cx));
+                (layer, progress)
+            })
+        });
+        if setup_exit.is_none() {
+            self.setup_exit = None;
+        }
         let conv = ConvFrame {
+            waiting_to_open: self.waiting_to_open,
             agent_note,
             pin,
             note_details_only,
@@ -4469,6 +4516,7 @@ impl Render for Inbox {
                 .as_ref()
                 .is_some_and(|visit| visit.returning.is_some())
             | verify_pin
+            | setup_exit.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4569,7 +4617,8 @@ impl Render for Inbox {
             });
             selected.and_then(|target| checks.for_message(&target.id))
         });
-        shell(
+        let background = theme.background;
+        let root = shell(
             theme,
             &self.session,
             &mut self.motion,
@@ -4618,7 +4667,26 @@ impl Render for Inbox {
                     .absolute()
                     .size_0(),
             )
-        })
+        });
+        if let Some((setup, progress)) = setup_exit {
+            div()
+                .relative()
+                .size_full()
+                .bg(rgb(background))
+                .child(root.opacity(motion::lerp(motion::ARRIVE_FROM, 1., progress)))
+                .child(
+                    setup
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .overflow_hidden()
+                        .opacity(1. - progress),
+                )
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 }
 
@@ -4697,6 +4765,7 @@ struct ConvFrame {
     note_expanded_in_band: bool,
     hide_message_cursor: bool,
     return_glide: Option<LandingGlide>,
+    waiting_to_open: bool,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
@@ -5554,6 +5623,7 @@ fn header(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn thread_list(
     theme: &Theme,
     session: &Session,
@@ -7271,6 +7341,18 @@ fn conversation(
             theme.accent,
             focus * (1.0 - columns.progress),
         )))
+        .when(frame.waiting_to_open && subject.is_empty(), |pane| {
+            pane.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(theme.dimmed))
+                    .child("Select a conversation"),
+            )
+        })
         .when(!subject.is_empty(), |pane| {
             pane.child(
                 div()
@@ -8542,7 +8624,10 @@ fn status_bar(
                 theme.accent,
             ),
             None => (
-                session.sync.status(),
+                (width < 440.)
+                    .then(|| session.sync.compact_download_status())
+                    .flatten()
+                    .unwrap_or_else(|| session.sync.status()),
                 if session.sync.is_error() {
                     theme.error
                 } else {

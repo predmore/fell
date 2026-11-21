@@ -340,10 +340,7 @@ fn prepare(
 ) -> fell_core::Result<(Account, SyncKind)> {
     if let Some(config) = config {
         let account = config.account();
-        store.upsert_account(&account)?;
-        // Before the window can archive anything, so the first action is
-        // queued for the server or not as the file says.
-        store.set_write_back(&account.id, config.write_back)?;
+        store.configure_account(&account, config.write_back)?;
         return Ok((account, SyncKind::Connecting));
     }
     let accounts = store.list_accounts()?;
@@ -622,6 +619,19 @@ mod tests {
         let (fixture, kind) = prepare(&store, None, true).unwrap();
         assert_eq!(kind, SyncKind::FixtureOffline);
         assert!(prepare(&store, None, false).is_err());
+        for id in ["local", "fixture", "demo"] {
+            let mut demo = fixture.clone();
+            demo.id = AccountId(id.into());
+            seed_if_empty(&store, &demo).unwrap();
+            assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+            store
+                .set_agent_grant(
+                    &demo.id,
+                    "bot",
+                    fell_core::AgentGrant::enabled(true, true, true),
+                )
+                .unwrap();
+        }
         let config = AccountConfig::bridge(
             "me@proton.me",
             "me@proton.me",
@@ -630,7 +640,18 @@ mod tests {
         let (account, kind) = prepare(&store, Some(&config), true).unwrap();
         assert_eq!(kind, SyncKind::Connecting);
         assert_eq!(account.email, "me@proton.me");
-        assert_ne!(account.id, fixture.id);
+        assert_eq!(store.list_accounts().unwrap(), [account]);
+        assert!(store.list_agent_grants().unwrap().is_empty());
+        for id in ["local", "fixture", "demo"].map(|id| AccountId(id.into())) {
+            assert!(store.list_threads(&id).unwrap().is_empty());
+            assert!(
+                store
+                    .agent_grant(&id, "bot")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown account")
+            );
+        }
     }
 
     #[test]

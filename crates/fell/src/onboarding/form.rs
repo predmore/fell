@@ -151,21 +151,33 @@ impl Issue {
     }
 
     fn connection(config: &AccountConfig, service: Service, error: &fell_core::Error) -> Self {
-        let (field, title) = match fell_core::classify_sync_error(error) {
+        let kind = fell_core::classify_sync_error(error);
+        let bridge = config.backend == BackendKind::Bridge;
+        let (field, title) = match kind {
             SyncFailureKind::LoginRejected | SyncFailureKind::Password => {
                 (Field::Password, "Sign-in was rejected")
             }
             SyncFailureKind::Tls => (Field::Security(service), "Secure connection failed"),
-            SyncFailureKind::Unreachable if config.backend == BackendKind::Bridge => {
-                (Field::Port(service), "Bridge didn’t answer")
-            }
             SyncFailureKind::Unreachable => (Field::Host(service), "Server didn’t answer"),
             SyncFailureKind::Other => (Field::Host(service), "Connection test failed"),
         };
         Self {
             field,
             title,
-            recovery: connection_recovery(config, error),
+            recovery: match kind {
+                SyncFailureKind::LoginRejected if bridge => {
+                    Some("Use the password Bridge shows, not your Proton password.")
+                }
+                SyncFailureKind::Tls if bridge => Some(match service {
+                    Service::Imap => "Bridge uses STARTTLS on port 1143.",
+                    Service::Smtp => "Bridge uses STARTTLS on port 1025 for outgoing mail.",
+                }),
+                SyncFailureKind::Tls => Some(match service {
+                    Service::Imap => "Try TLS on 993 or STARTTLS on 143.",
+                    Service::Smtp => "Try TLS on 465 or STARTTLS on 587.",
+                }),
+                _ => connection_recovery(config, error),
+            },
         }
     }
 }
@@ -227,6 +239,7 @@ pub(super) struct Form {
     pub step: Step,
     pub provider: Provider,
     pub checks: [Check; 2],
+    pub bridge_unreachable: [bool; 2],
     pub issues: Vec<Issue>,
     pub storage: Storage,
     pub attempt: u64,
@@ -244,6 +257,7 @@ impl Default for Form {
             step: Step::Provider,
             provider: Provider::Bridge,
             checks: [Check::Waiting; 2],
+            bridge_unreachable: [false; 2],
             issues: Vec::new(),
             storage: Storage::Keyring,
             attempt: 0,
@@ -421,10 +435,13 @@ impl Form {
             return None;
         }
         let config = self.config();
-        self.checked_from_servers = self.step == Step::Servers;
+        if self.step != Step::Connection {
+            self.checked_from_servers = self.step == Step::Servers;
+        }
         self.step = Step::Connection;
         self.attempt = self.attempt.wrapping_add(1);
         self.checks = [Check::Testing, Check::Waiting];
+        self.bridge_unreachable = [false; 2];
         self.storage = Storage::Keyring;
         Some(config)
     }
@@ -473,17 +490,13 @@ impl Form {
                     (Service::Smtp, report.smtp.err()),
                 ] {
                     if let Some(error) = error {
-                        let issue = Issue::connection(config, service, &error);
-                        if !self.issues.contains(&issue) {
-                            self.issues.push(issue);
-                        }
+                        self.record_check_issue(config, service, &error);
                     }
                 }
             }
             Err(error) => {
                 self.checks = [Check::Failed, Check::Waiting];
-                self.issues
-                    .push(Issue::connection(config, Service::Imap, &error));
+                self.record_check_issue(config, Service::Imap, &error);
             }
         }
         // Leave both failures on their fields. Visit credentials first if one
@@ -499,6 +512,28 @@ impl Form {
             self.step = Step::Identity;
         }
         Some(first)
+    }
+
+    fn record_check_issue(
+        &mut self,
+        config: &AccountConfig,
+        service: Service,
+        error: &fell_core::Error,
+    ) {
+        if config.backend == BackendKind::Bridge
+            && fell_core::classify_sync_error(error) == SyncFailureKind::Unreachable
+        {
+            self.bridge_unreachable[service as usize] = true;
+        } else {
+            let issue = Issue::connection(config, service, error);
+            if !self.issues.contains(&issue) {
+                self.issues.push(issue);
+            }
+        }
+    }
+
+    pub fn can_retry(&self) -> bool {
+        self.bridge_unreachable.contains(&true) && !self.checks.contains(&Check::Testing)
     }
 
     pub fn connected(&self) -> bool {
@@ -703,16 +738,19 @@ mod tests {
             form.issues[0]
                 .recovery
                 .unwrap()
-                .contains("Bridge's mailbox details")
+                .contains("Use the password Bridge shows, not your Proton password.")
         );
         assert_eq!(form.issues[1].field, Field::Security(Service::Smtp));
-        assert!(form.issues[1].recovery.unwrap().contains("certificate"));
+        assert_eq!(
+            form.issues[1].recovery,
+            Some("Bridge uses STARTTLS on port 1025 for outgoing mail.")
+        );
         form.set_text(Field::Password, "corrected".into());
         assert_eq!(form.issues.len(), 1);
     }
 
     #[test]
-    fn bridge_reachability_failure_goes_to_the_listener_with_shared_recovery() {
+    fn bridge_reachability_failure_can_retry_on_the_connection_step() {
         let mut form = Form::default();
         identity(&mut form);
         let config = form.begin_check().unwrap();
@@ -721,18 +759,14 @@ mod tests {
             imap: Err(unreachable),
             smtp: Ok(()),
         };
-        assert_eq!(
-            form.finish_check(form.attempt, &config, Ok(report)),
-            Some(Field::Port(Service::Imap))
-        );
-        assert_eq!(form.step, Step::Servers);
-        assert_eq!(form.issues[0].title, "Bridge didn’t answer");
-        assert!(
-            form.issues[0]
-                .recovery
-                .unwrap()
-                .starts_with("Start Proton Mail Bridge")
-        );
+        assert_eq!(form.finish_check(form.attempt, &config, Ok(report)), None);
+        assert_eq!(form.step, Step::Connection);
+        assert_eq!(form.bridge_unreachable, [true, false]);
+        assert!(form.can_retry());
+        assert_eq!(form.begin_check(), Some(config));
+        assert!(!form.can_retry());
+        form.back();
+        assert_eq!(form.step, Step::Identity);
     }
 
     #[test]
@@ -745,6 +779,7 @@ mod tests {
         assert!(!form.storage.inline_available());
         form.storage = Storage::Failed(SaveAccountError::Keyring {
             detail: "keyring unavailable".into(),
+            kind: None,
             recovery: None,
         });
         assert!(form.storage.inline_available());

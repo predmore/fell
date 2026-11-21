@@ -671,22 +671,34 @@ impl Store {
     }
 
     pub fn upsert_account(&self, account: &Account) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO accounts (id, display_name, email, backend_kind)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                email = excluded.email,
-                backend_kind = excluded.backend_kind",
-            params![
-                account.id.as_str(),
-                account.display_name,
-                account.email,
-                account.backend_kind.as_str()
-            ],
-        )?;
+        upsert_account_on(&self.conn, account)?;
         self.seal_private_files()?;
         Ok(())
+    }
+
+    /// Install a configured account and retire the in-process demo mailbox
+    /// in the same transaction. Demo grants never follow the new account.
+    pub fn configure_account(&self, account: &Account, write_back: bool) -> Result<()> {
+        if crate::is_demo_account(&account.id) {
+            return Err(crate::Error::Invalid(
+                "Account ID is reserved for demo mail".into(),
+            ));
+        }
+        let tx = immediate_transaction(&self.conn)?;
+        for id in crate::backend::DEMO_ACCOUNT_IDS {
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                delete_demo_account(&tx, id)?;
+            }
+        }
+        upsert_account_on(&tx, account)?;
+        crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
+        tx.commit()?;
+        self.seal_private_files()
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
@@ -2431,6 +2443,67 @@ fn unique_tokens(raw: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn upsert_account_on(conn: &Connection, account: &Account) -> Result<()> {
+    conn.execute(
+        "INSERT INTO accounts (id, display_name, email, backend_kind)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            email = excluded.email,
+            backend_kind = excluded.backend_kind",
+        params![
+            account.id.as_str(),
+            account.display_name,
+            account.email,
+            account.backend_kind.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
+    for child in ["agent_action_messages", "agent_action_drafts"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {child} WHERE action_id IN (
+                SELECT id FROM agent_actions WHERE account_id = ?1
+            )"
+            ),
+            [id],
+        )?;
+    }
+    crate::actions::remove_account_actions(conn, id)?;
+    // Message deletes invoke the FTS, body, parts and threading triggers.
+    // The embedding change log keeps vector caches on other connections current.
+    for table in [
+        "messages",
+        "message_aliases",
+        "message_copies",
+        "copy_orphans",
+        "message_embeddings",
+        "embedding_queue",
+        "search_trigrams",
+        "search_terms",
+        "thread_dirty_ids",
+        "thread_dirty_subjects",
+        "folder_roles",
+        "account_folders",
+        "sent_bcc",
+        "server_outbox",
+        "write_back_accounts",
+        "agent_grants",
+        "agent_actions",
+        "review_drafts",
+        "compose_drafts",
+        "compose_send",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE account_id = ?1"), [id])?;
+    }
+    conn.execute("DELETE FROM meta WHERE key = 'cursor:' || ?1", [id])?;
+    conn.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 fn sync_cursor_on(conn: &Connection, account_id: &AccountId) -> Result<Option<crate::SyncCursor>> {

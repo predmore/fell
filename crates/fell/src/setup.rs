@@ -302,7 +302,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     )
     .map_err(|err| match err {
         SaveAccountError::File(detail) => detail,
-        SaveAccountError::Keyring { detail, recovery } => {
+        SaveAccountError::Keyring { detail, recovery, .. } => {
             let recovery = recovery.unwrap_or_default();
             format!("{detail}\n{recovery}\nUse --password-inline or --password-command to choose a different password source.")
         }
@@ -316,6 +316,7 @@ pub(crate) enum SaveAccountError {
     File(String),
     Keyring {
         detail: String,
+        kind: Option<fell_core::credentials::KeyringError>,
         recovery: Option<&'static str>,
     },
 }
@@ -342,6 +343,10 @@ pub(crate) fn save_account(
             .store_keyring_password(keyring, &password)
             .map_err(|err| SaveAccountError::Keyring {
                 detail: err.to_string(),
+                kind: match err {
+                    fell_core::Error::Keyring(kind) => Some(kind),
+                    _ => None,
+                },
                 recovery: connection_recovery(&config, &err),
             })?;
     }
