@@ -5906,12 +5906,15 @@ fn collapsed_message(
 
 const MESSAGE_HEADER_GAP_PX: f32 = 10.0;
 
-fn expanded_header_widths(width: f32, [sender, email, folders, date]: [f32; 4]) -> [f32; 4] {
+fn expanded_header_gaps([sender, email, ..]: [f32; 4]) -> f32 {
     // The folder group also acts as the spacer before the date when empty.
-    let gaps =
-        (1 + usize::from(sender > 0.0) + usize::from(email > 0.0)) as f32 * MESSAGE_HEADER_GAP_PX;
+    (1 + usize::from(sender > 0.0) + usize::from(email > 0.0)) as f32 * MESSAGE_HEADER_GAP_PX
+}
+
+fn expanded_header_widths(width: f32, fields: [f32; 4]) -> [f32; 4] {
+    let [sender, email, folders, date] = fields;
     let date = date.min(width);
-    let room = (width - date - gaps).max(0.0);
+    let room = (width - date - expanded_header_gaps(fields)).max(0.0);
     // When the identity needs to truncate, give it at least two thirds of
     // the room. A short or absent folder list leaves more for the sender.
     let identity = (room - folders.min(room / 3.0)).min(sender + email);
@@ -5919,6 +5922,22 @@ fn expanded_header_widths(width: f32, [sender, email, folders, date]: [f32; 4]) 
     let sender = sender.min(identity - email);
     let folders = folders.min((room - sender - email).max(0.0));
     [sender, email, folders, date]
+}
+
+fn expanded_header_flow(
+    columns: ReaderColumns,
+    fields: [f32; 4],
+    mut layer: impl FnMut([f32; 4]) -> gpui::AnyElement,
+) -> gpui::AnyElement {
+    // A header that fits both modes keeps one layer, just like a short subject.
+    let full_width = fields.iter().sum::<f32>() + expanded_header_gaps(fields);
+    columns.flow(
+        |columns| ReaderColumn {
+            width: columns.header.width.min(full_width),
+            ..columns.header
+        },
+        |width, _| layer(expanded_header_widths(width, fields)),
+    )
 }
 
 fn expanded_message_header(
@@ -5943,98 +5962,113 @@ fn expanded_message_header(
         shape_ui_line(window, style, text, weight, Some(color))
             .map_or(0.0, |line| f32::from(line.width).ceil())
     };
-    let [sender_width, email_width, folder_width, _] = expanded_header_widths(
-        columns.card.width,
-        [
-            measure(
-                &sender_style,
-                &sender,
-                FontWeight::SEMIBOLD,
-                theme.foreground,
-            ),
-            measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
-            measure(&style, &joined, FontWeight::NORMAL, theme.dimmed),
-            date_width,
-        ],
-    );
+    let widths = [
+        measure(
+            &sender_style,
+            &sender,
+            FontWeight::SEMIBOLD,
+            theme.foreground,
+        ),
+        measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
+        measure(&style, &joined, FontWeight::NORMAL, theme.dimmed),
+        date_width,
+    ];
     let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
         clip_shaped(window, style, text, width.floor(), weight, Some(color))
             .filter(|line| !line.text.is_empty() && f32::from(line.width).ceil() <= width)
     };
-    let sender = fit(
-        &sender_style,
-        &sender,
-        sender_width,
-        FontWeight::SEMIBOLD,
-        theme.foreground,
-    );
-    let email = fit(
-        &style,
-        &email,
-        email_width,
-        FontWeight::NORMAL,
-        theme.dimmed,
-    );
-    let line_width = |line: &Option<gpui::ShapedLine>| {
-        line.as_ref()
-            .map_or(0., |line| f32::from(line.width).ceil())
-    };
-    let folder_width =
-        folder_width + (sender_width - line_width(&sender)) + (email_width - line_width(&email));
-    let fit_folders =
-        |text: &str| fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed);
-    let fit_whole = |text: &str| fit_folders(text).filter(|line| line.text == text);
-    let folders = fit_whole(&joined)
-        .or_else(|| {
-            let shortened = folders
-                .iter()
-                .map(|path| match path.split_once('/') {
-                    Some((first, rest)) if rest.contains('/') => {
-                        let leaf = rest.rsplit('/').next().unwrap_or(rest);
-                        format!("{first}/…/{leaf}")
-                    }
-                    _ => path.clone(),
+    let leading = expanded_header_flow(
+        columns,
+        widths,
+        |[sender_width, email_width, folder_width, _]| {
+            let sender = fit(
+                &sender_style,
+                &sender,
+                sender_width,
+                FontWeight::SEMIBOLD,
+                theme.foreground,
+            );
+            let email = fit(
+                &style,
+                &email,
+                email_width,
+                FontWeight::NORMAL,
+                theme.dimmed,
+            );
+            let line_width = |line: &Option<gpui::ShapedLine>| {
+                line.as_ref()
+                    .map_or(0., |line| f32::from(line.width).ceil())
+            };
+            let folder_width = folder_width
+                + (sender_width - line_width(&sender))
+                + (email_width - line_width(&email));
+            let fit_folders =
+                |text: &str| fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed);
+            let fit_whole = |text: &str| fit_folders(text).filter(|line| line.text == text);
+            let folders = fit_whole(&joined)
+                .or_else(|| {
+                    let shortened = folders
+                        .iter()
+                        .map(|path| match path.split_once('/') {
+                            Some((first, rest)) if rest.contains('/') => {
+                                let leaf = rest.rsplit('/').next().unwrap_or(rest);
+                                format!("{first}/…/{leaf}")
+                            }
+                            _ => path.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    fit_whole(&shortened)
                 })
-                .collect::<Vec<_>>()
-                .join(" · ");
-            fit_whole(&shortened)
-        })
-        .or_else(|| {
-            let leaves = folders
-                .iter()
-                .map(|path| match path.rsplit_once('/') {
-                    Some((_, leaf)) => format!("…/{leaf}"),
-                    None => path.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
-            fit_folders(&leaves)
-        });
-    let leading = div()
-        .flex()
-        .items_center()
-        .gap(px(MESSAGE_HEADER_GAP_PX))
-        .children(
-            [sender, email, folders]
-                .into_iter()
-                .flatten()
-                .map(|line| shaped_text(line, window)),
-        );
+                .or_else(|| {
+                    let leaves = folders
+                        .iter()
+                        .map(|path| match path.rsplit_once('/') {
+                            Some((_, leaf)) => format!("…/{leaf}"),
+                            None => path.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    fit_folders(&leaves)
+                });
+            div()
+                .flex()
+                .items_center()
+                .gap(px(MESSAGE_HEADER_GAP_PX))
+                .children(
+                    [sender, email, folders]
+                        .into_iter()
+                        .flatten()
+                        .map(|line| shaped_text(line, window)),
+                )
+                .into_any_element()
+        },
+    );
     let date = fit(
         &sender_style,
         &date,
-        columns.card.width,
+        columns.header.width,
         FontWeight::NORMAL,
         theme.dimmed,
     );
+    // Only the leading clip changes width. The date sits at the padded
+    // card edge throughout the slide, independently of either header measure.
     message_date_row(
         div()
-            .w(px(columns.date_column().width))
+            .w(px(columns.card_right()))
             // The recipient line belongs to this header, so it sits close.
             .pb(px(if message.recipients.is_some() { 2. } else { 8. })),
         MESSAGE_HEADER_GAP_PX,
-        leading,
-        date.map(|line| div().flex_none().child(shaped_text(line, window))),
+        div().child(leading),
+        date.map(|line| {
+            div()
+                .flex_none()
+                .max_w(px(columns.card.width))
+                .flex()
+                .justify_end()
+                .overflow_hidden()
+                .child(shaped_text(line, window))
+        }),
     )
 }
 
@@ -6083,11 +6117,7 @@ fn expanded_message(
                 }),
             )
         })
-        .child(
-            columns
-                .card
-                .place(expanded_message_header(theme, message, columns, window)),
-        )
+        .child(expanded_message_header(theme, message, columns, window))
         .children(message.recipients.as_ref().map(|line| {
             div()
                 .id(gpui::ElementId::named_usize("recipients", index))
@@ -7615,15 +7645,15 @@ impl<T: Styled> FontOpt for T {
 mod tests {
     use super::{
         LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns,
-        account_header, collapsed_sender_budget, ctrl_letter, expanded_header_widths, key_from,
-        message_content_width, moved_in_list, should_follow_visible, unread_bar_dx,
-        useful_header_email, write_back_notice,
+        account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
+        expanded_header_widths, key_from, message_content_width, moved_in_list,
+        should_follow_visible, unread_bar_dx, useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
     use crate::motion;
     use crate::present::Pane;
-    use gpui::{Keystroke, Modifiers};
+    use gpui::{IntoElement, Keystroke, Modifiers, div};
 
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
         Keystroke {
@@ -7715,6 +7745,46 @@ mod tests {
             [300.0, 225.0, 0.0, 55.0],
         );
         assert_eq!([sender, email, folders, date], [108.5, 108.5, 0.0, 55.0]);
+    }
+
+    #[test]
+    fn expanded_header_field_widths_hold_during_the_reading_slide() {
+        let long = [900.0, 450.0, 250.0, 55.0];
+        let short = [80.0, 120.0, 60.0, 55.0];
+        for (width, split) in [(760.0, 0.0), (1000.0, 387.0), (1920.0, 724.0)] {
+            let columns_at =
+                |reading, progress| ReaderColumns::new(width, split, reading, progress, 2.0);
+            let measure = |columns, fields| {
+                let mut layers = Vec::new();
+                expanded_header_flow(columns, fields, |widths| {
+                    layers.push(widths);
+                    div().into_any_element()
+                });
+                layers
+            };
+            let [split_layer, reading_layer] = [
+                measure(columns_at(false, 0.0), long)[0],
+                measure(columns_at(true, 1.0), long)[0],
+            ];
+            assert_ne!(split_layer, reading_layer);
+            for reading in [false, true] {
+                for step in 0..=100 {
+                    let progress = if reading { step } else { 100 - step } as f32 / 100.0;
+                    let columns =
+                        columns_at(reading, progress).with_reflow(Some(motion::ReadingReflow {
+                            alpha: [1.0 - progress, progress],
+                            height: progress,
+                        }));
+                    assert_eq!(measure(columns, long), [split_layer, reading_layer]);
+                    assert_eq!(measure(columns, short), [short]);
+                    let card_right = columns.card.inset + columns.card.width + 2.0 * MESSAGE_PAD_PX;
+                    assert_eq!(
+                        MESSAGE_PAD_PX + columns.card_right(),
+                        card_right - MESSAGE_PAD_PX
+                    );
+                }
+            }
+        }
     }
 
     #[test]
