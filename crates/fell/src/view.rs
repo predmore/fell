@@ -183,6 +183,18 @@ struct ListRead {
 
 type ThreadsResult = Result<ListRead, String>;
 
+async fn finish_mailbox_change<T>(
+    reply: futures::channel::oneshot::Receiver<fell_core::Result<T>>,
+    done: impl FnOnce(fell_core::Result<T>),
+) {
+    let result = reply.await.unwrap_or_else(|_| {
+        Err(fell_core::Error::Action(
+            "Could not update this mailbox".into(),
+        ))
+    });
+    done(result);
+}
+
 /// Use one notice so a flag failure and a move failure can both be seen.
 fn write_back_notice(
     session: &Session,
@@ -848,9 +860,9 @@ impl Inbox {
             self.store.call(read)
         };
         cx.spawn(async move |this, cx| {
-            let Ok(result) = reply.await else {
-                return;
-            };
+            let result = reply
+                .await
+                .unwrap_or_else(|_| Err("Could not read this folder".into()));
             let _ = this.update(cx, |inbox, cx| {
                 if inbox.read_gen == generation {
                     let log = inbox.frames.clone();
@@ -1908,24 +1920,24 @@ impl Inbox {
         self.begin_search_refresh(cx);
         let reply = self.store.call(change);
         cx.spawn(async move |this, cx| {
-            let Ok(result) = reply.await else {
-                return;
-            };
-            let _ = this.update(cx, |inbox, cx| {
-                let after = done(inbox, result);
-                if inbox.session.search.is_some() {
-                    let select = after
-                        .as_ref()
-                        .and_then(|intent| intent.select.as_ref())
-                        .map(|key| key.thread_id.0.clone());
-                    inbox.refresh_saved_search_folder(select, cx);
-                    inbox.refresh_search(cx);
-                }
-                if let Some(after) = after {
-                    inbox.request_threads(after, cx);
-                }
-                cx.notify();
-            });
+            finish_mailbox_change(reply, |result| {
+                let _ = this.update(cx, |inbox, cx| {
+                    let after = done(inbox, result);
+                    if inbox.session.search.is_some() {
+                        let select = after
+                            .as_ref()
+                            .and_then(|intent| intent.select.as_ref())
+                            .map(|key| key.thread_id.0.clone());
+                        inbox.refresh_saved_search_folder(select, cx);
+                        inbox.refresh_search(cx);
+                    }
+                    if let Some(after) = after {
+                        inbox.request_threads(after, cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .await;
         })
         .detach();
     }
@@ -7935,6 +7947,22 @@ mod tests {
     use crate::motion;
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
+
+    #[test]
+    fn a_dropped_mailbox_reply_still_runs_failure_completion() {
+        let (sender, reply) = futures::channel::oneshot::channel::<fell_core::Result<()>>();
+        drop(sender);
+
+        let mut outcome = None;
+        futures::executor::block_on(super::finish_mailbox_change(reply, |result| {
+            outcome = Some(result);
+        }));
+
+        assert!(matches!(
+            outcome,
+            Some(Err(fell_core::Error::Action(message))) if message == "Could not update this mailbox"
+        ));
+    }
 
     #[test]
     fn folder_labels_keep_the_leaf_and_filter_match_in_view() {
