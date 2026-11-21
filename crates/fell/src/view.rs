@@ -1062,7 +1062,7 @@ impl Inbox {
             }
             present::Landing::Jump => self.scroll_list_to_cursor(),
         }
-        self.start_list_shift(drawn, switched);
+        self.start_list_shift(drawn, switched, intent.select.is_some());
         if self.warmed_folder.as_deref() != Some(self.list_folder.as_str()) {
             self.warm_bottom(more_after, cx);
         }
@@ -1425,7 +1425,7 @@ impl Inbox {
     /// Rows among them that left the list fade out where they were, and
     /// scroll with the list from there. `replace`: the list is another
     /// folder's; it fades in and nothing of the old one lingers.
-    fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool) {
+    fn start_list_shift(&mut self, drawn: Vec<Drawn>, replace: bool, reveal_selection: bool) {
         let now = self.motion.clock.now();
         // Ghosts keep their place in the list's content, as of the offset
         // the next frame draws at.
@@ -1487,7 +1487,14 @@ impl Inbox {
             replace,
             now,
         )
-        .map(|shift| shift.fading_below(below));
+        .map(|shift| {
+            let shift = shift.fading_below(below);
+            if reveal_selection && !replace {
+                shift.show_restored_selection()
+            } else {
+                shift
+            }
+        });
     }
 
     /// Move each glide one frame along, and end the ones that arrived.
@@ -2181,7 +2188,7 @@ impl Inbox {
             self.session.remove_thread(id);
         }
         self.scroll_list_to_cursor();
-        self.start_list_shift(drawn, false);
+        self.start_list_shift(drawn, false, false);
         self.request_messages(true, cx);
         // The removed row was the last one loaded: load the row after it.
         self.issue_fetch(cx);
@@ -4479,8 +4486,8 @@ fn thread_list(
                                 ))
                             })
                             .collect();
-                        let layer = if let Some(reveal) = moving.reveal {
-                            let shown = motion::snap(ROW_PX * reveal, window.scale_factor());
+                        let layer = if moving.reveal.is_some() {
+                            let shown = moving.visible_height(ROW_PX, window.scale_factor());
                             // The selected slot is highlighted as soon as
                             // it opens. Its content fades in on top.
                             slot_layer(moving.dy, 1.0)
@@ -5099,14 +5106,48 @@ fn thread_line_two(
     );
     let shaped_w = subject.as_ref().map_or(0.0, |line| f32::from(line.width));
     let (visible_w, snippet_x) = row_widths::line_two(box_w, shaped_w);
+    let draw_snippet = |x: f32, width: f32, opacity| {
+        let line = clip_shaped(
+            window,
+            &style,
+            &row.snippet,
+            width,
+            FontWeight::NORMAL,
+            Some(snippet_color),
+        )?;
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(x))
+                .w(px((text_width - x).max(24.0)))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .opacity(opacity)
+                .child(shaped_text(line, window)),
+        )
+    };
+    let fade = frame.snippet_fade.and_then(|fade| {
+        let old = clip_shaped(
+            window,
+            &style,
+            &row.subject,
+            fade.old_room.min(max_subject),
+            row_weight(true),
+            None,
+        )?;
+        let (_, old_x) = row_widths::line_two(fade.old_box.min(max_subject), old.width.into());
+        (old_x > snippet_x).then_some((old_x, fade))
+    });
+    let outgoing =
+        fade.and_then(|(x, fade)| draw_snippet(x, (text_width - x).max(24.0), fade.outgoing));
     let snippet_w = (text_width - room.min(shaped_w) - row_widths::SUBJECT_GAP).max(24.0);
-    let snippet = clip_shaped(
-        window,
-        &style,
-        &row.snippet,
+    let incoming = draw_snippet(
+        snippet_x,
         snippet_w,
-        FontWeight::NORMAL,
-        Some(snippet_color),
+        fade.map_or(1.0, |(_, fade)| fade.incoming),
     );
     let subject = subject.map(|line| {
         let clipped = (shaped_w.min(room) - visible_w).clamp(0.0, 1.0);
@@ -5143,16 +5184,10 @@ fn thread_line_two(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(row_widths::SUBJECT_GAP))
         .overflow_hidden()
         .children(subject)
-        .children(snippet.map(|line| {
-            div()
-                .flex_none()
-                .w(px((text_width - snippet_x).max(24.0)))
-                .overflow_hidden()
-                .child(shaped_text(line, window))
-        }))
+        .children(outgoing)
+        .children(incoming)
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
@@ -8029,9 +8064,9 @@ mod tests {
 
     #[test]
     fn archive_undo_selects_each_restored_row_and_the_first_of_a_batch() {
-        use super::restored_folder_key;
+        use super::{ListShift, Motion, ROW_PX, restored_folder_key};
         use crate::fixtures::{fixture_account, seed_if_empty};
-        use crate::keymap::Keymap;
+        use crate::keymap::{KeyId, Keymap};
         use crate::model::{Session, SyncKind};
         use crate::present::{draft_row_id, thread_rows};
         use fell_core::{FolderSpan, ListKey, Store};
@@ -8066,6 +8101,13 @@ mod tests {
         }
 
         let restore = |session: &mut Session, expected: &ListKey| {
+            let before = session
+                .threads
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id.clone(), index as f32 * ROW_PX))
+                .collect();
+            assert!(session.on_key(KeyId::Char('u'), 10).undo);
             let (_, restored) = store.undo_with_threads(&account.id).unwrap();
             let selected = restored_folder_key(&store, &account.id, folder, &restored);
             assert_eq!(selected.as_ref(), Some(expected));
@@ -8076,6 +8118,35 @@ mod tests {
                 session.cursor_id.as_deref(),
                 Some(expected.thread_id.as_str())
             );
+            let cursor = session.cursor_index();
+            let cursor_id = session.cursor_id.as_deref().unwrap();
+            assert!(session.highlighted().contains(cursor_id));
+            let top = cursor as f32 * ROW_PX;
+            let below = session
+                .threads
+                .iter()
+                .enumerate()
+                .skip(cursor + 1)
+                .map(|(index, row)| (row.id.as_str(), index as f32 * ROW_PX));
+            let first = std::time::Instant::now();
+            let mut shift = ListShift::<()>::start(
+                &Motion::new(true),
+                before,
+                vec![],
+                vec![],
+                640.0,
+                false,
+                first,
+            )
+            .unwrap()
+            .show_restored_selection();
+            let row = shift.row(cursor_id, top, ROW_PX, below, first);
+            assert!(
+                row.reveal.is_some(),
+                "an adjacent survivor makes room for the row"
+            );
+            let highlight = row.visible_height(ROW_PX, 1.0);
+            assert!(highlight > 0.0, "first-frame highlight: {highlight}");
             restored
         };
         for key in keys.iter().rev() {
@@ -8090,6 +8161,7 @@ mod tests {
         let selected = vec![
             draft.id.clone(),
             keys[2].thread_id.0.clone(),
+            keys[1].thread_id.0.clone(),
             keys[0].thread_id.0.clone(),
         ];
         session.threads.insert(0, draft);
@@ -8097,6 +8169,7 @@ mod tests {
         assert_eq!(skipped, ["unsent"]);
         let batch: Vec<_> = batch.into_iter().map(fell_core::ThreadId).collect();
         store.archive_threads(&account.id, &batch, folder).unwrap();
+        session.set_threads(thread_rows(&list(), &account.email));
         let restored = restore(&mut session, &keys[0]);
         assert_eq!(restored.len(), batch.len());
         assert!(batch.iter().all(|id| restored.contains(id)));

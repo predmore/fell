@@ -420,14 +420,16 @@ impl Session {
     }
 
     pub fn search_scopes(&self, ids: &[String]) -> Option<Vec<(fell_core::ThreadId, String)>> {
-        ids.iter()
-            .map(|id| {
+        let scopes: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
                 Some((
                     fell_core::ThreadId(id.clone()),
                     self.search_source(id)?.to_owned(),
                 ))
             })
-            .collect()
+            .collect();
+        (!scopes.is_empty()).then_some(scopes)
     }
 
     pub fn saved_folder_span(&self) -> Option<fell_core::FolderSpan> {
@@ -1411,5 +1413,43 @@ mod tests {
         assert_eq!(session.cursor_id.as_deref(), Some("still"));
         assert_eq!(session.unread_count, 2);
         assert_eq!(session.threads.len(), 1);
+    }
+
+    #[test]
+    fn mixed_search_selection_skips_matches_without_a_folder_and_deletes_only_to_trash() {
+        let mut session = session();
+        session.perform(Action::Search, 10);
+        session.type_search("hall");
+        let mut hits = reply(
+            vec![
+                row_hit("inbox", "m1"),
+                row_hit("trash", "m2"),
+                row_hit("missing", "m3"),
+            ],
+            None,
+        );
+        hits.hits.get_mut("trash").unwrap().folder = Some("Trash".into());
+        hits.hits.get_mut("missing").unwrap().folder = None;
+        land(&mut session, hits);
+        session.on_key(KeyId::Enter, 10);
+        session
+            .picked
+            .extend(["inbox".into(), "trash".into(), "missing".into()]);
+        let targets = session.action_targets();
+        assert_eq!(
+            session.search_scopes(&targets).unwrap(),
+            [
+                (fell_core::ThreadId("inbox".into()), "INBOX".into()),
+                (fell_core::ThreadId("trash".into()), "Trash".into()),
+            ]
+        );
+        assert!(session.search_scopes(&["missing".into()]).is_none());
+        let step = session.perform(Action::Delete, 10);
+        assert!(step.delete && !step.purge);
+        session.picked.remove("inbox");
+        session.select_if_present("trash");
+        let step = session.perform(Action::Delete, 10);
+        assert!(!step.delete && !step.purge);
+        assert!(!session.on_key(KeyId::Char('y'), 11).purge);
     }
 }

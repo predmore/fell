@@ -2058,13 +2058,12 @@ impl Session {
                     };
                     let trash = scopes
                         .iter()
-                        .filter(|(_, folder)| self.roles.is(FolderRole::Trash, folder))
-                        .count();
-                    if trash != 0 && trash != scopes.len() {
-                        self.show_toast("Select Trash results separately to remove them", true);
+                        .all(|(_, folder)| self.roles.is(FolderRole::Trash, folder));
+                    if trash && scopes.len() != targets.len() {
+                        self.show_toast("No folder for a selected match", true);
                         return step;
                     }
-                    trash != 0
+                    trash
                 } else {
                     self.in_trash()
                 };
@@ -2360,7 +2359,7 @@ impl Session {
     /// `U` (`star` false) or `s` on the targets. All already unread (or
     /// starred) turns it off; otherwise every target gets it.
     fn toggle_flag(&mut self, star: bool) -> Step {
-        let ids = self.flag_targets();
+        let mut ids = self.flag_targets();
         if ids.is_empty() {
             let text = if self.cursor_draft().is_some() {
                 DRAFT_NOT_THREAD
@@ -2370,9 +2369,13 @@ impl Session {
             self.show_toast(text, true);
             return Step::default();
         }
-        if self.search.is_some() && self.search_scopes(&ids).is_none() {
-            self.show_toast("No folder for a selected match", true);
-            return Step::default();
+        let multiple_selected = ids.len() > 1;
+        if self.search.is_some() {
+            ids.retain(|id| self.search_source(id).is_some());
+            if ids.is_empty() {
+                self.show_toast("No folder for a selected match", true);
+                return Step::default();
+            }
         }
         let rows: Vec<&ThreadRow> = self
             .threads
@@ -2392,7 +2395,7 @@ impl Session {
         };
         let count = ids.len();
         // The selection was the operand: it is used up, as in vim.
-        if count > 1 {
+        if multiple_selected {
             self.visual = false;
             self.anchor_id = None;
             self.picked.clear();

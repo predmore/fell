@@ -512,30 +512,33 @@ impl Store {
         })
     }
 
-    /// Delete results from their respective source folders in one undo entry.
+    /// Delete eligible results from their source folders in one undo entry.
+    /// Returns the action and the number of threads changed.
     pub fn delete_scoped_threads(
         &self,
         account: &AccountId,
         targets: &[(ThreadId, String)],
-    ) -> Result<LocalAction> {
+    ) -> Result<(LocalAction, usize)> {
         self.relocate_scoped_threads(account, targets, ActionKind::Delete)
     }
 
-    /// Move results to Junk, or out of Junk to Inbox, in one undo entry.
+    /// Move eligible results to Junk, or out of Junk to Inbox, in one undo
+    /// entry. Returns the action and the number of threads changed.
     pub fn spam_scoped_threads(
         &self,
         account: &AccountId,
         targets: &[(ThreadId, String)],
-    ) -> Result<LocalAction> {
+    ) -> Result<(LocalAction, usize)> {
         self.relocate_scoped_threads(account, targets, ActionKind::Spam)
     }
 
-    /// Archive results from their respective source folders in one undo entry.
+    /// Archive eligible results from their source folders in one undo entry.
+    /// Returns the action and the number of threads changed.
     pub fn archive_scoped_threads(
         &self,
         account: &AccountId,
         targets: &[(ThreadId, String)],
-    ) -> Result<LocalAction> {
+    ) -> Result<(LocalAction, usize)> {
         self.relocate_scoped_threads(account, targets, ActionKind::Archive)
     }
 
@@ -544,7 +547,7 @@ impl Store {
         account: &AccountId,
         targets: &[(ThreadId, String)],
         kind: ActionKind,
-    ) -> Result<LocalAction> {
+    ) -> Result<(LocalAction, usize)> {
         self.require_account(account)?;
         let tx = crate::store::immediate_transaction(self.connection())?;
         ensure_action_schema(&tx)?;
@@ -552,45 +555,28 @@ impl Store {
         let mut routes: BTreeMap<(String, &str), Vec<String>> = BTreeMap::new();
         let mut plans = Vec::new();
         let mut seen = HashSet::new();
+        let mut ineligible = None;
         let mut only_junk = true;
         for (thread, folder) in targets {
-            if !seen.insert(thread) {
+            if seen.contains(thread) {
                 continue;
             }
-            let from = canonical_folder(folder)?;
-            if kind == ActionKind::Delete && roles.is(FolderRole::Trash, &from) {
-                return Err(Error::Action("already in Trash".into()));
-            }
-            let junk = roles.is(FolderRole::Junk, &from);
+            let (to, planned, junk) =
+                match plan_scoped_relocation(&tx, account, thread, folder, &roles, kind) {
+                    Ok(target) => target,
+                    Err(err @ Error::Action(_)) => {
+                        ineligible.get_or_insert(err);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+            seen.insert(thread);
             only_junk &= junk;
-            let to = match kind {
-                ActionKind::Archive => {
-                    check_archive_route(&roles, &from)?;
-                    roles.archive_name()
-                }
-                ActionKind::Spam if junk => roles.name(FolderRole::Inbox),
-                ActionKind::Spam => roles.name(FolderRole::Junk),
-                _ => roles.name(FolderRole::Trash),
-            };
-            if roles.is_view(to)
-                && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
-            {
-                return Err(Error::Action(format!("{} is a view", roles.label(to))));
-            }
-            let rows = load_thread(&tx, account, thread)?;
-            let planned = if kind == ActionKind::Archive {
-                plan_archive(&tx, account, &rows, &from, &roles)?
-            } else {
-                plan_relocate(&tx, account, &rows, &from, to, &roles, kind)?
-            };
-            if planned.is_empty() {
-                return Err(Error::Action(format!("no messages in {from}")));
-            }
             add_routes(&mut routes, to, &planned);
             plans.extend(planned);
         }
         if plans.is_empty() {
-            return Err(Error::Action("no conversation".into()));
+            return Err(ineligible.unwrap_or_else(|| Error::Action("no conversation".into())));
         }
         let (kind, verb) = match kind {
             ActionKind::Archive => (kind, "archived"),
@@ -602,7 +588,7 @@ impl Store {
         let action = record_and_apply(&tx, account, kind, &summary, &plans)?;
         queue_routes(&tx, account, &action, routes, &roles)?;
         tx.commit()?;
-        Ok(action)
+        Ok((action, seen.len()))
     }
 
     /// Delete the messages in `threads` from Trash for good, in Fell only.
@@ -921,6 +907,45 @@ fn check_archive_route(roles: &FolderRoles, from: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn plan_scoped_relocation<'a>(
+    conn: &Connection,
+    account: &AccountId,
+    thread: &ThreadId,
+    folder: &str,
+    roles: &'a FolderRoles,
+    kind: ActionKind,
+) -> Result<(&'a str, Vec<Planned>, bool)> {
+    let from = canonical_folder(folder)?;
+    if kind == ActionKind::Delete && roles.is(FolderRole::Trash, &from) {
+        return Err(Error::Action("already in Trash".into()));
+    }
+    let junk = roles.is(FolderRole::Junk, &from);
+    let to = match kind {
+        ActionKind::Archive => {
+            check_archive_route(roles, &from)?;
+            roles.archive_name()
+        }
+        ActionKind::Spam if junk => roles.name(FolderRole::Inbox),
+        ActionKind::Spam => roles.name(FolderRole::Junk),
+        _ => roles.name(FolderRole::Trash),
+    };
+    if roles.is_view(to)
+        && (kind != ActionKind::Archive || roles.get(FolderRole::Archive).is_some())
+    {
+        return Err(Error::Action(format!("{} is a view", roles.label(to))));
+    }
+    let rows = load_thread(conn, account, thread)?;
+    let plans = if kind == ActionKind::Archive {
+        plan_archive(conn, account, &rows, &from, roles)?
+    } else {
+        plan_relocate(conn, account, &rows, &from, to, roles, kind)?
+    };
+    if plans.is_empty() {
+        return Err(Error::Action(format!("no messages in {from}")));
+    }
+    Ok((to, plans, junk))
 }
 
 fn plan_archive(
@@ -2425,7 +2450,8 @@ mod tests {
             (first.clone(), FOLDER_SENT.into()),
             (second.clone(), FOLDER_INBOX.into()),
         ];
-        let action = store.delete_scoped_threads(&owner, &targets).unwrap();
+        let (action, count) = store.delete_scoped_threads(&owner, &targets).unwrap();
+        assert_eq!(count, 2);
         assert_eq!(
             folders_of(&store, &first),
             [vec![FOLDER_INBOX], vec![FOLDER_TRASH]]
@@ -2438,7 +2464,8 @@ mod tests {
         );
         assert_eq!(folders_of(&store, &second), [vec![FOLDER_INBOX]]);
 
-        let action = store.archive_scoped_threads(&owner, &targets).unwrap();
+        let (action, count) = store.archive_scoped_threads(&owner, &targets).unwrap();
+        assert_eq!(count, 2);
         assert_eq!(
             folders_of(&store, &first),
             [vec![FOLDER_INBOX], vec![FOLDER_ARCHIVE]]
@@ -2450,15 +2477,6 @@ mod tests {
         assert!(restored.contains(&first));
         assert!(restored.contains(&second));
 
-        let invalid = [
-            (first.clone(), FOLDER_SENT.into()),
-            (second.clone(), "Missing".into()),
-        ];
-        assert!(store.spam_scoped_threads(&owner, &invalid).is_err());
-        assert_eq!(
-            folders_of(&store, &first),
-            [vec![FOLDER_INBOX], vec![FOLDER_SENT]]
-        );
         let flag = store
             .flag_scoped_threads(&owner, &targets, FlagChange::Star)
             .unwrap()
@@ -2467,6 +2485,125 @@ mod tests {
         assert!(!first_messages[0].starred);
         assert!(first_messages[1].starred);
         assert_eq!(store.undo(&owner).unwrap().id, flag.id);
+    }
+
+    #[test]
+    fn scoped_archive_and_delete_skip_destination_and_stale_sources() {
+        let store = open(&[("a1", "a@x")]);
+        let owner = account("a1");
+        let (first, second) = two_in_inbox(&store);
+        for (kind, destination, error) in [
+            (
+                ActionKind::Archive,
+                FOLDER_ARCHIVE,
+                "archive moves messages into Archive",
+            ),
+            (ActionKind::Delete, FOLDER_TRASH, "already in Trash"),
+        ] {
+            let mut there = sample(
+                "a1",
+                &format!("{destination}@x"),
+                "Already there",
+                "there body",
+            );
+            there.folders = vec![destination.into()];
+            let there = store.upsert_message(&there).unwrap();
+            let relocate = |targets: &[(ThreadId, String)]| {
+                store.relocate_scoped_threads(&owner, targets, kind)
+            };
+            let ineligible = [
+                (there.clone(), destination.into()),
+                (first.clone(), "Missing".into()),
+            ];
+            assert_eq!(text(relocate(&ineligible[..1])), error);
+            assert_eq!(text(relocate(&ineligible[1..])), "no messages in Missing");
+            assert_eq!(text(store.undo(&owner)), "nothing to undo");
+
+            let mut targets = ineligible.to_vec();
+            targets.extend([
+                (first.clone(), FOLDER_SENT.into()),
+                (second.clone(), FOLDER_INBOX.into()),
+            ]);
+            let (action, count) = relocate(&targets).unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(folders_of(&store, &there), [vec![destination]]);
+            assert_eq!(
+                folders_of(&store, &first),
+                [vec![FOLDER_INBOX], vec![destination]]
+            );
+            assert_eq!(folders_of(&store, &second), [vec![destination]]);
+            let (undone, restored) = store.undo_with_threads(&owner).unwrap();
+            assert_eq!(undone, action);
+            assert_eq!(restored.len(), 2);
+            assert!(restored.contains(&first) && restored.contains(&second));
+            assert_eq!(
+                folders_of(&store, &first),
+                [vec![FOLDER_INBOX], vec![FOLDER_SENT]]
+            );
+            assert_eq!(folders_of(&store, &second), [vec![FOLDER_INBOX]]);
+            assert_eq!(text(store.undo(&owner)), "nothing to undo");
+        }
+    }
+
+    #[test]
+    fn scoped_spam_skips_stale_sources_and_view_destinations() {
+        let store = open(&[("a1", "a@x")]);
+        let owner = account("a1");
+        let (first, second) = two_in_inbox(&store);
+        let mut junk = sample("a1", "junk@x", "Junk", "junk body");
+        junk.folders = vec!["Spam".into()];
+        junk.starred = true;
+        let junk = store.upsert_message(&junk).unwrap();
+        let spam = |targets: &[(ThreadId, String)]| store.spam_scoped_threads(&owner, targets);
+        let stale = (second.clone(), "Missing".into());
+        let rescue = (junk.clone(), "Spam".into());
+        let report = (first.clone(), FOLDER_INBOX.into());
+        assert_eq!(
+            text(spam(std::slice::from_ref(&stale))),
+            "no messages in Missing"
+        );
+        let (action, count) = spam(&[stale.clone(), rescue.clone(), report.clone()]).unwrap();
+        assert_eq!((action.kind, count), (ActionKind::Spam, 2));
+        assert_eq!(
+            folders_of(&store, &first),
+            [vec!["Spam"], vec![FOLDER_SENT]]
+        );
+        assert_eq!(folders_of(&store, &junk), [vec![FOLDER_INBOX]]);
+        assert_eq!(folders_of(&store, &second), [vec![FOLDER_INBOX]]);
+        assert_eq!(store.undo(&owner).unwrap(), action);
+
+        store
+            .apply_delta(
+                &owner,
+                &MailboxDelta {
+                    roles: Some(FolderRoles::new(vec![crate::RoleFolder {
+                        role: FolderRole::Junk,
+                        name: "Labels/Spam".into(),
+                        raw: "Labels/Spam".into(),
+                        source: crate::RoleSource::Config,
+                    }])),
+                    views: Some(vec![crate::backend::MailboxView {
+                        mailbox: "Labels/Spam".into(),
+                        folder: "Labels/Spam".into(),
+                        kind: crate::backend::MailboxViewKind::Starred,
+                    }]),
+                    ..MailboxDelta::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(text(spam(std::slice::from_ref(&report))), "Spam is a view");
+        let (action, count) = spam(&[report, stale, (junk.clone(), "Labels/Spam".into())]).unwrap();
+        assert_eq!((action.kind, count), (ActionKind::NotSpam, 1));
+        assert_eq!(
+            folders_of(&store, &first),
+            [vec![FOLDER_INBOX], vec![FOLDER_SENT]]
+        );
+        assert_eq!(folders_of(&store, &junk), [vec![FOLDER_INBOX]]);
+        let (undone, restored) = store.undo_with_threads(&owner).unwrap();
+        assert_eq!(undone, action);
+        assert_eq!(restored, std::slice::from_ref(&junk));
+        assert_eq!(folders_of(&store, &junk), [vec!["Spam"]]);
+        assert_eq!(text(store.undo(&owner)), "nothing to undo");
     }
 
     #[test]

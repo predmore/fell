@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 pub const QUICK: Duration = Duration::from_millis(80);
 /// Rows moving, a pane sliding in, a scroll gliding to its target.
 pub const SLIDE: Duration = Duration::from_millis(120);
+/// Give a restored slot one frame of room before drawing its selection.
+const RESTORE_LEAD: Duration = Duration::from_millis(16);
 /// A pane coming into view: the conversation replacing the list in a
 /// narrow window, or the list coming back. The longest move, so the longest.
 pub const PANE: Duration = Duration::from_millis(160);
@@ -384,6 +386,11 @@ impl RowMotion {
         opacity: 1.0,
         reveal: None,
     };
+
+    pub fn visible_height(self, height: f32, scale: f32) -> f32 {
+        self.reveal
+            .map_or(height, |share| snap(height * share, scale))
+    }
 }
 
 /// A row that left the list, drawn where it was while it fades out and the
@@ -473,6 +480,15 @@ impl<R: Clone> ListShift<R> {
             replaced,
             reach,
         })
+    }
+
+    /// The restored row already owns the cursor. Give its slot room on
+    /// the first frame even when the motion clock draws at the start time.
+    pub fn show_restored_selection(mut self) -> Self {
+        if let Some(start) = self.transition.started.checked_sub(RESTORE_LEAD) {
+            self.transition.started = start;
+        }
+        self
     }
 
     /// The list was replaced (another folder): the old list's rows below

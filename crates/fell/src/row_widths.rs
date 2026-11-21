@@ -3,10 +3,10 @@
 //!
 //! The subject box eases from the width it had on screen to the width of
 //! the text at its new weight. At rest read and unread rows leave the same
-//! gap after the subject. The unread bar fades over [`motion::FADE`]. The
-//! subject switches weight immediately. Its text is clipped as the box
-//! grows, and the snippet stays next to the visible subject. Stars fade
-//! and scale in and out independently.
+//! gap after the subject. The unread bar starts fading when the subject
+//! switches weight. The snippet follows the clipping edge as the box grows
+//! and cross-fades between its old and new positions as the box shrinks.
+//! Stars fade and scale in and out independently.
 //! With reduced motion each change shows immediately.
 
 use std::collections::HashMap;
@@ -30,6 +30,14 @@ pub const STAR_FROM: f32 = 0.8;
 /// How wide the fade is that softens the subject's clipped right edge.
 pub const SUBJECT_FADE: f32 = 12.0;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnippetFade {
+    pub old_box: f32,
+    pub old_room: f32,
+    pub outgoing: f32,
+    pub incoming: f32,
+}
+
 /// A row as one frame draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowFrame {
@@ -41,6 +49,7 @@ pub struct RowFrame {
     pub unread: f32,
     /// The weight of the sender and subject text in this frame.
     pub bold: bool,
+    pub snippet_fade: Option<SnippetFade>,
     /// How much of the star shows (its opacity; its scale follows).
     pub star: f32,
 }
@@ -54,6 +63,7 @@ impl RowFrame {
             subject_room: subject_w,
             unread: f32::from(u8::from(unread)),
             bold: unread,
+            snippet_fade: None,
             star: f32::from(u8::from(starred)),
         }
     }
@@ -64,18 +74,23 @@ impl RowFrame {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnreadChange {
+    old_box: f32,
+    old_room: f32,
+    old_accent: f32,
+    fade: Transition,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Kept {
     /// The subject the widths belong to.
     subject: String,
     /// The box width at rest: where it is, or where it is easing to.
     width: f32,
-    /// The box easing from this width to `width`.
-    slide: Option<(f32, Transition)>,
     unread: bool,
     starred: bool,
-    /// Starting unread accent while it eases.
-    unread_transition: Option<(f32, Transition)>,
+    unread_change: Option<UnreadChange>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
     labels: Option<Vec<String>>,
@@ -84,31 +99,28 @@ struct Kept {
 
 impl Kept {
     fn frame(&self, now: Instant) -> RowFrame {
-        let subject_w = match &self.slide {
-            Some((from, slide)) => motion::lerp(*from, self.width, slide.progress(now)),
-            None => self.width,
-        };
-        let toward = |on: bool, transition: Option<&Transition>| {
-            let t = motion::progress(transition, now);
-            if on { t } else { 1.0 - t }
-        };
-        let unread_target = f32::from(u8::from(self.unread));
-        let unread = match self.unread_transition {
-            Some((from, transition)) => motion::lerp(from, unread_target, transition.progress(now)),
-            None => unread_target,
-        };
-        RowFrame {
-            subject_w,
-            subject_room: self.width,
-            unread,
-            bold: self.unread,
-            star: toward(self.starred, self.star.as_ref()),
+        let mut frame = RowFrame::still(self.width, self.unread, self.starred);
+        if let Some(change) = self.unread_change {
+            let progress = change.fade.progress(now);
+            frame.subject_w = motion::lerp(change.old_box, self.width, progress);
+            frame.unread = motion::lerp(change.old_accent, frame.unread, progress);
+            if !self.unread && change.old_box > self.width && change.fade.running(now) {
+                frame.snippet_fade = Some(SnippetFade {
+                    old_box: change.old_box,
+                    old_room: change.old_room,
+                    outgoing: change.fade.remaining(now),
+                    incoming: motion::lerp(motion::ARRIVE_FROM, 1.0, progress),
+                });
+            }
         }
+        let star = motion::progress(self.star.as_ref(), now);
+        frame.star = if self.starred { star } else { 1.0 - star };
+        frame
     }
 
     fn running(&self, now: Instant) -> bool {
-        self.slide.is_some_and(|(_, t)| t.running(now))
-            || self.unread_transition.is_some_and(|(_, t)| t.running(now))
+        self.unread_change
+            .is_some_and(|change| change.fade.running(now))
             || self.star.is_some_and(|t| t.running(now))
             || self
                 .previous_labels
@@ -175,10 +187,9 @@ impl RowWidths {
                     Kept {
                         subject: subject.to_string(),
                         width,
-                        slide: None,
                         unread,
                         starred,
-                        unread_transition: None,
+                        unread_change: None,
                         star: None,
                         labels: None,
                         previous_labels: None,
@@ -190,27 +201,25 @@ impl RowWidths {
         if !record {
             return kept.frame(now);
         }
-        if kept.slide.is_some_and(|(_, t)| !t.running(now)) {
-            kept.slide = None;
-        }
-        if kept.unread_transition.is_some_and(|(_, t)| !t.running(now)) {
-            kept.unread_transition = None;
+        if kept
+            .unread_change
+            .is_some_and(|change| !change.fade.running(now))
+        {
+            kept.unread_change = None;
         }
         if kept.star.is_some_and(|t| !t.running(now)) {
             kept.star = None;
         }
         if unread != kept.unread {
             let drawn = kept.frame(now);
-            let from = drawn.subject_w.min(kept.width);
             kept.unread = unread;
             kept.width = natural(unread).ceil();
-            kept.unread_transition = motion
-                .start(motion::FADE, now)
-                .map(|transition| (drawn.unread, transition));
-            kept.slide = (from != kept.width)
-                .then(|| motion.start(motion::SLIDE, now))
-                .flatten()
-                .map(|slide| (from, slide));
+            kept.unread_change = motion.start(motion::FADE, now).map(|fade| UnreadChange {
+                old_box: drawn.subject_w.min(drawn.subject_room),
+                old_room: drawn.subject_room,
+                old_accent: drawn.unread,
+                fade,
+            });
         }
         if starred != kept.starred {
             kept.starred = starred;
@@ -254,8 +263,7 @@ impl RowWidths {
     /// A key arrived: finish running transitions before acting on it.
     pub fn settle(&mut self) {
         for kept in self.rows.values_mut() {
-            kept.slide = None;
-            kept.unread_transition = None;
+            kept.unread_change = None;
             kept.star = None;
             kept.previous_labels = None;
         }
@@ -301,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn marking_read_keeps_the_snippet_with_the_regular_subject() {
+    fn marking_read_cross_fades_the_snippet_and_unread_accent_together() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         let before = draw(&mut widths, "t1", true, t0);
@@ -311,16 +319,24 @@ mod tests {
         assert_eq!(start.unread, 1.0);
         assert!(!start.bold, "the subject fits throughout the slide");
         assert_eq!(start.subject_room, REGULAR.ceil());
+        let fade = start.snippet_fade.unwrap();
+        assert_eq!((fade.outgoing, fade.incoming), (1.0, motion::ARRIVE_FROM));
+        assert_eq!(line_two(fade.old_box, BOLD).1, snippet_x(before));
         let mid = draw(&mut widths, "t1", false, at(key, 40));
         let narrow = REGULAR + SUBJECT_GAP;
         assert!(mid.subject_w < start.subject_w && mid.subject_w > start.subject_room);
         assert_eq!(snippet_x(start), narrow);
         assert_eq!(snippet_x(mid), narrow);
         assert!(mid.unread > 0.0 && mid.unread < 0.5);
+        let mid_fade = mid.snippet_fade.unwrap();
+        assert_eq!(mid_fade.old_box, fade.old_box);
+        assert!(mid_fade.outgoing < fade.outgoing);
+        assert!(mid_fade.incoming > fade.incoming);
 
         let done = draw(&mut widths, "t1", false, at(key, 120));
         assert_eq!(snippet_x(done), narrow);
         assert_eq!(done.unread, 0.0);
+        assert_eq!(done.snippet_fade, None);
         assert!(!widths.running(at(key, 120)));
     }
 
@@ -421,6 +437,7 @@ mod tests {
         let read = draw(&mut widths, "t1", false, at(t0, 32));
         assert_eq!(snippet_x(read), REGULAR + SUBJECT_GAP);
         assert_eq!(read.unread, 0.0);
+        assert_eq!(read.snippet_fade, None);
         assert!(!widths.running(at(t0, 32)));
     }
 

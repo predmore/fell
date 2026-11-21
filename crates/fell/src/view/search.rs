@@ -444,23 +444,13 @@ impl Inbox {
         let Some(scopes) = self
             .session
             .search_scopes(&ids)
-            .filter(|scopes| !scopes.is_empty())
+            .filter(|scopes| removal != Removal::Purge || scopes.len() == ids.len())
         else {
             self.session
                 .show_toast("No folder for a selected match", true);
             return;
         };
         let account = self.account_id.clone();
-        let done = match removal {
-            Removal::Archive => archived_notice(scopes.len()),
-            Removal::Delete => format!(
-                "Moved to {}",
-                self.session
-                    .folder_text(self.session.roles.name(FolderRole::Trash))
-            ),
-            Removal::Spam => "Spam status updated".to_owned(),
-            Removal::Purge => "Removed from Fell".to_owned(),
-        };
         let accepted = self
             .session
             .search
@@ -471,10 +461,12 @@ impl Inbox {
                 Removal::Archive => store.archive_scoped_threads(&account, &scopes),
                 Removal::Delete => store.delete_scoped_threads(&account, &scopes),
                 Removal::Spam => store.spam_scoped_threads(&account, &scopes),
-                Removal::Purge => store.purge_scoped_threads(&account, &scopes),
+                Removal::Purge => store
+                    .purge_scoped_threads(&account, &scopes)
+                    .map(|action| (action, scopes.len())),
             },
             move |inbox, result| match result {
-                Ok(_) => {
+                Ok((action, count)) => {
                     if inbox
                         .session
                         .search
@@ -485,6 +477,18 @@ impl Inbox {
                         inbox.session.visual = false;
                         inbox.session.anchor_id = None;
                     }
+                    let role_label =
+                        |role| inbox.session.folder_text(inbox.session.roles.name(role));
+                    let done = match removal {
+                        Removal::Archive => archived_notice(count),
+                        Removal::Delete => moved_notice(count, &role_label(FolderRole::Trash)),
+                        Removal::Spam if action.kind == fell_core::ActionKind::NotSpam => {
+                            moved_notice(count, &role_label(FolderRole::Inbox))
+                        }
+                        Removal::Spam if count == 1 => "Spam status updated".to_owned(),
+                        Removal::Spam => format!("Updated spam status for {count} conversations"),
+                        Removal::Purge => "Removed from Fell".to_owned(),
+                    };
                     inbox.session.show_toast(done, false);
                     inbox.send_to_server();
                     Some(ReadIntent {

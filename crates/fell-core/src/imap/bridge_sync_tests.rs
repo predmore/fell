@@ -634,7 +634,9 @@ fn bridge_view_actions_change_every_real_folder_and_undo_restores_the_views() {
             match destination {
                 "Archive" => store.archive_thread(&acct.id, &thread, from),
                 "Trash" => store.delete_threads(&acct.id, std::slice::from_ref(&thread), from),
-                _ => store.spam_scoped_threads(&acct.id, &[(thread.clone(), from.into())]),
+                _ => store
+                    .spam_scoped_threads(&acct.id, &[(thread.clone(), from.into())])
+                    .map(|(action, _)| action),
             }
             .unwrap();
             assert_eq!(inbox().folders, [destination]);
