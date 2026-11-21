@@ -228,6 +228,81 @@ fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
 }
 
 #[test]
+fn undo_rejects_an_in_flight_fetch_from_a_reinserted_message() {
+    let (root, cache, store) = open_fixture("undo-after-reinsert");
+    let original = message("a1", "note@x", "Trash", 1);
+    let account = &original.account_id;
+    let message_id = &original.headers.message_id;
+    let thread = store.upsert_message(&original).unwrap();
+    let original_part = listed_parts(&store, &original).remove(0);
+    store.delete_thread(account, &thread, "Trash").unwrap();
+
+    let mut reinserted = message("a1", "note@x", "INBOX", 2);
+    reinserted.parts.as_mut().unwrap().mime_parts.truncate(1);
+    store
+        .apply_delta(
+            account,
+            &MailboxDelta {
+                messages: vec![reinserted],
+                ..MailboxDelta::default()
+            },
+        )
+        .unwrap();
+    let part = store
+        .part_request(account, message_id, "2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.part, original_part.part);
+    assert!(matches!(
+        store.cached_part_state(&part).unwrap(),
+        Some((_, true))
+    ));
+
+    let worker = PartFetcher::start_for_store(
+        || Ok(Box::new(Serves(b"bmV3IQ=="))), // "new!"
+        cache.clone(),
+        root.join("mail.db"),
+    );
+    let (entered, downloading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let timeout = Duration::from_secs(10);
+    worker.fetch(part.clone(), move |event| match event {
+        PartEvent::Progress { .. } => {
+            entered.send(()).unwrap();
+            paused.recv_timeout(timeout).unwrap();
+        }
+        PartEvent::Done(value) => done.send(value).unwrap(),
+        PartEvent::Downloading { .. } => {}
+    });
+    downloading.recv_timeout(timeout).unwrap();
+    assert!(matches!(
+        store.cached_part_state(&part).unwrap(),
+        Some((_, false))
+    ));
+
+    store.undo(account).unwrap();
+    let restored_part = listed_parts(&store, &original).remove(0);
+    assert_eq!(restored_part.part, original_part.part);
+    assert!(matches!(
+        store.cached_part_state(&restored_part).unwrap(),
+        Some((_, true))
+    ));
+    // A sweep can acknowledge undo's cleanup before the download resumes.
+    store.clean_part_cache(&cache).unwrap();
+    assert!(matches!(
+        store.cached_part_state(&restored_part).unwrap(),
+        Some((_, false))
+    ));
+    resume.send(()).unwrap();
+    let error = result.recv_timeout(timeout).unwrap().unwrap_err();
+    assert_eq!(error.to_string(), part_removed().to_string());
+    assert!(cache.lookup(&restored_part).is_none());
+    drop((worker, store));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
     let (root, cache, store) = open_fixture("cleanup-during-fetch");
     let mut target = message("a1", "expunge@x", "Trash", 1);

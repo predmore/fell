@@ -1094,6 +1094,13 @@ fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -
             replace_message_row(conn, account_id, &current, saved)?;
             restore_aliases(conn, account_id, &saved.message_id, &snapshot.aliases)?;
             restore_bodies(conn, account_id, snapshot.action_id, &saved.message_id)?;
+            // Removing the interim list records its sections for cleanup.
+            // A fetch can already be writing one of them as undo commits.
+            conn.execute(
+                "UPDATE part_cache_sections SET pending = 1
+                 WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id.as_str(), saved.message_id],
+            )?;
             return Ok(());
         }
         let folders = join_tokens(&invert_tokens(
@@ -1297,7 +1304,8 @@ fn replace_message_row(
             list_id = ?20,
             reply_to_line = ?21,
             attachment_names = ?22,
-            body_fingerprint = ?23
+            body_fingerprint = ?23,
+            part_cache_stamp = randomblob(16)
          WHERE account_id = ?24 AND message_id = ?25",
         params_from_iter(values),
     )?;
