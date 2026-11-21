@@ -22,7 +22,12 @@ pub(in crate::imap) struct WriteFixture {
     pub refuse: Option<String>,
     /// Answer `UID SEARCH HEADER Message-ID` with NO.
     pub refuse_search: bool,
+    /// Return this many tagged-OK empty HEADER searches before finding the copy.
+    pub empty_header_searches: usize,
+    pub close_on_login: bool,
     pub refuse_append: bool,
+    /// Disconnect without committing the next APPEND.
+    pub lose_append_before_commit: bool,
     /// Drop the connection after this many `UID MOVE` replies.
     pub close_after_moves: Option<u32>,
     /// Apply the next command with this verb (`"MOVE"`), then drop the
@@ -78,6 +83,9 @@ pub(super) fn handle(
             let reply = if let Some(args) = strip_prefix_ignore(rest, "SEARCH HEADER Message-ID ") {
                 if writes.refuse_search {
                     format!("{tag} NO search not now\r\n")
+                } else if writes.empty_header_searches > 0 {
+                    writes.empty_header_searches -= 1;
+                    format!("* SEARCH\r\n{tag} OK SEARCH\r\n")
                 } else {
                     search_message_id(tag, args, &state)
                 }
@@ -168,6 +176,10 @@ pub(super) fn append(
 ) {
     let mut state = state.lock().expect("state");
     let mut writes = writes.lock().expect("writes");
+    if std::mem::take(&mut writes.lose_append_before_commit) {
+        let _ = out.stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     let name = mailbox_name(rest);
     let mailbox = state.mailboxes.iter_mut().find(|item| item.name == name);
     let reply = match (writes.refuse_append, mailbox, literals.pop()) {
@@ -180,7 +192,7 @@ pub(super) fn append(
                 .max()
                 .unwrap_or(0)
                 + 1;
-            let flags = if rest.contains(" (\\Seen) ") {
+            let flags = if rest.ends_with(" (\\Seen)") {
                 vec!["\\Seen".into()]
             } else {
                 Vec::new()

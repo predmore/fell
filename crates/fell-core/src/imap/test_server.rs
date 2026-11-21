@@ -330,6 +330,9 @@ fn handle(
                 }
             }
             "LOGIN" => {
+                if writes.lock().expect("writes").close_on_login {
+                    break;
+                }
                 let (user, pass) = if literals.len() >= 2 {
                     (
                         String::from_utf8_lossy(&literals[0]).into_owned(),
@@ -1138,6 +1141,11 @@ fn read_client_command(
         let Some((len, needs_continuation)) = trailing_literal(&line) else {
             return Some((line, literals));
         };
+        let append =
+            split_command(&line).is_some_and(|(_, verb, _)| verb.eq_ignore_ascii_case("APPEND"));
+        if append && !chunk.ends_with("\r\n") {
+            return None;
+        }
         if let Some(start) = line.rfind('{') {
             line.truncate(start);
         }
@@ -1149,6 +1157,14 @@ fn read_client_command(
         let mut buf = vec![0u8; len];
         if read.read_exact(&mut buf).is_err() {
             return None;
+        }
+        if append {
+            let mut end = [0; 2];
+            read.read_exact(&mut end).ok()?;
+            if end != *b"\r\n" {
+                return None;
+            }
+            return Some((line, vec![buf]));
         }
         line.push_str(&String::from_utf8_lossy(&buf));
         literals.push(buf);

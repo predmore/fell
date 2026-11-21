@@ -41,6 +41,7 @@ type Listener = Box<dyn Fn() -> bool + Send>;
 /// The inbox notice for a draft that may have gone out, worded as its row
 /// and preview are.
 pub const MAYBE_SENT_NOTICE: &str = "may have been sent  ·  check Sent";
+pub const LOCAL_SENT_COPY_FAILED: &str = "Sent · local copy could not be saved";
 
 /// `text` with its first letter upper case.
 fn sentence_case(text: &str) -> String {
@@ -453,6 +454,11 @@ impl DraftHub {
         };
         let warn = warn_failure || locked == Some(SendLock::MaybeSent.reason());
         self.push_closed(id, line, sent, warn);
+    }
+
+    /// The SMTP send succeeded but Fell could not save its local copy.
+    pub fn report_sent_copy_failure(&self, id: &str) {
+        self.push_closed(id, LOCAL_SENT_COPY_FAILED.into(), true, true);
     }
 
     /// Queue `line` for the inbox. Mail that went out is not offered again

@@ -107,7 +107,8 @@ CREATE TABLE IF NOT EXISTS server_outbox (
     flag_superseded INTEGER NOT NULL DEFAULT 0,
     -- Extra copies bound from an early keyword edit replay with that edit.
     keyword_parent INTEGER,
-    append_mime BLOB
+    append_mime BLOB,
+    append_empty INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_outbox_state ON server_outbox(account_id, state, id);
@@ -145,6 +146,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("server_outbox", "flag_modseq", "BLOB"),
     ("server_outbox", "flag_base", "INTEGER"),
     ("server_outbox", "append_mime", "BLOB"),
+    (
+        "server_outbox",
+        "append_empty",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
     (
         "server_outbox",
         "flag_superseded",
@@ -431,7 +437,7 @@ fn enabled(conn: &Connection, account_id: &AccountId) -> Result<bool> {
     Ok(enabled.is_some_and(|value| value != 0))
 }
 
-/// Queue the Bcc-free SMTP bytes in the same transaction as the local row.
+/// Queue the Bcc-free SMTP bytes, even if the local row could not be saved.
 pub(crate) fn queue_append(
     conn: &Connection,
     account: &AccountId,
@@ -465,34 +471,48 @@ pub(crate) struct PendingAppend {
     pub mime: Vec<u8>,
     /// The exact mailbox used if a command may already have reached it.
     pub sent_to: Option<String>,
+    pub bound: Option<Bound>,
+    pub checked_empty: bool,
 }
 
 pub(crate) fn pending_append(store: &Store, entry: &OutboxEntry) -> Result<Option<PendingAppend>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT o.append_mime, CASE WHEN o.sent THEN o.target_mailbox END
+            "SELECT o.append_mime, CASE WHEN o.sent THEN o.target_mailbox END,
+                    o.target_uidvalidity, o.target_uidnext, o.append_empty
          FROM server_outbox o JOIN write_back_accounts a USING (account_id)
          WHERE o.id = ?1 AND o.state = 'pending' AND a.enabled
            AND o.generation = a.generation AND o.retry_unix <= ?2",
             params![entry.id, now_unix()],
             |row| {
+                let bound: Bound = (row.get(2)?, row.get(3)?);
                 Ok(PendingAppend {
                     mime: row.get(0)?,
                     sent_to: row.get(1)?,
+                    bound: (bound.0 != 0 && bound.1 != 0).then_some(bound),
+                    checked_empty: row.get(4)?,
                 })
             },
         )
         .optional()?)
 }
 
-pub(crate) fn mark_append_sent(store: &Store, entry: &OutboxEntry, mailbox: &str) -> Result<bool> {
+pub(crate) fn mark_append_sent(
+    store: &Store,
+    entry: &OutboxEntry,
+    mailbox: &str,
+    bound: Option<Bound>,
+) -> Result<bool> {
     let tx = crate::store::immediate_transaction(store.connection())?;
+    let (validity, next) = bound.unwrap_or_default();
     let changed = tx.execute(
-        "UPDATE server_outbox SET sent = 1, target_mailbox = ?2
+        "UPDATE server_outbox
+         SET sent = 1, target_mailbox = ?2, target_uidvalidity = ?3, target_uidnext = ?4,
+             append_empty = 0
          WHERE id = ?1 AND state = 'pending' AND generation IN
              (SELECT generation FROM write_back_accounts WHERE account_id = server_outbox.account_id AND enabled)",
-        params![entry.id, mailbox],
+        params![entry.id, mailbox, validity, next],
     )?;
     tx.commit()?;
     Ok(changed != 0)
@@ -1155,6 +1175,7 @@ pub(crate) enum Outcome<'a> {
         retry_unix: i64,
         counts: bool,
         refused: bool,
+        append_empty: bool,
     },
     Dropped {
         error: &'a str,
@@ -1237,6 +1258,7 @@ pub(crate) fn settle(
             retry_unix,
             counts,
             refused,
+            append_empty,
         } => {
             // Undone while it was on the wire, and now refused: the server
             // never moved it, so there is nothing to move back.
@@ -1247,9 +1269,17 @@ pub(crate) fn settle(
             tx.execute(
                 "UPDATE server_outbox
                  SET attempts = attempts + ?2, retry_unix = ?3, error = ?4,
-                     sent = CASE WHEN ?5 THEN 0 ELSE sent END
+                     sent = CASE WHEN ?5 THEN 0 ELSE sent END,
+                     append_empty = ?6
                  WHERE id = ?1",
-                params![entry.id, i64::from(counts), retry_unix, error, refused],
+                params![
+                    entry.id,
+                    i64::from(counts),
+                    retry_unix,
+                    error,
+                    refused,
+                    append_empty
+                ],
             )?;
             tx.commit()?;
             return Ok(if recovering {

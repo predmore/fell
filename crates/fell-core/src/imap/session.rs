@@ -1513,7 +1513,7 @@ impl ServerCertVerifier for AcceptInvalidCerts {
     }
 }
 
-fn quote_imap(value: &str) -> Result<String, String> {
+pub(super) fn quote_imap(value: &str) -> Result<String, String> {
     if value
         .chars()
         .any(|ch| ch == '\r' || ch == '\n' || ch == '\0')

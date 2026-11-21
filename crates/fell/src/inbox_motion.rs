@@ -237,6 +237,8 @@ pub struct InboxMotion {
     arrival_pending: bool,
     /// Bodies settling into the open thread, by message id.
     bodies: HashMap<String, (Transition, bool)>,
+    /// Sent cards already laid out for the hand-off, awaiting an active inbox frame.
+    messages_pending: HashSet<String>,
     /// Where a glide a key interrupted was drawn, so the next glide starts
     /// there instead of snapping to the old target first.
     list_from: Option<f32>,
@@ -369,6 +371,7 @@ impl InboxMotion {
             card_to: None,
             card_glide: None,
             bodies: HashMap::new(),
+            messages_pending: HashSet::new(),
             quotes: DisclosureMotion::default(),
             recipients: DisclosureMotion::default(),
             last_unread: None,
@@ -559,6 +562,7 @@ impl InboxMotion {
         self.arrival = None;
         self.arrival_pending = true;
         self.bodies.clear();
+        self.messages_pending.clear();
     }
 
     /// Jump every transition to its end state: a key acts on what the
@@ -593,6 +597,7 @@ impl InboxMotion {
         self.arrival_pending = false;
         self.finish_empty_list_entry();
         self.bodies.clear();
+        self.messages_pending.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
         self.unread_out = None;
@@ -1107,22 +1112,42 @@ impl InboxMotion {
     }
 
     /// Fade in the whole card when a newly sent reply joins the open thread.
-    pub fn message_arrived(&mut self, id: &str, now: Instant) {
-        if let Some(fade) = self.motion.start(motion::QUICK, now) {
-            self.bodies.insert(id.to_string(), (fade, true));
+    pub fn message_arrived(&mut self, id: &str) {
+        if self.motion.enabled() {
+            self.messages_pending.insert(id.to_string());
+        }
+    }
+
+    pub fn has_pending_messages(&self) -> bool {
+        !self.messages_pending.is_empty()
+    }
+
+    pub fn reveal_arriving_messages(&mut self, now: Instant) {
+        if let Some(fade) = self.motion.start(motion::FADE, now) {
+            self.bodies
+                .extend(self.messages_pending.drain().map(|id| (id, (fade, true))));
         }
     }
 
     /// Opacity for each body or card still settling in, by message id.
     pub fn arrival_alphas(&self, now: Instant, whole_card: bool) -> HashMap<String, f32> {
-        self.bodies
+        let mut alphas: HashMap<_, _> = self
+            .bodies
             .iter()
             .filter(|(_, (_, whole))| *whole == whole_card)
             .map(|(id, (fade, _))| {
                 let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, fade.progress(now));
                 (id.clone(), alpha)
             })
-            .collect()
+            .collect();
+        if whole_card {
+            alphas.extend(
+                self.messages_pending
+                    .iter()
+                    .map(|id| (id.clone(), motion::ARRIVE_FROM)),
+            );
+        }
+        alphas
     }
 
     /// History and recipients can open together with `q` or separately by
@@ -1559,6 +1584,110 @@ mod tests {
                 assert_eq!(status.notice_dy == 0.0, ms >= 140);
             }
         }
+    }
+
+    #[test]
+    fn notice_replacement_keeps_the_texts_apart() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Reply · Avery Lane", false);
+        motion.observe(&session, (true, true), now);
+        let swap = later(now, 200);
+        session.show_toast("Sent “Field test notes”", false);
+        motion.observe(&session, (true, true), swap);
+
+        let first = motion.status(&session, swap);
+        assert_eq!(first.leaving.unwrap().0.text, "Reply · Avery Lane");
+        assert_eq!(first.notice.unwrap().1, 0.0);
+        assert_eq!(first.hints, 0.0);
+        let leaving = motion.status(&session, later(swap, 30));
+        assert!(leaving.leaving.unwrap().1 > 0.0);
+        assert_eq!(leaving.notice.unwrap().1, 0.0);
+        let arriving = motion.status(&session, later(swap, 100));
+        assert_eq!(arriving.leaving.unwrap().1, 0.0);
+        assert!((0.0..1.0).contains(&arriving.notice.unwrap().1));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(swap, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_sent_notice_yields_before_the_retry_notice_fades_in() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Sent “Re: Field test notes”", false);
+        motion.observe(&session, (true, true), now);
+        let swapped = later(now, 180);
+        session.show_toast("Sent · retrying server copy", false);
+        motion.observe(&session, (true, true), swapped);
+        let exiting = motion.status(&session, later(swapped, 30));
+        assert!(exiting.leaving.unwrap().1 > 0.0);
+        assert_eq!(exiting.notice.unwrap().1, 0.0);
+        assert!(motion.tick(later(swapped, 60)));
+        let arriving = motion.status(&session, later(swapped, 100));
+        assert_eq!(arriving.leaving.unwrap().1, 0.0);
+        let (notice, opacity) = arriving.notice.unwrap();
+        assert!(!notice.alert);
+        assert!((0.0..1.0).contains(&opacity));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(swapped, 140)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_sent_cards_fade_starts_on_the_first_revealed_frame() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let now = Instant::now();
+        motion.message_arrived("reply");
+        let revealed = later(now, 500);
+        assert!(!motion.tick(revealed));
+        assert_eq!(
+            motion.arrival_alphas(revealed, true)["reply"],
+            motion::ARRIVE_FROM
+        );
+        motion.reveal_arriving_messages(revealed);
+        assert_eq!(
+            motion.arrival_alphas(revealed, true)["reply"],
+            motion::ARRIVE_FROM
+        );
+        let halfway = later(revealed, 60);
+        assert!(motion.tick(halfway));
+        assert!(
+            (motion::ARRIVE_FROM..1.0).contains(&motion.arrival_alphas(halfway, true)["reply"])
+        );
+        assert!(!motion.tick(later(revealed, 120)));
+    }
+
+    #[test]
+    fn a_notice_that_comes_late_waits_for_the_last_one_to_leave() {
+        let mut motion = InboxMotion::new(Motion::new(true));
+        let mut session = session();
+        let now = Instant::now();
+        session.show_toast("Undone", false);
+        motion.observe(&session, (true, true), now);
+        motion.settle(now);
+        let key = later(now, 300);
+        session.clear_toast();
+        motion.observe(&session, (true, true), key);
+
+        let shown = later(key, 50);
+        let before = motion.status(&session, shown).leaving.unwrap().1;
+        session.show_toast("Archived · u", false);
+        motion.observe(&session, (true, true), shown);
+        let start = motion.status(&session, shown);
+        assert_eq!(start.leaving.unwrap().1, before);
+        assert_eq!(start.notice.unwrap().1, 0.0);
+        let incoming = motion.status(&session, later(shown, 100));
+        assert_eq!(incoming.leaving.unwrap().1, 0.0);
+        assert!((0.0..1.0).contains(&incoming.notice.unwrap().1));
+        assert_eq!(
+            notice_opacity(&motion, &session, later(shown, 140)),
+            Some(1.0)
+        );
     }
 
     #[test]

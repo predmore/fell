@@ -19,7 +19,7 @@ Decided with Jon on 2026-11-16. This is the bar the UX judges score against (eve
 ## Quiet: no noise
 - Do not print key hints for obvious actions (`Esc` to close, `Enter` to open, `j`/`k`, `q` to quit). An empty state says what is true ("No mail matches"), not how to leave it.
 - Show a key only where it is the answer to a question the user has right now and they could not guess it: a fix for an error, a pending agent suggestion, a destructive confirm. Discovery lives in which-key and the `:` palette.
-- One message at a time in the status bar; notices fade out on their own.
+- One message at a time in the status bar. A replacement notice starts fading in after the old notice fades out. Notices also fade out on their own.
 
 ## Layout: two panes
 - Left: the thread list for the current folder (or search results).

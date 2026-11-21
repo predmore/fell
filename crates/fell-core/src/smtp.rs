@@ -207,7 +207,7 @@ fn uncertain(message: String) -> Error {
     ))
 }
 
-fn sender(mime: &[u8]) -> Result<String> {
+pub(crate) fn sender(mime: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(header_block(mime))
         .map_err(|_| smtp_err("smtp: message headers are not UTF-8"))?;
     let mut from = None;

@@ -28,23 +28,53 @@ impl Store {
         mime: &[u8],
         append: bool,
     ) -> Result<(ThreadId, Message)> {
-        self.conn.pragma_update(None, "synchronous", "FULL")?;
-        let tx = immediate_transaction(&self.conn)?;
-        let roles = self.folder_roles(account)?;
-        let folder = roles.name(FolderRole::Sent);
-        let mut message = crate::imap::rfc822::local_sent_message(account, folder, mime);
+        let mut message =
+            crate::imap::rfc822::local_sent_message(account, FolderRole::Sent.default_name(), mime);
         if &message.headers.message_id != id || !message.bcc.is_empty() {
             return Err(Error::Action("unexpected headers in sent MIME".into()));
         }
+        if append {
+            // Apply the SMTP check to the raw headers too. A Bcc field
+            // with no parseable addresses still cannot go into the outbox.
+            crate::smtp::sender(mime)?;
+        }
+        match self.insert_sent_message(draft_id, bcc, &mut message, append.then_some(mime)) {
+            Ok(thread) => Ok((thread, message)),
+            Err(local) => {
+                if append && let Err(queue) = self.queue_sent_after_failed_insert(account, id, mime)
+                {
+                    return Err(Error::Action(format!(
+                        "{local}. Could not queue Sent copy: {queue}"
+                    )));
+                }
+                Err(local)
+            }
+        }
+    }
+
+    fn insert_sent_message(
+        &self,
+        draft_id: &str,
+        bcc: &[Address],
+        message: &mut Message,
+        append: Option<&[u8]>,
+    ) -> Result<ThreadId> {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = immediate_transaction(&self.conn)?;
+        let account = &message.account_id;
+        let id = &message.headers.message_id;
+        let roles = self.folder_roles(account)?;
+        let folder = roles.name(FolderRole::Sent);
+        message.folders = vec![folder.to_string()];
         if !has_copy(&tx, account, id, folder)? {
-            insert_arrival(&tx, &message, &mut MergeRoles::new(Some(&roles)))?;
+            insert_arrival(&tx, message, &mut MergeRoles::new(Some(&roles)))?;
             let canonical = canonical_id_on(&tx, account, id)?
                 .ok_or_else(|| Error::Action("sent message missing after insert".into()))?;
             tx.execute(
                 "INSERT OR IGNORE INTO local_sent (account_id, message_id, folder) VALUES (?1, ?2, ?3)",
                 params![account.as_str(), canonical, folder],
             )?;
-            if append {
+            if let Some(mime) = append {
                 crate::outbox::queue_append(&tx, account, id, folder, mime)?;
             }
         }
@@ -60,7 +90,23 @@ impl Store {
         tx.commit()?;
         // Only the person's conversation gets the envelope's Bcc.
         message.bcc = bcc.to_vec();
-        Ok((thread, message))
+        Ok(thread)
+    }
+
+    fn queue_sent_after_failed_insert(
+        &self,
+        account: &AccountId,
+        id: &MessageId,
+        mime: &[u8],
+    ) -> Result<()> {
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = immediate_transaction(&self.conn)?;
+        let roles = self.folder_roles(account)?;
+        let folder = roles.name(FolderRole::Sent);
+        if !has_copy(&tx, account, id, folder)? {
+            crate::outbox::queue_append(&tx, account, id, folder, mime)?;
+        }
+        tx.commit()
     }
 }
 

@@ -133,23 +133,30 @@ impl WriteSession {
         self.session.list_selectable()
     }
 
-    /// APPEND the exact SMTP MIME as a synchronizing IMAP literal.
+    /// APPEND the exact SMTP MIME to a quoted mailbox as a synchronizing literal.
     pub(in crate::imap) fn append_seen(
         &mut self,
-        mailbox: &str,
+        quoted_mailbox: &str,
         mime: &[u8],
     ) -> Result<(), WriteError> {
-        let name = quote_imap(mailbox).map_err(|err| WriteError::Refused(err.to_string()))?;
         let session = &mut self.session;
         session.tag += 1;
         let tag = format!("a{}", session.tag);
         session
-            .write_all(format!("{tag} APPEND {name} (\\Seen) {{{}}}\r\n", mime.len()).as_bytes())
+            .write_all(
+                format!(
+                    "{tag} APPEND {quoted_mailbox} (\\Seen) {{{}}}\r\n",
+                    mime.len()
+                )
+                .as_bytes(),
+            )
             .map_err(WriteError::Connection)?;
         for _ in 0..super::untagged_limit() {
             let (line, _) = session.read_logical().map_err(WriteError::Connection)?;
             if line.starts_with('+') {
                 session.write_all(mime).map_err(WriteError::Connection)?;
+                // RFC 3501 §9 and RFC 9051 §9: the literal's octet count
+                // excludes the CRLF that terminates the APPEND command.
                 session.write_all(b"\r\n").map_err(WriteError::Connection)?;
                 return write_reply("APPEND", session.read_reply(&tag, "APPEND")).map(|_| ());
             }
@@ -175,6 +182,13 @@ impl WriteSession {
 
     /// `SELECT` the mailbox read-write and return its UIDVALIDITY.
     pub(in crate::imap) fn select(&mut self, mailbox: &str) -> Result<u32, WriteError> {
+        self.select_with_next(mailbox).map(|(validity, _)| validity)
+    }
+
+    pub(in crate::imap) fn select_with_next(
+        &mut self,
+        mailbox: &str,
+    ) -> Result<(u32, Option<u32>), WriteError> {
         let name = quote_imap(mailbox).map_err(|err| WriteError::Refused(err.to_string()))?;
         let modifier = if self.session.condstore {
             " (CONDSTORE)"
@@ -187,11 +201,18 @@ impl WriteSession {
                 .untagged
                 .iter()
                 .any(|line| has_code(&line.text, "NOMODSEQ"));
-        reply
+        let validity = reply
             .untagged
             .iter()
             .find_map(|line| bracket_u32(&line.text, "UIDVALIDITY"))
-            .ok_or_else(|| WriteError::Refused(format!("SELECT {mailbox} returned no UIDVALIDITY")))
+            .ok_or_else(|| {
+                WriteError::Refused(format!("SELECT {mailbox} returned no UIDVALIDITY"))
+            })?;
+        let next = reply
+            .untagged
+            .iter()
+            .find_map(|line| bracket_u32(&line.text, "UIDNEXT"));
+        Ok((validity, next))
     }
 
     pub(in crate::imap) fn conditional(&self) -> bool {

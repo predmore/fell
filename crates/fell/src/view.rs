@@ -36,6 +36,7 @@ use fell_core::actions::LabelUndoTarget;
 use fell_core::compose::{DraftSummary, ReplyKind};
 
 use crate::attachments::{self, Download, Fetcher, Request as AttachmentRequest};
+use crate::compose_ui::ComposeView;
 use crate::draft_host::DraftHome;
 use crate::frame_log::{FrameLog, SharedFrameLog};
 use crate::inbox_motion::{Disclosures, InboxMotion, PaneEntry, StatusMotion};
@@ -112,6 +113,14 @@ pub fn run(trace_start: Option<Instant>) {
                     trace.window_created(window);
                 }
                 let view = cx.new(|cx| Inbox::new(window, cx));
+                view.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |_, window, cx| {
+                        if window.is_window_active() {
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                });
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus);
                 view
@@ -120,14 +129,18 @@ pub fn run(trace_start: Option<Instant>) {
         match view {
             Ok(view) => {
                 cx.set_global(InboxWindow(view));
-                if let Some(trace) = trace {
-                    cx.on_window_closed(move |cx| {
-                        if !cx.windows().contains(&view.into()) {
-                            trace.finish();
-                        }
-                    })
-                    .detach();
-                }
+                cx.on_window_closed(move |cx| {
+                    if cx.windows().contains(&view.into()) {
+                        let _ = view.update(cx, |inbox, _, cx| {
+                            if inbox.motion.has_pending_messages() {
+                                cx.notify();
+                            }
+                        });
+                    } else if let Some(trace) = &trace {
+                        trace.finish();
+                    }
+                })
+                .detach();
             }
             Err(_) => fell_core::diagnostic!(ERROR, "Could not open inbox window"),
         }
@@ -173,18 +186,12 @@ pub(crate) fn present_sent_copy(
         .flatten()
 }
 
-pub(crate) fn finish_sent_copy(cx: &mut App, saved: bool) {
+pub(crate) fn wake_sent_copy_sync(cx: &mut App) {
     if let Some(inbox) = cx.try_global::<InboxWindow>().map(|inbox| inbox.0) {
-        let _ = inbox.update(cx, |inbox, _, cx| {
-            if saved {
-                if let Some(sync) = &inbox.sync {
-                    sync.write_back_now();
-                }
-            } else {
-                inbox
-                    .session
-                    .show_toast("Sent · local copy could not be saved", true);
-                cx.notify();
+        let _ = inbox.update(cx, |inbox, _, _| {
+            // A failed local insert can still have queued the server copy.
+            if let Some(sync) = &inbox.sync {
+                sync.write_back_now();
             }
         });
     }
@@ -1017,9 +1024,11 @@ impl Inbox {
                                     .any(|write| write.kind == OutboxKind::AppendSent);
                                 dropped.retain(|write| write.kind != OutboxKind::AppendSent);
                                 let mut lines = Vec::new();
-                                if sent_append_delayed {
-                                    lines.push("Sent · retrying server copy".to_string());
-                                } else if sent_failed {
+                                let local_save_failed =
+                                    inbox.session.status_notice().is_some_and(|notice| {
+                                        notice.text == fell_core::compose::LOCAL_SENT_COPY_FAILED
+                                    });
+                                if sent_failed {
                                     lines.push("Sent · server copy unconfirmed".to_string());
                                 }
                                 if !dropped.is_empty() || flag_recovery_delayed {
@@ -1029,8 +1038,15 @@ impl Inbox {
                                         flag_recovery_delayed,
                                     ));
                                 }
-                                let text = lines.join(" · ");
-                                inbox.session.show_toast(text, true);
+                                if !lines.is_empty() {
+                                    inbox.session.show_toast(lines.join(" · "), true);
+                                } else if sent_append_delayed && !local_save_failed {
+                                    inbox
+                                        .session
+                                        .show_toast("Sent · retrying server copy", false);
+                                } else {
+                                    return;
+                                }
                                 cx.notify();
                                 return;
                             }
@@ -2479,8 +2495,7 @@ impl Inbox {
             None
         };
         self.invalidate_conversation_layout();
-        let now = self.motion.clock.now();
-        self.motion.message_arrived(&shown.id, now);
+        self.motion.message_arrived(&shown.id);
         let messages = &mut self.session.messages;
         let at = messages.partition_point(|old| old.date_unix <= shown.date_unix);
         messages.insert(at, shown);
@@ -4252,6 +4267,18 @@ impl Render for Inbox {
             });
         self.want_bodies(cx);
         self.motion.narrow_status = width < present::NARROW_WIDTH;
+        // Closing compose reveals the inbox even without keyboard
+        // activation, as on a Wayland seat with no keyboard attached.
+        if panes.1
+            && self.motion.has_pending_messages()
+            && (window.is_window_active()
+                || !cx
+                    .windows()
+                    .iter()
+                    .any(|handle| handle.downcast::<ComposeView>().is_some()))
+        {
+            self.motion.reveal_arriving_messages(now);
+        }
         self.motion.observe(&self.session, panes, now);
         let reflow = self.motion.reading_reflow(now);
         let list_width = list_width(width, self.split);

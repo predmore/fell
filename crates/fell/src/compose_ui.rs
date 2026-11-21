@@ -1029,44 +1029,45 @@ impl ComposeView {
                     attempts.finish(&sent_id, attempt, outcome.as_ref().err().cloned())
                 })
                 .unwrap_or(false);
-            if !current {
-                if let Some(saved) = copy_saved {
-                    let _ = cx.update(|cx| crate::view::finish_sent_copy(cx, saved));
+            if current {
+                let shown = this.update(cx, |this, cx| {
+                    if this.sending.as_deref() == Some(sent_id.as_str()) {
+                        this.sending = None;
+                    }
+                    let end = finish_send(
+                        &this.hub,
+                        &sent_id,
+                        this.draft_id.as_ref(),
+                        this.close_on_send,
+                        &outcome,
+                    );
+                    if let Some(status) = end.status {
+                        this.sent = end.sent;
+                        if !end.close {
+                            this.status = match &outcome {
+                                Err(SendFailure::Locked(_)) | Ok(_) => status.into(),
+                                Err(_) => "".into(),
+                            };
+                        }
+                    }
+                    if end.close {
+                        this.closing = true;
+                    }
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    // The window closed while the send ran.
+                    hub.report_send(
+                        &sent_id,
+                        send_failure_line(&hub, &sent_id, &outcome).as_deref(),
+                    );
                 }
-                return;
-            }
-            let shown = this.update(cx, |this, cx| {
-                if this.sending.as_deref() == Some(sent_id.as_str()) {
-                    this.sending = None;
-                }
-                let end = finish_send(
-                    &this.hub,
-                    &sent_id,
-                    this.draft_id.as_ref(),
-                    this.close_on_send,
-                    &outcome,
-                );
-                if let Some(status) = end.status {
-                    this.sent = end.sent;
-                    this.status = match &outcome {
-                        Err(SendFailure::Locked(_)) | Ok(_) => status.into(),
-                        Err(_) => "".into(),
-                    };
-                }
-                if end.close {
-                    this.closing = true;
-                }
-                cx.notify();
-            });
-            if shown.is_err() {
-                // The window closed while the send ran.
-                hub.report_send(
-                    &sent_id,
-                    send_failure_line(&hub, &sent_id, &outcome).as_deref(),
-                );
             }
             if let Some(saved) = copy_saved {
-                let _ = cx.update(|cx| crate::view::finish_sent_copy(cx, saved));
+                if !saved {
+                    hub.report_sent_copy_failure(&sent_id);
+                }
+                let _ = cx.update(crate::view::wake_sent_copy_sync);
             }
         })
         .detach();
@@ -1776,7 +1777,7 @@ impl Render for ComposeView {
             }
         }
         window.focus(&self.focus);
-        let (mut snap, lock, reply_check) = self
+        let (mut snap, mut lock, reply_check) = self
             .hub
             .with_session(self.draft_id.as_ref(), |session| {
                 let snap = session.snapshot();
@@ -1797,6 +1798,15 @@ impl Render for ComposeView {
                 (snap, session.send_lock(), check)
             })
             .unwrap_or_else(|| (empty_snapshot(self.draft_id.as_ref()), None, None));
+        // The inbox gets a chance to lay out the reply before we close.
+        // Keep the in-flight footer until it takes over.
+        if self.close_on_send
+            && (self.closing || self.sending.as_deref() == Some(self.draft_id.as_ref()))
+            && lock == Some(SendLock::Sent)
+        {
+            lock = Some(SendLock::InFlight);
+            snap.send_block = Some(SendLock::InFlight.reason().into());
+        }
         if self.send_feedback.readiness.is_some() && lock.is_none() {
             snap.send_block = Some(SEND_UNAVAILABLE.into());
         }

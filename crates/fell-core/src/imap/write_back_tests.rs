@@ -2782,10 +2782,23 @@ fn sent_reply_is_inline_before_sync_and_dedups_with_bcc_after_sync() {
 fn sent_append_recovers_a_lost_reply_without_a_second_append() {
     let fixture = sent_fixture();
     record_reply(&fixture, true);
-    fixture.server.writes.lock().unwrap().lose_reply_to = Some("APPEND");
+    {
+        let mut writes = fixture.server.writes.lock().unwrap();
+        writes.lose_reply_to = Some("APPEND");
+        // The first two HEADER searches succeed but omit the stored copy.
+        writes.empty_header_searches = 2;
+    }
     let report = fixture.replay();
     assert!(report.sent_append_delayed);
     assert_eq!(report.waiting, 1);
+    for _ in 0..2 {
+        fixture.make_due();
+        let report = fixture.replay();
+        assert_eq!(report.sent, 0);
+        assert_eq!(report.waiting, 1);
+        assert!(!report.sent_append_delayed);
+        assert_eq!(fixture.on_server("Filed mail").len(), 1);
+    }
     fixture.make_due();
     let report = fixture.replay();
     assert_eq!(report.sent, 1);
@@ -2802,6 +2815,148 @@ fn sent_append_recovers_a_lost_reply_without_a_second_append() {
             .filter(|command| command.contains(" APPEND "))
             .count(),
         1
+    );
+}
+
+#[test]
+fn append_connection_failures_do_not_use_the_refusal_budget() {
+    let fixture = sent_fixture();
+    record_reply(&fixture, true);
+    fixture.server.writes.lock().unwrap().close_on_login = true;
+    for attempt in 0..=super::write_back::MAX_ATTEMPTS {
+        fixture.make_due();
+        let report = fixture.replay();
+        assert!(report.interrupted.is_some());
+        assert_eq!(report.sent_append_delayed, attempt == 0);
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.waiting, 1);
+        let row = &fixture.store.outbox(&fixture.account.id).unwrap()[0];
+        assert_eq!(row.state, OutboxState::Pending);
+        assert_eq!(row.attempts, 0);
+        assert!(!row.sent);
+        assert!(row.retry_unix > crate::outbox::now_unix());
+    }
+    {
+        let mut writes = fixture.server.writes.lock().unwrap();
+        writes.close_on_login = false;
+        writes.lose_reply_to = Some("APPEND");
+    }
+    fixture.make_due();
+    assert!(fixture.replay().interrupted.is_some());
+    for _ in 0..=super::write_back::MAX_ATTEMPTS {
+        fixture.server.writes.lock().unwrap().lose_reply_to = Some("SEARCH");
+        fixture.make_due();
+        let report = fixture.replay();
+        assert!(report.interrupted.is_some());
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.waiting, 1);
+        let row = &fixture.store.outbox(&fixture.account.id).unwrap()[0];
+        assert_eq!(row.attempts, 0);
+        assert!(row.sent);
+    }
+    fixture.make_due();
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn sent_append_is_reissued_after_two_empty_searches_with_no_new_uid() {
+    let fixture = sent_fixture();
+    record_reply(&fixture, true);
+    fixture
+        .server
+        .writes
+        .lock()
+        .unwrap()
+        .lose_append_before_commit = true;
+    assert!(fixture.replay().interrupted.is_some());
+    fixture.make_due();
+    let report = fixture.replay();
+    assert_eq!(report.sent, 0);
+    assert_eq!(report.waiting, 1);
+    assert!(fixture.on_server("Filed mail").is_empty());
+    fixture.make_due();
+    assert_eq!(fixture.replay().sent, 1);
+    assert_eq!(fixture.on_server("Filed mail").len(), 1);
+}
+
+#[test]
+fn sent_copy_is_appended_after_smtp_even_if_sqlite_refuses_the_local_insert() {
+    let fixture = sent_fixture();
+    let account = &fixture.account.id;
+    let id = crate::MessageId::new("reply@compose.fell");
+    fixture
+        .store
+        .claim_compose_send(account, "fixture-reply", Some(id.as_str()))
+        .unwrap();
+    crate::smtp::tests::confirm_fixture_delivery(&fixture.backend.config, account, REPLY_MIME)
+        .unwrap();
+    fixture
+        .store
+        .connection()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_local_reply BEFORE INSERT ON messages
+             WHEN NEW.message_id = 'reply@compose.fell' AND NEW.remote_id = ''
+             BEGIN SELECT RAISE(ABORT, 'local insert failed'); END;",
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .record_sent_message(account, "fixture-reply", &id, &[], REPLY_MIME, true)
+            .unwrap_err()
+            .to_string()
+            .contains("local insert failed")
+    );
+    let thread = fixture.thread("INBOX", "Alpha");
+    assert_eq!(
+        fixture
+            .store
+            .thread_messages(account, &thread)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fixture.replay().sent, 1);
+    {
+        let state = fixture.server.state.lock().unwrap();
+        assert_eq!(state.mailboxes[1].messages[0].raw, REPLY_MIME);
+    }
+    fixture.sync();
+    assert!(fixture.copy_recorded("Filed mail", 1));
+    assert_eq!(
+        fixture
+            .store
+            .thread_messages(account, &thread)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn sent_mime_with_bcc_is_not_queued_on_local_save_failure() {
+    let fixture = sent_fixture();
+    let mime = [b"Bcc:\r\n".as_slice(), REPLY_MIME].concat();
+    assert!(
+        fixture
+            .store
+            .record_sent_message(
+                &fixture.account.id,
+                "fixture-reply",
+                &crate::MessageId::new("reply@compose.fell"),
+                &[],
+                &mime,
+                true,
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .outbox(&fixture.account.id)
+            .unwrap()
+            .is_empty()
     );
 }
 
