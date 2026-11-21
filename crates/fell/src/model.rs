@@ -283,6 +283,8 @@ pub struct Step {
     pub scroll_pages: i32,
     /// Conversation lines. Positive moves down.
     pub scroll_lines: i32,
+    /// Go to the selected message's header even if its index is unchanged.
+    pub jump_to_message: bool,
     /// The reader expanded or folded a message, its quotes, or recipients.
     pub message_disclosure_changed: bool,
     /// The view moves the thread to [`Session::pending_move`].
@@ -1900,8 +1902,14 @@ impl Session {
                 let count = self.take_count();
                 step.reload_messages = self.move_cursor(Motion::Backward(count));
             }
-            Action::First => step.reload_messages = self.jump_first(),
-            Action::Last => step.reload_messages = self.jump_last(),
+            Action::First | Action::Last => {
+                step.reload_messages = if action == Action::First {
+                    self.jump_first()
+                } else {
+                    self.jump_last()
+                };
+                step.jump_to_message = self.pane == Pane::Conversation && !self.messages.is_empty();
+            }
             Action::Open => {
                 self.count.clear();
                 if self.cursor_draft().is_some() {
@@ -3581,6 +3589,24 @@ mod tests {
         assert!(session.refresh_messages(vec![reread_first, reread_second, newcomer], true));
         assert!(session.messages.iter().all(|message| message.expanded));
         assert_eq!(session.message_cursor, 2);
+    }
+
+    #[test]
+    fn first_and_last_message_commands_reveal_an_already_selected_header() {
+        let mut session = session();
+        session.set_messages(vec![empty_message(true), empty_message(true)]);
+        session.pane = Pane::Conversation;
+        assert_eq!(session.message_cursor, 1);
+        let last = session.on_key(KeyId::Char('G'), 10);
+        assert!(last.jump_to_message);
+        assert_eq!(session.message_cursor, 1);
+
+        for _ in 0..2 {
+            assert!(!session.on_key(KeyId::Char('g'), 10).jump_to_message);
+            assert!(session.on_key(KeyId::Char('g'), 10).jump_to_message);
+            assert_eq!(session.message_cursor, 0);
+        }
+        assert!(!session.on_key(KeyId::Char('k'), 10).jump_to_message);
     }
 
     #[test]

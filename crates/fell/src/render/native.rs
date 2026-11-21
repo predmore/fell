@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use gpui::{
 };
 use image::Frame;
 use smallvec::SmallVec;
+use unicode_linebreak::{BreakOpportunity, linebreaks};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::theme::{Palette, ink, paint};
 
@@ -993,7 +995,7 @@ fn push_cell_lines(blocks: &[Block], out: &mut Vec<String>) {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Mark {
     strong: bool,
     emphasis: bool,
@@ -1027,14 +1029,7 @@ fn render_inlines(
     let mut out = Vec::new();
     let mut text = String::new();
     let mut ranges: Vec<(Range<usize>, Mark)> = Vec::new();
-    let plain = Mark {
-        strong: false,
-        emphasis: false,
-        strike: false,
-        code: false,
-        mono: false,
-        link: false,
-    };
+    let plain = Mark::default();
     let mut at = 0;
     while at < inlines.len() {
         // Blocked images side by side in a sentence are one line too.
@@ -1175,20 +1170,15 @@ fn flush_text(
         .drain(..)
         .map(|(range, mark)| (range.len(), mark))
         .collect();
-    // Each paragraph wraps itself, a line at a time (see [`MailText`]).
-    let element = MailText {
-        rtl: is_right_to_left(text),
-        keep: code_ranges(&runs),
-        text: SharedString::from(text.clone()),
-        runs,
-        palette: *palette,
-        lines: Rc::default(),
-        line_height: px(0.),
-        font_size: px(0.),
-        text_runs: Vec::new(),
-    };
+    let element = MailText::new(SharedString::from(std::mem::take(text)), runs, *palette);
     out.push(div().w_full().child(element).into_any_element());
-    text.clear();
+}
+
+pub(crate) fn plain_text(text: String, palette: Palette) -> impl IntoElement {
+    let runs = vec![(text.len(), Mark::default())];
+    div()
+        .w_full()
+        .child(MailText::new(text.into(), runs, palette))
 }
 
 /// One line of text shaped with its runs. `shape_text`, not `shape_line`:
@@ -1281,84 +1271,261 @@ fn slice_runs(runs: &[gpui::TextRun], range: &Range<usize>) -> Vec<gpui::TextRun
     out
 }
 
-/// Byte ranges of each line of `text` broken at spaces to fit `width`,
+/// Byte ranges of each line of `text` broken to fit `width`,
 /// from `measure` of a range's width. Hard line breaks are kept.
 #[cfg(test)]
 pub(crate) fn wrap_words(
     text: &str,
     width: Option<f32>,
-    measure: impl FnMut(Range<usize>) -> f32,
+    mut measure: impl FnMut(Range<usize>) -> f32,
 ) -> Vec<Range<usize>> {
-    wrap_mail(text, width, &[], measure)
+    wrap_mail(text, width, &[], |range, _| measure(range))
+        .into_iter()
+        .map(|line| line.range)
+        .collect()
 }
 
-/// Byte ranges of each line of `text`, broken at spaces to fit `width`,
-/// from `measure` of a range's width. Hard line breaks are kept. A `keep`
-/// range (inline code) is not broken at its spaces unless it is wider than
-/// the line. A word wider than the line breaks between letters, as late as
-/// fits.
-pub(crate) fn wrap_mail(
+const SOFT_HYPHEN: char = '\u{ad}';
+
+struct MailLine {
+    range: Range<usize>,
+    hyphen: bool,
+}
+
+/// Fit lines at Unicode line-break opportunities using the measured width.
+/// Inline code stays together when it fits. An unbreakable span wider than
+/// the entire line falls back to grapheme boundaries.
+fn wrap_mail(
     text: &str,
     width: Option<f32>,
     keep: &[Range<usize>],
-    mut measure: impl FnMut(Range<usize>) -> f32,
-) -> Vec<Range<usize>> {
+    mut measure: impl FnMut(Range<usize>, bool) -> f32,
+) -> Vec<MailLine> {
     let mut lines = Vec::new();
     let mut offset = 0;
     for hard in text.split('\n') {
         let base = offset;
         offset += hard.len() + 1;
-        let Some(width) = width else {
-            lines.push(base..base + hard.len());
+        let Some(width) = width.filter(|_| !hard.is_empty()) else {
+            lines.push(MailLine {
+                range: base..base + hard.len(),
+                hyphen: false,
+            });
             continue;
         };
         let end = base + hard.len();
-        // Spaces inside code that fits on a line are not breaks.
+        // Suppress soft breaks strictly inside code that fits on a line.
         let held: Vec<&Range<usize>> = keep
             .iter()
             .filter(|range| range.start < end && range.end > base)
-            .filter(|range| measure((*range).clone()) <= width)
+            .filter(|range| measure((*range).clone(), false) <= width)
             .collect();
-        let breaks: Vec<usize> = hard
-            .match_indices(' ')
-            .map(|(at, _)| base + at)
-            .filter(|at| !held.iter().any(|range| range.contains(at)))
-            .collect();
+        let mut breaks: Vec<_> = linebreaks(hard).collect();
+        // Treat an inline code span after a space as an indivisible item.
+        // Its leading punctuation (for example, "/" in a path) would
+        // otherwise suppress the break before the span.
+        for range in &held {
+            if let Some(before) = hard.get(..range.start.saturating_sub(base))
+                && before.ends_with([' ', '\t'])
+            {
+                let at = range.start - base;
+                if let Err(index) = breaks.binary_search_by_key(&at, |&(next, _)| next) {
+                    breaks.insert(index, (at, BreakOpportunity::Allowed));
+                }
+            }
+        }
         let mut line_start = base;
         let mut line_end = base;
-        let mut word_start = base;
-        for word_end in breaks.iter().copied().chain(std::iter::once(end)) {
-            if line_end > line_start && measure(line_start..word_end) > width {
-                lines.push(line_start..line_end);
-                line_start = word_start;
+        let mut next_start = base;
+        let mut line_hyphen = false;
+        for (after, opportunity) in breaks {
+            let mandatory = opportunity == BreakOpportunity::Mandatory;
+            let next = base + after;
+            if !mandatory
+                && held
+                    .iter()
+                    .any(|range| range.start < next && next < range.end)
+            {
+                continue;
             }
-            // A word wider than the line on its own.
-            while line_start < word_end && measure(line_start..word_end) > width {
-                let mut cut = line_start;
-                for (at, ch) in text[line_start..word_end].char_indices() {
-                    let next = line_start + at + ch.len_utf8();
-                    if cut > line_start && measure(line_start..next) > width {
+            let content = &hard[..after];
+            let content = if mandatory {
+                content.trim_end_matches([
+                    '\r', '\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}',
+                ])
+            } else {
+                content
+            };
+            let word_end = (base + content.trim_end_matches([' ', '\t']).len()).max(line_start);
+            let hyphen = !mandatory && word_end == next && content.ends_with(SOFT_HYPHEN);
+            let mut overflows = measure(line_start..word_end, false) > width;
+            if overflows && line_end > line_start {
+                lines.push(MailLine {
+                    range: line_start..line_end,
+                    hyphen: line_hyphen,
+                });
+                line_start = next_start;
+                overflows = measure(line_start..word_end, false) > width;
+            }
+            if overflows {
+                while line_start < word_end {
+                    let mut cut = line_start;
+                    let mut cut_hyphen = false;
+                    for (at, grapheme) in text[line_start..word_end].grapheme_indices(true) {
+                        let next = line_start + at + grapheme.len();
+                        if cut > line_start && measure(line_start..next, false) > width {
+                            break;
+                        }
+                        let hyphen_here = next < word_end && grapheme.ends_with(SOFT_HYPHEN);
+                        if hyphen_here
+                            && cut > line_start
+                            && measure(line_start..next, true) > width
+                        {
+                            continue;
+                        }
+                        cut = next;
+                        cut_hyphen = hyphen_here && cut > line_start + grapheme.len();
+                    }
+                    if cut >= word_end {
                         break;
                     }
-                    cut = next;
+                    lines.push(MailLine {
+                        range: line_start..cut,
+                        hyphen: cut_hyphen,
+                    });
+                    line_start = cut;
                 }
-                if cut >= word_end {
-                    break;
-                }
-                lines.push(line_start..cut);
-                line_start = cut;
             }
-            line_end = word_end;
-            word_start = word_end + 1;
+            if mandatory {
+                lines.push(MailLine {
+                    range: line_start..word_end,
+                    hyphen: false,
+                });
+                line_start = next;
+                line_end = next;
+            } else if !hyphen || measure(line_start..word_end, true) <= width {
+                line_end = word_end;
+                next_start = next;
+                line_hyphen = hyphen;
+            }
         }
-        lines.push(line_start..line_end);
     }
     lines
 }
 
+/// Remove discretionary hyphens from the shaper's input, keeping a visible
+/// hyphen and its style only where a line actually breaks at one.
+fn visible_mail_line<'a>(
+    text: &'a str,
+    range: &Range<usize>,
+    hyphen: bool,
+) -> std::borrow::Cow<'a, str> {
+    let text = &text[range.clone()];
+    if !text.contains(SOFT_HYPHEN) {
+        return text.into();
+    }
+    let mut visible = text.replace(SOFT_HYPHEN, "");
+    if hyphen {
+        visible.push('-');
+    }
+    visible.into()
+}
+
+fn shape_mail_line(
+    window: &mut Window,
+    text: &str,
+    font_size: Pixels,
+    runs: &[gpui::TextRun],
+    range: &Range<usize>,
+    hyphen: bool,
+) -> gpui::WrappedLine {
+    let visible = visible_mail_line(text, range, hyphen);
+    let mut runs = slice_runs(runs, range);
+    if matches!(visible, std::borrow::Cow::Owned(_)) {
+        let mut remaining = &text[range.clone()];
+        let count = runs.len();
+        for (index, run) in runs.iter_mut().enumerate() {
+            let (part, rest) = remaining.split_at(run.len);
+            run.len -= part.matches(SOFT_HYPHEN).count() * SOFT_HYPHEN.len_utf8();
+            if hyphen && index + 1 == count {
+                run.len += 1;
+            }
+            remaining = rest;
+        }
+        runs.retain(|run| run.len > 0);
+    }
+    shape_one(window, &visible, font_size, &runs)
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct WrapKey {
+    text: SharedString,
+    fonts: Vec<(usize, gpui::Font)>,
+    keep: Vec<Range<usize>>,
+    size: Pixels,
+    width: Option<Pixels>,
+}
+
+#[derive(Default)]
+struct WrappedMail {
+    lines: Vec<MailLine>,
+    width: Pixels,
+}
+
+/// MailText elements are rebuilt by their parent on animation frames. Keep
+/// their line breaks across frames, with a bounded cache shared by the window
+/// layouts. Color and decorations do not affect the line breaks.
+#[derive(Default)]
+struct WrapCache {
+    entries: HashMap<Rc<WrapKey>, Rc<WrappedMail>>,
+    order: VecDeque<Rc<WrapKey>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct MailWrapping(RefCell<WrapCache>);
+
+impl gpui::Global for MailWrapping {}
+
+impl WrapCache {
+    fn get_or_wrap(
+        &mut self,
+        key: WrapKey,
+        wrap: impl FnOnce(&WrapKey) -> WrappedMail,
+    ) -> Rc<WrappedMail> {
+        const MAX_ENTRIES: usize = 4096;
+        const MAX_BYTES: usize = 8 * 1024 * 1024;
+        if let Some(wrapped) = self.entries.get(&key) {
+            return wrapped.clone();
+        }
+        let wrapped = Rc::new(wrap(&key));
+        let size = |key: &WrapKey, body: &WrappedMail| {
+            key.text.len()
+                + body.lines.len() * std::mem::size_of::<MailLine>()
+                + key.fonts.len() * std::mem::size_of::<(usize, gpui::Font)>()
+                + key.keep.len() * std::mem::size_of::<Range<usize>>()
+        };
+        let bytes = size(&key, &wrapped);
+        if bytes <= MAX_BYTES {
+            while self.bytes + bytes > MAX_BYTES || self.entries.len() >= MAX_ENTRIES {
+                let oldest = self.order.pop_front().expect("a full cache has entries");
+                let body = self
+                    .entries
+                    .remove(&oldest)
+                    .expect("the queued entry is cached");
+                self.bytes -= size(&oldest, &body);
+            }
+            let key = Rc::new(key);
+            self.order.push_back(key.clone());
+            self.entries.insert(key, wrapped.clone());
+            self.bytes += bytes;
+        }
+        wrapped
+    }
+}
+
 /// Text in the inherited face with runs of bold, italic, links and inline
-/// code, wrapped here rather than by gpui: at spaces only, so inline code
-/// (`/mnt/archive`) never breaks at its slash, and a line at a time, so a
+/// code. Lines wrap here to keep inline code together when it fits and so a
 /// link's underline ends with its last letter on each line instead of
 /// running into the next line's indent. A paragraph written right to left
 /// is set flush right (gpui would wrap it out of place). Inline code needs
@@ -1372,10 +1539,26 @@ struct MailText {
     keep: Vec<Range<usize>>,
     rtl: bool,
     palette: Palette,
-    lines: Rc<RefCell<Vec<Range<usize>>>>,
+    wrapped: Rc<RefCell<Rc<WrappedMail>>>,
     line_height: Pixels,
     font_size: Pixels,
     text_runs: Vec<gpui::TextRun>,
+}
+
+impl MailText {
+    fn new(text: SharedString, runs: Vec<(usize, Mark)>, palette: Palette) -> Self {
+        Self {
+            rtl: is_right_to_left(&text),
+            keep: code_ranges(&runs),
+            text,
+            runs,
+            palette,
+            wrapped: Rc::default(),
+            line_height: px(0.),
+            font_size: px(0.),
+            text_runs: Vec::new(),
+        }
+    }
 }
 
 impl IntoElement for MailText {
@@ -1403,8 +1586,11 @@ impl Element for MailText {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        if !cx.has_global::<MailWrapping>() {
+            cx.set_global(MailWrapping::default());
+        }
         let base = window.text_style();
         let font_size = base.font_size.to_pixels(window.rem_size());
         let line_height = base
@@ -1428,63 +1614,31 @@ impl Element for MailText {
             .collect();
         let text = self.text.clone();
         let runs = self.text_runs.clone();
+        let fonts: Vec<_> = runs.iter().map(|run| (run.len, run.font.clone())).collect();
         let keep = self.keep.clone();
         let rtl = self.rtl;
-        let lines = Rc::clone(&self.lines);
+        let measured = Rc::clone(&self.wrapped);
         let layout = window.request_measured_layout(
             gpui::Style::default(),
-            move |known, available, window, _| {
+            move |known, available, window, cx| {
                 let width = known.width.or(match available.width {
                     gpui::AvailableSpace::Definite(width) => Some(width),
                     _ => None,
                 });
-                let shape = |range: &Range<usize>, window: &mut Window| {
-                    shape_one(
-                        window,
-                        &text[range.clone()],
-                        font_size,
-                        &slice_runs(&runs, range),
-                    )
+                let key = WrapKey {
+                    text: text.clone(),
+                    fonts: fonts.clone(),
+                    keep: keep.clone(),
+                    size: font_size,
+                    width,
                 };
-                // In byte order, a range's width is the distance between
-                // its ends on its whole line, shaped once, with each byte's
-                // x looked up, so a long run of text without spaces wraps
-                // in linear time. When glyphs are reordered, shape each
-                // range instead.
-                let mut hard = Vec::new();
-                if !rtl {
-                    let mut at = 0;
-                    for line in text.split('\n') {
-                        let range = at..at + line.len();
-                        let shaped = shape(&range, window);
-                        let layout = &shaped.unwrapped_layout;
-                        let glyphs = layout
-                            .runs
-                            .iter()
-                            .flat_map(|run| &run.glyphs)
-                            .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
-                        hard.push((at, byte_xs(glyphs, line.len(), f32::from(layout.width))));
-                        at += line.len() + 1;
-                    }
-                }
-                let wrapped = wrap_mail(&text, width.map(f32::from), &keep, |range| {
-                    let line = hard.partition_point(|(start, _)| *start <= range.start);
-                    match line.checked_sub(1).map(|line| &hard[line]) {
-                        Some((start, Some(xs))) if range.end - start < xs.len() => {
-                            xs[range.end - start] - xs[range.start - start]
-                        }
-                        _ => f32::from(shape(&range, window).unwrapped_layout.width),
-                    }
-                });
-                let mut widest = 0f32;
-                for range in &wrapped {
-                    widest = widest.max(f32::from(shape(range, window).unwrapped_layout.width));
-                }
-                let size = gpui::size(
-                    width.unwrap_or(px(widest)),
-                    line_height * wrapped.len() as f32,
-                );
-                *lines.borrow_mut() = wrapped;
+                let wrapped = cx
+                    .global::<MailWrapping>()
+                    .0
+                    .borrow_mut()
+                    .get_or_wrap(key, |key| wrap_shaped_mail(key, &runs, rtl, window));
+                let size = gpui::size(wrapped.width, line_height * wrapped.lines.len() as f32);
+                *measured.borrow_mut() = wrapped;
                 size
             },
         );
@@ -1512,16 +1666,28 @@ impl Element for MailText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let font_size = self.font_size;
-        for (at, range) in self.lines.borrow().iter().enumerate() {
-            if range.is_empty() {
+        let mask = window.content_mask().bounds;
+        let height = f32::from(self.line_height).max(1.0);
+        let first = (f32::from(mask.top() - bounds.top()) / height)
+            .floor()
+            .max(1.0) as usize
+            - 1;
+        let end = (f32::from(mask.bottom() - bounds.top()) / height)
+            .ceil()
+            .max(0.0) as usize
+            + 1;
+        let wrapped = self.wrapped.borrow();
+        for (at, line) in wrapped.lines.iter().enumerate().take(end).skip(first) {
+            if line.range.is_empty() {
                 continue;
             }
-            let shaped = shape_one(
+            let shaped = shape_mail_line(
                 window,
-                &self.text[range.clone()],
-                font_size,
-                &slice_runs(&self.text_runs, range),
+                &self.text,
+                self.font_size,
+                &self.text_runs,
+                &line.range,
+                line.hyphen,
             );
             let x = if self.rtl {
                 bounds.right() - shaped.unwrapped_layout.width
@@ -1534,6 +1700,66 @@ impl Element for MailText {
             let _ = shaped.paint(origin, self.line_height, align, None, window, cx);
         }
     }
+}
+
+fn wrap_shaped_mail(
+    key: &WrapKey,
+    runs: &[gpui::TextRun],
+    rtl: bool,
+    window: &mut Window,
+) -> WrappedMail {
+    let shape = |range: &Range<usize>, hyphen, window: &mut Window| {
+        shape_mail_line(window, &key.text, key.size, runs, range, hyphen)
+    };
+    // In byte order, a range's width is the distance between its ends
+    // on a hard line, shaped once. When glyphs are reordered or soft
+    // hyphens change the byte positions, shape the range instead.
+    let mut hard = Vec::new();
+    if key.width.is_some() && !rtl {
+        let mut at = 0;
+        for line in key.text.split('\n') {
+            let xs = if line.contains(SOFT_HYPHEN) {
+                None
+            } else {
+                let shaped = shape(&(at..at + line.len()), false, window);
+                let layout = &shaped.unwrapped_layout;
+                let glyphs = layout
+                    .runs
+                    .iter()
+                    .flat_map(|run| &run.glyphs)
+                    .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
+                byte_xs(glyphs, line.len(), f32::from(layout.width))
+            };
+            hard.push((at, xs));
+            at += line.len() + 1;
+        }
+    }
+    let lines = wrap_mail(
+        &key.text,
+        key.width.map(f32::from),
+        &key.keep,
+        |range, hyphen| {
+            let line = hard.partition_point(|(start, _)| *start <= range.start);
+            match line.checked_sub(1).map(|line| &hard[line]) {
+                Some((start, Some(xs))) if range.end - start < xs.len() => {
+                    xs[range.end - start] - xs[range.start - start]
+                }
+                _ => f32::from(shape(&range, hyphen, window).unwrapped_layout.width),
+            }
+        },
+    );
+    let width = key.width.unwrap_or_else(|| {
+        lines
+            .iter()
+            .map(|line| {
+                shape(&line.range, line.hyphen, window)
+                    .unwrapped_layout
+                    .width
+            })
+            .max()
+            .unwrap_or(px(0.0))
+    });
+    WrappedMail { lines, width }
 }
 
 fn dimmed_line(line: String, palette: &Palette) -> AnyElement {
@@ -2930,6 +3156,88 @@ mod decode_tests {
     }
 
     #[test]
+    fn typographic_apostrophes_stay_within_words_at_a_line_break() {
+        for text in ["we don’t go", "we don't go", "we can’t go", "we won’t go"] {
+            let lines = wrap_words(text, Some(6.0), |range| text[range].chars().count() as f32);
+            let lines: Vec<_> = lines.iter().map(|range| &text[range.clone()]).collect();
+            assert_eq!(lines, ["we", &text[3..text.len() - 3], "go"]);
+        }
+    }
+
+    #[test]
+    fn unicode_wrap_respects_nonbreaking_spaces_and_mandatory_separators() {
+        let text = "go A\u{a0}B\u{2028}猫犬鳥";
+        let lines = wrap_words(text, Some(4.0), |range| text[range].chars().count() as f32);
+        let lines: Vec<_> = lines.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(lines, ["go", "A\u{a0}B", "猫犬鳥"]);
+        let text = "猫犬鳥";
+        let lines = wrap_words(text, Some(2.0), |range| text[range].chars().count() as f32);
+        let lines: Vec<_> = lines.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(lines, ["猫犬", "鳥"]);
+    }
+
+    #[test]
+    fn wrapping_preserves_blank_lines_between_paragraphs_and_at_the_end() {
+        let text = "First paragraph.\n\nSecond paragraph.\n";
+        let lines = wrap_words(text, Some(20.0), |range| range.len() as f32);
+        let lines: Vec<_> = lines.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(lines, ["First paragraph.", "", "Second paragraph.", ""]);
+    }
+
+    #[test]
+    fn a_soft_hyphen_only_prints_at_a_discretionary_break() {
+        use super::{visible_mail_line, wrap_mail};
+
+        let show = |text: &str, width| {
+            wrap_mail(text, width, &[], |range, hyphen| {
+                visible_mail_line(text, &range, hyphen).chars().count() as f32
+            })
+            .into_iter()
+            .map(|line| visible_mail_line(text, &line.range, line.hyphen).into_owned())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(show("well\u{ad}known", Some(9.0)), ["wellknown"]);
+        assert_eq!(show("well\u{ad}known", Some(5.0)), ["well-", "known"]);
+        assert_eq!(show("well\u{ad}known", Some(4.0)), ["well", "know", "n"]);
+        assert_eq!(show("well\u{ad}\nknown", Some(9.0)), ["well", "known"]);
+        assert_eq!(show("well\u{ad}known", None), ["wellknown"]);
+    }
+
+    #[test]
+    fn a_long_mail_is_wrapped_once_at_a_stable_width() {
+        use super::{WrapCache, WrapKey, WrappedMail, wrap_mail};
+        use std::rc::Rc;
+
+        let mut cache = WrapCache::default();
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(1500);
+        let key = WrapKey {
+            fonts: vec![(text.len(), gpui::font("sans-serif"))],
+            text: text.into(),
+            keep: Vec::new(),
+            size: gpui::px(14.),
+            width: Some(gpui::px(600.)),
+        };
+        let first = cache.get_or_wrap(key.clone(), |key| {
+            let width = key.width.unwrap();
+            let lines = wrap_mail(&key.text, Some(width.into()), &key.keep, |range, _| {
+                range.len() as f32 * 7.0
+            });
+            WrappedMail { lines, width }
+        });
+        assert!(first.lines.len() > 500);
+        for _ in 0..12 {
+            let frame = cache.get_or_wrap(key.clone(), |_| panic!("rewrapped at the same width"));
+            assert!(Rc::ptr_eq(&frame, &first));
+        }
+        let different_width = WrapKey {
+            width: Some(gpui::px(850.)),
+            ..key
+        };
+        let frame = cache.get_or_wrap(different_width, |_| WrappedMail::default());
+        assert!(!Rc::ptr_eq(&frame, &first));
+    }
+
+    #[test]
     fn english_led_mixed_direction_glyphs_need_range_shaping() {
         let text = "Hi אבג now";
         assert!(!super::is_right_to_left(text));
@@ -2949,14 +3257,14 @@ mod decode_tests {
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
     fn inline_code_stays_whole_unless_it_is_wider_than_the_line() {
-        let width = |range: Range<usize>| range.len() as f32;
-        let show = |text: &str, lines: Vec<Range<usize>>| -> Vec<String> {
+        let width = |range: Range<usize>, _| range.len() as f32;
+        let show = |text: &str, lines: Vec<super::MailLine>| -> Vec<String> {
             lines
                 .iter()
-                .map(|range| text[range.clone()].to_string())
+                .map(|line| text[line.range.clone()].to_string())
                 .collect()
         };
-        // Breaks only at spaces: `/mnt/archive` is one word anyway.
+        // Do not take a Unicode break inside inline code.
         let text = "change it to /mnt/archive when";
         let lines = super::wrap_mail(text, Some(16.0), &[13..25], width);
         assert_eq!(show(text, lines), ["change it to", "/mnt/archive", "when"]);
@@ -2967,13 +3275,21 @@ mod decode_tests {
         // Wider than the line: it breaks at its spaces first.
         let lines = super::wrap_mail(text, Some(9.0), &[4..15], width);
         assert_eq!(show(text, lines), ["try", "retries =", "5 on", "staging"]);
-        // A word wider than the line breaks between letters.
+        // Normal text uses Unicode's break opportunity after a slash.
         let text = "see https://a.test/very/long/path ok";
         let lines = super::wrap_mail(text, Some(12.0), &[], width);
         assert_eq!(
             show(text, lines),
-            ["see", "https://a.te", "st/very/long", "/path ok"]
+            ["see https://", "a.test/very/", "long/path ok"]
         );
+    }
+
+    #[test]
+    fn an_overwide_word_breaks_only_between_graphemes() {
+        let text = "e\u{301}e\u{301}e\u{301}";
+        let lines = wrap_words(text, Some(3.0), |range| text[range].chars().count() as f32);
+        let lines: Vec<_> = lines.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(lines, ["e\u{301}"; 3]);
     }
 
     #[test]
