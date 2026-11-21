@@ -15,7 +15,7 @@ mod webview;
 
 pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
 pub use native::{BLOCK_GAP, ImageGallery, blocks_column, document_column, is_right_to_left};
-pub(crate) use native::{BlockColumn, blocks_column_spaced, plain_text};
+pub(crate) use native::{BlockColumn, READING_MEASURE_PX, blocks_column_spaced, plain_text};
 pub use theme::{Palette, ThemeKind};
 
 use std::sync::Arc;

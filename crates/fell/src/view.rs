@@ -43,6 +43,7 @@ use crate::model::{
 };
 use crate::motion::{self, Glide, ListShift, Motion, RowMotion};
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
+use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
@@ -5270,7 +5271,7 @@ struct ReaderColumns {
     prose: ReaderColumn,
     card: ReaderColumn,
     wide: ReaderColumn,
-    active: bool,
+    reading_wide: f32,
     progress: f32,
 }
 
@@ -5292,43 +5293,44 @@ impl ReaderColumns {
         let reading_wide = full
             .min(READING_WIDE_PX)
             .min((window - 2.0 * READING_GUTTER_PX).max(split));
-        // Interpolate both ends of the card and the wide column. A table
-        // gains room as the list leaves and stays inside the window.
-        let centered = |from_width, to_width| {
-            let to_left = (full - to_width) * 0.5;
+        // Layout uses the destination measure from the first frame. The
+        // pane clips content as the insets move and the card resizes.
+        let centered_inset = |to_width: f32| {
+            let to_left = ((full - to_width) * 0.5).round();
             let left = motion::snap(motion::lerp(split_left, to_left, progress), scale);
-            let inset = (left - pane_left).max(0.0);
-            ReaderColumn {
-                width: motion::lerp(from_width, to_width, progress)
-                    .min((available - inset).max(0.)),
-                inset,
-            }
+            (left - pane_left).max(0.0)
         };
-        let card = centered(split, reading_prose);
+        let inset = centered_inset(reading_prose);
+        let card = ReaderColumn {
+            width: motion::lerp(split, reading_prose, progress)
+                .round()
+                .min((available - inset).max(0.0).floor()),
+            inset,
+        };
         let header_width = if reading { reading_prose } else { split };
-        let text_room = (available - card.inset).max(0.0);
-        let header = ReaderColumn {
-            width: header_width.min(text_room),
-            inset: card.inset,
-        };
-        let prose_width = if reading {
-            reading_prose
-        } else {
-            split.min(READING_MEASURE_PX)
-        };
-        // Most windows have 600 px in either layout. Near the split
-        // threshold, keep the line inside the pane while it opens.
-        let prose = ReaderColumn {
-            width: prose_width.min(text_room),
-            inset: card.inset,
-        };
         Self {
-            header,
-            prose,
+            header: ReaderColumn {
+                width: header_width,
+                inset,
+            },
+            prose: ReaderColumn {
+                width: header_width.min(READING_MEASURE_PX),
+                inset,
+            },
             card,
-            wide: centered(split, reading_wide),
-            active: reading || progress > 0.0,
+            wide: ReaderColumn {
+                width: if reading { reading_wide } else { split },
+                inset: centered_inset(reading_wide),
+            },
+            reading_wide,
             progress,
+        }
+    }
+
+    fn date_column(self) -> ReaderColumn {
+        ReaderColumn {
+            width: self.card.width,
+            inset: self.card.inset + MESSAGE_PAD_PX,
         }
     }
 }
@@ -5479,6 +5481,10 @@ fn conversation(
     let hold = frame.anchor.map(|anchor| (anchor, LayoutSlot::default()));
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
+    let on_collapsed = session
+        .messages
+        .get(session.message_cursor)
+        .is_some_and(|message| !message.expanded);
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     let messages: Vec<_> = session
         .messages
@@ -5491,12 +5497,17 @@ fn conversation(
                 0.0
             };
             let block = if message.expanded {
+                let fill = motion::mix(
+                    theme.background,
+                    theme.surface,
+                    if on_collapsed { 0.4 * focus } else { cursor },
+                );
                 expanded_message(
                     theme,
                     session,
                     message,
                     index,
-                    cursor,
+                    (cursor, fill),
                     columns,
                     live,
                     frame,
@@ -5506,22 +5517,18 @@ fn conversation(
                 )
             } else {
                 let body = frame.alphas.get(&message.id).copied().unwrap_or(1.0);
-                ReaderColumn {
-                    width: columns.card.width + 2.0 * MESSAGE_PAD_PX,
-                    inset: columns.card.inset,
-                }
-                .place(collapsed_message(
+                collapsed_message(
                     theme,
                     message,
                     index,
                     (cursor, body),
+                    columns,
                     collapsed_rows
-                        .get_or_init(|| CollapsedRows::new(window, theme, columns.card.width)),
+                        .get_or_init(|| CollapsedRows::new(window, theme, columns.header.width)),
                     live,
                     window,
                     cx,
-                ))
-                .into_any_element()
+                )
             };
             if let Some((anchor, probe)) = &hold
                 && anchor.index == index
@@ -5638,12 +5645,28 @@ fn conversation_line_style(window: &Window, theme: &Theme, size: gpui::Pixels) -
     style
 }
 
+/// The leading fields have already been laid out at the destination width.
+/// Clip them as the card moves so the date always has its own space.
+fn message_date_row<T: Styled + ParentElement>(
+    row: T,
+    gap: f32,
+    leading: gpui::Div,
+    date: Option<gpui::Div>,
+) -> T {
+    row.flex()
+        .items_center()
+        .gap(px(gap))
+        .child(div().flex_1().min_w_0().overflow_hidden().child(leading))
+        .children(date)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapsed_message(
     theme: &Theme,
     message: &ConvMessage,
     index: usize,
     (cursor, body): (f32, f32),
+    columns: ReaderColumns,
     rows: &CollapsedRows,
     live: Live,
     window: &Window,
@@ -5711,16 +5734,14 @@ fn collapsed_message(
             .map_or(0., |line| f32::from(line.width).ceil())
     };
     let snippet_w = remaining - sender_w;
-    div()
+    let dates = columns.date_column();
+    let row = div()
         .id(gpui::ElementId::named_usize("message", index))
         .h(px(40.))
-        .w_full()
+        .ml(px(dates.inset - MESSAGE_PAD_PX))
+        .w(px(dates.width + 2.0 * MESSAGE_PAD_PX))
         .min_w(px(0.))
         .px(px(MESSAGE_PAD_PX))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(rows.gap))
         .overflow_hidden()
         .rounded_md()
         .bg(rgb(motion::mix(theme.background, theme.selection, cursor)))
@@ -5745,7 +5766,11 @@ fn collapsed_message(
                     cx.notify();
                 }),
             )
-        })
+        });
+    let leading = div()
+        .flex()
+        .items_center()
+        .gap(px(rows.gap))
         .child(
             div()
                 .w(px(sender_w))
@@ -5762,8 +5787,12 @@ fn collapsed_message(
                 .text_color(rgb(dimmed))
                 .when(body < 1.0, |line| line.opacity(body))
                 .children(clip(snippet, snippet_w, FontWeight::NORMAL).map(|line| line.text)),
-        )
-        .child(
+        );
+    message_date_row(
+        row,
+        rows.gap,
+        leading,
+        Some(
             div()
                 .w(px(date_w))
                 .flex_none()
@@ -5771,8 +5800,9 @@ fn collapsed_message(
                 .text_right()
                 .text_color(rgb(dimmed))
                 .children(clip(&date, date_w, FontWeight::NORMAL).map(|line| line.text)),
-        )
-        .into_any_element()
+        ),
+    )
+    .into_any_element()
 }
 
 const MESSAGE_HEADER_GAP_PX: f32 = 10.0;
@@ -5795,7 +5825,7 @@ fn expanded_header_widths(width: f32, [sender, email, folders, date]: [f32; 4]) 
 fn expanded_message_header(
     theme: &Theme,
     message: &ConvMessage,
-    width: f32,
+    columns: ReaderColumns,
     window: &Window,
 ) -> gpui::Div {
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
@@ -5815,7 +5845,7 @@ fn expanded_message_header(
             .map_or(0.0, |line| f32::from(line.width).ceil())
     };
     let [sender_width, email_width, folder_width, _] = expanded_header_widths(
-        width,
+        columns.header.width,
         [
             measure(
                 &sender_style,
@@ -5830,7 +5860,7 @@ fn expanded_message_header(
     );
     let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
         clip_shaped(window, style, text, width.floor(), weight, Some(color))
-            .filter(|line| f32::from(line.width).ceil() <= width)
+            .filter(|line| !line.text.is_empty() && f32::from(line.width).ceil() <= width)
     };
     let sender = fit(
         &sender_style,
@@ -5881,28 +5911,28 @@ fn expanded_message_header(
                 .join(" · ");
             fit_folders(&leaves)
         });
-    div()
-        .flex()
-        .items_center()
-        .gap(px(MESSAGE_HEADER_GAP_PX))
-        // The recipient line belongs to this header, so it sits close.
-        .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
-        .children(sender.map(|line| shaped_text(line, window)))
-        .children(email.map(|line| shaped_text(line, window)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .children(folders.map(|line| shaped_text(line, window))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .whitespace_nowrap()
-                .text_color(rgb(theme.dimmed))
-                .child(date),
-        )
+    let leading = div().flex().items_center().gap(px(MESSAGE_HEADER_GAP_PX)).children(
+        [sender, email, folders]
+            .into_iter()
+            .flatten()
+            .map(|line| shaped_text(line, window)),
+    );
+    let date = fit(
+        &sender_style,
+        &date,
+        columns.header.width,
+        FontWeight::NORMAL,
+        theme.dimmed,
+    );
+    message_date_row(
+        div()
+            .w(px(columns.date_column().width))
+            // The recipient line belongs to this header, so it sits close.
+            .pb(px(if message.recipients.is_some() { 2. } else { 8. })),
+        MESSAGE_HEADER_GAP_PX,
+        leading,
+        date.map(|line| div().flex_none().child(shaped_text(line, window))),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5911,7 +5941,7 @@ fn expanded_message(
     session: &Session,
     message: &ConvMessage,
     index: usize,
-    cursor: f32,
+    (cursor, fill): (f32, u32),
     columns: ReaderColumns,
     live: Live,
     frame: &ConvFrame,
@@ -5935,7 +5965,7 @@ fn expanded_message(
                 .left(px(columns.card.inset))
                 .w(px(columns.card.width + 2.0 * MESSAGE_PAD_PX))
                 .rounded_md()
-                .bg(rgb(motion::mix(theme.background, theme.surface, cursor))),
+                .bg(rgb(fill)),
         )
         .when(live.0, |card| {
             card.on_mouse_down(
@@ -5954,7 +5984,7 @@ fn expanded_message(
         .child(
             columns.header.place(
                 div()
-                    .child(expanded_message_header(theme, message, header_width, window))
+                    .child(expanded_message_header(theme, message, columns, window))
                     .children(message.recipients.as_ref().map(|line| {
                         recipient_lines(
                             theme,
@@ -5997,6 +6027,7 @@ fn expanded_message(
                 columns,
                 name_key: index == session.message_cursor,
                 focused: cursor,
+                fill,
                 index,
                 live: live.0,
             },
@@ -6031,6 +6062,7 @@ struct FoldView {
     /// How much the message shows the cursor in the focused
     /// conversation, 0 to 1: the fold `q` acts on takes the accent with it.
     focused: f32,
+    fill: u32,
     index: usize,
     /// Drawn on screen, not as an unseen copy: a click opens the fold.
     live: bool,
@@ -6172,10 +6204,6 @@ fn message_body(
         .into_any_element()
 }
 
-/// Longest line of mail text, about 72 characters: past it the eye loses
-/// its place going back to the next line.
-const READING_MEASURE_PX: f32 = 600.;
-
 /// A prepared HTML body, one section at a time: what the sender wrote is
 /// painted; quoted history and the signature fold to one line until `q`.
 fn html_sections(
@@ -6202,18 +6230,13 @@ fn html_sections(
         .map(|(at, section)| {
             let rtl = body.rtl.get(at).copied().unwrap_or(false);
             let blocks = folded.blocks(section);
-            let layout = if columns.active {
-                crate::render::BlockColumn::reading(
-                    columns.wide.width,
-                    columns.wide.inset,
-                    columns.prose.width,
-                    columns.prose.inset,
-                )
-            } else if rtl {
-                crate::render::BlockColumn::full(columns.prose.width)
-            } else {
-                crate::render::BlockColumn::measured(columns.wide.width, READING_MEASURE_PX)
-            };
+            let layout = crate::render::BlockColumn::reading(
+                (columns.wide.width, columns.wide.inset),
+                (columns.prose.width, columns.prose.inset),
+                columns.reading_wide,
+                columns.progress,
+                folds.fill,
+            );
             match section.fold {
                 // A quote the sender answers under it: open, under the
                 // history rule, in the dimmed colour.
@@ -6261,7 +6284,11 @@ fn html_sections(
                             rtl,
                         },
                         folds,
-                        (columns.prose, columns.wide.width + columns.wide.inset),
+                        (
+                            columns.prose,
+                            (columns.wide.width + columns.wide.inset)
+                                .max(columns.prose.width + columns.prose.inset),
+                        ),
                         reveal,
                         || {
                             history_section(
@@ -6287,11 +6314,14 @@ fn history_section(
     gallery: &crate::render::ImageGallery,
     (theme, rtl, layout): (&Theme, bool, crate::render::BlockColumn),
 ) -> gpui::AnyElement {
-    let (layout, inset) = layout.history(blocks, gallery);
-    history_rule(div(), rtl, crate::theme::strong_border(theme))
-        .ml(px(inset))
-        .w(px(layout.width))
-        .text_color(rgb(theme.dimmed))
+    let (rule, layout) = layout.quote(
+        div(),
+        HISTORY_INDENT_PX,
+        2.0,
+        crate::theme::strong_border(theme),
+        rtl,
+    );
+    rule.text_color(rgb(theme.dimmed))
         .child(history_blocks(
             blocks,
             kind,
@@ -6334,7 +6364,6 @@ fn history_blocks(
         Some(Fold::SignatureAndQuote | Fold::QuoteAndSignature)
     );
     let line_height = px(theme.ui_px * 1.4);
-    let layout = layout.indented(HISTORY_INDENT_PX);
     let column = |run: &[Block], layout| {
         crate::render::blocks_column_spaced(run, history, false, gallery, layout, 8.)
             .line_height(line_height)
@@ -6343,16 +6372,19 @@ fn history_blocks(
         .flex()
         .flex_col()
         .gap(px(8.))
-        .children(blocks.iter().map(|block| {
-            match block {
-                Block::Quote { blocks } if nested => {
-                    history_rule(div(), rtl, crate::theme::strong_border(theme))
-                        .child(column(blocks, layout.indented(HISTORY_INDENT_PX)))
-                        .into_any_element()
-                }
-                Block::Quote { blocks } => column(blocks, layout).into_any_element(),
-                other => column(std::slice::from_ref(other), layout).into_any_element(),
+        .children(blocks.iter().map(|block| match block {
+            Block::Quote { blocks } if nested => {
+                let (rule, nested_layout) = layout.quote(
+                    div(),
+                    HISTORY_INDENT_PX,
+                    2.0,
+                    crate::theme::strong_border(theme),
+                    rtl,
+                );
+                rule.child(column(blocks, nested_layout)).into_any_element()
             }
+            Block::Quote { blocks } => column(blocks, layout).into_any_element(),
+            other => column(std::slice::from_ref(other), layout).into_any_element(),
         }))
         .into_any_element()
 }
@@ -7465,7 +7497,7 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, READING_MEASURE_PX, ReaderColumns,
+        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns,
         account_header, collapsed_sender_budget, ctrl_letter, expanded_header_widths, key_from,
         message_content_width, moved_in_list, should_follow_visible, unread_bar_dx,
         useful_header_email, write_back_notice,
@@ -7561,43 +7593,50 @@ mod tests {
             (560.0, 0.0),
             (760.0, 0.0),
             (880.0, 310.0),
+            (1000.0, 387.0),
+            (1500.0, 337.0),
             (1500.0, 487.0),
+            (1920.0, 724.0),
+            (1920.0, 429.4),
             (2400.0, 520.0),
         ] {
             for reading in [true, false] {
-                let mut previous: Option<[f32; 3]> = None;
+                let end_progress = if reading { 1.0 } else { 0.0 };
+                let end = ReaderColumns::new(width, split, reading, end_progress, 2.0);
+                let end_pane = ReaderColumns::pane_left(split, end_progress, 2.0);
+                let mut previous: Option<[f32; 2]> = None;
                 for step in 0..=100 {
                     let progress = if reading { step } else { 100 - step } as f32 / 100.0;
                     let columns = ReaderColumns::new(width, split, reading, progress, 2.0);
                     let pane_left = ReaderColumns::pane_left(split, progress, 2.0);
-                    assert_eq!(columns.header.inset, columns.prose.inset);
+                    let dates = columns.date_column();
                     let [header, prose, card, wide] =
                         [columns.header, columns.prose, columns.card, columns.wide];
-                    for column in [header, prose, card, wide] {
-                        assert!(
-                            pane_left + column.inset + column.width
-                                <= message_content_width(width) + 0.01
-                        );
+                    assert_eq!(header.inset, prose.inset);
+                    assert_eq!(dates.inset, header.inset + MESSAGE_PAD_PX);
+                    let card_right = card.inset + card.width + 2.0 * MESSAGE_PAD_PX;
+                    assert_eq!(dates.inset + dates.width, card_right - MESSAGE_PAD_PX);
+                    assert_eq!(card.width, card.width.round());
+                    assert!(
+                        pane_left + card.inset + card.width <= message_content_width(width) + 0.01
+                    );
+                    for (column, destination) in
+                        [(header, end.header), (prose, end.prose), (wide, end.wide)]
+                    {
+                        assert_eq!(column.width, destination.width);
+                        if step == 100 {
+                            assert!(
+                                pane_left + column.inset + column.width
+                                    <= message_content_width(width) + 0.51
+                            );
+                        }
                     }
-                    let origins = [
-                        pane_left + header.inset,
-                        pane_left + card.inset,
-                        pane_left + wide.inset,
-                    ];
+                    let origins = [pane_left + header.inset, pane_left + wide.inset];
                     if let Some(previous) = previous {
-                        let end = ReaderColumns::new(
-                            width,
-                            split,
-                            reading,
-                            if reading { 1.0 } else { 0.0 },
-                            2.0,
-                        );
-                        let end_left = if reading { 0.0 } else { split };
-                        for (index, end_inset) in [end.header.inset, end.card.inset, end.wide.inset]
-                            .into_iter()
-                            .enumerate()
+                        for (index, end_inset) in
+                            [end.header.inset, end.wide.inset].into_iter().enumerate()
                         {
-                            let end = end_left + end_inset;
+                            let end = end_pane + end_inset;
                             assert!((origins[index] - end).abs() <= (previous[index] - end).abs());
                         }
                     }
