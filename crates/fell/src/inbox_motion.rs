@@ -875,6 +875,12 @@ impl InboxMotion {
             .map(|(_, fade)| SELECTION_FROM * (1.0 - fade.progress(now)))
     }
 
+    /// A list change put the selection directly on its new row.
+    pub fn land_selection(&mut self, selected: Option<String>) {
+        self.last_selected = selected;
+        self.selection_out = None;
+    }
+
     /// Opacity of the conversation's subject and messages: another
     /// thread's arrive from [`motion::ARRIVE_FROM`], so the pane never
     /// blinks to empty.

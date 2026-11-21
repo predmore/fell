@@ -373,17 +373,16 @@ pub struct RowMotion {
     /// Draw the row this far below its slot (negative: above).
     pub dy: f32,
     pub opacity: f32,
-    /// How much of the row's height shows, from its top: a row put back
-    /// between two others opens with the gap the rows below leave, so they
-    /// never slide over it.
-    pub reveal: f32,
+    /// How much of a restored row's height shows, from its top. The slot
+    /// opens with the gap the rows below leave. Other rows show whole.
+    pub reveal: Option<f32>,
 }
 
 impl RowMotion {
     pub const STILL: RowMotion = RowMotion {
         dy: 0.0,
         opacity: 1.0,
-        reveal: 1.0,
+        reveal: None,
     };
 }
 
@@ -531,7 +530,7 @@ impl<R: Clone> ListShift<R> {
             Some(dy) => RowMotion {
                 dy: dy * (1.0 - p),
                 opacity: 1.0,
-                reveal: 1.0,
+                reveal: None,
             },
             None => {
                 // Consecutive restored rows share the gap opened by the
@@ -553,7 +552,7 @@ impl<R: Clone> ListShift<R> {
                     RowMotion {
                         dy: 0.0,
                         opacity: p,
-                        reveal: (gap / height).clamp(0.0, 1.0),
+                        reveal: Some((gap / height).clamp(0.0, 1.0)),
                     }
                 } else {
                     // Arriving in a slot nothing slides into (another
@@ -565,7 +564,7 @@ impl<R: Clone> ListShift<R> {
                     RowMotion {
                         dy: 0.0,
                         opacity: lerp(ARRIVE_FROM, 1.0, arrive.progress(now)),
-                        reveal: 1.0,
+                        reveal: None,
                     }
                 }
             }
@@ -583,6 +582,28 @@ impl<R: Clone> ListShift<R> {
             None => self.start_for(id, top),
         };
         start.map_or(0.0, |dy| dy * (1.0 - p))
+    }
+
+    /// Furthest outside the viewport a slot can be while its row is visible.
+    pub fn overscan(&self, row_height: f32) -> usize {
+        if self.replaced {
+            return 0;
+        }
+        (self.reach / row_height).ceil() as usize
+    }
+
+    /// A virtualized list skips slots outside the viewport. Keep a moving
+    /// row from one of those slots until it has slid fully out of the clip.
+    pub fn visible_overflow(
+        &self,
+        id: &str,
+        slot: f32,
+        row_height: f32,
+        viewport: f32,
+        now: Instant,
+    ) -> Option<f32> {
+        let painted = slot + self.offset_of(id, slot, now);
+        (painted < viewport && painted + row_height > 0.0).then_some(painted)
     }
 
     /// Ghosts whose old top falls in the slot `[top, top + height)` (list
@@ -765,7 +786,7 @@ mod tests {
             RowMotion {
                 dy: 68.0,
                 opacity: 1.0,
-                reveal: 1.0,
+                reveal: None,
             },
             "c starts where it was"
         );
@@ -806,7 +827,7 @@ mod tests {
             RowMotion {
                 dy: 0.0,
                 opacity: ARRIVE_FROM,
-                reveal: 1.0,
+                reveal: None,
             }
         );
         assert_eq!(
@@ -821,21 +842,21 @@ mod tests {
         // Undo puts b back between a and c: c was at 68 and now sits at 136.
         let mut shift = shift(&[("a", 0.0), ("c", 68.0)], &[], vec![], false, start);
         let b = shift.row("b", 68.0, 68.0, Some(("c", 136.0)), start);
-        assert_eq!(b.reveal, 0.0, "closed while c still covers its slot");
+        assert_eq!(b.reveal, Some(0.0), "closed while c still covers its slot");
         assert_eq!(b.opacity, 0.0, "it grows with its gap");
         let mid = at(start, 40);
         let b = shift.row("b", 68.0, 68.0, Some(("c", 136.0)), mid);
         let c = shift.row("c", 136.0, 68.0, None, mid);
         // The part of b that shows ends where c is drawn.
-        assert!((68.0 + 68.0 * b.reveal - (136.0 + c.dy)).abs() < 0.01);
+        assert!((68.0 + 68.0 * b.reveal.unwrap() - (136.0 + c.dy)).abs() < 0.01);
         assert_eq!(
             shift
                 .row("b", 68.0, 68.0, Some(("c", 136.0)), at(start, 120))
                 .reveal,
-            1.0
+            Some(1.0)
         );
         // A row added at the end has nothing to make room for.
-        assert_eq!(shift.row("d", 204.0, 68.0, None, start).reveal, 1.0);
+        assert_eq!(shift.row("d", 204.0, 68.0, None, start).reveal, None);
     }
 
     #[test]
@@ -849,12 +870,39 @@ mod tests {
             let mut revealed = 0.0;
             for (index, (id, top)) in slots[..3].iter().copied().enumerate() {
                 let row = shift.row(id, top, 68.0, slots[index + 1..].iter().copied(), now);
-                revealed += row.reveal * 68.0;
+                revealed += row.reveal.unwrap() * 68.0;
                 assert_eq!(row.dy, 0.0);
             }
             let next = shift.row("e", 272.0, 68.0, None, now);
             assert!((revealed - (272.0 + next.dy - 68.0)).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn rows_pushed_below_the_viewport_follow_the_restore() {
+        let start = Instant::now();
+        let shift = shift(
+            &[("a", 0.0), ("b", 68.0), ("c", 136.0)],
+            &[],
+            vec![],
+            false,
+            start,
+        );
+        let viewport = 204.0;
+        // Two restored rows put b and c just below the viewport.
+        let painted =
+            |id, slot, ms| shift.visible_overflow(id, slot, 68.0, viewport, at(start, ms));
+        assert_eq!(painted("b", 204.0, 0), Some(68.0));
+        assert_eq!(painted("c", 272.0, 0), Some(136.0));
+        for ms in [8, 16, 40, 80] {
+            let b = painted("b", 204.0, ms).unwrap();
+            assert!(b > 68.0 && b < viewport);
+            if let Some(c) = painted("c", 272.0, ms) {
+                assert!((c - b - 68.0).abs() < 0.01, "{ms} ms");
+            }
+        }
+        assert_eq!(painted("b", 204.0, 120), None);
+        assert_eq!(painted("c", 272.0, 120), None);
     }
 
     #[test]
@@ -889,7 +937,7 @@ mod tests {
                 let drawn = switched.row(id, *top, 68.0, below, now);
                 assert!(drawn.opacity >= ARRIVE_FROM, "{id} at {ms} ms: {drawn:?}");
                 assert!(drawn.opacity >= last[i], "never dims again");
-                assert_eq!((drawn.dy, drawn.reveal), (0.0, 1.0));
+                assert_eq!((drawn.dy, drawn.reveal), (0.0, None));
                 last[i] = drawn.opacity;
             }
         }

@@ -4,8 +4,9 @@
 //! The subject box eases from the width it had on screen to the width of
 //! the text at its new weight. At rest read and unread rows leave the same
 //! gap after the subject. The unread bar fades over [`motion::FADE`]. The
-//! subject switches to regular before shrinking and to bold after growing,
-//! so it fits throughout. Stars fade and scale in and out independently.
+//! subject switches weight immediately. Its text is clipped as the box
+//! grows, and the snippet stays next to the visible subject. Stars fade
+//! and scale in and out independently.
 //! With reduced motion each change shows immediately.
 
 use std::collections::HashMap;
@@ -26,9 +27,8 @@ pub const STAR: Duration = Duration::from_millis(100);
 /// The scale a star grows from as it fades in, and shrinks to as it leaves.
 pub const STAR_FROM: f32 = 0.8;
 
-/// How wide the fade is that softens the snippet's right edge while a
-/// relaxing box carries it past the end of the line.
-pub const EDGE_FADE: f32 = 16.0;
+/// How wide the fade is that softens the subject's clipped right edge.
+pub const SUBJECT_FADE: f32 = 12.0;
 
 /// A row as one frame draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,13 +58,6 @@ impl RowFrame {
         }
     }
 
-    /// How strongly the snippet's right edge fades this frame: while a
-    /// relaxing box (wider than where it is going) carries the snippet,
-    /// cut for where it is going, past the end of the line. 0 at rest.
-    pub fn edge_fade(&self) -> f32 {
-        ((self.subject_w - self.subject_room) / (EDGE_FADE / 2.0)).clamp(0.0, 1.0)
-    }
-
     /// The star's scale this frame.
     pub fn star_scale(&self) -> f32 {
         motion::lerp(STAR_FROM, 1.0, self.star)
@@ -81,8 +74,8 @@ struct Kept {
     slide: Option<(f32, Transition)>,
     unread: bool,
     starred: bool,
-    /// Starting unread accent and text weight while the accent eases.
-    unread_transition: Option<(f32, bool, Transition)>,
+    /// Starting unread accent while it eases.
+    unread_transition: Option<(f32, Transition)>,
     /// The star fading in (`starred`) or out.
     star: Option<Transition>,
     labels: Option<Vec<String>>,
@@ -100,27 +93,22 @@ impl Kept {
             if on { t } else { 1.0 - t }
         };
         let unread_target = f32::from(u8::from(self.unread));
-        let (unread, bold) = match self.unread_transition {
-            Some((from, bold, transition)) if transition.running(now) => (
-                motion::lerp(from, unread_target, transition.progress(now)),
-                bold,
-            ),
-            _ => (unread_target, self.unread),
+        let unread = match self.unread_transition {
+            Some((from, transition)) => motion::lerp(from, unread_target, transition.progress(now)),
+            None => unread_target,
         };
         RowFrame {
             subject_w,
             subject_room: self.width,
             unread,
-            bold,
+            bold: self.unread,
             star: toward(self.starred, self.star.as_ref()),
         }
     }
 
     fn running(&self, now: Instant) -> bool {
         self.slide.is_some_and(|(_, t)| t.running(now))
-            || self
-                .unread_transition
-                .is_some_and(|(_, _, t)| t.running(now))
+            || self.unread_transition.is_some_and(|(_, t)| t.running(now))
             || self.star.is_some_and(|t| t.running(now))
             || self
                 .previous_labels
@@ -205,10 +193,7 @@ impl RowWidths {
         if kept.slide.is_some_and(|(_, t)| !t.running(now)) {
             kept.slide = None;
         }
-        if kept
-            .unread_transition
-            .is_some_and(|(_, _, t)| !t.running(now))
-        {
+        if kept.unread_transition.is_some_and(|(_, t)| !t.running(now)) {
             kept.unread_transition = None;
         }
         if kept.star.is_some_and(|t| !t.running(now)) {
@@ -216,21 +201,16 @@ impl RowWidths {
         }
         if unread != kept.unread {
             let drawn = kept.frame(now);
+            let from = drawn.subject_w.min(kept.width);
             kept.unread = unread;
             kept.width = natural(unread).ceil();
-            let bold = if kept.width < drawn.subject_w {
-                // Change weight before shrinking so the subject still fits.
-                unread
-            } else {
-                drawn.bold
-            };
             kept.unread_transition = motion
                 .start(motion::FADE, now)
-                .map(|transition| (drawn.unread, bold, transition));
-            kept.slide = (drawn.subject_w != kept.width)
+                .map(|transition| (drawn.unread, transition));
+            kept.slide = (from != kept.width)
                 .then(|| motion.start(motion::SLIDE, now))
                 .flatten()
-                .map(|slide| (drawn.subject_w, slide));
+                .map(|slide| (from, slide));
         }
         if starred != kept.starred {
             kept.starred = starred;
@@ -287,10 +267,10 @@ impl RowWidths {
     }
 }
 
-/// Line two of a row: the subject box width and where the snippet starts,
-/// for a subject box of `subject` px in a line `text_width` px wide.
-pub fn line_two(subject: f32, text_width: f32) -> (f32, f32) {
-    let subject_w = subject.min(SUBJECT_MAX).min(text_width);
+/// How much of the subject fits and where the snippet starts. If the new
+/// weight is narrower, the snippet follows the text inside the easing box.
+pub fn line_two(box_width: f32, shaped_width: f32) -> (f32, f32) {
+    let subject_w = box_width.min(shaped_width);
     (subject_w, subject_w + SUBJECT_GAP)
 }
 
@@ -317,31 +297,30 @@ mod tests {
     }
 
     fn snippet_x(frame: RowFrame) -> f32 {
-        line_two(frame.subject_w, 400.0).1
+        line_two(frame.subject_w, natural(frame.bold)).1
     }
 
     #[test]
-    fn marking_read_starts_in_place_and_eases_to_regular_width() {
+    fn marking_read_keeps_the_snippet_with_the_regular_subject() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
         let before = draw(&mut widths, "t1", true, t0);
         let key = at(t0, 16);
         let start = draw(&mut widths, "t1", false, key);
-        assert_eq!(snippet_x(start), snippet_x(before));
+        assert_eq!(start.subject_w, before.subject_w);
         assert_eq!(start.unread, 1.0);
         assert!(!start.bold, "the subject fits throughout the slide");
         assert_eq!(start.subject_room, REGULAR.ceil());
-        assert_eq!(start.edge_fade(), 1.0);
-
         let mid = draw(&mut widths, "t1", false, at(key, 40));
-        let narrow = REGULAR.ceil() + SUBJECT_GAP;
-        assert!(snippet_x(mid) < snippet_x(start) && snippet_x(mid) > narrow);
+        let narrow = REGULAR + SUBJECT_GAP;
+        assert!(mid.subject_w < start.subject_w && mid.subject_w > start.subject_room);
+        assert_eq!(snippet_x(start), narrow);
+        assert_eq!(snippet_x(mid), narrow);
         assert!(mid.unread > 0.0 && mid.unread < 0.5);
 
         let done = draw(&mut widths, "t1", false, at(key, 120));
         assert_eq!(snippet_x(done), narrow);
         assert_eq!(done.unread, 0.0);
-        assert_eq!(done.edge_fade(), 0.0);
         assert!(!widths.running(at(key, 120)));
     }
 
@@ -351,18 +330,18 @@ mod tests {
         let t0 = Instant::now();
         let read = draw(&mut widths, "t1", false, t0);
         let from = snippet_x(read);
-        let to = BOLD.ceil() + SUBJECT_GAP;
-        assert_eq!(from, REGULAR.ceil() + SUBJECT_GAP);
-        // The frame that shows the `U` starts the slide where it was.
+        let to = BOLD + SUBJECT_GAP;
+        assert_eq!(from, REGULAR + SUBJECT_GAP);
+        // The frame that shows the `U` starts at the regular box width.
         let key = at(t0, 50);
         let start = draw(&mut widths, "t1", true, key);
-        assert_eq!(snippet_x(start), from);
-        // The bold text is cut to where the box is going, not to the box.
+        assert_eq!(start.subject_w, read.subject_w);
+        assert!(start.bold);
         assert_eq!(start.subject_room, BOLD.ceil());
-        let mut last = from;
+        let mut last = snippet_x(start);
         for ms in [16, 33, 50, 66, 83, 100] {
             let x = snippet_x(draw(&mut widths, "t1", true, at(key, ms)));
-            assert!(x > last && x < to, "{ms} ms: {x}");
+            assert!(x >= last && x <= to, "{ms} ms: {x}");
             last = x;
         }
         // Ease-out: most of the way in the first half.
@@ -374,6 +353,25 @@ mod tests {
     }
 
     #[test]
+    fn the_measured_subject_to_snippet_gap_holds_in_both_directions() {
+        let mut widths = RowWidths::default();
+        let start = Instant::now();
+        draw(&mut widths, "t1", false, start);
+        for (unread, offset) in [(true, 16), (false, 160)] {
+            let key = at(start, offset);
+            for ms in 0..=120 {
+                let frame = draw(&mut widths, "t1", unread, at(key, ms));
+                assert_eq!(frame.bold, unread, "{ms} ms");
+                let measured = natural(frame.bold);
+                let visible = frame.subject_w.min(measured);
+                let (_, snippet) = line_two(frame.subject_w, measured);
+                let gap = snippet - visible;
+                assert!((gap - SUBJECT_GAP).abs() < 0.01, "{ms} ms: {gap} px");
+            }
+        }
+    }
+
+    #[test]
     fn a_key_mid_slide_snaps_it_to_the_end() {
         let mut widths = RowWidths::default();
         let t0 = Instant::now();
@@ -382,7 +380,7 @@ mod tests {
         assert!(widths.running(at(t0, 40)));
         widths.settle();
         let frame = draw(&mut widths, "t1", true, at(t0, 40));
-        assert_eq!(snippet_x(frame), BOLD.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(frame), BOLD + SUBJECT_GAP);
         assert_eq!(frame.unread, 1.0);
         assert!(!widths.running(at(t0, 40)));
     }
@@ -417,11 +415,11 @@ mod tests {
         let t0 = Instant::now();
         draw(&mut widths, "t1", false, t0);
         let unread = widths.frame("t1", SUBJECT, (true, true), natural, at(t0, 16), true);
-        assert_eq!(snippet_x(unread), BOLD.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(unread), BOLD + SUBJECT_GAP);
         assert_eq!((unread.unread, unread.star), (1.0, 1.0));
         assert!(!widths.running(at(t0, 16)));
         let read = draw(&mut widths, "t1", false, at(t0, 32));
-        assert_eq!(snippet_x(read), REGULAR.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(read), REGULAR + SUBJECT_GAP);
         assert_eq!(read.unread, 0.0);
         assert!(!widths.running(at(t0, 32)));
     }
@@ -454,9 +452,9 @@ mod tests {
         draw(&mut widths, "t1", false, key);
         let mid = draw(&mut widths, "t1", false, at(key, 60));
         let reversed = draw(&mut widths, "t1", true, at(key, 60));
-        assert_eq!(reversed.subject_w, mid.subject_w);
+        assert_eq!(reversed.subject_w, mid.subject_room);
         assert_eq!(reversed.unread, mid.unread);
-        assert!(!reversed.bold);
+        assert!(reversed.bold);
         assert_eq!(reversed.subject_room, BOLD.ceil());
         assert!(draw(&mut widths, "t1", true, at(key, 180)).bold);
     }
@@ -504,7 +502,7 @@ mod tests {
             assert_eq!(measured.get(), Some(unread));
             assert_eq!(frame.bold, unread);
             assert_eq!(frame.subject_w, natural(unread).ceil());
-            assert_eq!(snippet_x(frame) - frame.subject_w, SUBJECT_GAP);
+            assert_eq!(snippet_x(frame) - natural(unread), SUBJECT_GAP);
         }
     }
 
@@ -515,10 +513,10 @@ mod tests {
         let ids = ["t0", "t1", "t2"];
         draw(&mut widths, "t1", true, t0);
         let start = draw(&mut widths, "t1", false, at(t0, 16));
-        assert_eq!(snippet_x(start), BOLD.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(start), REGULAR + SUBJECT_GAP);
         widths.keep_drawn(2..3, ids.iter().copied());
         let back = draw(&mut widths, "t1", false, at(t0, 32));
-        assert_eq!(snippet_x(back), REGULAR.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(back), REGULAR + SUBJECT_GAP);
     }
 
     #[test]
@@ -528,7 +526,7 @@ mod tests {
         widths.frame("t0", SUBJECT, (false, false), natural, t0, false);
         // First drawn unread: laid out bold, nothing moving.
         let frame = draw(&mut widths, "t0", true, at(t0, 16));
-        assert_eq!(snippet_x(frame), BOLD.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(frame), BOLD + SUBJECT_GAP);
         assert!(!widths.running(at(t0, 16)));
         // A measuring pass sees a change but does not start it.
         let measured = widths.frame("t0", SUBJECT, (false, false), natural, at(t0, 32), false);
@@ -543,7 +541,7 @@ mod tests {
         draw(&mut widths, "t1", true, t0);
         widths.clear();
         let frame = draw(&mut widths, "t1", false, at(t0, 16));
-        assert_eq!(snippet_x(frame), REGULAR.ceil() + SUBJECT_GAP);
+        assert_eq!(snippet_x(frame), REGULAR + SUBJECT_GAP);
         assert_eq!(frame.unread, 0.0);
         // A row whose subject changed lays out for the new text, at once.
         let other = widths.frame("t1", "Other", (true, false), |_| 40.0, at(t0, 32), true);

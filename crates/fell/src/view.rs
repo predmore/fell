@@ -325,8 +325,11 @@ struct Inbox {
     refresh_in_flight: bool,
     /// Bumped by every folder read. A read the user superseded is dropped.
     read_gen: u64,
-    /// Asked for while a read was in flight. Issued when it lands.
+    /// Asked for while a read or undo was in flight. Issued when it lands.
     read_wanted: Option<ReadIntent>,
+    /// An in-flight read can already see rows restored on the store thread.
+    /// Wait for the undo reply so those rows arrive with their selection.
+    undos_in_flight: usize,
     /// Threads taken out of the list whose archive or move has not landed.
     /// A read that started before the write cannot paint them back.
     pending_removals: std::collections::HashSet<String>,
@@ -457,6 +460,7 @@ impl Inbox {
             refresh_in_flight: false,
             read_gen: 0,
             read_wanted: None,
+            undos_in_flight: 0,
             pending_removals: std::collections::HashSet::new(),
             pending_flags: std::collections::HashMap::new(),
             flag_gen: 0,
@@ -756,12 +760,15 @@ impl Inbox {
         // starts now on the interactive lane, and the refresh is dropped
         // when it lands. This read sees everything the refresh would have.
         let supersede = self.read_in_flight && self.refresh_in_flight && !intent.is_refresh();
-        if self.read_in_flight && !supersede {
+        if self.undos_in_flight > 0 || (self.read_in_flight && !supersede) {
             self.read_wanted = Some(match self.read_wanted.take() {
                 Some(earlier) => earlier.merge(intent),
                 None => intent,
             });
             return;
+        }
+        if let Some(earlier) = self.read_wanted.take() {
+            intent = earlier.merge(intent);
         }
         // An interactive read that replaces a refresh picks up its body reread.
         intent.refresh_open |= supersede;
@@ -877,8 +884,9 @@ impl Inbox {
         // A user action (switch, archive, move, undo) since this read started
         // makes it stale. Skip it and read again with both intents, so the
         // list never flashes a folder or a row the user already left.
-        let stale =
-            folder != self.session.folder || wanted.as_ref().is_some_and(|next| !next.is_refresh());
+        let stale = self.undos_in_flight > 0
+            || folder != self.session.folder
+            || wanted.as_ref().is_some_and(|next| !next.is_refresh());
         if stale {
             let merged = match wanted {
                 Some(next) => intent.merge(next),
@@ -1019,8 +1027,11 @@ impl Inbox {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
         }
         self.session.set_page(rows, more_before, more_after, unread);
-        if let Some(key) = &intent.select {
-            self.session.select_if_present(&key.thread_id.0);
+        if let Some(key) = &intent.select
+            && self.session.select_if_present(key.thread_id.as_str())
+            && self.session.cursor_id != before_id
+        {
+            self.motion.land_selection(self.session.cursor_id.clone());
         }
         let after_index = self
             .session
@@ -1390,18 +1401,22 @@ impl Inbox {
             .motion
             .painted_list_offset()
             .unwrap_or_else(|| self.list_offset());
-        let first = ((-offset / ROW_PX).floor() as i64 - 2).max(0) as usize;
-        let last = (((-offset + view) / ROW_PX).ceil() as i64 + 2).max(0) as usize;
+        let first = ((-offset / ROW_PX).floor() as usize).saturating_sub(2);
+        let last = ((-offset + view) / ROW_PX).ceil() as usize + 2;
+        let overscan = self.motion.list.as_ref().map_or(0, |s| s.overscan(ROW_PX));
         let rows = &self.session.threads;
-        (first.min(rows.len())..last.min(rows.len()))
-            .map(|index| {
+        (first.saturating_sub(overscan)..(last + overscan).min(rows.len()))
+            .filter_map(|index| {
                 let row = &rows[index];
                 let slot = index as f32 * ROW_PX + offset;
-                Drawn {
-                    top: slot + self.motion.row_offset(&row.id, slot, now),
-                    slot,
-                    row: row.clone(),
-                }
+                let top = slot + self.motion.row_offset(&row.id, slot, now);
+                ((first..last).contains(&index) || (top < view && top + ROW_PX > 0.0)).then(|| {
+                    Drawn {
+                        top,
+                        slot,
+                        row: row.clone(),
+                    }
+                })
             })
             .collect()
     }
@@ -2195,41 +2210,48 @@ impl Inbox {
         let account = self.account_id.clone();
         let folder = self.session.folder.clone();
         let reading = folder.clone();
+        self.undos_in_flight += 1;
         self.change_mailbox(
             move |store| {
                 let (action, restored) = store.undo_with_threads(&account)?;
                 let select = restored_folder_key(store, &account, &reading, &restored);
                 Ok((action, restored, select))
             },
-            move |inbox, result| match result {
-                Ok((action, restored, select)) => {
-                    if action.kind == fell_core::ActionKind::DiscardDrafts {
-                        inbox.session.show_toast(action.summary, false);
-                        return Some(ReadIntent {
+            move |inbox, result| {
+                inbox.undos_in_flight -= 1;
+                match result {
+                    Ok((action, restored, select)) => {
+                        if action.kind == fell_core::ActionKind::DiscardDrafts {
+                            inbox.session.show_toast(action.summary, false);
+                            return Some(ReadIntent {
+                                changed: true,
+                                ..ReadIntent::default()
+                            });
+                        }
+                        inbox.session.show_toast("Undone", false);
+                        inbox.send_to_server();
+                        if inbox.session.search.is_some() && !restored.is_empty() {
+                            inbox.search_view.prefer = restored;
+                        }
+                        let select = select.filter(|_| inbox.session.folder == folder);
+                        Some(ReadIntent {
                             changed: true,
+                            select,
                             ..ReadIntent::default()
-                        });
+                        })
                     }
-                    inbox.session.show_toast("Undone", false);
-                    inbox.send_to_server();
-                    if inbox.session.search.is_some() && !restored.is_empty() {
-                        inbox.search_view.prefer = restored;
+                    Err(err) => {
+                        let raw = err.to_string();
+                        if raw == "nothing to undo" {
+                            inbox.session.show_toast("Nothing to undo", false);
+                        } else {
+                            inbox.session.show_toast(raw, true);
+                        }
+                        // Resume any folder read held while the undo ran.
+                        (inbox.undos_in_flight == 0 && !inbox.read_in_flight)
+                            .then(|| inbox.read_wanted.take())
+                            .flatten()
                     }
-                    let select = select.filter(|_| inbox.session.folder == folder);
-                    Some(ReadIntent {
-                        changed: true,
-                        select,
-                        ..ReadIntent::default()
-                    })
-                }
-                Err(err) => {
-                    let raw = err.to_string();
-                    if raw == "nothing to undo" {
-                        inbox.session.show_toast("Nothing to undo", false);
-                    } else {
-                        inbox.session.show_toast(raw, true);
-                    }
-                    None
                 }
             },
             cx,
@@ -4348,6 +4370,7 @@ fn thread_list(
                 let text_width = row_text_width(list_width);
                 let now = inbox.frame_now;
                 let offset = inbox.list_offset();
+                let viewport = inbox.list_viewport().unwrap_or(0.0);
                 let last = inbox.session.threads.len().saturating_sub(1);
                 let bar_dx = unread_bar_dx(inbox.motion.pane_entry(Pane::List, now).dx);
                 // The list also asks for row 0 alone to measure a row's
@@ -4357,6 +4380,7 @@ fn thread_list(
                     let ids = inbox.session.threads.iter().map(|row| row.id.as_str());
                     inbox.row_widths.keep_drawn(range.clone(), ids);
                 }
+                let visible = range.clone();
                 let rows: Vec<_> = range
                     .map(|index| {
                         let row = inbox.session.threads[index].clone();
@@ -4402,7 +4426,43 @@ fn thread_list(
                         let reach = if index == last { f32::INFINITY } else { ROW_PX };
                         // Ghosts are kept in content pixels, so they scroll.
                         let ghosts = shift.ghosts_in(index as f32 * ROW_PX, reach, now);
-                        if moving == RowMotion::STILL && ghosts.is_empty() {
+                        // GPUI only asks for in-view slots. Paint rows still
+                        // moving across an edge from the nearest drawn slot.
+                        let extra = shift.overscan(ROW_PX);
+                        let above = (drawn && index == visible.start)
+                            .then(|| visible.start.saturating_sub(extra)..visible.start);
+                        let below = (drawn && index + 1 == visible.end)
+                            .then(|| visible.end..(visible.end + extra).min(last + 1));
+                        let overflow = above
+                            .into_iter()
+                            .chain(below)
+                            .flatten()
+                            .filter_map(|outside| {
+                                let row = &inbox.session.threads[outside];
+                                let slot = outside as f32 * ROW_PX + offset;
+                                let painted =
+                                    shift.visible_overflow(&row.id, slot, ROW_PX, viewport, now)?;
+                                let dy = motion::snap(painted - top, window.scale_factor());
+                                let look = RowLook {
+                                    selected: highlighted.contains(&row.id),
+                                    fading: None,
+                                    ghost: true,
+                                    bar_dx,
+                                    frame: still_frame(row, window),
+                                    previous_labels: None,
+                                };
+                                Some(slot_layer(dy, 1.0).child(thread_row(
+                                    &theme_for_rows,
+                                    row,
+                                    outside,
+                                    look,
+                                    text_width,
+                                    window,
+                                    cx,
+                                )))
+                            })
+                            .collect::<Vec<_>>();
+                        if moving == RowMotion::STILL && ghosts.is_empty() && overflow.is_empty() {
                             return element;
                         }
                         let ghosts: Vec<_> = ghosts
@@ -4428,26 +4488,26 @@ fn thread_list(
                                 ))
                             })
                             .collect();
+                        let layer = if let Some(reveal) = moving.reveal {
+                            let shown = motion::snap(ROW_PX * reveal, window.scale_factor());
+                            // The selected slot is highlighted as soon as
+                            // it opens. Its content fades in on top.
+                            slot_layer(moving.dy, 1.0)
+                                .h(px(shown))
+                                .overflow_hidden()
+                                .when(selected, |layer| layer.bg(rgb(theme_for_rows.selection)))
+                                .child(slot_layer(0.0, moving.opacity).child(element))
+                        } else {
+                            slot_layer(moving.dy, moving.opacity).child(element)
+                        };
                         div()
                             .id(gpui::ElementId::named_usize("thread-slot", index))
                             .relative()
                             .h(px(ROW_PX))
                             .w_full()
                             .children(ghosts)
-                            .child(
-                                slot_layer(moving.dy, moving.opacity)
-                                    .when(moving.reveal < 1.0, |layer| {
-                                        // Only the part of the gap that has
-                                        // opened shows, so the rows sliding
-                                        // down never cover it.
-                                        let shown = motion::snap(
-                                            ROW_PX * moving.reveal,
-                                            window.scale_factor(),
-                                        );
-                                        layer.h(px(shown)).overflow_hidden()
-                                    })
-                                    .child(element),
-                            )
+                            .child(layer)
+                            .children(overflow)
                             .into_any_element()
                     })
                     .collect();
@@ -5014,7 +5074,7 @@ fn names(
 }
 
 /// Line two: the subject and the snippet. `background` is the row's fill
-/// this frame, which the snippet's edge fades into.
+/// this frame, which the clipped subject's edge fades into.
 fn thread_line_two(
     theme: &Theme,
     row: &ThreadRow,
@@ -5033,15 +5093,22 @@ fn thread_line_two(
     } else {
         theme.foreground
     };
-    // The box is drawn where it is now (it eases while it grows or
-    // relaxes); its text and the snippet are cut where it is going, so
-    // they do not change from frame to frame.
-    let (box_w, _) = row_widths::line_two(frame.subject_w, text_width);
-    let (room, rest_x) = row_widths::line_two(frame.subject_room, text_width);
-    let snippet_w = (text_width - rest_x).max(24.0);
-    // Shaped once here and drawn from that shaping: a row that comes into
-    // view shapes each of its two texts at most twice.
+    let max_subject = row_widths::SUBJECT_MAX.min(text_width);
+    let box_w = frame.subject_w.min(max_subject);
+    let room = frame.subject_room.min(max_subject);
+    // Shape at the new weight once and reveal it through the moving box.
     let style = window.text_style();
+    let subject = clip_shaped(
+        window,
+        &style,
+        &row.subject,
+        room,
+        row_weight(frame.bold),
+        Some(subject_color),
+    );
+    let shaped_w = subject.as_ref().map_or(0.0, |line| f32::from(line.width));
+    let (visible_w, snippet_x) = row_widths::line_two(box_w, shaped_w);
+    let snippet_w = (text_width - room.min(shaped_w) - row_widths::SUBJECT_GAP).max(24.0);
     let snippet = clip_shaped(
         window,
         &style,
@@ -5050,41 +5117,32 @@ fn thread_line_two(
         FontWeight::NORMAL,
         Some(snippet_color),
     );
-    let subject = (!row.subject.is_empty()).then(|| {
-        let shaped = clip_shaped(
-            window,
-            &style,
-            &row.subject,
-            room,
-            row_weight(frame.bold),
-            Some(subject_color),
-        );
+    let subject = subject.map(|line| {
+        let clipped = (shaped_w.min(room) - visible_w).clamp(0.0, 1.0);
         div()
             .relative()
             .flex_none()
-            .w(px(box_w))
+            .w(px(visible_w))
             .overflow_hidden()
-            .children(shaped.map(|line| shaped_text(line, window)))
-    });
-    // A relaxing box carries the snippet, cut for where it is going, past
-    // the end of the line: its last pixels fade into the row instead of
-    // showing half a letter.
-    let edge = frame.edge_fade();
-    let edge_fade = (edge > 0.0).then(|| {
-        let solid = gpui::Hsla::from(rgb(background));
-        let clear = gpui::Hsla { a: 0.0, ..solid };
-        div()
-            .absolute()
-            .top(px(0.))
-            .bottom(px(0.))
-            .right(px(0.))
-            .w(px(row_widths::EDGE_FADE))
-            .opacity(edge)
-            .bg(gpui::linear_gradient(
-                90.,
-                gpui::linear_color_stop(clear, 0.),
-                gpui::linear_color_stop(solid, 1.),
-            ))
+            .child(shaped_text(line, window))
+            .when(clipped > 0.0, |subject| {
+                let solid = gpui::Hsla::from(rgb(background));
+                let clear = gpui::Hsla { a: 0.0, ..solid };
+                subject.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(row_widths::SUBJECT_FADE.min(visible_w)))
+                        .opacity(clipped)
+                        .bg(gpui::linear_gradient(
+                            90.,
+                            gpui::linear_color_stop(clear, 0.),
+                            gpui::linear_color_stop(solid, 1.),
+                        )),
+                )
+            })
     });
     // Keep line two at a fixed height while the snippet fills in.
     div()
@@ -5100,11 +5158,10 @@ fn thread_line_two(
         .children(snippet.map(|line| {
             div()
                 .flex_none()
-                .w(px((text_width - box_w - row_widths::SUBJECT_GAP).max(24.0)))
+                .w(px((text_width - snippet_x).max(24.0)))
                 .overflow_hidden()
                 .child(shaped_text(line, window))
         }))
-        .children(edge_fade)
 }
 
 fn line_px(window: &Window, text: &str, weight: FontWeight) -> f32 {
