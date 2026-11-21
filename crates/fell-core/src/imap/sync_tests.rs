@@ -1213,7 +1213,11 @@ fn starttls_does_not_send_the_password_in_clear() {
         smtp: unused_smtp(),
     };
     let err = backend.fetch_changes(None).unwrap_err();
-    assert!(matches!(err, crate::Error::Backend(_)));
+    assert_eq!(
+        crate::classify_sync_error(&err),
+        crate::SyncFailureKind::Tls,
+        "{err}"
+    );
     let logged = commands(&server);
     let joined = logged.join("\n");
     assert!(joined.to_ascii_uppercase().contains("STARTTLS"));

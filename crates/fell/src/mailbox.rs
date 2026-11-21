@@ -199,34 +199,45 @@ pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
     }
 }
 
-/// Write the account file mode 0600, creating `~/.config/fell` mode 0700 if needed.
-pub fn write_account_config(config: &AccountConfig) -> Result<PathBuf, String> {
+/// Prepare the file so setup can save its keyring password before publishing
+/// the new config with mode 0600. Dropping the staged file keeps the current
+/// config in place.
+pub(crate) fn stage_account_config(config: &AccountConfig) -> Result<StagedAccountConfig, String> {
     let path = account_config_path()
         .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
-    write_account_config_at(&path, config)?;
-    Ok(path)
+    stage_account_config_at(path, config)
 }
 
-fn write_account_config_at(path: &Path, config: &AccountConfig) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+pub(crate) struct StagedAccountConfig {
+    path: PathBuf,
+    file: tempfile::NamedTempFile,
+}
 
-    if let Some(dir) = path.parent() {
-        create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
+impl StagedAccountConfig {
+    pub(crate) fn publish(self) -> Result<PathBuf, String> {
+        self.file
+            .persist(&self.path)
+            .map_err(|err| format!("{}: {}", self.path.display(), err.error))?;
+        Ok(self.path)
     }
-    let tmp = path.with_extension("toml.tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|err| format!("{}: {err}", tmp.display()))?;
+}
+
+pub(crate) fn stage_account_config_at(
+    path: PathBuf,
+    config: &AccountConfig,
+) -> Result<StagedAccountConfig, String> {
+    use std::io::Write;
+
+    let dir = path.parent().expect("account file has a parent directory");
+    create_mailbox_dirs(dir).map_err(|err| err.to_string())?;
+    // NamedTempFile creates a private (0600 on Unix) file and gives each
+    // attempt its own path, so concurrent setup attempts cannot reuse it.
+    let mut file =
+        tempfile::NamedTempFile::new_in(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     file.write_all(config.render().as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|err| format!("{}: {err}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|err| format!("{}: {err}", path.display()))?;
-    Ok(())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|err| format!("{}: {err}", file.path().display()))?;
+    Ok(StagedAccountConfig { path, file })
 }
 
 fn fallback(error: String) -> (Store, Opened) {
@@ -475,15 +486,17 @@ mod tests {
 
     #[test]
     fn written_account_file_is_private_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("fell-write-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("fell/account.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fell/account.toml");
         let config = AccountConfig::bridge(
             "me@proton.me",
             "me@proton.me",
             fell_core::PasswordSource::Inline("p\"w #1".into()),
         );
-        write_account_config_at(&path, &config).unwrap();
+        stage_account_config_at(path.clone(), &config)
+            .unwrap()
+            .publish()
+            .unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let dir_mode = fs::metadata(path.parent().unwrap())
@@ -493,10 +506,26 @@ mod tests {
             & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(read_account_config(&path).unwrap(), Some(config.clone()));
-        // A second write replaces the first through a fresh 0600 temp file.
-        write_account_config_at(&path, &config).unwrap();
-        assert!(!path.with_extension("toml.tmp").exists());
-        let _ = fs::remove_dir_all(&dir);
+        let keyring = AccountConfig {
+            password: fell_core::PasswordSource::Keyring,
+            ..config.clone()
+        };
+        let staged = stage_account_config_at(path.clone(), &keyring).unwrap();
+        let staged_path = staged.file.path().to_owned();
+        assert_eq!(
+            read_account_config(&staged_path).unwrap(),
+            Some(keyring.clone())
+        );
+        // A failed keyring write drops the staged file and keeps the installed account.
+        drop(staged);
+        assert!(!staged_path.exists());
+        assert_eq!(read_account_config(&path).unwrap(), Some(config));
+
+        stage_account_config_at(path.clone(), &keyring)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(read_account_config(&path).unwrap(), Some(keyring));
     }
 
     #[test]

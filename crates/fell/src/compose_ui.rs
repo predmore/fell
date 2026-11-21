@@ -2220,7 +2220,8 @@ pub(crate) struct SendEnd {
 const SENT_UNRECORDED: &str =
     "Sent; the mailbox did not record it, so this draft will read as possibly sent";
 
-const SMTP_AUTH_RECOVERY: &str = "Update the password in account.toml or fix password_command. Run fell account check before retrying.";
+const SMTP_AUTH_RECOVERY: &str =
+    "Update the account password and run fell account check before retrying.";
 
 /// The window is one, and `c`, Enter or an agent's `request_send` can move
 /// it to another draft while a send is still in flight. Only the draft that
@@ -2389,8 +2390,8 @@ pub fn prepare_from_editor(
 }
 
 /// The backend for a send from the window: the demo mailbox, or the account
-/// file's login and SMTP settings for this account id. Runs
-/// `password_command`, so call it off the UI thread.
+/// file's login and SMTP settings for this account id. Resolves the account
+/// password, so call it off the UI thread.
 fn account_backend(account: &AccountId) -> Result<Box<dyn MailBackend + Send>, SendFailure> {
     let config = crate::mailbox::send_account_config(account).map_err(SendFailure::Unavailable)?;
     fell_core::backend_for(account, config.as_ref()).map_err(SendFailure::from_core)

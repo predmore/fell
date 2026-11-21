@@ -173,7 +173,9 @@ impl Session {
         };
         session.read_greeting()?;
         if config.security == ImapSecurity::StartTls {
-            session.command("STARTTLS", "STARTTLS")?;
+            session
+                .command("STARTTLS", "STARTTLS")
+                .map_err(|err| Error::Tls(err.to_string()))?;
             session.upgrade(config)?;
         }
         let logged_in = session.login(&config.username, &config.password)?;
@@ -1289,27 +1291,33 @@ fn wrap_tls(
     pending: Vec<u8>,
     config: &ImapConfig,
 ) -> Result<StreamOwned<ClientConnection, Prefixed<TcpStream>>, Error> {
-    let tls = tls_config(config)?;
+    let tls = tls_config(config).map_err(|err| Error::Tls(err.to_string()))?;
     let name = ServerName::try_from(config.host.as_str())
         .map_err(|_| {
-            imap_err(format!(
+            Error::Tls(format!(
                 "host {} is not a valid TLS server name",
                 config.host
             ))
         })?
         .to_owned();
-    let conn = ClientConnection::new(tls, name)
-        .map_err(|err| imap_err(format!("tls handshake setup failed: {err}")))?;
+    let mut conn = ClientConnection::new(tls, name)
+        .map_err(|err| Error::Tls(format!("TLS handshake setup failed: {err}")))?;
     // Bytes read with the tagged STARTTLS OK, including a ServerHello that
     // arrived in the same read, must be seen by rustls.
-    Ok(StreamOwned::new(
-        conn,
-        Prefixed {
-            prefix: pending,
-            pos: 0,
-            inner: tcp,
-        },
-    ))
+    let mut io = Prefixed {
+        prefix: pending,
+        pos: 0,
+        inner: tcp,
+    };
+    conn.complete_io(&mut io)
+        .map_err(|err| Error::Tls(format!("TLS handshake with {} failed: {err}", config.host)))?;
+    if conn.is_handshaking() {
+        return Err(Error::Tls(format!(
+            "TLS handshake with {} did not complete",
+            config.host
+        )));
+    }
+    Ok(StreamOwned::new(conn, io))
 }
 
 /// Reads `prefix` before the underlying socket, then writes straight through.

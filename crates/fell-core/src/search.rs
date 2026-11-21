@@ -944,30 +944,65 @@ fn semantic_threads(
     let Some(query) = ready.embed_query(&text) else {
         return Ok(Vec::new());
     };
-    let allowed = if has_filters(parsed) {
+    let filtered = has_filters(parsed);
+    // With common filters, checking the best candidates by message id can
+    // fill the result without reading every message in the account. Bound
+    // this probe so a selective filter still takes the bulk path below.
+    // Header MATCH operators can scan FTS postings on each lookup, so keep
+    // those on the bulk path from the start.
+    let probe =
+        filtered && parsed.from.is_empty() && parsed.to.is_empty() && parsed.subject.is_empty();
+    let allowed_rows = || -> Result<Vec<bool>> {
         let ids = filtered_message_ids(conn, account_id, parsed)?;
-        Some(
-            ready
-                .index
-                .rows_of(account_id.as_str(), ids.iter().map(String::as_str)),
-        )
-    } else {
-        None
+        Ok(ready
+            .index
+            .rows_of(account_id.as_str(), ids.iter().map(String::as_str)))
     };
+    let allowed = (filtered && !probe).then(allowed_rows).transpose()?;
     reached(Step::Filtered);
     let mut nearest = ready
         .index
-        .nearest(account_id.as_str(), &query, allowed.as_deref())
-        .map(|(message_id, _)| message_id);
-    reached(Step::Scanned);
-    let mut threads = HashSet::new();
+        .nearest(account_id.as_str(), &query, allowed.as_deref());
     let mut hits = Vec::new();
-    loop {
+    if probe {
+        hits = semantic_hits(
+            conn,
+            account_id,
+            parsed,
+            &mut nearest,
+            SEMANTIC_PROBE_BATCHES,
+            hits,
+        )?;
+        if hits.len() == semantic::SEMANTIC_THREADS || nearest.is_empty() {
+            return Ok(hits);
+        }
+        // Apply the bulk filter to the remaining scores and keep the hits
+        // already checked in the same snapshot.
+        nearest.retain_allowed(&allowed_rows()?);
+    }
+    semantic_hits(conn, account_id, parsed, &mut nearest, usize::MAX, hits)
+}
+
+fn semantic_hits(
+    conn: &Connection,
+    account_id: &AccountId,
+    parsed: &ParsedQuery,
+    nearest: &mut semantic::Nearest<'_>,
+    batches: usize,
+    mut hits: Vec<SearchHit>,
+) -> Result<Vec<SearchHit>> {
+    reached(Step::Scanned);
+    let mut threads: HashSet<_> = hits.iter().map(|hit| hit.thread_id.clone()).collect();
+    for _ in 0..batches {
         // Read one batch at a time. A run of near-identical replies
         // may all belong to one thread.
-        let batch: Vec<_> = nearest.by_ref().take(SEMANTIC_LOOKUP_BATCH).collect();
+        let batch: Vec<_> = nearest
+            .by_ref()
+            .take(SEMANTIC_LOOKUP_BATCH)
+            .map(|(message_id, _)| message_id)
+            .collect();
         if batch.is_empty() {
-            return Ok(hits);
+            break;
         }
         let mut found = semantic_rows(conn, account_id, parsed, &batch)?;
         for message_id in batch {
@@ -983,6 +1018,7 @@ fn semantic_threads(
             }
         }
     }
+    Ok(hits)
 }
 
 /// Every message of the account that passes the query's operators, ignoring
@@ -1001,6 +1037,8 @@ fn filtered_message_ids(
 
 /// One batch of candidates in the message lookup.
 const SEMANTIC_LOOKUP_BATCH: usize = 100;
+/// Most common filters have enough matches in the first few batches.
+const SEMANTIC_PROBE_BATCHES: usize = 4;
 
 /// The hits for `messages`, by message id, with the query's operators applied.
 fn semantic_rows(
@@ -1068,7 +1106,7 @@ fn filtered_select(
 pub(crate) enum Step {
     /// The vector matrix was brought up to date.
     Refreshed,
-    /// The operators ran and chose which rows the scan may use.
+    /// The scan is about to run, with preliminary operator matches if needed.
     Filtered,
     /// The scan chose its messages; their rows are read next.
     Scanned,
