@@ -222,10 +222,17 @@ pub fn blocks_column(
 /// The wide block width and, when set, the position of the prose within it.
 #[derive(Clone, Copy)]
 pub(crate) struct BlockColumn {
-    pub width: f32,
-    pub prose: Option<(f32, f32)>,
+    width: f32,
+    prose: Option<(f32, f32)>,
     wide_inset: f32,
-    measure: Option<f32>,
+    reader: Option<ReaderTable>,
+}
+
+#[derive(Clone, Copy)]
+struct ReaderTable {
+    reading_wide: f32,
+    progress: f32,
+    fill: u32,
 }
 
 impl BlockColumn {
@@ -234,30 +241,32 @@ impl BlockColumn {
             width,
             prose: None,
             wide_inset: 0.0,
-            measure: None,
+            reader: None,
         }
     }
 
-    pub fn measured(width: f32, measure: f32) -> Self {
-        Self {
-            measure: Some(measure),
-            ..Self::full(width)
-        }
-    }
-
-    pub fn reading(wide: f32, wide_inset: f32, prose: f32, prose_inset: f32) -> Self {
+    pub fn reading(
+        (wide, wide_inset): (f32, f32),
+        (prose, prose_inset): (f32, f32),
+        reading_wide: f32,
+        progress: f32,
+        fill: u32,
+    ) -> Self {
         Self {
             width: wide,
             prose: Some((prose, prose_inset)),
             wide_inset,
-            measure: None,
+            reader: Some(ReaderTable {
+                reading_wide,
+                progress,
+                fill,
+            }),
         }
     }
 
-    pub fn indented(self, indent: f32) -> Self {
+    fn indented(self, indent: f32) -> Self {
         Self {
             width: (self.width - indent).max(0.),
-            measure: self.measure.map(|width| (width - indent).max(0.)),
             prose: self
                 .prose
                 .map(|(width, inset)| ((width - indent).max(0.), inset)),
@@ -277,39 +286,81 @@ impl BlockColumn {
         })
     }
 
-    /// Keep the history rule beside the text when there are no wide blocks.
-    pub fn history(self, blocks: &[Block], gallery: &ImageGallery) -> (Self, f32) {
-        if let Some((width, inset)) = self.prose
-            && !blocks.iter().any(|block| is_wide_block(block, gallery))
-        {
-            return (Self::reading(width, 0.0, width, 0.0), inset);
+    /// Indent the prose under the rule. Wide children stay in their column.
+    fn history(self, indent: f32, rule: f32, rtl: bool) -> (Self, Option<f32>) {
+        if let Some((width, inset)) = self.prose {
+            let edge = if rtl {
+                inset + (width - rule).max(0.)
+            } else {
+                inset
+            };
+            let prose = (
+                (width - indent).max(0.),
+                if rtl { inset } else { inset + indent },
+            );
+            (
+                Self {
+                    prose: Some(prose),
+                    ..self
+                },
+                Some(edge),
+            )
+        } else {
+            (self.indented(indent), None)
         }
-        (self, 0.0)
+    }
+
+    pub fn quote(
+        self,
+        element: gpui::Div,
+        indent: f32,
+        rule: f32,
+        color: u32,
+        rtl: bool,
+    ) -> (gpui::Div, Self) {
+        let (layout, edge) = self.history(indent, rule, rtl);
+        let element = if let Some(edge) = edge {
+            element.relative().child(
+                div()
+                    .absolute()
+                    .left(px(edge))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(rule))
+                    .bg(paint(color)),
+            )
+        } else if rtl {
+            element
+                .pr(px(indent - rule))
+                .border_r(px(rule))
+                .border_color(paint(color))
+        } else {
+            element
+                .pl(px(indent - rule))
+                .border_l(px(rule))
+                .border_color(paint(color))
+        };
+        (element, layout)
+    }
+
+    fn table(self, intrinsic: f32) -> (f32, f32) {
+        let (Some(reader), Some((prose_width, prose_inset))) = (self.reader, self.prose) else {
+            return (self.width, 0.0);
+        };
+        if intrinsic <= READING_MEASURE_PX {
+            (intrinsic.min(prose_width), prose_inset)
+        } else {
+            let width = intrinsic.min(self.width);
+            let reading_width = intrinsic.min(reader.reading_wide);
+            let inset =
+                self.wide_inset + (reader.reading_wide - reading_width) * 0.5 * reader.progress;
+            (width, inset)
+        }
     }
 }
 
-const WIDE_IMAGE_PX: f32 = 600.0;
-
-fn is_wide_block(block: &Block, gallery: &ImageGallery) -> bool {
-    let decoded = |source: &ImageSource| matches!(source, ImageSource::Data { bytes, .. } if gallery.placed(bytes, false).is_some_and(|(_, width, _)| width > WIDE_IMAGE_PX));
-    match block {
-        Block::Table { .. } | Block::Code { .. } => true,
-        Block::Image { source, .. } => decoded(source),
-        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
-            let mut has_image = false;
-            walk_inlines_sources(inlines, &mut |source| has_image |= decoded(source));
-            has_image
-        }
-        Block::Quote { blocks } | Block::Small { blocks } | Block::ReplyHeader { blocks } => {
-            blocks.iter().any(|block| is_wide_block(block, gallery))
-        }
-        Block::List { items, .. } => items
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .any(|block| is_wide_block(block, gallery)),
-        Block::ThematicBreak => false,
-    }
-}
+/// A comfortable line of mail text, about 72 characters.
+pub(crate) const READING_MEASURE_PX: f32 = 600.0;
 
 /// [`blocks_column`] with `gap` between blocks instead of [`BLOCK_GAP`]:
 /// opened history sits tighter than the sender's own paragraphs.
@@ -326,15 +377,6 @@ pub(crate) fn blocks_column_spaced(
     let mut column = div().flex().flex_col().line_height(px(22.));
     let mut previous: Option<&Block> = None;
     for (start, end) in column_runs(blocks, allow_remote, gallery) {
-        let measure = layout.measure.filter(|_| {
-            !matches!(
-                blocks[start],
-                Block::Table { .. } | Block::Code { large: false, .. }
-            )
-        });
-        let block_layout = measure.map_or(layout, |measure| {
-            BlockColumn::full(measure.min(layout.width))
-        });
         let child = if end - start == 2 {
             sketch_with_caption(
                 &blocks[start],
@@ -342,10 +384,10 @@ pub(crate) fn blocks_column_spaced(
                 palette,
                 allow_remote,
                 gallery,
-                block_layout,
+                layout,
             )
         } else {
-            render_block(&blocks[start], palette, allow_remote, gallery, block_layout)
+            render_block(&blocks[start], palette, allow_remote, gallery, layout)
         };
         let gap = previous.map_or(0., |above| {
             // Blocked-image lines stacked one under another read as a
@@ -358,12 +400,7 @@ pub(crate) fn blocks_column_spaced(
                 gap_between(above, &blocks[start]) * gap
             }
         });
-        column = column.child(
-            div()
-                .mt(px(gap))
-                .when_some(measure, |prose, measure| prose.max_w(px(measure)))
-                .child(child),
-        );
+        column = column.child(div().mt(px(gap)).child(child));
         previous = Some(&blocks[end - 1]);
     }
     column
@@ -546,28 +583,18 @@ fn render_block(
             )
             .into_any_element(),
         Block::Quote { blocks } => {
-            let (quote_layout, inset) = layout.history(blocks, gallery);
-            let tight = quote_layout.width != layout.width || inset > 0.0;
-            let layout = quote_layout;
-            div()
-                .ml(px(inset))
-                .when(tight, |quote| quote.w(px(layout.width)))
-                .border_l(px(QUOTE_RULE_PX))
-                .border_color(paint(palette.quote))
-                .pl(px(QUOTE_INSET_PX - QUOTE_RULE_PX))
+            let (quote, layout) =
+                layout.quote(div(), QUOTE_INSET_PX, QUOTE_RULE_PX, palette.quote, false);
+            quote
                 .text_color(paint(palette.foreground))
                 .flex()
                 .flex_col()
                 .gap_2()
-                .children(blocks.iter().map(|child| {
-                    render_block(
-                        child,
-                        palette,
-                        allow_remote,
-                        gallery,
-                        layout.indented(QUOTE_INSET_PX),
-                    )
-                }))
+                .children(
+                    blocks
+                        .iter()
+                        .map(|child| render_block(child, palette, allow_remote, gallery, layout)),
+                )
                 .into_any_element()
         }
         Block::List { ordered, items } => div()
@@ -618,18 +645,7 @@ fn render_block(
             header,
             rows,
             align,
-        } => layout
-            .wide(div())
-            .child(render_table(
-                header,
-                rows,
-                align,
-                palette,
-                allow_remote,
-                gallery,
-                layout.width,
-            ))
-            .into_any_element(),
+        } => render_table(header, rows, align, palette, allow_remote, gallery, layout),
         Block::Image { source, alt } => {
             image_el(source, alt, palette, allow_remote, gallery, layout)
         }
@@ -699,7 +715,7 @@ fn render_table(
     palette: &Palette,
     allow_remote: bool,
     gallery: &ImageGallery,
-    width: f32,
+    layout: BlockColumn,
 ) -> AnyElement {
     let cell = |blocks: &Vec<Block>| {
         let mut lines = Vec::new();
@@ -714,7 +730,7 @@ fn render_table(
                     palette,
                     allow_remote,
                     gallery,
-                    BlockColumn::full(width),
+                    BlockColumn::full(layout.width),
                 )
             }))
             .into_any_element();
@@ -732,7 +748,7 @@ fn render_table(
             .collect(),
         align: align.to_vec(),
         palette: *palette,
-        width,
+        layout,
         inner: None,
     }
     .into_any_element()
@@ -750,7 +766,7 @@ struct TableElement {
     rows: Vec<Vec<TableCell>>,
     align: Vec<Align>,
     palette: Palette,
-    width: f32,
+    layout: BlockColumn,
     inner: Option<AnyElement>,
 }
 
@@ -813,6 +829,8 @@ impl Element for TableElement {
             })
             .collect();
         let widths = column_widths(&lines, measure);
+        let intrinsic = widths.iter().map(|column| column.max).sum::<f32>() + 2. * TABLE_BORDER_PX;
+        let (width, inset) = self.layout.table(intrinsic);
         let palette = self.palette;
         let table = div()
             .flex()
@@ -820,13 +838,16 @@ impl Element for TableElement {
             .overflow_hidden()
             .border(px(TABLE_BORDER_PX))
             .border_color(paint(palette.border))
-            .rounded(px(4.));
+            .rounded(px(4.))
+            .when_some(self.layout.reader, |table, reader| {
+                table.w(px(width)).ml(px(inset)).bg(paint(reader.fill))
+            });
         let header = std::mem::take(&mut self.header);
         let rows = std::mem::take(&mut self.rows);
-        let table = if table_columns_fit(&widths, self.width) {
+        let table = if table_columns_fit(&widths, width) {
             self.grid(table, header, rows, &widths)
         } else {
-            self.stacked(table, header, rows, &widths, measure)
+            self.stacked(table, header, rows, &widths, width, measure)
         };
         let mut inner = table.into_any_element();
         let layout = inner.request_layout(window, cx);
@@ -911,6 +932,7 @@ impl TableElement {
         header: Vec<TableCell>,
         rows: Vec<Vec<TableCell>>,
         widths: &[ColumnWidth],
+        width: f32,
         measure: impl Fn(&str, bool) -> f32,
     ) -> gpui::Div {
         if rows.is_empty() {
@@ -935,7 +957,7 @@ impl TableElement {
                 }
             })
             .collect();
-        let room = (self.width - 2. * TABLE_BORDER_PX - TABLE_CELL_PAD_PX).max(0.);
+        let room = (width - 2. * TABLE_BORDER_PX - TABLE_CELL_PAD_PX).max(0.);
         // Share a label column across rows while it leaves room for the
         // values. At very small widths a label sits over its own value.
         let label_width = labels
@@ -2289,7 +2311,7 @@ fn image_el(
         && let Some((rendered, width, height)) = gallery.placed(bytes, palette.scheme() == "dark")
     {
         let (limit, inset) = layout.prose.map_or((width, 0.0), |prose| {
-            if width > WIDE_IMAGE_PX {
+            if width > READING_MEASURE_PX {
                 (layout.width, layout.wide_inset)
             } else {
                 prose
@@ -3269,6 +3291,29 @@ mod decode_tests {
         };
         assert!(super::table_columns_fit(&widths_for(2), 250.));
         assert!(!super::table_columns_fit(&widths_for(4), 250.));
+    }
+
+    #[test]
+    fn a_quote_indents_prose_and_small_tables_without_moving_wide_children() {
+        use super::BlockColumn;
+
+        let layout = BlockColumn::reading((1040., 182.), (600., 402.), 1040., 1., 0);
+        let (quote, rule) = layout.history(12., 2., false);
+        assert_eq!(rule, Some(402.));
+        assert_eq!(quote.prose, Some((588., 414.)));
+        assert_eq!(
+            (quote.width, quote.wide_inset),
+            (layout.width, layout.wide_inset)
+        );
+        assert_eq!(quote.table(170.), (170., 414.));
+        assert_eq!(quote.table(600.), (588., 414.));
+        assert_eq!(quote.table(900.), layout.table(900.));
+        assert_eq!(quote.table(900.), (900., 252.));
+        assert_eq!(quote.table(1400.), (1040., 182.));
+        let (rtl_quote, rtl_rule) = layout.history(12., 2., true);
+        assert_eq!(rtl_rule, Some(1000.));
+        assert_eq!(rtl_quote.prose, Some((588., 402.)));
+        assert_eq!(rtl_quote.table(900.), quote.table(900.));
     }
 
     #[test]
