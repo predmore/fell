@@ -39,6 +39,100 @@ fn listed_parts(store: &Store, message: &Message) -> Vec<PartRequest> {
     list
 }
 
+pub(super) fn listed_fixture(tag: &str) -> (PathBuf, PartCache, Store, PartRequest) {
+    let (root, cache, store) = open_fixture(tag);
+    let target = message("a1", "part@x", "INBOX", 1);
+    store.upsert_message(&target).unwrap();
+    let part = listed_parts(&store, &target).remove(0);
+    (root, cache, store, part)
+}
+
+fn delete_and_sweep_during_download(role: PartRole) {
+    let (root, cache, store) = open_fixture("sweep-during-download");
+    let mut target = message("a1", "expunge@x", "Trash", 1);
+    let part = &mut target.parts.as_mut().unwrap().mime_parts[0];
+    part.role = role;
+    if role == PartRole::Inline {
+        part.mime_type = "image/png".into();
+        part.content_id = Some("logo@x".into());
+    }
+    let thread = store.upsert_message(&target).unwrap();
+    let part = listed_parts(&store, &target).remove(0);
+    let mut old_name = part.clone();
+    old_name.part.filename = Some("old-name".into());
+    let old = cache.seed(&old_name, b"old!").unwrap();
+    let dir = old.path.parent().unwrap();
+
+    let fetch_store = Store::open_for_part_fetch(&root.join("mail.db")).unwrap();
+    let backend = Serves(b"ZGF0YQ==", || {
+        store
+            .delete_thread(&target.account_id, &thread, "Trash")
+            .unwrap();
+        store.clean_part_cache(&cache).unwrap();
+        assert!(!dir.exists(), "the sweep finished during the download");
+        assert!(
+            !store
+                .conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM part_cache_sections)",
+                    [],
+                    |row| { row.get::<_, bool>(0) }
+                )
+                .unwrap(),
+            "the sweep acknowledged cleanup"
+        );
+    });
+    let error = if role == PartRole::Inline {
+        prefetch_inline_parts(&backend, &cache, &fetch_store, &[part]).unwrap_err()
+    } else {
+        fetch_part(&backend, &cache, &fetch_store, &part, &mut |_| {}).unwrap_err()
+    };
+    assert_eq!(error.to_string(), part_removed().to_string());
+    assert!(
+        !dir.exists(),
+        "the stale download did not recreate the entry"
+    );
+    drop((fetch_store, store));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fetch_part_cannot_republish_after_delete_and_sweep() {
+    delete_and_sweep_during_download(PartRole::Attachment);
+}
+
+#[test]
+fn inline_prefetch_cannot_republish_after_delete_and_sweep() {
+    delete_and_sweep_during_download(PartRole::Inline);
+}
+
+#[test]
+fn a_cached_hit_remains_readable_after_delete_and_sweep() {
+    use std::io::Read;
+
+    let (root, cache, store) = open_fixture("sweep-after-hit");
+    let target = message("a1", "hit@x", "Trash", 1);
+    let thread = store.upsert_message(&target).unwrap();
+    let part = listed_parts(&store, &target).remove(0);
+    let backend = Serves(b"ZGF0YQ==", || {});
+    fetch_part(&backend, &cache, &store, &part, &mut |_| {}).unwrap();
+    let offline = Serves(b"", || panic!("a hit must skip the backend"));
+    let mut hit = fetch_part(&offline, &cache, &store, &part, &mut |_| {}).unwrap();
+
+    store
+        .delete_thread(&target.account_id, &thread, "Trash")
+        .unwrap();
+    let error = fetch_part(&offline, &cache, &store, &part, &mut |_| {}).unwrap_err();
+    assert_eq!(error.to_string(), part_removed().to_string());
+    store.clean_part_cache(&cache).unwrap();
+    assert!(!hit.path.exists());
+    let mut bytes = Vec::new();
+    hit.file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"data");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn sync_settle_cleans_current_and_retired_sections_in_only_the_deleted_account() {
     let (root, cache, store) = open_fixture("sync-cleanup");
@@ -49,17 +143,17 @@ fn sync_settle_cleans_current_and_retired_sections_in_only_the_deleted_account()
         store.upsert_message(message).unwrap();
     }
     let target_parts = listed_parts(&store, &target);
-    let current = cache.store(&target_parts[0], b"data").unwrap();
-    let retired = cache.store(&target_parts[1], b"data").unwrap();
+    let current = cache.seed(&target_parts[0], b"data").unwrap();
+    let retired = cache.seed(&target_parts[1], b"data").unwrap();
     let account_neighbor = cache
-        .store(&listed_parts(&store, &other_account)[0], b"data")
+        .seed(&listed_parts(&store, &other_account)[0], b"data")
         .unwrap();
     let message_neighbor = cache
-        .store(&listed_parts(&store, &other_message)[0], b"data")
+        .seed(&listed_parts(&store, &other_message)[0], b"data")
         .unwrap();
     let mut old_name = target_parts[0].clone();
     old_name.part.filename = Some("old.pdf".into());
-    let old_name = cache.store(&old_name, b"data").unwrap();
+    let old_name = cache.seed(&old_name, b"data").unwrap();
 
     target.parts.as_mut().unwrap().mime_parts.truncate(1);
     store.upsert_message(&target).unwrap();
@@ -117,8 +211,8 @@ fn duplicate_merge_cleans_the_absorbed_rows_cache_and_keeps_the_canonical_rows_c
     store.upsert_message(&duplicate).unwrap();
     let keeper_part = &listed_parts(&store, &keeper)[0];
     let duplicate_part = &listed_parts(&store, &duplicate)[0];
-    let retained = cache.store(keeper_part, b"keep").unwrap();
-    let removed = cache.store(duplicate_part, b"drop").unwrap();
+    let retained = cache.seed(keeper_part, b"keep").unwrap();
+    let removed = cache.seed(duplicate_part, b"drop").unwrap();
 
     duplicate.list_id = Some("list.example.test".into());
     store.upsert_message(&duplicate).unwrap();
@@ -144,8 +238,8 @@ fn a_rolled_back_delete_keeps_its_cache_and_a_committed_purge_retries_after_reop
     let target = message("a1", "purge@x", "Trash", 1);
     let thread = store.upsert_message(&target).unwrap();
     let requests = listed_parts(&store, &target);
-    let blocked = cache.store(&requests[0], b"data").unwrap();
-    let ready = cache.store(&requests[1], b"data").unwrap();
+    let blocked = cache.seed(&requests[0], b"data").unwrap();
+    let ready = cache.seed(&requests[1], b"data").unwrap();
     let store_path = root.join("mail.db");
     let reader = Store::open_for_part_fetch(&store_path).unwrap();
     let tx = crate::store::begin_immediate(&store.conn).unwrap();
@@ -193,7 +287,7 @@ fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
     store.upsert_message(&target).unwrap();
     let part = listed_parts(&store, &target).remove(0);
     let worker = PartFetcher::start_for_store(
-        || Ok(Box::new(Serves(b"ZGF0YQ=="))), // "data"
+        || Ok(Box::new(Serves(b"ZGF0YQ==", || {}))), // "data"
         cache.clone(),
         root.join("mail.db"),
     );
@@ -222,7 +316,7 @@ fn an_in_flight_fetch_publishes_after_an_html_rewrite() {
     resume.send(()).unwrap();
     let published = result.recv_timeout(timeout).unwrap().unwrap();
     assert_eq!(fs::read(&published.path).unwrap(), b"data");
-    assert_eq!(cache.lookup(&part), Some(published));
+    assert_eq!(cache.lookup(&part).unwrap().path, published.path);
     drop((worker, store));
     fs::remove_dir_all(root).unwrap();
 }
@@ -259,7 +353,7 @@ fn undo_rejects_an_in_flight_fetch_from_a_reinserted_message() {
     ));
 
     let worker = PartFetcher::start_for_store(
-        || Ok(Box::new(Serves(b"bmV3IQ=="))), // "new!"
+        || Ok(Box::new(Serves(b"bmV3IQ==", || {}))), // "new!"
         cache.clone(),
         root.join("mail.db"),
     );
@@ -311,10 +405,10 @@ fn an_in_flight_fetch_cannot_repopulate_the_cache_after_expunge_and_undo() {
     }
     let thread = store.upsert_message(&target).unwrap();
     let parts = listed_parts(&store, &target);
-    let earlier_hit = cache.store(&parts[1], b"stale").unwrap();
+    let earlier_hit = cache.seed(&parts[1], b"stale").unwrap();
     let start = || {
         PartFetcher::start_for_store(
-            || Ok(Box::new(Serves(b"ZnJlc2g="))), // "fresh"
+            || Ok(Box::new(Serves(b"ZnJlc2g=", || {}))), // "fresh"
             cache.clone(),
             root.join("mail.db"),
         )
