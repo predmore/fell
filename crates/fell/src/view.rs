@@ -914,6 +914,14 @@ impl Inbox {
             self.draft_home = None;
         }
         self.session.sync = opened.sync;
+        if let Some(warning) = opened.warning {
+            self.session.show_toast(warning, true);
+            self.dismiss_notice_after(
+                self.session.toast_generation(),
+                std::time::Duration::from_secs(8),
+                cx,
+            );
+        }
         cx.default_global::<ReplyChecks>()
             .start(self.account_id.clone(), sync_with.is_none() || store_failed);
         if !store_failed {
@@ -1574,13 +1582,12 @@ impl Inbox {
         // before starting another body-only read.
         let new_selection = open_changed && self.session.cursor_id.is_some();
         let refresh_open = open_changed || grew || waiting || intent.refresh_open;
-        if !self.waiting_to_open
-            && (emptied
-                || new_selection
-                || self.session.cursor_draft().is_some()
-                || (refresh_open && !follow_up_pending))
+        if emptied
+            || new_selection
+            || self.session.cursor_draft().is_some()
+            || (refresh_open && !follow_up_pending)
         {
-            self.request_messages(true, cx);
+            self.read_selected_messages(true, cx);
         }
         // A cursor move that waited for these rows may need more.
         self.issue_fetch(cx);
@@ -2046,15 +2053,20 @@ impl Inbox {
         }
     }
 
+    /// An explicit selection can open a conversation while bodies download.
+    fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.waiting_to_open = false;
+        self.read_selected_messages(force, cx);
+    }
+
     /// Read the selected thread on the store thread. A read that is stale
     /// by the time the store thread reaches it is skipped there.
-    fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
+    fn read_selected_messages(&mut self, force: bool, cx: &mut Context<Self>) {
         let Some(id) = self.session.cursor_id.clone() else {
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.clear_open_message();
             return;
         };
-        self.waiting_to_open = false;
         if !force && self.open_thread.as_deref() == Some(id.as_str()) {
             return;
         }
@@ -2062,6 +2074,7 @@ impl Inbox {
             return;
         }
         if let Some(draft) = self.session.cursor_draft() {
+            self.waiting_to_open = false;
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.body_loads.clear();
@@ -2107,38 +2120,41 @@ impl Inbox {
             Some((generation, search.effective_query().to_owned()))
         });
         let cached = self.bodies.stamps();
+        let wait_for_body = self.waiting_to_open;
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
-                return None;
+                return Ok(None);
             }
-            Some(
+            let mut view =
                 read_conversation(store, &account, &thread, (&me, &roles, &names, &viewing))
-                    .map(|mut view| {
-                        let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
-                        let matches = query.as_ref().map(|(accepted, query)| {
-                            (
-                                *accepted,
-                                store
-                                    .search_thread_matches(&account, query, &thread)
-                                    .unwrap_or_default(),
-                            )
-                        });
-                        let latest_note = opening
-                            .then(|| {
-                                store
-                                    .latest_thread_note_id(&account, &thread)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .flatten();
-                        let notes = store.thread_notes(&account, &thread).ok();
-                        (view, reads, matches, notes, latest_note)
-                    })
-                    .map_err(|err| err.to_string()),
-            )
+                    .map_err(|err| err.to_string())?;
+            // The automatic preview after setup waits for the last message.
+            // Each sync write refreshes the folder and retries this read.
+            if wait_for_body && !present::newest_body_ready(&view) {
+                return Ok(None);
+            }
+            let reads = mail_body::read_bodies(store, &account, &mut view, &cached);
+            let matches = query.as_ref().map(|(accepted, query)| {
+                (
+                    *accepted,
+                    store
+                        .search_thread_matches(&account, query, &thread)
+                        .unwrap_or_default(),
+                )
+            });
+            let latest_note = opening
+                .then(|| {
+                    store
+                        .latest_thread_note_id(&account, &thread)
+                        .ok()
+                        .flatten()
+                })
+                .flatten();
+            let notes = store.thread_notes(&account, &thread).ok();
+            Ok(Some((view, reads, matches, notes, latest_note)))
         });
         cx.spawn(async move |this, cx| {
-            let Ok(Some(result)) = reply.await else {
+            let Ok(result) = reply.await else {
                 return;
             };
             let _ = this.update(cx, |inbox, cx| {
@@ -2149,7 +2165,8 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok((view, _, _, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
+                    Ok(None) => {}
+                    Ok(Some((view, _, _, _, _))) if view.is_empty() && inbox.session.search.is_some() => {
                         // A hit may disappear between the two reads. Search
                         // has its own list, so a folder read cannot replace it.
                         inbox.clear_open_message();
@@ -2159,7 +2176,7 @@ impl Inbox {
                             inbox.refresh_search(cx);
                         }
                     }
-                    Ok((view, _, _, _, _))
+                    Ok(Some((view, _, _, _, _)))
                         if view.is_empty() && !inbox.session.messages.is_empty() =>
                     {
                         // The open thread key can disappear between the folder
@@ -2169,10 +2186,11 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                     }
-                    Ok((mut view, reads, matches, notes, latest_note)) => {
+                    Ok(Some((mut view, reads, matches, notes, latest_note))) => {
                         if let Some(notes) = notes {
                             inbox.update_agent_notes(note_generation, &id, notes);
                         }
+                        inbox.waiting_to_open = false;
                         inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());

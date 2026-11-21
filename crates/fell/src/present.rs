@@ -91,6 +91,12 @@ pub fn awaiting_bodies(shown: &[ConvMessage]) -> bool {
         .any(|message| message.body_state == fell_core::BodyState::Pending)
 }
 
+pub fn newest_body_ready(shown: &[ConvMessage]) -> bool {
+    shown
+        .last()
+        .is_some_and(|message| message.body_state != fell_core::BodyState::Pending)
+}
+
 pub fn same_messages(shown: &[ConvMessage], read: &[ConvMessage]) -> bool {
     shown.len() == read.len() && shown.iter().zip(read).all(|(old, new)| old.id == new.id)
 }
@@ -1427,6 +1433,23 @@ mod tests {
             context: None,
             body_state: state,
         }
+    }
+
+    #[test]
+    fn the_first_inbox_preview_opens_when_the_newest_body_is_ready() {
+        use fell_core::BodyState::{Pending, Stored, TooLarge};
+
+        assert!(!newest_body_ready(&[]));
+        let mut messages = [
+            shown_message("a", Stored, "older"),
+            shown_message("b", Pending, ""),
+        ];
+        assert!(!newest_body_ready(&messages));
+        messages[0].body_state = Pending;
+        messages[1] = shown_message("b", Stored, "newest");
+        assert!(newest_body_ready(&messages));
+        messages[1].body_state = TooLarge;
+        assert!(newest_body_ready(&messages));
     }
 
     #[test]

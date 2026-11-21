@@ -30,6 +30,7 @@ pub struct Opened {
     pub account: Account,
     pub sync: SyncKind,
     pub error: Option<String>,
+    pub warning: Option<String>,
 }
 
 pub fn startup() -> Startup {
@@ -63,19 +64,12 @@ pub fn open_store(
 ) -> (Store, Opened) {
     let opened = path
         .and_then(|path| open_at(&path).map_err(|err| err.to_string()))
-        .and_then(|store| match prepare(&store, config, demo) {
-            Ok((account, sync)) => Ok((store, account, sync)),
-            Err(err) => Err(err.to_string()),
+        .and_then(|store| {
+            let opened = prepare(&store, config, demo).map_err(|err| err.to_string())?;
+            Ok((store, opened))
         });
     match opened {
-        Ok((store, account, sync)) => (
-            store,
-            Opened {
-                account,
-                sync,
-                error: None,
-            },
-        ),
+        Ok(result) => result,
         Err(error) => fallback(error),
     }
 }
@@ -329,37 +323,56 @@ fn fallback(error: String) -> (Store, Opened) {
             },
             sync: SyncKind::StoreError,
             error: Some(error),
+            warning: None,
         },
     )
 }
 
-fn prepare(
-    store: &Store,
-    config: Option<&AccountConfig>,
-    demo: bool,
-) -> fell_core::Result<(Account, SyncKind)> {
+fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_core::Result<Opened> {
     if let Some(config) = config {
         let account = config.account();
-        store.configure_account(&account, config.write_back)?;
-        return Ok((account, SyncKind::Connecting));
+        let retained = store.configure_account(&account, config.write_back)?;
+        let warning = (!retained.is_empty()).then(|| {
+            format!(
+                "Kept existing accounts with reserved IDs · {}",
+                retained.join(", ")
+            )
+        });
+        return Ok(Opened {
+            account,
+            sync: SyncKind::Connecting,
+            error: None,
+            warning,
+        });
     }
     let accounts = store.list_accounts()?;
     if demo && accounts.is_empty() {
         let account = fixture_account();
         seed_if_empty(store, &account)?;
-        return Ok((account, SyncKind::FixtureOffline));
+        return Ok(Opened {
+            account,
+            sync: SyncKind::FixtureOffline,
+            error: None,
+            warning: None,
+        });
     }
     let account = accounts
         .into_iter()
         .find(|account| demo || !fell_core::is_demo_account(&account.id))
         .ok_or_else(|| fell_core::Error::Invalid("No readable account configuration.".into()))?;
-    if fell_core::is_demo_account(&account.id) {
-        Ok((account, SyncKind::FixtureOffline))
+    let sync = if fell_core::is_demo_account(&account.id) {
+        SyncKind::FixtureOffline
     } else if store.list_threads(&account.id)?.is_empty() {
-        Ok((account, SyncKind::FirstSync))
+        SyncKind::FirstSync
     } else {
-        Ok((account, SyncKind::LocalOffline))
-    }
+        SyncKind::LocalOffline
+    };
+    Ok(Opened {
+        account,
+        sync,
+        error: None,
+        warning: None,
+    })
 }
 
 fn open_at(path: &Path) -> fell_core::Result<Store> {
@@ -616,8 +629,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert!(prepare(&store, None, false).is_err());
         assert!(store.list_accounts().unwrap().is_empty());
-        let (fixture, kind) = prepare(&store, None, true).unwrap();
-        assert_eq!(kind, SyncKind::FixtureOffline);
+        let opened = prepare(&store, None, true).unwrap();
+        assert_eq!(opened.sync, SyncKind::FixtureOffline);
+        let fixture = opened.account;
         assert!(prepare(&store, None, false).is_err());
         for id in ["local", "fixture", "demo"] {
             let mut demo = fixture.clone();
@@ -637,8 +651,10 @@ mod tests {
             "me@proton.me",
             fell_core::PasswordSource::Inline("x".into()),
         );
-        let (account, kind) = prepare(&store, Some(&config), true).unwrap();
-        assert_eq!(kind, SyncKind::Connecting);
+        let opened = prepare(&store, Some(&config), true).unwrap();
+        assert_eq!(opened.sync, SyncKind::Connecting);
+        assert!(opened.warning.is_none());
+        let account = opened.account;
         assert_eq!(account.email, "me@proton.me");
         assert_eq!(store.list_accounts().unwrap(), [account]);
         assert!(store.list_agent_grants().unwrap().is_empty());
@@ -650,6 +666,44 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("unknown account")
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_real_account_keeps_the_disk_mailbox_open_on_each_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.db");
+        let legacy = Account {
+            email: "legacy@example.test".into(),
+            ..fixture_account()
+        };
+        let store = Store::open(&path).unwrap();
+        store.upsert_account(&legacy).unwrap();
+        drop(store);
+
+        let config = AccountConfig::bridge(
+            "configured@example.test",
+            "configured@example.test",
+            fell_core::PasswordSource::Inline("test".into()),
+        );
+        for _ in 0..2 {
+            let (store, opened) = open_store(Ok(path.clone()), Some(&config), false);
+            assert_eq!(store.db_path(), Some(path.as_path()));
+            assert_eq!(opened.sync, SyncKind::Connecting);
+            assert!(opened.error.is_none());
+            assert!(
+                opened
+                    .warning
+                    .as_deref()
+                    .unwrap()
+                    .contains("reserved IDs · local")
+            );
+            assert_eq!(opened.account.id, config.account().id);
+            assert!(store.get_account(&opened.account.id).unwrap().is_some());
+            assert_eq!(
+                store.get_account(&legacy.id).unwrap().unwrap().email,
+                legacy.email
             );
         }
     }

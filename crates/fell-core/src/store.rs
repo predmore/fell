@@ -678,19 +678,40 @@ impl Store {
 
     /// Install a configured account and retire the in-process demo mailbox
     /// in the same transaction. Demo grants never follow the new account.
-    pub fn configure_account(&self, account: &Account, write_back: bool) -> Result<()> {
+    /// Return the reserved IDs of real accounts left in place.
+    pub fn configure_account(
+        &self,
+        account: &Account,
+        write_back: bool,
+    ) -> Result<Vec<&'static str>> {
         if crate::is_demo_account(&account.id) {
-            return Err(reserved_account_id(account.id.as_str()));
+            return Err(crate::Error::Invalid(format!(
+                "Account ID {:?} is reserved for demo mail",
+                account.id.as_str()
+            )));
         }
         let tx = immediate_transaction(&self.conn)?;
         crate::outbox::ensure_schema(&tx)?;
+        let mut retained = Vec::new();
         for id in crate::backend::DEMO_ACCOUNT_IDS {
-            delete_demo_account(&tx, id)?;
+            let demo = tx
+                .query_row(
+                    "SELECT email = ?2 AND backend_kind = 'bridge' FROM accounts WHERE id = ?1",
+                    params![id, crate::DEMO_MAILBOX_ADDRESS],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            match demo {
+                Some(true) => delete_demo_account(&tx, id)?,
+                Some(false) => retained.push(id),
+                None => {}
+            }
         }
         upsert_account_on(&tx, account)?;
         crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
         tx.commit()?;
-        self.seal_private_files()
+        self.seal_private_files()?;
+        Ok(retained)
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>> {
@@ -2455,25 +2476,7 @@ fn upsert_account_on(conn: &Connection, account: &Account) -> Result<()> {
     Ok(())
 }
 
-fn reserved_account_id(id: &str) -> crate::Error {
-    crate::Error::Invalid(format!(
-        "Account ID \"{id}\" is reserved for demo mail. An existing real account with this ID must be migrated before setup can continue."
-    ))
-}
-
 fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
-    let demo = conn
-        .query_row(
-            "SELECT email = ?2 AND backend_kind = 'bridge' FROM accounts WHERE id = ?1",
-            params![id, crate::DEMO_MAILBOX_ADDRESS],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()?;
-    match demo {
-        None => return Ok(()),
-        Some(false) => return Err(reserved_account_id(id)),
-        Some(true) => {}
-    }
     for child in ["agent_action_messages", "agent_action_drafts"] {
         conn.execute(
             &format!(
@@ -2499,6 +2502,7 @@ fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
         "thread_dirty_ids",
         "thread_dirty_subjects",
         "folder_roles",
+        "mailbox_views",
         "account_folders",
         "sent_bcc",
         "server_outbox",
@@ -4628,8 +4632,14 @@ mod tests {
             )
             .unwrap();
 
-        let error = store.configure_account(&account(), true).unwrap_err();
-        assert!(error.to_string().contains("\"fixture\" is reserved"));
+        let configured = account();
+        assert_eq!(
+            store.configure_account(&configured, true).unwrap(),
+            ["fixture"]
+        );
+        assert!(store.get_account(&demo.id).unwrap().is_none());
+        assert!(store.get_account(&configured.id).unwrap().is_some());
+        assert!(store.write_back(&configured.id).unwrap());
         assert_eq!(
             store.get_account(&real.id).unwrap().unwrap().email,
             real.email
