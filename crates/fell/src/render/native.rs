@@ -1186,7 +1186,7 @@ pub(crate) fn plain_text(text: String, palette: Palette) -> impl IntoElement {
 /// into the one before it when the colour and decorations match, so a bold
 /// label at the start of a line set the whole line bold.
 fn shape_one(
-    window: &mut Window,
+    window: &Window,
     text: &str,
     font_size: Pixels,
     runs: &[gpui::TextRun],
@@ -1206,14 +1206,24 @@ fn shape_one(
 }
 
 /// The x of each byte of a shaped left-to-right line, as `x_for_index`
-/// gives it: where the first glyph at or after the byte starts. The last
-/// entry is the line's width. Mixed-direction glyph order can make byte
-/// offsets unusable even in a paragraph that's left-aligned.
-fn byte_xs(glyphs: impl Iterator<Item = (usize, f32)>, len: usize, width: f32) -> Option<Vec<f32>> {
-    let glyphs: Vec<_> = glyphs.collect();
+/// gives it: where the first glyph at or after the byte starts. The text
+/// being wrapped has soft hyphens that the shaper's input omits. Mixed
+/// direction glyph order can make byte offsets unusable.
+fn byte_xs(glyphs: impl Iterator<Item = (usize, f32)>, text: &str, width: f32) -> Option<Vec<f32>> {
+    let mut hyphens = text.match_indices(SOFT_HYPHEN).peekable();
+    let mut skipped = 0;
+    let glyphs: Vec<_> = glyphs
+        .map(|(index, x)| {
+            while hyphens.next_if(|(at, _)| *at <= index + skipped).is_some() {
+                skipped += SOFT_HYPHEN.len_utf8();
+            }
+            (index + skipped, x)
+        })
+        .collect();
     if !glyphs.iter().map(|(index, _)| index).is_sorted() {
         return None;
     }
+    let len = text.len();
     let mut xs = vec![width; len + 1];
     let mut next = glyphs.len();
     let mut x = width;
@@ -1432,7 +1442,7 @@ fn visible_mail_line<'a>(
 }
 
 fn shape_mail_line(
-    window: &mut Window,
+    window: &Window,
     text: &str,
     font_size: Pixels,
     runs: &[gpui::TextRun],
@@ -1706,30 +1716,68 @@ fn wrap_shaped_mail(
     key: &WrapKey,
     runs: &[gpui::TextRun],
     rtl: bool,
-    window: &mut Window,
+    window: &Window,
 ) -> WrappedMail {
-    let shape = |range: &Range<usize>, hyphen, window: &mut Window| {
+    let shape = |range: &Range<usize>, hyphen| {
         shape_mail_line(window, &key.text, key.size, runs, range, hyphen)
     };
+    let mut run_ends = None;
+    let mut advances = HashMap::new();
+    wrap_measured_mail(
+        key,
+        rtl,
+        |range| {
+            let shaped = shape(range, false);
+            let layout = &shaped.unwrapped_layout;
+            let glyphs = layout
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
+            byte_xs(glyphs, &key.text[range.clone()], f32::from(layout.width))
+        },
+        |range, hyphen| f32::from(shape(range, hyphen).unwrapped_layout.width),
+        |end| {
+            let ends = run_ends.get_or_insert_with(|| {
+                runs.iter()
+                    .scan(0, |end, run| {
+                        *end += run.len;
+                        Some(*end)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // Use the font of the last source byte, the same one that
+            // shape_mail_line uses to draw the discretionary hyphen.
+            let run = &runs[ends.partition_point(|&run_end| run_end < end)];
+            *advances.entry(&run.font).or_insert_with(|| {
+                let run = gpui::TextRun {
+                    len: 1,
+                    ..run.clone()
+                };
+                f32::from(
+                    shape_one(window, "-", key.size, &[run])
+                        .unwrapped_layout
+                        .width,
+                )
+            })
+        },
+    )
+}
+
+fn wrap_measured_mail(
+    key: &WrapKey,
+    rtl: bool,
+    mut prefix_xs: impl FnMut(&Range<usize>) -> Option<Vec<f32>>,
+    mut measure: impl FnMut(&Range<usize>, bool) -> f32,
+    mut hyphen_advance: impl FnMut(usize) -> f32,
+) -> WrappedMail {
     // In byte order, a range's width is the distance between its ends
-    // on a hard line, shaped once. When glyphs are reordered or soft
-    // hyphens change the byte positions, shape the range instead.
+    // on a hard line, shaped once. Reordered glyphs need range shaping.
     let mut hard = Vec::new();
     if key.width.is_some() && !rtl {
         let mut at = 0;
         for line in key.text.split('\n') {
-            let xs = if line.contains(SOFT_HYPHEN) {
-                None
-            } else {
-                let shaped = shape(&(at..at + line.len()), false, window);
-                let layout = &shaped.unwrapped_layout;
-                let glyphs = layout
-                    .runs
-                    .iter()
-                    .flat_map(|run| &run.glyphs)
-                    .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
-                byte_xs(glyphs, line.len(), f32::from(layout.width))
-            };
+            let xs = prefix_xs(&(at..at + line.len()));
             hard.push((at, xs));
             at += line.len() + 1;
         }
@@ -1742,20 +1790,21 @@ fn wrap_shaped_mail(
             let line = hard.partition_point(|(start, _)| *start <= range.start);
             match line.checked_sub(1).map(|line| &hard[line]) {
                 Some((start, Some(xs))) if range.end - start < xs.len() => {
-                    xs[range.end - start] - xs[range.start - start]
+                    let width = xs[range.end - start] - xs[range.start - start];
+                    if hyphen {
+                        width + hyphen_advance(range.end)
+                    } else {
+                        width
+                    }
                 }
-                _ => f32::from(shape(&range, hyphen, window).unwrapped_layout.width),
+                _ => measure(&range, hyphen),
             }
         },
     );
     let width = key.width.unwrap_or_else(|| {
         lines
             .iter()
-            .map(|line| {
-                shape(&line.range, line.hyphen, window)
-                    .unwrapped_layout
-                    .width
-            })
+            .map(|line| px(measure(&line.range, line.hyphen)))
             .max()
             .unwrap_or(px(0.0))
     });
@@ -3204,6 +3253,60 @@ mod decode_tests {
     }
 
     #[test]
+    fn soft_hyphen_breaks_reuse_one_hard_line_measurement_at_each_width() {
+        use std::cell::Cell;
+
+        use super::{WrapKey, byte_xs, visible_mail_line, wrap_mail, wrap_measured_mail};
+
+        let text = "well\u{ad}known café ".repeat(1000);
+        for width in [5.0, 16.0] {
+            let key = WrapKey {
+                text: text.clone().into(),
+                fonts: Vec::new(),
+                keep: Vec::new(),
+                size: gpui::px(14.0),
+                width: Some(gpui::px(width)),
+            };
+            let shapes = Cell::new(0);
+            let measure =
+                |range: &_, hyphen| visible_mail_line(&text, range, hyphen).chars().count() as f32;
+            let fast = wrap_measured_mail(
+                &key,
+                false,
+                |range| {
+                    shapes.set(shapes.get() + 1);
+                    let stripped = visible_mail_line(&text, range, false);
+                    let glyphs = stripped
+                        .char_indices()
+                        .enumerate()
+                        .map(|(x, (byte, _))| (byte, x as f32));
+                    byte_xs(
+                        glyphs,
+                        &text[range.clone()],
+                        stripped.chars().count() as f32,
+                    )
+                },
+                |range, hyphen| {
+                    shapes.set(shapes.get() + 1);
+                    measure(range, hyphen)
+                },
+                |_| 1.0,
+            );
+            let reference = wrap_mail(&text, Some(width), &[], |range, hyphen| {
+                measure(&range, hyphen)
+            });
+            assert_eq!(shapes.get(), 1);
+            assert!(fast.lines.len() >= 1000);
+            assert!(
+                fast.lines
+                    .iter()
+                    .map(|line| (&line.range, line.hyphen))
+                    .eq(reference.iter().map(|line| (&line.range, line.hyphen)))
+            );
+        }
+    }
+
+    #[test]
     fn a_long_mail_is_wrapped_once_at_a_stable_width() {
         use super::{WrapCache, WrapKey, WrappedMail, wrap_mail};
         use std::rc::Rc;
@@ -3247,9 +3350,9 @@ mod decode_tests {
             .into_iter()
             .enumerate()
             .map(|(x, byte)| (byte, x as f32));
-        assert!(super::byte_xs(glyphs, text.len(), 10.0).is_none());
+        assert!(super::byte_xs(glyphs, text, 10.0).is_none());
         assert_eq!(
-            super::byte_xs([(0, 0.0), (1, 2.0), (1, 3.0)].into_iter(), 3, 5.0),
+            super::byte_xs([(0, 0.0), (1, 2.0), (1, 3.0)].into_iter(), "abc", 5.0),
             Some(vec![0.0, 2.0, 5.0, 5.0])
         );
     }
