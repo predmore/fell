@@ -131,6 +131,7 @@ pub struct ThreadNote {
     pub actor: String,
     pub created_unix: i64,
     pub summary: String,
+    pub seen: bool,
     pub suggestions: Vec<PendingSuggestion>,
 }
 
@@ -215,7 +216,7 @@ impl Store {
     /// Includes seen notes until dismissed. Every actor contributes at most one.
     pub fn thread_notes(&self, account: &AccountId, thread: &ThreadId) -> Result<Vec<ThreadNote>> {
         let mut stmt = self.connection().prepare_cached(
-            "SELECT n.id, n.actor, n.created_unix, n.summary, s.key, s.value
+            "SELECT n.id, n.actor, n.created_unix, n.summary, n.seen, s.key, s.value
              FROM visible_thread_notes n
              LEFT JOIN json_each(n.suggestions) s ON NOT EXISTS (
                  SELECT 1 FROM local_thread_note_actions r
@@ -234,11 +235,12 @@ impl Store {
                     actor: row.get(1)?,
                     created_unix: row.get(2)?,
                     summary: row.get(3)?,
+                    seen: row.get(4)?,
                     suggestions: Vec::new(),
                 });
             }
-            if let Some(position) = row.get(4)? {
-                let raw: String = row.get(5)?;
+            if let Some(position) = row.get(5)? {
+                let raw: String = row.get(6)?;
                 // Older notes may contain labels we now reject. Keep the
                 // rest of the note readable and leave those actions unavailable.
                 if let Ok(action) = Suggestion::parse(&raw) {
@@ -251,6 +253,20 @@ impl Store {
             }
         }
         Ok(notes)
+    }
+
+    /// Includes dismissed and superseded notes so reopening a thread can
+    /// distinguish a later annotation from undo of an older one.
+    pub fn latest_thread_note_id(
+        &self,
+        account: &AccountId,
+        thread: &ThreadId,
+    ) -> Result<Option<i64>> {
+        Ok(self.connection().query_row(
+            "SELECT max(id) FROM thread_notes WHERE account_id = ?1 AND thread_id = ?2",
+            params![account.as_str(), thread.as_str()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn unread_note_threads(&self, account: &AccountId) -> Result<HashSet<String>> {
@@ -316,9 +332,12 @@ impl Store {
                 let suggestion = pending_suggestion(&tx, account, thread, note, position)?;
                 let mut related = None;
                 let action = match suggestion {
-                    Suggestion::Archive => {
-                        Some(self.archive_threads_in(&tx, account, std::slice::from_ref(thread), folder)?)
-                    }
+                    Suggestion::Archive => Some(self.archive_threads_in(
+                        &tx,
+                        account,
+                        std::slice::from_ref(thread),
+                        folder,
+                    )?),
                     Suggestion::Label(label) => {
                         Some(self.label_thread_in(&tx, account, thread, LabelChange::Add(label))?)
                     }

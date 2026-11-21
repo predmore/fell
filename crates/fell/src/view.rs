@@ -25,7 +25,7 @@ use futures::StreamExt;
 use gpui::{
     App, Application, AvailableSpace, Bounds, Context, FocusHandle, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement, Styled, StyledText, TextStyle, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb,
     size, uniform_list,
@@ -54,8 +54,8 @@ use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase, ScrollAnchor,
-    clamped_offset,
+    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase,
+    ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -65,6 +65,7 @@ use crate::theme::{self, Theme};
 use crate::ui_trace::UiTrace;
 use crate::worker::Worker;
 
+use self::agent_notes::NoteVisit;
 use self::disclosure::disclosure;
 
 pub fn run(trace_start: Option<Instant>) {
@@ -472,10 +473,9 @@ struct Inbox {
     forwarding_attachments: bool,
     note_view: agent_notes::NoteView,
     conv_note_slot: bool,
-    // Notes present on open can pin. Notes that arrive while reading grow
-    // in the scroll area without covering the visible messages.
-    pin_agent_note: bool,
-    revealing_agent_note: bool,
+    note_pin: agent_notes::NotePin,
+    note_band: Pixels,
+    note_visit: Option<NoteVisit>,
     note_in_flight: Option<i64>,
     session: Session,
     theme: Theme,
@@ -654,8 +654,9 @@ impl Inbox {
             forwarding_attachments: false,
             note_view: agent_notes::NoteView::default(),
             conv_note_slot: false,
-            pin_agent_note: false,
-            revealing_agent_note: false,
+            note_pin: agent_notes::NotePin::default(),
+            note_band: px(0.),
+            note_visit: None,
             note_in_flight: None,
             session,
             store,
@@ -1929,9 +1930,10 @@ impl Inbox {
                 self.scroll_conversation();
             }
             self.session.clear_query_fault(QueryFault::Message);
-            self.mark_open(id);
+            self.mark_open(id, None);
             return;
         }
+        let opening = self.open_thread.as_deref() != Some(&id);
         let generation = self.conv_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let current = self.conv_gen.clone();
         let account = self.account_id.clone();
@@ -1965,8 +1967,16 @@ impl Inbox {
                                     .unwrap_or_default(),
                             )
                         });
+                        let latest_note = opening
+                            .then(|| {
+                                store
+                                    .latest_thread_note_id(&account, &thread)
+                                    .ok()
+                                    .flatten()
+                            })
+                            .flatten();
                         let notes = store.thread_notes(&account, &thread).ok();
-                        (view, reads, matches, notes)
+                        (view, reads, matches, notes, latest_note)
                     })
                     .map_err(|err| err.to_string()),
             )
@@ -1983,7 +1993,7 @@ impl Inbox {
                 }
                 let log = inbox.frames.clone();
                 FrameLog::event(log.as_ref(), "messages", || match result {
-                    Ok((view, _, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
+                    Ok((view, _, _, _, _)) if view.is_empty() && inbox.session.search.is_some() => {
                         // A hit may disappear between the two reads. Search
                         // has its own list, so a folder read cannot replace it.
                         inbox.clear_open_message();
@@ -1993,7 +2003,7 @@ impl Inbox {
                             inbox.refresh_search(cx);
                         }
                     }
-                    Ok((view, _, _, _))
+                    Ok((view, _, _, _, _))
                         if view.is_empty() && !inbox.session.messages.is_empty() =>
                     {
                         // The open thread key can disappear between the folder
@@ -2003,9 +2013,9 @@ impl Inbox {
                             inbox.request_threads(ReadIntent::default(), cx);
                         }
                     }
-                    Ok((mut view, reads, matches, notes)) => {
+                    Ok((mut view, reads, matches, notes, latest_note)) => {
                         if let Some(notes) = notes {
-                            inbox.session.agent_notes.update(Some(id.clone()), notes);
+                            inbox.update_agent_notes(&id, notes);
                         }
                         inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
@@ -2041,7 +2051,7 @@ impl Inbox {
                         {
                             inbox.land_on_reader();
                         }
-                        inbox.mark_open(id);
+                        inbox.mark_open(id, latest_note);
                         if follow {
                             inbox.scroll_conversation();
                         }
@@ -3201,7 +3211,7 @@ impl Inbox {
                     Ok(id) => {
                         if let Some(note) = suggestion {
                             inbox.note_in_flight = None;
-                            inbox.session.agent_notes.resolved(&note);
+                            inbox.agent_note_resolved(&note);
                         }
                         if crate::draft_host::show_draft(&hub, &id) {
                             inbox.settle_opening_notice(notice, cx);
@@ -3302,14 +3312,19 @@ impl Inbox {
         self.session.messages.clear();
         self.open_thread = None;
         self.open_subject.clear();
-        self.pin_agent_note = false;
+        self.note_pin = agent_notes::NotePin::default();
     }
 
     /// The conversation now shows thread `id`'s messages.
-    fn mark_open(&mut self, id: String) {
+    fn mark_open(&mut self, id: String, latest_note: Option<i64>) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         if self.open_thread.as_deref() != Some(&id) {
-            self.pin_agent_note = self.session.agent_notes.current(Some(&id)).is_some();
+            let notes = &self.session.agent_notes;
+            self.note_pin = agent_notes::NotePin::opened(
+                notes.current(Some(&id)).map(|note| note.id),
+                latest_note.max(notes.newest(&id)),
+            );
+            self.note_visit = None;
         }
         self.open_subject = self
             .session
@@ -3474,20 +3489,8 @@ impl Inbox {
         if step.note_scroll != 0 {
             self.note_view.scroll(step.note_scroll);
         }
-        if step.toggle_agent_note
-            && self.pin_agent_note
-            && self.conv_note_slot
-            && agent_notes::header_scrolled_away(&self.conv_scroll)
-        {
-            self.session.agent_notes.collapsed = false;
-            self.reader_took_over(false);
-            self.glide_conversation_for(
-                f32::from(clamped_offset(&self.conv_scroll)),
-                0.,
-                motion::PANE,
-                0.,
-            );
-            self.revealing_agent_note = self.motion.conv_glide.is_some();
+        if step.toggle_agent_note {
+            self.toggle_pinned_note();
         }
         if step.retry_attachment {
             if let Some(request) = self.attachment_retry.clone() {
@@ -3712,13 +3715,13 @@ impl Inbox {
 
     fn reader_took_over(&mut self, selected: bool) {
         self.reveal = Reveal::Reading { selected };
-        self.revealing_agent_note = false;
+        self.note_visit = None;
         self.release_landing();
     }
 
     fn invalidate_conversation_layout(&mut self) {
         self.body_refresh = BodyRefresh::default();
-        self.revealing_agent_note = false;
+        self.note_visit = None;
         self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
@@ -3828,18 +3831,6 @@ impl Inbox {
             .map(|message| message.id.as_str());
         self.landing
             .anchor(current, index, self.motion.conv_glide.is_some())
-            .map(|mut anchor| {
-                anchor.y = self.note_landing_inset();
-                anchor
-            })
-    }
-
-    fn note_landing_inset(&self) -> gpui::Pixels {
-        if self.pin_agent_note && self.conv_note_slot {
-            agent_notes::pinned_header_height(&self.theme)
-        } else {
-            px(0.)
-        }
     }
 
     /// The reader took over: stop holding their message in place.
@@ -3868,11 +3859,8 @@ impl Inbox {
         let view = self.conv_scroll.bounds();
         let offset = f32::from(self.conv_scroll.offset().y);
         let max = f32::from(self.conv_scroll.max_offset().height);
-        let target = present::offset_to_message_top(
-            f32::from(item.top()),
-            f32::from(view.top() + self.note_landing_inset()),
-            max,
-        );
+        let target =
+            present::offset_to_message_top(f32::from(item.top()), f32::from(view.top()), max);
         self.glide_conversation(offset, target);
     }
 
@@ -4172,21 +4160,67 @@ impl Render for Inbox {
             &self.motion.motion,
             now,
         );
+        let offset = clamped_offset(&self.conv_scroll);
         let note_anchor = (note_moving
             && self.conv_layout_current
             && self.motion.conv_glide.is_none()
-            && clamped_offset(&self.conv_scroll) < px(-0.5))
+            && offset < px(-0.5))
         .then(|| ScrollAnchor::capture(&self.conv_scroll, usize::from(self.conv_note_slot)))
         .flatten();
         let agent_note = self.note_view.frame(now);
         self.conv_note_slot = agent_note.is_some() && !self.session.messages.is_empty();
+        let pinnable = note.filter(|_| self.conv_note_slot && self.search_conversation_live());
+        let visiting = self
+            .note_visit
+            .as_ref()
+            .is_some_and(|visit| note.is_some_and(|note| note.id == visit.note));
+        let band = if panes.1 {
+            self.note_pin.band(
+                pinnable,
+                visiting,
+                self.conv_layout_current.then_some(offset),
+                self.theme.ui_px,
+            )
+        } else {
+            px(0.)
+        };
+        let pinned = band > px(0.);
+        let pin_alpha = self.note_pin.alpha(now);
+        let band_delta = band - self.note_band;
+        self.note_band = band;
+        let verify_pin = panes.1 && !self.conv_layout_current && self.note_pin.matches(pinnable);
+        self.conv_layout_current = panes.1;
+        if band_delta != px(0.) {
+            // Preserve window Y while the scrollport moves under the band.
+            let mut offset = self.conv_scroll.offset();
+            offset.y -= band_delta;
+            self.conv_scroll.set_offset(offset);
+            if let Some(glide) = &mut self.motion.conv_glide {
+                glide.from -= f32::from(band_delta);
+                glide.to -= f32::from(band_delta);
+            }
+        }
+        let returning = self.note_return(now);
+        let anchor = self.hold_landing().or_else(|| {
+            anchor.or(note_anchor).map(|mut anchor| {
+                anchor.y -= band_delta;
+                anchor
+            })
+        });
+        let note_details_only = self.note_visit.as_ref().is_some_and(|visit| {
+            agent_note
+                .as_ref()
+                .is_some_and(|frame| frame.note.id == visit.note)
+        });
         let conv = ConvFrame {
             agent_note,
-            pin_agent_note: self.pin_agent_note,
-            revealing_agent_note: self.revealing_agent_note && self.motion.conv_glide.is_some(),
+            pin_alpha: pinned.then_some(pin_alpha),
+            note_details_only,
+            note_expanded_in_band: visiting && returning.is_none(),
+            return_glide: returning.map(|(_, glide)| glide),
             alphas: self.motion.body_alphas(now),
             disclosures: self.motion.disclosures(&self.session, now),
-            anchor: self.hold_landing().or(anchor).or(note_anchor),
+            anchor: returning.map(|(anchor, _)| anchor).or(anchor),
             frames: self.frames.clone(),
             attachment_download: self.attachment_download.clone(),
             reveal_attachment,
@@ -4202,6 +4236,12 @@ impl Render for Inbox {
         );
         let animating = self.motion.tick(now)
             | self.note_view.running()
+            | self.note_pin.running()
+            | self
+                .note_visit
+                .as_ref()
+                .is_some_and(|visit| visit.returning.is_some())
+            | verify_pin
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4425,8 +4465,10 @@ struct ListContent {
 #[derive(Default)]
 struct ConvFrame {
     agent_note: Option<agent_notes::NoteFrame>,
-    pin_agent_note: bool,
-    revealing_agent_note: bool,
+    pin_alpha: Option<f32>,
+    note_details_only: bool,
+    note_expanded_in_band: bool,
+    return_glide: Option<LandingGlide>,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     disclosures: Disclosures,
@@ -7010,6 +7052,23 @@ fn conversation(
                     ),
             )
         })
+        .children(
+            frame
+                .pin_alpha
+                .zip(frame.agent_note.as_ref())
+                .map(|(alpha, note)| {
+                    agent_notes::pinned_header(
+                        theme,
+                        session,
+                        columns,
+                        note,
+                        frame.note_expanded_in_band,
+                        alpha * arrival,
+                        live,
+                        cx,
+                    )
+                }),
+        )
         .child(match leaving {
             Some((reader, _)) => div()
                 .flex_1()
@@ -7025,22 +7084,19 @@ fn conversation(
                 )
                 .into_any_element(),
             None => {
-                let note_frame = frame
+                let note = frame
                     .agent_note
                     .as_ref()
-                    .filter(|_| !session.messages.is_empty());
-                let note = note_frame
-                    .map(|note| agent_notes::slot(theme, session, columns, note, live, window, cx));
-                let pinned = note_frame
-                    .filter(|_| frame.pin_agent_note && live.0)
+                    .filter(|_| !session.messages.is_empty())
                     .map(|note| {
-                        agent_notes::pinned_header(
+                        agent_notes::slot(
                             theme,
                             session,
                             columns,
                             note,
-                            frame.revealing_agent_note,
-                            arrival,
+                            !frame.note_details_only,
+                            live,
+                            window,
                             cx,
                         )
                     });
@@ -7061,22 +7117,14 @@ fn conversation(
                 let landing = chip_probe
                     .map(|probe| (None, probe))
                     .or_else(|| hold.map(|(anchor, probe)| (Some(anchor.y), probe)));
-                let body = match (&scroll, landing) {
+                match (&scroll, landing) {
                     (Some(scroll), Some((y, probe))) => LandingHold {
                         inner: body,
                         probe,
                         scroll: scroll.clone(),
                         y,
+                        glide: frame.return_glide,
                         frames: frame.frames.clone(),
-                    }
-                    .into_any_element(),
-                    _ => body,
-                };
-                match (scroll, pinned) {
-                    (Some(scroll), Some(header)) => agent_notes::PinnedHeader {
-                        inner: body,
-                        header,
-                        scroll,
                     }
                     .into_any_element(),
                     _ => body,

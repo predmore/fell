@@ -1793,7 +1793,9 @@ mod tests {
                 .unwrap()
                 .contains(thread.as_str())
         );
+        assert!(!notes()[0].seen);
         store.see_thread_note(&account, annotation.id).unwrap();
+        assert!(notes()[0].seen);
         assert!(store.unread_note_threads(&account).unwrap().is_empty());
         assert_eq!(
             store
@@ -1816,6 +1818,10 @@ mod tests {
             crate::ActionKind::DismissNote
         );
         assert!(notes().is_empty());
+        assert_eq!(
+            store.latest_thread_note_id(&account, &thread).unwrap(),
+            Some(annotation.id)
+        );
         assert!(
             store
                 .search(&account, "has:suggestions")

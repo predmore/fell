@@ -3,9 +3,8 @@ use std::time::{Duration, Instant};
 use fell_core::notes::{NoteDecision, Suggestion, ThreadNote, display_safe};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, Element, FontWeight, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point, px, rgb, size,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point, px, rgb,
 };
 
 use super::{
@@ -15,7 +14,7 @@ use crate::keymap::{self, Action};
 use crate::model::{NoteRequest, SUGGESTIONS_QUERY, Session};
 use crate::motion::{self, Motion, Transition};
 use crate::present::{self, Pane};
-use crate::scroll_anchor::clamped_offset;
+use crate::scroll_anchor::{LandingGlide, ScrollAnchor, clamped_offset};
 use crate::theme::{self, Theme};
 
 pub(super) const MARKER_SLOT: f32 = 12.0;
@@ -101,7 +100,7 @@ pub(super) struct NoteView {
 }
 
 pub(super) struct NoteFrame {
-    note: ThreadNote,
+    pub(super) note: ThreadNote,
     closed: bool,
     details: (f32, f32),
     height: f32,
@@ -251,20 +250,86 @@ impl NoteView {
     }
 }
 
-const PINNED_HEADER_GAP: f32 = 4.0;
+const PINNED_HEADER_GAP: f32 = 8.0;
+const PINNED_BORDER: f32 = 1.0;
 
-fn header_height(theme: &Theme) -> Pixels {
-    px(theme.ui_px + 12.0)
+fn header_height(ui_px: f32) -> Pixels {
+    px(ui_px + 12.0)
 }
 
-pub(super) fn pinned_header_height(theme: &Theme) -> Pixels {
-    header_height(theme) + px(PINNED_HEADER_GAP)
+fn pinned_header_height(ui_px: f32) -> Pixels {
+    header_height(ui_px) + px(PINNED_BORDER + PINNED_HEADER_GAP)
 }
 
-pub(super) fn header_scrolled_away(scroll: &ScrollHandle) -> bool {
-    scroll
-        .bounds_for_item(0)
-        .is_some_and(|item| item.top() + clamped_offset(scroll) < scroll.bounds().top() - px(0.5))
+/// Pin the note carried into this reader or a new, unseen arrival in it.
+#[derive(Default)]
+pub(super) struct NotePin {
+    id: Option<i64>,
+    newest: Option<i64>,
+    arrival: Option<Transition>,
+}
+
+impl NotePin {
+    pub(super) fn opened(note: Option<i64>, newest: Option<i64>) -> Self {
+        Self {
+            id: note,
+            newest,
+            arrival: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        note: Option<&ThreadNote>,
+        newest: Option<i64>,
+        scrolled: bool,
+        motion: &Motion,
+        now: Instant,
+    ) {
+        if scrolled
+            && let Some(note) = note
+            && !note.seen
+            && Some(note.id) == newest
+            && newest > self.newest
+        {
+            self.id = Some(note.id);
+            self.arrival = motion.start(motion::FADE, now);
+        }
+        self.newest = self.newest.max(newest);
+    }
+
+    pub(super) fn matches(&self, note: Option<&ThreadNote>) -> bool {
+        self.id.is_some() && self.id == note.map(|note| note.id)
+    }
+
+    pub(super) fn band(
+        &self,
+        note: Option<&ThreadNote>,
+        visiting: bool,
+        offset: Option<Pixels>,
+        ui_px: f32,
+    ) -> Pixels {
+        if self.matches(note)
+            && (visiting || offset.is_some_and(|offset| header_scrolled_away(offset, ui_px)))
+        {
+            pinned_header_height(ui_px)
+        } else {
+            px(0.)
+        }
+    }
+
+    pub(super) fn alpha(&mut self, now: Instant) -> f32 {
+        self.arrival = self.arrival.filter(|fade| fade.running(now));
+        motion::progress(self.arrival.as_ref(), now)
+    }
+
+    pub(super) fn running(&self) -> bool {
+        self.arrival.is_some()
+    }
+}
+
+fn header_scrolled_away(offset: Pixels, ui_px: f32) -> bool {
+    offset <= -header_height(ui_px)
 }
 
 fn active(session: &Session, frame: &NoteFrame, live: Live) -> bool {
@@ -281,6 +346,7 @@ fn note_header(
     frame: &NoteFrame,
     closed: bool,
     active: bool,
+    id: &'static str,
     cx: &mut Context<Inbox>,
 ) -> gpui::Stateful<gpui::Div> {
     let (position, total) = session.agent_notes.position();
@@ -293,11 +359,11 @@ fn note_header(
     };
     let age = present::compact_relative_date(super::now_unix(), frame.note.created_unix);
     div()
-        .id("toggle-agent-note")
+        .id(id)
         .flex()
         .items_center()
         .gap(px(7.0))
-        .h(header_height(theme))
+        .h(header_height(theme.ui_px))
         .child(
             div()
                 .flex_none()
@@ -353,11 +419,13 @@ fn note_column(theme: &Theme, columns: ReaderColumns, content: impl IntoElement)
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn slot(
     theme: &Theme,
     session: &Session,
     columns: ReaderColumns,
     frame: &NoteFrame,
+    inline_header: bool,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -365,7 +433,17 @@ pub(super) fn slot(
     let line = theme.ui_px + 3.0;
     let width = (columns.card.width - 21.0).max(0.0);
     let active = active(session, frame, live);
-    let header = note_header(theme, session, frame, frame.closed, active, cx);
+    let header = inline_header.then(|| {
+        note_header(
+            theme,
+            session,
+            frame,
+            frame.closed,
+            active,
+            "toggle-agent-note",
+            cx,
+        )
+    });
     let summary = display_safe(&frame.note.summary, true);
     let detail = (frame.details.0 > 0.0).then(|| {
         div().pr(px(8.0)).child(disclosure::reveal(
@@ -403,114 +481,91 @@ pub(super) fn slot(
         columns.card.inset + columns.card.width + MESSAGE_PAD_PX,
         frame.height,
         frame.alpha,
-        note_column(theme, columns, div().child(header).children(detail)).into_any_element(),
+        note_column(theme, columns, div().children(header).children(detail)).into_any_element(),
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn pinned_header(
     theme: &Theme,
     session: &Session,
     columns: ReaderColumns,
     frame: &NoteFrame,
-    opening: bool,
-    arrival: f32,
+    expanded: bool,
+    alpha: f32,
+    live: Live,
     cx: &mut Context<Inbox>,
 ) -> AnyElement {
     let header = note_header(
         theme,
         session,
         frame,
-        !opening,
-        active(session, frame, Live(true)),
+        !expanded,
+        active(session, frame, live) && alpha > 0.0,
+        "toggle-pinned-note",
         cx,
     );
     div()
-        .w_full()
-        .px(px(super::CONVERSATION_PAD_PX))
-        .when(!opening, |header| header.pb(px(PINNED_HEADER_GAP)))
-        .bg(rgb(theme.background))
-        .block_mouse_except_scroll()
-        .child(note_column(theme, columns, header).opacity(frame.alpha * arrival))
+        .id("pinned-agent-note-band")
+        .flex_none()
+        .h(pinned_header_height(theme.ui_px))
+        .pb(px(PINNED_HEADER_GAP))
+        .when(live.0, |band| {
+            band.on_scroll_wheel(cx.listener(
+                |inbox, event: &gpui::ScrollWheelEvent, window, cx| {
+                    if inbox.session.overlay != super::Overlay::None {
+                        return;
+                    }
+                    let scroll = &inbox.conv_scroll;
+                    let old = clamped_offset(scroll);
+                    let delta = event.delta.pixel_delta(window.line_height());
+                    let y = (old + delta.y).clamp(-scroll.max_offset().height, px(0.));
+                    if y != old {
+                        scroll.set_offset(point(scroll.offset().x, y));
+                        inbox.reader_took_over(false);
+                        inbox.motion.cancel_glides();
+                        cx.notify();
+                    }
+                },
+            ))
+        })
+        .child(
+            div()
+                .border_b(px(PINNED_BORDER))
+                .border_color(rgb(theme.border))
+                .px(px(super::CONVERSATION_PAD_PX))
+                .child(note_column(theme, columns, header))
+                .opacity(alpha),
+        )
         .into_any_element()
 }
 
-/// Paint the header above the laid-out scroll viewport, only when the
-/// inline header has moved behind its top edge. Using this frame's
-/// clamped offset also handles conversations that fit on the first layout.
-pub(super) struct PinnedHeader {
-    pub inner: AnyElement,
-    pub header: AnyElement,
-    pub scroll: ScrollHandle,
+struct ChipMotion {
+    removed: f32,
+    slide: f32,
+    restored: f32,
+    reflow: f32,
 }
 
-impl IntoElement for PinnedHeader {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for PinnedHeader {
-    type RequestLayoutState = ();
-    type PrepaintState = bool;
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        (self.inner.request_layout(window, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        self.inner.prepaint(window, cx);
-        let pinned = header_scrolled_away(&self.scroll);
-        if pinned {
-            self.header.prepaint_as_root(
-                bounds.origin,
-                size(
-                    AvailableSpace::Definite(bounds.size.width),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                cx,
-            );
-        }
-        pinned
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        pinned: &mut bool,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.inner.paint(window, cx);
-        if *pinned {
-            self.header.paint(window, cx);
+impl ChipMotion {
+    fn sample(t: f32, accepting: bool) -> Self {
+        let fade = DETAIL_FADE.as_secs_f32() / motion::PANE.as_secs_f32();
+        let slide = 1.0 - fade;
+        if accepting {
+            let (removed, movement) = fade_then_slide(t);
+            Self {
+                removed,
+                slide: movement,
+                restored: 1.0,
+                reflow: motion::ease_out((t - fade) / fade),
+            }
+        } else {
+            Self {
+                removed: 0.0,
+                slide: motion::ease_out(t / slide),
+                restored: motion::ease_out((t - slide) / fade),
+                reflow: motion::ease_out(t / fade),
+            }
         }
     }
 }
@@ -606,11 +661,7 @@ fn suggestions(
         .as_ref()
         .map_or((Vec::new(), 1.0), |(note, t)| (layout(note), *t));
     let removed = |old: &Chip| !chips.iter().any(|chip| chip.decision == old.decision);
-    let (alpha, progress) = if previous.iter().any(removed) {
-        fade_then_slide(t)
-    } else {
-        (0.0, motion::ease_out(t))
-    };
+    let motion = ChipMotion::sample(t, previous.iter().any(removed));
     let height = |chips: &[Chip]| chips.last().map_or(0.0, |chip| chip.y + line);
     let current_height = height(&chips);
     let previous_height = if frame.suggestions.is_some() {
@@ -618,19 +669,40 @@ fn suggestions(
     } else {
         current_height
     };
+    // A row-changing chip fades at each of its two positions. Keep the
+    // lower row in the disclosure until its departing chips have faded.
+    let height_progress = if current_height < previous_height {
+        motion.slide * motion.reflow
+    } else {
+        motion.reflow
+    };
     let note_id = frame.note.id;
-    let mut row = div()
-        .relative()
-        .h(px(motion::lerp(previous_height, current_height, progress)));
-    for old in previous.iter().filter(|old| alpha > 0.0 && removed(old)) {
-        row = row.child(draw_chip(theme, old, line).opacity(alpha));
+    let mut row = div().relative().h(px(crate::motion::lerp(
+        previous_height,
+        current_height,
+        height_progress,
+    )));
+    for old in previous
+        .iter()
+        .filter(|old| motion.removed > 0.0 && removed(old))
+    {
+        row = row.child(draw_chip(theme, old, line).opacity(motion.removed));
     }
     for mut chip in chips {
         let old = previous.iter().find(|old| old.decision == chip.decision);
-        if let Some(old) = old {
-            chip.x = motion::lerp(old.x, chip.x, progress);
-            chip.y = motion::lerp(old.y, chip.y, progress);
-        }
+        let alpha = match old {
+            Some(old) if old.y != chip.y => {
+                if motion.reflow < 1.0 {
+                    row = row.child(draw_chip(theme, old, line).opacity(1.0 - motion.reflow));
+                }
+                motion.reflow
+            }
+            Some(old) => {
+                chip.x = crate::motion::lerp(old.x, chip.x, motion.slide);
+                1.0
+            }
+            None => motion.restored,
+        };
         let decision = chip.decision;
         let id = match decision {
             NoteDecision::Dismiss => 0,
@@ -638,7 +710,7 @@ fn suggestions(
         };
         let element = draw_chip(theme, &chip, line)
             .id(("agent-suggestion", id))
-            .when(clickable, |chip| {
+            .when(clickable && alpha > 0.0, |chip| {
                 chip.cursor_pointer()
                     .on_click(cx.listener(move |inbox, _, _, cx| {
                         if let Some(request) = inbox.session.note_request(decision)
@@ -648,11 +720,7 @@ fn suggestions(
                         }
                     }))
             });
-        row = row.child(if old.is_none() && frame.suggestions.is_some() {
-            element.opacity(progress)
-        } else {
-            element
-        });
+        row = row.child(element.opacity(alpha));
     }
     row
 }
@@ -691,7 +759,150 @@ fn keycap(theme: &Theme, key: &str) -> gpui::Div {
         .child(key.to_owned())
 }
 
+pub(super) struct NoteVisit {
+    pub note: i64,
+    message: String,
+    y: Pixels,
+    pub returning: Option<NoteReturn>,
+}
+
+pub(super) struct NoteReturn {
+    from: Pixels,
+    band: Pixels,
+    time: Option<Transition>,
+}
+
 impl Inbox {
+    pub(super) fn toggle_pinned_note(&mut self) {
+        if self.open_thread != self.session.cursor_id {
+            return;
+        }
+        let Some(note) = self.session.note().map(|note| note.id) else {
+            return;
+        };
+        if self.note_band == px(0.) {
+            return;
+        }
+        let scroll = &self.conv_scroll;
+        let offset = f32::from(clamped_offset(scroll));
+        if let Some(visit) = &mut self.note_visit
+            && visit.note == note
+        {
+            if visit.returning.take().is_some() {
+                self.session.agent_notes.collapsed = false;
+                self.glide_conversation_for(offset, 0., motion::PANE, 0.);
+            } else {
+                self.session.agent_notes.collapsed = true;
+                self.return_from_note(note);
+            }
+            return;
+        }
+        let first_message = usize::from(self.conv_note_slot);
+        let anchor = match self.reveal {
+            super::Reveal::Reading { selected: false } => None,
+            _ => ScrollAnchor::capture_message(scroll, self.session.message_cursor, first_message),
+        }
+        .or_else(|| ScrollAnchor::capture(scroll, first_message));
+        let Some(anchor) = anchor else { return };
+        let Some(message) = self.session.messages.get(anchor.index) else {
+            return;
+        };
+        let message = message.id.clone();
+        let offset = self.motion.glide_from_conversation(offset);
+        // The pinned band now supplies the inline header. Account for its
+        // removal from the scroll content before the opening glide.
+        let offset = (offset + f32::from(header_height(self.theme.ui_px))).min(0.);
+        self.reader_took_over(false);
+        self.note_visit = Some(NoteVisit {
+            note,
+            message,
+            y: anchor.y + self.note_band,
+            returning: None,
+        });
+        self.session.agent_notes.collapsed = false;
+        self.glide_conversation_for(offset, 0., motion::PANE, 0.);
+    }
+
+    pub(super) fn agent_note_resolved(&mut self, request: &NoteRequest) {
+        if self.open_thread.as_deref() == Some(&request.thread)
+            && self.session.cursor_id == self.open_thread
+        {
+            self.return_from_note(request.id);
+        }
+        self.session.agent_notes.resolved(request);
+    }
+
+    fn return_from_note(&mut self, note: i64) {
+        let Some(visit) = &mut self.note_visit else {
+            return;
+        };
+        if visit.note != note || visit.returning.is_some() {
+            return;
+        }
+        let offset = f32::from(clamped_offset(&self.conv_scroll));
+        let from = self.motion.glide_from_conversation(offset);
+        self.motion.conv_glide = None;
+        visit.returning = Some(NoteReturn {
+            from: px(from),
+            band: self.note_band,
+            time: self
+                .motion
+                .motion
+                .start(motion::PANE, self.motion.clock.now()),
+        });
+    }
+
+    pub(super) fn note_return(&mut self, now: Instant) -> Option<(ScrollAnchor, LandingGlide)> {
+        let visit = self.note_visit.as_ref()?;
+        let returning = visit.returning.as_ref()?;
+        let index = self
+            .session
+            .messages
+            .iter()
+            .position(|message| message.id == visit.message);
+        let y = visit.y - self.note_band;
+        let glide = LandingGlide {
+            from: returning.from + returning.band - self.note_band,
+            progress: motion::progress(returning.time.as_ref(), now),
+        };
+        if glide.progress >= 1.0 || index.is_none() {
+            self.note_visit = None;
+            if let Some(index) = index {
+                self.session.message_cursor = index;
+            }
+        }
+        index.map(|index| (ScrollAnchor { index, y }, glide))
+    }
+
+    pub(super) fn update_agent_notes(&mut self, thread: &str, notes: Vec<ThreadNote>) -> bool {
+        let scrolled = self.open_thread.as_deref() == Some(thread)
+            && self.conv_layout_current
+            && self.session.pane == Pane::Conversation
+            && self.note_visit.is_none()
+            && header_scrolled_away(clamped_offset(&self.conv_scroll), self.theme.ui_px);
+        let newest = notes.first().map(|note| note.id);
+        let state = &mut self.session.agent_notes;
+        let changed = state.update(Some(thread.to_owned()), notes);
+        if self.open_thread.as_deref() == Some(thread) {
+            let current = state.current(Some(thread));
+            if self.note_visit.as_ref().is_some_and(|visit| {
+                visit.returning.is_none()
+                    && self.note_in_flight != Some(visit.note)
+                    && current.is_none_or(|note| note.id != visit.note)
+            }) {
+                self.note_visit = None;
+            }
+            self.note_pin.observe(
+                current,
+                newest,
+                scrolled,
+                &self.motion.motion,
+                self.motion.clock.now(),
+            );
+        }
+        changed
+    }
+
     pub(super) fn watch_notes(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut seen = None;
@@ -752,7 +963,9 @@ impl Inbox {
                         let shown = notes.filter(|_| {
                             open == inbox.open_thread && open == inbox.session.cursor_id
                         });
-                        let note_changed = shown.is_some_and(|notes| state.update(open, notes));
+                        let note_changed = open.zip(shown).is_some_and(|(thread, notes)| {
+                            inbox.update_agent_notes(&thread, notes)
+                        });
                         if filter_changed
                             && inbox.session.search.as_ref().is_some_and(|search| {
                                 search.effective_query().contains(SUGGESTIONS_QUERY)
@@ -843,7 +1056,7 @@ impl Inbox {
                 inbox.note_in_flight = None;
                 match result {
                     Ok(_) => {
-                        inbox.session.agent_notes.resolved(&note);
+                        inbox.agent_note_resolved(&note);
                         inbox.send_to_server();
                         inbox.session.show_toast(notice, false);
                         Some(ReadIntent {
@@ -865,6 +1078,96 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn note(id: i64, seen: bool) -> ThreadNote {
+        ThreadNote {
+            id,
+            seen,
+            actor: "Survey assistant".into(),
+            created_unix: 0,
+            summary: "Survey update".into(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn paging_and_wheeling_keep_the_whole_band_outside_the_mail_viewport() {
+        let note = note(1, true);
+        let pin = NotePin::opened(Some(1), Some(1));
+        let ui_px = 14.;
+        let full_height = px(780.);
+        let subject_bottom = px(66.);
+        let viewport = |offset| {
+            let top = subject_bottom + pin.band(Some(&note), false, Some(offset), ui_px);
+            (top, full_height - top)
+        };
+        let landed = px(-660.);
+        let (mail_top, page_height) = viewport(landed);
+        assert_eq!(mail_top, subject_bottom + header_height(ui_px) + px(9.));
+        // Page by one actual scrollport, then wheel by one line.
+        assert_eq!(viewport(landed - page_height), (mail_top, page_height));
+        assert_eq!(
+            viewport(landed - page_height - px(24.)),
+            (mail_top, page_height)
+        );
+    }
+
+    #[test]
+    fn a_collapsed_inline_header_clears_the_view_before_its_band_takes_over() {
+        let note = note(1, true);
+        let pin = NotePin::opened(Some(1), Some(1));
+        let ui_px = 14.;
+        let header = header_height(ui_px);
+        assert_eq!(pin.band(Some(&note), false, Some(px(0.)), ui_px), px(0.));
+        assert_eq!(
+            pin.band(Some(&note), false, Some(px(1.) - header), ui_px),
+            px(0.)
+        );
+        let band = pin.band(Some(&note), false, Some(-header), ui_px);
+        assert_eq!(band, header + px(9.));
+        assert_eq!(pin.band(Some(&note), true, Some(px(0.)), ui_px), band);
+    }
+
+    #[test]
+    fn a_dismissed_open_note_cannot_pin_a_seen_or_already_known_replacement() {
+        let start = Instant::now();
+        let motion = Motion::new(true);
+        let mut pin = NotePin::opened(Some(3), Some(4));
+        assert!(pin.matches(Some(&note(3, true))));
+        assert!(!pin.matches(None));
+        let mut reopened = NotePin::opened(None, Some(3));
+        reopened.observe(Some(&note(3, false)), Some(3), true, &motion, start);
+        assert!(!reopened.matches(Some(&note(3, false))));
+
+        pin.observe(Some(&note(4, false)), Some(4), true, &motion, start);
+        assert!(!pin.matches(Some(&note(4, false))));
+        pin.observe(Some(&note(5, true)), Some(5), true, &motion, start);
+        assert!(!pin.matches(Some(&note(5, true))));
+        pin.observe(Some(&note(6, false)), Some(6), false, &motion, start);
+        pin.observe(Some(&note(6, false)), Some(6), true, &motion, start);
+        assert!(!pin.matches(Some(&note(6, false))));
+
+        // A genuinely new, unseen annotation can pin while reading.
+        pin.observe(Some(&note(7, false)), Some(7), true, &motion, start);
+        assert!(pin.matches(Some(&note(7, false))));
+        assert_eq!(pin.alpha(start), 0.);
+        assert!(pin.alpha(start + Duration::from_millis(60)) > 0.);
+        assert_eq!(pin.alpha(start + motion::FADE), 1.);
+    }
+
+    #[test]
+    fn undo_moves_remaining_chips_before_revealing_the_restored_chip() {
+        let sample = |ms: f32| ChipMotion::sample(ms / 160., false);
+        assert_eq!(sample(0.).restored, 0.);
+        assert_eq!(sample(59.).restored, 0.);
+        assert!(sample(59.).reflow < 1.);
+        assert_eq!(sample(60.).reflow, 1.);
+        assert!(sample(90.).slide < 1.);
+        assert_eq!(sample(100.).slide, 1.);
+        assert_eq!(sample(100.).restored, 0.);
+        assert!(sample(130.).restored > 0. && sample(130.).restored < 1.);
+        assert_eq!(sample(160.).restored, 1.);
+    }
 
     #[test]
     fn details_and_accepted_chips_fade_before_their_space_moves() {

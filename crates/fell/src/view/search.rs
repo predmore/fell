@@ -1495,7 +1495,11 @@ fn row(
         .as_ref()
         .map(|folder| inbox.session.roles.label(folder));
     let unread_note = inbox.session.agent_notes.unread.contains(&row.id);
-    let marker_room = if unread_note { super::agent_notes::MARKER_SLOT + ROW_GAP } else { 0.0 };
+    let marker_room = if unread_note {
+        super::agent_notes::MARKER_SLOT + ROW_GAP
+    } else {
+        0.0
+    };
     let RowLine {
         sender_width,
         sender,

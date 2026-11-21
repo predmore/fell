@@ -4139,9 +4139,9 @@ fn ensure_agent_grant_revision(conn: &Connection) -> Result<()> {
     ensure_triggers(
         conn,
         "agent_grant_revision",
-        "1",
+        "2",
         "CREATE TRIGGER bump_agent_grant_revision
-         AFTER UPDATE OF enabled, can_read, can_triage, can_draft ON agent_grants
+         AFTER UPDATE OF enabled, can_read, can_triage, can_draft, can_annotate ON agent_grants
          BEGIN
              UPDATE agent_grants SET revision = revision + 1
              WHERE agent_id = NEW.agent_id AND account_id = NEW.account_id;

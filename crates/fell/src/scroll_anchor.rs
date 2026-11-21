@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{AnyElement, App, Bounds, IntoElement, LayoutId, Pixels, ScrollHandle, Window, px};
 
-use crate::{frame_log::SharedFrameLog, present};
+use crate::{frame_log::SharedFrameLog, motion, present};
 
 /// A message's index and its top relative to the scroll viewport.
 #[derive(Clone, Copy)]
@@ -174,8 +174,16 @@ pub(super) struct LandingHold {
     /// Relative viewport position to hold. None reveals a focused chip
     /// with the smallest scroll that brings its bounds into view.
     pub y: Option<Pixels>,
+    pub glide: Option<LandingGlide>,
     /// `FELL_FRAME_LOG`: each offset set here is a `landing` note.
     pub frames: Option<SharedFrameLog>,
+}
+
+/// Interpolate toward a destination measured from each frame's fresh layout.
+#[derive(Clone, Copy)]
+pub(super) struct LandingGlide {
+    pub from: Pixels,
+    pub progress: f32,
 }
 
 impl IntoElement for LandingHold {
@@ -224,7 +232,14 @@ impl gpui::Element for LandingHold {
             let item = window.layout_bounds(item);
             let mut offset = before;
             offset.y = match self.y {
-                Some(y) => offset_to_hold(bounds, item, y),
+                Some(y) => {
+                    let target = offset_to_hold(bounds, item, y);
+                    self.glide.map_or(target, |glide| {
+                        let moving =
+                            motion::lerp(f32::from(glide.from), f32::from(target), glide.progress);
+                        px(motion::snap(moving, window.scale_factor()))
+                    })
+                }
                 None => offset_to_reveal(bounds, item, before.y),
             };
             self.scroll.set_offset(offset);

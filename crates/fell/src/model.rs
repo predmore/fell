@@ -3868,6 +3868,7 @@ mod tests {
             actor: "review".into(),
             created_unix: 10,
             summary: "A summary".into(),
+            seen: false,
             suggestions: vec![
                 PendingSuggestion {
                     position: 0,

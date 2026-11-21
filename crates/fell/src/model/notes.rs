@@ -35,6 +35,12 @@ impl AgentNotes {
             .flatten()
     }
 
+    pub fn newest(&self, thread: &str) -> Option<i64> {
+        (Some(thread) == self.thread.as_deref())
+            .then(|| self.notes.first().map(|note| note.id))
+            .flatten()
+    }
+
     pub fn position(&self) -> (usize, usize) {
         (self.selected + 1, self.notes.len())
     }
