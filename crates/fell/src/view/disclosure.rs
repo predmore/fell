@@ -24,19 +24,13 @@ pub(super) fn disclosure(
     }
 
     let (summary_alpha, details_alpha) = disclosure_opacities(shown);
-    let layer = |element, alpha| {
-        div()
-            .w(px(width))
-            .opacity(alpha)
-            .child(element)
-            .into_any_element()
-    };
-    Disclosure {
-        summary: layer(summary(), summary_alpha),
-        details: layer(details(), details_alpha),
+    layered(
+        width,
+        [summary(), details()],
+        [summary_alpha, details_alpha],
         shown,
-    }
-    .into_any_element()
+        [false, true],
+    )
 }
 
 /// A fade-through at a common top edge, so the two sets of glyphs do not
@@ -45,15 +39,60 @@ fn disclosure_opacities(shown: f32) -> (f32, f32) {
     ((1.0 - 2.0 * shown).max(0.0), (2.0 * shown - 1.0).max(0.0))
 }
 
-/// Layout uses both wrapped heights at the current width. Only the
-/// details can be masked, and the summary stays at its own baseline.
-struct Disclosure {
-    summary: AnyElement,
-    details: AnyElement,
-    shown: f32,
+/// Two separately laid-out measures at one origin. The row below sees an
+/// interpolated height while each layer keeps its own line breaks.
+pub(crate) fn reflow(
+    width: f32,
+    frame: motion::ReadingReflow,
+    layers: [AnyElement; 2],
+) -> AnyElement {
+    layered(width, layers, frame.alpha, frame.height, [true; 2])
 }
 
-impl IntoElement for Disclosure {
+/// Keep the child's layout width and mask it at the moving padded edge.
+pub(crate) fn clip_column(inset: f32, width: f32, right: f32, child: gpui::Div) -> gpui::Div {
+    if inset + width <= right {
+        return child.ml(px(inset)).w(px(width));
+    }
+    div()
+        .ml(px(inset))
+        .w(px((right - inset).max(0.0)))
+        .overflow_hidden()
+        .child(child.w(px(width)))
+}
+
+fn layered(
+    width: f32,
+    layers: [AnyElement; 2],
+    alpha: [f32; 2],
+    height: f32,
+    clipped: [bool; 2],
+) -> AnyElement {
+    let layer = |element, opacity| {
+        div()
+            .w(px(width))
+            .opacity(opacity)
+            .child(element)
+            .into_any_element()
+    };
+    let [from, to] = layers;
+    Layered {
+        layers: [layer(from, alpha[0]), layer(to, alpha[1])],
+        alpha,
+        height,
+        clipped,
+    }
+    .into_any_element()
+}
+
+struct Layered {
+    layers: [AnyElement; 2],
+    alpha: [f32; 2],
+    height: f32,
+    clipped: [bool; 2],
+}
+
+impl IntoElement for Layered {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -61,7 +100,7 @@ impl IntoElement for Disclosure {
     }
 }
 
-impl Element for Disclosure {
+impl Element for Layered {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -81,9 +120,11 @@ impl Element for Disclosure {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let space = size(AvailableSpace::MaxContent, AvailableSpace::MaxContent);
-        let closed = self.summary.layout_as_root(space, window, cx).height;
-        let open = self.details.layout_as_root(space, window, cx).height;
-        let height = motion::lerp(f32::from(closed), f32::from(open), self.shown);
+        let [from, to] = self
+            .layers
+            .each_mut()
+            .map(|layer| f32::from(layer.layout_as_root(space, window, cx).height));
+        let height = motion::lerp(from, to, self.height);
         let style = Style {
             size: Size {
                 height: px(height).into(),
@@ -103,14 +144,15 @@ impl Element for Disclosure {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (summary_alpha, details_alpha) = disclosure_opacities(self.shown);
-        if summary_alpha > 0.0 {
-            self.summary.prepaint_at(bounds.origin, window, cx);
-        }
-        if details_alpha > 0.0 {
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                self.details.prepaint_at(bounds.origin, window, cx);
-            });
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            if self.alpha[index] > 0.0 {
+                window.with_content_mask(
+                    self.clipped[index].then_some(ContentMask { bounds }),
+                    |window| {
+                        layer.prepaint_at(bounds.origin, window, cx);
+                    },
+                );
+            }
         }
     }
 
@@ -124,14 +166,15 @@ impl Element for Disclosure {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (summary_alpha, details_alpha) = disclosure_opacities(self.shown);
-        if summary_alpha > 0.0 {
-            self.summary.paint(window, cx);
-        }
-        if details_alpha > 0.0 {
-            window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                self.details.paint(window, cx);
-            });
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            if self.alpha[index] > 0.0 {
+                window.with_content_mask(
+                    self.clipped[index].then_some(ContentMask { bounds }),
+                    |window| {
+                        layer.paint(window, cx);
+                    },
+                );
+            }
         }
     }
 }
