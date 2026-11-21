@@ -198,20 +198,54 @@ pub fn load_account_file() -> Result<(PathBuf, AccountConfig), String> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum AccountFileError {
+    AlreadyConfigured,
+    Write(String),
+}
+
+impl From<String> for AccountFileError {
+    fn from(detail: String) -> Self {
+        Self::Write(detail)
+    }
+}
+
+impl From<&str> for AccountFileError {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for AccountFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyConfigured => {
+                f.write_str("An account is already configured. Reopen Fell to use it.")
+            }
+            Self::Write(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// Prepare the file so setup can save its keyring password before publishing
 /// the new config with mode 0600. Dropping the staged file keeps the current
 /// config in place.
-pub(crate) fn stage_account_config(config: &AccountConfig) -> Result<StagedAccountConfig, String> {
+pub(crate) fn stage_account_config(
+    config: &AccountConfig,
+) -> Result<StagedAccountConfig, AccountFileError> {
     stage_config(config, false)
 }
 
 pub(crate) fn stage_new_account_config(
     config: &AccountConfig,
-) -> Result<StagedAccountConfig, String> {
+) -> Result<StagedAccountConfig, AccountFileError> {
     stage_config(config, true)
 }
 
-fn stage_config(config: &AccountConfig, first_run: bool) -> Result<StagedAccountConfig, String> {
+fn stage_config(
+    config: &AccountConfig,
+    first_run: bool,
+) -> Result<StagedAccountConfig, AccountFileError> {
     let path = account_config_path()
         .ok_or_else(|| "no config directory; set HOME or XDG_CONFIG_HOME".to_string())?;
     stage_account_config_at(path, config, first_run)
@@ -225,13 +259,19 @@ pub(crate) struct StagedAccountConfig {
 }
 
 impl StagedAccountConfig {
-    pub(crate) fn publish(self) -> Result<PathBuf, String> {
+    pub(crate) fn publish(self) -> Result<PathBuf, AccountFileError> {
         let installed = if self.first_run {
             self.file.persist_noclobber(&self.path)
         } else {
             self.file.persist(&self.path)
         };
-        installed.map_err(|err| format!("{}: {}", self.path.display(), err.error))?;
+        installed.map_err(|err| {
+            if self.first_run && err.error.kind() == std::io::ErrorKind::AlreadyExists {
+                AccountFileError::AlreadyConfigured
+            } else {
+                format!("{}: {}", self.path.display(), err.error).into()
+            }
+        })?;
         Ok(self.path)
     }
 }
@@ -240,7 +280,7 @@ pub(crate) fn stage_account_config_at(
     path: PathBuf,
     config: &AccountConfig,
     first_run: bool,
-) -> Result<StagedAccountConfig, String> {
+) -> Result<StagedAccountConfig, AccountFileError> {
     use std::io::Write;
 
     let dir = path.parent().expect("account file has a parent directory");
@@ -252,9 +292,9 @@ pub(crate) fn stage_account_config_at(
         .map_err(|err| format!("Couldn't lock the account directory: {err}"))?;
     if first_run {
         match path.symlink_metadata() {
-            Ok(_) => return Err("An account is already configured. Reopen Fell to use it.".into()),
+            Ok(_) => return Err(AccountFileError::AlreadyConfigured),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("{}: {err}", path.display())),
+            Err(err) => return Err(format!("{}: {err}", path.display()).into()),
         }
     }
     let mut file =
@@ -294,12 +334,8 @@ fn prepare(store: &Store, config: Option<&AccountConfig>, demo: bool) -> fell_co
     if let Some(config) = config {
         let account = config.account();
         let retained = store.configure_account(&account, config.write_back)?;
-        let warning = (!retained.is_empty()).then(|| {
-            format!(
-                "Kept existing accounts with reserved IDs · {}",
-                retained.join(", ")
-            )
-        });
+        let warning =
+            (!retained.is_empty()).then(|| "Kept older local mail, drafts, and outbox".to_owned());
         return Ok(Opened {
             account,
             sync: SyncKind::Connecting,
@@ -654,12 +690,9 @@ mod tests {
             assert_eq!(store.db_path(), Some(path.as_path()));
             assert_eq!(opened.sync, SyncKind::Connecting);
             assert!(opened.error.is_none());
-            assert!(
-                opened
-                    .warning
-                    .as_deref()
-                    .unwrap()
-                    .contains("reserved IDs · local")
+            assert_eq!(
+                opened.warning.as_deref(),
+                Some("Kept older local mail, drafts, and outbox")
             );
             assert_eq!(opened.account.id, config.account().id);
             assert!(store.get_account(&opened.account.id).unwrap().is_some());

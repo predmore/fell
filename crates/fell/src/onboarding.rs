@@ -8,7 +8,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use fell_core::credentials::SecretService;
-use fell_core::onboarding::check_connection;
+use fell_core::onboarding::{ConnectionReport, check_connection};
+use fell_core::{AccountConfig, BackendKind, SyncFailureKind, classify_sync_error};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{Context, FocusHandle, KeyDownEvent, Window};
@@ -47,6 +48,12 @@ enum Bridge {
     Offline,
 }
 
+struct FinishedCheck {
+    attempt: u64,
+    config: AccountConfig,
+    result: fell_core::Result<ConnectionReport>,
+}
+
 pub(crate) struct Onboarding {
     form: Form,
     focus: FocusHandle,
@@ -59,6 +66,7 @@ pub(crate) struct Onboarding {
     feedback: layout::Feedback,
     bridge: Bridge,
     check_started: Instant,
+    checked: Option<FinishedCheck>,
 }
 
 impl Onboarding {
@@ -90,6 +98,7 @@ impl Onboarding {
             feedback: layout::Feedback::default(),
             bridge: Bridge::Checking,
             check_started: Instant::now(),
+            checked: None,
         }
     }
 
@@ -185,6 +194,7 @@ impl Onboarding {
             Step::Connection => vec![Back],
             Step::Done => match self.form.storage {
                 Storage::Saving { .. } => vec![Next],
+                _ if self.form.storage.must_reopen() => vec![Next],
                 Storage::ConfirmInline(_) => vec![Back, Next],
                 _ if self.form.storage.inline_available() => vec![Next, Inline, Back],
                 _ => vec![Next, Back],
@@ -275,8 +285,10 @@ impl Onboarding {
                 Step::Connection if self.form.can_retry() => self.check(window, cx),
                 Step::Connection if self.form.connected() => {
                     self.form.done();
+                    self.feedback.begin_save();
                     self.change_step(before, Control::Next, cx);
                 }
+                Step::Done if self.form.storage.must_reopen() => cx.quit(),
                 Step::Done => self.save(window, cx),
                 _ => {}
             },
@@ -320,6 +332,10 @@ impl Onboarding {
             return;
         };
         self.check_started = self.clock.now();
+        self.checked = None;
+        if before != Step::Connection {
+            self.feedback.begin_check(&self.form);
+        }
         self.change_step(before, Control::Back, cx);
         let attempt = self.form.attempt;
         let (progress, mut events) = mpsc::unbounded();
@@ -340,16 +356,41 @@ impl Onboarding {
             }
             let (config, result) = work.await;
             let _ = this.update(cx, |view, cx| {
-                if view.form.accepts_check(attempt) {
-                    let control = view
-                        .form
-                        .finish_check(attempt, &config, result)
-                        .map_or(Control::Next, Control::Field);
-                    view.change_step(Step::Connection, control, cx);
+                if !view.form.accepts_check(attempt) {
+                    return;
+                }
+                let returning_to_fields = result.as_ref().is_ok_and(|report| {
+                    report.errors().any(|error| {
+                        config.backend != BackendKind::Bridge
+                            || classify_sync_error(error) != SyncFailureKind::Unreachable
+                    })
+                });
+                let check = FinishedCheck {
+                    attempt,
+                    config,
+                    result,
+                };
+                if returning_to_fields && view.motion.enabled() {
+                    // Paint both final sign-in results before the test page
+                    // gives way to the field that needs attention.
+                    view.checked = Some(check);
+                    cx.notify();
+                } else {
+                    view.finish_check(check, cx);
                 }
             });
         })
         .detach();
+    }
+
+    fn finish_check(&mut self, check: FinishedCheck, cx: &mut Context<Self>) {
+        if self.form.accepts_check(check.attempt) {
+            let control = self
+                .form
+                .finish_check(check.attempt, &check.config, check.result)
+                .map_or(Control::Next, Control::Field);
+            self.change_step(Step::Connection, control, cx);
+        }
     }
 
     fn save(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -384,7 +425,6 @@ impl Onboarding {
         if self.transition.take().is_some() {
             cx.notify();
         }
-        self.feedback.settle();
         match key.key.as_str() {
             "tab" => {
                 let controls = self.controls();
