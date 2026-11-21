@@ -39,6 +39,7 @@ mod write_lock;
 pub use bodies::{BodyRequest, PartKinds, PartStamp};
 pub use intents::PendingFlags;
 pub(crate) use summaries::folder_names as message_folder_names;
+pub(crate) use summaries::label_names;
 pub use summaries::{FolderPage, FolderSpan, ListFilter, ListKey, ListSource, ThreadList};
 
 pub(crate) fn listed_folder_roles(
@@ -1672,6 +1673,17 @@ impl Store {
         span: &FolderSpan,
     ) -> Result<FolderPage> {
         summaries::folder_page(&self.conn, account_id, folder, span)
+    }
+
+    /// A window of an exact label's list and the position of its selected thread.
+    pub fn label_page(
+        &self,
+        account: &AccountId,
+        label: &str,
+        span: &FolderSpan,
+        follow: Option<&ThreadId>,
+    ) -> Result<(FolderPage, Option<ListKey>)> {
+        summaries::label_page(&self.conn, account, label, span, follow)
     }
 
     /// Up to `limit` threads of a folder or label after `after` (from the

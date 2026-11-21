@@ -389,6 +389,22 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
         Some(folder_budget),
         |_| store.folder_page(&account.id, INBOX, &middle_span).unwrap(),
     );
+    let (label_page, _) = store.label_page(&account.id, "tag1", &top_span, None)?;
+    assert_eq!(label_page.threads.len(), PAGE_SIZE);
+    assert!(label_page.more_after);
+    report.latency(
+        "Label page (100 rows)",
+        SAMPLES,
+        Some(folder_budget),
+        |_| {
+            (
+                store
+                    .label_page(&account.id, "tag1", &top_span, None)
+                    .unwrap(),
+                store.list_labels(&account.id).unwrap(),
+            )
+        },
+    );
     for index in 0..LONG_THREADS {
         black_box(read(&store, index));
     }

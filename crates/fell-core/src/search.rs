@@ -83,6 +83,7 @@ pub struct SearchLocation {
     pub starred: bool,
     pub sender_name: Option<String>,
     pub message_count: usize,
+    pub labels: Vec<String>,
     pub has_attachment: bool,
 }
 
@@ -149,7 +150,9 @@ pub(crate) fn locations(
                     EXISTS (SELECT 1 FROM messages f
                             WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id
                               AND f.has_attachment = 1),
-                    ({scopes}), ({has_view_copy})
+                    ({scopes}), ({has_view_copy}),
+                    (SELECT group_concat(f.labels, char(30)) FROM messages f
+                     WHERE f.account_id = m.account_id AND f.thread_id = m.thread_id)
              FROM messages m
              WHERE m.account_id = ? AND m.message_id IN ({marks})"
         );
@@ -209,6 +212,7 @@ pub(crate) fn locations(
                     sender_name: row.get(7)?,
                     message_count: row.get::<_, i64>(8)? as usize,
                     has_attachment: row.get(9)?,
+                    labels: crate::store::split_field(&row.get::<_, String>(12)?),
                 },
             );
         }

@@ -1235,13 +1235,13 @@ fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "list_labels",
-            description: "List label names used on this account.",
+            description: "List label names available on this account.",
             scope: ToolScope::Read,
             schema: object_schema(Map::new(), &[]),
         },
         Tool {
             name: "label",
-            description: "Add or remove a label on every message in a thread. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited. Does not send mail.",
+            description: "Add or remove a label on every message in a thread. Requires the triage scope, which is off until granted. Logged, undoable, and rate-limited. Honors the account’s write-back setting. Does not send mail.",
             scope: ToolScope::Triage,
             schema: object_schema(
                 Map::from_iter([

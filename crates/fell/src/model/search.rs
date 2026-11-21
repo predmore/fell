@@ -98,7 +98,12 @@ impl SearchReply {
                         date_unix,
                         subject: one_line(&subject),
                         snippet: one_line(&snippet),
-                        labels: Vec::new(),
+                        labels: location.as_ref().map_or_else(Vec::new, |hit| {
+                            let mut labels = hit.labels.clone();
+                            labels.sort();
+                            labels.dedup();
+                            labels
+                        }),
                         warn: false,
                         unread: location.as_ref().is_some_and(|hit| hit.unread),
                         draft: None,
@@ -830,6 +835,7 @@ mod tests {
                         starred: false,
                         sender_name: Some("Ada".into()),
                         message_count: 3,
+                        labels: vec![],
                         has_attachment: true,
                     },
                 )
@@ -1131,7 +1137,7 @@ mod tests {
                 .contains("venue-2@fell.test")
         );
         assert!(
-            session.is_open(session.message_cursor),
+            session.is_open(&session.messages[session.message_cursor].id),
             "the only hall match here is folded"
         );
         session.on_key(KeyId::Char('N'), 10);

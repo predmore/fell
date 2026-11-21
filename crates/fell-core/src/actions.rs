@@ -12,10 +12,9 @@
 //! ([`Store::folder_roles`]), not fixed names.
 //!
 //! With write-back on for the account (`write_back` in `account.toml`),
-//! archive, move, delete to Trash, spam, and not spam also queue the server
-//! move in the same transaction, and undo takes it back (see
-//! [`crate::outbox`]). Labels stay local, and so does a permanent delete from
-//! Trash ([`Store::purge_threads`]): the server keeps its copy in Trash.
+//! moves and label edits also queue the server change in the same
+//! transaction, and undo takes it back (see [`crate::outbox`]). A permanent
+//! delete from Trash ([`Store::purge_threads`]) stays local.
 //!
 //! A folder those calls remove is recorded on that message. A later
 //! [`Store::apply_delta`] still unions other folders and labels, and leaves
@@ -383,14 +382,24 @@ impl Store {
         thread_id: &ThreadId,
         change: LabelChange,
     ) -> Result<LocalAction> {
+        self.label_threads(account_id, std::slice::from_ref(thread_id), change)
+    }
+
+    /// Apply one label edit to a selection as one undoable action.
+    pub fn label_threads(
+        &self,
+        account_id: &AccountId,
+        threads: &[ThreadId],
+        change: LabelChange,
+    ) -> Result<LocalAction> {
         let (adding, raw) = match &change {
             LabelChange::Add(label) => (true, label.as_str()),
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_thread(
+        self.apply_threads(
             account_id,
-            thread_id,
+            threads,
             ActionKind::Label,
             None,
             |conn, rows| {
@@ -975,6 +984,9 @@ fn record_and_apply(
                 })
                 .transpose()?;
             insert_snapshot(conn, id, account_id, plan, was_keyword)?;
+            if let Some(edit) = label_edit {
+                crate::outbox::labels::queue(conn, account_id, id, &plan.before.message_id, edit)?;
+            }
         }
         record_tombstones(conn, id, account_id, plan)?;
         if plan.view.clear_star || (plan.remove_row && !plan.view.hidden.is_empty()) {
