@@ -1317,6 +1317,61 @@ fn a_search_reads_one_snapshot_while_sync_and_the_indexer_commit() {
 }
 
 #[test]
+fn a_selective_folder_filter_can_find_hits_beyond_the_probe() {
+    let _reset = EmbedderReset;
+    testing_embedder(Some(concepts));
+    let store = Store::open_in_memory().unwrap();
+    let probe_size = SEMANTIC_PROBE_BATCHES * SEMANTIC_LOOKUP_BATCH;
+    let mut messages: Vec<_> = (0..probe_size)
+        .map(|index| {
+            let id = format!("bill-{index}");
+            mail(
+                &id,
+                "from@corpus.test",
+                &id,
+                &format!("Invoice for job {index}"),
+                1_700_000_000 + index as i64,
+            )
+        })
+        .collect();
+    let conversation = Some("shared-conversation".into());
+    messages[0].headers.proton_conversation_id = conversation.clone();
+    messages[0].folders.push("Saved".into());
+    let mut archived = mail(
+        "archived",
+        "from@corpus.test",
+        "Work completed",
+        "Invoice for plumber",
+        1_700_000_000,
+    );
+    archived.headers.proton_conversation_id = conversation;
+    archived.folders = vec!["Archive".into(), "Saved".into()];
+    messages.push(archived);
+    let mut saved = mail(
+        "saved",
+        "from@corpus.test",
+        "Another job",
+        "Invoice for electrician",
+        1_700_000_000,
+    );
+    saved.folders = vec!["Saved".into()];
+    messages.push(saved);
+    fill(&store, &messages);
+    index_with(&store, &Concepts);
+
+    let query = "money owed in:Archive";
+    assert!(keyword(&store, query).hits.is_empty());
+    assert_eq!(ids(&hybrid(&store, query)), ["archived"]);
+
+    // Saved has a probe hit. The fallback skips its lower-scored reply and
+    // appends the next distinct thread.
+    assert_eq!(
+        ids(&hybrid(&store, "money owed in:Saved")),
+        ["bill-0", "saved"]
+    );
+}
+
+#[test]
 fn semantic_rows_apply_the_operators_again() {
     let reset = EmbedderReset;
     testing_embedder(Some(concepts));
