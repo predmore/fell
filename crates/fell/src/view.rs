@@ -522,6 +522,9 @@ impl Inbox {
         sync_with: Option<(AccountConfig, std::path::PathBuf)>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(trace) = cx.try_global::<UiTrace>() {
+            trace.store_opened(opened.error.as_deref());
+        }
         self.account_id = opened.account.id.clone();
         self.session.account_name = opened.account.display_name.clone();
         self.session.account_email = opened.account.email.clone();

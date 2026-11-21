@@ -2,8 +2,9 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{DirBuilder, File};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
@@ -59,7 +60,7 @@ impl UiTrace {
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no state directory"))?;
         let dir = state_home.join("fell/trace");
-        std::fs::create_dir_all(&dir)?;
+        DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let (file, path) = tempfile::Builder::new()
             .prefix("inbox-")
             .suffix(".jsonl")
@@ -111,6 +112,16 @@ impl UiTrace {
 
     pub(crate) fn folder_ready(&self) {
         self.0.borrow_mut().folder_ready = true;
+    }
+
+    pub(crate) fn store_opened(&self, error: Option<&str>) {
+        let event = if let Some(error) = error {
+            eprintln!("fell: could not open mailbox store: {error}");
+            "store_open_failed"
+        } else {
+            "store_opened"
+        };
+        self.0.borrow_mut().milestone(event);
     }
 
     pub(crate) fn painted(&self, window: &Window) {

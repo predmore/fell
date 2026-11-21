@@ -40,7 +40,9 @@ def wait_for(child, description, condition, timeout=15):
 
 
 def copy_fixture(source, path):
-    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
+    # The benchmark produces a closed, checkpointed fixture. An immutable
+    # connection checks it without locking or creating SQLite sidecars.
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
         count, examples = db.execute(
             "SELECT count(*), sum(from_email LIKE '%@bench.test') FROM messages"
         ).fetchone()
@@ -131,6 +133,15 @@ def replay(args):
             with running([args.binary, "--trace"], env=app_env, stdout=log, stderr=log) as app:
                 path = wait_for(app, "trace file", lambda: next(traces.glob("*.jsonl"), None))
                 try:
+                    store_event = wait_for(app, "store open result", lambda: next(
+                        (e["event"] for e in read_events(path)
+                         if e["event"] in ("store_opened", "store_open_failed")),
+                        None,
+                    ))
+                    if store_event == "store_open_failed":
+                        raise RuntimeError(
+                            "Fell could not open the disposable FELL_STORE (see fell.log)"
+                        )
                     wait_for(app, "usable inbox CPU paint", lambda: any(
                         e["event"] == "usable_inbox_paint" for e in read_events(path)
                     ))
