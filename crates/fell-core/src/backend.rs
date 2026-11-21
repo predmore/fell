@@ -422,7 +422,7 @@ pub fn is_demo_account(account_id: &AccountId) -> bool {
 /// same id: its credentials and SMTP settings are the only ones used, so a
 /// draft can never supply them.
 ///
-/// Resolves `password_command`, so call it off the UI thread.
+/// Resolves the configured password source, so call it off the UI thread.
 pub fn backend_for(
     account_id: &AccountId,
     config: Option<&AccountConfig>,

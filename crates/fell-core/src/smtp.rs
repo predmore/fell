@@ -146,7 +146,9 @@ fn login(endpoint: &Endpoint) -> Result<(Pipe, Reply)> {
         Ok(hello) => Ok((pipe, hello)),
         Err(err) => {
             // Leave politely on every refusal once a session is open.
-            let _ = command(&mut pipe, "QUIT");
+            if pipe.plain.is_some() || pipe.tls.is_some() {
+                let _ = command(&mut pipe, "QUIT");
+            }
             Err(err)
         }
     }
@@ -159,11 +161,13 @@ fn handshake(pipe: &mut Pipe, endpoint: &Endpoint) -> Result<Reply> {
     let mut hello = expect(command(pipe, "EHLO localhost")?, 250, "EHLO")?;
     if endpoint.security == ImapSecurity::StartTls {
         if !offers(&hello, "STARTTLS") {
-            return Err(smtp_err(
-                "smtp: the server does not offer STARTTLS and this account requires TLS",
+            return Err(Error::Tls(
+                "smtp: the server does not offer STARTTLS and this account requires TLS".into(),
             ));
         }
-        expect(command(pipe, "STARTTLS")?, 220, "STARTTLS")?;
+        command(pipe, "STARTTLS")
+            .and_then(|reply| expect(reply, 220, "STARTTLS"))
+            .map_err(|err| Error::Tls(err.to_string()))?;
         pipe.upgrade(&endpoint.host, endpoint.accept_invalid_certs)?;
         hello = expect(command(pipe, "EHLO localhost")?, 250, "EHLO")?;
     }
@@ -765,7 +769,11 @@ Bcc: this is body text\r\n"
     fn required_tls_does_not_log_in_to_a_loopback_server_without_starttls() {
         let (result, got) = attempt(Wire::Clear, ImapSecurity::StartTls, AfterData::Accept);
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::Backend(_)), "{err:?}");
+        assert_eq!(
+            crate::classify_sync_error(&err),
+            crate::SyncFailureKind::Tls,
+            "{err}"
+        );
         assert!(err.to_string().contains("STARTTLS"), "{err}");
         assert!(got.auth.is_empty(), "the login went out: {}", got.auth);
         assert!(got.data.is_empty());
@@ -906,6 +914,24 @@ Bcc: this is body text\r\n"
         required.smtp_security = Some(ImapSecurity::StartTls);
         let err = required.check_smtp().unwrap_err();
         assert!(err.to_string().contains("STARTTLS"), "{err}");
+        assert_eq!(classify_sync_error(&err), SyncFailureKind::Tls, "{err}");
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        join.join().unwrap();
+        assert!(got.auth.is_empty());
+    }
+
+    #[test]
+    fn a_failed_starttls_handshake_closes_without_authenticating() {
+        let (port, rx, join) = serve(Wire::StartTls, AfterData::Accept);
+        let mut config = backend(port, ImapSecurity::StartTls).smtp;
+        config.accept_invalid_certs = false;
+        let err =
+            check_login(&Endpoint::new(&config, "mailbox-user", "sample-password")).unwrap_err();
+        assert_eq!(
+            crate::classify_sync_error(&err),
+            crate::SyncFailureKind::Tls,
+            "{err}"
+        );
         let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         join.join().unwrap();
         assert!(got.auth.is_empty());

@@ -1,13 +1,17 @@
 //! `fell account setup|show|check`: write and test `~/.config/fell/account.toml`.
 //!
 //! Setup asks for anything not given as a flag, checks the login against the
-//! server, and only then writes the file (mode 0600). It reads no mail.
+//! server, and only then saves the credentials and writes the file (mode 0600).
+//! It reads no mail.
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 
-use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource, classify_sync_error};
+use fell_core::credentials::{PasswordStore, SecretService};
+use fell_core::onboarding::{ConnectionProgress, check_connection, connection_recovery};
+use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
-use crate::mailbox::{load_account_file, write_account_config};
+use crate::mailbox::{StagedAccountConfig, load_account_file, stage_account_config};
 
 const USAGE: &str = "\
 fell account setup [options]   write ~/.config/fell/account.toml after a login check
@@ -15,11 +19,13 @@ fell account show              print the account file without the password
 fell account check             log in to IMAP and SMTP with the account file, send nothing
 
 setup options (anything missing is asked for on a terminal):
+  Entered passwords are saved in the desktop keyring by default.
   --imap                       a plain IMAP account instead of Proton Mail Bridge
   --email ADDRESS              the address you send as
   --name NAME                  display name
   --username USER              IMAP username (Bridge shows it under the account's mailbox details)
   --password-stdin             read the password from the first line of stdin
+  --password-inline            store the entered password in account.toml
   --password-command CMD       run CMD (sh -c) for the password at each sync
   --host HOST --port PORT      default 127.0.0.1:1143 for Bridge, PORT 993 for IMAP
   --security starttls|tls|plain
@@ -67,6 +73,7 @@ struct Flags {
     name: Option<String>,
     username: Option<String>,
     password_stdin: bool,
+    password_inline: bool,
     password_command: Option<String>,
     host: Option<String>,
     port: Option<u16>,
@@ -98,6 +105,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--name" => flags.name = Some(value("--name")?),
             "--username" => flags.username = Some(value("--username")?),
             "--password-stdin" => flags.password_stdin = true,
+            "--password-inline" => flags.password_inline = true,
             "--password-command" => flags.password_command = Some(value("--password-command")?),
             "--host" => flags.host = Some(value("--host")?),
             "--port" => flags.port = Some(port(&value("--port")?)?),
@@ -114,6 +122,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     }
     if flags.password_stdin && flags.password_command.is_some() {
         return Err("use --password-stdin or --password-command, not both".into());
+    }
+    if flags.password_inline && flags.password_command.is_some() {
+        return Err("use --password-inline or --password-command, not both".into());
     }
     Ok(flags)
 }
@@ -273,8 +284,7 @@ fn setup(args: &[String]) -> Result<(), String> {
             Ok(default.to_string())
         }
     })?;
-    // Same rules the app applies when it reads the file back.
-    let config = AccountConfig::parse(&config.render()).map_err(|err| err.to_string())?;
+    config.validate().map_err(|err| err.to_string())?;
 
     if !flags.no_check {
         check_both(&config).map_err(|err| {
@@ -283,9 +293,39 @@ fn setup(args: &[String]) -> Result<(), String> {
             )
         })?;
     }
-    let path = write_account_config(&config)?;
+    let path = save_account(
+        config,
+        flags.password_inline,
+        &SecretService,
+        stage_account_config,
+    )?;
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
+}
+
+fn save_account(
+    mut config: AccountConfig,
+    password_inline: bool,
+    keyring: &dyn PasswordStore,
+    stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, String>,
+) -> Result<PathBuf, String> {
+    let keyring_password = match (password_inline, config.password) {
+        (false, PasswordSource::Inline(password)) => {
+            config.password = PasswordSource::Keyring;
+            Some(password)
+        }
+        (_, password) => {
+            config.password = password;
+            None
+        }
+    };
+    let staged = stage(&config)?;
+    if let Some(password) = keyring_password {
+        config.store_keyring_password(keyring, &password).map_err(|err| {
+            format!("{}\nUse --password-inline or --password-command to choose a different password source.", explain(&config, &[&err]))
+        })?;
+    }
+    staged.publish()
 }
 
 fn show() -> Result<(), String> {
@@ -308,31 +348,24 @@ fn check() -> Result<(), String> {
 /// even when IMAP fails, so one run shows both, unless the password itself
 /// could not be read.
 fn check_both(config: &AccountConfig) -> Result<(), String> {
-    let mut failures = Vec::new();
-    print!("Logging in to IMAP at {}:{} … ", config.host, config.port);
-    let _ = io::stdout().flush();
-    match config.check_login() {
-        Ok(count) => println!("ok, {count} folders"),
-        Err(err) => {
+    let report = check_connection(config, |progress| match progress {
+        ConnectionProgress::ImapStarted => {
+            print!("Logging in to IMAP at {}:{} … ", config.host, config.port);
+            let _ = io::stdout().flush();
+        }
+        ConnectionProgress::ImapFinished(Ok(count)) => println!("ok, {count} folders"),
+        ConnectionProgress::SmtpStarted => {
+            let smtp = config.smtp_config();
+            print!("Logging in to SMTP at {}:{} … ", smtp.host, smtp.port);
+            let _ = io::stdout().flush();
+        }
+        ConnectionProgress::SmtpFinished(Ok(())) => println!("ok"),
+        ConnectionProgress::ImapFinished(Err(_)) | ConnectionProgress::SmtpFinished(Err(_)) => {
             println!("failed");
-            failures.push(err);
         }
-    }
-    let password = failures
-        .iter()
-        .any(|err| classify_sync_error(err) == fell_core::SyncFailureKind::Password);
-    if !password {
-        let smtp = config.smtp_config();
-        print!("Logging in to SMTP at {}:{} … ", smtp.host, smtp.port);
-        let _ = io::stdout().flush();
-        match config.check_smtp() {
-            Ok(()) => println!("ok"),
-            Err(err) => {
-                println!("failed");
-                failures.push(err);
-            }
-        }
-    }
+    })
+    .map_err(|err| explain(config, &[&err]))?;
+    let failures: Vec<_> = report.errors().collect();
     if failures.is_empty() {
         Ok(())
     } else {
@@ -342,34 +375,16 @@ fn check_both(config: &AccountConfig) -> Result<(), String> {
 
 /// Each error on its own line, then what to do about them. A hint two
 /// failures share is said once.
-fn explain(config: &AccountConfig, errors: &[fell_core::Error]) -> String {
+fn explain(config: &AccountConfig, errors: &[&fell_core::Error]) -> String {
     let mut lines: Vec<String> = errors.iter().map(ToString::to_string).collect();
     for err in errors {
-        let hint = hint(config, err);
-        if !hint.is_empty() && !lines.iter().any(|line| line == hint) {
+        if let Some(hint) = connection_recovery(config, err)
+            && !lines.iter().any(|line| line == hint)
+        {
             lines.push(hint.to_string());
         }
     }
     lines.join("\n")
-}
-
-fn hint(config: &AccountConfig, err: &fell_core::Error) -> &'static str {
-    let bridge = config.backend == BackendKind::Bridge;
-    match classify_sync_error(err) {
-        fell_core::SyncFailureKind::Unreachable if bridge => {
-            "Nothing is listening there. Start Proton Mail Bridge and sign in, then try again."
-        }
-        fell_core::SyncFailureKind::Unreachable => {
-            "The server did not answer on that host and port."
-        }
-        fell_core::SyncFailureKind::LoginRejected if bridge => {
-            "Bridge refused the login. Use the IMAP username and password Bridge shows for this \
-             account, not your Proton password."
-        }
-        fell_core::SyncFailureKind::LoginRejected => "The server refused the username or password.",
-        fell_core::SyncFailureKind::Password => "The password command did not print a password.",
-        fell_core::SyncFailureKind::Other => "",
-    }
 }
 
 fn prompt(label: &str, default: Option<&str>) -> Result<String, String> {
@@ -510,19 +525,20 @@ mod tests {
         let text = explain(
             &config,
             &[
-                err("imap: connect 127.0.0.1:1143 failed: refused"),
-                err("smtp: connect 127.0.0.1:1025 failed: refused"),
+                &err("imap: connect 127.0.0.1:1143 failed: refused"),
+                &err("smtp: connect 127.0.0.1:1025 failed: refused"),
             ],
         );
         assert_eq!(text.lines().count(), 3, "{text}");
         assert!(text.ends_with("then try again."), "{text}");
         let text = explain(
             &config,
-            &[err(
-                "smtp: the server does not offer STARTTLS and this account requires TLS",
+            &[&fell_core::Error::Tls(
+                "smtp: the server does not offer STARTTLS and this account requires TLS".into(),
             )],
         );
-        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("Check the server host, port, TLS mode, and certificate"));
     }
 
     #[test]
@@ -558,6 +574,9 @@ mod tests {
                 .unwrap_err()
                 .contains("not both")
         );
+        assert!(parse_flags(&args(&["--password-inline", "--password-command", "x"])).is_err());
+        let inline = parse_flags(&args(&["--password-stdin", "--password-inline"])).unwrap();
+        assert!(inline.password_inline && inline.password_stdin);
         assert!(parse_flags(&args(&["--port", "nope"])).is_err());
         assert!(parse_flags(&args(&["--smtp-port", "0"])).is_err());
         assert!(parse_flags(&args(&["--smtp-security", "none"])).is_err());
@@ -580,6 +599,73 @@ mod tests {
             ),
             (Some("smtp.b"), Some(2525), Some(ImapSecurity::Tls))
         );
+    }
+
+    #[test]
+    fn setup_publishes_keyring_config_only_after_saving_the_password() {
+        use std::cell::Cell;
+
+        use fell_core::credentials::KeyringError;
+
+        struct FakeKeyring<'a> {
+            path: &'a std::path::Path,
+            fail: Cell<bool>,
+            writes: Cell<usize>,
+        }
+
+        impl PasswordStore for FakeKeyring<'_> {
+            fn read(&self, _: &str) -> Result<String, KeyringError> {
+                panic!("setup does not need to read a saved password")
+            }
+
+            fn store(&self, _: &str, password: &str) -> Result<(), KeyringError> {
+                assert!(
+                    std::fs::read_to_string(self.path)
+                        .unwrap()
+                        .contains("password = ")
+                );
+                assert_eq!(password, "sample-password");
+                self.writes.set(self.writes.get() + 1);
+                if self.fail.get() {
+                    Err(KeyringError::Locked)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.toml");
+        let stage =
+            |config: &AccountConfig| crate::mailbox::stage_account_config_at(path.clone(), config);
+        let keyring = FakeKeyring {
+            path: &path,
+            fail: Cell::new(true),
+            writes: Cell::new(0),
+        };
+        let config = AccountConfig::bridge(
+            "a@example.test",
+            "mailbox-user",
+            PasswordSource::Inline("sample-password".into()),
+        );
+        save_account(config.clone(), true, &keyring, stage).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(AccountConfig::parse(&original).unwrap(), config);
+        assert_eq!(keyring.writes.get(), 0);
+
+        let err = save_account(config.clone(), false, &keyring, stage).unwrap_err();
+        assert!(err.contains("Unlock your desktop keyring"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        keyring.fail.set(false);
+        save_account(config, false, &keyring, stage).unwrap();
+        let published = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            AccountConfig::parse(&published).unwrap().password,
+            PasswordSource::Keyring
+        );
+        assert!(!published.contains("sample-password"));
+        assert_eq!(keyring.writes.get(), 2);
     }
 
     fn imap_account(security: ImapSecurity) -> AccountConfig {

@@ -9,7 +9,8 @@
 //! email = "me@proton.me"
 //! name = "Me"
 //! username = "me@proton.me"     # Bridge shows this in its mailbox settings
-//! password = "bridge-password"  # or: password_command = "pass show fell/bridge"
+//! password_source = "keyring"   # set by account setup
+//! # password = "bridge-password"  # or: password_command = "pass show fell/bridge"
 //! # host = "127.0.0.1"
 //! # port = 1143
 //! # security = "starttls"       # "starttls", "tls", or "plain"
@@ -29,26 +30,31 @@
 //! With `write_back = true`, Fell queues server moves and read and star
 //! changes for the sync thread (see [`crate::outbox`]).
 //!
-//! Sending uses only this file's username and password, never anything in a
+//! Sending uses only this file's username and password source, never anything in a
 //! draft folder. `smtp_security = "starttls"` (the default) refuses a server
 //! that does not offer STARTTLS rather than log in over cleartext.
 
 use std::fmt;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::account::{Account, AccountId, BackendKind};
 use crate::backend::{BridgeBackend, DEMO_ACCOUNT_IDS, ImapBackend, MailBackend};
+use crate::credentials::{KeyringError, PasswordStore, SecretService};
 use crate::folders::FolderRole;
 use crate::imap::{ImapConfig, ImapSecurity};
 use crate::smtp::SmtpConfig;
 use crate::{Error, Result};
 
-/// Where the IMAP password comes from.
+/// Where the shared IMAP and SMTP password comes from.
 #[derive(Clone, PartialEq, Eq)]
 pub enum PasswordSource {
     Inline(String),
     /// Run with `sh -c`; the first line of stdout is the password.
     Command(String),
+    /// Read from the desktop Secret Service for this account's login settings.
+    Keyring,
 }
 
 impl fmt::Debug for PasswordSource {
@@ -56,6 +62,7 @@ impl fmt::Debug for PasswordSource {
         match self {
             Self::Inline(_) => f.write_str("Inline(<redacted>)"),
             Self::Command(command) => f.debug_tuple("Command").field(command).finish(),
+            Self::Keyring => f.write_str("Keyring"),
         }
     }
 }
@@ -174,13 +181,32 @@ impl AccountConfig {
             None if security == ImapSecurity::Tls => 993,
             None => 143,
         };
-        let password = match (get("password"), get("password_command")) {
-            (Some(_), Some(_)) => {
+        let password = match (
+            get("password"),
+            get("password_command"),
+            get("password_source"),
+        ) {
+            (Some(value), None, None) => PasswordSource::Inline(value.text("password")?),
+            (None, Some(value), None) => PasswordSource::Command(value.text("password_command")?),
+            (Some(_), Some(_), None) => {
                 return Err(invalid("set password or password_command, not both"));
             }
-            (Some(value), None) => PasswordSource::Inline(value.text("password")?),
-            (None, Some(value)) => PasswordSource::Command(value.text("password_command")?),
-            (None, None) => return Err(invalid("password or password_command is required")),
+            (None, None, Some(value)) => {
+                if value.text("password_source")? != "keyring" {
+                    return Err(invalid("password_source must be \"keyring\""));
+                }
+                PasswordSource::Keyring
+            }
+            (None, None, None) => {
+                return Err(invalid(
+                    "password or password_command or password_source = \"keyring\" is required",
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    "set only one of password, password_command, and password_source",
+                ));
+            }
         };
         let smtp_host = get("smtp_host").map(|v| v.text("smtp_host")).transpose()?;
         let smtp_port = get("smtp_port").map(Value::port).transpose()?;
@@ -231,7 +257,8 @@ impl AccountConfig {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Check account settings without opening a connection or reading the password source.
+    pub fn validate(&self) -> Result<()> {
         if self.id.is_empty() || DEMO_ACCOUNT_IDS.contains(&self.id.as_str()) {
             return Err(invalid(format!(
                 "id {:?} is reserved for the demo mailbox",
@@ -246,6 +273,9 @@ impl AccountConfig {
         }
         if self.host.is_empty() {
             return Err(invalid("host is required for an imap account"));
+        }
+        if self.port == 0 || self.smtp_port == Some(0) {
+            return Err(invalid("port 0 is out of range"));
         }
         if self.security == ImapSecurity::Plain && !self.is_loopback() {
             return Err(invalid(
@@ -292,6 +322,7 @@ impl AccountConfig {
         match &self.password {
             PasswordSource::Inline(password) => push(&mut out, "password", password),
             PasswordSource::Command(command) => push(&mut out, "password_command", command),
+            PasswordSource::Keyring => push(&mut out, "password_source", "keyring"),
         }
         push(&mut out, "host", &self.host);
         out.push_str(&format!("port = {}\n", self.port));
@@ -362,7 +393,7 @@ impl AccountConfig {
         }
     }
 
-    /// Resolve the password (running `password_command` if set) and build the backend.
+    /// Resolve the password and build the backend. Call off the UI thread.
     pub fn backend(&self) -> Result<Box<dyn MailBackend + Send>> {
         Ok(match self.backend {
             BackendKind::Imap => Box::new(ImapBackend {
@@ -416,8 +447,11 @@ impl AccountConfig {
     }
 
     fn imap_config(&self) -> Result<ImapConfig> {
-        let password = self.resolve_password()?;
-        Ok(ImapConfig {
+        Ok(self.imap_config_with_password(self.resolve_password()?))
+    }
+
+    pub(crate) fn imap_config_with_password(&self, password: String) -> ImapConfig {
+        ImapConfig {
             host: self.host.clone(),
             port: self.port,
             username: self.username.clone(),
@@ -427,12 +461,54 @@ impl AccountConfig {
             // other host must present a certificate a public CA vouches for.
             accept_invalid_certs: self.backend == BackendKind::Bridge && self.is_loopback(),
             folder_overrides: self.folders.clone(),
-        })
+        }
     }
 
     fn resolve_password(&self) -> Result<String> {
+        self.resolve_password_with(&SecretService)
+    }
+
+    /// Save a password for this keyring-backed account. Call after a successful
+    /// connection check with the entered password, before publishing the file.
+    pub fn store_keyring_password(&self, store: &dyn PasswordStore, password: &str) -> Result<()> {
+        self.validate()?;
+        if self.password != PasswordSource::Keyring {
+            return Err(invalid("password_source must be \"keyring\""));
+        }
+        if password.is_empty() {
+            return Err(KeyringError::Invalid.into());
+        }
+        Ok(store.store(&self.credential_key(), password)?)
+    }
+
+    /// Bind the credential to both endpoints as well as the local account
+    /// identity (the default id `mail` is shared by every account file).
+    /// Changing display name or folder settings keeps the same credential.
+    fn credential_key(&self) -> String {
+        let smtp = self.smtp_config();
+        let mut hash = Sha256::new();
+        for field in [
+            self.id.as_str(),
+            self.email.as_str(),
+            self.backend.as_str(),
+            self.username.as_str(),
+            self.host.as_str(),
+            security_name(self.security),
+            &smtp.host,
+            security_name(smtp.security),
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field);
+        }
+        hash.update(self.port.to_be_bytes());
+        hash.update(smtp.port.to_be_bytes());
+        format!("{:x}", hash.finalize())
+    }
+
+    pub(crate) fn resolve_password_with(&self, store: &dyn PasswordStore) -> Result<String> {
         match &self.password {
             PasswordSource::Inline(password) => Ok(password.clone()),
+            PasswordSource::Keyring => Ok(store.read(&self.credential_key())?),
             PasswordSource::Command(command) => {
                 let output = Command::new("sh")
                     .arg("-c")
@@ -476,17 +552,20 @@ pub enum SyncFailureKind {
     Unreachable,
     /// The server refused the username or password.
     LoginRejected,
-    /// `password_command` failed.
+    /// The configured password source failed.
     Password,
+    /// The connection could not negotiate TLS.
+    Tls,
     Other,
 }
 
 pub fn classify_sync_error(err: &Error) -> SyncFailureKind {
-    if matches!(err, Error::SmtpCredentialsRejected(_)) {
-        return SyncFailureKind::LoginRejected;
-    }
-    let Error::Backend(message) = err else {
-        return SyncFailureKind::Other;
+    let message = match err {
+        Error::SmtpCredentialsRejected(_) => return SyncFailureKind::LoginRejected,
+        Error::Keyring(_) => return SyncFailureKind::Password,
+        Error::Tls(_) => return SyncFailureKind::Tls,
+        Error::Backend(message) => message,
+        _ => return SyncFailureKind::Other,
     };
     let upper = message.to_ascii_uppercase();
     if message.starts_with("password_command") {
@@ -754,6 +833,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!((config.port, config.security), (993, ImapSecurity::Tls));
+    }
+
+    #[test]
+    fn keyring_source_round_trips_and_excludes_inline_and_command() {
+        let config =
+            AccountConfig::parse("email = \"a@b\"\npassword_source = \"keyring\"").unwrap();
+        assert_eq!(config.password, PasswordSource::Keyring);
+        let rendered = config.render();
+        assert_eq!(AccountConfig::parse(&rendered).unwrap(), config);
+        assert!(rendered.contains("password_source = \"keyring\""));
+        assert!(!rendered.contains("password =") && !rendered.contains("password_command"));
+
+        for fields in [
+            "password_source = \"other\"",
+            "password_source = 1",
+            "password_source = \"keyring\"\npassword = \"test-only\"",
+            "password_source = \"keyring\"\npassword_command = \"printf test-only\"",
+        ] {
+            assert!(AccountConfig::parse(&format!("email = \"a@b\"\n{fields}")).is_err());
+        }
     }
 
     #[test]

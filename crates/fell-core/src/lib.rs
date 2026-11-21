@@ -11,10 +11,12 @@ pub mod actions;
 pub mod agent;
 pub mod backend;
 pub mod compose;
+pub mod credentials;
 pub mod embed;
 pub mod folders;
 pub mod imap;
 pub mod message;
+pub mod onboarding;
 pub mod outbox;
 pub mod parts;
 pub mod search;
@@ -89,6 +91,10 @@ pub enum Error {
     SendUnconfirmed,
     #[error("{0}")]
     Backend(String),
+    #[error(transparent)]
+    Keyring(#[from] credentials::KeyringError),
+    #[error("{0}")]
+    Tls(String),
     /// The SMTP AUTH exchange rejected the configured credentials.
     #[error("{0}")]
     SmtpCredentialsRejected(String),
