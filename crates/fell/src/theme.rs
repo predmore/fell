@@ -60,6 +60,10 @@ struct Fonts {
 }
 
 impl Theme {
+    pub(crate) fn note_rule(&self) -> u32 {
+        self.accent
+    }
+
     pub fn is_light(&self) -> bool {
         luminance(self.background) > 0.4
     }
@@ -291,7 +295,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             >= contrast(theme.dimmed, theme.background) + 0.8
         && contrast(theme.on_selection, theme.selection)
             >= contrast(theme.on_selection_dim, theme.selection) + 0.8
-        && contrast(theme.accent, theme.background) >= MARK_CONTRAST
+        && contrast(theme.note_rule(), theme.background) >= MARK_CONTRAST
         && [theme.dimmed, theme.accent].into_iter().all(|color| {
             contrast(note_text(color, theme.background), theme.background) >= NOTE_TEXT_CONTRAST
         })

@@ -472,6 +472,10 @@ struct Inbox {
     forwarding_attachments: bool,
     note_view: agent_notes::NoteView,
     conv_note_slot: bool,
+    // Notes present on open can pin. Notes that arrive while reading grow
+    // in the scroll area without covering the visible messages.
+    pin_agent_note: bool,
+    revealing_agent_note: bool,
     note_in_flight: Option<i64>,
     session: Session,
     theme: Theme,
@@ -650,6 +654,8 @@ impl Inbox {
             forwarding_attachments: false,
             note_view: agent_notes::NoteView::default(),
             conv_note_slot: false,
+            pin_agent_note: false,
+            revealing_agent_note: false,
             note_in_flight: None,
             session,
             store,
@@ -2025,12 +2031,7 @@ impl Inbox {
                             // message. Scrolling only far enough to show its
                             // end would cut the row above it, or its header
                             // when it is tall. A thread that fits stays put.
-                            if inbox.session.agent_notes.current(Some(&id)).is_some() {
-                                let x = inbox.conv_scroll.offset().x;
-                                inbox.conv_scroll.set_offset(point(x, px(0.)));
-                            } else {
-                                inbox.land_on_reader();
-                            }
+                            inbox.land_on_reader();
                             false
                         };
                         if let Some((accepted, matches)) = matches
@@ -3301,11 +3302,15 @@ impl Inbox {
         self.session.messages.clear();
         self.open_thread = None;
         self.open_subject.clear();
+        self.pin_agent_note = false;
     }
 
     /// The conversation now shows thread `id`'s messages.
     fn mark_open(&mut self, id: String) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
+        if self.open_thread.as_deref() != Some(&id) {
+            self.pin_agent_note = self.session.agent_notes.current(Some(&id)).is_some();
+        }
         self.open_subject = self
             .session
             .threads
@@ -3468,6 +3473,21 @@ impl Inbox {
         }
         if step.note_scroll != 0 {
             self.note_view.scroll(step.note_scroll);
+        }
+        if step.toggle_agent_note
+            && self.pin_agent_note
+            && self.conv_note_slot
+            && agent_notes::header_scrolled_away(&self.conv_scroll)
+        {
+            self.session.agent_notes.collapsed = false;
+            self.reader_took_over(false);
+            self.glide_conversation_for(
+                f32::from(clamped_offset(&self.conv_scroll)),
+                0.,
+                motion::PANE,
+                0.,
+            );
+            self.revealing_agent_note = self.motion.conv_glide.is_some();
         }
         if step.retry_attachment {
             if let Some(request) = self.attachment_retry.clone() {
@@ -3692,11 +3712,13 @@ impl Inbox {
 
     fn reader_took_over(&mut self, selected: bool) {
         self.reveal = Reveal::Reading { selected };
+        self.revealing_agent_note = false;
         self.release_landing();
     }
 
     fn invalidate_conversation_layout(&mut self) {
         self.body_refresh = BodyRefresh::default();
+        self.revealing_agent_note = false;
         self.release_landing();
         self.conv_layout_current = false;
         self.reveal.cancel_pending();
@@ -3806,6 +3828,18 @@ impl Inbox {
             .map(|message| message.id.as_str());
         self.landing
             .anchor(current, index, self.motion.conv_glide.is_some())
+            .map(|mut anchor| {
+                anchor.y = self.note_landing_inset();
+                anchor
+            })
+    }
+
+    fn note_landing_inset(&self) -> gpui::Pixels {
+        if self.pin_agent_note && self.conv_note_slot {
+            agent_notes::pinned_header_height(&self.theme)
+        } else {
+            px(0.)
+        }
     }
 
     /// The reader took over: stop holding their message in place.
@@ -3834,22 +3868,28 @@ impl Inbox {
         let view = self.conv_scroll.bounds();
         let offset = f32::from(self.conv_scroll.offset().y);
         let max = f32::from(self.conv_scroll.max_offset().height);
-        let target =
-            present::offset_to_message_top(f32::from(item.top()), f32::from(view.top()), max);
+        let target = present::offset_to_message_top(
+            f32::from(item.top()),
+            f32::from(view.top() + self.note_landing_inset()),
+            max,
+        );
         self.glide_conversation(offset, target);
     }
 
     /// Set the conversation's offset to `to`, gliding there from where it
     /// is drawn. `offset` is the offset the key saw.
     fn glide_conversation(&mut self, offset: f32, to: f32) {
+        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
+        self.glide_conversation_for(offset, to, motion::SLIDE, reach);
+    }
+
+    fn glide_conversation_for(&mut self, offset: f32, to: f32, duration: Duration, reach: f32) {
         let from = self.motion.glide_from_conversation(offset);
         let x = self.conv_scroll.offset().x;
         self.conv_scroll.set_offset(point(x, px(to)));
         let now = self.motion.clock.now();
-        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
-        self.motion.conv_glide =
-            Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now)
-                .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
+        self.motion.conv_glide = Glide::start(&self.motion.motion, from, to, reach, duration, now)
+            .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
         if let Some(glide) = self.motion.conv_glide {
             self.conv_scroll.set_offset(point(x, px(glide.from)));
         }
@@ -4142,6 +4182,8 @@ impl Render for Inbox {
         self.conv_note_slot = agent_note.is_some() && !self.session.messages.is_empty();
         let conv = ConvFrame {
             agent_note,
+            pin_agent_note: self.pin_agent_note,
+            revealing_agent_note: self.revealing_agent_note && self.motion.conv_glide.is_some(),
             alphas: self.motion.body_alphas(now),
             disclosures: self.motion.disclosures(&self.session, now),
             anchor: self.hold_landing().or(anchor).or(note_anchor),
@@ -4383,6 +4425,8 @@ struct ListContent {
 #[derive(Default)]
 struct ConvFrame {
     agent_note: Option<agent_notes::NoteFrame>,
+    pin_agent_note: bool,
+    revealing_agent_note: bool,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     disclosures: Disclosures,
@@ -6981,11 +7025,25 @@ fn conversation(
                 )
                 .into_any_element(),
             None => {
-                let note = frame
+                let note_frame = frame
                     .agent_note
                     .as_ref()
-                    .filter(|_| !session.messages.is_empty())
+                    .filter(|_| !session.messages.is_empty());
+                let note = note_frame
                     .map(|note| agent_notes::slot(theme, session, columns, note, live, window, cx));
+                let pinned = note_frame
+                    .filter(|_| frame.pin_agent_note && live.0)
+                    .map(|note| {
+                        agent_notes::pinned_header(
+                            theme,
+                            session,
+                            columns,
+                            note,
+                            frame.revealing_agent_note,
+                            arrival,
+                            cx,
+                        )
+                    });
                 let body = div()
                     .id("conversation-scroll")
                     .flex_1()
@@ -7003,13 +7061,22 @@ fn conversation(
                 let landing = chip_probe
                     .map(|probe| (None, probe))
                     .or_else(|| hold.map(|(anchor, probe)| (Some(anchor.y), probe)));
-                match (scroll, landing) {
+                let body = match (&scroll, landing) {
                     (Some(scroll), Some((y, probe))) => LandingHold {
                         inner: body,
                         probe,
-                        scroll,
+                        scroll: scroll.clone(),
                         y,
                         frames: frame.frames.clone(),
+                    }
+                    .into_any_element(),
+                    _ => body,
+                };
+                match (scroll, pinned) {
+                    (Some(scroll), Some(header)) => agent_notes::PinnedHeader {
+                        inner: body,
+                        header,
+                        scroll,
                     }
                     .into_any_element(),
                     _ => body,

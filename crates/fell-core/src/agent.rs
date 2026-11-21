@@ -1747,7 +1747,10 @@ mod tests {
                 .save_suggested_reply(&draft, &thread, annotation.id, 0)
                 .is_err()
         );
-        store.undo(&account).unwrap();
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Reply draft kept · suggestion restored")
+        );
         assert_eq!(
             store.thread_notes(&account, &thread).unwrap()[0]
                 .suggestions
@@ -1820,9 +1823,15 @@ mod tests {
                 .hits
                 .is_empty()
         );
-        store.undo(&account).unwrap();
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Note restored")
+        );
         assert_eq!(notes()[0].suggestions.len(), 1);
-        store.undo(&account).unwrap();
+        assert_eq!(
+            store.undo_with_note(&account).unwrap().1,
+            Some("Unstarred · suggestion restored")
+        );
         assert_eq!(notes()[0].suggestions.len(), 2);
         assert!(!messages().iter().any(|msg| msg.starred));
         store.undo(&account).unwrap();

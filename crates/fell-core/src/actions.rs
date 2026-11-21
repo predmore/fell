@@ -902,7 +902,8 @@ impl Store {
         )?;
         expect_one(changed, "undo")?;
         // Undoing an annotation also closes its mirror in the agent log.
-        let note = crate::notes::undo_local(&tx, account_id, action.id)?;
+        let note =
+            crate::notes::undo_local(&tx, account_id, action.id)?.map(|note| note.notice(&action));
         tx.commit()?;
         Ok((action, note, restored_threads))
     }

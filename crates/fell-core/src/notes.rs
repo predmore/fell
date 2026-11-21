@@ -16,6 +16,7 @@ pub const MAX_SUGGESTIONS: usize = 6;
 
 const ANNOTATION: i64 = -1;
 const DISMISSAL: i64 = -2;
+const REPLY_OPENED: &str = "Suggested reply opened";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS thread_notes (
@@ -397,12 +398,7 @@ pub(crate) fn accept_reply(
         return Err(Error::Action("The agent note changed".into()));
     }
     ensure_action_schema(conn)?;
-    let action = insert_local_action(
-        conn,
-        account,
-        ActionKind::AcceptSuggestion,
-        "Suggested reply opened",
-    )?;
+    let action = insert_local_action(conn, account, ActionKind::AcceptSuggestion, REPLY_OPENED)?;
     link_action(conn, action.id, note, position, None)?;
     Ok(action.id)
 }
@@ -422,11 +418,37 @@ fn link_action(
     Ok(())
 }
 
+pub(crate) enum NoteUndo {
+    Annotation,
+    Dismissal,
+    Acceptance { snoozed: bool },
+}
+
+impl NoteUndo {
+    pub(crate) fn notice(self, action: &LocalAction) -> &'static str {
+        match self {
+            Self::Annotation => "Note removed",
+            Self::Dismissal => "Note restored",
+            Self::Acceptance { snoozed: true } => "Snooze undone · suggestion restored",
+            Self::Acceptance { snoozed: false } => match action.kind {
+                ActionKind::Archive => "Unarchived · suggestion restored",
+                ActionKind::Label => "Label removed · suggestion restored",
+                ActionKind::Read => "Marked unread · suggestion restored",
+                ActionKind::Star => "Unstarred · suggestion restored",
+                ActionKind::AcceptSuggestion if action.summary == REPLY_OPENED => {
+                    "Reply draft kept · suggestion restored"
+                }
+                _ => "Suggestion restored",
+            },
+        }
+    }
+}
+
 pub(crate) fn undo_local(
     conn: &Connection,
     account: &AccountId,
     action: i64,
-) -> Result<Option<&'static str>> {
+) -> Result<Option<NoteUndo>> {
     let link: Option<(i64, i64, Option<i64>)> = conn.query_row(
         "SELECT note_id, operation, related_agent_action FROM local_thread_note_actions WHERE action_id = ?1 AND undone = 0",
         [action], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -443,9 +465,11 @@ pub(crate) fn undo_local(
             [action],
         )?;
         return Ok(Some(match operation {
-            ANNOTATION => "Note removed",
-            DISMISSAL => "Note restored",
-            _ => "Suggestion restored",
+            ANNOTATION => NoteUndo::Annotation,
+            DISMISSAL => NoteUndo::Dismissal,
+            _ => NoteUndo::Acceptance {
+                snoozed: related.is_some(),
+            },
         }));
     }
     Ok(None)

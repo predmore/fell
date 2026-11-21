@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 use fell_core::notes::{NoteDecision, Suggestion, ThreadNote, display_safe};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, FontWeight, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, div, point, px, rgb,
+    AnyElement, App, AvailableSpace, Bounds, Context, Element, FontWeight, GlobalElementId,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point, px, rgb, size,
 };
 
 use super::{
@@ -14,6 +15,7 @@ use crate::keymap::{self, Action};
 use crate::model::{NoteRequest, SUGGESTIONS_QUERY, Session};
 use crate::motion::{self, Motion, Transition};
 use crate::present::{self, Pane};
+use crate::scroll_anchor::clamped_offset;
 use crate::theme::{self, Theme};
 
 pub(super) const MARKER_SLOT: f32 = 12.0;
@@ -42,6 +44,15 @@ pub(super) fn marker(theme: &Theme, selected: bool) -> gpui::Div {
 
 const ARRIVAL: Duration = Duration::from_millis(140);
 const DISMISSAL: Duration = Duration::from_millis(240);
+const DETAIL_FADE: Duration = Duration::from_millis(60);
+
+fn fade_then_slide(t: f32) -> (f32, f32) {
+    let split = DETAIL_FADE.as_secs_f32() / motion::PANE.as_secs_f32();
+    (
+        motion::fade_out(t / split),
+        motion::ease_out((t - split) / (1.0 - split)),
+    )
+}
 
 #[derive(Clone, Copy)]
 enum VisibilityChange {
@@ -84,7 +95,7 @@ pub(super) struct NoteView {
     shown: bool,
     closed: bool,
     visibility: Option<Visibility>,
-    fold: Option<(f32, Transition)>,
+    fold: Option<((f32, f32), Transition)>,
     previous_suggestions: Option<(ThreadNote, Transition)>,
     scroll: ScrollHandle,
 }
@@ -92,7 +103,7 @@ pub(super) struct NoteView {
 pub(super) struct NoteFrame {
     note: ThreadNote,
     closed: bool,
-    details: f32,
+    details: (f32, f32),
     height: f32,
     alpha: f32,
     leaving: bool,
@@ -158,13 +169,14 @@ impl NoteView {
                     self.scroll = ScrollHandle::new();
                 } else if old.suggestions != note.suggestions {
                     self.previous_suggestions = motion
-                        .start(motion::SLIDE, now)
+                        .start(motion::PANE, now)
                         .map(|time| (old.clone(), time));
                 }
             }
             if self.closed != closed {
                 let from = self.details(now);
-                self.fold = motion.start(motion::SLIDE, now).map(|time| (from, time));
+                let duration = if closed { motion::PANE } else { motion::SLIDE };
+                self.fold = motion.start(duration, now).map(|time| (from, time));
                 self.closed = closed;
             }
             self.shown = true;
@@ -194,10 +206,19 @@ impl NoteView {
         was_moving || changed
     }
 
-    fn details(&self, now: Instant) -> f32 {
-        let to = if self.closed { 0.0 } else { 1.0 };
+    fn details(&self, now: Instant) -> (f32, f32) {
+        let to = if self.closed { (0.0, 0.0) } else { (1.0, 1.0) };
         self.fold.map_or(to, |(from, time)| {
-            motion::lerp(from, to, time.progress(now))
+            if self.closed {
+                let (alpha, movement) = fade_then_slide(time.linear(now));
+                (from.0 * (1.0 - movement), from.1 * alpha)
+            } else {
+                let progress = time.progress(now);
+                (
+                    motion::lerp(from.0, to.0, progress),
+                    motion::lerp(from.1, to.1, progress),
+                )
+            }
         })
     }
 
@@ -230,45 +251,58 @@ impl NoteView {
     }
 }
 
-pub(super) fn slot(
-    theme: &Theme,
-    session: &Session,
-    columns: ReaderColumns,
-    frame: &NoteFrame,
-    live: Live,
-    window: &Window,
-    cx: &mut Context<Inbox>,
-) -> gpui::Div {
-    let column = columns.card;
-    let line = theme.ui_px + 3.0;
-    let header_height = line + 14.0;
-    let width = (column.width - 21.0).max(0.0);
-    let active = live.0
+const PINNED_HEADER_GAP: f32 = 4.0;
+
+fn header_height(theme: &Theme) -> Pixels {
+    px(theme.ui_px + 12.0)
+}
+
+pub(super) fn pinned_header_height(theme: &Theme) -> Pixels {
+    header_height(theme) + px(PINNED_HEADER_GAP)
+}
+
+pub(super) fn header_scrolled_away(scroll: &ScrollHandle) -> bool {
+    scroll
+        .bounds_for_item(0)
+        .is_some_and(|item| item.top() + clamped_offset(scroll) < scroll.bounds().top() - px(0.5))
+}
+
+fn active(session: &Session, frame: &NoteFrame, live: Live) -> bool {
+    live.0
         && !frame.leaving
         && frame.alpha > 0.0
         && session.pane == Pane::Conversation
-        && session.note().is_some_and(|note| note.id == frame.note.id);
+        && session.note().is_some_and(|note| note.id == frame.note.id)
+}
+
+fn note_header(
+    theme: &Theme,
+    session: &Session,
+    frame: &NoteFrame,
+    closed: bool,
+    active: bool,
+    cx: &mut Context<Inbox>,
+) -> gpui::Stateful<gpui::Div> {
     let (position, total) = session.agent_notes.position();
     let actor = display_safe(&frame.note.actor, false);
-    let summary = display_safe(&frame.note.summary, true);
     let dimmed = rgb(theme::note_text(theme.dimmed, theme.background));
-    let kind = if summary.is_empty() {
+    let kind = if frame.note.summary.is_empty() {
         "Agent suggestions"
     } else {
         "Agent summary"
     };
     let age = present::compact_relative_date(super::now_unix(), frame.note.created_unix);
-    let header = div()
+    div()
         .id("toggle-agent-note")
         .flex()
         .items_center()
         .gap(px(7.0))
-        .h(px(header_height))
+        .h(header_height(theme))
         .child(
             div()
                 .flex_none()
                 .text_color(dimmed)
-                .child(if frame.closed { "▸" } else { "▾" }),
+                .child(if closed { "▸" } else { "▾" }),
         )
         .child(
             div()
@@ -299,12 +333,45 @@ pub(super) fn slot(
                     let step = inbox.session.perform(Action::ToggleAgentNote, 1);
                     inbox.apply_step(step, before, cx);
                 }))
-        });
-    let detail = (frame.details > 0.0).then(|| {
-        disclosure::reveal(
+        })
+}
+
+fn note_column(theme: &Theme, columns: ReaderColumns, content: impl IntoElement) -> gpui::Div {
+    div().flex_none().pl(px(MESSAGE_PAD_PX)).child(
+        columns.card.place(
+            div()
+                .w_full()
+                .border_l(px(2.0))
+                .border_color(rgb(theme.note_rule()))
+                .pl(px(11.0))
+                .text_color(rgb(theme.foreground))
+                .text_size(px(theme.ui_px - 1.0))
+                .line_height(px(theme.ui_px + 3.0))
+                .child(content)
+                .into_any_element(),
+        ),
+    )
+}
+
+pub(super) fn slot(
+    theme: &Theme,
+    session: &Session,
+    columns: ReaderColumns,
+    frame: &NoteFrame,
+    live: Live,
+    window: &Window,
+    cx: &mut Context<Inbox>,
+) -> gpui::Div {
+    let line = theme.ui_px + 3.0;
+    let width = (columns.card.width - 21.0).max(0.0);
+    let active = active(session, frame, live);
+    let header = note_header(theme, session, frame, frame.closed, active, cx);
+    let summary = display_safe(&frame.note.summary, true);
+    let detail = (frame.details.0 > 0.0).then(|| {
+        div().pr(px(8.0)).child(disclosure::reveal(
             width,
-            frame.details,
-            1.0,
+            frame.details.0,
+            frame.details.1,
             div()
                 .flex()
                 .flex_col()
@@ -330,28 +397,122 @@ pub(super) fn slot(
                     cx,
                 ))
                 .into_any_element(),
-        )
+        ))
     });
-    let content = div()
-        .w_full()
-        .border_l(px(2.0))
-        .border_color(rgb(motion::mix(theme.background, theme.accent, 0.4)))
-        .pl(px(11.0))
-        .pr(px(8.0))
-        .text_color(rgb(theme.foreground))
-        .text_size(px(theme.ui_px - 1.0))
-        .line_height(px(line))
-        .child(header)
-        .children(detail);
+    div().flex_none().child(disclosure::reveal(
+        columns.card.inset + columns.card.width + MESSAGE_PAD_PX,
+        frame.height,
+        frame.alpha,
+        note_column(theme, columns, div().child(header).children(detail)).into_any_element(),
+    ))
+}
+
+pub(super) fn pinned_header(
+    theme: &Theme,
+    session: &Session,
+    columns: ReaderColumns,
+    frame: &NoteFrame,
+    opening: bool,
+    arrival: f32,
+    cx: &mut Context<Inbox>,
+) -> AnyElement {
+    let header = note_header(
+        theme,
+        session,
+        frame,
+        !opening,
+        active(session, frame, Live(true)),
+        cx,
+    );
     div()
-        .flex_none()
-        .pl(px(MESSAGE_PAD_PX))
-        .child(column.place(disclosure::reveal(
-            column.width,
-            frame.height,
-            frame.alpha,
-            div().py(px(4.0)).child(content).into_any_element(),
-        )))
+        .w_full()
+        .px(px(super::CONVERSATION_PAD_PX))
+        .when(!opening, |header| header.pb(px(PINNED_HEADER_GAP)))
+        .bg(rgb(theme.background))
+        .block_mouse_except_scroll()
+        .child(note_column(theme, columns, header).opacity(frame.alpha * arrival))
+        .into_any_element()
+}
+
+/// Paint the header above the laid-out scroll viewport, only when the
+/// inline header has moved behind its top edge. Using this frame's
+/// clamped offset also handles conversations that fit on the first layout.
+pub(super) struct PinnedHeader {
+    pub inner: AnyElement,
+    pub header: AnyElement,
+    pub scroll: ScrollHandle,
+}
+
+impl IntoElement for PinnedHeader {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for PinnedHeader {
+    type RequestLayoutState = ();
+    type PrepaintState = bool;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.inner.prepaint(window, cx);
+        let pinned = header_scrolled_away(&self.scroll);
+        if pinned {
+            self.header.prepaint_as_root(
+                bounds.origin,
+                size(
+                    AvailableSpace::Definite(bounds.size.width),
+                    AvailableSpace::MaxContent,
+                ),
+                window,
+                cx,
+            );
+        }
+        pinned
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        pinned: &mut bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.paint(window, cx);
+        if *pinned {
+            self.header.paint(window, cx);
+        }
+    }
 }
 
 struct Chip {
@@ -444,7 +605,12 @@ fn suggestions(
         .suggestions
         .as_ref()
         .map_or((Vec::new(), 1.0), |(note, t)| (layout(note), *t));
-    let progress = motion::ease_out(t);
+    let removed = |old: &Chip| !chips.iter().any(|chip| chip.decision == old.decision);
+    let (alpha, progress) = if previous.iter().any(removed) {
+        fade_then_slide(t)
+    } else {
+        (0.0, motion::ease_out(t))
+    };
     let height = |chips: &[Chip]| chips.last().map_or(0.0, |chip| chip.y + line);
     let current_height = height(&chips);
     let previous_height = if frame.suggestions.is_some() {
@@ -456,10 +622,8 @@ fn suggestions(
     let mut row = div()
         .relative()
         .h(px(motion::lerp(previous_height, current_height, progress)));
-    for old in &previous {
-        if !chips.iter().any(|chip| chip.decision == old.decision) {
-            row = row.child(draw_chip(theme, old, line).opacity(motion::fade_out(t)));
-        }
+    for old in previous.iter().filter(|old| alpha > 0.0 && removed(old)) {
+        row = row.child(draw_chip(theme, old, line).opacity(alpha));
     }
     for mut chip in chips {
         let old = previous.iter().find(|old| old.decision == chip.decision);
@@ -695,5 +859,24 @@ impl Inbox {
             },
             cx,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn details_and_accepted_chips_fade_before_their_space_moves() {
+        let linear =
+            |millis| Duration::from_millis(millis).as_secs_f32() / motion::PANE.as_secs_f32();
+        let (alpha, movement) = fade_then_slide(linear(32));
+        assert!(alpha > 0. && alpha < 1.);
+        assert_eq!(movement, 0.);
+        assert_eq!(fade_then_slide(linear(60)), (0., 0.));
+        let (alpha, movement) = fade_then_slide(linear(90));
+        assert_eq!(alpha, 0.);
+        assert!(movement > 0. && movement < 1.);
+        assert_eq!(fade_then_slide(1.), (0., 1.));
     }
 }

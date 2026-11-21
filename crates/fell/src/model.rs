@@ -340,6 +340,7 @@ pub struct ReadDwell {
 pub struct Step {
     pub note: Option<NoteRequest>,
     pub note_scroll: i8,
+    pub toggle_agent_note: bool,
 
     pub action: Option<Action>,
     pub reload_threads: bool,

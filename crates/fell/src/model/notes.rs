@@ -173,7 +173,10 @@ impl Session {
         }
         let mut step = Step::default();
         match action {
-            Action::ToggleAgentNote => self.agent_notes.collapsed = !self.agent_notes.collapsed,
+            Action::ToggleAgentNote => {
+                self.agent_notes.collapsed = !self.agent_notes.collapsed;
+                step.toggle_agent_note = true;
+            }
             Action::NextAgentNote => {
                 self.agent_notes.selected =
                     (self.agent_notes.selected + 1) % self.agent_notes.notes.len();
