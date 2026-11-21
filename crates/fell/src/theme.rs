@@ -287,6 +287,34 @@ pub fn watch(changed: futures::channel::mpsc::UnboundedSender<()>) -> bool {
     watch_dirs(watched_dirs(), changed)
 }
 
+pub fn follow<V: 'static>(
+    cx: &mut gpui::Context<V>,
+    mut update: impl FnMut(&mut V, Theme, &mut gpui::Context<V>) + 'static,
+) {
+    use futures::StreamExt as _;
+
+    let (changed, mut changes) = futures::channel::mpsc::unbounded();
+    let watching = watch(changed);
+    cx.spawn(async move |this, cx| {
+        loop {
+            if watching {
+                if changes.next().await.is_none() {
+                    break;
+                }
+            } else {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+            }
+            let next = cx.background_executor().spawn(async { load() }).await;
+            if this.update(cx, |view, cx| update(view, next, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 /// Each folder holding a file `load` reads, and that folder's parent, so a
 /// replaced folder (Omarchy rewrites `current/theme`) is noticed and
 /// watched again.

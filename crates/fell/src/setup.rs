@@ -298,17 +298,33 @@ fn setup(args: &[String]) -> Result<(), String> {
         flags.password_inline,
         &SecretService,
         stage_account_config,
-    )?;
+    )
+    .map_err(|err| match err {
+        SaveAccountError::File(detail) => detail,
+        SaveAccountError::Keyring { detail, recovery } => {
+            let recovery = recovery.unwrap_or_default();
+            format!("{detail}\n{recovery}\nUse --password-inline or --password-command to choose a different password source.")
+        }
+    })?;
     println!("Saved {} (mode 600). Open Fell to sync.", path.display());
     Ok(())
 }
 
-fn save_account(
+#[derive(Debug)]
+pub(crate) enum SaveAccountError {
+    File(String),
+    Keyring {
+        detail: String,
+        recovery: Option<&'static str>,
+    },
+}
+
+pub(crate) fn save_account(
     mut config: AccountConfig,
     password_inline: bool,
     keyring: &dyn PasswordStore,
     stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, String>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, SaveAccountError> {
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {
             config.password = PasswordSource::Keyring;
@@ -319,13 +335,16 @@ fn save_account(
             None
         }
     };
-    let staged = stage(&config)?;
+    let staged = stage(&config).map_err(SaveAccountError::File)?;
     if let Some(password) = keyring_password {
-        config.store_keyring_password(keyring, &password).map_err(|err| {
-            format!("{}\nUse --password-inline or --password-command to choose a different password source.", explain(&config, &[&err]))
-        })?;
+        config
+            .store_keyring_password(keyring, &password)
+            .map_err(|err| SaveAccountError::Keyring {
+                detail: err.to_string(),
+                recovery: connection_recovery(&config, &err),
+            })?;
     }
-    staged.publish()
+    staged.publish().map_err(SaveAccountError::File)
 }
 
 fn show() -> Result<(), String> {
@@ -636,8 +655,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.toml");
-        let stage =
-            |config: &AccountConfig| crate::mailbox::stage_account_config_at(path.clone(), config);
+        let stage = |config: &AccountConfig| {
+            crate::mailbox::stage_account_config_at(path.clone(), config, false)
+        };
         let keyring = FakeKeyring {
             path: &path,
             fail: Cell::new(true),
@@ -654,7 +674,10 @@ mod tests {
         assert_eq!(keyring.writes.get(), 0);
 
         let err = save_account(config.clone(), false, &keyring, stage).unwrap_err();
-        assert!(err.contains("Unlock your desktop keyring"));
+        assert!(
+            matches!(err, SaveAccountError::Keyring { recovery: Some(hint), .. }
+            if hint.contains("Unlock your desktop keyring"))
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
         keyring.fail.set(false);

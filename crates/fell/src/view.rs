@@ -58,8 +58,8 @@ use crate::ui_trace::UiTrace;
 
 use self::disclosure::disclosure;
 
-pub fn run(trace_start: Option<Instant>) {
-    eprintln!("{}: opening inbox", fell_version::VERSION);
+pub fn run(demo: bool, trace_start: Option<Instant>) {
+    eprintln!("{}: opening Fell", fell_version::VERSION);
     Application::new().run(move |cx: &mut App| {
         let trace = trace_start.and_then(|start| match UiTrace::open(start) {
             Ok(trace) => Some(trace),
@@ -77,37 +77,43 @@ pub fn run(trace_start: Option<Instant>) {
             })
             .detach();
         }
-        // Agents' drafts open in a compose window from here; see draft_host.
-        let _hub = crate::draft_host::host_agent_drafts(cx);
+        let startup = mailbox::startup();
         let (width, height) = window_size();
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        let view = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Fell".into()),
-                    ..Default::default()
-                }),
-                app_id: Some("dev.predmore.fell".into()),
-                focus: true,
-                show: true,
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Fell".into()),
                 ..Default::default()
-            },
-            |window, cx| {
+            }),
+            app_id: Some("dev.predmore.fell".into()),
+            focus: true,
+            show: true,
+            ..Default::default()
+        };
+        let view = if startup.account_missing && !demo {
+            cx.open_window(options, |window, cx| {
                 if let Some(trace) = &trace {
                     trace.window_created(window);
                 }
-                let view = cx.new(Inbox::new);
-                let focus = view.read(cx).focus.clone();
-                window.focus(&focus);
-                view
-            },
-        );
+                cx.new(|cx| crate::onboarding::Onboarding::new(window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        } else {
+            crate::draft_host::host_agent_drafts(cx);
+            cx.open_window(options, |window, cx| {
+                if let Some(trace) = &trace {
+                    trace.window_created(window);
+                }
+                cx.new(|cx| Inbox::focused(startup, demo, window, cx))
+            })
+            .map(gpui::AnyWindowHandle::from)
+        };
         match view {
             Ok(view) => {
                 if let Some(trace) = trace {
                     cx.on_window_closed(move |cx| {
-                        if !cx.windows().contains(&view.into()) {
+                        if !cx.windows().contains(&view) {
                             trace.finish();
                         }
                     })
@@ -118,6 +124,12 @@ pub fn run(trace_start: Option<Instant>) {
         }
         cx.activate(true);
     });
+}
+
+pub(crate) fn finish_onboarding(window: &mut Window, cx: &mut App) {
+    let startup = mailbox::startup();
+    crate::draft_host::host_agent_drafts(cx);
+    window.replace_root(cx, |window, cx| Inbox::focused(startup, false, window, cx));
 }
 
 /// Why the folder is being reread. Requests made while a read is in flight
@@ -389,15 +401,25 @@ struct Warm {
 const WARM_ROWS: usize = 2;
 
 impl Inbox {
-    fn new(cx: &mut Context<Self>) -> Self {
-        let startup = mailbox::startup();
+    fn focused(
+        startup: mailbox::Startup,
+        demo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inbox = Self::new(startup, demo, cx);
+        window.focus(&inbox.focus);
+        inbox
+    }
+
+    fn new(startup: mailbox::Startup, demo: bool, cx: &mut Context<Self>) -> Self {
         let theme = theme::load();
         let config = startup.config.clone();
         let path = startup.path.clone();
         let draft_home = startup.path.clone().ok().map(DraftHome::real);
         let (store, ready) = StoreClient::spawn({
             let config = config.clone();
-            move || mailbox::open_store(path, config.as_ref())
+            move || mailbox::open_store(path, config.as_ref(), demo)
         });
         let (name, email) = match &config {
             Some(config) => {
@@ -483,7 +505,13 @@ impl Inbox {
             let _ = this.update(cx, |inbox, cx| inbox.on_store_ready(opened, sync_with, cx));
         })
         .detach();
-        inbox.watch_theme(cx);
+        theme::follow(cx, |inbox, next, cx| {
+            if inbox.theme != next {
+                inbox.theme = next;
+                inbox.row_widths.clear();
+                cx.notify();
+            }
+        });
         inbox.watch_reviews(cx);
         inbox.watch_dates(cx);
         inbox
@@ -1921,43 +1949,6 @@ impl Inbox {
                         }
                         if let Some((line, warn)) = closed.last().cloned() {
                             inbox.session.show_toast(line, warn);
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Reload the theme when Omarchy, GTK, or Alacritty settings change.
-    /// inotify wakes this; without it, a slow poll does.
-    fn watch_theme(&self, cx: &mut Context<Self>) {
-        let (changed, mut changes) = futures::channel::mpsc::unbounded();
-        let watching = theme::watch(changed);
-        cx.spawn(async move |this, cx| {
-            loop {
-                if watching {
-                    if changes.next().await.is_none() {
-                        break;
-                    }
-                } else {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                }
-                let next = cx
-                    .background_executor()
-                    .spawn(async { theme::load() })
-                    .await;
-                let alive = this
-                    .update(cx, |inbox, cx| {
-                        if inbox.theme != next {
-                            inbox.theme = next;
-                            inbox.row_widths.clear();
                             cx.notify();
                         }
                     })

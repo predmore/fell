@@ -58,7 +58,7 @@ cargo test --workspace
 cargo run -p fell
 ```
 
-`fell` opens a two-pane inbox on the local store. With no account set up, an empty store is filled with fixture threads, and the status line says the sync is offline.
+`fell` opens a two-pane inbox on the local store, or starts account setup on first launch. Use `fell --demo` with a fresh data directory and no account configuration to open the sample inbox.
 
 ### Trace inbox performance
 
@@ -66,7 +66,9 @@ Run `fell --trace` or `FELL_TRACE=1 fell` and open the inbox as usual. Fell prin
 
 ## Connect your mail
 
-Install and start [Proton Mail Bridge](https://proton.me/mail/bridge) (`sudo pacman -S protonmail-bridge` on Arch), sign in, and copy the IMAP username and password Bridge shows for your account. Then:
+Open Fell to choose Proton Mail Bridge or another IMAP account, enter your account details, and test both mail connections. For Proton, install and start [Proton Mail Bridge](https://proton.me/mail/bridge), sign in, and use the IMAP credentials shown under Mailbox details in Bridge. Fell starts syncing when you save the account.
+
+Terminal setup is also available:
 
 ```sh
 cargo run -p fell -- account setup   # asks for email, username, Bridge password; checks the login

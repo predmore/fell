@@ -14,7 +14,8 @@ use gpui::{
 
 const USAGE: &str = "\
 Usage:
-  fell                         open the inbox
+  fell                         set up a mail account or open the inbox
+  fell --demo                  open a sample inbox if no account is configured
   fell --trace                 record inbox startup and frame timing
   fell account setup|show|check
                                connect and test a mail account
@@ -35,8 +36,7 @@ Development previews:
 /// What the command line asks for.
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
-    Inbox,
-    TraceInbox,
+    Inbox { demo: bool, trace: bool },
     Help,
     Version,
     Account(Vec<String>),
@@ -67,6 +67,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     let mut fixture = None;
     let mut trace = false;
+    let mut demo = false;
     let mut light = None;
     let mut compose = ComposePreview {
         light: false,
@@ -86,6 +87,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--help" | "-h" | "help" => return Ok(Command::Help),
             "--version" | "-V" => return Ok(Command::Version),
             "--trace" => trace = true,
+            "--demo" => demo = true,
             "--fixture" => match value("--fixture")? {
                 "--help" | "-h" => return Ok(Command::Help),
                 name => fixture = Some(name.to_string()),
@@ -120,19 +122,16 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     let light_set = light.is_some();
     let light = light.unwrap_or(false);
-    if trace {
-        return if fixture.is_none() && compose_flag.is_none() && !light_set {
-            Ok(Command::TraceInbox)
-        } else {
-            Err("--trace is for the inbox".into())
-        };
+    if (trace || demo) && (fixture.is_some() || compose_flag.is_some() || light_set) {
+        let flag = if trace { "--trace" } else { "--demo" };
+        return Err(format!("{flag} is for the inbox"));
     }
     match (fixture, compose_flag) {
         (Some(_), Some(flag)) => Err(format!("{flag} is for the compose preview, not --fixture")),
         (Some(name), None) => Ok(Command::Fixture { name, light }),
         (None, Some(_)) => Ok(Command::Compose(ComposePreview { light, ..compose })),
         (None, None) if light_set => Ok(Command::Compose(ComposePreview { light, ..compose })),
-        (None, None) => Ok(Command::Inbox),
+        (None, None) => Ok(Command::Inbox { demo, trace }),
     }
 }
 
@@ -164,11 +163,14 @@ fn main() {
         Command::Account(args) => std::process::exit(fell::account_command(&args)),
         Command::Embeddings(args) => std::process::exit(fell::embeddings_command(&args)),
         Command::Mcp(args) => mcp(&args),
-        Command::Inbox if std::env::var_os("FELL_TRACE").is_some_and(|value| value == "1") => {
-            fell::run_traced(started);
+        Command::Inbox { demo, trace } => {
+            let trace = trace || std::env::var_os("FELL_TRACE").is_some_and(|value| value == "1");
+            match (demo, trace) {
+                (true, trace) => fell::run_demo(trace.then_some(started)),
+                (false, true) => fell::run_traced(started),
+                (false, false) => fell::run(),
+            }
         }
-        Command::TraceInbox => fell::run_traced(started),
-        Command::Inbox => fell::run(),
         Command::Fixture { name, light } => preview(name, light),
         Command::Compose(preview) => compose_preview(preview),
     }
@@ -296,6 +298,24 @@ mod tests {
     }
 
     #[test]
+    fn the_demo_inbox_is_explicit() {
+        assert_eq!(
+            parse(&[]),
+            Ok(Command::Inbox {
+                demo: false,
+                trace: false
+            })
+        );
+        assert_eq!(
+            parse(&["--demo"]),
+            Ok(Command::Inbox {
+                demo: true,
+                trace: false
+            })
+        );
+    }
+
+    #[test]
     fn help_never_opens_a_window() {
         for args in [
             &["--help"][..],
@@ -338,7 +358,13 @@ mod tests {
 
     #[test]
     fn known_forms_still_parse() {
-        assert_eq!(parse(&[]), Ok(Command::Inbox));
+        assert_eq!(
+            parse(&[]),
+            Ok(Command::Inbox {
+                demo: false,
+                trace: false
+            })
+        );
         assert_eq!(
             parse(&["account", "setup", "--bogus"]),
             Ok(Command::Account(vec!["setup".into(), "--bogus".into()]))
@@ -384,7 +410,20 @@ mod tests {
 
     #[test]
     fn trace_opens_only_the_inbox() {
-        assert_eq!(parse(&["--trace"]), Ok(Command::TraceInbox));
+        assert_eq!(
+            parse(&["--trace"]),
+            Ok(Command::Inbox {
+                demo: false,
+                trace: true
+            })
+        );
+        assert_eq!(
+            parse(&["--trace", "--demo"]),
+            Ok(Command::Inbox {
+                demo: true,
+                trace: true
+            })
+        );
         assert!(parse(&["--trace", "--fixture", "native-personal-reply"]).is_err());
         assert!(parse(&["--trace", "--play"]).is_err());
     }
