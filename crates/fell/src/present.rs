@@ -1305,7 +1305,7 @@ pub fn ellipsis(head: &str) -> String {
 }
 
 /// The longest start of `middle` that fits between `before` and `after`,
-/// with an ellipsis.
+/// with an ellipsis. Prefer a word break within four characters of the cut.
 fn cut_to(
     middle: &str,
     before: &str,
@@ -1314,20 +1314,29 @@ fn cut_to(
     measure: &impl Fn(&str) -> f32,
 ) -> String {
     let chars: Vec<char> = middle.chars().collect();
-    let mut best = format!("{before}…{after}");
+    let candidate = |end| {
+        let short: String = chars[..end].iter().collect();
+        format!("{before}{}{after}", ellipsis(&short))
+    };
+    let mut end = 0;
     let (mut lo, mut hi) = (1, chars.len());
     while lo <= hi {
         let mid = (lo + hi) / 2;
-        let short: String = chars[..mid].iter().collect();
-        let candidate = format!("{before}{}{after}", ellipsis(&short));
-        if measure(&candidate) <= max_px {
-            best = candidate;
+        if measure(&candidate(mid)) <= max_px {
+            end = mid;
             lo = mid + 1;
         } else {
             hi = mid - 1;
         }
     }
-    best
+    if chars.get(end).is_some_and(|ch| !ch.is_whitespace())
+        && let Some(boundary) = chars[..end].iter().rposition(|ch| ch.is_whitespace())
+        && boundary > 0
+        && end - boundary <= 4
+    {
+        return candidate(boundary);
+    }
+    candidate(end)
 }
 
 /// `Name <address>`, or the address alone, as a `From:` header writes it.
@@ -1883,7 +1892,7 @@ mod tests {
         };
         assert_eq!(
             notice.fit(room, width),
-            "Removed “travel” from “Tickets to the a…”"
+            "Removed “travel” from “Tickets to the…”"
         );
         notice.verb = "Restored";
         notice.relation = "to";

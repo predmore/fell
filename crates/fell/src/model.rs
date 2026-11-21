@@ -316,6 +316,8 @@ struct LabelSelection {
     ids: Vec<String>,
     subject: Option<String>,
     counts: Option<HashMap<String, usize>>,
+    waiting_to_open: bool,
+    pending_choice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -680,27 +682,48 @@ impl Session {
         self.label_selection.subject.as_deref()
     }
 
+    pub fn visible_overlay(&self) -> Overlay {
+        if self.label_picker_active() && self.label_selection.waiting_to_open {
+            Overlay::None
+        } else {
+            self.overlay.clone()
+        }
+    }
+
+    pub fn label_picker_active(&self) -> bool {
+        self.overlay == Overlay::Folders && self.folder_intent == FolderIntent::Label
+    }
+
+    pub fn open_label_picker(&mut self) {
+        if self.label_picker_active() {
+            self.label_selection.waiting_to_open = false;
+        }
+    }
+
     pub fn load_label_targets(
         &mut self,
         result: Result<HashMap<String, fell_core::store::ThreadLabels>, String>,
-    ) {
-        if self.overlay != Overlay::Folders || self.folder_intent != FolderIntent::Label {
-            return;
+    ) -> Step {
+        if !self.label_picker_active() {
+            return Step::default();
         }
         let targets = match result {
             Ok(targets) => targets,
             Err(error) => {
                 self.overlay = Overlay::None;
-                self.show_toast(error, true);
-                return;
+                self.folder_intent = FolderIntent::Go;
+                self.show_toast(format!("Could not read labels · {error}"), true);
+                return Step::default();
             }
         };
         let selection = &mut self.label_selection;
+        selection.waiting_to_open = false;
         selection.ids.retain(|id| targets.contains_key(id));
         if selection.ids.is_empty() {
             self.overlay = Overlay::None;
+            self.folder_intent = FolderIntent::Go;
             self.show_toast("A selected conversation is no longer available", true);
-            return;
+            return Step::default();
         }
         if let [id] = selection.ids.as_slice() {
             selection.subject = Some(targets[id].subject.clone());
@@ -712,6 +735,11 @@ impl Session {
             }
         }
         selection.counts = Some(counts);
+        if let Some(name) = selection.pending_choice.take() {
+            self.apply_picker_choice(name)
+        } else {
+            Step::default()
+        }
     }
 
     pub fn record_startup_error(&mut self, error: String) {
@@ -2152,11 +2180,7 @@ impl Session {
 
     /// Enter or a click on the highlighted folder.
     pub fn confirm_folder(&mut self) -> Step {
-        if self.folder_intent == FolderIntent::Label && self.label_selection.counts.is_none() {
-            return Step::default();
-        }
-        let choices = self.picker_choices();
-        let Some(chosen) = choices.get(self.folder_index) else {
+        let Some(chosen) = self.picker_choices().into_iter().nth(self.folder_index) else {
             if matches!(
                 self.folder_intent,
                 FolderIntent::Label | FolderIntent::LabelList
@@ -2168,23 +2192,37 @@ impl Session {
             self.folder_intent = FolderIntent::Go;
             return Step::default();
         };
+        if self.label_picker_active() && self.label_selection.counts.is_none() {
+            self.label_selection.pending_choice = Some(chosen.name);
+            return Step::default();
+        }
+        self.apply_picker_choice(chosen.name)
+    }
+
+    fn apply_picker_choice(&mut self, name: String) -> Step {
         let intent = self.folder_intent;
         self.overlay = Overlay::None;
         self.folder_query.clear();
         self.folder_intent = FolderIntent::Go;
         match intent {
             FolderIntent::Move => {
-                self.pending_move = Some(chosen.name.clone());
+                self.pending_move = Some(name);
                 Step {
                     apply_move: true,
                     ..Step::default()
                 }
             }
             FolderIntent::Label => {
+                let labeled = self
+                    .label_selection
+                    .counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(&name))
+                    .copied();
                 let edit = LabelEdit {
                     ids: self.label_selection.ids.clone(),
-                    name: chosen.name.clone(),
-                    add: chosen.mark != Some("✓"),
+                    name,
+                    add: labeled != Some(self.label_selection.ids.len()),
                 };
                 if edit.add || self.label_scope.as_deref() != Some(&edit.name) {
                     self.visual = false;
@@ -2198,11 +2236,11 @@ impl Session {
                 }
             }
             FolderIntent::LabelList => Step {
-                reload_threads: self.go_label(&chosen.name),
+                reload_threads: self.go_label(&name),
                 ..Step::default()
             },
             FolderIntent::Go => Step {
-                reload_threads: self.go_folder(&chosen.name),
+                reload_threads: self.go_folder(&name),
                 ..Step::default()
             },
         }
@@ -2392,7 +2430,8 @@ impl Session {
                     self.label_selection = LabelSelection {
                         ids: targets,
                         subject,
-                        counts: None,
+                        waiting_to_open: true,
+                        ..LabelSelection::default()
                     };
                     step.read_label_targets = true;
                 }
@@ -3466,7 +3505,7 @@ mod tests {
         }
     }
 
-    fn load_test_label_targets(session: &mut Session) {
+    fn load_test_label_targets(session: &mut Session) -> Step {
         let ids = session.label_target_ids();
         session.load_label_targets(Ok(session
             .threads
@@ -3481,7 +3520,73 @@ mod tests {
                     },
                 )
             })
-            .collect()));
+            .collect()))
+    }
+
+    #[test]
+    fn label_picker_opens_with_checks_if_counts_arrive_before_the_deadline() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.threads[0].labels = vec!["Work".into()];
+        assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
+        assert_eq!(session.visible_overlay(), Overlay::None);
+
+        assert!(load_test_label_targets(&mut session).labels.is_none());
+        assert_eq!(session.visible_overlay(), Overlay::Folders);
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+    }
+
+    #[test]
+    fn the_label_picker_can_open_before_late_counts_arrive() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.threads[0].labels = vec!["Work".into()];
+        session.on_key(KeyId::Char('l'), 10);
+        session.open_label_picker();
+        assert_eq!(session.visible_overlay(), Overlay::Folders);
+        assert_eq!(session.picker_choices()[0].mark, None);
+
+        assert!(load_test_label_targets(&mut session).labels.is_none());
+        assert_eq!(session.picker_choices()[0].mark, Some("✓"));
+    }
+
+    #[test]
+    fn enter_queued_during_label_lookup_uses_the_choice_at_the_time_of_the_key() {
+        for timed_out in [false, true] {
+            let mut session = session();
+            session.labels = vec!["Travel".into(), "Work".into()];
+            session.threads[0].labels = vec!["Work".into()];
+            session.on_key(KeyId::Char('l'), 10);
+            if timed_out {
+                session.open_label_picker();
+            }
+            type_picker(&mut session, "work");
+            assert!(session.on_key(KeyId::Enter, 10).labels.is_none());
+            session.on_key(KeyId::Backspace, 10);
+
+            let edit = load_test_label_targets(&mut session).labels.unwrap();
+            assert_eq!(edit.name, "Work");
+            assert_eq!(edit.ids, ["a"]);
+            assert!(!edit.add);
+            assert_eq!(session.visible_overlay(), Overlay::None);
+        }
+    }
+
+    #[test]
+    fn failing_label_lookup_drops_the_queued_enter_and_explains_why() {
+        let mut session = session();
+        session.labels = vec!["Work".into()];
+        session.on_key(KeyId::Char('l'), 10);
+        session.open_label_picker();
+        session.on_key(KeyId::Enter, 10);
+
+        let step = session.load_label_targets(Err("Store unavailable".into()));
+        assert!(step.labels.is_none());
+        assert_eq!(session.visible_overlay(), Overlay::None);
+        let toast = session.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "Could not read labels · Store unavailable");
+        assert!(toast.alert);
+        assert!(load_test_label_targets(&mut session).labels.is_none());
     }
 
     #[test]
@@ -3595,7 +3700,6 @@ mod tests {
 
         for (mark, add) in [(Some("−"), true), (Some("✓"), false)] {
             assert!(session.on_key(KeyId::Char('l'), 10).read_label_targets);
-            assert!(session.on_key(KeyId::Enter, 10).labels.is_none());
             let ids = session.label_target_ids();
             assert_eq!(ids, [last.as_str(), first.as_str()]);
             session.load_label_targets(Ok(store.thread_labels(&account.id, ids).unwrap()));

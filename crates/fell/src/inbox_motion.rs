@@ -106,12 +106,18 @@ pub struct Layer {
     palette_from_agents: bool,
     pub label_target: Option<String>,
     pub picker_choices: Vec<PickerChoice>,
+    pub label_marks: f32,
 }
 
 impl Layer {
-    fn of(session: &Session) -> Self {
+    fn of(session: &Session, overlay: Overlay, label_marks: f32) -> Self {
+        let picker_choices = if overlay == Overlay::Folders {
+            session.picker_choices()
+        } else {
+            Vec::new()
+        };
         Self {
-            overlay: session.overlay.clone(),
+            overlay,
             chord: session.chord.clone(),
             palette_query: session.palette_query.clone(),
             palette_index: session.palette_index,
@@ -121,11 +127,8 @@ impl Layer {
             agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
             palette_from_agents: session.palette_from_agents,
             label_target: session.label_target(),
-            picker_choices: if session.overlay == Overlay::Folders {
-                session.picker_choices()
-            } else {
-                Vec::new()
-            },
+            picker_choices,
+            label_marks,
         }
     }
 
@@ -250,9 +253,16 @@ pub struct InboxMotion {
     label_header_in: Option<Transition>,
     last_banner: Option<Banner>,
     /// The rows and reader leave before the empty message comes in.
-    empty_list: Option<(Transition, Transition, bool)>,
+    empty_list: Option<EmptyList>,
+    label_marks: Option<Transition>,
     quotes: DisclosureMotion,
     recipients: DisclosureMotion,
+}
+
+struct EmptyList {
+    exit: Transition,
+    enter: Option<Transition>,
+    replaces_reader: bool,
 }
 
 /// How open each moving disclosure is, from 0 to 1, by message id.
@@ -366,6 +376,7 @@ impl InboxMotion {
             label_header_in: None,
             last_banner: None,
             empty_list: None,
+            label_marks: None,
         }
     }
 
@@ -457,8 +468,9 @@ impl InboxMotion {
         self.last_which = which;
         self.last_chord = !session.chord.is_empty();
 
-        if session.overlay != self.last_overlay {
-            if session.overlay == Overlay::None {
+        let overlay = session.visible_overlay();
+        if overlay != self.last_overlay {
+            if overlay == Overlay::None {
                 // Gone for input at once; only its pixels fade.
                 self.overlay = None;
                 self.card_to = self.card_height(now);
@@ -475,9 +487,10 @@ impl InboxMotion {
                 self.card_to = None;
                 self.card_glide = None;
             }
-            self.last_overlay = session.overlay.clone();
+            self.last_overlay = overlay.clone();
         }
-        self.last_layer = (which || session.overlay != Overlay::None).then(|| Layer::of(session));
+        self.last_layer = (which || overlay != Overlay::None)
+            .then(|| Layer::of(session, overlay, self.label_marks(now)));
 
         // Only a key moves the panes; a window resized across the narrow
         // threshold shows its panes at once.
@@ -630,7 +643,7 @@ impl InboxMotion {
         self.selection_out = None;
         self.arrival = None;
         self.arrival_pending = false;
-        self.cancel_empty_list();
+        self.finish_empty_list_entry();
         self.bodies.clear();
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
@@ -715,9 +728,11 @@ impl InboxMotion {
         }
         running |= self.folder_out.is_some();
         running |= keep(&mut self.label_header_in, now);
+        running |= keep(&mut self.label_marks, now);
         if self
             .empty_list
-            .is_some_and(|(_, enter, _)| !enter.running(now))
+            .as_ref()
+            .is_some_and(|list| !list.enter.unwrap_or(list.exit).running(now))
         {
             self.empty_list = None;
         }
@@ -840,34 +855,47 @@ impl InboxMotion {
         self.reading_list_fade = None;
         self.reading_reflow = None;
         // The snapshot owns the exit. A key arriving before the next paint
-        // can skip it without starting the usual reading-mode slide.
+        // can land the list without starting the usual reading-mode slide.
         self.last_layout = (Pane::List, false);
         let replaces_reader = self.last_panes == (false, true);
-        self.empty_list = self
-            .motion
-            .start(motion::FADE, now)
-            .zip(self.motion.start(motion::FADE, now + motion::FADE))
-            .map(|(exit, enter)| (exit, enter, replaces_reader));
+        self.empty_list = self.motion.start(motion::FADE, now).map(|exit| EmptyList {
+            exit,
+            enter: self.motion.start(motion::FADE, now + motion::FADE),
+            replaces_reader,
+        });
         replaces_reader
     }
 
-    pub fn cancel_empty_list(&mut self) {
-        self.empty_list = None;
+    pub fn finish_empty_list_entry(&mut self) {
+        if let Some(list) = &mut self.empty_list {
+            list.enter = None;
+        }
     }
 
     pub fn empty_list_exit(&self, now: Instant) -> f32 {
         self.empty_list
-            .map_or(0.0, |(exit, _, _)| exit.remaining(now))
+            .as_ref()
+            .map_or(0.0, |list| list.exit.remaining(now))
     }
 
     pub fn empty_list_pane(&self, same_scope: bool, now: Instant) -> f32 {
-        self.empty_list.map_or(1.0, |(_, enter, replaces_reader)| {
-            if replaces_reader && same_scope {
-                enter.progress(now)
-            } else {
-                1.0
-            }
-        })
+        self.empty_list
+            .as_ref()
+            .filter(|list| list.replaces_reader && same_scope)
+            .and_then(|list| list.enter)
+            .map_or(1.0, |enter| enter.progress(now))
+    }
+
+    pub fn reset_label_marks(&mut self) {
+        self.label_marks = None;
+    }
+
+    pub fn fade_label_marks(&mut self, now: Instant) {
+        self.label_marks = self.motion.start(motion::FADE, now);
+    }
+
+    pub fn label_marks(&self, now: Instant) -> f32 {
+        self.label_marks.map_or(1.0, |fade| fade.progress(now))
     }
 
     /// Keep an empty banner in step with the scope the header is showing.
@@ -886,13 +914,11 @@ impl InboxMotion {
         }
         Some((
             banner,
-            self.empty_list.map_or(1.0, |(_, enter, replaces_reader)| {
-                if replaces_reader {
-                    1.0
-                } else {
-                    enter.progress(now)
-                }
-            }),
+            self.empty_list
+                .as_ref()
+                .filter(|list| !list.replaces_reader)
+                .and_then(|list| list.enter)
+                .map_or(1.0, |enter| enter.progress(now)),
         ))
     }
 
@@ -1166,13 +1192,16 @@ mod tests {
         session.full_width = false;
 
         let halfway = now + motion::FADE / 2;
-        assert!(motions.empty_list_exit(halfway) > 0.0);
+        let opacity = motions.empty_list_exit(halfway);
+        assert!(opacity > 0.0);
         motions.settle(halfway);
         session.on_key(KeyId::Char('/'), 10);
         motions.observe(&session, (true, true), halfway);
 
         assert!(session.search_editing());
-        assert_eq!(motions.empty_list_exit(halfway), 0.0);
+        assert_eq!(motions.empty_list_exit(halfway), opacity);
+        assert!(motions.empty_list_exit(halfway + motion::FADE / 4) < opacity);
+        assert_eq!(motions.empty_list_exit(now + motion::FADE), 0.0);
         assert_eq!(motions.empty_list_pane(false, halfway), 1.0);
         assert_eq!(motions.reading_progress(halfway), 0.0);
         assert_eq!(motions.reading_list_opacity(halfway), 1.0);
@@ -1193,14 +1222,36 @@ mod tests {
         motions.observe(&session, (true, true), now);
 
         let halfway = now + motion::FADE / 2;
-        assert!(motions.empty_list_exit(halfway) > 0.0);
+        let opacity = motions.empty_list_exit(halfway);
+        assert!(opacity > 0.0);
         motions.settle(halfway);
         session.on_key(KeyId::Enter, 10);
 
         assert_eq!(session.pane, Pane::List);
         assert!(!session.full_width);
-        assert_eq!(motions.empty_list_exit(halfway), 0.0);
+        assert_eq!(motions.empty_list_exit(halfway), opacity);
+        assert!(motions.empty_list_exit(halfway + motion::FADE / 4) < opacity);
+        assert_eq!(motions.empty_list_exit(now + motion::FADE), 0.0);
         assert_eq!(motions.empty_list_pane(true, halfway), 1.0);
+    }
+
+    #[test]
+    fn late_picker_marks_fade_for_the_shared_duration() {
+        let now = Instant::now();
+        let mut motions = InboxMotion::new(Motion::new(true));
+        assert_eq!(motions.label_marks(now), 1.0);
+        motions.fade_label_marks(now);
+        assert_eq!(motions.label_marks(now), 0.0);
+        let halfway = now + motion::FADE / 2;
+        motions.settle(halfway);
+        assert!((0.0..1.0).contains(&motions.label_marks(halfway)));
+        assert!(motions.tick(halfway));
+        assert_eq!(motions.label_marks(now + motion::FADE), 1.0);
+        assert!(!motions.tick(now + motion::FADE));
+
+        let mut reduced = InboxMotion::new(Motion::new(false));
+        reduced.fade_label_marks(now);
+        assert_eq!(reduced.label_marks(now), 1.0);
     }
 
     #[test]
