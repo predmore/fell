@@ -632,6 +632,12 @@ impl crate::Store {
         let actor = require_token(actor, "actor")?;
         let tx = crate::store::immediate_transaction(&self.conn)?;
         require_account(&tx, account_id)?;
+        let label_edit = matches!(kind, "label" | "unlabel")
+            .then(|| LabelEdit::from_summary(&summary))
+            .transpose()?;
+        if let Some(edit) = label_edit {
+            keywords::validate_label(&tx, account_id, edit.label())?;
+        }
         let mut messages = load_thread(&tx, account_id, thread_id)?;
         if messages.is_empty() {
             return Err(Error::UnknownThread);
@@ -648,9 +654,6 @@ impl crate::Store {
         if writes.is_empty() {
             return Ok(None);
         }
-        let label_edit = matches!(kind, "label" | "unlabel")
-            .then(|| LabelEdit::from_summary(&summary))
-            .transpose()?;
         let action = insert_action(&tx, account_id, actor, kind, &summary)?;
         for (old, new) in &writes {
             let was_keyword = label_edit

@@ -5,7 +5,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
-use crate::imap::RemoteCopy;
+use crate::imap::{RemoteCopy, is_reserved_keyword};
 use crate::message::MessageId;
 use crate::search::{IndexedText, sync_terms, terms_for_indexed};
 use crate::{Error, Result};
@@ -18,6 +18,7 @@ pub(super) fn observe(
     copy: &RemoteCopy,
     modseq: Option<u64>,
     keywords: &[String],
+    bridge: bool,
 ) -> Result<()> {
     let mut unique = Vec::new();
     for keyword in keywords {
@@ -48,10 +49,15 @@ pub(super) fn observe(
         return Ok(());
     };
     let before = split_field(&previous);
-    let removed = before.iter().any(|keyword| !contains(&unique, keyword));
+    // A Bridge observation carries a label mailbox's name. Generic IMAP
+    // observations carry raw FLAGS keywords, which we keep on the copy.
+    let is_label = |keyword: &str| bridge || !is_reserved_keyword(keyword);
+    let removed = before
+        .iter()
+        .any(|keyword| is_label(keyword) && !contains(&unique, keyword));
     let added: Vec<_> = unique
         .into_iter()
-        .filter(|keyword| !contains(&before, keyword))
+        .filter(|keyword| is_label(keyword) && !contains(&before, keyword))
         .collect();
     if !added.is_empty() {
         expire_readd_suppression(conn, account_id, &message_id, &added)?;
@@ -143,6 +149,110 @@ fn write_labels(
     Ok(true)
 }
 
+/// Earlier versions copied all IMAP keywords into labels. Clean the label
+/// projection and its ownership markers without changing server observations.
+pub(super) fn migrate_reserved_labels(conn: &Connection) -> Result<()> {
+    const REPAIR: &str = "reserved_imap_labels_v1";
+    let done = |conn: &Connection| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
+            [REPAIR],
+            |row| row.get::<_, bool>(0),
+        )
+    };
+    if done(conn)? {
+        return Ok(());
+    }
+    let tx = super::immediate_transaction(conn)?;
+    if done(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE legacy_imap_keywords (
+            account_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            keywords TEXT NOT NULL,
+            PRIMARY KEY (account_id, message_id),
+            FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id)
+                ON DELETE CASCADE
+        )",
+    )?;
+    let mut changes = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT m.account_id, m.message_id, m.labels, COALESCE(k.labels, '')
+             FROM accounts a JOIN messages m ON m.account_id = a.id
+             LEFT JOIN message_keyword_labels k USING (account_id, message_id)
+             WHERE a.backend_kind = 'imap' AND (m.labels != '' OR k.labels IS NOT NULL)",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let (labels, flags) = partition_labels(&row.get::<_, String>(2)?);
+            let (managed, reserved_managed) = partition_labels(&row.get::<_, String>(3)?);
+            if !flags.is_empty() || !reserved_managed.is_empty() {
+                changes.push((
+                    AccountId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    labels,
+                    flags,
+                    managed,
+                ));
+            }
+        }
+    }
+    for (account_id, message_id, labels, mut flags, managed) in changes {
+        if !flags.is_empty() {
+            // Pre-provenance labels have no reliable copy or revision. Keep
+            // that evidence separately so it can't be used as live FLAGS.
+            let observed = supported_keywords(&tx, &account_id, &message_id)?;
+            flags.retain(|flag| !contains(&observed, flag));
+            if !flags.is_empty() {
+                tx.execute(
+                    "INSERT INTO legacy_imap_keywords VALUES (?1, ?2, ?3)",
+                    params![account_id.as_str(), message_id, join_tokens(&flags)],
+                )?;
+            }
+        }
+        save_managed(&tx, &account_id, &message_id, &managed)?;
+        set_message_labels(&tx, &account_id, &message_id, &join_tokens(&labels))?;
+    }
+    tx.execute("INSERT INTO meta (key, value) VALUES (?1, '1')", [REPAIR])?;
+    tx.commit()
+}
+
+fn partition_labels(labels: &str) -> (Vec<String>, Vec<String>) {
+    split_field(labels)
+        .into_iter()
+        .partition(|label| !is_reserved_keyword(label))
+}
+
+fn is_imap(conn: &Connection, account_id: &AccountId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1 AND backend_kind = 'imap')",
+        )?
+        .query_row([account_id.as_str()], |row| row.get(0))?)
+}
+
+pub(crate) fn validate_label(conn: &Connection, account_id: &AccountId, label: &str) -> Result<()> {
+    if is_reserved_keyword(label) && is_imap(conn, account_id)? {
+        return Err(Error::Invalid(
+            "this name is reserved for an IMAP flag".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// An undo snapshot made by an older release can still contain flags.
+pub(crate) fn restore_visible_labels(
+    conn: &Connection,
+    account_id: &AccountId,
+    encoded: &str,
+) -> Result<Option<String>> {
+    let (labels, flags) = partition_labels(encoded);
+    Ok((!flags.is_empty() && is_imap(conn, account_id)?).then(|| join_tokens(&labels)))
+}
+
 /// A label added in Fell stays local even if it had previously been imported
 /// from a copy and then taken off in Fell.
 pub(super) fn keep_local(
@@ -197,7 +307,7 @@ impl<'a> LabelEdit<'a> {
         }
     }
 
-    fn label(self) -> &'a str {
+    pub(crate) fn label(self) -> &'a str {
         match self {
             Self::Added(label) | Self::Removed(label) => label,
         }
@@ -331,6 +441,9 @@ pub(crate) fn undo_label_action(
     history: LabelHistory,
 ) -> Result<()> {
     let edit = LabelEdit::from_summary(summary)?;
+    if is_reserved_keyword(edit.label()) && is_imap(conn, account_id)? {
+        return Ok(());
+    }
     let (_, snapshots, _) = history.tables();
     let mut stmt = conn.prepare(&format!(
         "SELECT message_id, labels, label_was_keyword FROM {snapshots}

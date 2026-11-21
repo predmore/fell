@@ -388,23 +388,30 @@ impl Store {
             LabelChange::Remove(label) => (false, label.as_str()),
         };
         let label = canonical_label(raw)?;
-        self.apply_thread(account_id, thread_id, ActionKind::Label, None, |_, rows| {
-            let plans = plan_label(rows, adding, &label);
-            if plans.is_empty() {
-                let message = if adding {
-                    "label is already applied"
+        self.apply_thread(
+            account_id,
+            thread_id,
+            ActionKind::Label,
+            None,
+            |conn, rows| {
+                keywords::validate_label(conn, account_id, &label)?;
+                let plans = plan_label(rows, adding, &label);
+                if plans.is_empty() {
+                    let message = if adding {
+                        "label is already applied"
+                    } else {
+                        "label is not on this thread"
+                    };
+                    return Err(Error::Action(message.into()));
+                }
+                let edit = if adding {
+                    LabelEdit::Added(&label)
                 } else {
-                    "label is not on this thread"
+                    LabelEdit::Removed(&label)
                 };
-                return Err(Error::Action(message.into()));
-            }
-            let edit = if adding {
-                LabelEdit::Added(&label)
-            } else {
-                LabelEdit::Removed(&label)
-            };
-            Ok((edit.summary(), plans))
-        })
+                Ok((edit.summary(), plans))
+            },
+        )
     }
 
     /// Move `from_folder` to the account's Trash folder on messages in the
@@ -1159,6 +1166,17 @@ fn apply_plan(conn: &Connection, account_id: &AccountId, plan: &Planned) -> Resu
 
 fn restore_row(conn: &Connection, account_id: &AccountId, snapshot: &Snapshot) -> Result<()> {
     let saved = &snapshot.row;
+    let filtered;
+    let saved =
+        if let Some(labels) = keywords::restore_visible_labels(conn, account_id, &saved.labels)? {
+            filtered = SavedRow {
+                labels,
+                ..saved.clone()
+            };
+            &filtered
+        } else {
+            saved
+        };
     if let Some(current) = load_one(conn, account_id, &saved.message_id)? {
         if snapshot.removed {
             // A snapshot taken before Fell kept Reply-To and attachment names

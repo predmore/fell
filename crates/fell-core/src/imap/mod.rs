@@ -1812,10 +1812,59 @@ fn flag_update(
                     .into_iter()
                     .collect(),
             ),
-            _ => (mode.keywords && item.flags_present).then(|| rfc822::keyword_labels(&item.flags)),
+            _ => (mode.keywords && item.flags_present).then(|| rfc822::keywords(&item.flags)),
         },
         modseq: item.modseq,
     }
+}
+
+/// Reserved IMAP flags and keywords, matched as whole, case-insensitive atoms.
+pub(crate) fn is_reserved_keyword(keyword: &str) -> bool {
+    // IANA IMAP and JMAP Keywords registry, including its JMAP-only and
+    // reserved entries. Thunderbird's $label1–$label5 are user tags, and
+    // FLAGS alone cannot distinguish them from other uses of those names.
+    const RESERVED: &[&str] = &[
+        "$MDNSent",
+        "$Forwarded",
+        "$SubmitPending",
+        "$Submitted",
+        "$Junk",
+        "$NotJunk",
+        "$Phishing",
+        "$Important",
+        "$draft",
+        "$seen",
+        "$flagged",
+        "$answered",
+        "$recent",
+        "$autosent",
+        "$canunsubscribe",
+        "$followed",
+        "$hasattachment",
+        "$hasmemo",
+        "$hasnoattachment",
+        "$imported",
+        "$istrusted",
+        "$MailFlagBit0",
+        "$MailFlagBit1",
+        "$MailFlagBit2",
+        "$maskedemail",
+        "$memo",
+        "$muted",
+        "$new",
+        "$notify",
+        "$unsubscribed",
+        // Bare flags emitted by some IMAP clients.
+        "Forwarded",
+        "Redirected",
+        "Junk",
+        "NonJunk",
+        "NotJunk",
+    ];
+    keyword.starts_with('\\')
+        || RESERVED
+            .iter()
+            .any(|reserved| keyword.eq_ignore_ascii_case(reserved))
 }
 
 /// With no revision, a new row already applied unread as part of its arrival.

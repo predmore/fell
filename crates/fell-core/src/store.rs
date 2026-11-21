@@ -581,6 +581,7 @@ impl Store {
             bodies::queue_unlisted_mail(&conn)?;
         }
         crate::actions::migrate_purge_snapshots(&conn)?;
+        keywords::migrate_reserved_labels(&conn)?;
         Ok(Self {
             indexer: None,
             semantic: std::cell::RefCell::new(crate::search::semantic::Semantic::new(
@@ -3400,7 +3401,7 @@ fn apply_flag(
 ) -> Result<()> {
     let copy = crate::imap::parse_remote_id(&flag.remote_id.0);
     if let (Some(copy), Some(keywords)) = (&copy, &flag.keywords) {
-        keywords::observe(conn, account_id, copy, flag.modseq, keywords)?;
+        keywords::observe(conn, account_id, copy, flag.modseq, keywords, bridge)?;
     }
     let fresh = if let Some(copy) = &copy
         && ((flag.unread.is_some() && flag.modseq.is_some()) || (bridge && flag.flagged.is_some()))
