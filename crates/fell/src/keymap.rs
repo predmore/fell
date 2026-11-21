@@ -117,7 +117,7 @@ impl Action {
             Self::Palette => "Command palette",
             Self::Help => "Help",
             Self::About => "About Fell",
-            Self::ReopenReview => "Reopen the agent review that closed",
+            Self::ReopenReview => "Reopen closed review",
         }
     }
 
@@ -250,22 +250,22 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Char('g'), KeyId::Char('i')],
         Action::Inbox,
-        Some("go"),
+        Some("Go"),
     );
     bind(
         &[KeyId::Char('g'), KeyId::Char('s')],
         Action::Sent,
-        Some("go"),
+        Some("Go"),
     );
     bind(
         &[KeyId::Char('g'), KeyId::Char('d')],
         Action::Drafts,
-        Some("go"),
+        Some("Go"),
     );
     bind(
         &[KeyId::Char('g'), KeyId::Char('f')],
         Action::FolderPicker,
-        Some("go"),
+        Some("Go"),
     );
     bind(&[KeyId::Char('c')], Action::Compose, None);
     bind(&[KeyId::Char('r')], Action::Reply, None);
@@ -290,63 +290,63 @@ fn default_bindings() -> Vec<Binding> {
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('i')],
         Action::Inbox,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('s')],
         Action::Sent,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('d')],
         Action::Drafts,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('f')],
         Action::FolderPicker,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('m')],
         Action::Move,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('#')],
         Action::Delete,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('f'), KeyId::Char('!')],
         Action::Spam,
-        Some("folders"),
+        Some("Folders"),
     );
     bind(&[KeyId::Leader, KeyId::Char('s')], Action::SyncNow, None);
     bind(
         &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('s')],
         Action::SaveAllAttachments,
-        Some("attachments / agents"),
+        Some("Attachments / agents"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('R')],
         Action::RetryAttachment,
-        Some("attachments / agents"),
+        Some("Attachments / agents"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('r')],
         Action::ReopenReview,
-        Some("agents"),
+        Some("Agents"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('z')],
         Action::FullWidth,
-        Some("toggles"),
+        Some("Toggles"),
     );
     bind(
         &[KeyId::Leader, KeyId::Char('t'), KeyId::Char('q')],
         Action::ToggleQuotes,
-        Some("toggles"),
+        Some("Toggles"),
     );
     bindings
 }
@@ -404,19 +404,16 @@ pub fn which_key(keymap: &Keymap, prefix: &[KeyId]) -> Vec<WhichItem> {
 }
 
 fn which_label(prefix: &[KeyId], bindings: &[&Binding]) -> String {
-    let terminal = prefix.len() + 1;
-    if bindings.len() == 1
-        && bindings
-            .iter()
-            .all(|binding| binding.keys.len() == terminal)
+    if let [binding] = bindings
+        && binding.keys.len() == prefix.len() + 1
     {
-        return bindings[0].action.label().to_string();
+        return binding.action.label().to_string();
     }
-    bindings
+    let group = bindings
         .iter()
         .find_map(|binding| binding.group)
-        .unwrap_or("more")
-        .to_string()
+        .unwrap_or("More");
+    format!("{group}…")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +445,7 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
         let label = action.label();
         let score = fuzzy(query, label).or_else(|| match action {
             Action::About => fuzzy(query, "version"),
+            Action::ReopenReview => fuzzy(query, "Reopen closed agent review"),
             _ => None,
         });
         let Some(score) = score else {
@@ -628,12 +626,12 @@ mod tests {
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "f" && item.label == "folders")
+                .any(|item| item.key == "f" && item.label == "Folders…")
         );
         assert!(
             leader
                 .iter()
-                .any(|item| item.key == "t" && item.label == "toggles")
+                .any(|item| item.key == "t" && item.label == "Toggles…")
         );
         assert!(leader.iter().all(|item| item.key != "m"));
         let folders = which_key(&keymap, &[KeyId::Leader, KeyId::Char('f')]);
@@ -643,6 +641,33 @@ mod tests {
                 .iter()
                 .any(|item| item.key == "m" && item.label == "Move")
         );
+    }
+
+    #[test]
+    fn which_key_marks_groups_and_shares_the_short_review_label_with_the_palette() {
+        let keymap = Keymap::default();
+        let leader = which_key(&keymap, &[KeyId::Leader]);
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "s" && item.label == "Sync now")
+        );
+        assert!(
+            leader
+                .iter()
+                .any(|item| item.key == "a" && item.label == "Attachments / agents…")
+        );
+
+        let agents = which_key(&keymap, &[KeyId::Leader, KeyId::Char('a')]);
+        let review = agents.iter().find(|item| item.key == "r").unwrap();
+        assert_eq!(review.label, "Reopen closed review");
+
+        let matches = palette_items(&keymap, "agent", &[]);
+        let command = matches
+            .iter()
+            .find(|item| item.action == Action::ReopenReview)
+            .unwrap();
+        assert_eq!(command.label, review.label);
     }
 
     #[test]
