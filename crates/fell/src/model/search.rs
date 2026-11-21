@@ -619,7 +619,7 @@ impl Session {
         thread: &str,
         message: &MessageId,
         snippet: &str,
-        preview: Option<SearchPreview>,
+        preview: fell_core::Result<Option<SearchPreview>>,
     ) -> bool {
         let Some(hit) = self
             .search
@@ -634,12 +634,13 @@ impl Session {
             return false;
         };
         let snippet = one_line(snippet);
-        if row.snippet == snippet && hit.preview == preview {
-            return false;
-        }
+        let mut changed = row.snippet != snippet;
         row.snippet = snippet;
-        hit.preview = preview;
-        true
+        if let Ok(preview) = preview {
+            changed |= hit.preview != preview;
+            hit.preview = preview;
+        }
+        changed
     }
 
     pub fn set_search_matches(
@@ -972,7 +973,23 @@ mod tests {
             )
             .unwrap();
         let snippet = store.message_snippet(&account.id, &id).unwrap().unwrap();
-        assert!(session.set_search_snippet(generation, &thread, &id, &snippet, read_preview()));
+        assert!(session.set_search_snippet(
+            generation,
+            &thread,
+            &id,
+            &snippet,
+            Err(fell_core::Error::Search("preview unavailable".into())),
+        ));
+        assert_eq!(session.threads[1].snippet, "Heading The invoice is ready.");
+        assert_eq!(
+            session.search.as_ref().unwrap().hits[&thread]
+                .preview
+                .as_ref()
+                .unwrap()
+                .text,
+            "HeadingThe invoice is ready."
+        );
+        assert!(session.set_search_snippet(generation, &thread, &id, &snippet, Ok(read_preview())));
         assert_eq!(session.threads[0], other);
         assert_eq!(session.threads[1].snippet, "Heading The invoice is ready.");
         let search = session.search.as_ref().unwrap();
@@ -989,7 +1006,7 @@ mod tests {
             &thread,
             &id,
             "stale",
-            None
+            Ok(None)
         ));
     }
 

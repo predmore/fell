@@ -3903,6 +3903,7 @@ fn fit_folder_path<T>(
     fit: impl Fn(&str) -> Option<T>,
     text: impl Fn(&T) -> &str,
 ) -> Option<T> {
+    let fit = |candidate: &str| fit(candidate).filter(|line| text(line) != "…");
     let full = fit(path);
     if full.as_ref().is_some_and(|line| text(line) == path) {
         return full;
@@ -4002,7 +4003,7 @@ fn fit_folder_path<T>(
             return fit(&format!("…{}", &tail[start..]));
         }
     }
-    exact("…")
+    None
 }
 
 fn folder_match(label: &str, query: &str) -> Option<std::ops::Range<usize>> {
@@ -7572,14 +7573,7 @@ fn folder_picker(
                         &label,
                         FolderFit::Picker(&query),
                         |path| {
-                            // Allow for the heavier match without changing the fit
-                            // as more of the same word is highlighted.
-                            let weight = if folder_match(path, &query).is_some() {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            };
-                            clip_shaped(window, &style, path, label_room, weight, None)
+                            clip_shaped(window, &style, path, label_room, FontWeight::NORMAL, None)
                                 .filter(|line| f32::from(line.width) <= label_room)
                         },
                         |line| &line.text,
@@ -7630,13 +7624,16 @@ fn folder_picker(
                             let matched = folder_match(&line.text, &query);
                             let highlight = HighlightStyle {
                                 color: Some(rgb(theme.accent).into()),
-                                font_weight: Some(FontWeight::SEMIBOLD),
                                 ..HighlightStyle::default()
                             };
-                            div().flex_none().whitespace_nowrap().child(
-                                StyledText::new(line.text)
-                                    .with_highlights(matched.map(|range| (range, highlight))),
-                            )
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .font_weight(FontWeight::NORMAL)
+                                .child(
+                                    StyledText::new(line.text)
+                                        .with_highlights(matched.map(|range| (range, highlight))),
+                                )
                         }))
                         .children(detail.map(|name| {
                             div()
@@ -7909,6 +7906,9 @@ mod tests {
         assert_eq!(fit(&sibling, 16, FolderFit::Search), "…training");
         assert_eq!(fit(path, 17, FolderFit::Header), "Projects/…/Field…");
         assert_eq!(fit("Field survey", 8, FolderFit::Search), "…survey");
+        for mode in [picker, FolderFit::Search, FolderFit::Header] {
+            assert!(fit_folder_path(path, mode, |_| Some("…"), |line| line).is_none());
+        }
     }
 
     #[test]
