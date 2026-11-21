@@ -17,6 +17,8 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 const SAMPLES: usize = 31;
+const PAGE_WARMUPS: usize = 10;
+const PAGE_SAMPLES: usize = 101;
 const THREAD_SAMPLES: usize = 5 * LONG_THREADS;
 const SQLITE_CONTROL_ITERATIONS: usize = 2_048;
 const HEADROOM: f64 = 1.20;
@@ -364,13 +366,18 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
     thread_budget.limit *= thread_scale;
     let folder_budget = Budget::fixed(budgets.folder_page_p95_ms);
     let store = Store::open(&path)?;
-    black_box(store.folder_page(&account.id, INBOX, &top_span)?);
-    report.latency(
-        "Inbox first page (100 rows)",
-        SAMPLES,
-        Some(folder_budget),
-        |_| store.folder_page(&account.id, INBOX, &top_span).unwrap(),
-    );
+    let mut measure_inbox_page = |label: &str, span: &FolderSpan| -> Result<(), Box<dyn Error>> {
+        for _ in 0..PAGE_WARMUPS {
+            let page = store.folder_page(&account.id, INBOX, span)?;
+            assert_eq!(page.threads.len(), PAGE_SIZE);
+            black_box(page);
+        }
+        report.latency(label, PAGE_SAMPLES, Some(folder_budget), |_| {
+            store.folder_page(&account.id, INBOX, span).unwrap()
+        });
+        Ok(())
+    };
+    measure_inbox_page("Inbox first page (100 rows)", &top_span)?;
     let middle_span = {
         let full = store.folder_threads(&account.id, INBOX)?;
         let middle = full.len() / 2;
@@ -381,14 +388,7 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
             after: 0,
         }
     };
-    let mid_page = store.folder_page(&account.id, INBOX, &middle_span)?;
-    assert_eq!(mid_page.threads.len(), PAGE_SIZE);
-    report.latency(
-        "Inbox page near middle cursor (100 rows)",
-        SAMPLES,
-        Some(folder_budget),
-        |_| store.folder_page(&account.id, INBOX, &middle_span).unwrap(),
-    );
+    measure_inbox_page("Inbox page near middle cursor (100 rows)", &middle_span)?;
     for index in 0..LONG_THREADS {
         black_box(read(&store, index));
     }

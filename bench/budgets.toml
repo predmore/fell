@@ -1,5 +1,6 @@
 # Ubuntu CI reference values rounded up for runner variance. See README.md
 # for the measured baseline and product maxima. The gate adds 20% to each value.
+# Both warmed Inbox windows use this fixed 0.90 ms limit after headroom.
 folder_page_p95_ms = 0.75
 thread_open_p95_ms = 3.0
 # Reference p50 for 2,048 executions of SQLite SELECT 1 in memory.
