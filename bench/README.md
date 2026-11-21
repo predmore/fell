@@ -24,12 +24,15 @@ Folder, thread, keyword and RSS reference measurements come from the original `u
 | 50-message thread p95 | 2.404 ms | 3.00 ms | 3.60 ms | 16 ms |
 | Keyword search p95 | 19.285 ms | 25.00 ms | 30.00 ms | 50 ms |
 | RSS | 13.365 MB | 18.00 MB | 21.60 MB | 250 MB |
-| Hybrid search p95 per query | 14.862–16.633 ms | 150 ms | 150 ms | 150 ms |
-| MiniLM graph p95 per query | 4.098–6.441 ms | 60 ms | 72 ms | — |
+| Hybrid search p95 per query (standard) | 14.862–16.633 ms | 150 ms | 150 ms | 150 ms |
+| MiniLM graph p95 per query (standard) | 4.098–6.441 ms | 60 ms | 72 ms | — |
+| Hybrid search p95 per query (x86_64 without AVX2) | 172.247–179.173 ms | 180 ms | 216 ms | 150 ms |
+| MiniLM graph p95 per query (x86_64 without AVX2) | 159.022–161.731 ms | 165 ms | 198 ms | — |
 | Hybrid residual p95 difference per query | 9.474–11.250 ms | 75 ms | 90 ms | — |
 
 - **Thread read.** Use a standalone in-memory SQLite connection and time 2,048 executions of a prepared `SELECT 1` statement per sample. Multiply the 3.6 ms thread limit by the ratio of the loop's p50 to the 0.10 ms reference, bounded from 1.0 to 1.25. The reference rounds up a local release measurement of 0.079 ms. The adjusted thread limit can reach 4.5 ms. [Issue #220](https://github.com/predmore/fell/issues/220)
-- **Hybrid search.** Warm every query and its graph input, then collect 31 end-to-end and 31 standalone MiniLM samples per query. The fixed 150 ms cap covers the full wall-clock time. The 60 ms graph baseline rounds up nine times the slowest graph p95 of 6.4 ms in the optimized hosted run. The older slow runner took about 28 seconds for hybrid setup versus 3.1 seconds in a faster run, so the setup ratio serves as an estimate for calibration. The graph ceiling adds headroom up to 72 ms. The difference between the two p95s, floored at zero, has its own 90 ms limit to catch regressions in the rest of search. [Optimized hosted job](https://github.com/predmore/fell/actions/runs/44856382153/job/136701473396) · [Slow hosted run](https://github.com/predmore/fell/actions/runs/44826216637) · [Faster hosted run](https://github.com/predmore/fell/actions/runs/44669080478)
+- **Hybrid search.** Warm every query and its graph input, then collect 31 end-to-end and 31 standalone MiniLM samples per query. The benchmark reports the CPU, runtime x86 feature flags, tract's thread count and optimized matrix kernels. Hybrid setup time covers model load, vector seeding and search warmup. The difference between the two p95s, floored at zero, has a 90 ms ceiling on every CPU. The report also counts queries whose end-to-end p95 exceeds the 150 ms product target. [Optimized hosted job](https://github.com/predmore/fell/actions/runs/44856382153/job/136701473396)
+- **x86 feature checks.** The benchmark process uses Rust's runtime feature detection to select the CI ceilings. The 72 ms graph and 150 ms end-to-end limits apply to x86_64 with AVX2 and to other architectures. MiniLM's AVX2 integer matrix kernel works with FMA disabled. Missing AVX2 on x86_64 selects the 198 ms graph and 216 ms end-to-end ceilings, with 20% headroom over rounded measurements from the slow hosted attempt. That attempt predates CPU diagnostics. Its timings provide provisional calibration for the lower SIMD tiers. [Slow hosted attempt](https://github.com/predmore/fell/actions/runs/44861700978/job/136717118203) · [Issue #228](https://github.com/predmore/fell/issues/228)
 
 The calibration job took 9m54s, including 62s to save an 848 MB cache, 1m24s to build, and 279s to seed the mailbox. A later cold release build exceeded the ten-minute job limit before producing an executable. CI now builds that executable in a prerequisite job and passes it to the budget job from the same run. The ten-minute budget job covers runtime setup, model verification, fixture generation and measurements. The full CI path includes the prerequisite build. [Cold build](https://github.com/predmore/fell/actions/runs/44661013350/job/136038979928)
 
@@ -48,7 +51,7 @@ if options.semantic && query == "in:Archive budget meeting" {
 }
 ```
 
-The keyword text-and-operators row and the filtered hybrid residual row should fail their budgets. A separate 150 ms delay around the shared graph invocation, timed by both the graph and end-to-end rows, should fail both ceilings. A 0.5 ms delay in `Store::open` should leave thread calibration independent of the open timing, and a thread-read delay that crosses its effective ceiling should fail that row. Remove the temporary worktree after the checks.
+The keyword text-and-operators row and the filtered hybrid residual row should fail their budgets. On the standard budget profile, a separate 150 ms delay around the shared graph invocation, timed by both the graph and end-to-end rows, should fail both ceilings. A 0.5 ms delay in `Store::open` should leave thread calibration independent of the open timing, and a thread-read delay that crosses its effective ceiling should fail that row. Remove the temporary worktree after the checks.
 
 ## Replay the inbox
 

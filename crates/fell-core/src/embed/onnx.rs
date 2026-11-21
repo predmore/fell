@@ -108,6 +108,31 @@ impl OnnxEmbedder {
         Ok(embedder)
     }
 
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn testing_executor_threads() -> usize {
+        multithread::current_executor_threads()
+    }
+
+    /// Matrix kernels selected when tract optimized the graph on this host.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn testing_matmul_kernels(&self) -> Vec<&str> {
+        use tract_onnx::tract_core::ops::matmul::optimized::OptMatMul;
+
+        let mut names: Vec<_> = self
+            .plan
+            .model()
+            .nodes()
+            .iter()
+            .filter_map(|node| node.op_as::<OptMatMul>())
+            .flat_map(|op| op.mmm.iter().map(|kernel| kernel.name()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     fn input_tensors(&self, ids: &[i64]) -> TractResult<TVec<TValue>> {
         let len = ids.len();
         self.inputs
