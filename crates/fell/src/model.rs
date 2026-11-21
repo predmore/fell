@@ -1719,21 +1719,18 @@ impl Session {
     }
 
     fn agents_key(&mut self, key: KeyId, page_rows: usize) -> Step {
-        if self.agents.confirm.is_none() {
-            match key {
-                KeyId::Escape => {
-                    self.dismiss_overlay();
-                    return Step::default();
-                }
-                KeyId::Char(':') | KeyId::CtrlShiftP => {
-                    return self.run(Action::Palette, page_rows);
-                }
-                _ => {}
+        match key {
+            KeyId::Escape if self.agents.confirm.is_none() || self.agents.pending => {
+                self.dismiss_overlay();
+                Step::default()
             }
-        }
-        Step {
-            agents: self.agents.key(key),
-            ..Step::default()
+            KeyId::Char(':') | KeyId::CtrlShiftP if self.agents.confirm.is_none() => {
+                self.run(Action::Palette, page_rows)
+            }
+            _ => Step {
+                agents: self.agents.key(key),
+                ..Step::default()
+            },
         }
     }
 
@@ -1741,7 +1738,7 @@ impl Session {
         self.overlay = if std::mem::take(&mut self.palette_from_agents) {
             Overlay::Agents
         } else {
-            self.agents.confirm = None;
+            self.agents.confirm_revoke(false);
             Overlay::None
         };
     }

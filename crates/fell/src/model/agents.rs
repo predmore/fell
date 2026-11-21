@@ -160,10 +160,10 @@ pub struct Confirmation {
 
 impl Agents {
     pub fn open(&mut self) -> Option<Request> {
-        self.confirm = None;
         if self.pending {
             return None;
         }
+        self.confirm = None;
         self.set_notice(None);
         self.pending = true;
         Some(Request::Load)
@@ -276,39 +276,39 @@ impl Agents {
             self.set_notice(None);
             return None;
         }
-        self.change(row, grant, ChangeKind::Scope)
+        Some(self.change(row, grant, ChangeKind::Scope))
     }
 
     pub fn confirm_revoke(&mut self, yes: bool) -> Option<Request> {
-        let Confirmation { row, .. } = self.confirm.take()?;
+        if self.pending {
+            return None;
+        }
         if yes {
-            self.change(row, AgentGrant::DISABLED, ChangeKind::Revoke)
+            let row = self.confirm.as_ref()?.row.clone();
+            Some(self.change(row, AgentGrant::DISABLED, ChangeKind::Revoke))
         } else {
+            self.confirm = None;
             None
         }
     }
 
     pub fn undo(&mut self) -> Option<Request> {
-        let (row, grant) = self.undo.clone()?;
-        self.change(row, grant, ChangeKind::Undo)
-    }
-
-    fn change(
-        &mut self,
-        row: AgentSummary,
-        grant: AgentGrant,
-        kind: ChangeKind,
-    ) -> Option<Request> {
         if self.pending || self.confirm.is_some() {
             return None;
         }
+        let (row, grant) = self.undo.clone()?;
+        Some(self.change(row, grant, ChangeKind::Undo))
+    }
+
+    fn change(&mut self, row: AgentSummary, grant: AgentGrant, kind: ChangeKind) -> Request {
         self.pending = true;
         self.set_notice(None);
-        Some(Request::Change { row, grant, kind })
+        Request::Change { row, grant, kind }
     }
 
     pub fn answer(&mut self, reply: Reply) {
         self.pending = false;
+        self.confirm = None;
         match reply {
             Reply::Loaded(rows) => self.replace_rows(rows),
             Reply::Stale(rows) => {
@@ -354,6 +354,7 @@ impl Agents {
 
     pub fn fail(&mut self, message: &'static str) {
         self.pending = false;
+        self.confirm = None;
         self.set_notice(Some((message, true)));
     }
 
@@ -468,6 +469,37 @@ mod tests {
         apply(&mut session, &store, step);
         assert_eq!(read_grant(), changed);
         assert!(!session.agents.can_undo());
+    }
+
+    #[test]
+    fn revoke_confirmation_stays_inert_until_the_delayed_reply() {
+        let (store, row, mut session) = setup();
+        let step = session.perform(Action::Agents, 10);
+        apply(&mut session, &store, step);
+
+        session.on_key(KeyId::Char('x'), 10);
+        let confirmed = session.on_key(KeyId::Char('y'), 10);
+        assert!(session.agents.pending);
+        assert!(session.on_key(KeyId::Char('y'), 10).agents.is_none());
+        assert!(session.agents.confirm_revoke(false).is_none());
+        assert!(session.on_key(KeyId::Left, 10).agents.is_none());
+        session.on_key(KeyId::Escape, 10);
+        assert_eq!(session.overlay, Overlay::None);
+        assert!(session.perform(Action::Agents, 10).agents.is_none());
+        assert_eq!(session.overlay, Overlay::Agents);
+        assert_eq!(session.agents.control(), Control::Revoke);
+        let prompt = session.agents.confirm.as_ref().unwrap();
+        assert_eq!(prompt.control, Control::Revoke);
+        assert_eq!(prompt.row, row);
+        assert_eq!(session.agents.rows[0], row);
+        assert_eq!(session.agents.notice, None);
+
+        apply(&mut session, &store, confirmed);
+        assert!(!session.agents.pending);
+        assert!(session.agents.confirm.is_none());
+        assert_eq!(session.agents.rows[0].grant, AgentGrant::DISABLED);
+        assert_eq!(session.agents.control(), Control::Read);
+        assert_eq!(session.agents.notice, Some(("Access revoked", false)));
     }
 
     #[test]

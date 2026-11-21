@@ -19,7 +19,7 @@ use super::{FontOpt, Inbox, now_unix};
 
 const ROW_HEIGHT: f32 = 82.;
 const TITLE_HEIGHT: f32 = 48.;
-const FOOTER_HEIGHT: f32 = 70.;
+const FOOTER_HEIGHT: f32 = 92.;
 const EMPTY_HEIGHT: f32 = 102.;
 const NOTICE_TIME: Duration = Duration::from_secs(3);
 const SWITCH_CONTRAST: f64 = 3.15;
@@ -32,48 +32,80 @@ struct Confirmation {
     action: &'static str,
 }
 
-#[derive(Default, PartialEq, Eq)]
-struct Footer {
-    confirmation: Option<Confirmation>,
-    notice: Option<(&'static str, bool)>,
-    undo: bool,
-    description: &'static str,
+#[derive(PartialEq, Eq)]
+enum Footer {
+    Confirm(Confirmation),
+    Message {
+        text: &'static str,
+        notice: Option<bool>,
+        undo: bool,
+    },
 }
 
 impl Footer {
     fn of(agents: &Agents) -> Self {
-        Self {
-            confirmation: agents.confirm.as_ref().map(|confirm| {
-                let agent = display_safe(&confirm.row.agent_id);
-                let account = agents
-                    .email(&confirm.row)
-                    .map_or_else(|| "this account".into(), display_safe);
-                let consequence = format!("{agent} loses access to {account} on its next request.");
-                if confirm.control == Control::Revoke {
-                    Confirmation {
-                        prompt: format!("Revoke {agent}?"),
-                        consequence,
-                        action: "Revoke · y",
-                    }
-                } else {
-                    Confirmation {
-                        prompt: format!("Turn off {} for {agent}?", confirm.control.label()),
-                        consequence: format!("It's the last permission, so {consequence}"),
-                        action: "Turn off · y",
-                    }
+        if let Some(confirm) = &agents.confirm {
+            let agent = display_safe(&confirm.row.agent_id);
+            let account = agents
+                .email(&confirm.row)
+                .map_or_else(|| "this account".into(), display_safe);
+            let consequence = format!("{agent} loses access to {account} on its next request.");
+            return Self::Confirm(if confirm.control == Control::Revoke {
+                Confirmation {
+                    prompt: format!("Revoke {agent}?"),
+                    consequence,
+                    action: "Revoke · y",
                 }
-            }),
-            notice: agents.notice,
-            undo: agents.can_undo(),
-            description: if agents
-                .rows
-                .get(agents.selected)
-                .is_some_and(|row| !row.grant.enabled)
-            {
-                "No access"
             } else {
-                agents.control().description()
-            },
+                Confirmation {
+                    prompt: format!("Turn off {} for {agent}?", confirm.control.label()),
+                    consequence: format!("Last permission: {consequence}"),
+                    action: "Turn off · y",
+                }
+            });
+        }
+        let (text, notice) = if let Some((text, error)) = agents.notice {
+            (text, Some(error))
+        } else if agents
+            .rows
+            .get(agents.selected)
+            .is_some_and(|row| !row.grant.enabled)
+        {
+            ("No access", None)
+        } else {
+            (agents.control().description(), None)
+        };
+        Self::Message {
+            text,
+            notice,
+            undo: agents.can_undo(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ControlFocus {
+    row: usize,
+    control: Control,
+    confirming: bool,
+}
+
+impl ControlFocus {
+    fn of(agents: &Agents) -> Self {
+        Self {
+            row: agents.selected,
+            control: agents.control(),
+            confirming: agents.confirm.is_some(),
+        }
+    }
+
+    fn border(self, row: usize, control: Control, bg: u32, fg: u32, dim: u32) -> u32 {
+        if self.row != row || self.control != control {
+            bg
+        } else if self.confirming {
+            dim
+        } else {
+            fg
         }
     }
 }
@@ -84,7 +116,9 @@ pub(super) struct AgentMotion {
     switches: Option<(Arc<Vec<AgentSummary>>, Transition)>,
     selected: Option<usize>,
     selection: Option<(usize, Transition)>,
-    footer: Footer,
+    focused: Option<ControlFocus>,
+    focus_fade: Option<(ControlFocus, Transition)>,
+    footer: Option<Footer>,
     footer_fade: Option<FooterFade>,
 }
 
@@ -96,8 +130,7 @@ struct FooterFade {
 
 impl FooterFade {
     fn opacities(&self, now: Instant) -> (f32, f32) {
-        let (old, new) = footer_opacities(self.fade.linear(now));
-        (old * self.from, new)
+        footer_opacities(self.fade.linear(now), self.from)
     }
 }
 
@@ -121,37 +154,49 @@ impl AgentMotion {
             let previous = std::mem::replace(&mut self.selected, selected);
             self.selection = previous.zip(motion.start(motion::FADE, now));
         }
-        let footer = Footer::of(agents);
+        let focused = selected.map(|_| ControlFocus::of(agents));
+        if self.focused != focused {
+            let previous = std::mem::replace(&mut self.focused, focused);
+            self.focus_fade = previous.zip(motion.start(motion::FADE, now));
+        }
+        let footer = selected.map(|_| Footer::of(agents));
         if self.footer != footer {
             let before = std::mem::replace(&mut self.footer, footer);
-            self.footer_fade = motion.start(motion::FADE, now).map(|fade| {
-                // The grant reply can arrive while confirmation is still
-                // leaving. Carry what is visible instead of flashing a line.
-                let (before, from) = if let Some(prior) = self.footer_fade.take() {
-                    let (old, new) = prior.opacities(now);
-                    if old > 0. {
-                        (prior.before, old)
+            let prior = self.footer_fade.take();
+            self.footer_fade = before
+                .zip(motion.start(motion::FADE, now))
+                .map(|(before, fade)| {
+                    // A rapid change starts from the line already on screen.
+                    let (before, from) = if let Some(prior) = prior {
+                        let (old, new) = prior.opacities(now);
+                        if old > 0. {
+                            (prior.before, old)
+                        } else {
+                            (before, new)
+                        }
                     } else {
-                        (before, new)
-                    }
-                } else {
-                    (before, 1.)
-                };
-                FooterFade { before, from, fade }
-            });
+                        (before, 1.)
+                    };
+                    FooterFade { before, from, fade }
+                });
         }
         self.switches = self.switches.take().filter(|(_, fade)| fade.running(now));
         self.selection = self.selection.take().filter(|(_, fade)| fade.running(now));
+        self.focus_fade = self.focus_fade.take().filter(|(_, fade)| fade.running(now));
         self.footer_fade = self
             .footer_fade
             .take()
             .filter(|fade| fade.fade.running(now));
-        self.switches.is_some() || self.selection.is_some() || self.footer_fade.is_some()
+        self.switches.is_some()
+            || self.selection.is_some()
+            || self.focus_fade.is_some()
+            || self.footer_fade.is_some()
     }
 
     pub(super) fn settle(&mut self) {
         self.switches = None;
         self.selection = None;
+        self.focus_fade = None;
     }
 
     fn selection_at(&self, index: usize, now: Instant) -> f32 {
@@ -278,7 +323,7 @@ pub(super) fn card(
                         div()
                             .px(px(16.))
                             .py(px(17.))
-                            .text_color(rgb(theme.dimmed))
+                            .text_color(rgb(row_dimmed(theme, theme.surface, 0.)))
                             .child(if agents.pending {
                                 "Loading agent access…"
                             } else if agents.notice.is_some() {
@@ -336,6 +381,11 @@ fn agent_row(
     let fg = motion::mix(theme.foreground, theme.on_selection, selection);
     let dim = row_dimmed(theme, bg, selection);
     let outline = switch_outline(theme, bg);
+    let focused = ControlFocus::of(agents);
+    let focus_fade = frame.and_then(|(motion, now)| {
+        let (before, fade) = motion.focus_fade?;
+        Some((before, fade.progress(now)))
+    });
     let previous = frame.and_then(|(motion, now)| {
         let (rows, fade) = motion.switches.as_ref()?;
         let previous = rows
@@ -423,16 +473,11 @@ fn agent_row(
                 .children(Control::ALL.into_iter().map(|control| {
                     let scope = control.scope(row.grant);
                     let actionable = scope.is_some() || row.grant.enabled;
-                    let focused = selected && actionable && control == agents.control();
-                    let border = match &agents.confirm {
-                        Some(confirm)
-                            if focused && scope.is_some() && confirm.control == control =>
-                        {
-                            theme.dimmed
-                        }
-                        None if focused => fg,
-                        _ => bg,
-                    };
+                    let border = focused.border(index, control, bg, fg, theme.dimmed);
+                    let border = focus_fade.map_or(border, |(before, progress)| {
+                        let before = before.border(index, control, bg, fg, theme.dimmed);
+                        motion::mix(before, border, progress)
+                    });
                     let label = if actionable {
                         control.label()
                     } else {
@@ -526,44 +571,60 @@ fn footer(
     frame: Option<(&AgentMotion, Instant)>,
     cx: &mut Context<Inbox>,
 ) -> Div {
-    let transition = frame.and_then(|(motion, now)| {
-        let fade = motion.footer_fade.as_ref()?;
-        let (old_alpha, new_alpha) = fade.opacities(now);
-        Some((&fade.before, old_alpha, new_alpha))
-    });
+    let current = Footer::of(agents);
+    let (line, opacity, live) = match frame.and_then(|(motion, now)| {
+        motion
+            .footer_fade
+            .as_ref()
+            .map(|fade| (fade, fade.opacities(now)))
+    }) {
+        Some((fade, (old, _))) if old > 0. => (&fade.before, old, false),
+        Some((_, (_, new))) => (&current, new, live),
+        None => (&current, 1., live),
+    };
     div()
         .relative()
         .flex_none()
         .h(px(FOOTER_HEIGHT))
         .border_t(px(1.))
         .border_color(rgb(theme.border))
-        .when_some(transition, |line, (before, alpha, _)| {
-            line.child(footer_content(theme, before, false, cx).opacity(alpha))
-        })
-        .child(
-            footer_content(theme, &Footer::of(agents), live && !agents.pending, cx)
-                .opacity(transition.map_or(1., |(_, _, alpha)| alpha)),
-        )
+        .child(footer_content(theme, line, live && !agents.pending, cx).opacity(opacity))
 }
 
-fn footer_opacities(time: f32) -> (f32, f32) {
+fn footer_opacities(time: f32, from: f32) -> (f32, f32) {
+    // Swap at the same opacity so even a frame just before the swap has text.
     if time < 0.5 {
-        (motion::fade_out(2. * time), 0.)
+        (
+            motion::lerp(motion::ARRIVE_FROM, from, motion::fade_out(2. * time)),
+            0.,
+        )
     } else {
-        (0., motion::ease_out_quad(2. * time - 1.))
+        (
+            0.,
+            motion::lerp(
+                motion::ARRIVE_FROM,
+                1.,
+                motion::ease_out_quad(2. * time - 1.),
+            ),
+        )
     }
 }
 
 fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<Inbox>) -> Div {
-    let (text, color) = match (&footer.confirmation, footer.notice) {
-        (Some(confirm), _) => (confirm.prompt.clone(), theme.foreground),
-        (None, Some((text, true))) => (text.into(), theme.error),
-        (None, Some((text, false))) => (text.into(), theme.foreground),
-        (None, None) => (footer.description.into(), theme.dimmed),
+    let (text, color, confirm, undo) = match footer {
+        Footer::Confirm(confirm) => (&*confirm.prompt, theme.foreground, Some(confirm), false),
+        Footer::Message { text, notice, undo } => {
+            let color = match notice {
+                Some(true) => theme.error,
+                Some(false) => theme.foreground,
+                None => row_dimmed(theme, theme.surface, 0.),
+            };
+            (*text, color, None, *undo)
+        }
     };
-    let buttons: &[(&str, Option<bool>)] = if let Some(confirm) = &footer.confirmation {
+    let buttons: &[(&str, Option<bool>)] = if let Some(confirm) = confirm {
         &[("Cancel", Some(false)), (confirm.action, Some(true))]
-    } else if footer.undo {
+    } else if undo {
         &[("Undo revoke", None)]
     } else {
         &[]
@@ -580,7 +641,7 @@ fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<I
                 .text_size(px(theme.ui_px - 2.))
                 .line_height(px(theme.ui_px + 1.))
                 .text_color(rgb(color))
-                .child(text),
+                .child(text.to_owned()),
         )
         .children(buttons.iter().map(|&(label, answer)| {
             let color = if answer == Some(true) {
@@ -618,12 +679,13 @@ fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<I
         .absolute()
         .inset_0()
         .px(px(14.))
+        .py(px(10.))
         .flex()
         .flex_col()
         .justify_center()
         .gap(px(2.))
         .child(line)
-        .when_some(footer.confirmation.as_ref(), |content, confirm| {
+        .when_some(confirm, |content, confirm| {
             content.child(
                 div()
                     .text_size(px(theme.ui_px - 2.))
@@ -713,12 +775,12 @@ mod tests {
 
     #[test]
     fn footer_fades_out_before_the_next_line_fades_in() {
-        assert_eq!(footer_opacities(0.), (1., 0.));
-        assert_eq!(footer_opacities(0.5), (0., 0.));
-        assert_eq!(footer_opacities(1.), (0., 1.));
-        let (old, new) = footer_opacities(0.25);
-        assert!(old > 0. && old < 1. && new == 0.);
-        let (old, new) = footer_opacities(0.75);
-        assert!(old == 0. && new > 0. && new < 1.);
+        assert_eq!(footer_opacities(0., 1.), (1., 0.));
+        assert_eq!(footer_opacities(0.5, 1.), (0., motion::ARRIVE_FROM));
+        assert_eq!(footer_opacities(1., 1.), (0., 1.));
+        let (old, new) = footer_opacities(0.25, 1.);
+        assert!(old > motion::ARRIVE_FROM && old < 1. && new == 0.);
+        let (old, new) = footer_opacities(0.75, 1.);
+        assert!(old == 0. && new > motion::ARRIVE_FROM && new < 1.);
     }
 }
