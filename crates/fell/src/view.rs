@@ -46,7 +46,8 @@ use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingHold, LayoutProbe, LayoutSlot, Reveal, RevealPhase, ScrollAnchor, clamped_offset,
+    LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase, ScrollAnchor,
+    clamped_offset,
 };
 use crate::store_actor::StoreClient;
 use crate::sync_worker::{self, SyncEvent, SyncHandle};
@@ -364,7 +365,7 @@ struct Inbox {
     bodies_asked: BodyAsks,
     /// The reader's message to hold at the top of the conversation until
     /// they scroll it. See [`Inbox::hold_landing`].
-    landing: Option<String>,
+    landing: ReaderLanding,
 }
 
 /// Room kept for a body that is still being prepared: a short paragraph, so
@@ -472,7 +473,7 @@ impl Inbox {
             bodies: BodyCache::default(),
             body_loads: BodyLoads::default(),
             bodies_asked: BodyAsks::default(),
-            landing: None,
+            landing: ReaderLanding::default(),
         };
         let sync_with = config.zip(startup.path.ok());
         cx.spawn(async move |this, cx| {
@@ -2937,10 +2938,6 @@ impl Inbox {
                 None => self.scroll_list_to_cursor(),
             }
         }
-        // A tall message aligns to its top when scrolled into view. Skip that
-        // unless the reader moved to another message, or a new thread loaded.
-        // Paging already moved the viewport by pixels, so it must not jump
-        // the current message back to the top.
         if step.message_disclosure_changed {
             self.reader_took_over(true);
         }
@@ -2949,7 +2946,9 @@ impl Inbox {
             self.nudge_conversation(step.scroll_pages, step.scroll_lines);
         } else if step.reveal_search_hit {
             self.scroll_conversation();
-        } else if !step.reveal_attachment && self.session.message_cursor != message_before {
+        } else if !step.reveal_attachment
+            && (step.jump_to_message || self.session.message_cursor != message_before)
+        {
             if self.session.cursor_id == thread_before {
                 self.reader_took_over(true);
                 self.glide_conversation_to_cursor();
@@ -3103,11 +3102,12 @@ impl Inbox {
     /// there while the conversation lays out: [`LandingHold`] sets the
     /// offset from each frame's own layout, before it paints.
     fn land_on_reader(&mut self) {
-        self.landing = self
-            .session
-            .messages
-            .get(self.session.message_cursor)
-            .map(|message| message.id.clone());
+        self.landing.hold(
+            self.session
+                .messages
+                .get(self.session.message_cursor)
+                .map(|message| message.id.as_str()),
+        );
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
@@ -3118,51 +3118,48 @@ impl Inbox {
             .messages
             .get(index)
             .map(|message| message.id.as_str());
-        if self.landing.as_deref() != current {
-            self.release_landing();
-        }
         self.landing
-            .as_ref()
-            .map(|_| ScrollAnchor { index, y: px(0.) })
+            .anchor(current, index, self.motion.conv_glide.is_some())
     }
 
     /// The reader took over: stop holding their message in place.
     fn release_landing(&mut self) {
-        self.landing = None;
+        self.landing.hold(None);
     }
 
-    /// `j`/`k` in the conversation: glide to the message, by the rule
-    /// GPUI's `scroll_to_item` uses, once its bounds are known.
+    /// Message navigation aligns the selected header using laid-out bounds.
     fn glide_conversation_to_cursor(&mut self) {
         let index = self.session.message_cursor;
-        let Some(item) = self.conv_scroll.bounds_for_item(index) else {
+        let id = self
+            .session
+            .messages
+            .get(index)
+            .map(|message| message.id.as_str());
+        self.landing.hold(id);
+        let Some(item) = self
+            .conv_layout_current
+            .then(|| self.conv_scroll.bounds_for_item(index))
+            .flatten()
+        else {
             self.scroll_conversation();
             return;
         };
         let view = self.conv_scroll.bounds();
         let offset = f32::from(self.conv_scroll.offset().y);
         let max = f32::from(self.conv_scroll.max_offset().height);
-        let (top, bottom) = (f32::from(item.top()), f32::from(item.bottom()));
-        let target = if top + offset < f32::from(view.top()) {
-            f32::from(view.top()) - top
-        } else if bottom + offset > f32::from(view.bottom()) {
-            // Show its end, but never scroll its header off the top: a
-            // message taller than the viewport is read from its start.
-            (f32::from(view.bottom()) - bottom).max(f32::from(view.top()) - top)
-        } else {
-            offset
-        };
-        self.glide_conversation(offset, target.clamp(-max, 0.0));
+        let target =
+            present::offset_to_message_top(f32::from(item.top()), f32::from(view.top()), max);
+        self.glide_conversation(offset, target);
     }
 
     /// Set the conversation's offset to `to`, gliding there from where it
     /// is drawn. `offset` is the offset the key saw.
     fn glide_conversation(&mut self, offset: f32, to: f32) {
         let from = self.motion.glide_from_conversation(offset);
-        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
         let x = self.conv_scroll.offset().x;
         self.conv_scroll.set_offset(point(x, px(to)));
         let now = self.motion.clock.now();
+        let reach = f32::from(self.conv_scroll.bounds().size.height) * motion::GLIDE_MAX_VIEWPORTS;
         self.motion.conv_glide =
             Glide::start(&self.motion.motion, from, to, reach, motion::SLIDE, now)
                 .map(|glide| glide.gentle_beyond(LONG_GLIDE_PX));
@@ -5593,33 +5590,74 @@ fn collapsed_message(
         .into_any_element()
 }
 
+const MESSAGE_HEADER_GAP_PX: f32 = 10.0;
+
+fn expanded_header_widths(width: f32, [sender, email, folders, date]: [f32; 4]) -> [f32; 4] {
+    // The folder group also acts as the spacer before the date when empty.
+    let gaps =
+        (1 + usize::from(sender > 0.0) + usize::from(email > 0.0)) as f32 * MESSAGE_HEADER_GAP_PX;
+    let date = date.min(width);
+    let room = (width - date - gaps).max(0.0);
+    // When the identity needs to truncate, give it at least two thirds of
+    // the room. A short or absent folder list leaves more for the sender.
+    let identity = (room - folders.min(room / 3.0)).min(sender + email);
+    let email = email.min(identity - sender.min(identity / 2.0));
+    let sender = sender.min(identity - email);
+    let folders = folders.min((room - sender - email).max(0.0));
+    [sender, email, folders, date]
+}
+
 fn expanded_message_header(
     theme: &Theme,
     message: &ConvMessage,
     width: f32,
     window: &Window,
 ) -> gpui::Div {
-    const GAP: f32 = 10.;
     let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
     let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
     let date = present::relative_date(now_unix(), message.date_unix);
     let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
-    let room = (width - date_width - 3. * GAP).max(0.);
+    let sender = present::display_safe(&message.sender);
+    let email = present::display_safe(&message.email);
+    let folders = message
+        .folders
+        .iter()
+        .map(|folder| present::display_safe(folder))
+        .collect::<Vec<_>>();
+    let joined = folders.join(" · ");
+    let measure = |style: &TextStyle, text: &str, weight, color| {
+        shape_ui_line(window, style, text, weight, Some(color))
+            .map_or(0.0, |line| f32::from(line.width).ceil())
+    };
+    let [sender_width, email_width, folder_width, _] = expanded_header_widths(
+        width,
+        [
+            measure(
+                &sender_style,
+                &sender,
+                FontWeight::SEMIBOLD,
+                theme.foreground,
+            ),
+            measure(&style, &email, FontWeight::NORMAL, theme.dimmed),
+            measure(&style, &joined, FontWeight::NORMAL, theme.dimmed),
+            date_width,
+        ],
+    );
     let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
         clip_shaped(window, style, text, width.floor(), weight, Some(color))
             .filter(|line| f32::from(line.width).ceil() <= width)
     };
     let sender = fit(
         &sender_style,
-        &present::display_safe(&message.sender),
-        room * 0.42,
+        &sender,
+        sender_width,
         FontWeight::SEMIBOLD,
         theme.foreground,
     );
     let email = fit(
         &style,
-        &present::display_safe(&message.email),
-        room * 0.42,
+        &email,
+        email_width,
         FontWeight::NORMAL,
         theme.dimmed,
     );
@@ -5627,16 +5665,12 @@ fn expanded_message_header(
         line.as_ref()
             .map_or(0., |line| f32::from(line.width).ceil())
     };
-    let folder_width = (room - line_width(&sender) - line_width(&email)).max(0.);
-    let folders = message
-        .folders
-        .iter()
-        .map(|folder| present::display_safe(folder))
-        .collect::<Vec<_>>();
+    let folder_width =
+        folder_width + (sender_width - line_width(&sender)) + (email_width - line_width(&email));
     let fit_folders =
         |text: &str| fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed);
     let fit_whole = |text: &str| fit_folders(text).filter(|line| line.text == text);
-    let folders = fit_whole(&folders.join(" · "))
+    let folders = fit_whole(&joined)
         .or_else(|| {
             let shortened = folders
                 .iter()
@@ -5665,19 +5699,11 @@ fn expanded_message_header(
     div()
         .flex()
         .items_center()
-        .gap(px(GAP))
+        .gap(px(MESSAGE_HEADER_GAP_PX))
         // The recipient line belongs to this header, so it sits close.
         .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
-        .child(
-            div()
-                .flex_none()
-                .children(sender.map(|line| shaped_text(line, window))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .children(email.map(|line| shaped_text(line, window))),
-        )
+        .children(sender.map(|line| shaped_text(line, window)))
+        .children(email.map(|line| shaped_text(line, window)))
         .child(
             div()
                 .flex_1()
@@ -5832,6 +5858,8 @@ fn message_body(
         Rich::Plain | Rich::PlainPart(_) | Rich::Missing => {
             // A signature and the quote next to it fold as one, as in HTML.
             // A draft's markdown is painted as its compose window shows it.
+            let palette = mail_body::palette(theme);
+            let quiet = mail_body::history_palette(theme);
             let mut runs: Vec<(usize, Option<fell_render::Fold>, Vec<&str>)> = Vec::new();
             let mut drafts: HashMap<usize, gpui::AnyElement> = HashMap::new();
             let body = match &message.rich {
@@ -5876,7 +5904,7 @@ fn message_body(
                         .line_height(px(theme.ui_px * 1.45))
                         .map(|text| match drafts.remove(&at) {
                             Some(draft) => text.child(draft),
-                            None => text.child(texts.concat()),
+                            None => text.child(crate::render::plain_text(texts.concat(), palette)),
                         })
                         .into_any_element(),
                     Some(kind) => {
@@ -5897,7 +5925,7 @@ fn message_body(
                                 div()
                                     .max_w(px(READING_MEASURE_PX - HISTORY_INDENT_PX))
                                     .line_height(line_height)
-                                    .child(text)
+                                    .child(crate::render::plain_text(text, quiet))
                                     .into_any_element()
                             },
                             cx,
@@ -7183,8 +7211,9 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, collapsed_sender_budget, ctrl_letter, key_from, moved_in_list,
-        should_follow_visible, unread_bar_dx, write_back_notice,
+        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, collapsed_sender_budget, ctrl_letter,
+        expanded_header_widths, key_from, moved_in_list, should_follow_visible, unread_bar_dx,
+        write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7210,6 +7239,29 @@ mod tests {
         assert_eq!(collapsed_sender_budget(70., 18.2, 17.1, 72.), 52.);
         assert_eq!(collapsed_sender_budget(24., 18.2, 17.1, 72.), 24.);
         assert_eq!(collapsed_sender_budget(0., 18.2, 17.1, 72.), 0.);
+    }
+
+    #[test]
+    fn expanded_sender_truncates_without_losing_the_address_or_date() {
+        let fields = [900.0, 135.0, 35.0, 30.0];
+        assert_eq!(expanded_header_widths(1_200.0, fields), fields);
+        assert_eq!(
+            expanded_header_widths(502.0, fields),
+            [272.0, 135.0, 35.0, 30.0]
+        );
+
+        let width = 150.0;
+        let [sender, email, folders, date] =
+            expanded_header_widths(width, [300.0, 225.0, 200.0, 55.0]);
+        assert_eq!(date, 55.0);
+        assert!(sender > 0.0 && email > 0.0 && folders > 0.0);
+        assert!(sender + email + folders + date + MESSAGE_HEADER_GAP_PX * 3.0 <= width);
+
+        let [sender, email, folders, date] = expanded_header_widths(
+            super::message_content_width(360.0),
+            [300.0, 225.0, 0.0, 55.0],
+        );
+        assert_eq!([sender, email, folders, date], [108.5, 108.5, 0.0, 55.0]);
     }
 
     /// After each key, whether a box left wide relaxes: only a key that
