@@ -13,14 +13,15 @@ use fell::bench_read_conversation;
 use fell_core::embed::{MINILM_L6_V2_INT8, OnnxEmbedder, default_models_dir, installed_model_dir};
 use fell_core::test_support::mailbox::{self, LONG_MESSAGES, LONG_THREADS};
 use fell_core::{FolderSpan, ListKey, SearchOptions, Store};
+use rusqlite::Connection;
 use serde::Deserialize;
 
 const SAMPLES: usize = 31;
 const THREAD_SAMPLES: usize = 5 * LONG_THREADS;
-const GRAPH_SAMPLES: usize = 11;
+const SQLITE_CONTROL_ITERATIONS: usize = 2_048;
 const HEADROOM: f64 = 1.20;
 const MAX_THREAD_SCALE: f64 = 1.25;
-const MAX_GRAPH_ALLOWANCE_MS: f64 = 200.0;
+const HYBRID_PRODUCT_MAX_MS: f64 = 150.0;
 const PAGE_SIZE: usize = 100;
 const INBOX: &str = "INBOX";
 const QUERIES: [(&str, &str, Option<&str>); 5] = [
@@ -50,10 +51,10 @@ const HYBRID_QUERIES: [(&str, &str); 4] = [
 struct Budgets {
     folder_page_p95_ms: f64,
     thread_open_p95_ms: f64,
-    thread_reference_open_p50_ms: f64,
+    thread_reference_sqlite_p50_ms: f64,
     keyword_search_p95_ms: f64,
-    semantic_search_p95_ms: f64,
-    semantic_reference_graph_p50_ms: f64,
+    semantic_residual_p95_ms: f64,
+    semantic_graph_p95_ms: f64,
     rest_rss_mb: f64,
 }
 
@@ -64,18 +65,15 @@ impl Budgets {
             ("folder_page_p95_ms", budgets.folder_page_p95_ms),
             ("thread_open_p95_ms", budgets.thread_open_p95_ms),
             (
-                "thread_reference_open_p50_ms",
-                budgets.thread_reference_open_p50_ms,
+                "thread_reference_sqlite_p50_ms",
+                budgets.thread_reference_sqlite_p50_ms,
             ),
             ("keyword_search_p95_ms", budgets.keyword_search_p95_ms),
-            ("semantic_search_p95_ms", budgets.semantic_search_p95_ms),
-            (
-                "semantic_reference_graph_p50_ms",
-                budgets.semantic_reference_graph_p50_ms,
-            ),
+            ("semantic_residual_p95_ms", budgets.semantic_residual_p95_ms),
+            ("semantic_graph_p95_ms", budgets.semantic_graph_p95_ms),
             ("rest_rss_mb", budgets.rest_rss_mb),
         ] {
-            let max_limit = value * HEADROOM * MAX_THREAD_SCALE + MAX_GRAPH_ALLOWANCE_MS;
+            let max_limit = value * HEADROOM * MAX_THREAD_SCALE;
             if !(value > 0.0 && max_limit.is_finite()) {
                 return Err(
                     format!("{name} must be positive and finite in {}", path.display()).into(),
@@ -156,7 +154,7 @@ impl Report {
         count: usize,
         budget: Option<Budget>,
         mut run: impl FnMut(usize) -> T,
-    ) -> f64 {
+    ) -> (f64, f64) {
         let mut samples: Vec<_> = (0..count)
             .map(|index| {
                 let started = Instant::now();
@@ -168,8 +166,9 @@ impl Report {
             .collect();
         samples.sort_unstable();
         let p50 = percentile_ms(&samples, 50);
-        self.row(label, count, Some(p50), percentile_ms(&samples, 95), budget);
-        p50
+        let p95 = percentile_ms(&samples, 95);
+        self.row(label, count, Some(p50), p95, budget);
+        (p50, p95)
     }
 
     fn rss(&mut self, label: &str, budget: f64) -> Result<(), Box<dyn Error>> {
@@ -301,11 +300,12 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
     // These timings open fresh connections over a recently seeded file. The
     // initial RSS sample above precedes repeated opens and list/search warmups.
     drop(store);
-    let open_p50 = report.latency("Open populated store", SAMPLES, None, |_| {
+    let control_p50 = measure_sqlite_control(&mut report)?;
+    report.latency("Open populated store", SAMPLES, None, |_| {
         Store::open(&path).unwrap()
     });
     let thread_scale =
-        (open_p50 / budgets.thread_reference_open_p50_ms).clamp(1.0, MAX_THREAD_SCALE);
+        (control_p50 / budgets.thread_reference_sqlite_p50_ms).clamp(1.0, MAX_THREAD_SCALE);
     let mut thread_budget = Budget::fixed(budgets.thread_open_p95_ms);
     thread_budget.limit *= thread_scale;
     let folder_budget = Budget::fixed(budgets.folder_page_p95_ms);
@@ -372,11 +372,23 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
     scratch.close()?;
     writeln!(
         report.out,
-        "\nThread limit scaled by {thread_scale:.3} using store-open p50.\n\n{semantic_note}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Latency rows use nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
+        "\nThread limit scaled by {thread_scale:.3} using the in-memory SQLite control p50.\n\n{semantic_note}\n\nFixture generation took {seed_elapsed:.2?} ({disk_mb:.1} MB on disk). Full suite took {:.2?}, including setup and cleanup. Latency rows use nearest-rank percentiles. RSS values are single process snapshots in decimal MB.",
         suite_started.elapsed()
     )?;
     report.finish()?;
     semantic.map(|_| ())
+}
+
+fn measure_sqlite_control(report: &mut Report) -> rusqlite::Result<f64> {
+    let conn = Connection::open_in_memory()?;
+    let mut stmt = conn.prepare("SELECT 1")?;
+    let label = format!("SQLite control ({SQLITE_CONTROL_ITERATIONS} × `SELECT 1`)");
+    let (p50, _) = report.latency(&label, SAMPLES, None, |_| {
+        for _ in 0..SQLITE_CONTROL_ITERATIONS {
+            black_box(stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap());
+        }
+    });
+    Ok(p50)
 }
 
 fn measure_semantic(
@@ -398,23 +410,23 @@ fn measure_semantic(
     let started = Instant::now();
     let model = OnnxEmbedder::load(&MINILM_L6_V2_INT8, &dir)?;
     mailbox::seed_vectors(store, &model)?;
-    let mut controls = Vec::with_capacity(HYBRID_QUERIES.len());
+    let mut graph_p95s = Vec::with_capacity(HYBRID_QUERIES.len());
     for (query, text) in HYBRID_QUERIES {
-        // Warm this input shape before collecting the control.
+        // Warm this input shape before timing the graph.
         model.testing_graph_latency(text)?;
-        let mut samples = (0..GRAPH_SAMPLES)
+        let mut samples = (0..SAMPLES)
             .map(|_| model.testing_graph_latency(text))
             .collect::<Result<Vec<_>, _>>()?;
         samples.sort_unstable();
-        let p50 = percentile_ms(&samples, 50);
+        let p95 = percentile_ms(&samples, 95);
         report.row(
             &format!("MiniLM graph · `{query}`"),
             samples.len(),
-            Some(p50),
-            percentile_ms(&samples, 95),
-            None,
+            Some(percentile_ms(&samples, 50)),
+            p95,
+            Some(Budget::fixed(budgets.semantic_graph_p95_ms)),
         );
-        controls.push(p50);
+        graph_p95s.push(p95);
     }
     store.testing_search_embedder(Box::new(model))?;
     let account = mailbox::account();
@@ -424,19 +436,25 @@ fn measure_semantic(
         assert!(warm.hits.iter().any(|hit| hit.semantic_only), "{query}");
     }
     let setup = started.elapsed();
-    for ((query, _), graph_p50) in HYBRID_QUERIES.into_iter().zip(controls) {
-        let mut budget = Budget::fixed(budgets.semantic_search_p95_ms);
-        budget.limit += (graph_p50 - budgets.semantic_reference_graph_p50_ms)
-            .clamp(0.0, MAX_GRAPH_ALLOWANCE_MS);
-        report.latency(
+    for ((query, _), graph_p95) in HYBRID_QUERIES.into_iter().zip(graph_p95s) {
+        let (_, hybrid_p95) = report.latency(
             &format!("Hybrid · `{query}`"),
             SAMPLES,
-            Some(budget),
+            Some(Budget {
+                baseline: HYBRID_PRODUCT_MAX_MS,
+                limit: HYBRID_PRODUCT_MAX_MS,
+            }),
             |_| store.search(&account.id, query).unwrap(),
+        );
+        report.row(
+            &format!("Hybrid residual · `{query}`"),
+            SAMPLES,
+            None,
+            (hybrid_p95 - graph_p95).max(0.0),
+            Some(Budget::fixed(budgets.semantic_residual_p95_ms)),
         );
     }
     Ok(format!(
-        "Hybrid setup took {setup:.2?} and seeded 100k vectors from local MiniLM topic vectors with deterministic jitter. Each hybrid limit includes the corresponding MiniLM graph p50 above {:.1} ms, capped at {MAX_GRAPH_ALLOWANCE_MS:.1} ms of extra time.",
-        budgets.semantic_reference_graph_p50_ms,
+        "Hybrid setup took {setup:.2?} and seeded 100k vectors from local MiniLM topic vectors with deterministic jitter. Each residual is the difference between the query's end-to-end p95 and graph p95, floored at zero. Both timings also have independent ceilings.",
     ))
 }

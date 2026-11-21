@@ -123,9 +123,9 @@ impl OnnxEmbedder {
             .collect()
     }
 
-    /// Measure the pinned graph alone as a hardware control for the store
-    /// benchmark. Tokenization, tensor construction, pooling, and the store
-    /// are outside the control and remain part of the hybrid measurement.
+    /// Measure the pinned graph alone for the store benchmark. Tokenization,
+    /// tensor construction, pooling, and the store remain part of the
+    /// end-to-end hybrid measurement.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn testing_graph_latency(&self, text: &str) -> Result<std::time::Duration, ModelError> {

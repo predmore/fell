@@ -2,10 +2,11 @@
 # for the measured baseline and product maxima. The gate adds 20% to each value.
 folder_page_p95_ms = 0.75
 thread_open_p95_ms = 3.0
-# Median open time of the reference hosted runner, in milliseconds.
-thread_reference_open_p50_ms = 1.85
+# Reference p50 for 2,048 executions of SQLite SELECT 1 in memory.
+thread_reference_sqlite_p50_ms = 0.10
 keyword_search_p95_ms = 25.0
-# The optimized query path plus headroom has a 90 ms limit on fast runners.
-semantic_search_p95_ms = 75.0
-semantic_reference_graph_p50_ms = 20.0
+# Independent limits for non-graph work and the MiniLM graph.
+# The benchmark additionally caps end-to-end p95 at 150 ms.
+semantic_residual_p95_ms = 75.0
+semantic_graph_p95_ms = 60.0
 rest_rss_mb = 18.0

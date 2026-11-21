@@ -477,7 +477,7 @@ impl VectorIndex {
         account: &str,
         query: &[f32],
         allowed: Option<&[bool]>,
-    ) -> impl Iterator<Item = (&str, f32)> + '_ {
+    ) -> Nearest<'_> {
         let mut candidates = Vec::new();
         // `load` refuses zero dimensions, and `chunks_exact(0)` would panic.
         if let (Some(slot), false) = (self.account_slot(account), self.dims == 0)
@@ -494,11 +494,35 @@ impl VectorIndex {
                 }
             }
         }
-        let mut nearest = BinaryHeap::from(candidates);
-        std::iter::from_fn(move || {
-            let Scored(score, row) = nearest.pop()?;
-            Some((self.keys[row as usize].as_ref(), score))
-        })
+        Nearest {
+            candidates: BinaryHeap::from(candidates),
+            keys: &self.keys,
+        }
+    }
+}
+
+pub(crate) struct Nearest<'a> {
+    candidates: BinaryHeap<Scored>,
+    keys: &'a [Arc<str>],
+}
+
+impl Nearest<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    pub(crate) fn retain_allowed(&mut self, allowed: &[bool]) {
+        self.candidates
+            .retain(|candidate| allowed[candidate.1 as usize]);
+    }
+}
+
+impl<'a> Iterator for Nearest<'a> {
+    type Item = (&'a str, f32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Scored(score, row) = self.candidates.pop()?;
+        Some((self.keys[row as usize].as_ref(), score))
     }
 }
 

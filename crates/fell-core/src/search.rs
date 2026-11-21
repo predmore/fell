@@ -950,55 +950,57 @@ fn semantic_threads(
     // this probe so a selective filter still takes the bulk path below.
     // Header MATCH operators can scan FTS postings on each lookup, so keep
     // those on the bulk path from the start.
-    if filtered && parsed.from.is_empty() && parsed.to.is_empty() && parsed.subject.is_empty() {
-        reached(Step::Filtered);
-        let mut nearest = ready
+    let probe =
+        filtered && parsed.from.is_empty() && parsed.to.is_empty() && parsed.subject.is_empty();
+    let allowed_rows = || -> Result<Vec<bool>> {
+        let ids = filtered_message_ids(conn, account_id, parsed)?;
+        Ok(ready
             .index
-            .nearest(account_id.as_str(), &query, None)
-            .map(|(message_id, _)| message_id);
-        let hits = semantic_hits(
+            .rows_of(account_id.as_str(), ids.iter().map(String::as_str)))
+    };
+    let allowed = (filtered && !probe).then(allowed_rows).transpose()?;
+    reached(Step::Filtered);
+    let mut nearest = ready
+        .index
+        .nearest(account_id.as_str(), &query, allowed.as_deref());
+    let mut hits = Vec::new();
+    if probe {
+        hits = semantic_hits(
             conn,
             account_id,
             parsed,
             &mut nearest,
             SEMANTIC_PROBE_BATCHES,
+            hits,
         )?;
-        if hits.len() == semantic::SEMANTIC_THREADS || nearest.next().is_none() {
+        if hits.len() == semantic::SEMANTIC_THREADS || nearest.is_empty() {
             return Ok(hits);
         }
+        // Apply the bulk filter to the remaining scores and keep the hits
+        // already checked in the same snapshot.
+        nearest.retain_allowed(&allowed_rows()?);
     }
-    let allowed = if filtered {
-        let ids = filtered_message_ids(conn, account_id, parsed)?;
-        Some(
-            ready
-                .index
-                .rows_of(account_id.as_str(), ids.iter().map(String::as_str)),
-        )
-    } else {
-        None
-    };
-    reached(Step::Filtered);
-    let mut nearest = ready
-        .index
-        .nearest(account_id.as_str(), &query, allowed.as_deref())
-        .map(|(message_id, _)| message_id);
-    semantic_hits(conn, account_id, parsed, &mut nearest, usize::MAX)
+    semantic_hits(conn, account_id, parsed, &mut nearest, usize::MAX, hits)
 }
 
-fn semantic_hits<'a>(
+fn semantic_hits(
     conn: &Connection,
     account_id: &AccountId,
     parsed: &ParsedQuery,
-    nearest: &mut impl Iterator<Item = &'a str>,
+    nearest: &mut semantic::Nearest<'_>,
     batches: usize,
+    mut hits: Vec<SearchHit>,
 ) -> Result<Vec<SearchHit>> {
     reached(Step::Scanned);
-    let mut threads = HashSet::new();
-    let mut hits = Vec::new();
+    let mut threads: HashSet<_> = hits.iter().map(|hit| hit.thread_id.clone()).collect();
     for _ in 0..batches {
         // Read one batch at a time. A run of near-identical replies
         // may all belong to one thread.
-        let batch: Vec<_> = nearest.by_ref().take(SEMANTIC_LOOKUP_BATCH).collect();
+        let batch: Vec<_> = nearest
+            .by_ref()
+            .take(SEMANTIC_LOOKUP_BATCH)
+            .map(|(message_id, _)| message_id)
+            .collect();
         if batch.is_empty() {
             break;
         }

@@ -1334,6 +1334,9 @@ fn a_selective_folder_filter_can_find_hits_beyond_the_probe() {
             )
         })
         .collect();
+    let conversation = Some("shared-conversation".into());
+    messages[0].headers.proton_conversation_id = conversation.clone();
+    messages[0].folders.push("Saved".into());
     let mut archived = mail(
         "archived",
         "from@corpus.test",
@@ -1341,14 +1344,31 @@ fn a_selective_folder_filter_can_find_hits_beyond_the_probe() {
         "Invoice for plumber",
         1_700_000_000,
     );
-    archived.folders = vec!["Archive".into()];
+    archived.headers.proton_conversation_id = conversation;
+    archived.folders = vec!["Archive".into(), "Saved".into()];
     messages.push(archived);
+    let mut saved = mail(
+        "saved",
+        "from@corpus.test",
+        "Another job",
+        "Invoice for electrician",
+        1_700_000_000,
+    );
+    saved.folders = vec!["Saved".into()];
+    messages.push(saved);
     fill(&store, &messages);
     index_with(&store, &Concepts);
 
     let query = "money owed in:Archive";
     assert!(keyword(&store, query).hits.is_empty());
     assert_eq!(ids(&hybrid(&store, query)), ["archived"]);
+
+    // Saved has a probe hit. The fallback skips its lower-scored reply and
+    // appends the next distinct thread.
+    assert_eq!(
+        ids(&hybrid(&store, "money owed in:Saved")),
+        ["bill-0", "saved"]
+    );
 }
 
 #[test]
