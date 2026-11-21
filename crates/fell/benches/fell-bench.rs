@@ -22,8 +22,6 @@ const SQLITE_CONTROL_ITERATIONS: usize = 2_048;
 const HEADROOM: f64 = 1.20;
 const MAX_THREAD_SCALE: f64 = 1.25;
 const HYBRID_PRODUCT_MAX_MS: f64 = 150.0;
-// Round up the slow hosted end-to-end p95 of 179.2 ms before adding headroom.
-const HYBRID_X86_FALLBACK_BASELINE_MS: f64 = 180.0;
 const PAGE_SIZE: usize = 100;
 const INBOX: &str = "INBOX";
 const QUERIES: [(&str, &str, Option<&str>); 5] = [
@@ -57,7 +55,6 @@ struct Budgets {
     keyword_search_p95_ms: f64,
     semantic_residual_p95_ms: f64,
     semantic_graph_p95_ms: f64,
-    semantic_graph_x86_fallback_p95_ms: f64,
     rest_rss_mb: f64,
 }
 
@@ -74,10 +71,6 @@ impl Budgets {
             ("keyword_search_p95_ms", budgets.keyword_search_p95_ms),
             ("semantic_residual_p95_ms", budgets.semantic_residual_p95_ms),
             ("semantic_graph_p95_ms", budgets.semantic_graph_p95_ms),
-            (
-                "semantic_graph_x86_fallback_p95_ms",
-                budgets.semantic_graph_x86_fallback_p95_ms,
-            ),
             ("rest_rss_mb", budgets.rest_rss_mb),
         ] {
             let max_limit = value * HEADROOM * MAX_THREAD_SCALE;
@@ -110,22 +103,36 @@ fn percentile_ms(sorted: &[Duration], percentile: usize) -> f64 {
     sorted[(sorted.len() * percentile).div_ceil(100) - 1].as_secs_f64() * 1e3
 }
 
-fn cpu_report() -> (String, bool) {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let model = cpuinfo
+fn cpuinfo_field<'a>(cpuinfo: &'a str, key: &str) -> Option<&'a str> {
+    cpuinfo
         .lines()
         .filter_map(|line| line.split_once(':'))
-        .find_map(|(key, value)| (key.trim() == "model name").then_some(value.trim()))
-        .unwrap_or("unavailable");
+        .find_map(|(k, value)| (k.trim() == key).then_some(value.trim()))
+}
+
+fn cpu_report() -> String {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    // x86 names the model; arm64 kernels usually report only implementer and part ids.
+    let model = cpuinfo_field(&cpuinfo, "model name")
+        .or_else(|| cpuinfo_field(&cpuinfo, "Model"))
+        .or_else(|| cpuinfo_field(&cpuinfo, "Hardware"))
+        .map(str::to_owned)
+        .or_else(|| {
+            let implementer = cpuinfo_field(&cpuinfo, "CPU implementer")?;
+            let part = cpuinfo_field(&cpuinfo, "CPU part")?;
+            Some(format!("implementer {implementer}, part {part}"))
+        })
+        .unwrap_or_else(|| "unavailable".into());
     let logical_cpus = std::thread::available_parallelism()
         .map_or_else(|_| "unavailable".into(), |count| count.to_string());
     let arch = std::env::consts::ARCH;
     let threads = OnnxEmbedder::testing_executor_threads();
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut out = format!(
         "CPU model: {model} ({arch})\n\nLogical CPUs available: {logical_cpus}\n\nTract executor threads: {threads}\n\n"
     );
     #[cfg(target_arch = "x86_64")]
-    let x86_fallback = {
+    {
         let avx = std::arch::is_x86_feature_detected!("avx");
         let avx2 = std::arch::is_x86_feature_detected!("avx2");
         let fma = std::arch::is_x86_feature_detected!("fma");
@@ -136,18 +143,17 @@ fn cpu_report() -> (String, bool) {
             "x86 features: avx={avx} avx2={avx2} fma={fma} f16c={f16c} avx512f={avx512f}\n"
         )
         .unwrap();
-        // MiniLM's integer matrix kernels use AVX2 independently of FMA.
-        !avx2
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let x86_fallback = false;
-    let profile = if x86_fallback {
-        "x86_64 without AVX2"
-    } else {
-        "standard"
-    };
-    writeln!(out, "Hybrid budget profile: {profile}\n").unwrap();
-    (out, x86_fallback)
+        // MiniLM's integer matrix kernels need AVX2 for the fast tract path.
+        // Every CPU keeps the same ceilings until a slow run shows the cause (#228).
+        if !avx2 {
+            writeln!(
+                out,
+                "AVX2 is unavailable, so tract uses its slower integer kernels.\n"
+            )
+            .unwrap();
+        }
+    }
+    out
 }
 
 struct Report {
@@ -299,7 +305,7 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
             return Err(format!("pinned MiniLM setup exited with {status}").into());
         }
     }
-    let (cpu, x86_fallback) = cpu_report();
+    let cpu = cpu_report();
     let mut report = Report::new(&cpu);
     let scratch = tempfile::Builder::new()
         .prefix("fell-store-budgets-")
@@ -409,7 +415,7 @@ fn run_suite() -> Result<(), Box<dyn Error>> {
             |_| store.search_with(&account.id, query, options).unwrap(),
         );
     }
-    let semantic = measure_semantic(&store, &mut report, &budgets, x86_fallback);
+    let semantic = measure_semantic(&store, &mut report, &budgets);
     let semantic_note = match &semantic {
         Ok(note) => note.clone(),
         Err(err) => format!("Hybrid measurement failed: {err}"),
@@ -443,7 +449,6 @@ fn measure_semantic(
     store: &Store,
     report: &mut Report,
     budgets: &Budgets,
-    x86_fallback: bool,
 ) -> Result<String, Box<dyn Error>> {
     let explicit = std::env::var_os("FELL_BENCH_MODEL_DIR").map(PathBuf::from);
     let root = explicit.clone().or_else(default_models_dir);
@@ -456,26 +461,21 @@ fn measure_semantic(
         }
         return Ok("Hybrid search skipped because the pinned local MiniLM model is absent.".into());
     };
-    let (graph_baseline, hybrid_budget) = if x86_fallback {
-        (
-            budgets.semantic_graph_x86_fallback_p95_ms,
-            Budget::fixed(HYBRID_X86_FALLBACK_BASELINE_MS),
-        )
-    } else {
-        (
-            budgets.semantic_graph_p95_ms,
-            Budget {
-                baseline: HYBRID_PRODUCT_MAX_MS,
-                limit: HYBRID_PRODUCT_MAX_MS,
-            },
-        )
+    let hybrid_budget = Budget {
+        baseline: HYBRID_PRODUCT_MAX_MS,
+        limit: HYBRID_PRODUCT_MAX_MS,
     };
-    let graph_budget = Budget::fixed(graph_baseline);
+    let graph_budget = Budget::fixed(budgets.semantic_graph_p95_ms);
     let started = Instant::now();
     let model = OnnxEmbedder::load(&MINILM_L6_V2_INT8, &dir)?;
     mailbox::seed_vectors(store, &model)?;
     let mut setup = started.elapsed();
     let kernels = model.testing_matmul_kernels().join(", ");
+    let kernels = if kernels.is_empty() {
+        "(none)".to_owned()
+    } else {
+        kernels
+    };
     let mut graph_p95s = Vec::with_capacity(HYBRID_QUERIES.len());
     for (query, text) in HYBRID_QUERIES {
         // Warm this input shape before timing the graph.
