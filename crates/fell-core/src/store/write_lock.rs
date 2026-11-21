@@ -115,6 +115,11 @@ pub(crate) struct LockWait {
 }
 
 impl LockWait {
+    #[cfg(test)]
+    pub(super) fn write_is_waiting(&self) -> bool {
+        self.turns.someone_waiting()
+    }
+
     /// Replace `conn`'s busy handler with this one.
     pub(crate) fn install(conn: &mut Connection, turns: Arc<Turns>) -> Result<Arc<Self>> {
         let wait = Arc::new(Self {

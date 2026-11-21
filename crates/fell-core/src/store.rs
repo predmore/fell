@@ -489,6 +489,11 @@ impl Store {
         self.path.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn write_is_waiting(&self) -> bool {
+        self.lock_wait.write_is_waiting()
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::from_connection(conn, std::sync::Arc::default())

@@ -146,10 +146,16 @@ pub struct Agents {
     pub selected: usize,
     column: usize,
     pub pending: bool,
-    pub confirm: Option<AgentSummary>,
+    pub confirm: Option<Confirmation>,
     undo: Option<(AgentSummary, AgentGrant)>,
     pub notice: Option<(&'static str, bool)>,
     pub notice_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Confirmation {
+    pub row: AgentSummary,
+    pub control: Control,
 }
 
 impl Agents {
@@ -266,7 +272,7 @@ impl Agents {
         self.column = Control::ALL.iter().position(|item| *item == control)?;
         let grant = control.toggle(row.grant);
         if control == Control::Revoke || !grant.enabled {
-            self.confirm = Some(row);
+            self.confirm = Some(Confirmation { row, control });
             self.set_notice(None);
             return None;
         }
@@ -274,7 +280,7 @@ impl Agents {
     }
 
     pub fn confirm_revoke(&mut self, yes: bool) -> Option<Request> {
-        let row = self.confirm.take()?;
+        let Confirmation { row, .. } = self.confirm.take()?;
         if yes {
             self.change(row, AgentGrant::DISABLED, ChangeKind::Revoke)
         } else {
@@ -476,7 +482,10 @@ mod tests {
         apply(&mut session, &store, step);
 
         assert!(session.on_key(KeyId::Space, 10).agents.is_none());
-        assert!(session.agents.confirm.is_some());
+        assert_eq!(
+            session.agents.confirm.as_ref().unwrap().control,
+            Control::Read
+        );
         assert_eq!(read_grant(), grant);
         session.on_key(KeyId::Escape, 10);
         assert!(session.agents.confirm.is_none());

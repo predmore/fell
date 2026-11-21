@@ -254,12 +254,20 @@ impl crate::Store {
         account_id: &AccountId,
         actor: &str,
     ) -> Result<rusqlite::Transaction<'_>> {
+        let tx = crate::store::begin_immediate(&self.conn)?;
+        Self::check_agent_draft_access(&tx, account_id, actor)?;
+        Ok(tx)
+    }
+
+    pub(crate) fn check_agent_draft_access(
+        tx: &rusqlite::Transaction<'_>,
+        account_id: &AccountId,
+        actor: &str,
+    ) -> Result<()> {
         let agent_id = actor
             .strip_prefix("agent:")
             .ok_or_else(|| Error::Invalid("missing agent identity".into()))?;
-        let tx = crate::store::begin_immediate(&self.conn)?;
-        check_write_grant(&tx, account_id, agent_id, WriteScope::Draft)?;
-        Ok(tx)
+        check_write_grant(tx, account_id, agent_id, WriteScope::Draft)
     }
 
     pub fn list_labels(&self, account_id: &AccountId) -> Result<Vec<String>> {

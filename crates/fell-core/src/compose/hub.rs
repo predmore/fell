@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -552,6 +552,41 @@ impl DraftHub {
         self.focused.lock().expect("focused").clone()
     }
 
+    fn open_agent_draft(&self, draft_id: &str, agent: &str) -> Result<(), String> {
+        let Some(_opening) = self.begin_open(draft_id) else {
+            return if self
+                .sessions
+                .lock()
+                .expect("sessions")
+                .contains_key(draft_id)
+            {
+                Ok(())
+            } else {
+                Err("the draft is opening in Fell; try again".into())
+            };
+        };
+        let account = super::persist::stored_compose_account(draft_id)
+            .ok_or("draft has no mailbox record")?;
+        match super::persist::stored_compose_owner(draft_id).as_deref() {
+            Some(owner) if owner == agent => {}
+            Some(_) => return Err("this draft belongs to another agent".into()),
+            None => return Err("draft has no mailbox record".into()),
+        }
+        let folder = super::persist::ensure_draft_folder(draft_id)?;
+        if workspace::draft_file_is_symlink(&folder) || !folder.join("draft.md").is_file() {
+            return Err("draft has no mailbox record".into());
+        }
+        let mut session = DraftSession::open_folder(&folder, crate::AccountId(account))?;
+        // As in insert_new, keep any live session that was inserted while opening.
+        session.attach_writer();
+        self.sessions
+            .lock()
+            .expect("sessions")
+            .entry(draft_id.into())
+            .or_insert(session);
+        Ok(())
+    }
+
     pub fn handle_line(&self, line: &str) -> String {
         let request: Value = match serde_json::from_str(line) {
             Ok(value) => value,
@@ -578,42 +613,14 @@ impl DraftHub {
             .to_string();
         let mut sessions = self.sessions.lock().expect("sessions");
         if !draft_id.is_empty() && !sessions.contains_key(&draft_id) {
-            // The inbox is reading this draft from its folder: a second
-            // reader now could take a half-written folder as the draft.
-            if self.opening.lock().expect("opening").contains(&draft_id) {
-                return denied(&id, "the draft is opening in Fell; try again");
+            drop(sessions);
+            if let Err(err) = self.open_agent_draft(&draft_id, &agent) {
+                return denied(&id, &err);
             }
-            let Some(account) = super::persist::stored_compose_account(&draft_id) else {
-                return denied(&id, "draft has no mailbox record");
-            };
-            match super::persist::stored_compose_owner(&draft_id).as_deref() {
-                Some(owner) if owner == agent => {}
-                Some(_) => return denied(&id, "this draft belongs to another agent"),
-                None => return denied(&id, "draft has no mailbox record"),
-            }
-            let folder = match super::persist::ensure_draft_folder(&draft_id) {
-                Ok(folder) => folder,
-                Err(err) => return denied(&id, &err),
-            };
-            if workspace::draft_file_is_symlink(&folder) || !folder.join("draft.md").is_file() {
-                return denied(&id, "draft has no mailbox record");
-            }
-            match DraftSession::open_folder(&folder, crate::AccountId(account)) {
-                Ok(mut session) => {
-                    session.attach_writer();
-                    sessions.insert(draft_id.clone(), session);
-                }
-                Err(err) => return denied(&id, &err),
-            }
+            sessions = self.sessions.lock().expect("sessions");
         }
-        let Some(session) = sessions.get_mut(&draft_id) else {
-            return json!({
-                "id": id,
-                "ok": false,
-                "transmitted": false,
-                "error": "unknown draft"
-            })
-            .to_string();
+        let Some(session) = sessions.get(&draft_id) else {
+            return denied(&id, "unknown draft");
         };
         if matches!(
             op,
@@ -627,24 +634,53 @@ impl DraftHub {
             return denied(&id, "this draft belongs to another agent");
         }
         let writes = matches!(op, "edit_draft" | "replace_draft_body" | "request_send");
-        let store = if writes {
-            match draft_mailbox(session) {
-                Ok(store) => Some(store),
-                Err(err) => return denied(&id, &err),
-            }
-        } else {
-            None
-        };
-        // Keep revoke and the live change ordered, including all edits in a
-        // batch. The queued save and the window acknowledgment happen later.
-        let access = if let Some(store) = &store {
-            match store.lock_agent_draft_access(session.account_id(), &agent) {
-                Ok(access) => Some(access),
+        let store;
+        let (access, mut sessions) = if writes {
+            let path = session.mailbox_path();
+            let account = session.account_id().clone();
+            drop(sessions);
+            let Some(path) = path.as_ref().filter(|path| path.is_file()) else {
+                return denied(&id, "draft has no mailbox record");
+            };
+            store = match crate::Store::open(path) {
+                Ok(store) => store,
                 Err(err) => return denied(&id, &err.to_string()),
+            };
+            // The editor and discard can already hold sessions when they
+            // write SQLite. Release the transaction before waiting for them,
+            // and never wait for SQLite with the UI's session lock held.
+            let (tx, sessions) = loop {
+                let tx = match crate::store::begin_immediate(store.connection()) {
+                    Ok(tx) => tx,
+                    Err(err) => return denied(&id, &err.to_string()),
+                };
+                match self.sessions.try_lock() {
+                    Ok(locked) => break (tx, locked),
+                    Err(TryLockError::WouldBlock) => {
+                        drop(tx);
+                        drop(self.sessions.lock().expect("sessions"));
+                    }
+                    Err(TryLockError::Poisoned(err)) => panic!("sessions: {err}"),
+                }
+            };
+            let Some(session) = sessions.get(&draft_id) else {
+                return denied(&id, "unknown draft");
+            };
+            if session.account_id() != &account || session.mailbox_path().as_ref() != Some(path) {
+                return denied(&id, "the draft mailbox changed; try again");
             }
+            if !session.allows_agent(&agent) {
+                return denied(&id, "this draft belongs to another agent");
+            }
+            if let Err(err) = crate::Store::check_agent_draft_access(&tx, &account, &agent) {
+                return denied(&id, &err.to_string());
+            }
+            (Some(tx), sessions)
         } else {
-            None
+            (None, sessions)
         };
+        let session = sessions.get_mut(&draft_id).expect("checked live draft");
+        let mut flush = false;
         let mut reveal = None;
         let mut reply = match op {
             "get_draft" => ok_draft(id, session, &agent),
@@ -692,7 +728,7 @@ impl DraftHub {
                         "user_changes_since_your_last_read": changes,
                     }),
                     None => {
-                        let _ = session.flush();
+                        flush = true;
                         ok_draft_with(id, session, &agent, changes)
                     }
                 }
@@ -702,7 +738,7 @@ impl DraftHub {
                 let body = request.get("body").and_then(Value::as_str).unwrap_or("");
                 match session.replace_body(body) {
                     Ok(()) => {
-                        let _ = session.flush();
+                        flush = true;
                         ok_draft_with(id, session, &agent, changes)
                     }
                     Err(err) => json!({
@@ -751,8 +787,11 @@ impl DraftHub {
                 "error": "unknown draft op"
             }),
         };
-        let saved = sessions.get(&draft_id).and_then(DraftSession::save_waiter);
         drop(access);
+        if flush {
+            let _ = session.flush();
+        }
+        let saved = session.save_waiter();
         drop(sessions);
         self.emit();
         // An agent reads draft.md right after a tool returns, so the reply
@@ -891,14 +930,6 @@ pub fn rpc_call(request: &Value) -> Result<Value, String> {
         .read_line(&mut line)
         .map_err(|err| err.to_string())?;
     serde_json::from_str(line.trim()).map_err(|err| err.to_string())
-}
-
-fn draft_mailbox(session: &DraftSession) -> Result<crate::Store, String> {
-    let path = session
-        .mailbox_path()
-        .filter(|path| path.is_file())
-        .ok_or("draft has no mailbox record")?;
-    crate::Store::open(path).map_err(|err| err.to_string())
 }
 
 fn open_draft_for_agent(
@@ -1221,29 +1252,33 @@ mod tests {
     }
 
     fn grant_d1(hub: &DraftHub) -> crate::Store {
-        hub.with_session("d1", |session| {
-            let path = session.folder().with_file_name("mail.db");
-            let store = crate::Store::open(&path).unwrap();
-            let account_id = session.account_id().clone();
-            store
-                .upsert_account(&crate::Account {
-                    id: account_id.clone(),
-                    display_name: "Demo".into(),
-                    email: "demo@example.test".into(),
-                    backend_kind: crate::BackendKind::Bridge,
-                })
-                .unwrap();
-            store
-                .set_agent_grant(
-                    &account_id,
-                    "bot",
-                    crate::AgentGrant::enabled(true, false, true),
+        let (path, account_id) = hub
+            .with_session("d1", |session| {
+                (
+                    session.folder().with_file_name("mail.db"),
+                    session.account_id().clone(),
                 )
-                .unwrap();
-            session.bind_store(path);
-            store
-        })
-        .unwrap()
+            })
+            .unwrap();
+        let store = crate::Store::open(&path).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: account_id.clone(),
+                display_name: "Demo".into(),
+                email: "demo@example.test".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        store
+            .set_agent_grant(
+                &account_id,
+                "bot",
+                crate::AgentGrant::enabled(true, false, true),
+            )
+            .unwrap();
+        hub.with_session("d1", |session| session.bind_store(path))
+            .unwrap();
+        store
     }
 
     #[test]
@@ -1295,6 +1330,99 @@ mod tests {
                 .unwrap(),
             "alpha\n"
         );
+    }
+
+    #[test]
+    fn a_blocked_mailbox_open_leaves_sessions_available_to_the_ui() {
+        let hub = hub_with_d1("blocked-agent-write");
+        let store = grant_d1(&hub);
+        let write = crate::store::begin_immediate(store.connection()).unwrap();
+        let agent_hub = Arc::clone(&hub);
+        let agent = std::thread::spawn(move || request_send_d1(&agent_hub));
+        let start = std::time::Instant::now();
+        while !store.write_is_waiting() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "agent did not reach SQLite"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ui_can_take_sessions = hub.sessions.try_lock().is_ok();
+        drop(write);
+        assert_eq!(agent.join().unwrap()["ok"], true);
+        assert!(
+            ui_can_take_sessions,
+            "the agent held sessions while waiting on SQLite"
+        );
+    }
+
+    #[test]
+    fn offline_draft_writes_recheck_scope_after_mcp_authorizes() {
+        let id = format!(
+            "fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(&id);
+        fs::create_dir_all(&root).unwrap();
+        let account = AccountId("offline".into());
+        let fields = DraftFields {
+            subject: "Demo draft".into(),
+            ..DraftFields::default()
+        };
+        let folder = workspace::draft_folder(&id).unwrap();
+        workspace::materialize_in(folder.parent().unwrap(), &id, &fields, "alpha\n", &account)
+            .unwrap();
+        let db = root.join("mail.db");
+        let store = crate::Store::open(&db).unwrap();
+        store
+            .upsert_account(&crate::Account {
+                id: account.clone(),
+                display_name: "Demo".into(),
+                email: "demo@example.test".into(),
+                backend_kind: crate::BackendKind::Bridge,
+            })
+            .unwrap();
+        store
+            .save_compose(&super::super::persist::StoredCompose {
+                id: id.clone(),
+                account_id: account.clone(),
+                fields,
+                body: "alpha\n".into(),
+                files: Vec::new(),
+                identities: Vec::new(),
+                owner: "agent:bot".into(),
+                reply: Default::default(),
+            })
+            .unwrap();
+        super::super::persist::remember_compose_store(&id, &db).unwrap();
+        let before = workspace::read_draft_file(&folder).unwrap();
+        let enabled = crate::AgentGrant::enabled(true, false, true);
+        let settings = crate::Store::open(&db).unwrap();
+        for (revoked, expected) in [
+            (crate::AgentGrant::DISABLED, "disabled"),
+            (
+                crate::AgentGrant::enabled(true, false, false),
+                "draft scope",
+            ),
+        ] {
+            settings.set_agent_grant(&account, "bot", enabled).unwrap();
+            assert_eq!(store.agent_grant(&account, "bot").unwrap(), enabled);
+            settings.set_agent_grant(&account, "bot", revoked).unwrap();
+            let edit =
+                file_fallback_edit(&store, &id, "agent:bot", account.as_str(), "alpha", "beta");
+            let replace =
+                file_fallback_replace_body(&store, &id, "agent:bot", account.as_str(), "beta");
+            for result in [edit, replace] {
+                let error = result.unwrap_err();
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+        assert_eq!(workspace::read_draft_file(&folder).unwrap(), before);
+        assert_eq!(store.load_compose(&id).unwrap().unwrap().body, "alpha\n");
     }
 
     fn request_send_d1(hub: &DraftHub) -> Value {

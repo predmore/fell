@@ -39,6 +39,8 @@ allow = [
 exceptions = [
     { crate = "hexf-parse", allow = ["CC0-1.0"] },
     { crate = "libfuzzer-sys", allow = ["NCSA"] },
+    # GPUI's headless layout test support pulls this through zed-xim (dev only).
+    { crate = "tiny-keccak", allow = ["CC0-1.0"] },
     # `notify` is the inotify watcher for live draft.md sync. The crate is CC0.
     { crate = "notify", allow = ["CC0-1.0"] },
 ]

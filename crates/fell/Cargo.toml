@@ -47,6 +47,7 @@ wry = { version = "0.57.2", default-features = false, features = ["os-webview"] 
 [dev-dependencies]
 # Tests check the store starts loading search (`Store::testing_*`). Dev only.
 fell-core = { workspace = true, features = ["ui-confirm", "test-utils"] }
+gpui = { workspace = true, features = ["test-support"] }
 # The shaper GPUI uses on Linux, to test line cuts on real shaping.
 cosmic-text = "0.14"
 rusqlite.workspace = true

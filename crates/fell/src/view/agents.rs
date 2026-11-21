@@ -13,37 +13,67 @@ use crate::model::Overlay;
 use crate::model::agents::{Agents, Control, Request};
 use crate::motion::{self, Motion, Transition};
 use crate::present::{display_safe, relative_date};
-use crate::theme::Theme;
+use crate::theme::{Theme, ensure_all};
 
 use super::{FontOpt, Inbox, now_unix};
 
 const ROW_HEIGHT: f32 = 82.;
 const TITLE_HEIGHT: f32 = 48.;
 const FOOTER_HEIGHT: f32 = 70.;
+const EMPTY_HEIGHT: f32 = 102.;
 const NOTICE_TIME: Duration = Duration::from_secs(3);
+const SWITCH_CONTRAST: f64 = 3.15;
+const ROW_TEXT_CONTRAST: f64 = 4.65;
+
+#[derive(PartialEq, Eq)]
+struct Confirmation {
+    prompt: String,
+    consequence: String,
+    action: &'static str,
+}
 
 #[derive(Default, PartialEq, Eq)]
 struct Footer {
-    confirmation: Option<(String, String)>,
+    confirmation: Option<Confirmation>,
     notice: Option<(&'static str, bool)>,
     undo: bool,
+    description: &'static str,
 }
 
 impl Footer {
     fn of(agents: &Agents) -> Self {
         Self {
-            confirmation: agents.confirm.as_ref().map(|row| {
-                let agent = display_safe(&row.agent_id);
+            confirmation: agents.confirm.as_ref().map(|confirm| {
+                let agent = display_safe(&confirm.row.agent_id);
                 let account = agents
-                    .email(row)
+                    .email(&confirm.row)
                     .map_or_else(|| "this account".into(), display_safe);
-                (
-                    format!("Revoke {agent}?"),
-                    format!("{account} access ends on its next request."),
-                )
+                let consequence = format!("{agent} loses access to {account} on its next request.");
+                if confirm.control == Control::Revoke {
+                    Confirmation {
+                        prompt: format!("Revoke {agent}?"),
+                        consequence,
+                        action: "Revoke · y",
+                    }
+                } else {
+                    Confirmation {
+                        prompt: format!("Turn off {} for {agent}?", confirm.control.label()),
+                        consequence: format!("It's the last permission, so {consequence}"),
+                        action: "Turn off · y",
+                    }
+                }
             }),
             notice: agents.notice,
             undo: agents.can_undo(),
+            description: if agents
+                .rows
+                .get(agents.selected)
+                .is_some_and(|row| !row.grant.enabled)
+            {
+                "No access"
+            } else {
+                agents.control().description()
+            },
         }
     }
 }
@@ -55,7 +85,20 @@ pub(super) struct AgentMotion {
     selected: Option<usize>,
     selection: Option<(usize, Transition)>,
     footer: Footer,
-    footer_fade: Option<(Footer, Transition)>,
+    footer_fade: Option<FooterFade>,
+}
+
+struct FooterFade {
+    before: Footer,
+    from: f32,
+    fade: Transition,
+}
+
+impl FooterFade {
+    fn opacities(&self, now: Instant) -> (f32, f32) {
+        let (old, new) = footer_opacities(self.fade.linear(now));
+        (old * self.from, new)
+    }
 }
 
 impl AgentMotion {
@@ -81,14 +124,28 @@ impl AgentMotion {
         let footer = Footer::of(agents);
         if self.footer != footer {
             let before = std::mem::replace(&mut self.footer, footer);
-            self.footer_fade = motion.start(motion::FADE, now).map(|fade| (before, fade));
+            self.footer_fade = motion.start(motion::FADE, now).map(|fade| {
+                // The grant reply can arrive while confirmation is still
+                // leaving. Carry what is visible instead of flashing a line.
+                let (before, from) = if let Some(prior) = self.footer_fade.take() {
+                    let (old, new) = prior.opacities(now);
+                    if old > 0. {
+                        (prior.before, old)
+                    } else {
+                        (before, new)
+                    }
+                } else {
+                    (before, 1.)
+                };
+                FooterFade { before, from, fade }
+            });
         }
         self.switches = self.switches.take().filter(|(_, fade)| fade.running(now));
         self.selection = self.selection.take().filter(|(_, fade)| fade.running(now));
         self.footer_fade = self
             .footer_fade
             .take()
-            .filter(|(_, fade)| fade.running(now));
+            .filter(|fade| fade.fade.running(now));
         self.switches.is_some() || self.selection.is_some() || self.footer_fade.is_some()
     }
 
@@ -166,7 +223,7 @@ pub(super) fn card(
     let list_height = if populated {
         ROW_HEIGHT * agents.rows.len() as f32 + FOOTER_HEIGHT
     } else {
-        ROW_HEIGHT
+        EMPTY_HEIGHT
     };
     let height = TITLE_HEIGHT + list_height + 2.;
     div()
@@ -205,11 +262,17 @@ pub(super) fn card(
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .when_some(scroll, |list, scroll| list.track_scroll(scroll))
-                .children(
-                    agents.rows.iter().enumerate().map(|(index, row)| {
-                        agent_row(theme, agents, row, index, now, live, frame, cx)
-                    }),
-                )
+                .children(agents.rows.iter().enumerate().map(|(index, row)| {
+                    agent_row(
+                        theme,
+                        agents,
+                        row,
+                        index,
+                        now,
+                        frame,
+                        live.then_some(&mut *cx),
+                    )
+                }))
                 .when(agents.rows.is_empty(), |list| {
                     list.child(
                         div()
@@ -232,6 +295,12 @@ pub(super) fn card(
                                         .text_size(px(theme.mono_px.max(theme.ui_px - 1.)))
                                         .child("fell mcp add claude-code"),
                                 )
+                                .child(
+                                    div()
+                                        .pt(px(4.))
+                                        .text_size(px(theme.ui_px - 2.))
+                                        .child("Also supports codex, gemini, opencode, and goose."),
+                                )
                             }),
                     )
                 }),
@@ -241,16 +310,23 @@ pub(super) fn card(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
+fn row_dimmed(theme: &Theme, bg: u32, selection: f32) -> u32 {
+    let dim = motion::mix(theme.dimmed, theme.on_selection_dim, selection);
+    ensure_all(dim, &[bg], ROW_TEXT_CONTRAST)
+}
+
+fn switch_outline(theme: &Theme, bg: u32) -> u32 {
+    ensure_all(theme.label_outline(bg), &[bg], SWITCH_CONTRAST)
+}
+
 fn agent_row(
     theme: &Theme,
     agents: &Agents,
     row: &AgentSummary,
     index: usize,
     now: i64,
-    live: bool,
     frame: Option<(&AgentMotion, Instant)>,
-    cx: &mut Context<Inbox>,
+    mut cx: Option<&mut Context<Inbox>>,
 ) -> Div {
     let selected = agents.selected == index;
     let selection = frame.map_or(f32::from(u8::from(selected)), |(motion, now)| {
@@ -258,7 +334,8 @@ fn agent_row(
     });
     let bg = motion::mix(theme.surface, theme.selection, selection);
     let fg = motion::mix(theme.foreground, theme.on_selection, selection);
-    let dim = motion::mix(theme.dimmed, theme.on_selection_dim, selection);
+    let dim = row_dimmed(theme, bg, selection);
+    let outline = switch_outline(theme, bg);
     let previous = frame.and_then(|(motion, now)| {
         let (rows, fade) = motion.switches.as_ref()?;
         let previous = rows
@@ -282,7 +359,7 @@ fn agent_row(
         .flex()
         .flex_col()
         .justify_between()
-        .when(live, |row| {
+        .when_some(cx.as_deref_mut(), |row, cx| {
             row.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |inbox, _, _, cx| {
@@ -338,24 +415,33 @@ fn agent_row(
                         .child(last_action),
                 ),
         )
-        .child(div().flex().items_center().gap(px(8.)).children(
-            Control::ALL.into_iter().filter_map(|control| {
-                let scope = control.scope(row.grant);
-                let actionable = scope.is_some() || row.grant.enabled;
-                if control == Control::Revoke && !selected && actionable {
-                    return None;
-                }
-                let focused = selected
-                    && actionable
-                    && control == agents.control()
-                    && agents.confirm.is_none();
-                let border = if focused { fg } else { bg };
-                let label = if actionable {
-                    control.label()
-                } else {
-                    "Revoked"
-                };
-                Some(
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .children(Control::ALL.into_iter().map(|control| {
+                    let scope = control.scope(row.grant);
+                    let actionable = scope.is_some() || row.grant.enabled;
+                    let focused = selected && actionable && control == agents.control();
+                    let border = match &agents.confirm {
+                        Some(confirm)
+                            if focused && scope.is_some() && confirm.control == control =>
+                        {
+                            theme.dimmed
+                        }
+                        None if focused => fg,
+                        _ => bg,
+                    };
+                    let label = if actionable {
+                        control.label()
+                    } else {
+                        "Revoked"
+                    };
+                    let clickable = actionable
+                        && (scope.is_some() || selected)
+                        && !agents.pending
+                        && agents.confirm.is_none();
                     div()
                         .flex_none()
                         .h(px(27.))
@@ -373,27 +459,23 @@ fn agent_row(
                                 .ml_auto()
                                 .w(px((theme.ui_px * 4.5).max(67.)))
                                 .justify_center()
+                                .opacity(selection)
                         })
-                        .when(
-                            live && actionable && !agents.pending && agents.confirm.is_none(),
-                            |button| {
-                                button.cursor_pointer().on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |inbox, _, _, cx| {
-                                        cx.stop_propagation();
-                                        if inbox.session.overlay == Overlay::Agents {
-                                            inbox.agents_motion.settle();
-                                            let request =
-                                                inbox.session.agents.activate(index, control);
-                                            inbox.agent_button(request, cx);
-                                        }
-                                    }),
-                                )
-                            },
-                        )
+                        .when_some(cx.as_deref_mut().filter(|_| clickable), |button, cx| {
+                            button.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |inbox, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if inbox.session.overlay == Overlay::Agents {
+                                        inbox.agents_motion.settle();
+                                        let request = inbox.session.agents.activate(index, control);
+                                        inbox.agent_button(request, cx);
+                                    }
+                                }),
+                            )
+                        })
                         .child(label)
                         .when_some(scope, |button, on| {
-                            let outline = theme.label_outline(bg);
                             let to = f32::from(u8::from(on));
                             let offset = previous
                                 .and_then(|(grant, progress)| {
@@ -405,6 +487,7 @@ fn agent_row(
                             let track = motion::mix(outline, fg, offset);
                             button.child(
                                 div()
+                                    .debug_selector(|| format!("agent-{index}-{}", control.label()))
                                     .w(px(18.))
                                     .h(px(11.))
                                     .rounded_full()
@@ -422,10 +505,9 @@ fn agent_row(
                                             .bg(rgb(motion::mix(outline, bg, offset))),
                                     ),
                             )
-                        }),
-                )
-            }),
-        ))
+                        })
+                })),
+        )
 }
 
 impl Inbox {
@@ -445,46 +527,42 @@ fn footer(
     cx: &mut Context<Inbox>,
 ) -> Div {
     let transition = frame.and_then(|(motion, now)| {
-        let (before, fade) = motion.footer_fade.as_ref()?;
-        Some((before, motion::fade_out(fade.linear(now))))
+        let fade = motion.footer_fade.as_ref()?;
+        let (old_alpha, new_alpha) = fade.opacities(now);
+        Some((&fade.before, old_alpha, new_alpha))
     });
-    let description = agents.control().description();
     div()
         .relative()
         .flex_none()
         .h(px(FOOTER_HEIGHT))
         .border_t(px(1.))
         .border_color(rgb(theme.border))
-        .when_some(transition, |line, (before, alpha)| {
-            line.child(footer_content(theme, before, description, false, cx).opacity(alpha))
+        .when_some(transition, |line, (before, alpha, _)| {
+            line.child(footer_content(theme, before, false, cx).opacity(alpha))
         })
         .child(
-            footer_content(
-                theme,
-                &Footer::of(agents),
-                description,
-                live && !agents.pending,
-                cx,
-            )
-            .opacity(transition.map_or(1., |(_, alpha)| 1. - alpha)),
+            footer_content(theme, &Footer::of(agents), live && !agents.pending, cx)
+                .opacity(transition.map_or(1., |(_, _, alpha)| alpha)),
         )
 }
 
-fn footer_content(
-    theme: &Theme,
-    footer: &Footer,
-    description: &str,
-    live: bool,
-    cx: &mut Context<Inbox>,
-) -> Div {
+fn footer_opacities(time: f32) -> (f32, f32) {
+    if time < 0.5 {
+        (motion::fade_out(2. * time), 0.)
+    } else {
+        (0., motion::ease_out_quad(2. * time - 1.))
+    }
+}
+
+fn footer_content(theme: &Theme, footer: &Footer, live: bool, cx: &mut Context<Inbox>) -> Div {
     let (text, color) = match (&footer.confirmation, footer.notice) {
-        (Some((prompt, _)), _) => (prompt.clone(), theme.foreground),
+        (Some(confirm), _) => (confirm.prompt.clone(), theme.foreground),
         (None, Some((text, true))) => (text.into(), theme.error),
         (None, Some((text, false))) => (text.into(), theme.foreground),
-        (None, None) => (description.into(), theme.dimmed),
+        (None, None) => (footer.description.into(), theme.dimmed),
     };
-    let buttons: &[(&str, Option<bool>)] = if footer.confirmation.is_some() {
-        &[("Cancel", Some(false)), ("Revoke · y", Some(true))]
+    let buttons: &[(&str, Option<bool>)] = if let Some(confirm) = &footer.confirmation {
+        &[("Cancel", Some(false)), (confirm.action, Some(true))]
     } else if footer.undo {
         &[("Undo revoke", None)]
     } else {
@@ -545,13 +623,102 @@ fn footer_content(
         .justify_center()
         .gap(px(2.))
         .child(line)
-        .when_some(footer.confirmation.as_ref(), |content, (_, consequence)| {
+        .when_some(footer.confirmation.as_ref(), |content, confirm| {
             content.child(
                 div()
                     .text_size(px(theme.ui_px - 2.))
                     .line_height(px(theme.ui_px + 1.))
                     .text_color(rgb(theme.foreground))
-                    .child(consequence.clone()),
+                    .child(confirm.consequence.clone()),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fell_core::{AgentGrant, Store};
+    use gpui::{IntoElement, Render, TestAppContext, Window};
+
+    struct Rows {
+        agents: Agents,
+        theme: Theme,
+        width: f32,
+    }
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).flex().flex_col().children(
+                self.agents.rows.iter().enumerate().map(|(index, row)| {
+                    agent_row(&self.theme, &self.agents, row, index, 0, None, None)
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn switch_layout_is_the_same_on_selected_and_unselected_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let account = crate::fixtures::fixture_account();
+        store.upsert_account(&account).unwrap();
+        for agent in ["codex", "gemini"] {
+            store
+                .set_agent_grant(&account.id, agent, AgentGrant::enabled(true, false, false))
+                .unwrap();
+        }
+        let mut agents = Agents::default();
+        agents.answer(Request::Load.run(&store).unwrap());
+        let theme = crate::theme::every_test_theme().remove(0);
+        let mut app = TestAppContext::single();
+        let (view, cx) = app.add_window_view(|_, _| Rows {
+            agents,
+            theme,
+            width: 578.,
+        });
+        let switches = [
+            ["agent-0-Read", "agent-0-Triage", "agent-0-Draft"],
+            ["agent-1-Read", "agent-1-Triage", "agent-1-Draft"],
+        ];
+        for width in [578., 386.] {
+            let mut before = None;
+            for selected in [0, 1] {
+                view.update(cx, |view, cx| {
+                    view.width = width;
+                    view.agents.select(selected);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                let positions =
+                    switches.map(|row| row.map(|id| cx.debug_bounds(id).unwrap().origin.x));
+                assert_eq!(positions[0], positions[1], "width {width}, row {selected}");
+                if let Some(before) = before {
+                    assert_eq!(positions, before, "selecting a row moved its switches");
+                }
+                before = Some(positions);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_rows_have_contrast_headroom_on_every_stock_theme() {
+        for theme in crate::theme::every_test_theme() {
+            for (bg, selection) in [(theme.surface, 0.), (theme.selection, 1.)] {
+                let outline = crate::theme::contrast(switch_outline(&theme, bg), bg);
+                let dimmed = crate::theme::contrast(row_dimmed(&theme, bg, selection), bg);
+                assert!(outline >= SWITCH_CONTRAST, "{}: {outline:.3}", theme.name);
+                assert!(dimmed >= ROW_TEXT_CONTRAST, "{}: {dimmed:.3}", theme.name);
+            }
+        }
+    }
+
+    #[test]
+    fn footer_fades_out_before_the_next_line_fades_in() {
+        assert_eq!(footer_opacities(0.), (1., 0.));
+        assert_eq!(footer_opacities(0.5), (0., 0.));
+        assert_eq!(footer_opacities(1.), (0., 1.));
+        let (old, new) = footer_opacities(0.25);
+        assert!(old > 0. && old < 1. && new == 0.);
+        let (old, new) = footer_opacities(0.75);
+        assert!(old == 0. && new > 0. && new < 1.);
+    }
 }
