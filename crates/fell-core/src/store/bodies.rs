@@ -26,6 +26,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::account::AccountId;
+use crate::imap::{SNIPPET_BYTES, cap_snippet, html_snippet_text};
 use crate::message::{
     Disposition, MessageId, MessageParts, MimePart, PartRole, RemoteId, TransferEncoding,
 };
@@ -730,7 +731,7 @@ pub(super) fn read_at_stamp(
 }
 
 pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
-    const KEY: &str = "html_snippet_block_spacing";
+    const KEY: &str = "html_snippet_block_spacing_v2";
     let progress = |conn: &Connection| {
         conn.query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
@@ -762,13 +763,13 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
         let html: Vec<u8> = row.get(3)?;
         let old: String = row.get(4)?;
         if let Ok(html) = decompress(&html)
-            && let Some(snippet) = crate::imap::html_snippet(&html)
-            && is_spacing_repair(&old, &snippet)
+            && let Some(full) = html_snippet_text(&html)
+            && let Some(snippet) = spacing_repair(&old, &full)
         {
             let account: String = row.get(1)?;
             let message: String = row.get(2)?;
             let stamp: Option<Vec<u8>> = row.get(5)?;
-            updates.push((account, message, old, stamp, snippet));
+            updates.push((account, message, old, stamp, snippet.to_owned()));
         }
     }
     drop(rows);
@@ -797,14 +798,33 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
     Ok((next >= 0).then_some(changed))
 }
 
-fn is_spacing_repair(old: &str, new: &str) -> bool {
-    // The renderer and the old MIME extractor disagree on hidden
-    // preheaders and image alt text. Only repair whitespace changes.
-    old != new
-        && old
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .eq(new.chars().filter(|ch| !ch.is_whitespace()))
+fn non_whitespace(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|ch| !ch.is_whitespace())
+}
+
+fn spacing_repair<'a>(old: &str, full: &'a str) -> Option<&'a str> {
+    let new = cap_snippet(full);
+    if old == new {
+        return None;
+    }
+    // The native renderer can omit hidden preheaders or include image alt
+    // text. Compare visible characters against the full text first.
+    let mut full_chars = non_whitespace(full);
+    if !non_whitespace(old).all(|ch| full_chars.next() == Some(ch)) {
+        return None;
+    }
+    let Some(next) = full_chars.next() else {
+        return Some(new);
+    };
+    // A legacy snippet can end just below the byte cap at a UTF-8 boundary.
+    // Added spacing can push characters out, but must never bring any in.
+    if old.len() + next.len_utf8() <= SNIPPET_BYTES {
+        return None;
+    }
+    let mut old_chars = non_whitespace(old);
+    non_whitespace(new)
+        .all(|ch| old_chars.next() == Some(ch))
+        .then_some(new)
 }
 
 pub(super) fn fill_fetched_html_snippet(
@@ -812,7 +832,7 @@ pub(super) fn fill_fetched_html_snippet(
     account: &AccountId,
     message: &str,
     parts: &StoredParts,
-    snippet: &str,
+    full_snippet: &str,
 ) -> Result<()> {
     // FillGap can keep parts from a different copy. Use the preview only
     // when its HTML was kept and the stored message is still HTML-only.
@@ -827,7 +847,14 @@ pub(super) fn fill_fetched_html_snippet(
             |row| row.get(0),
         )
         .optional()?;
-    if old.is_some_and(|old| old.is_empty() || is_spacing_repair(&old, snippet)) {
+    let snippet = old.and_then(|old| {
+        if old.is_empty() {
+            Some(cap_snippet(full_snippet))
+        } else {
+            spacing_repair(&old, full_snippet)
+        }
+    });
+    if let Some(snippet) = snippet {
         conn.prepare_cached(
             "UPDATE messages SET snippet = ?3 WHERE account_id = ?1 AND message_id = ?2",
         )?

@@ -220,7 +220,8 @@ fn parse_message(
         .map(|body| body.into_owned())
         .filter(|body| !body.trim().is_empty());
     let parts = parsed.as_ref().map(body_parts).unwrap_or_default();
-    let snippet = html_only_snippet(&parts)
+    let snippet = html_only_snippet_text(&parts)
+        .map(|text| cap_snippet(&text).to_owned())
         .unwrap_or_else(|| snippet(body_text.as_deref().unwrap_or(&subject)));
     let unread = !flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen"));
     let mut labels = keywords(flags);
@@ -823,26 +824,35 @@ fn list_id_header(message: &mail_parser::Message<'_>) -> Option<String> {
     }
 }
 
-pub(crate) fn html_only_snippet(parts: &MessageParts) -> Option<String> {
+pub(crate) fn html_only_snippet_text(parts: &MessageParts) -> Option<String> {
     parts
         .html
         .as_deref()
         .filter(|_| parts.plain.is_none())
-        .and_then(html_snippet)
+        .and_then(html_snippet_text)
 }
 
-pub(crate) fn html_snippet(html: &str) -> Option<String> {
-    let preview = snippet(&fell_render::html_to_document(html).plain_text());
+pub(crate) fn html_snippet_text(html: &str) -> Option<String> {
+    let preview = collapse_snippet(&fell_render::html_to_document(html).plain_text());
     (!preview.is_empty()).then_some(preview)
 }
 
-fn snippet(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut end = collapsed.len().min(160);
-    while !collapsed.is_char_boundary(end) {
+pub(crate) const SNIPPET_BYTES: usize = 160;
+
+pub(crate) fn cap_snippet(text: &str) -> &str {
+    let mut end = text.len().min(SNIPPET_BYTES);
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    collapsed[..end].to_string()
+    &text[..end]
+}
+
+fn collapse_snippet(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn snippet(text: &str) -> String {
+    cap_snippet(&collapse_snippet(text)).to_owned()
 }
 
 #[cfg(test)]
@@ -974,6 +984,25 @@ mod tests {
 
     #[test]
     fn cached_html_snippets_only_repair_block_spacing() {
+        let paragraph = "The survey continues along the marked route. ".repeat(6);
+        let long_heading = format!("<h1>Heading</h1><p>{paragraph}</p>");
+        let long_preheader = format!(
+            "<div style=\"display:none\">Preheader</div><h1>Heading</h1><p>{paragraph}</p>"
+        );
+        let old_long = snippet(&format!("Heading{paragraph}"));
+        let fixed_long = snippet(&format!("Heading {paragraph}"));
+        assert_eq!(old_long.len(), SNIPPET_BYTES);
+        assert_eq!(fixed_long.len(), SNIPPET_BYTES);
+        assert!(
+            fixed_long.chars().filter(|ch| !ch.is_whitespace()).count()
+                < old_long.chars().filter(|ch| !ch.is_whitespace()).count()
+        );
+        let old_preheader = snippet(&format!("PreheaderHeading{paragraph}"));
+        let unicode = format!("{}🧭Follow the signs.", "a".repeat(SNIPPET_BYTES - 10));
+        let unicode_heading = format!("<h1>Heading</h1><p>{unicode}</p>");
+        let old_unicode = snippet(&format!("Heading{unicode}"));
+        let fixed_unicode = snippet(&format!("Heading {unicode}"));
+        assert_eq!(old_unicode.len(), SNIPPET_BYTES - 3);
         let cases = [
             (
                 "<div style=\"display:none\">Preheader</div><p>News today.</p>",
@@ -992,6 +1021,9 @@ mod tests {
             ),
             ("<p>News today.</p>", "News today.", "News today."),
             ("<b>sur</b>vey", "survey", "survey"),
+            (&long_heading, &old_long, &fixed_long),
+            (&long_preheader, &old_preheader, &old_preheader),
+            (&unicode_heading, &old_unicode, &fixed_unicode),
         ];
         let store = crate::Store::open_in_memory().unwrap();
         let account = AccountId("a1".into());
@@ -1035,6 +1067,13 @@ mod tests {
                     messages: messages.clone(),
                     ..Default::default()
                 },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('html_snippet_block_spacing', -1)",
+                [],
             )
             .unwrap();
 

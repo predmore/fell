@@ -1247,7 +1247,7 @@ impl Store {
         account_id: &AccountId,
         fetched: &[(MessageId, Option<crate::MessageParts>)],
     ) -> Result<usize> {
-        // Deflate before the write lock: archive and mark-read wait on it.
+        // Deflate and render before the write lock: archive and mark-read wait on it.
         let compressed: Vec<_> = fetched
             .iter()
             .map(|(message_id, parts)| {
@@ -1255,8 +1255,8 @@ impl Store {
                     .as_ref()
                     .map(bodies::StoredParts::new)
                     .unwrap_or_default();
-                let snippet = parts.as_ref().and_then(crate::imap::html_only_snippet);
-                (message_id, stored, snippet)
+                let full_snippet = parts.as_ref().and_then(crate::imap::html_only_snippet_text);
+                (message_id, stored, full_snippet)
             })
             .collect();
         // A CID-only answer can require inspecting the kept HTML again.
@@ -1284,7 +1284,7 @@ impl Store {
             .lock_wait
             .behind_waiting_writes(|| immediate_transaction(&self.conn))?;
         let mut filled = 0;
-        for ((message_id, parts, snippet), repair) in compressed.iter().zip(repairs) {
+        for ((message_id, parts, full_snippet), repair) in compressed.iter().zip(repairs) {
             let Some(canonical) = canonical_id_on(&tx, account_id, message_id)? else {
                 continue;
             };
@@ -1295,8 +1295,14 @@ impl Store {
                 filled += 1;
             }
             let listed = bodies::write(&tx, account_id, &canonical, parts, bodies::Write::FillGap)?;
-            if let Some(snippet) = snippet {
-                bodies::fill_fetched_html_snippet(&tx, account_id, &canonical, parts, snippet)?;
+            if let Some(full_snippet) = full_snippet {
+                bodies::fill_fetched_html_snippet(
+                    &tx,
+                    account_id,
+                    &canonical,
+                    parts,
+                    full_snippet,
+                )?;
             }
             if listed && let Some(list) = parts.mime_parts() {
                 // The first list replaces flags an older classifier set.
