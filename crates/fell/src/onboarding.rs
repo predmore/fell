@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use gpui::{Context, FocusHandle, KeyDownEvent, Window};
 
 use crate::mailbox::stage_new_account_config;
-use crate::motion::{self, Motion, Transition};
+use crate::motion::{self, LayerSwap, Motion};
 use crate::setup::save_account;
 use crate::theme::{self, Theme};
 
@@ -23,7 +23,6 @@ use self::input::Editor;
 
 const STEP_OUT: Duration = Duration::from_millis(60);
 const STEP_IN: Duration = Duration::from_millis(140);
-const STEP_IN_DELAY: Duration = Duration::from_millis(24);
 const STEP_OFFSET: f32 = 8.;
 
 const BRIDGE_URL: &str = "https://proton.me/mail/bridge";
@@ -35,6 +34,7 @@ enum Control {
     Install,
     Field(Field),
     Servers,
+    StartTls(Service),
     Next,
     Back,
     Inline,
@@ -55,7 +55,8 @@ pub(crate) struct Onboarding {
     theme: Theme,
     motion: Motion,
     clock: motion::Clock,
-    transition: Option<(Step, Transition, Transition)>,
+    transition: Option<(Step, LayerSwap)>,
+    feedback: layout::Feedback,
     bridge: Bridge,
     check_started: Instant,
 }
@@ -68,6 +69,7 @@ impl Onboarding {
             view.theme = next;
             view.motion = Motion::from_env();
             view.transition = None;
+            view.feedback.settle();
             cx.notify();
         });
         view
@@ -85,6 +87,7 @@ impl Onboarding {
             motion: Motion::from_env(),
             clock: motion::Clock::default(),
             transition: None,
+            feedback: layout::Feedback::default(),
             bridge: Bridge::Checking,
             check_started: Instant::now(),
         }
@@ -164,15 +167,21 @@ impl Onboarding {
             Step::Servers => Service::ALL
                 .into_iter()
                 .flat_map(|service| {
-                    [
+                    let fields = [
                         Input(Field::Host(service)),
                         Input(Field::Port(service)),
                         Input(Field::Security(service)),
-                    ]
+                    ];
+                    fields.into_iter().chain(
+                        self.form
+                            .offers_starttls(service)
+                            .then_some(Control::StartTls(service)),
+                    )
                 })
                 .chain([Next, Back])
                 .collect(),
-            Step::Connection if self.form.connected() || self.form.can_retry() => vec![Next, Back],
+            Step::Connection if self.form.can_retry() => vec![Next, Back, Control::Install],
+            Step::Connection if self.form.connected() => vec![Next, Back],
             Step::Connection => vec![Back],
             Step::Done => match self.form.storage {
                 Storage::Saving { .. } => vec![Next],
@@ -197,10 +206,8 @@ impl Onboarding {
     fn change_step(&mut self, before: Step, control: Control, cx: &mut Context<Self>) {
         if before != self.form.step {
             let now = self.clock.now();
-            self.transition = self
-                .motion
-                .start(STEP_IN, now + STEP_IN_DELAY)
-                .map(|incoming| (before, Transition::new(now, STEP_OUT), incoming));
+            self.transition =
+                LayerSwap::start(self.motion, now, STEP_OUT, STEP_IN).map(|swap| (before, swap));
             self.editor.reset(0);
         }
         self.select(control);
@@ -240,6 +247,11 @@ impl Onboarding {
                 self.change_step(before, Control::Provider(first), cx);
             }
             Control::Install => cx.open_url(BRIDGE_URL),
+            Control::StartTls(service) => {
+                self.form.use_starttls(service);
+                self.select(Control::Field(Field::Security(service)));
+                cx.notify();
+            }
             Control::Field(Field::Security(service)) => {
                 self.form.cycle_security(service, false);
                 cx.notify();
@@ -372,6 +384,7 @@ impl Onboarding {
         if self.transition.take().is_some() {
             cx.notify();
         }
+        self.feedback.settle();
         match key.key.as_str() {
             "tab" => {
                 let controls = self.controls();

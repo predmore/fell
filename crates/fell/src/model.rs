@@ -92,21 +92,6 @@ impl SyncKind {
         self.status_at(now)
     }
 
-    pub fn compact_download_status(&self) -> Option<String> {
-        let Self::Syncing {
-            progress: Some(progress),
-            ..
-        } = self
-        else {
-            return None;
-        };
-        Some(format!(
-            "Downloading messages · {}/{}",
-            grouped(progress.done),
-            grouped(progress.total)
-        ))
-    }
-
     pub fn status_at(&self, now: i64) -> String {
         match self {
             Self::FixtureOffline => "fixture · offline".into(),
@@ -122,10 +107,9 @@ impl SyncKind {
                     || "syncing".into(),
                     |progress| {
                         format!(
-                            "{} · {} of {} messages downloaded",
-                            progress.folder,
-                            grouped(progress.done),
-                            grouped(progress.total)
+                            "Downloading {} messages · {} done",
+                            grouped(progress.total),
+                            grouped(progress.done)
                         )
                     },
                 );
@@ -1742,6 +1726,12 @@ impl Session {
         self.message_cursor = self.messages.len().saturating_sub(1);
     }
 
+    pub fn cursor_awaits_body(&self) -> bool {
+        self.messages
+            .get(self.message_cursor)
+            .is_some_and(|message| message.body_state == fell_core::BodyState::Pending)
+    }
+
     pub fn focused_attachment(&self) -> Option<&AttachmentTarget> {
         let target = self.attachment_focus.as_ref()?;
         let message = self.messages.get(self.message_cursor)?;
@@ -3232,18 +3222,47 @@ mod tests {
     use crate::present::NameSpan;
 
     #[test]
-    fn a_first_sync_names_its_folder_and_how_far_it_is() {
+    fn a_normal_launch_lands_on_the_newest_stored_message_with_an_older_body_pending() {
+        use crate::scroll_anchor::{Reveal, ScrollAnchor};
+        use fell_core::BodyState;
+
+        let mut session = Session::new(
+            "Demo",
+            "reader@example.test",
+            SyncKind::Connecting,
+            Keymap::default(),
+        );
+        let older = ConvMessage {
+            body_state: BodyState::Pending,
+            ..empty_message(false)
+        };
+        let newest = ConvMessage {
+            id: "newest".into(),
+            body_state: BodyState::Stored,
+            ..empty_message(true)
+        };
+        session.set_messages(vec![older, newest]);
+        assert!(crate::present::awaiting_bodies(&session.messages));
+        let landing = ScrollAnchor::landing(&session, Reveal::Waiting);
+        assert_eq!(landing.index, 1);
+        assert!(!landing.start_if_short);
+
+        session.messages[1].body_state = BodyState::Pending;
+        let landing = ScrollAnchor::landing(&session, Reveal::Waiting);
+        assert_eq!(landing.index, 1);
+        assert!(landing.start_if_short);
+    }
+
+    #[test]
+    fn a_first_sync_shows_how_many_bodies_are_downloading() {
         let progress = fell_core::SyncProgress {
             folder: "Inbox".into(),
             done: 4_210,
             total: 31_882,
         };
         for (new_messages, expected) in [
-            (None, "Inbox · 4,210 of 31,882 messages downloaded"),
-            (
-                Some(2),
-                "Inbox · 4,210 of 31,882 messages downloaded · 2 new",
-            ),
+            (None, "Downloading 31,882 messages · 4,210 done"),
+            (Some(2), "Downloading 31,882 messages · 4,210 done · 2 new"),
         ] {
             let syncing = SyncKind::Syncing {
                 new_messages,

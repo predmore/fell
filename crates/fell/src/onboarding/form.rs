@@ -139,6 +139,7 @@ pub(super) struct Issue {
     pub field: Field,
     pub title: &'static str,
     pub recovery: Option<&'static str>,
+    pub suggest_starttls: bool,
 }
 
 impl Issue {
@@ -147,6 +148,7 @@ impl Issue {
             field,
             title,
             recovery: None,
+            suggest_starttls: false,
         }
     }
 
@@ -164,6 +166,7 @@ impl Issue {
         Self {
             field,
             title,
+            suggest_starttls: kind == SyncFailureKind::Tls,
             recovery: match kind {
                 SyncFailureKind::LoginRejected if bridge => {
                     Some("Use the password Bridge shows, not your Proton password.")
@@ -303,6 +306,28 @@ impl Form {
 
     pub fn security(&self, service: Service) -> ImapSecurity {
         self.servers[service as usize].security
+    }
+
+    pub fn offers_starttls(&self, service: Service) -> bool {
+        self.security(service) != ImapSecurity::StartTls
+            && self
+                .issues
+                .iter()
+                .any(|issue| issue.field == Field::Security(service) && issue.suggest_starttls)
+    }
+
+    pub fn use_starttls(&mut self, service: Service) {
+        let endpoint = &mut self.servers[service as usize];
+        let (implicit, explicit) = match service {
+            Service::Imap => ("993", "143"),
+            Service::Smtp => ("465", "587"),
+        };
+        if self.provider != Provider::Bridge && endpoint.port.trim() == implicit {
+            endpoint.port = explicit.into();
+        }
+        endpoint.security = ImapSecurity::StartTls;
+        self.issues
+            .retain(|issue| issue.field != Field::Security(service));
     }
 
     pub fn cycle_security(&mut self, service: Service, backwards: bool) {
@@ -564,6 +589,19 @@ fn port(text: &str) -> Option<u16> {
 mod tests {
     use super::*;
     use fell_core::Error;
+
+    #[test]
+    fn starttls_recovery_updates_standard_ports_and_keeps_custom_ports() {
+        let mut form = Form::default();
+        form.choose(Provider::Custom);
+        form.set_text(Field::Port(Service::Smtp), "2525".into());
+        form.use_starttls(Service::Imap);
+        form.use_starttls(Service::Smtp);
+        assert_eq!(form.security(Service::Imap), ImapSecurity::StartTls);
+        assert_eq!(form.security(Service::Smtp), ImapSecurity::StartTls);
+        assert_eq!(form.text(Field::Port(Service::Imap)), "143");
+        assert_eq!(form.text(Field::Port(Service::Smtp)), "2525");
+    }
 
     fn identity(form: &mut Form) {
         form.set_text(Field::Email, "robin@example.test".into());

@@ -500,6 +500,7 @@ impl MailBackend for ProtonApiBackend {
 
 /// Ids served by the in-process demo backend. An account file may not use them.
 pub(crate) const DEMO_ACCOUNT_IDS: [&str; 3] = ["local", "fixture", "demo"];
+pub const DEMO_MAILBOX_ADDRESS: &str = "tessa@harbor.test";
 
 /// The demo mailbox, served in process with no network and no credentials.
 pub fn is_demo_account(account_id: &AccountId) -> bool {

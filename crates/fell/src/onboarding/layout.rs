@@ -1,17 +1,19 @@
 use std::time::Instant;
 
 use fell_core::ImapSecurity;
-use fell_core::credentials::KeyringError;
 use gpui::{
     AnyElement, Context, CursorStyle, Div, FontWeight, KeyDownEvent, MouseButton, Render,
     SharedString, Stateful, Window, div, prelude::*, px, rgb,
 };
 
-use crate::motion::{self, ARRIVE_FROM};
-use crate::setup::SaveAccountError;
+use crate::motion::{self, ARRIVE_FROM, SwapFrame};
 
 use super::form::{Check, Issue};
-use super::{Bridge, Control, Field, Onboarding, Provider, Service, Step, Storage};
+use super::{Bridge, Control, Field, Onboarding, Provider, Service, Step};
+
+mod feedback;
+pub(super) use feedback::Feedback;
+use feedback::{Connection, SaveState};
 
 type Footer = Option<AnyElement>;
 
@@ -32,38 +34,34 @@ impl Render for Onboarding {
         let mut old_layer = None;
         let mut arrival = 1.;
         let mut slide = 0.;
-        if let Some((old, outgoing, incoming)) = self.transition
-            && incoming.running(now)
+        match self
+            .transition
+            .and_then(|(old, swap)| Some((old, swap.frame(now)?)))
         {
-            let progress = incoming.progress(now);
-            let leaving = outgoing.remaining(now);
-            // Let the old step dim below the arrival floor before painting
-            // the incoming text. The outgoing layer only paints.
-            arrival = if leaving >= ARRIVE_FROM {
-                0.
-            } else {
-                motion::lerp(ARRIVE_FROM, 1., progress)
-            };
-            slide = motion::lerp(super::STEP_OFFSET, 0., progress);
-            if outgoing.running(now) {
-                old_layer = Some((old, leaving));
+            Some((old, SwapFrame::Leaving(opacity))) => {
+                arrival = 0.;
+                old_layer = Some((old, opacity));
             }
-            window.request_animation_frame();
-        } else {
-            self.transition = None;
+            Some((_, SwapFrame::Arriving(progress))) => {
+                arrival = motion::lerp(ARRIVE_FROM, 1., progress);
+                slide = motion::lerp(super::STEP_OFFSET, 0., progress);
+            }
+            None => self.transition = None,
         }
+        let feedback = self.feedback.refresh(&self.form, self.motion, now);
         let pulsing = self.motion.enabled()
             && self.form.step == Step::Connection
             && self.form.checks.contains(&Check::Testing);
         let pulse = if pulsing {
-            window.request_animation_frame();
             let phase =
                 now.duration_since(self.check_started).as_secs_f32() * std::f32::consts::TAU;
             motion::lerp(1., 0.35, (1. - phase.cos()) * 0.5)
         } else {
             1.
         };
-        if self.transition.is_none() && !pulsing {
+        if self.transition.is_some() || feedback || pulsing {
+            window.request_animation_frame();
+        } else {
             self.clock.idle();
         }
         div()
@@ -229,15 +227,12 @@ impl Onboarding {
                 } else {
                     user.trim().to_owned().into()
                 };
-                let password_note = self
-                    .form
-                    .issues
-                    .iter()
-                    .find(|issue| issue.field == Field::Password)
-                    .map_or_else(
+                let password_note = self.feedback.issues.paint(false, |issues, _| {
+                    issues.iter().find(|issue| issue.field == Field::Password).map_or_else(
                         || self.meta(self.form.provider.password_hint()),
                         |issue| self.field_issue(issue),
-                    );
+                    )
+                });
                 let content = column()
                     .child(self.field_box(
                         Field::Email,
@@ -284,172 +279,97 @@ impl Onboarding {
                 self.footer("Back", None, Some("Test connection"), live, cx),
             ),
             Step::Connection => {
-                let passed = self.form.connected();
-                let retry = self.form.can_retry();
-                let (title, detail, primary) = if passed {
-                    (
-                        "Connection verified",
-                        "Both sign-ins work. Nothing was sent or downloaded.",
-                        Some("Continue"),
-                    )
-                } else if retry {
-                    (
-                        "Connection test failed",
-                        "Check Bridge, then test both sign-ins again.",
+                let state = self.feedback.connection.value;
+                let (secondary, primary) = match state {
+                    Connection::Testing => (None, None),
+                    Connection::Verified => (None, Some("Continue")),
+                    Connection::BridgeOffline => (
+                        Some((Control::Install, "Install Bridge ↗")),
                         Some("Try again"),
-                    )
-                } else {
-                    (
-                        "Testing connection",
-                        "Fell checks both sign-ins without sending or downloading mail.",
-                        None,
-                    )
+                    ),
                 };
                 (
-                    title,
-                    detail,
+                    "",
+                    "",
                     column().children(
                         Service::ALL
                             .into_iter()
                             .map(|service| self.check_row(service, pulse)),
                     ),
-                    self.footer("Back", None, primary, live, cx),
+                    self.footer("Back", secondary, primary, live, cx),
                 )
             }
-            Step::Done => {
-                let saving = matches!(self.form.storage, Storage::Saving { .. });
-                let inline = matches!(
-                    self.form.storage,
-                    Storage::ConfirmInline(_) | Storage::Saving { inline: true }
-                );
-                let body = if inline {
-                    "Your password will be saved as plain text in account.toml. Fell restricts access to the file to your user account."
-                } else if self.form.storage.inline_available() {
-                    "Fell couldn't store the password in your keyring."
-                } else {
-                    "Fell stores the password in your desktop keyring and uses it to sync mail."
-                };
-                let content =
-                    column()
-                        .child(
-                            div()
-                                .border_1()
-                                .rounded_lg()
-                                .border_color(rgb(self.theme.border))
-                                .bg(rgb(self.theme.surface))
-                                .p_4()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .truncate()
-                                        .child(self.form.text(Field::Email).trim().to_owned()),
-                                )
-                                .child(self.meta(body)),
-                        )
-                        .when(saving && !inline, |el| {
-                            el.child(self.meta("Approve any keyring prompt to continue."))
-                        })
-                        .when_some(
-                            match &self.form.storage {
-                                Storage::Failed(error) => Some(error),
-                                _ => None,
-                            },
-                            |el, error| {
-                                let (title, detail) = match error {
-                                    SaveAccountError::Keyring { kind: Some(KeyringError::Unavailable { .. }), .. } => (
-                                        "Couldn't reach your keyring",
-                                        Some("Start GNOME Keyring or KWallet, then retry. Or save the password in a file."),
-                                    ),
-                                    SaveAccountError::Keyring { kind: Some(KeyringError::Locked), recovery, .. } => {
-                                        ("Keyring is locked", *recovery)
-                                    }
-                                    SaveAccountError::Keyring { recovery, .. } => {
-                                        ("Couldn't save to your keyring", *recovery)
-                                    }
-                                    SaveAccountError::File(detail) => {
-                                        ("Couldn’t save account.toml", Some(detail.as_str()))
-                                    }
-                                };
-                                el.child(self.error(title, detail))
-                            },
-                        );
-                let title = if inline {
-                    "Save password in file"
-                } else {
-                    "Save your account"
-                };
-                let detail = if inline {
-                    "Choose where Fell keeps your mail password."
-                } else {
-                    "Your account is ready to sync."
-                };
-                let footer = if saving {
-                    [
-                        Some(
-                            self.button(
-                                Control::Back,
-                                if inline { "Use keyring" } else { "Back" },
-                                false,
-                                false,
-                                cx,
-                            )
-                            .text_color(rgb(self.theme.dimmed))
-                            .into_any_element(),
-                        ),
-                        None,
-                        Some(
-                            self.button(Control::Next, "Saving…", true, false, cx)
-                                .w(px(SAVE_WIDTH))
-                                .text_center()
-                                .into_any_element(),
-                        ),
-                    ]
-                } else if inline {
-                    self.save_footer("Use keyring", None, "Save in file", live, cx)
-                } else {
-                    let fallback = self
-                        .form
-                        .storage
-                        .inline_available()
-                        .then_some((Control::Inline, "Save in file…"));
-                    let primary = if fallback.is_some() {
-                        "Retry keyring"
-                    } else {
-                        "Save account"
-                    };
-                    self.save_footer("Back", fallback, primary, live, cx)
-                };
-                (title, detail, content, footer)
+            Step::Done => (
+                "",
+                "",
+                column()
+                    .child(
+                        div()
+                            .border_1()
+                            .rounded_lg()
+                            .border_color(rgb(self.theme.border))
+                            .bg(rgb(self.theme.surface))
+                            .p_4()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(self.form.text(Field::Email).trim().to_owned()),
+                    )
+                    .child(
+                        self.feedback.save.paint(false, |state, _| match state {
+                            SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
+                            SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
+                            SaveState::ConfirmFile | SaveState::SavingFile => self.meta(
+                                "Your password will be saved as plain text in account.toml. Fell restricts access to the file to your user account.",
+                            ),
+                            SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
+                        }).min_h(px((self.theme.ui_px + 4.) * 5.)),
+                    ),
+                self.storage_footer(live, cx),
+            ),
+        };
+        let heading = match step {
+            Step::Connection => {
+                let heading = self.feedback.connection.paint(false, |state, _| {
+                    let (title, detail) = state.heading();
+                    self.heading(title, detail)
+                });
+                self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
             }
+            Step::Done => {
+                let heading = self.feedback.save.paint(false, |state, _| {
+                    let (title, detail) = state.heading();
+                    self.heading(title, detail)
+                });
+                self.reserved_heading(SaveState::HEADINGS, heading)
+            }
+            _ => self.heading(title, detail),
         };
         div()
             .flex()
             .flex_col()
             .min_h(px(482.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .mb_5()
-                    .child(
-                        div()
-                            .text_size(px(self.theme.ui_px + 15.))
-                            .line_height(px(self.theme.ui_px + 21.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title.to_owned()),
-                    )
-                    .child(self.meta(detail.to_owned())),
-            )
+            .child(heading.mb_5())
             .child(div().flex_1().child(content))
             .when(footer.iter().any(Option::is_some), |el| {
                 let [back, mut secondary, primary] = footer;
-                let alt = (narrow && secondary.is_some())
-                    .then(|| div().flex().justify_end().children(secondary.take()));
-                el.children(alt).child(
+                let opacity = match step {
+                    Step::Connection => self.feedback.connection.arrival(),
+                    Step::Done => self.feedback.save.arrival(),
+                    _ => 1.,
+                };
+                let secondary_row = narrow
+                    && (step == Step::Done || (step == Step::Identity && secondary.is_some()));
+                el.when(secondary_row, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .min_h(px(self.theme.ui_px + 16.))
+                            .opacity(opacity)
+                            .children(secondary.take()),
+                    )
+                })
+                .child(
                     div()
                         .flex()
                         .items_center()
@@ -457,10 +377,84 @@ impl Onboarding {
                         .mt_3()
                         .children(back)
                         .child(div().flex_1())
-                        .children(secondary)
-                        .children(primary),
+                        .children(
+                            [secondary, primary]
+                                .into_iter()
+                                .flatten()
+                                .map(|button| div().opacity(opacity).child(button)),
+                        ),
                 )
             })
+    }
+
+    fn heading(&self, title: &str, detail: &str) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_size(px(self.theme.ui_px + 15.))
+                    .line_height(px(self.theme.ui_px + 21.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title.to_owned()),
+            )
+            .child(self.meta(detail.to_owned()))
+    }
+
+    fn reserved_heading(&self, headings: [(&str, &str); 3], current: Div) -> Div {
+        // Each measuring copy takes the full column width. The row keeps
+        // the tallest heading's height at the current window size.
+        div()
+            .relative()
+            .overflow_hidden()
+            .child(div().flex().children(headings.map(|(title, detail)| {
+                self.heading(title, detail).w_full().flex_none().opacity(0.)
+            })))
+            .child(current.absolute().inset_0())
+    }
+
+    fn storage_footer(&self, live: bool, cx: &Context<Self>) -> [Footer; 3] {
+        match &self.feedback.save.value {
+            SaveState::SavingKeyring | SaveState::SavingFile => [
+                Some(
+                    self.button(
+                        Control::Back,
+                        if matches!(self.feedback.save.value, SaveState::SavingFile) {
+                            "Use keyring"
+                        } else {
+                            "Back"
+                        },
+                        false,
+                        false,
+                        cx,
+                    )
+                    .text_color(rgb(self.theme.dimmed))
+                    .into_any_element(),
+                ),
+                None,
+                Some(
+                    self.button(Control::Next, "Saving…", true, false, cx)
+                        .w(px(SAVE_WIDTH))
+                        .text_center()
+                        .into_any_element(),
+                ),
+            ],
+            SaveState::ConfirmFile => {
+                self.save_footer("Use keyring", None, "Save in file", live, cx)
+            }
+            SaveState::Failed {
+                can_save_file: true,
+                ..
+            } => self.save_footer(
+                "Back",
+                Some((Control::Inline, "Save in file…")),
+                "Retry keyring",
+                live,
+                cx,
+            ),
+            _ => self.save_footer("Back", None, "Save account", live, cx),
+        }
     }
 
     fn save_footer(
@@ -564,7 +558,7 @@ impl Onboarding {
     fn bridge_status(&self, live: bool, cx: &Context<Self>) -> Div {
         let (text, marker, color) = match self.bridge {
             Bridge::Checking => ("Checking Bridge…", "•", self.theme.dimmed),
-            Bridge::Listening => ("Bridge is running", "✓", self.theme.accent),
+            Bridge::Listening => ("Bridge is running", "✓", self.theme.success),
             Bridge::Offline => (
                 "Bridge isn't running. Open it and sign in, or",
                 "•",
@@ -577,7 +571,13 @@ impl Onboarding {
             .flex()
             .items_start()
             .gap_1p5()
-            .child(div().flex_none().text_color(rgb(color)).child(marker))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(14.))
+                    .text_color(rgb(color))
+                    .child(marker),
+            )
             .child(
                 div()
                     .min_w_0()
@@ -619,6 +619,7 @@ impl Onboarding {
             .py_1p5()
             .rounded_md()
             .border_1()
+            .when(control == Control::Back, |el| el.ml(px(-13.)))
             .when(primary, |el| {
                 el.bg(rgb(theme.accent))
                     .text_color(rgb(theme.background))
@@ -643,7 +644,7 @@ impl Onboarding {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         div()
-            .id(SharedString::from(label.to_owned()))
+            .id(SharedString::from(format!("{control:?}-{label}")))
             .when(live, |el| {
                 let accent = self.theme.accent;
                 el.cursor_pointer()
@@ -651,6 +652,7 @@ impl Onboarding {
                     .on_click(cx.listener(move |view, _, window, cx| {
                         cx.stop_propagation();
                         view.transition = None;
+                        view.feedback.settle();
                         view.select(control);
                         view.activate(control, window, cx);
                         cx.notify();
@@ -708,13 +710,16 @@ impl Onboarding {
                     .justify_between()
                     .gap_2()
                     .child(self.label(label))
-                    .when_some(
-                        self.form
-                            .issues
-                            .iter()
-                            .find(|issue| field == Field::Email && issue.field == field),
-                        |el, issue| el.child(self.field_issue(issue)),
-                    ),
+                    .when(field == Field::Email, |el| {
+                        el.child(self.feedback.issues.paint(false, |issues, _| {
+                            div().children(
+                                issues
+                                    .iter()
+                                    .filter(|issue| issue.field == field)
+                                    .map(|issue| self.field_issue(issue)),
+                            )
+                        }))
+                    }),
             )
             .child(
                 div()
@@ -726,15 +731,14 @@ impl Onboarding {
                     .rounded_md()
                     .border_color(rgb(border))
                     .bg(rgb(self.theme.surface))
-                    .when(focus, |el| {
-                        el.relative().child(focus_ring(self.theme.accent, 7.))
-                    })
+                    .when(focus, |el| el.relative().child(focus_ring(border, 7.)))
                     .when(live, |el| {
                         el.cursor(CursorStyle::IBeam).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |view, e: &gpui::MouseDownEvent, window, cx| {
                                 window.focus(&view.focus);
                                 view.transition = None;
+                                view.feedback.settle();
                                 view.select(Control::Field(field));
                                 view.point_caret(field, e.position, e.modifiers.shift);
                                 cx.notify();
@@ -771,6 +775,7 @@ impl Onboarding {
         let field = Field::Security(service);
         let control = Control::Field(field);
         let focused = live && self.control == control;
+        let border = self.field_border(field, focused);
         let security = match self.form.security(service) {
             ImapSecurity::StartTls => "STARTTLS",
             ImapSecurity::Tls => "TLS",
@@ -816,11 +821,9 @@ impl Onboarding {
                                     .h(px(self.theme.ui_px + 20.))
                                     .border_1()
                                     .rounded_md()
-                                    .border_color(rgb(self.field_border(field, focused)))
+                                    .border_color(rgb(border))
                                     .bg(rgb(self.theme.surface))
-                                    .when(focused, |el| {
-                                        el.relative().child(focus_ring(self.theme.accent, 7.))
-                                    })
+                                    .when(focused, |el| el.relative().child(focus_ring(border, 7.)))
                                     .child(
                                         div().text_size(px(self.theme.ui_px - 1.)).child(security),
                                     )
@@ -829,29 +832,54 @@ impl Onboarding {
                     ),
             )
             .child(
-                div().min_h(px((self.theme.ui_px + 4.) * 3.)).children(
-                    self.form
-                        .issues
-                        .iter()
-                        .filter(|issue| fields.contains(&issue.field))
-                        .map(|issue| self.field_issue(issue)),
-                ),
+                self.feedback
+                    .issues
+                    .paint(live, |issues, live| {
+                        div().w_full().min_w_0().flex().flex_col().gap_1().children(
+                            issues
+                                .iter()
+                                .filter(|issue| fields.contains(&issue.field))
+                                .map(|issue| {
+                                    if issue.field != field {
+                                        return self.field_issue(issue);
+                                    }
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .gap_1()
+                                        .child(
+                                            self.field_issue(issue).w_full().min_w_0().text_right(),
+                                        )
+                                        .when(live && self.form.offers_starttls(service), |el| {
+                                            el.child(
+                                                self.button(
+                                                    Control::StartTls(service),
+                                                    "Use STARTTLS",
+                                                    false,
+                                                    live,
+                                                    cx,
+                                                )
+                                                .text_color(rgb(self.theme.accent)),
+                                            )
+                                        })
+                                }),
+                        )
+                    })
+                    .min_h(px((self.theme.ui_px + 4.) * 4.)),
             )
     }
 
     fn check_row(&self, service: Service, pulse: f32) -> Div {
-        let (status, marker, color) = match self.form.checks[service as usize] {
-            Check::Waiting => ("Waiting", "•", self.theme.dimmed),
-            Check::Testing => ("Signing in…", "•", self.theme.accent),
-            Check::Connected => ("Connected", "✓", self.theme.accent),
-            Check::Failed => ("Failed", "✕", self.theme.error),
-        };
+        let state = &self.feedback.checks[service as usize];
         div()
             .px_4()
             .py_3()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .bg(rgb(self.theme.surface))
             .border_1()
             .border_color(rgb(self.theme.border))
@@ -867,36 +895,36 @@ impl Onboarding {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(service.name()),
                     )
-                    .child(
+                    .child(state.paint(false, |(check, _), _| {
+                        let (status, marker, color) = match check {
+                            Check::Waiting => ("Waiting", "•", self.theme.dimmed),
+                            Check::Testing => ("Signing in…", "•", self.theme.accent),
+                            Check::Connected => ("Connected", "✓", self.theme.success),
+                            Check::Failed => ("Failed", "✕", self.theme.error),
+                        };
                         div()
                             .flex()
+                            .justify_end()
                             .items_center()
                             .gap_2()
                             .child(
                                 div()
+                                    .text_size(px(14.))
                                     .text_color(rgb(color))
-                                    .opacity(
-                                        if self.form.checks[service as usize] == Check::Testing {
-                                            pulse
-                                        } else {
-                                            1.
-                                        },
-                                    )
+                                    .opacity(if *check == Check::Testing { pulse } else { 1. })
                                     .child(marker),
                             )
-                            .child(self.meta(status)),
-                    ),
+                            .child(self.meta(status).whitespace_nowrap())
+                    })),
             )
-            .when(
-                self.form.bridge_unreachable[service as usize]
-                    && (service == Service::Imap
-                        || !self.form.bridge_unreachable[Service::Imap as usize]),
-                |el| {
-                    el.child(self.error(
-                        "Bridge isn't running",
-                        Some("Open Proton Mail Bridge and sign in, then try again."),
-                    ))
-                },
+            .child(
+                state
+                    .paint(false, |(_, offline), _| {
+                        div().when(*offline, |el| {
+                            el.child(self.error("Bridge isn't running", None))
+                        })
+                    })
+                    .min_h(px(self.theme.ui_px + 4.)),
             )
     }
 }

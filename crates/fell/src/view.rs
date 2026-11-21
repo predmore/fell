@@ -49,7 +49,7 @@ use crate::model::{
     Banner, DRAFT_NOT_THREAD, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
     QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
 };
-use crate::motion::{self, Glide, ListShift, Motion, RowMotion, Transition};
+use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
 use crate::present::{self, ConvMessage, Pane, Rich, ThreadRow};
 use crate::render::READING_MEASURE_PX;
@@ -217,11 +217,8 @@ pub(crate) fn finish_onboarding(
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.waiting_to_open = true;
         let now = inbox.motion.clock.now();
-        inbox.setup_exit = inbox
-            .motion
-            .motion
-            .start(motion::FADE, now)
-            .map(|fade| (setup, fade));
+        inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
+            .map(|swap| (setup, swap));
         inbox
     });
 }
@@ -561,7 +558,7 @@ struct Inbox {
     note_generation: u64,
     session: Session,
     theme: Theme,
-    setup_exit: Option<(gpui::Entity<Onboarding>, Transition)>,
+    setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
     waiting_to_open: bool,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
@@ -2249,14 +2246,18 @@ impl Inbox {
     fn queue_conversation_refresh(&mut self, messages: Vec<ConvMessage>) {
         // Newly downloaded bodies can push the latest message below a short
         // pane. An already scrollable pane keeps the reader where they are.
-        let downloaded = self
-            .session
-            .messages
-            .iter()
-            .zip(&messages)
-            .any(|(old, new)| {
-                old.body_state == fell_core::BodyState::Pending && old.body_state != new.body_state
-            });
+        let downloaded =
+            self.session
+                .messages
+                .iter()
+                .zip(&messages)
+                .enumerate()
+                .any(|(index, (old, new))| {
+                    (index == self.session.message_cursor
+                        || matches!(self.reveal, Reveal::Following(_)))
+                        && old.body_state == fell_core::BodyState::Pending
+                        && old.body_state != new.body_state
+                });
         if downloaded {
             self.reveal.body_changed(
                 self.conv_layout_current
@@ -3934,9 +3935,9 @@ impl Inbox {
     }
 
     /// The frame after bodies were filled in laid them out: glide to the
-    /// newest message's start if it is out of view. Nothing moves when it
+    /// reader's message if its start is out of view. Nothing moves when it
     /// shows already.
-    fn reveal_newest(&mut self, window: &mut Window) {
+    fn reveal_reader(&mut self, window: &mut Window) {
         match self.reveal {
             Reveal::Waiting | Reveal::Following(RevealPhase::Idle) | Reveal::Reading { .. } => {}
             Reveal::Following(RevealPhase::Laying) => {
@@ -3945,10 +3946,9 @@ impl Inbox {
             }
             Reveal::Following(RevealPhase::Ready) => {
                 self.reveal = Reveal::Following(RevealPhase::Idle);
-                let last = self.session.messages.len().saturating_sub(1);
                 let Some(item) = self
                     .conv_scroll
-                    .bounds_for_item(last + usize::from(self.conv_note_slot))
+                    .bounds_for_item(self.session.message_cursor + usize::from(self.conv_note_slot))
                 else {
                     return;
                 };
@@ -3980,38 +3980,29 @@ impl Inbox {
         }
     }
 
-    /// Put the reader's message at the top of the viewport and keep it
-    /// there while the conversation lays out: [`LandingHold`] sets the
-    /// offset from each frame's own layout, before it paints.
-    fn landing_index(&self) -> usize {
-        if self.reveal == Reveal::Waiting && present::awaiting_bodies(&self.session.messages) {
-            // Pending messages can be too short to align the newest one
-            // to the top without the scroll container clamping mid-message.
-            0
-        } else {
-            self.session.message_cursor
-        }
-    }
-
+    /// Hold the reader's message using each frame's own layout bounds.
     fn land_on_reader(&mut self) {
         self.landing.hold(
             self.session
                 .messages
-                .get(self.landing_index())
+                .get(self.session.message_cursor)
                 .map(|message| message.id.as_str()),
         );
     }
 
     /// Hold this message until the reader scrolls or moves to another one.
     fn hold_landing(&mut self) -> Option<ScrollAnchor> {
-        let index = self.landing_index();
+        let index = self.session.message_cursor;
         let current = self
             .session
             .messages
             .get(index)
             .map(|message| message.id.as_str());
-        self.landing
-            .anchor(current, index, self.motion.conv_glide.is_some())
+        self.landing.anchor(
+            current,
+            ScrollAnchor::landing(&self.session, self.reveal),
+            self.motion.conv_glide.is_some(),
+        )
     }
 
     /// The reader took over: stop holding their message in place.
@@ -4361,7 +4352,7 @@ impl Render for Inbox {
             now,
         );
         if self.body_refresh.is_empty() {
-            self.reveal_newest(window);
+            self.reveal_reader(window);
         }
         let layout_anchor = || {
             if (previous_reading != self.motion.reading_target() || self.motion.reading_sliding())
@@ -4472,18 +4463,15 @@ impl Render for Inbox {
                 .as_ref()
                 .is_some_and(|frame| frame.note.id == visit.note)
         });
-        let setup_exit = self.setup_exit.as_ref().and_then(|(setup, fade)| {
-            fade.running(now).then(|| {
-                let progress = fade.progress(now);
-                let layer = setup.update(cx, |setup, cx| setup.leaving_layer(window, cx));
-                (layer, progress)
-            })
-        });
-        if setup_exit.is_none() {
+        let setup_frame = self
+            .setup_exit
+            .as_ref()
+            .and_then(|(_, swap)| swap.frame(now));
+        if setup_frame.is_none() {
             self.setup_exit = None;
         }
         let conv = ConvFrame {
-            waiting_to_open: self.waiting_to_open,
+            syncing: matches!(self.session.sync, SyncKind::Syncing { .. }),
             agent_note,
             pin,
             note_details_only,
@@ -4516,7 +4504,7 @@ impl Render for Inbox {
                 .as_ref()
                 .is_some_and(|visit| visit.returning.is_some())
             | verify_pin
-            | setup_exit.is_some()
+            | setup_frame.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4668,24 +4656,25 @@ impl Render for Inbox {
                     .size_0(),
             )
         });
-        if let Some((setup, progress)) = setup_exit {
-            div()
-                .relative()
-                .size_full()
-                .bg(rgb(background))
+        let shell = || div().relative().size_full().bg(rgb(background));
+        match (setup_frame, &self.setup_exit) {
+            (Some(SwapFrame::Leaving(opacity)), Some((setup, _))) => {
+                let layer = setup.update(cx, |setup, cx| setup.leaving_layer(window, cx));
+                shell()
+                    .child(root.opacity(0.))
+                    .child(
+                        layer
+                            .absolute()
+                            .inset_0()
+                            .overflow_hidden()
+                            .opacity(opacity),
+                    )
+                    .into_any_element()
+            }
+            (Some(SwapFrame::Arriving(progress)), _) => shell()
                 .child(root.opacity(motion::lerp(motion::ARRIVE_FROM, 1., progress)))
-                .child(
-                    setup
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .overflow_hidden()
-                        .opacity(1. - progress),
-                )
-                .into_any_element()
-        } else {
-            root.into_any_element()
+                .into_any_element(),
+            _ => root.into_any_element(),
         }
     }
 }
@@ -4765,7 +4754,7 @@ struct ConvFrame {
     note_expanded_in_band: bool,
     hide_message_cursor: bool,
     return_glide: Option<LandingGlide>,
-    waiting_to_open: bool,
+    syncing: bool,
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
@@ -6911,6 +6900,7 @@ fn splitter(theme: &Theme, cx: &mut Context<Inbox>) -> impl IntoElement {
 
 const CONVERSATION_RULE_PX: f32 = 2.;
 const CONVERSATION_PAD_PX: f32 = 20.;
+const CONVERSATION_BOTTOM_PX: f32 = 28.;
 const MESSAGE_PAD_PX: f32 = 8.;
 const COLLAPSED_GAP_PX: f32 = 12.;
 const COLLAPSED_NARROW_GAP_PX: f32 = 8.;
@@ -7259,6 +7249,10 @@ fn conversation(
         .anchor
         .filter(|_| leaving.is_none())
         .map(|anchor| (anchor, LayoutSlot::default()));
+    let bottom = frame
+        .anchor
+        .filter(|anchor| leaving.is_none() && anchor.start_if_short)
+        .map(|_| LayoutSlot::default());
     let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let collapsed_rows = OnceCell::new();
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
@@ -7301,6 +7295,7 @@ fn conversation(
                     columns,
                     collapsed_rows
                         .get_or_init(|| CollapsedRows::new(window, theme, columns.card.width)),
+                    frame.syncing,
                     live,
                     window,
                     cx,
@@ -7311,12 +7306,23 @@ fn conversation(
             } else {
                 block
             };
-            if let Some((anchor, probe)) = &hold
+            let block = if let Some((anchor, probe)) = &hold
                 && anchor.index == index
             {
                 LayoutProbe {
                     inner: block,
                     slot: probe.clone(),
+                }
+                .into_any_element()
+            } else {
+                block
+            };
+            if let Some(bottom) = &bottom
+                && index + 1 == session.messages.len()
+            {
+                LayoutProbe {
+                    inner: block,
+                    slot: bottom.clone(),
                 }
                 .into_any_element()
             } else {
@@ -7341,18 +7347,6 @@ fn conversation(
             theme.accent,
             focus * (1.0 - columns.progress),
         )))
-        .when(frame.waiting_to_open && subject.is_empty(), |pane| {
-            pane.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(theme.dimmed))
-                    .child("Select a conversation"),
-            )
-        })
         .when(!subject.is_empty(), |pane| {
             pane.child(
                 div()
@@ -7437,7 +7431,7 @@ fn conversation(
                         None => body.overflow_hidden(),
                     })
                     .px(px(CONVERSATION_PAD_PX))
-                    .pb(px(28.))
+                    .pb(px(CONVERSATION_BOTTOM_PX))
                     .when(arrival < 1.0, |body| body.opacity(arrival))
                     .children(note)
                     .children(messages)
@@ -7449,6 +7443,7 @@ fn conversation(
                     (Some(scroll), Some((y, probe))) => LandingHold {
                         inner: body,
                         probe,
+                        bottom: bottom.map(|probe| (probe, px(CONVERSATION_BOTTOM_PX))),
                         scroll: scroll.clone(),
                         y,
                         glide: frame.return_glide,
@@ -7529,6 +7524,7 @@ fn collapsed_message(
     (cursor, body): (f32, f32),
     columns: ReaderColumns,
     rows: &CollapsedRows,
+    syncing: bool,
     live: Live,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -7536,7 +7532,7 @@ fn collapsed_message(
     let now = now_unix();
     let mut date = present::relative_date(now, message.date_unix);
     let dimmed = motion::mix(theme.dimmed, theme.on_selection, cursor);
-    let missing = present::missing_body_line(message.body_state);
+    let missing = present::missing_body_line(message.body_state, syncing);
     let snippet = missing.as_deref().unwrap_or(&message.snippet);
     let measure =
         |text: &str| line_px_with_style(window, &rows.style, text, FontWeight::NORMAL).ceil();
@@ -8010,7 +8006,7 @@ fn message_body(
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let alpha = frame.body_alpha(&message.id);
-    if let Some(line) = present::missing_body_line(message.body_state) {
+    if let Some(line) = present::missing_body_line(message.body_state, frame.syncing) {
         return folds.columns.flow(
             |columns| columns.prose,
             |_, _| {
@@ -8624,10 +8620,7 @@ fn status_bar(
                 theme.accent,
             ),
             None => (
-                (width < 440.)
-                    .then(|| session.sync.compact_download_status())
-                    .flatten()
-                    .unwrap_or_else(|| session.sync.status()),
+                session.sync.status(),
                 if session.sync.is_error() {
                     theme.error
                 } else {
