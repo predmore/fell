@@ -225,6 +225,15 @@ pub(super) enum Storage {
 }
 
 impl Storage {
+    pub fn must_reopen(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed(SaveAccountError::File(
+                crate::mailbox::AccountFileError::AlreadyConfigured
+            ))
+        )
+    }
+
     pub fn inline_available(&self) -> bool {
         matches!(self, Self::Failed(SaveAccountError::Keyring { .. }))
     }
@@ -388,6 +397,7 @@ impl Form {
             Step::Servers => Step::Identity,
             Step::Connection if self.checked_from_servers => Step::Servers,
             Step::Connection => Step::Identity,
+            Step::Done if self.storage.must_reopen() => Step::Done,
             Step::Done if matches!(self.storage, Storage::Saving { .. }) => Step::Done,
             Step::Done if matches!(self.storage, Storage::ConfirmInline(_)) => {
                 if let Storage::ConfirmInline(error) = std::mem::take(&mut self.storage) {
@@ -572,7 +582,10 @@ impl Form {
     }
 
     pub fn begin_save(&mut self) -> Option<(AccountConfig, bool)> {
-        if self.step != Step::Done || matches!(self.storage, Storage::Saving { .. }) {
+        if self.step != Step::Done
+            || matches!(self.storage, Storage::Saving { .. })
+            || self.storage.must_reopen()
+        {
             return None;
         }
         let inline = matches!(self.storage, Storage::ConfirmInline(_));

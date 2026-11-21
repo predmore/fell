@@ -250,6 +250,10 @@ impl LayerSwap {
         })
     }
 
+    pub fn set_arrival_duration(&mut self, duration: Duration) {
+        self.incoming.duration = duration;
+    }
+
     pub fn frame(self, now: Instant) -> Option<SwapFrame> {
         if self.outgoing.running(now) {
             Some(SwapFrame::Leaving(self.outgoing.remaining(now)))

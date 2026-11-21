@@ -11,31 +11,41 @@ use crate::{frame_log::SharedFrameLog, model::Session, motion, present};
 pub(super) struct ScrollAnchor {
     pub index: usize,
     pub y: Pixels,
-    /// A short header-only message would clamp the scroll offset halfway
-    /// through the conversation. Open at the start until its body arrives.
+    /// For an automatic preview or pending body, open at the start when
+    /// aligning the selected message would clip the one above it.
     pub start_if_short: bool,
 }
 
 /// An explicit message jump owns its landing even if it starts with a
 /// glide. Once the glide ends or a key settles it, use fresh layout bounds.
 #[derive(Default)]
-pub(super) struct ReaderLanding(Option<String>);
+pub(super) struct ReaderLanding {
+    id: Option<String>,
+    preview: bool,
+}
 
 impl ReaderLanding {
     pub fn hold(&mut self, id: Option<&str>) {
-        self.0 = id.map(str::to_owned);
+        self.id = id.map(str::to_owned);
+        self.preview = false;
+    }
+
+    pub fn hold_preview(&mut self, id: Option<&str>) {
+        self.hold(id);
+        self.preview = true;
     }
 
     pub fn anchor(
         &mut self,
         id: Option<&str>,
-        anchor: ScrollAnchor,
+        mut anchor: ScrollAnchor,
         gliding: bool,
     ) -> Option<ScrollAnchor> {
-        if self.0.as_deref() != id {
+        if self.id.as_deref() != id {
             self.hold(None);
         }
-        (!gliding && self.0.is_some()).then_some(anchor)
+        anchor.start_if_short |= self.preview;
+        (!gliding && self.id.is_some()).then_some(anchor)
     }
 }
 
@@ -180,9 +190,9 @@ fn landing_offset(
     view: Bounds<Pixels>,
     item: Bounds<Pixels>,
     y: Pixels,
-    pending_end: Option<Pixels>,
+    content_end: Option<Pixels>,
 ) -> Pixels {
-    if pending_end.is_some_and(|end| end - item.top() < view.size.height) {
+    if content_end.is_some_and(|end| end - item.top() + y < view.size.height) {
         px(0.)
     } else {
         offset_to_hold(view, item, y)
@@ -210,8 +220,8 @@ pub(super) struct LandingHold {
     pub inner: AnyElement,
     /// The layout of the reader's message, from [`LayoutProbe`].
     pub probe: LayoutSlot,
-    /// The end of the last card and bottom padding, used only for a
-    /// pending message's initial landing.
+    /// The end of the last card and bottom padding, used when a
+    /// landing may fall back to the top of the thread.
     pub bottom: Option<(LayoutSlot, Pixels)>,
     pub scroll: ScrollHandle,
     /// Relative viewport position to hold. None reveals a focused chip
@@ -483,6 +493,34 @@ mod tests {
             px(-370.)
         );
         assert_eq!(landing_offset(view, pending, px(0.), None), px(-370.));
+    }
+
+    #[test]
+    fn automatic_preview_uses_the_top_when_the_newest_header_cannot_align() {
+        let mut landing = ReaderLanding::default();
+        landing.hold_preview(Some("last"));
+        let anchor = landing
+            .anchor(
+                Some("last"),
+                ScrollAnchor {
+                    index: 2,
+                    y: px(0.),
+                    start_if_short: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(anchor.start_if_short);
+        let view = vertical_bounds(50., 300.);
+        let newest = vertical_bounds(420., 120.);
+        assert_eq!(
+            landing_offset(view, newest, anchor.y, Some(px(560.))),
+            px(0.)
+        );
+        assert_eq!(
+            landing_offset(view, newest, anchor.y, Some(px(760.))),
+            px(-370.)
+        );
     }
 
     #[test]

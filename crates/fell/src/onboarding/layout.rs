@@ -13,11 +13,14 @@ use super::{Bridge, Control, Field, Onboarding, Provider, Service, Step};
 
 mod feedback;
 pub(super) use feedback::Feedback;
-use feedback::{Connection, SaveState};
+use feedback::{Actions, Connection, SaveState};
 
 type Footer = Option<AnyElement>;
 
 const SAVE_WIDTH: f32 = 164.;
+const PORT_WIDTH: f32 = 62.;
+const SECURITY_WIDTH: f32 = 116.;
+const FIELD_GAP: f32 = 8.;
 
 fn focus_ring(accent: u32, radius: f32) -> Div {
     div()
@@ -49,6 +52,14 @@ impl Render for Onboarding {
             None => self.transition = None,
         }
         let feedback = self.feedback.refresh(&self.form, self.motion, now);
+        if self.feedback.checks_settled()
+            && let Some(check) = self.checked.take()
+        {
+            let entity = cx.entity();
+            window.defer(cx, move |_, cx| {
+                entity.update(cx, |view, cx| view.finish_check(check, cx));
+            });
+        }
         let pulsing = self.motion.enabled()
             && self.form.step == Step::Connection
             && self.form.checks.contains(&Check::Testing);
@@ -227,8 +238,8 @@ impl Onboarding {
                 } else {
                     user.trim().to_owned().into()
                 };
-                let password_note = self.feedback.issues.paint(false, |issues, _| {
-                    issues.iter().find(|issue| issue.field == Field::Password).map_or_else(
+                let password_note = self.feedback.password.paint(false, |issue, _| {
+                    issue.as_ref().map_or_else(
                         || self.meta(self.form.provider.password_hint()),
                         |issue| self.field_issue(issue),
                     )
@@ -278,27 +289,16 @@ impl Onboarding {
                 ),
                 self.footer("Back", None, Some("Test connection"), live, cx),
             ),
-            Step::Connection => {
-                let state = self.feedback.connection.value;
-                let (secondary, primary) = match state {
-                    Connection::Testing => (None, None),
-                    Connection::Verified => (None, Some("Continue")),
-                    Connection::BridgeOffline => (
-                        Some((Control::Install, "Install Bridge ↗")),
-                        Some("Try again"),
-                    ),
-                };
-                (
-                    "",
-                    "",
-                    column().children(
-                        Service::ALL
-                            .into_iter()
-                            .map(|service| self.check_row(service, pulse)),
-                    ),
-                    self.footer("Back", secondary, primary, live, cx),
-                )
-            }
+            Step::Connection => (
+                "",
+                "",
+                column().children(
+                    Service::ALL
+                        .into_iter()
+                        .map(|service| self.check_row(service, pulse)),
+                ),
+                [None, None, None],
+            ),
             Step::Done => (
                 "",
                 "",
@@ -315,16 +315,16 @@ impl Onboarding {
                             .child(self.form.text(Field::Email).trim().to_owned()),
                     )
                     .child(
-                        self.feedback.save.paint(false, |state, _| match state {
+                        self.feedback.save_note.paint(false, |state, _| match state {
                             SaveState::Ready => self.meta("Fell keeps your password in the desktop keyring."),
                             SaveState::SavingKeyring => self.meta("Approve any keyring prompt to continue."),
-                            SaveState::ConfirmFile | SaveState::SavingFile => self.meta(
+                            SaveState::ConfirmFile => self.meta(
                                 "Your password will be saved as plain text in account.toml. Fell restricts access to the file to your user account.",
                             ),
                             SaveState::Failed { title, detail, .. } => self.error(title, detail.as_deref()),
                         }).min_h(px((self.theme.ui_px + 4.) * 5.)),
                     ),
-                self.storage_footer(live, cx),
+                [None, None, None],
             ),
         };
         let heading = match step {
@@ -336,13 +336,28 @@ impl Onboarding {
                 self.reserved_heading(Connection::ALL.map(Connection::heading), heading)
             }
             Step::Done => {
-                let heading = self.feedback.save.paint(false, |state, _| {
-                    let (title, detail) = state.heading();
-                    self.heading(title, detail)
-                });
+                let heading = self
+                    .feedback
+                    .save_heading
+                    .paint(false, |(title, detail), _| self.heading(title, detail));
                 self.reserved_heading(SaveState::HEADINGS, heading)
             }
             _ => self.heading(title, detail),
+        };
+        let footer = match step {
+            Step::Connection => {
+                let buttons =
+                    self.animated_footer(&self.feedback.connection_actions, false, live, cx);
+                self.footer_rows(buttons, narrow)
+            }
+            Step::Done => {
+                let buttons = self.animated_footer(&self.feedback.save_actions, true, live, cx);
+                self.footer_rows(buttons, narrow)
+            }
+            _ => {
+                let stack = narrow && footer[1].is_some();
+                self.footer_rows(footer, stack)
+            }
         };
         div()
             .flex()
@@ -350,41 +365,34 @@ impl Onboarding {
             .min_h(px(482.))
             .child(heading.mb_5())
             .child(div().flex_1().child(content))
-            .when(footer.iter().any(Option::is_some), |el| {
-                let [back, mut secondary, primary] = footer;
-                let opacity = match step {
-                    Step::Connection => self.feedback.connection.arrival(),
-                    Step::Done => self.feedback.save.arrival(),
-                    _ => 1.,
-                };
-                let secondary_row = narrow
-                    && (step == Step::Done || (step == Step::Identity && secondary.is_some()));
-                el.when(secondary_row, |el| {
-                    el.child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .min_h(px(self.theme.ui_px + 16.))
-                            .opacity(opacity)
-                            .children(secondary.take()),
-                    )
-                })
-                .child(
+            .child(footer)
+    }
+
+    fn footer_rows(&self, [back, mut secondary, primary]: [Footer; 3], stacked: bool) -> Div {
+        if back.is_none() && secondary.is_none() && primary.is_none() {
+            return div();
+        }
+        div()
+            .when(stacked, |el| {
+                el.child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .mt_3()
-                        .children(back)
-                        .child(div().flex_1())
-                        .children(
-                            [secondary, primary]
-                                .into_iter()
-                                .flatten()
-                                .map(|button| div().opacity(opacity).child(button)),
-                        ),
+                        .ml(px(-13.))
+                        .min_h(px(self.theme.ui_px + 24.))
+                        .children(secondary.take()),
                 )
             })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mt_3()
+                    .children(back)
+                    .child(div().flex_1())
+                    .children(secondary)
+                    .children(primary),
+            )
     }
 
     fn heading(&self, title: &str, detail: &str) -> Div {
@@ -414,68 +422,38 @@ impl Onboarding {
             .child(current.absolute().inset_0())
     }
 
-    fn storage_footer(&self, live: bool, cx: &Context<Self>) -> [Footer; 3] {
-        match &self.feedback.save.value {
-            SaveState::SavingKeyring | SaveState::SavingFile => [
-                Some(
-                    self.button(
-                        Control::Back,
-                        if matches!(self.feedback.save.value, SaveState::SavingFile) {
-                            "Use keyring"
-                        } else {
-                            "Back"
-                        },
-                        false,
-                        false,
-                        cx,
-                    )
-                    .text_color(rgb(self.theme.dimmed))
-                    .into_any_element(),
-                ),
-                None,
-                Some(
-                    self.button(Control::Next, "Saving…", true, false, cx)
-                        .w(px(SAVE_WIDTH))
-                        .text_center()
-                        .into_any_element(),
-                ),
-            ],
-            SaveState::ConfirmFile => {
-                self.save_footer("Use keyring", None, "Save in file", live, cx)
-            }
-            SaveState::Failed {
-                can_save_file: true,
-                ..
-            } => self.save_footer(
-                "Back",
-                Some((Control::Inline, "Save in file…")),
-                "Retry keyring",
-                live,
-                cx,
-            ),
-            _ => self.save_footer("Back", None, "Save account", live, cx),
-        }
-    }
-
-    fn save_footer(
+    fn animated_footer(
         &self,
-        back: &str,
-        secondary: Option<(Control, &str)>,
-        primary: &str,
+        actions: &Actions,
+        saving: bool,
         live: bool,
         cx: &Context<Self>,
     ) -> [Footer; 3] {
-        let [back, secondary, _] = self.footer(back, secondary, None, live, cx);
-        [
-            back,
-            secondary,
+        std::array::from_fn(|index| {
             Some(
-                self.button(Control::Next, primary, true, live, cx)
-                    .w(px(SAVE_WIDTH))
-                    .text_center()
+                actions[index]
+                    .paint(live, |action, live| {
+                        div().children(action.map(|action| {
+                            let primary = index == 2;
+                            self.button(
+                                action.control,
+                                action.label,
+                                primary,
+                                live && action.enabled,
+                                cx,
+                            )
+                            .when(primary && saving, |button| {
+                                button.w(px(SAVE_WIDTH)).text_center()
+                            })
+                            .when(!primary && !action.enabled, |button| {
+                                button.text_color(rgb(self.theme.dimmed))
+                            })
+                        }))
+                    })
+                    .flex_none()
                     .into_any_element(),
-            ),
-        ]
+            )
+        })
     }
 
     fn footer(
@@ -652,7 +630,6 @@ impl Onboarding {
                     .on_click(cx.listener(move |view, _, window, cx| {
                         cx.stop_propagation();
                         view.transition = None;
-                        view.feedback.settle();
                         view.select(control);
                         view.activate(control, window, cx);
                         cx.notify();
@@ -711,14 +688,10 @@ impl Onboarding {
                     .gap_2()
                     .child(self.label(label))
                     .when(field == Field::Email, |el| {
-                        el.child(self.feedback.issues.paint(false, |issues, _| {
-                            div().children(
-                                issues
-                                    .iter()
-                                    .filter(|issue| issue.field == field)
-                                    .map(|issue| self.field_issue(issue)),
-                            )
-                        }))
+                        el.min_h(px(self.theme.ui_px + 4.))
+                            .child(self.feedback.email.paint(false, |issue, _| {
+                                div().children(issue.as_ref().map(|issue| self.field_issue(issue)))
+                            }))
                     }),
             )
             .child(
@@ -738,7 +711,6 @@ impl Onboarding {
                             cx.listener(move |view, e: &gpui::MouseDownEvent, window, cx| {
                                 window.focus(&view.focus);
                                 view.transition = None;
-                                view.feedback.settle();
                                 view.select(Control::Field(field));
                                 view.point_caret(field, e.position, e.modifiers.shift);
                                 cx.notify();
@@ -781,7 +753,7 @@ impl Onboarding {
             ImapSecurity::Tls => "TLS",
             ImapSecurity::Plain => "Plain",
         };
-        let fields = [Field::Host(service), Field::Port(service), field];
+        let [host_issue, port_issue, security_issue] = &self.feedback.servers[service as usize];
         div()
             .flex()
             .flex_col()
@@ -795,18 +767,18 @@ impl Onboarding {
                 div()
                     .flex()
                     .items_end()
-                    .gap_2()
+                    .gap(px(FIELD_GAP))
                     .child(
                         self.field_box(Field::Host(service), "Host", "mail.example.com", live, cx)
                             .flex_1(),
                     )
                     .child(
                         self.field_box(Field::Port(service), "Port", "", live, cx)
-                            .w(px(62.)),
+                            .w(px(PORT_WIDTH)),
                     )
                     .child(
                         div()
-                            .w(px(104.))
+                            .w(px(SECURITY_WIDTH))
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -832,43 +804,74 @@ impl Onboarding {
                     ),
             )
             .child(
-                self.feedback
-                    .issues
-                    .paint(live, |issues, live| {
-                        div().w_full().min_w_0().flex().flex_col().gap_1().children(
-                            issues
-                                .iter()
-                                .filter(|issue| fields.contains(&issue.field))
-                                .map(|issue| {
-                                    if issue.field != field {
-                                        return self.field_issue(issue);
-                                    }
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .items_end()
-                                        .gap_1()
-                                        .child(
-                                            self.field_issue(issue).w_full().min_w_0().text_right(),
-                                        )
-                                        .when(live && self.form.offers_starttls(service), |el| {
-                                            el.child(
-                                                self.button(
-                                                    Control::StartTls(service),
-                                                    "Use STARTTLS",
-                                                    false,
-                                                    live,
-                                                    cx,
-                                                )
-                                                .text_color(rgb(self.theme.accent)),
-                                            )
+                div()
+                    .relative()
+                    .h(px((self.theme.ui_px + 4.) * 4.))
+                    .child(
+                        host_issue
+                            .paint(false, |issue, _| {
+                                div().children(issue.as_ref().map(|issue| self.field_issue(issue)))
+                            })
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .right(px(PORT_WIDTH + SECURITY_WIDTH + FIELD_GAP * 2.)),
+                    )
+                    .child(
+                        port_issue
+                            .paint(false, |issue, _| {
+                                div().children(issue.as_ref().map(|issue| self.field_issue(issue)))
+                            })
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(PORT_WIDTH + SECURITY_WIDTH + FIELD_GAP)),
+                    )
+                    .child(
+                        security_issue
+                            .paint(live, |issue, live| {
+                                div().flex().flex_col().items_end().gap_1().when_some(
+                                    issue.as_ref(),
+                                    |el, issue| {
+                                        let validation = issue.recovery.is_none();
+                                        el.when(validation, |el| {
+                                            el.pt(px((self.theme.ui_px + 4.) * 2.))
                                         })
-                                }),
-                        )
-                    })
-                    .min_h(px((self.theme.ui_px + 4.) * 4.)),
+                                        .child(self.field_issue(issue).w_full().text_right())
+                                        .when(
+                                            issue.suggest_starttls,
+                                            |el| {
+                                                let control = Control::StartTls(service);
+                                                el.child(
+                                                    self.clickable(
+                                                        control,
+                                                        "Use STARTTLS",
+                                                        live,
+                                                        cx,
+                                                    )
+                                                    .relative()
+                                                    .rounded_sm()
+                                                    .text_size(px(self.theme.ui_px - 1.))
+                                                    .line_height(px(self.theme.ui_px + 4.))
+                                                    .text_color(rgb(self.theme.accent))
+                                                    .when(live && self.control == control, |link| {
+                                                        link.child(focus_ring(
+                                                            self.theme.accent,
+                                                            4.,
+                                                        ))
+                                                    })
+                                                    .child("Use STARTTLS"),
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
+                            })
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w_full(),
+                    ),
             )
     }
 
@@ -895,7 +898,7 @@ impl Onboarding {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(service.name()),
                     )
-                    .child(state.paint(false, |(check, _), _| {
+                    .child(state.paint(false, |check, _| {
                         let (status, marker, color) = match check {
                             Check::Waiting => ("Waiting", "•", self.theme.dimmed),
                             Check::Testing => ("Signing in…", "•", self.theme.accent),
@@ -918,8 +921,8 @@ impl Onboarding {
                     })),
             )
             .child(
-                state
-                    .paint(false, |(_, offline), _| {
+                self.feedback.bridge_offline[service as usize]
+                    .paint(false, |offline, _| {
                         div().when(*offline, |el| {
                             el.child(self.error("Bridge isn't running", None))
                         })

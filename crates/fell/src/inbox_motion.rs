@@ -753,6 +753,16 @@ impl InboxMotion {
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
     }
 
+    /// First-sync rows and their count are published in the same frame.
+    pub fn set_unread(&mut self, folder: &str, unread: usize) {
+        if let Some((previous, count)) = &mut self.last_unread
+            && previous == folder
+        {
+            *count = unread;
+            self.unread_out = None;
+        }
+    }
+
     /// Observe the folder whose page actually supplied the count.
     pub fn observe_header(
         &mut self,

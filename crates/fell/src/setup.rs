@@ -11,7 +11,9 @@ use fell_core::credentials::{PasswordStore, SecretService};
 use fell_core::onboarding::{ConnectionProgress, check_connection, connection_recovery};
 use fell_core::{AccountConfig, BackendKind, ImapSecurity, PasswordSource};
 
-use crate::mailbox::{StagedAccountConfig, load_account_file, stage_account_config};
+use crate::mailbox::{
+    AccountFileError, StagedAccountConfig, load_account_file, stage_account_config,
+};
 
 const USAGE: &str = "\
 fell account setup [options]   write ~/.config/fell/account.toml after a login check
@@ -301,7 +303,7 @@ fn setup(args: &[String]) -> Result<(), String> {
         stage_account_config,
     )
     .map_err(|err| match err {
-        SaveAccountError::File(detail) => detail,
+        SaveAccountError::File(detail) => detail.to_string(),
         SaveAccountError::Keyring { detail, recovery, .. } => {
             let recovery = recovery.unwrap_or_default();
             format!("{detail}\n{recovery}\nUse --password-inline or --password-command to choose a different password source.")
@@ -313,7 +315,7 @@ fn setup(args: &[String]) -> Result<(), String> {
 
 #[derive(Debug)]
 pub(crate) enum SaveAccountError {
-    File(String),
+    File(AccountFileError),
     Keyring {
         detail: String,
         kind: Option<fell_core::credentials::KeyringError>,
@@ -325,7 +327,7 @@ pub(crate) fn save_account(
     mut config: AccountConfig,
     password_inline: bool,
     keyring: &dyn PasswordStore,
-    stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, String>,
+    stage: impl FnOnce(&AccountConfig) -> Result<StagedAccountConfig, AccountFileError>,
 ) -> Result<PathBuf, SaveAccountError> {
     let keyring_password = match (password_inline, config.password) {
         (false, PasswordSource::Inline(password)) => {

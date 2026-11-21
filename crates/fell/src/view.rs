@@ -215,7 +215,8 @@ pub(crate) fn finish_onboarding(
     crate::draft_host::host_agent_drafts(cx);
     window.replace_root(cx, |window, cx| {
         let mut inbox = Inbox::focused(startup, false, window, cx);
-        inbox.waiting_to_open = true;
+        inbox.first_preview = FirstPreview::Handoff;
+        inbox.first_sync = true;
         let now = inbox.motion.clock.now();
         inbox.setup_exit = LayerSwap::start(inbox.motion.motion, now, motion::QUICK, motion::FADE)
             .map(|swap| (setup, swap));
@@ -232,6 +233,8 @@ struct ReadIntent {
     switch: bool,
     /// Sync changed a body. Read it after the list resolves the thread key.
     refresh_open: bool,
+    /// First sync publishes the unread count with these rows.
+    first_sync: bool,
     /// Archive, move, or undo wrote to the store. Scroll to the selection
     /// instead of holding the viewport still.
     changed: bool,
@@ -248,6 +251,7 @@ impl ReadIntent {
     fn merge(mut self, later: ReadIntent) -> ReadIntent {
         self.switch |= later.switch;
         self.refresh_open |= later.refresh_open;
+        self.first_sync |= later.first_sync;
         self.changed |= later.changed;
         if later.select.is_some() {
             self.select = later.select;
@@ -528,6 +532,51 @@ const ROW_PX: f32 = 68.0;
 /// curve, so one late frame cannot carry it half the way ([`Glide::gentle_beyond`]).
 const LONG_GLIDE_PX: f32 = 4.0 * ROW_PX;
 
+const FIRST_PREVIEW_WAIT: Duration = Duration::from_millis(1500);
+
+#[derive(Default, PartialEq, Eq)]
+enum FirstPreview {
+    #[default]
+    Off,
+    Handoff,
+    Waiting(Instant),
+    AllowPending,
+}
+
+impl FirstPreview {
+    fn finish_handoff(&mut self, now: Instant) -> bool {
+        if *self == Self::Handoff {
+            *self = Self::Waiting(now + FIRST_PREVIEW_WAIT);
+            return true;
+        }
+        false
+    }
+
+    fn waits_for_body(&self) -> bool {
+        matches!(self, Self::Handoff | Self::Waiting(_))
+    }
+
+    fn allow_pending(&mut self) -> bool {
+        if self.waits_for_body() {
+            *self = Self::AllowPending;
+            return true;
+        }
+        false
+    }
+
+    fn sync_changed(&mut self, sync: &SyncKind) -> bool {
+        !matches!(sync, SyncKind::Connecting | SyncKind::Syncing { .. }) && self.allow_pending()
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        matches!(self, Self::Waiting(deadline) if now >= *deadline) && self.allow_pending()
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(self) != Self::Off
+    }
+}
+
 struct Inbox {
     focus: FocusHandle,
     notifications: Option<crate::notifications::Queue>,
@@ -559,7 +608,8 @@ struct Inbox {
     session: Session,
     theme: Theme,
     setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
-    waiting_to_open: bool,
+    first_preview: FirstPreview,
+    first_sync: bool,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
@@ -779,7 +829,8 @@ impl Inbox {
             note_generation: 0,
             session,
             setup_exit: None,
-            waiting_to_open: false,
+            first_preview: FirstPreview::Off,
+            first_sync: false,
             store,
             startup_crash: None,
             worker_restart_notice: None,
@@ -914,8 +965,9 @@ impl Inbox {
             self.draft_home = None;
         }
         self.session.sync = opened.sync;
+        self.first_preview.sync_changed(&self.session.sync);
         if let Some(warning) = opened.warning {
-            self.session.show_toast(warning, true);
+            self.session.show_toast(warning, false);
             self.dismiss_notice_after(
                 self.session.toast_generation(),
                 std::time::Duration::from_secs(8),
@@ -1126,7 +1178,9 @@ impl Inbox {
                         if matches!(kind, SyncKind::Failed(_)) {
                             cx.global_mut::<ReplyChecks>().set_offline(true);
                         }
+                        let first_sync = inbox.first_sync;
                         if matches!(kind, SyncKind::Synced { .. }) {
+                            inbox.first_sync = false;
                             cx.global_mut::<ReplyChecks>().set_offline(false);
                             if wrote {
                                 inbox
@@ -1136,23 +1190,32 @@ impl Inbox {
                             // while it was not can go now.
                             inbox.bodies_asked.retry_failed();
                         }
+                        let open_pending = inbox.first_preview.sync_changed(&kind);
                         inbox.session.apply_sync_status(kind);
                         if wrote {
                             inbox.request_threads(
                                 ReadIntent {
                                     refresh_open: true,
+                                    first_sync,
                                     ..ReadIntent::default()
                                 },
                                 cx,
                             );
+                        } else if open_pending {
+                            inbox.read_selected_messages(true, cx);
                         }
                         cx.notify();
                     })
                     .is_ok();
                 if !alive {
-                    break;
+                    return;
                 }
             }
+            let _ = this.update(cx, |inbox, cx| {
+                if inbox.first_preview.allow_pending() {
+                    inbox.read_selected_messages(true, cx);
+                }
+            });
         })
         .detach();
     }
@@ -1531,6 +1594,9 @@ impl Inbox {
             self.row_widths.observe_labels(&row.id, &row.labels, now);
         }
         self.session.set_page(rows, more_before, more_after, unread);
+        if intent.first_sync && !switched {
+            self.motion.set_unread(&self.list_folder, unread);
+        }
         if let Some(key) = &intent.select
             && self.session.select_if_present(key.thread_id.as_str())
             && self.session.cursor_id != before_id
@@ -2055,7 +2121,7 @@ impl Inbox {
 
     /// An explicit selection can open a conversation while bodies download.
     fn request_messages(&mut self, force: bool, cx: &mut Context<Self>) {
-        self.waiting_to_open = false;
+        self.first_preview.take();
         self.read_selected_messages(force, cx);
     }
 
@@ -2074,7 +2140,7 @@ impl Inbox {
             return;
         }
         if let Some(draft) = self.session.cursor_draft() {
-            self.waiting_to_open = false;
+            self.first_preview.take();
             // A draft is shown from the drafts list, not read as a thread.
             self.conv_gen.fetch_add(1, Ordering::SeqCst);
             self.body_loads.clear();
@@ -2120,7 +2186,7 @@ impl Inbox {
             Some((generation, search.effective_query().to_owned()))
         });
         let cached = self.bodies.stamps();
-        let wait_for_body = self.waiting_to_open;
+        let wait_for_body = self.first_preview.waits_for_body();
         let reply = self.store.call(move |store| {
             if current.load(Ordering::SeqCst) != generation {
                 return Ok(None);
@@ -2190,7 +2256,7 @@ impl Inbox {
                         if let Some(notes) = notes {
                             inbox.update_agent_notes(note_generation, &id, notes);
                         }
-                        inbox.waiting_to_open = false;
+                        let automatic = inbox.first_preview.take();
                         inbox.body_loads.accept(reads, &mut inbox.bodies, &mut view);
                         inbox.session.clear_query_fault(QueryFault::Message);
                         let same = inbox.open_thread.as_deref() == Some(id.as_str());
@@ -2215,7 +2281,17 @@ impl Inbox {
                             // message. Scrolling only far enough to show its
                             // end would cut the row above it, or its header
                             // when it is tall. A thread that fits stays put.
-                            inbox.land_on_reader();
+                            if automatic {
+                                inbox.landing.hold_preview(
+                                    inbox
+                                        .session
+                                        .messages
+                                        .get(inbox.session.message_cursor)
+                                        .map(|message| message.id.as_str()),
+                                );
+                            } else {
+                                inbox.land_on_reader();
+                            }
                             false
                         };
                         if let Some((accepted, matches)) = matches
@@ -3774,7 +3850,7 @@ impl Inbox {
         } else if step.reload_messages {
             self.request_messages(true, cx);
         } else if (searching && self.session.search.is_none())
-            || (self.waiting_to_open
+            || (self.first_preview != FirstPreview::Off
                 && pane_before == Pane::List
                 && self.session.pane == Pane::Conversation)
         {
@@ -4232,7 +4308,7 @@ impl Inbox {
             search.editing = false;
             self.session.remember_search();
         }
-        if changed || self.waiting_to_open {
+        if changed || self.first_preview != FirstPreview::Off {
             self.request_messages(true, cx);
         }
         self.scroll_list_to_cursor();
@@ -4487,6 +4563,17 @@ impl Render for Inbox {
             .and_then(|(_, swap)| swap.frame(now));
         if setup_frame.is_none() {
             self.setup_exit = None;
+            if self.first_preview.finish_handoff(real) {
+                cx.spawn(async |this, cx| {
+                    cx.background_executor().timer(FIRST_PREVIEW_WAIT).await;
+                    let _ = this.update(cx, |inbox, cx| {
+                        if inbox.first_preview.expire(Instant::now()) {
+                            inbox.read_selected_messages(true, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
         }
         let conv = ConvFrame {
             syncing: matches!(self.session.sync, SyncKind::Syncing { .. }),
@@ -4685,7 +4772,7 @@ impl Render for Inbox {
                             .absolute()
                             .inset_0()
                             .overflow_hidden()
-                            .opacity(opacity),
+                            .opacity(motion::lerp(motion::ARRIVE_FROM, 1., opacity)),
                     )
                     .into_any_element()
             }
@@ -9744,17 +9831,18 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX,
-        ReaderColumns, account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, fit_folder_path, key_from, message_content_width,
-        picker_card_height, should_follow_visible, unread_bar_dx, useful_header_email,
-        write_back_notice,
+        FIRST_PREVIEW_WAIT, FirstPreview, FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX,
+        MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns, account_header, collapsed_sender_budget,
+        ctrl_letter, expanded_header_flow, expanded_header_widths, fit_folder_path, key_from,
+        message_content_width, picker_card_height, should_follow_visible,
+        unread_bar_dx, useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
-    use crate::model::Overlay;
+    use crate::model::{Overlay, SyncKind};
     use crate::motion;
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_dropped_mailbox_reply_still_runs_failure_completion() {
@@ -10123,6 +10211,57 @@ mod tests {
             list().iter().map(ListKey::of).collect::<Vec<_>>(),
             original.iter().map(ListKey::of).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn first_preview_releases_pending_bodies_when_sync_stops() {
+        use crate::model::SyncFailure;
+        use fell_core::SyncFailureKind;
+
+        let active = SyncKind::Syncing {
+            new_messages: None,
+            progress: None,
+        };
+        for terminal in [
+            SyncKind::LocalOffline,
+            SyncKind::StoreError,
+            SyncKind::Synced {
+                at: 0,
+                changed: false,
+                new_messages: None,
+            },
+            SyncKind::Failed(SyncFailure {
+                kind: SyncFailureKind::Unreachable,
+                bridge: false,
+                detail: "fixture stopped".into(),
+                recovery: None,
+            }),
+        ] {
+            let mut preview = FirstPreview::Handoff;
+            assert!(!preview.sync_changed(&SyncKind::Connecting));
+            assert!(!preview.sync_changed(&active));
+            assert!(preview.sync_changed(&terminal));
+            assert!(!preview.waits_for_body());
+            assert!(
+                preview.take(),
+                "the fallback still gets the automatic landing"
+            );
+            assert!(!preview.take());
+        }
+    }
+
+    #[test]
+    fn first_preview_times_out_after_the_setup_exit_finishes() {
+        let mut preview = FirstPreview::Handoff;
+        let exit = Instant::now() + Duration::from_secs(3);
+        assert!(!preview.expire(exit));
+        assert!(preview.finish_handoff(exit));
+        assert!(!preview.finish_handoff(exit));
+        assert!(!preview.expire(exit + Duration::from_millis(1499)));
+        assert!(preview.waits_for_body());
+        assert!(preview.expire(exit + FIRST_PREVIEW_WAIT));
+        assert!(!preview.waits_for_body());
+        assert!(preview.take());
     }
 
     #[test]
