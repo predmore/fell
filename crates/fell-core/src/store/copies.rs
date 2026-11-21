@@ -228,6 +228,14 @@ pub(super) fn record(conn: &Connection, message: &Message) -> Result<()> {
             copy.folder
         ],
     )?;
+    if message.folders.is_empty() {
+        super::views::retire_restore(
+            conn,
+            &message.account_id,
+            &stored.canonical_id,
+            &copy.folder,
+        )?;
+    }
     Ok(())
 }
 
@@ -548,6 +556,7 @@ pub(super) fn link(
             copy.folder
         ])?;
     if inserted != 0 && super::views::has_view(conn, account_id, &copy.mailbox)? {
+        super::views::retire_restore(conn, account_id, &row, &copy.folder)?;
         super::views::refresh_message(conn, account_id, &row)?;
     }
     Ok(true)
@@ -816,7 +825,10 @@ fn settle_one(
     if kept.is_empty() {
         let (any_copy, ordinary): (bool, bool) = conn
             .prepare_cached(
-                "SELECT COUNT(*) != 0, COUNT(*) != COUNT(v.mailbox)
+                "SELECT COUNT(*) != 0 OR EXISTS (
+                    SELECT 1 FROM local_all_mail_restores r
+                    WHERE r.account_id = ?1 AND r.message_id = ?2
+                 ), COUNT(*) != COUNT(v.mailbox)
              FROM message_copies c LEFT JOIN mailbox_views v
                ON v.account_id = c.account_id AND v.mailbox = c.mailbox
              WHERE c.account_id = ?1 AND c.message_id = ?2",

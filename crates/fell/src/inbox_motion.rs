@@ -607,7 +607,7 @@ impl InboxMotion {
     pub fn folder_header(&self, now: Instant) -> Option<(&str, usize, f32)> {
         self.folder_out
             .as_ref()
-            .map(|((folder, unread), fade)| (folder.as_str(), *unread, fade.progress(now)))
+            .map(|((folder, unread), fade)| (folder.as_str(), *unread, fade.linear(now)))
     }
 
     /// The header's unread count being replaced: the old count and how far

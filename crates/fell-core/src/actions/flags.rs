@@ -284,6 +284,31 @@ fn set_flags(
     Ok(())
 }
 
+/// Save a star as part of a folder action's undo entry. A deleted row
+/// needs the snapshot too, since restoring its message initializes flags.
+pub(super) fn snapshot_star(
+    conn: &Connection,
+    account: &AccountId,
+    action_id: i64,
+    message_id: &str,
+    clear: bool,
+) -> Result<()> {
+    let saved = conn.execute(
+        "INSERT INTO local_action_flags (action_id, message_id, unread, starred)
+         SELECT ?1, message_id, unread, starred FROM messages
+         WHERE account_id = ?2 AND message_id = ?3 AND starred",
+        params![action_id, account.as_str(), message_id],
+    )?;
+    if clear && saved != 0 {
+        conn.execute(
+            "UPDATE messages SET starred = 0 WHERE account_id = ?1 AND message_id = ?2",
+            params![account.as_str(), message_id],
+        )?;
+        intents::record(conn, account, message_id, None, Some(false))?;
+    }
+    Ok(())
+}
+
 /// Restore the flag the action changed, alongside its local intent. The
 /// other flag may have changed independently since the action was recorded.
 pub(super) fn undo(conn: &Connection, account_id: &AccountId, action: &LocalAction) -> Result<()> {
@@ -301,7 +326,7 @@ pub(super) fn undo(conn: &Connection, account_id: &AccountId, action: &LocalActi
         })?
         .collect::<rusqlite::Result<_>>()?
     };
-    if saved.is_empty() {
+    if saved.is_empty() && action.kind.is_flag() {
         return Err(Error::Action("action has no messages".into()));
     }
     let restore_unread = matches!(action.kind, ActionKind::Read | ActionKind::Unread);

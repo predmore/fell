@@ -510,6 +510,7 @@ impl Store {
         ensure_agent_action_columns(&conn)?;
         copies::ensure_copies(&conn)?;
         conn.execute_batch(views::SCHEMA)?;
+        conn.execute_batch(crate::actions::FOLDER_TOMBSTONE_SCHEMA)?;
         keywords::upgrade_undo_schema(&conn)?;
         bodies::ensure_bodies(&conn)?;
         conn.execute_batch(

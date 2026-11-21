@@ -3817,6 +3817,93 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
         .opacity(entry.opacity)
 }
 
+fn folder_path_ends(path: &str) -> Option<(&str, &str)> {
+    let (first, rest) = path.split_once('/')?;
+    Some((first, rest.rsplit('/').next().unwrap_or(rest)))
+}
+
+fn fit_folder_path(
+    path: &str,
+    fit: impl Fn(&str) -> Option<gpui::ShapedLine>,
+) -> Option<gpui::ShapedLine> {
+    let full = fit(path);
+    if full.as_ref().is_some_and(|line| line.text == path) {
+        return full;
+    }
+    let Some((first, leaf)) = folder_path_ends(path) else {
+        return full;
+    };
+    let prefix = format!("{first}/…/");
+    fit(&format!("{prefix}{leaf}"))
+        .filter(|line| {
+            line.text
+                .strip_prefix(&prefix)
+                .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
+        })
+        .or_else(|| fit(&format!("…/{leaf}")))
+}
+
+#[derive(PartialEq)]
+struct HeaderAccount {
+    name: Option<SharedString>,
+    email: Option<SharedString>,
+    quiet: bool,
+}
+
+impl HeaderAccount {
+    fn fit(
+        session: &Session,
+        room: f32,
+        gap: f32,
+        fit: &impl Fn(&str, f32, FontWeight) -> Option<gpui::ShapedLine>,
+    ) -> Self {
+        let account = session.account_name.trim();
+        let email = session.account_email.as_str();
+        let (name, email) = if account.is_empty() || account.eq_ignore_ascii_case(email) {
+            (email, None)
+        } else {
+            (account, (!email.is_empty()).then_some(email))
+        };
+        let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
+        let quiet = full.is_none();
+        let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
+        let email = name.as_ref().and_then(|line| {
+            fit(
+                email?,
+                room - f32::from(line.width).ceil() - gap,
+                FontWeight::NORMAL,
+            )
+        });
+        Self {
+            name: name.map(|line| line.text),
+            email: email.map(|line| line.text),
+            quiet,
+        }
+    }
+
+    fn render(self, theme: &Theme, gap: f32) -> gpui::Div {
+        div()
+            .flex()
+            .items_baseline()
+            .gap(px(gap))
+            .children(self.name.map(|name| {
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .when(self.quiet, |label| label.text_color(rgb(theme.dimmed)))
+                    .when(!self.quiet, |label| label.font_weight(FontWeight::SEMIBOLD))
+                    .child(name)
+            }))
+            .children(self.email.map(|email| {
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_color(rgb(theme.dimmed))
+                    .child(email)
+            }))
+    }
+}
+
 fn header(
     theme: &Theme,
     session: &Session,
@@ -3866,22 +3953,7 @@ fn header(
         let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
         let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
         let label = session.roles.label(folder);
-        let mut name = fit(&label, name_room, FontWeight::SEMIBOLD);
-        if name.as_ref().is_none_or(|line| line.text != label)
-            && let Some((first, rest)) = label.split_once('/')
-        {
-            let leaf = rest.rsplit('/').next().unwrap_or(rest);
-            let prefix = format!("{first}/…/");
-            let shortened = format!("{prefix}{leaf}");
-            let leaf_only = format!("…/{leaf}");
-            name = fit(&shortened, name_room, FontWeight::SEMIBOLD)
-                .filter(|line| {
-                    line.text
-                        .strip_prefix(&prefix)
-                        .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
-                })
-                .or_else(|| fit(&leaf_only, name_room, FontWeight::SEMIBOLD));
-        }
+        let name = fit_folder_path(&label, |path| fit(path, name_room, FontWeight::SEMIBOLD));
         let name_width = name
             .as_ref()
             .map_or(0., |line| f32::from(line.width).ceil());
@@ -3936,34 +4008,39 @@ fn header(
 
     let (current, current_width) =
         folder_group(folder, session.unread_threads(), motion.unread_count(now));
-    let leaving = motion.folder_header(now).map(|(old, unread, shown)| {
+    let leaving = motion.folder_header(now).map(|(old, unread, time)| {
         let (group, width) = folder_group(old, unread, None);
-        (group, width, shown)
+        (group, width, time)
     });
-    let group_width = leaving
+    let account = HeaderAccount::fit(session, room - current_width, COUNT_GAP, &fit);
+    let (old_width, time) = leaving
         .as_ref()
-        .map_or(current_width, |(_, old_width, shown)| {
-            motion::lerp(current_width.max(*old_width), current_width, *shown)
-        });
-
-    let account_room = room - group_width;
-    let account = session.account_name.trim();
-    let email = session.account_email.as_str();
-    let (account, detail) = if account.is_empty() || account.eq_ignore_ascii_case(email) {
-        (email, None)
+        .map_or((current_width, 1.), |(_, w, t)| (*w, *t));
+    let old = leaving
+        .as_ref()
+        .map(|_| HeaderAccount::fit(session, room - old_width, COUNT_GAP, &fit))
+        .filter(|old| *old != account);
+    // Reserve the wider folder slot until both fades finish. The account's
+    // paint clip moves before a wider folder enters, or after it has left.
+    const FOLDER_EXIT: f32 = 60. / 120.;
+    const FOLDER_ENTER: f32 = 40. / 120.;
+    let clip = if current_width > old_width {
+        motion::ease_out(time / FOLDER_ENTER)
     } else {
-        (account, (!email.is_empty()).then_some(email))
+        motion::ease_out((time - FOLDER_EXIT) / (1. - FOLDER_EXIT))
     };
-    let full = fit(account, account_room, FontWeight::SEMIBOLD).filter(|line| line.text == account);
-    let quiet = full.is_none();
-    let account = full.or_else(|| fit(account, account_room, FontWeight::NORMAL));
-    let detail = account.as_ref().and_then(|line| {
-        fit(
-            detail?,
-            account_room - f32::from(line.width).ceil() - COUNT_GAP,
-            FontWeight::NORMAL,
-        )
-    });
+    let account_width = room - motion::lerp(old_width, current_width, clip);
+    let account_fade = old.as_ref().map_or(1., |_| motion::ease_out(time));
+    let folder_in = motion::ease_out((time - FOLDER_ENTER) / (1. - FOLDER_ENTER));
+    let folder_slot = |group: gpui::Div, width: f32| {
+        div()
+            .flex_none()
+            .w(px(width))
+            .overflow_hidden()
+            .flex()
+            .justify_end()
+            .child(group)
+    };
 
     div()
         .h(px(44.))
@@ -3975,48 +4052,38 @@ fn header(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.surface))
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .flex()
-                .items_baseline()
-                .gap(px(COUNT_GAP))
-                .children(account.map(|line| {
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .when(quiet, |label| label.text_color(rgb(theme.dimmed)))
-                        .when(!quiet, |label| label.font_weight(FontWeight::SEMIBOLD))
-                        .child(line.text)
-                }))
-                .children(detail.map(|line| {
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .text_color(rgb(theme.dimmed))
-                        .child(line.text)
-                })),
+            div().flex_1().min_w_0().relative().flex().child(
+                div()
+                    .w(px(account_width.max(0.)))
+                    .flex_none()
+                    .relative()
+                    .overflow_hidden()
+                    .child(account.render(theme, COUNT_GAP).opacity(account_fade))
+                    .children(old.map(|old| {
+                        old.render(theme, COUNT_GAP)
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .opacity(1. - account_fade)
+                    })),
+            ),
         )
         .child(
             div()
                 .flex_none()
-                .w(px(group_width))
+                .w(px(current_width.max(old_width)))
                 .relative()
+                .overflow_hidden()
                 .flex()
                 .justify_end()
-                .child(
-                    current.opacity(
-                        leaving
-                            .as_ref()
-                            .map_or(1., |(_, _, shown)| motion::lerp(0.4, 1., *shown)),
-                    ),
-                )
-                .children(
-                    leaving.map(|(old, _, shown)| {
-                        old.absolute().right_0().top_0().opacity(1. - shown)
-                    }),
-                ),
+                .child(folder_slot(current, current_width).opacity(folder_in))
+                .children(leaving.map(|(old, width, time)| {
+                    folder_slot(old, width)
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .opacity(1. - motion::ease_out(time / FOLDER_EXIT))
+                })),
         )
 }
 
@@ -4348,7 +4415,7 @@ fn thread_row(
                 .child(thread_line_one(
                     theme,
                     row,
-                    frame,
+                    (frame, background),
                     selected,
                     text_width,
                     look.previous_labels,
@@ -4372,7 +4439,7 @@ const THREAD_ATTACHMENT_MARK: &str = "⧉";
 fn thread_line_one(
     theme: &Theme,
     row: &ThreadRow,
-    frame: RowFrame,
+    (frame, background): (RowFrame, u32),
     selected: bool,
     text_width: f32,
     previous_labels: Option<(Vec<String>, f32)>,
@@ -4414,7 +4481,7 @@ fn thread_line_one(
         thread_label_group(
             theme,
             row,
-            selected,
+            background,
             dim,
             (room - sender_width - THREAD_LINE_GAP).max(0.0),
             previous_labels,
@@ -4484,13 +4551,14 @@ const LABEL_CHIP_MAX: f32 = 144.0;
 fn thread_label_group(
     theme: &Theme,
     row: &ThreadRow,
-    selected: bool,
+    background: u32,
     dim: u32,
     room: f32,
     previous: Option<(Vec<String>, f32)>,
     window: &Window,
 ) -> Option<gpui::Div> {
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
+    let outline = theme.label_outline(background);
     let layout = |labels: &[String]| {
         let mut width = 0.0;
         let mut chips = Vec::new();
@@ -4515,7 +4583,16 @@ fn thread_label_group(
                 break;
             };
             let chip_width = f32::from(line.width).ceil() + LABEL_CHIP_CHROME;
-            if chip_width > budget + LABEL_CHIP_CHROME || (line.text == "…" && label != "…") {
+            let too_short = line.text != label
+                && line
+                    .text
+                    .trim_end_matches('…')
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .take(3)
+                    .count()
+                    < 3;
+            if chip_width > budget + LABEL_CHIP_CHROME || too_short {
                 break;
             }
             width += gap + chip_width;
@@ -4524,7 +4601,7 @@ fn thread_label_group(
                 line.text,
                 chip_width,
                 row.warn && index == 0,
-                selected,
+                outline,
                 dim,
             ));
         }
@@ -4541,7 +4618,7 @@ fn thread_label_group(
                     text.into(),
                     chip_width,
                     false,
-                    selected,
+                    outline,
                     dim,
                 ));
             }
@@ -4580,22 +4657,16 @@ fn thread_label_group(
 
 /// A label on a row: an outline that fits inside the 22 px line, so all
 /// four of its edges show. A warning is in the error colour, which holds
-/// AA on the selection as well as on the page. On a selected row the
-/// outline is drawn from the selection, so it stays as visible there.
+/// AA on the selection as well as on the page.
 fn label_chip(
     theme: &Theme,
     label: SharedString,
     width: f32,
     warn: bool,
-    selected: bool,
+    outline: u32,
     dim: u32,
 ) -> gpui::Div {
     let size = (theme.ui_px - 2.0).max(11.0);
-    let outline = match (warn, selected) {
-        (true, _) => theme.error,
-        (false, true) => theme::mix(theme.selection, dim, 0.35),
-        (false, false) => theme::mix(theme.background, dim, 0.5),
-    };
     div()
         .flex_none()
         .w(px(width))
@@ -4607,7 +4678,7 @@ fn label_chip(
         .px(px(6.))
         .rounded_md()
         .border_1()
-        .border_color(rgb(outline))
+        .border_color(rgb(if warn { theme.error } else { outline }))
         .text_size(px(size))
         .line_height(px(size + 2.0))
         .text_color(rgb(if warn { theme.error } else { dim }))
@@ -4685,26 +4756,32 @@ fn names(
         theme.foreground
     };
     let mut line = div().flex().flex_row().whitespace_nowrap();
-    if width > limit {
+    let width = if width > limit {
         let names: String = bold_parts
             .iter()
             .map(|(text, _)| text.as_str())
             .chain(extra_text.as_deref())
             .collect();
-        let visible = clip_line(
+        let visible = clip_shaped(
             window,
             &window.text_style(),
             &names,
             limit,
             FontWeight::BOLD,
-        );
+            None,
+        )
+        .filter(|line| f32::from(line.width).ceil() <= limit);
+        let fitted_width = visible
+            .as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil());
         line = line.child(
             div()
                 .flex_none()
                 .font_weight(row_weight(frame.bold))
                 .text_color(rgb(text_color))
-                .child(visible),
+                .children(visible.map(|line| line.text)),
         );
+        fitted_width
     } else {
         for (text, span_weight) in parts(frame.bold) {
             line = line.child(
@@ -4718,8 +4795,8 @@ fn names(
         if let Some(text) = extra_text {
             line = line.child(div().flex_none().text_color(rgb(dim)).child(text));
         }
-    }
-    let width = width.min(limit);
+        width
+    };
     (
         div()
             .relative()
@@ -5524,6 +5601,103 @@ fn collapsed_message(
         .into_any_element()
 }
 
+fn expanded_message_header(
+    theme: &Theme,
+    message: &ConvMessage,
+    width: f32,
+    window: &Window,
+) -> gpui::Div {
+    const GAP: f32 = 10.;
+    let style = conversation_line_style(window, theme, px(theme.ui_px - 1.));
+    let sender_style = conversation_line_style(window, theme, px(theme.ui_px));
+    let date = present::relative_date(now_unix(), message.date_unix);
+    let date_width = line_px_with_style(window, &sender_style, &date, FontWeight::NORMAL).ceil();
+    let room = (width - date_width - 3. * GAP).max(0.);
+    let fit = |style: &TextStyle, text: &str, width: f32, weight, color| {
+        clip_shaped(window, style, text, width.floor(), weight, Some(color))
+            .filter(|line| f32::from(line.width).ceil() <= width)
+    };
+    let sender = fit(
+        &sender_style,
+        &present::display_safe(&message.sender),
+        room * 0.42,
+        FontWeight::SEMIBOLD,
+        theme.foreground,
+    );
+    let email = fit(
+        &style,
+        &present::display_safe(&message.email),
+        room * 0.42,
+        FontWeight::NORMAL,
+        theme.dimmed,
+    );
+    let line_width = |line: &Option<gpui::ShapedLine>| {
+        line.as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil())
+    };
+    let folder_width = (room - line_width(&sender) - line_width(&email)).max(0.);
+    let mut folders = message
+        .folders
+        .iter()
+        .map(|folder| present::display_safe(folder))
+        .collect::<Vec<_>>();
+    let full = folders.join(" · ");
+    let folders = if line_px_with_style(window, &style, &full, FontWeight::NORMAL) <= folder_width {
+        full
+    } else {
+        for path in &mut folders {
+            if let Some((first, rest)) = path.split_once('/')
+                && let Some((_, leaf)) = rest.rsplit_once('/')
+            {
+                *path = format!("{first}/…/{leaf}");
+            }
+            if let Some(line) = fit_folder_path(path, |text| {
+                fit(&style, text, folder_width, FontWeight::NORMAL, theme.dimmed)
+            }) {
+                *path = line.text.to_string();
+            }
+        }
+        folders.join(" · ")
+    };
+    let folders = fit(
+        &style,
+        &folders,
+        folder_width,
+        FontWeight::NORMAL,
+        theme.dimmed,
+    );
+    div()
+        .flex()
+        .items_center()
+        .gap(px(GAP))
+        // The recipient line belongs to this header, so it sits close.
+        .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
+        .child(
+            div()
+                .flex_none()
+                .children(sender.map(|line| shaped_text(line, window))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .children(email.map(|line| shaped_text(line, window))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .children(folders.map(|line| shaped_text(line, window))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(rgb(theme.dimmed))
+                .child(date),
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expanded_message(
     theme: &Theme,
@@ -5561,42 +5735,7 @@ fn expanded_message(
                 }),
             )
         })
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.))
-                // The recipient line belongs to this header, so it sits close.
-                .pb(px(if message.recipients.is_some() { 2. } else { 8. }))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(message.sender.clone()),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(dim))
-                        .text_size(px(theme.ui_px - 1.0))
-                        .child(message.email.clone()),
-                )
-                .when(!message.folders.is_empty(), |row| {
-                    // A draft that may have gone out: its row's chip carries
-                    // the warning colour, so this says why once, quietly.
-                    row.child(
-                        div()
-                            .text_color(rgb(dim))
-                            .text_size(px(theme.ui_px - 1.0))
-                            .child(message.folders.clone()),
-                    )
-                })
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_color(rgb(dim))
-                        .child(present::relative_date(now_unix(), message.date_unix)),
-                ),
-        )
+        .child(expanded_message_header(theme, message, body_width, window))
         .children(message.recipients.as_ref().map(|line| {
             recipient_lines(
                 theme,

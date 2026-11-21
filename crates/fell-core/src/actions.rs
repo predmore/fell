@@ -51,6 +51,20 @@ const SELECT_SAVED: &str = "message_id, remote_id, thread_id, proton_conversatio
     date_unix, snippet, body_text, unread, folders, labels, arrived_via,
     to_line, cc_line, bcc_line, has_attachment, list_id, reply_to_line, attachment_names";
 
+pub(crate) const FOLDER_TOMBSTONE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS local_folder_tombstones (
+    action_id INTEGER NOT NULL,
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    PRIMARY KEY (action_id, message_id, folder),
+    FOREIGN KEY(action_id) REFERENCES local_actions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_folder_tombstones
+    ON local_folder_tombstones(account_id, message_id);
+";
+
 const ACTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,18 +120,6 @@ CREATE TABLE IF NOT EXISTS local_action_aliases (
     folder TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(action_id) REFERENCES local_actions(id)
 );
-
-CREATE TABLE IF NOT EXISTS local_folder_tombstones (
-    action_id INTEGER NOT NULL,
-    account_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    folder TEXT NOT NULL,
-    PRIMARY KEY (action_id, message_id, folder),
-    FOREIGN KEY(action_id) REFERENCES local_actions(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_local_folder_tombstones
-    ON local_folder_tombstones(account_id, message_id);
 
 -- The message_bodies row of a message an action removed, as stored. No row
 -- here means it had none, and undo queues it to be fetched again.
@@ -270,6 +272,14 @@ struct Planned {
     folders: String,
     labels: String,
     remove_row: bool,
+    view: ViewRelocation,
+}
+
+#[derive(Default)]
+struct ViewRelocation {
+    hidden: Vec<String>,
+    clear_star: bool,
+    server_only_folders: Vec<String>,
 }
 
 impl Store {
@@ -300,8 +310,19 @@ impl Store {
             ActionKind::Archive,
             server,
             |tx, rows| {
-                let plans = plan_relocate(tx, account_id, rows, &from_folder, &archive, &roles)?;
+                let plans = plan_relocate(
+                    tx,
+                    account_id,
+                    rows,
+                    &from_folder,
+                    &archive,
+                    &roles,
+                    ActionKind::Archive,
+                )?;
                 if plans.is_empty() {
+                    if roles.is_view(&from_folder) {
+                        return Err(Error::Action("already archived".into()));
+                    }
                     return Err(Error::Action(format!("no messages in {from_folder}")));
                 }
                 let summary = format!("archived {} from {from_folder}", plans.len());
@@ -334,7 +355,15 @@ impl Store {
             ActionKind::Move,
             server,
             |tx, rows| {
-                let plans = plan_relocate(tx, account_id, rows, &from_folder, &to_folder, &roles)?;
+                let plans = plan_relocate(
+                    tx,
+                    account_id,
+                    rows,
+                    &from_folder,
+                    &to_folder,
+                    &roles,
+                    ActionKind::Move,
+                )?;
                 if plans.is_empty() {
                     return Err(Error::Action(format!("no messages in {from_folder}")));
                 }
@@ -437,7 +466,15 @@ impl Store {
             ActionKind::Delete,
             server,
             |tx, rows| {
-                let plans = plan_relocate(tx, account_id, rows, &from_folder, &trash, &roles)?;
+                let plans = plan_relocate(
+                    tx,
+                    account_id,
+                    rows,
+                    &from_folder,
+                    &trash,
+                    &roles,
+                    ActionKind::Delete,
+                )?;
                 if plans.is_empty() {
                     return Err(Error::Action(format!("no messages in {from_folder}")));
                 }
@@ -469,7 +506,7 @@ impl Store {
         };
         let server = Some((to.as_str(), &roles));
         self.apply_threads(account_id, threads, kind, server, |tx, rows| {
-            let plans = plan_relocate(tx, account_id, rows, &from_folder, &to, &roles)?;
+            let plans = plan_relocate(tx, account_id, rows, &from_folder, &to, &roles, kind)?;
             if plans.is_empty() {
                 return Err(Error::Action(format!("no messages in {from_folder}")));
             }
@@ -535,11 +572,16 @@ impl Store {
                 &from,
                 to,
                 &roles,
+                if spam {
+                    ActionKind::Spam
+                } else {
+                    ActionKind::Delete
+                },
             )?;
             if planned.is_empty() {
                 return Err(Error::Action(format!("no messages in {from}")));
             }
-            add_routes(&mut routes, to, &planned);
+            add_routes(&mut routes, to, roles.name(FolderRole::Trash), &planned);
             plans.extend(planned);
         }
         if plans.is_empty() {
@@ -687,6 +729,8 @@ impl Store {
             for row in &load_snapshots(&tx, action.id)? {
                 restore_row(&tx, account_id, row)?;
             }
+            flags::undo(&tx, account_id, &action)?;
+            views::restore_all(&tx, account_id, action.id)?;
         }
         crate::outbox::undo_action(&tx, account_id, action.id)?;
         tx.execute(
@@ -839,7 +883,7 @@ impl Store {
         let action = record_and_apply(&tx, account_id, kind, &summary, &plans)?;
         if let Some((to, roles)) = server {
             let mut routes = BTreeMap::new();
-            add_routes(&mut routes, to, &plans);
+            add_routes(&mut routes, to, roles.name(FolderRole::Trash), &plans);
             queue_routes(&tx, account_id, &action, routes, roles)?;
         }
         tx.commit()?;
@@ -926,6 +970,15 @@ fn record_and_apply(
             insert_snapshot(conn, id, account_id, plan, was_keyword)?;
         }
         record_tombstones(conn, id, account_id, plan)?;
+        if plan.view.clear_star || (plan.remove_row && !plan.view.hidden.is_empty()) {
+            flags::snapshot_star(
+                conn,
+                account_id,
+                id,
+                &plan.before.message_id,
+                plan.view.clear_star,
+            )?;
+        }
     }
     if kind == ActionKind::Purge {
         finish_purge(conn, id, account_id)?;
@@ -1364,15 +1417,29 @@ fn plan_relocate(
     from: &str,
     to: &str,
     roles: &crate::folders::FolderRoles,
+    kind: ActionKind,
 ) -> Result<Vec<Planned>> {
     let from_view = roles.is_view(from);
     let mut plans = Vec::new();
     for row in rows {
         let folders = split_tokens(&row.folders);
-        let source = if from_view {
+        if from_view {
             if !views::in_scope(conn, account, &row.message_id, from)? {
                 continue;
             }
+            if kind != ActionKind::Move {
+                plans.extend(plan_view_relocation(
+                    conn,
+                    account,
+                    row,
+                    (from, to),
+                    roles,
+                    kind,
+                )?);
+                continue;
+            }
+        }
+        let source = if from_view {
             // Prefer the received copy so a separate sent reply or copy stays put.
             let Some(folder) = folders
                 .iter()
@@ -1398,20 +1465,85 @@ fn plan_relocate(
             folders: join_tokens(&next),
             labels: row.labels.clone(),
             remove_row: false,
+            view: ViewRelocation::default(),
         });
     }
     Ok(plans)
 }
 
+fn plan_view_relocation(
+    conn: &Connection,
+    account: &AccountId,
+    row: &SavedRow,
+    (from, to): (&str, &str),
+    roles: &crate::folders::FolderRoles,
+    kind: ActionKind,
+) -> Result<Option<Planned>> {
+    let folders = split_tokens(&row.folders);
+    let destructive = matches!(kind, ActionKind::Delete | ActionKind::Spam);
+    let remove_row = folders.iter().all(|folder| roles.is_view(folder));
+    if remove_row && !destructive {
+        return Ok(None);
+    }
+    let mut view = ViewRelocation {
+        clear_star: destructive && roles.is(FolderRole::Flagged, from),
+        ..Default::default()
+    };
+    let all = roles.name(FolderRole::All);
+    if roles.is_view(all)
+        && (destructive || roles.is(FolderRole::All, from))
+        && !to.eq_ignore_ascii_case(all)
+        && views::in_scope(conn, account, &row.message_id, all)?
+    {
+        view.hidden.push(all.to_owned());
+    }
+    if remove_row {
+        // A copy may still be indexed under a physical folder removed by
+        // an earlier local edit. Projected UIDs are never MOVE sources.
+        let copies = views::copy_folders(conn, account, &row.message_id)?;
+        for (folder, projected) in copies {
+            if projected {
+                view.hidden.push(folder);
+            } else if !folder.eq_ignore_ascii_case(roles.name(FolderRole::Trash)) {
+                view.server_only_folders.push(folder);
+            }
+        }
+    }
+    let next = if remove_row {
+        String::new()
+    } else if folders.len() == 1 && folders[0].eq_ignore_ascii_case(to) {
+        if view.hidden.is_empty() && !view.clear_star {
+            return Ok(None);
+        }
+        row.folders.clone()
+    } else {
+        to.to_owned()
+    };
+    Ok(Some(Planned {
+        before: row.clone(),
+        folders: next,
+        labels: row.labels.clone(),
+        remove_row,
+        view,
+    }))
+}
+
 fn add_routes<'a>(
     routes: &mut BTreeMap<(String, &'a str), Vec<String>>,
     to: &'a str,
+    trash: &'a str,
     plans: &[Planned],
 ) {
     for plan in plans {
         for from in removed_folders(plan) {
             routes
                 .entry((from, to))
+                .or_default()
+                .push(plan.before.message_id.clone());
+        }
+        for from in &plan.view.server_only_folders {
+            routes
+                .entry((from.clone(), trash))
                 .or_default()
                 .push(plan.before.message_id.clone());
         }
@@ -1442,6 +1574,7 @@ fn plan_expunge(rows: &[SavedRow], folder: &str) -> Vec<Planned> {
             folders: join_tokens(&left),
             labels: row.labels.clone(),
             remove_row: left.is_empty(),
+            view: ViewRelocation::default(),
         });
     }
     plans
@@ -1463,6 +1596,7 @@ fn plan_label(rows: &[SavedRow], add: bool, label: &str) -> Vec<Planned> {
             folders: row.folders.clone(),
             labels: join_tokens(&next),
             remove_row: false,
+            view: ViewRelocation::default(),
         });
     }
     plans
@@ -1845,7 +1979,11 @@ fn record_tombstones(
     account_id: &AccountId,
     plan: &Planned,
 ) -> Result<()> {
-    for folder in removed_folders(plan) {
+    for folder in removed_folders(plan)
+        .iter()
+        .chain(&plan.view.hidden)
+        .chain(&plan.view.server_only_folders)
+    {
         conn.execute(
             "INSERT OR IGNORE INTO local_folder_tombstones
                 (action_id, account_id, message_id, folder)

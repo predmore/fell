@@ -51,7 +51,10 @@ fn bridge_state() -> TestState {
 
 #[test]
 fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
-    let state = bridge_state();
+    let mut state = bridge_state();
+    state
+        .mailboxes
+        .push(mailbox("Sent", 16, vec![message(2, "inbox@x", &[])]));
     let unique_bytes = state.mailboxes[0].messages[0].raw.len()
         + state.mailboxes[4].messages[1].raw.len()
         + state.mailboxes[5].messages[0].raw.len();
@@ -68,7 +71,7 @@ fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
 
     let inbox = || stored(&store, &acct, "inbox@x").unwrap();
     let inbox_thread = inbox().thread_id;
-    assert_eq!(inbox().folders, ["INBOX"]);
+    assert_eq!(inbox().folders, ["INBOX", "Sent"]);
     assert_eq!(inbox().labels, ["A", "B"]);
     assert!(inbox().starred);
     let folder = |name| {
@@ -163,7 +166,7 @@ fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
     assert_eq!(folder("Folders/Projects/2026").len(), 1);
     assert_eq!(
         store.folder_names(&acct.id).unwrap(),
-        ["INBOX", "Folders/Projects/2026"]
+        ["INBOX", "Sent", "Folders/Projects/2026"]
     );
     let roles = store.folder_roles(&acct.id).unwrap();
     assert_eq!(roles.label("Folders/Projects/2026"), "Projects/2026");
@@ -203,6 +206,13 @@ fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
             .messages
             .push(message(10, "projects@x", &[]));
         state.mailboxes[2].uidnext = Some(11);
+        let sent = state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "Sent")
+            .unwrap();
+        sent.messages.push(message(3, "projects@x", &[]));
+        sent.uidnext = Some(4);
     }
     sync();
     assert_eq!(inbox().labels, ["B"]);
@@ -212,6 +222,8 @@ fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
     assert!(inbox().starred);
     assert_eq!(folder("Starred")[0].thread_id, inbox_thread);
     assert!(body_fetches(&server).is_empty());
+    assert_eq!(folder("Sent").len(), 2);
+    assert_eq!(server.body_responses.load(Ordering::Relaxed), 3);
 
     {
         let mut state = server.state.lock().unwrap();
@@ -226,8 +238,18 @@ fn bridge_projects_labels_and_stars_and_downloads_one_body_per_message() {
     assert!(search("in:Starred").is_empty());
     assert!(body_fetches(&server).is_empty());
 
-    // If the ordinary copy goes away, its All Mail copy keeps it accessible.
-    server.state.lock().unwrap().mailboxes[0].messages.clear();
+    // If the ordinary copies go away, the All Mail copy keeps it accessible.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.mailboxes[0].messages.clear();
+        state
+            .mailboxes
+            .iter_mut()
+            .find(|mailbox| mailbox.name == "Sent")
+            .unwrap()
+            .messages
+            .remove(0);
+    }
     sync();
     assert!(folder("INBOX").is_empty());
     assert!(inbox().folders.is_empty());
@@ -484,17 +506,12 @@ fn bridge_views_are_not_move_targets_and_actions_from_them_move_real_copies() {
         .spam_scoped_threads(&acct.id, &[(project.thread_id, folder)])
         .unwrap();
 
-    let query = "in:Starred";
-    let hits = store.search(&acct.id, query).unwrap().hits;
-    let locations = store
-        .search_locations(&acct.id, query, "INBOX", &hits)
-        .unwrap();
-    let folder = locations[&hits[0].message_id].folder.clone().unwrap();
-    // Already in Trash, so a deletion from the same view changes nothing.
     assert!(
         store
-            .delete_scoped_threads(&acct.id, &[(inbox.thread_id, folder)])
-            .is_err()
+            .search(&acct.id, "in:Starred")
+            .unwrap()
+            .hits
+            .is_empty()
     );
 
     assert_eq!(stored(&store, &acct, "inbox@x").unwrap().folders, ["Trash"]);
@@ -502,8 +519,12 @@ fn bridge_views_are_not_move_targets_and_actions_from_them_move_real_copies() {
         stored(&store, &acct, "projects@x").unwrap().folders,
         ["Spam"]
     );
-    let report = super::replay_outbox(&backend.imap, &acct.id, &store).unwrap();
-    assert_eq!(report.sent, 3);
+    for entry in store.outbox(&acct.id).unwrap() {
+        if entry.kind == crate::outbox::OutboxKind::Move {
+            assert!(!["All Mail", "Starred", "Labels/A"].contains(&entry.source_folder.as_str()));
+        }
+    }
+    super::replay_outbox(&backend.imap, &acct.id, &store).unwrap();
     let commands = commands(&server);
     let moves: Vec<_> = commands
         .iter()
@@ -518,9 +539,163 @@ fn bridge_views_are_not_move_targets_and_actions_from_them_move_real_copies() {
             "{moves:?}"
         );
     }
-    assert!(!commands.iter().any(|cmd| {
-        ["All Mail", "Starred", "Labels/A"]
+}
+
+#[test]
+fn bridge_view_actions_change_every_real_folder_and_undo_restores_the_views() {
+    let mut state = bridge_state();
+    state.mailboxes.push(mailbox(
+        "Folders/Trips",
+        16,
+        vec![message(4, "inbox@x", &[])],
+    ));
+    state.mailboxes.push(mailbox("Archive", 17, vec![]));
+    let server = TestServer::spawn(state);
+    let acct = account("proton", BackendKind::Bridge);
+    let backend = BridgeBackend {
+        account_id: acct.id.clone(),
+        imap: config(server.addr.port()),
+        ..BridgeBackend::default()
+    };
+    let store = Store::open_in_memory().unwrap();
+    let sync = || sync_once(&acct, &backend, &store).unwrap();
+    sync();
+    store.set_write_back(&acct.id, true).unwrap();
+    let inbox = || stored(&store, &acct, "inbox@x").unwrap();
+    let thread = inbox().thread_id;
+    let in_view = |folder: &str| {
+        store
+            .folder_threads(&acct.id, folder)
+            .unwrap()
             .iter()
-            .any(|name| cmd.contains(&format!("SELECT \"{name}\"")))
-    }));
+            .any(|row| row.thread_id == thread)
+    };
+    for from in ["All Mail", "Starred"] {
+        for destination in ["Archive", "Trash", "Spam"] {
+            match destination {
+                "Archive" => store.archive_thread(&acct.id, &thread, from),
+                "Trash" => store.delete_threads(&acct.id, std::slice::from_ref(&thread), from),
+                _ => store.spam_scoped_threads(&acct.id, &[(thread.clone(), from.into())]),
+            }
+            .unwrap();
+            assert_eq!(inbox().folders, [destination]);
+            if from == "All Mail" || destination != "Archive" {
+                assert!(!in_view("All Mail"));
+            }
+            assert_eq!(
+                in_view("Starred"),
+                from != "Starred" || destination == "Archive"
+            );
+            let mut moves: Vec<_> = store
+                .outbox(&acct.id)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.kind == crate::outbox::OutboxKind::Move)
+                .map(|entry| {
+                    assert_eq!(entry.target_folder, destination);
+                    entry.source_folder
+                })
+                .collect();
+            moves.sort_unstable();
+            assert_eq!(moves, ["Folders/Trips", "INBOX"]);
+            sync();
+            assert_eq!(inbox().folders, [destination]);
+            store.undo(&acct.id).unwrap();
+            assert_eq!(inbox().folders, ["INBOX", "Folders/Trips"]);
+            assert_eq!(inbox().labels, ["A", "B"]);
+            assert!(in_view("All Mail"));
+            assert!(in_view("Starred"));
+        }
+    }
+
+    let all_only = || stored(&store, &acct, "all-only@x");
+    let thread = all_only().unwrap().thread_id;
+    assert!(
+        store
+            .archive_thread(&acct.id, &thread, "All Mail")
+            .unwrap_err()
+            .to_string()
+            .contains("already archived")
+    );
+    for spam in [false, true] {
+        let selected = std::slice::from_ref(&thread);
+        if spam {
+            store.spam_threads(&acct.id, selected, "All Mail").unwrap();
+        } else {
+            store
+                .delete_threads(&acct.id, selected, "All Mail")
+                .unwrap();
+        }
+        assert!(all_only().is_none());
+        sync();
+        assert!(all_only().is_none());
+        store.undo(&acct.id).unwrap();
+        let restored = all_only().unwrap();
+        assert!(restored.folders.is_empty());
+        assert!(restored.body_text.unwrap().contains("protocol overhead"));
+        assert!(
+            store
+                .folder_threads(&acct.id, "All Mail")
+                .unwrap()
+                .iter()
+                .any(|row| row.thread_id == thread)
+        );
+    }
+
+    // A real copy can still be tracked even if its folder is already gone
+    // from the local row. Deleting that view-only row still queues the moves.
+    store
+        .connection()
+        .execute(
+            "UPDATE messages SET folders = '' WHERE message_id = 'inbox@x'",
+            [],
+        )
+        .unwrap();
+    let inbox_thread = inbox().thread_id;
+    store
+        .delete_threads(&acct.id, &[inbox_thread], "All Mail")
+        .unwrap();
+    let mut copies: Vec<_> = store
+        .outbox(&acct.id)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == crate::outbox::OutboxKind::Move)
+        .map(|entry| {
+            assert_eq!(entry.target_folder, "Trash");
+            entry.source_folder
+        })
+        .collect();
+    copies.sort_unstable();
+    assert_eq!(copies, ["Folders/Trips", "INBOX"]);
+    store.undo(&acct.id).unwrap();
+
+    // If sync already saw the All Mail copy go, undo still restores the
+    // view immediately. The next observed real copy takes over again.
+    let in_all = || {
+        store
+            .folder_threads(&acct.id, "All Mail")
+            .unwrap()
+            .iter()
+            .any(|row| row.thread_id == thread)
+    };
+    store
+        .delete_threads(&acct.id, std::slice::from_ref(&thread), "All Mail")
+        .unwrap();
+    server.state.lock().unwrap().mailboxes[4].messages.pop();
+    sync();
+    assert!(!in_all());
+    store.undo(&acct.id).unwrap();
+    assert!(in_all());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.mailboxes[4]
+            .messages
+            .push(message(10, "all-only@x", &[]));
+        state.mailboxes[4].uidnext = Some(11);
+    }
+    sync();
+    assert!(in_all());
+    server.state.lock().unwrap().mailboxes[4].messages.pop();
+    sync();
+    assert!(!in_all());
 }

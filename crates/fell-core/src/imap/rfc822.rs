@@ -54,7 +54,7 @@ pub(super) fn is_synthetic_message_id(message_id: &str) -> bool {
         || (message_id.starts_with("uid.") && message_id.ends_with("@imap.fell"))
 }
 
-pub(super) fn is_bridge_message_id(message_id: &str) -> bool {
+fn is_bridge_message_id(message_id: &str) -> bool {
     message_id.starts_with("bridge.") && message_id.ends_with("@imap.fell")
 }
 

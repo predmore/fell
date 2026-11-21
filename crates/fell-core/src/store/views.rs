@@ -16,6 +16,15 @@ CREATE TABLE IF NOT EXISTS mailbox_views (
     PRIMARY KEY (account_id, mailbox)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_mailbox_views_kind ON mailbox_views(account_id, kind);
+
+-- An undone action can restore All Mail before its server copy is back.
+CREATE TABLE IF NOT EXISTS local_all_mail_restores (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id, folder),
+    FOREIGN KEY (account_id, message_id) REFERENCES messages(account_id, message_id) ON DELETE CASCADE
+) WITHOUT ROWID;
 ";
 
 /// Scope names for a message, using the caller's SQL alias for its row.
@@ -24,9 +33,15 @@ pub(crate) fn scopes(message: &str) -> String {
         "SELECT group_concat(v.folder, char(30))
          FROM mailbox_views v WHERE v.account_id = {message}.account_id AND (
             (v.kind = 'starred' AND {message}.starred) OR
-            (v.kind = 'all' AND EXISTS (
+            (v.kind = 'all' AND (EXISTS (
                 SELECT 1 FROM message_copies c WHERE c.account_id = {message}.account_id
                   AND c.message_id = {message}.message_id AND c.mailbox = v.mailbox
+            ) OR EXISTS (
+                SELECT 1 FROM local_all_mail_restores r WHERE r.account_id = {message}.account_id
+                  AND r.message_id = {message}.message_id AND r.folder = v.folder
+            )) AND NOT EXISTS (
+                SELECT 1 FROM local_folder_tombstones t WHERE t.account_id = {message}.account_id
+                  AND t.message_id = {message}.message_id AND t.folder = v.folder COLLATE NOCASE
             ))
          )"
     )
@@ -41,6 +56,9 @@ pub(crate) fn has_view_copy(message: &str) -> String {
          ) OR EXISTS (
             SELECT 1 FROM copy_orphans q
             WHERE q.account_id = {message}.account_id AND q.message_id = {message}.message_id
+         ) OR EXISTS (
+            SELECT 1 FROM local_all_mail_restores r
+            WHERE r.account_id = {message}.account_id AND r.message_id = {message}.message_id
          )"
     )
 }
@@ -88,6 +106,55 @@ pub(crate) fn has_view(conn: &Connection, account_id: &AccountId, mailbox: &str)
             "SELECT EXISTS(SELECT 1 FROM mailbox_views WHERE account_id = ?1 AND mailbox = ?2)",
         )?
         .query_row(params![account_id.as_str(), mailbox], |row| row.get(0))?)
+}
+
+pub(crate) fn copy_folders(
+    conn: &Connection,
+    account: &AccountId,
+    message_id: &str,
+) -> Result<Vec<(String, bool)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT c.folder, v.mailbox IS NOT NULL
+         FROM message_copies c LEFT JOIN mailbox_views v
+           ON v.account_id = c.account_id AND v.mailbox = c.mailbox
+         WHERE c.account_id = ?1 AND c.message_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![account.as_str(), message_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn restore_all(conn: &Connection, account: &AccountId, action_id: i64) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO local_all_mail_restores (account_id, message_id, folder)
+         SELECT t.account_id, m.message_id, v.folder FROM local_folder_tombstones t
+         JOIN mailbox_views v ON v.account_id = t.account_id
+           AND v.folder = t.folder COLLATE NOCASE AND v.kind = 'all'
+         LEFT JOIN message_aliases a ON a.account_id = t.account_id AND a.message_id = t.message_id
+         JOIN messages m ON m.account_id = t.account_id
+           AND m.message_id = COALESCE(a.canonical_message_id, t.message_id)
+         WHERE t.account_id = ?1 AND t.action_id = ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM message_copies c WHERE c.account_id = m.account_id
+                 AND c.message_id = m.message_id AND c.mailbox = v.mailbox
+           )",
+    )?
+    .execute(params![account.as_str(), action_id])?;
+    Ok(())
+}
+
+pub(super) fn retire_restore(
+    conn: &Connection,
+    account: &AccountId,
+    message_id: &str,
+    folder: &str,
+) -> Result<()> {
+    conn.prepare_cached(
+        "DELETE FROM local_all_mail_restores WHERE account_id = ?1 AND message_id = ?2 AND folder = ?3",
+    )?
+    .execute(params![account.as_str(), message_id, folder])?;
+    Ok(())
 }
 
 pub(super) fn is_bridge(conn: &Connection, account_id: &AccountId) -> Result<bool> {
@@ -174,6 +241,21 @@ pub(super) fn replace(
         )?
         .execute(params![account, mailbox, folder, kind])?;
     }
+    let gone = "r.account_id = ?1 AND NOT EXISTS (
+        SELECT 1 FROM mailbox_views v
+        WHERE v.account_id = r.account_id AND v.kind = 'all' AND v.folder = r.folder
+    )";
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO copy_orphans (account_id, message_id, folder)
+             SELECT r.account_id, r.message_id, r.folder FROM local_all_mail_restores r WHERE {gone}"
+        ),
+        [account],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM local_all_mail_restores AS r WHERE {gone}"),
+        [account],
+    )?;
     // On upgrade, these copies were stored as folders. Remove those folder
     // names from affected rows and refresh the virtual scopes for them.
     let mut messages = conn.prepare_cached(

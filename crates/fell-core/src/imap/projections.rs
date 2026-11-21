@@ -87,7 +87,7 @@ pub(super) fn missing_legacy(
         .collect()
 }
 
-/// Read just enough of each virtual copy to associate it with a stored
+/// Read just enough of each copy to associate it with a stored
 /// message. The caller then asks which of those UIDs still need bodies.
 pub(super) fn link(
     session: &mut session::Session,
@@ -119,12 +119,10 @@ pub(super) fn link(
                     &item.body,
                     !mode.keywords,
                 );
-                if mode.view.is_some() || rfc822::is_bridge_message_id(message_id.as_str()) {
-                    links.push(CopyLink {
-                        message_id,
-                        flags: flag_update(copies.uidvalidity, copies.mailbox, &item, mode),
-                    });
-                }
+                links.push(CopyLink {
+                    message_id,
+                    flags: flag_update(copies.uidvalidity, copies.mailbox, &item, mode),
+                });
             }
             Ok(())
         },
