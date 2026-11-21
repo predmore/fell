@@ -25,6 +25,7 @@ use gpui::{
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
     prelude::*, px, rgb, size, uniform_list,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use fell_core::compose::{DraftSummary, ReplyKind};
 
@@ -1827,7 +1828,17 @@ impl Inbox {
                     Ok(Ok(has_html)) => {
                         inbox.bodies_asked.answered(&id);
                         if has_html {
-                            inbox.reread_open_thread(cx);
+                            if inbox.session.search.is_some() {
+                                inbox.reread_open_thread(cx);
+                            } else {
+                                inbox.request_threads(
+                                    ReadIntent {
+                                        refresh_open: true,
+                                        ..ReadIntent::default()
+                                    },
+                                    cx,
+                                );
+                            }
                         } else {
                             for message in &mut inbox.session.messages {
                                 if message.id == id && message.rich == Rich::Missing {
@@ -3817,13 +3828,16 @@ fn entering(pane: gpui::Stateful<gpui::Div>, entry: PaneEntry) -> gpui::Stateful
         .opacity(entry.opacity)
 }
 
-fn folder_path_ends(path: &str) -> Option<(&str, &str)> {
-    let (first, rest) = path.split_once('/')?;
-    Some((first, rest.rsplit('/').next().unwrap_or(rest)))
+#[derive(Clone, Copy)]
+enum FolderFit<'a> {
+    Header,
+    Picker(&'a str),
+    Search,
 }
 
 fn fit_folder_path<T>(
     path: &str,
+    mode: FolderFit<'_>,
     fit: impl Fn(&str) -> Option<T>,
     text: impl Fn(&T) -> &str,
 ) -> Option<T> {
@@ -3831,17 +3845,105 @@ fn fit_folder_path<T>(
     if full.as_ref().is_some_and(|line| text(line) == path) {
         return full;
     }
-    let Some((first, leaf)) = folder_path_ends(path) else {
-        return full;
+    let parents = path
+        .split_once('/')
+        .map(|(first, rest)| (first, rest.rsplit('/').next().unwrap_or(rest)));
+    let leaf = parents.map_or(path, |(_, leaf)| leaf);
+    let query = match mode {
+        FolderFit::Picker(query)
+            if !query.is_empty() && path.to_ascii_lowercase().contains(query) =>
+        {
+            query
+        }
+        _ => "",
     };
-    let prefix = format!("{first}/…/");
-    fit(&format!("{prefix}{leaf}"))
-        .filter(|line| {
-            text(line)
-                .strip_prefix(&prefix)
-                .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
-        })
-        .or_else(|| fit(&format!("…/{leaf}")))
+    let exact = |candidate: &str| fit(candidate).filter(|line| text(line) == candidate);
+    let keeps_match =
+        |line: &T| query.is_empty() || text(line).to_ascii_lowercase().contains(query);
+    if let Some((first, _)) = parents {
+        let prefix = format!("{first}/…/");
+        let shortened = format!("{prefix}{leaf}");
+        if matches!(mode, FolderFit::Header) {
+            return fit(&shortened)
+                .filter(|line| {
+                    text(line)
+                        .strip_prefix(&prefix)
+                        .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
+                })
+                .or_else(|| fit(&format!("…/{leaf}")));
+        }
+        if let Some(line) = exact(&shortened).filter(&keeps_match) {
+            return Some(line);
+        }
+    }
+    if !matches!(mode, FolderFit::Picker(_)) {
+        return if parents.is_some() { fit(leaf) } else { full };
+    }
+
+    let nested = parents.is_some();
+    if nested && let Some(line) = exact(&format!("…/{leaf}")).filter(&keeps_match) {
+        return Some(line);
+    }
+    // A match in a parent segment needs a slice of the full path.
+    let target = if query.is_empty() || leaf.to_ascii_lowercase().contains(query) {
+        leaf
+    } else {
+        path
+    };
+    let prefix = if nested && target != path {
+        "…/…"
+    } else {
+        "…"
+    };
+    let fit_suffix = |prefix: &str, tail: &str| {
+        let starts: Vec<_> = tail.grapheme_indices(true).map(|(i, _)| i).collect();
+        let first = starts
+            .partition_point(|&i| exact(&format!("{prefix}{}", tail[i..].trim_start())).is_none());
+        let start = *starts.get(first)?;
+        let suffix = tail[start..].trim_start();
+        // Prefer a whole word after the ellipsis when the width cut
+        // leaves a fragment. Keep a fragment if it carries the match or
+        // there is no complete word left.
+        if start > 0
+            && !tail[..start].ends_with(char::is_whitespace)
+            && !tail[start..].starts_with(char::is_whitespace)
+            && let Some((_, words)) = suffix.split_once(char::is_whitespace)
+            && let Some(line) =
+                exact(&format!("{prefix}{}", words.trim_start())).filter(&keeps_match)
+        {
+            return Some(line);
+        }
+        exact(&format!("{prefix}{suffix}"))
+    };
+    if let Some(line) = fit_suffix(prefix, target).filter(&keeps_match) {
+        return Some(line);
+    }
+    if !query.is_empty()
+        && let Some(start) = target.to_ascii_lowercase().find(query)
+    {
+        let boundaries = || target.grapheme_indices(true).map(|(i, _)| i);
+        let start_of_match = boundaries().take_while(|&i| i <= start).last().unwrap_or(0);
+        let end_of_match = boundaries()
+            .find(|&i| i >= start + query.len())
+            .unwrap_or(target.len());
+        let tail = &target[start_of_match..];
+        let after_match = &target[end_of_match..];
+        let anchor = format!("{prefix}{}…", &target[start_of_match..end_of_match]);
+        // Keep both the match and the distinguishing word at the end if
+        // they fit. In smaller rooms, spend the width on the match.
+        if after_match
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|last| exact(&format!("{anchor}{last}")).is_some())
+            && let Some(line) = fit_suffix(&anchor, after_match)
+        {
+            return Some(line);
+        }
+        return fit(&format!("{prefix}{tail}"))
+            .filter(keeps_match)
+            .or_else(|| fit(tail));
+    }
+    fit(leaf)
 }
 
 struct HeaderAccount {
@@ -3958,6 +4060,7 @@ fn header(
         let label = session.roles.label(folder);
         let name = fit_folder_path(
             &label,
+            FolderFit::Header,
             |path| fit(path, name_room, FontWeight::SEMIBOLD),
             |line| &line.text,
         );
@@ -6625,32 +6728,43 @@ const CARD_TOP_PX: f32 = 72.0;
 /// (its border, the 44 px query line and 4 px above and below the rows),
 /// up to its maximum and the window. `None` for any other overlay.
 fn card_fit(session: &Session, theme: &Theme, window: &Window) -> Option<f32> {
-    let (rows_px, max) = match session.overlay {
+    let room = f32::from(window.viewport_size().height) - CARD_TOP_PX - 16.0;
+    match session.overlay {
         Overlay::Palette => {
             let rows_px = session.palette().into_iter().map(|item| match item.action {
                 Action::About => about_palette_height(theme, window),
                 _ => PALETTE_ROW_PX,
             });
-            (rows_px.sum(), PALETTE_MAX_PX)
+            Some(present::card_height(rows_px.sum(), PALETTE_MAX_PX, room))
         }
-        Overlay::Folders => {
-            let choices = session.folder_choices();
-            let dividers = choices
-                .windows(2)
-                .filter(|pair| separates_folder_views(session, &pair[0], &pair[1]))
-                .count();
-            (
-                choices.len() as f32 * PICKER_ROW_PX + dividers as f32 * (PICKER_GROUP_GAP + 1.),
-                PICKER_MAX_PX,
-            )
+        Overlay::Folders => Some(picker_card_height(
+            &session.folder_choices(),
+            room,
+            |a, b| separates_folder_views(session, a, b),
+        )),
+        _ => None,
+    }
+}
+
+fn picker_card_height(
+    choices: &[String],
+    room: f32,
+    separates: impl Fn(&str, &str) -> bool,
+) -> f32 {
+    let capacity = room.min(PICKER_MAX_PX) - present::CARD_CHROME_PX;
+    // Measure from the last row so maximum scroll lands on a row boundary.
+    // Only dividers between visible rows count toward the scroll viewport.
+    let mut rows = 0.0;
+    for (i, name) in choices.iter().enumerate().rev() {
+        let divider = choices.get(i + 1).is_some_and(|next| separates(name, next));
+        let next = rows + PICKER_ROW_PX + if divider { PICKER_GROUP_GAP + 1.0 } else { 0.0 };
+        if next > capacity {
+            rows = rows.max(PICKER_ROW_PX);
+            break;
         }
-        _ => return None,
-    };
-    Some(present::card_height(
-        rows_px,
-        max,
-        f32::from(window.viewport_size().height) - CARD_TOP_PX - 16.0,
-    ))
+        rows = next;
+    }
+    present::card_height(rows, PICKER_MAX_PX, room)
 }
 
 /// The build stamp wraps at the same width and line height used in the row.
@@ -6913,6 +7027,7 @@ fn folder_picker(
 ) -> gpui::Div {
     let choices = session.folder_choices();
     let selected = session.folder_index;
+    let query = session.folder_query.trim().to_ascii_lowercase();
     let width = PICKER_PX.min(f32::from(window.viewport_size().width));
     let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
     let style = conversation_line_style(window, theme, px(theme.ui_px));
@@ -6939,7 +7054,7 @@ fn folder_picker(
         .child(
             div()
                 .flex_none()
-                .h(px(44.))
+                .h(px(present::CARD_QUERY_PX))
                 .px(px(14.))
                 .flex()
                 .flex_row()
@@ -6968,12 +7083,13 @@ fn folder_picker(
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .track_scroll(scroll)
-                .my(px(4.))
+                .my(px(present::CARD_ROW_INSET_PX))
                 .children(choices.iter().enumerate().map(|(index, name)| {
                     let name = name.clone();
                     let label = session.roles.label(&name);
                     let label = fit_folder_path(
                         &label,
+                        FolderFit::Picker(&query),
                         |path| {
                             clip_shaped(window, &style, path, label_room, FontWeight::NORMAL, None)
                                 .filter(|line| f32::from(line.width) <= label_room)
@@ -7238,9 +7354,9 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, collapsed_sender_budget, ctrl_letter,
-        expanded_header_widths, fit_folder_path, key_from, moved_in_list, should_follow_visible,
-        unread_bar_dx, write_back_notice,
+        FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, collapsed_sender_budget, ctrl_letter,
+        expanded_header_widths, fit_folder_path, key_from, moved_in_list, picker_card_height,
+        should_follow_visible, unread_bar_dx, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7249,10 +7365,11 @@ mod tests {
     use gpui::{Keystroke, Modifiers};
 
     #[test]
-    fn folder_path_keeps_the_ends_and_ellipsizes_the_leaf() {
-        let fit = |path, capacity| {
+    fn folder_labels_keep_the_leaf_and_filter_match_in_view() {
+        let fit = |path, capacity, mode| {
             fit_folder_path(
                 path,
+                mode,
                 |candidate| {
                     let len = candidate.chars().count();
                     Some(if len <= capacity {
@@ -7267,11 +7384,30 @@ mod tests {
             .unwrap()
         };
         let path = "Projects/2026/Field survey";
-        assert_eq!(fit(path, 40), path);
-        assert_eq!(fit(path, 23), "Projects/…/Field survey");
-        assert_eq!(fit(path, 17), "Projects/…/Field…");
-        assert_eq!(fit(path, 10), "…/Field s…");
-        assert_eq!(fit("Field survey", 8), "Field s…");
+        let picker = FolderFit::Picker("");
+        assert_eq!(fit(path, 40, picker), path);
+        assert_eq!(fit(path, 23, picker), "Projects/…/Field survey");
+        assert_eq!(fit(path, 17, picker), "…/Field survey");
+        assert_eq!(fit(path, 11, picker), "…/…survey");
+        assert_eq!(fit(path, 10, picker), "…/…survey");
+        assert_eq!(fit(path, 10, FolderFit::Picker("field")), "…/…Field…");
+        assert_eq!(fit(path, 10, FolderFit::Picker("2026")), "…2026/Fie…");
+        let long = "Projects/2026/Field survey equipment provisioning for remote area planning and regional coordination";
+        let matched = fit(long, 45, FolderFit::Picker("equipment provisioning"));
+        assert!(matched.starts_with("…/…equipment provisioning…"));
+        assert!(matched.ends_with("coordination"));
+        assert_eq!(fit(path, 10, FolderFit::Search), "Field sur…");
+        assert_eq!(fit(path, 17, FolderFit::Header), "Projects/…/Field…");
+        assert_eq!(fit("Field survey", 8, FolderFit::Search), "Field s…");
+    }
+
+    #[test]
+    fn folder_picker_fits_complete_rows_at_the_end() {
+        let folders: Vec<_> = (0..20).map(|index| index.to_string()).collect();
+        assert_eq!(picker_card_height(&folders, 692., |_, _| false), 360.);
+        assert_eq!(picker_card_height(&folders, 331., |_, _| false), 326.);
+        assert_eq!(picker_card_height(&folders, 692., |_, b| b == "16"), 369.);
+        assert_eq!(picker_card_height(&folders[..2], 692., |_, _| true), 131.);
     }
 
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {

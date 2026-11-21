@@ -399,13 +399,17 @@ pub fn landing(switched: bool, holds_viewport: bool, same_thread: bool) -> Landi
     }
 }
 
+pub const CARD_QUERY_PX: f32 = 44.0;
+pub const CARD_ROW_INSET_PX: f32 = 4.0;
+pub const CARD_CHROME_PX: f32 = 2.0 + CARD_QUERY_PX + 2.0 * CARD_ROW_INSET_PX;
+
 /// How tall a palette or folder-picker card is drawn to hold `rows_px`
 /// of items: its 1 px border top and bottom, the 44 px query line
 /// and 4 px above and below the rows. Never taller than `max` or the
 /// `room` the window leaves, never shorter than the query line.
 pub fn card_height(rows_px: f32, max: f32, room: f32) -> f32 {
-    let fit = 2.0 + 44.0 + 8.0 + rows_px;
-    fit.min(max).min(room).max(2.0 + 44.0)
+    let fit = CARD_CHROME_PX + rows_px;
+    fit.min(max).min(room).max(2.0 + CARD_QUERY_PX)
 }
 
 /// The list scroll offset (0 at the top, negative further down) that shows
