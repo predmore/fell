@@ -36,6 +36,8 @@ rustls-native-certs = "0.8.5"
 smallvec = "1"
 tempfile = "3"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls-no-provider"] }
+unicode-linebreak = "0.1"
+unicode-segmentation = "1"
 url = "2.5"
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
