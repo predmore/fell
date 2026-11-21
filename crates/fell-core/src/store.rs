@@ -1100,6 +1100,13 @@ impl Store {
         bodies::missing(&self.conn, account_id, limit)
     }
 
+    /// Repair one batch of cached HTML-only previews from the original parts
+    /// on the sync lane. Returns whether the batch changed previews, or
+    /// `None` after the cache is up to date.
+    pub fn repair_html_snippets(&self) -> Result<Option<bool>> {
+        bodies::repair_html_snippets(&self.conn)
+    }
+
     /// The server copies to fetch for one message with no stored body part
     /// or no part list, including one an earlier backfill could not fetch.
     /// `None` when it has both already, or no copy to fetch.

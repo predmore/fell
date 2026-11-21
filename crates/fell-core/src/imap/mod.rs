@@ -28,7 +28,7 @@ pub(crate) use reply_to::fetch_reply_to;
 #[cfg(test)]
 pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
-    CidReferences, attachment_names, has_attachment, is_bidi_control, parts_from_raw,
+    CidReferences, attachment_names, has_attachment, html_snippet, is_bidi_control, parts_from_raw,
 };
 
 #[cfg(test)]

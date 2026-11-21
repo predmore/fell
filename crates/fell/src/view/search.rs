@@ -1160,8 +1160,16 @@ pub(super) fn rows(
         entity.update(app, |inbox, cx| {
             inbox.queue_search_previews(range.clone(), window, cx);
             let highlighted = inbox.session.highlighted();
+            let width = f32::from(window.viewport_size().width);
+            let (_, beside) =
+                present::visible_panes(width, inbox.session.pane, inbox.session.full_width);
+            let width = if beside {
+                list_width(width, inbox.split)
+            } else {
+                width
+            };
             range
-                .map(|index| row(&theme, inbox, index, &highlighted, cx))
+                .map(|index| row(&theme, inbox, index, &highlighted, width, window, cx))
                 .collect()
         })
     })
@@ -1175,6 +1183,8 @@ fn row(
     inbox: &Inbox,
     index: usize,
     highlighted: &HashSet<String>,
+    list_width: f32,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::AnyElement {
     let row = &inbox.session.threads[index];
@@ -1203,12 +1213,55 @@ fn row(
         1.,
         motion::progress(inbox.search_view.arrival.as_ref(), inbox.frame_now),
     );
-    let date = present::relative_date(now_unix(), row.date_unix);
-    let detail = match &hit.folder {
-        Some(folder) if hit.related => format!("Related · {}", inbox.session.roles.label(folder)),
-        None if hit.related => "Related".to_owned(),
-        Some(folder) => format!("{} · {date}", inbox.session.roles.label(folder)),
-        None => date,
+    const PAD: f32 = 14.0;
+    let size = px(theme.ui_px - 2.0);
+    let style = conversation_line_style(window, theme, size);
+    let location = match &hit.folder {
+        Some(folder) if hit.related => {
+            Some(format!("Related · {}", inbox.session.roles.label(folder)))
+        }
+        None if hit.related => Some("Related".to_owned()),
+        Some(folder) => Some(inbox.session.roles.label(folder)),
+        None => None,
+    };
+    // Only the folder label truncates. Give the timestamp its shaped
+    // width so a long label cannot clip its last glyph or hide it.
+    let date = (!hit.related).then(|| present::relative_date(now_unix(), row.date_unix));
+    let dated_location = date
+        .as_ref()
+        .filter(|_| location.is_some())
+        .and_then(|date| {
+            shape_ui_line(
+                window,
+                &style,
+                &format!(" · {date}"),
+                FontWeight::NORMAL,
+                Some(dim),
+            )
+        });
+    // Give the detail one gap's leeway so a short folder name and time
+    // can fit together when their shaped width is just over the limit.
+    let detail_room = (list_width - LIST_BORDER_PX - 2.0 * PAD) * 0.30 + 8.0;
+    let date_width = dated_location
+        .as_ref()
+        .map_or(0.0, |line| f32::from(line.width).ceil());
+    let location_room = (detail_room - date_width).floor();
+    let location = location.and_then(|text| {
+        clip_shaped(
+            window,
+            &style,
+            &text,
+            location_room,
+            FontWeight::NORMAL,
+            Some(dim),
+        )
+        .filter(|line| f32::from(line.width).ceil() <= location_room)
+    });
+    let date = if location.is_some() {
+        dated_location
+    } else {
+        date.as_deref()
+            .and_then(|date| shape_ui_line(window, &style, date, FontWeight::NORMAL, Some(dim)))
     };
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
@@ -1234,7 +1287,7 @@ fn row(
         .relative()
         .h(px(ROW_PX))
         .w_full()
-        .px(px(14.))
+        .px(px(PAD))
         .flex()
         .flex_col()
         .justify_center()
@@ -1280,7 +1333,7 @@ fn row(
                         .items_center()
                         .gap(px(5.))
                         .text_color(rgb(dim))
-                        .text_size(px(theme.ui_px - 2.0))
+                        .text_size(size)
                         .child(div().min_w_0().truncate().child(row.spans[0].text.clone()))
                         .when(row.message_count > 1, |sender| {
                             sender
@@ -1310,15 +1363,12 @@ fn row(
                             .child(THREAD_ATTACHMENT_MARK),
                     )
                 })
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w(gpui::relative(0.30))
-                        .truncate()
-                        .text_color(rgb(dim))
-                        .text_size(px(theme.ui_px - 2.0))
-                        .child(detail),
-                ),
+                .child(div().flex_none().flex().items_center().children(
+                    location.into_iter().chain(date).map(|line| {
+                        let width = f32::from(line.width).ceil();
+                        shaped_text(line, window).w(px(width))
+                    }),
+                )),
         )
         .child(div().truncate().text_color(rgb(dim)).child(excerpt))
         .into_any_element()
