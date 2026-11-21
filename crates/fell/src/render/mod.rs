@@ -14,9 +14,9 @@ mod theme;
 mod webview;
 
 pub use body::{BodyModel, MessageBody, prepare_stored, round_trip_body};
-pub(crate) use native::plain_text;
-pub use native::{
-    BLOCK_GAP, ImageGallery, blocks_column, blocks_column_spaced, document_column, is_right_to_left,
+pub use native::{BLOCK_GAP, ImageGallery, blocks_column, document_column, is_right_to_left};
+pub(crate) use native::{
+    BlockColumn, BlockColumns, READING_MEASURE_PX, blocks_column_spaced, plain_text,
 };
 pub use theme::{Palette, ThemeKind};
 

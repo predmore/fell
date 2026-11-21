@@ -41,6 +41,33 @@ pub const PANE: Duration = Duration::from_millis(160);
 /// that leaves reads as a cut.
 pub const FADE: Duration = Duration::from_millis(120);
 
+/// Reading mode lays out both measures before moving the blocks below them.
+pub const READING_REFLOW: Duration = Duration::from_millis(140);
+
+#[derive(Clone, Copy)]
+pub struct ReadingReflow {
+    /// Opacity of the split and reading layouts, respectively.
+    pub alpha: [f32; 2],
+    /// Interpolation between their natural heights.
+    pub height: f32,
+}
+
+impl ReadingReflow {
+    pub fn opacities(from: [f32; 2], reading: bool, fade: Transition, now: Instant) -> [f32; 2] {
+        let entering = usize::from(reading);
+        let leaving = 1 - entering;
+        let fade_out = Transition::new(fade.started, Duration::from_millis(60));
+        let fade_in = Transition::new(
+            fade.started + Duration::from_millis(40),
+            Duration::from_millis(100),
+        );
+        let mut alpha = from;
+        alpha[leaving] *= fade_out.remaining(now);
+        alpha[entering] = lerp(from[entering], 1.0, fade_in.progress(now));
+        alpha
+    }
+}
+
 /// How far an overlay rises while it fades in, in pixels.
 pub const RISE_PX: f32 = 6.0;
 /// How far a notice rises as it comes in, and again as it leaves, in
