@@ -14,7 +14,7 @@ pub(super) struct ScrollAnchor {
     /// For an automatic or pending preview, align to a complete header
     /// when the selected message is too close to the end to align itself.
     pub snap_headers: bool,
-    /// Ease from the offset the placeholder was drawn at while its card grows.
+    /// Ease from the placeholder's viewport Y while its card grows.
     pub body_scroll: Option<(Pixels, f32)>,
 }
 
@@ -37,8 +37,12 @@ impl ReaderLanding {
         self.snap_headers = true;
     }
 
-    pub fn stop_snapping(&mut self) -> bool {
-        std::mem::take(&mut self.snap_headers)
+    pub fn snapping(&self) -> bool {
+        self.snap_headers
+    }
+
+    pub fn stop_snapping(&mut self) {
+        self.snap_headers = false;
     }
 
     pub fn anchor(
@@ -199,6 +203,20 @@ fn visible_top(view: Bounds<Pixels>, offset: Pixels, item: Bounds<Pixels>) -> Op
 
 fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixels {
     (y - (item.top() - view.top())).min(px(0.))
+}
+
+fn offset_for_body_growth(
+    view: Bounds<Pixels>,
+    item: Bounds<Pixels>,
+    target: Pixels,
+    from_y: Pixels,
+    progress: f32,
+) -> Pixels {
+    // The cards above this header already use their eased heights. Ease
+    // only the header's viewport position, then remove their full offset.
+    let target_y = item.top() - view.top() + target;
+    let y = from_y + (target_y - from_y) * progress;
+    offset_to_hold(view, item, y)
 }
 
 fn offset_to_header(
@@ -411,8 +429,9 @@ impl gpui::Element for LandingHold {
                         .filter_map(|probe| Some(window.layout_bounds(probe.get()?)))
                         .collect();
                     let target = offset_to_header(bounds, item, y, &headers, self.bottom_padding);
-                    let target = self.body_scroll
-                        .map_or(target, |(from, progress)| from + (target - from) * progress);
+                    let target = self.body_scroll.map_or(target, |(from, progress)| {
+                        offset_for_body_growth(bounds, item, target, from, progress)
+                    });
                     self.glide.map_or(target, |glide| {
                         let moving =
                             motion::lerp(f32::from(glide.from), f32::from(target), glide.progress);
@@ -561,6 +580,23 @@ mod tests {
         let offset = offset_to_hold(view, second_batch, next_y);
         assert_eq!(offset, px(-520.));
         assert_eq!(visible_top(view, offset, second_batch), Some(y));
+    }
+
+    #[test]
+    fn a_header_follows_its_eased_path_as_cards_above_it_grow() {
+        let view = vertical_bounds(50., 450.);
+        let from_y = px(180.);
+        let mut previous_y = from_y;
+        for frame in 0..=120 {
+            let ease = crate::motion::ease_out_quad(frame as f32 / 120.);
+            let item = vertical_bounds(370. + 800. * ease, 100. + 600. * ease);
+            let target = offset_to_hold(view, item, px(0.));
+            let offset = offset_for_body_growth(view, item, target, from_y, ease);
+            let y = visible_top(view, offset, item).unwrap();
+            assert!(y <= previous_y, "frame {frame}: {y:?} > {previous_y:?}");
+            assert!((f32::from(y) - 180. * (1. - ease)).abs() < 0.001);
+            previous_y = y;
+        }
     }
 
     #[test]

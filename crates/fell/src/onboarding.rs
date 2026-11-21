@@ -39,7 +39,6 @@ enum Control {
     Next,
     Back,
     Inline,
-    ConnectionStep,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -201,8 +200,8 @@ impl Onboarding {
                 .chain([Next, Back])
                 .collect(),
             Step::Connection if self.form.can_retry() => vec![Next, Back, Control::Install],
-            Step::Connection if self.form.connected() => vec![Next, Back],
-            Step::Connection => vec![Back],
+            Step::Connection if self.form.checks == [Check::Failed; 2] => vec![Back],
+            Step::Connection => vec![Next, Back],
             Step::Done => match self.form.storage {
                 Storage::Saving { .. } => vec![Next],
                 _ if self.form.storage.must_reopen() => vec![Next],
@@ -254,7 +253,6 @@ impl Onboarding {
     fn activate(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
         let before = self.form.step;
         match control {
-            Control::ConnectionStep => {}
             Control::Provider(provider) => {
                 self.form.choose(provider);
                 self.change_step(before, Control::Field(Field::Email), cx);
@@ -348,7 +346,7 @@ impl Onboarding {
         if before != Step::Connection {
             self.feedback.begin_check(&self.form);
         }
-        self.change_step(before, Control::ConnectionStep, cx);
+        self.change_step(before, Control::Next, cx);
         let attempt = self.form.attempt;
         let (progress, mut events) = mpsc::unbounded();
         let work = cx.background_executor().spawn(async move {

@@ -51,7 +51,7 @@ pub enum SyncKind {
 }
 
 /// `31882` as `31,882`.
-fn grouped(count: u32) -> String {
+pub(crate) fn grouped(count: usize) -> String {
     let digits = count.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
@@ -100,14 +100,14 @@ impl SyncKind {
         else {
             return None;
         };
-        let total = grouped(progress.total);
+        let total = grouped(progress.total as usize);
         let suffix = match new_messages {
             Some(count) if *count > 0 => format!(" done · {count} new"),
             _ => " done".into(),
         };
         Some(DownloadStatus {
             prefix: format!("Downloading {total} messages · "),
-            done: grouped(progress.done),
+            done: grouped(progress.done as usize),
             total,
             suffix,
         })

@@ -270,6 +270,39 @@ pub fn progress(transition: Option<&Transition>, now: Instant) -> f32 {
     transition.map_or(1.0, |transition| transition.progress(now))
 }
 
+/// A numeric label starts one crossfade per burst. Updates keep replacing
+/// its incoming value, so a steady stream never hides the latest count.
+pub struct NumberFade<T> {
+    outgoing: Option<(T, Transition)>,
+    last_change: Option<Instant>,
+}
+
+impl<T> Default for NumberFade<T> {
+    fn default() -> Self {
+        Self {
+            outgoing: None,
+            last_change: None,
+        }
+    }
+}
+
+impl<T> NumberFade<T> {
+    pub fn change(&mut self, old: T, motion: Motion, now: Instant) {
+        let quiet = self
+            .last_change
+            .replace(now)
+            .is_none_or(|last| now.saturating_duration_since(last) >= FADE);
+        if quiet {
+            self.outgoing = motion.start(FADE, now).map(|fade| (old, fade));
+        }
+    }
+
+    pub fn frame(&self, now: Instant) -> Option<(&T, f32)> {
+        let (old, fade) = self.outgoing.as_ref()?;
+        fade.running(now).then(|| (old, fade.progress(now)))
+    }
+}
+
 /// Whether motion is on, read once at startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Motion {

@@ -97,6 +97,7 @@ pub struct StatusMotion {
 struct BodyArrival {
     fade: Transition,
     height: Option<(f32, Transition)>,
+    placeholder: bool,
 }
 
 /// What an overlay or which-key showed, kept from the frame before it
@@ -264,7 +265,8 @@ pub struct InboxMotion {
     /// The folder and unread count from the last observed page.
     last_unread: Option<(String, Option<String>, Option<usize>)>,
     /// The count it replaced in the same folder, fading out under the new one.
-    unread_out: Option<(Option<usize>, Transition)>,
+    unread_fade: motion::NumberFade<Option<usize>>,
+    pub inbox_sync_total: Option<u32>,
     folder_out: Option<FolderHeaderFade>,
     /// A label scope changes its heading in the same frame as its rows.
     label_header_in: Option<Transition>,
@@ -394,7 +396,8 @@ impl InboxMotion {
             quotes: DisclosureMotion::default(),
             recipients: DisclosureMotion::default(),
             last_unread: None,
-            unread_out: None,
+            unread_fade: motion::NumberFade::default(),
+            inbox_sync_total: None,
             folder_out: None,
             label_header_in: None,
             last_banner: None,
@@ -623,7 +626,7 @@ impl InboxMotion {
         self.arrival_frame = None;
         self.quotes.transitions.clear();
         self.recipients.transitions.clear();
-        self.unread_out = None;
+        self.unread_fade = motion::NumberFade::default();
         self.label_header_in = None;
         Settled {
             list: list.map(|glide| glide.to),
@@ -702,7 +705,7 @@ impl InboxMotion {
         }
         running |= self.card_glide.is_some();
         running |= keep_with(&mut self.selection_out, now);
-        running |= keep_with(&mut self.unread_out, now);
+        running |= self.unread_fade.frame(now).is_some();
         if self
             .folder_out
             .as_ref()
@@ -765,24 +768,6 @@ impl InboxMotion {
             .map_or(0.0, |shift| shift.offset_of(id, top, now))
     }
 
-    /// First-sync rows and their count are published in the same frame.
-    pub fn set_unread(&mut self, folder: &str, unread: usize) {
-        if let Some((previous, previous_label, count)) = &mut self.last_unread
-            && previous == folder
-            && previous_label.is_none()
-            && count.is_some()
-        {
-            *count = Some(unread);
-            if self
-                .unread_out
-                .as_ref()
-                .is_some_and(|(old, _)| old.is_some())
-            {
-                self.unread_out = None;
-            }
-        }
-    }
-
     /// Observe the folder whose page actually supplied the count.
     pub fn observe_header(
         &mut self,
@@ -801,7 +786,7 @@ impl InboxMotion {
             let old = self.folder_out.take();
             if old_label.is_some() || label.is_some() {
                 self.label_header_in = self.motion.start(motion::FADE, now);
-                self.unread_out = None;
+                self.unread_fade = motion::NumberFade::default();
                 *count = unread;
                 return;
             }
@@ -829,12 +814,9 @@ impl InboxMotion {
                 }
                 next
             });
-            self.unread_out = None;
+            self.unread_fade = motion::NumberFade::default();
         } else if *count != unread && self.folder_out.is_none() {
-            self.unread_out = self
-                .motion
-                .start(motion::FADE, now)
-                .map(|fade| (*count, fade));
+            self.unread_fade.change(*count, self.motion, now);
         }
         *count = unread;
     }
@@ -931,9 +913,9 @@ impl InboxMotion {
     }
 
     pub fn unread_count(&self, now: Instant) -> Option<(Option<usize>, f32)> {
-        self.unread_out
-            .as_ref()
-            .map(|(old, fade)| (*old, fade.progress(now)))
+        self.unread_fade
+            .frame(now)
+            .map(|(old, progress)| (*old, progress))
     }
 
     fn observe_notice(&mut self, notice: Option<&Toast>, now: Instant) {
@@ -1146,7 +1128,7 @@ impl InboxMotion {
 
     /// Fade a body in under an already drawn header. When its card changes
     /// height, both the text and the height share the full fade.
-    pub fn body_arrived(&mut self, id: &str, height: Option<f32>, now: Instant) {
+    pub fn body_arrived(&mut self, id: &str, height: Option<f32>, pending: bool, now: Instant) {
         let duration = if height.is_some() {
             motion::FADE
         } else {
@@ -1156,8 +1138,14 @@ impl InboxMotion {
             && let Some(fade) = self.motion.start(duration, now)
         {
             let height = height.map(|height| (height, fade));
-            self.bodies
-                .insert(id.to_string(), BodyArrival { fade, height });
+            self.bodies.insert(
+                id.to_string(),
+                BodyArrival {
+                    fade,
+                    height,
+                    placeholder: pending && height.is_some(),
+                },
+            );
         }
     }
 
@@ -1239,7 +1227,13 @@ impl InboxMotion {
                 } else {
                     body.fade.progress(now)
                 };
-                let alpha = motion::lerp(motion::ARRIVE_FROM, 1.0, shown);
+                let alpha = if body.placeholder {
+                    // Open enough space for the new body before its first
+                    // line replaces the downloading label.
+                    motion::ease_out_quad((shown - 0.55) / 0.45)
+                } else {
+                    motion::lerp(motion::ARRIVE_FROM, 1.0, shown)
+                };
                 (id.clone(), alpha)
             })
             .collect()
@@ -1260,7 +1254,7 @@ impl InboxMotion {
             .collect()
     }
 
-    pub fn body_heights(&self, now: Instant) -> HashMap<String, (f32, f32)> {
+    pub fn body_heights(&self, now: Instant) -> HashMap<String, (f32, f32, bool)> {
         self.bodies
             .iter()
             .filter_map(|(id, body)| {
@@ -1269,7 +1263,11 @@ impl InboxMotion {
                 // once. Use the same gentler curve as a long scroll glide.
                 Some((
                     id.clone(),
-                    (from, motion::ease_out_quad(growth.linear(now))),
+                    (
+                        from,
+                        motion::ease_out_quad(growth.linear(now)),
+                        body.placeholder,
+                    ),
                 ))
             })
             .collect()
@@ -1514,10 +1512,8 @@ mod tests {
         let now = Instant::now();
         motion.observe_header("INBOX", None, None, now);
         assert_eq!(motion.header_unread(), None);
-        motion.set_unread("INBOX", 51);
         motion.observe_header("INBOX", None, Some(51), now);
         assert_eq!(motion.unread_count(now), Some((None, 0.)));
-        motion.set_unread("INBOX", 52);
         motion.observe_header("INBOX", None, Some(52), later(now, 30));
         assert_eq!(motion.header_unread(), Some(52));
         assert_eq!(
@@ -1527,6 +1523,16 @@ mod tests {
         assert!(!motion.tick(now + motion::FADE));
         assert_eq!(motion.header_unread(), Some(52));
         assert_eq!(motion.unread_count(now + motion::FADE), None);
+
+        let burst = later(now, 300);
+        motion.observe_header("INBOX", Some(127), burst);
+        motion.observe_header("INBOX", Some(207), later(burst, 40));
+        assert_eq!(motion.header_unread(), Some(207));
+        assert_eq!(
+            motion.unread_count(later(burst, 60)),
+            Some((Some(52), motion::ease_out(0.5)))
+        );
+        assert_eq!(motion.unread_count(burst + motion::FADE), None);
     }
 
     #[test]
@@ -2247,7 +2253,7 @@ mod tests {
         motion.observe(&session, (false, true), now);
         assert!(motion.closing_overlay(now).is_none());
         assert!(motion.status(&session, now).leaving.is_none());
-        motion.body_arrived("a", None, now);
+        motion.body_arrived("a", None, false, now);
         session.quotes_open.insert("a".into());
         session.recipients_open.insert("a".into());
         assert!(motion.body_alphas(now).is_empty());
@@ -2261,7 +2267,7 @@ mod tests {
         let mut motion = InboxMotion::new(Motion::new(true));
         let mut session = session();
         let now = Instant::now();
-        motion.body_arrived("a", None, now);
+        motion.body_arrived("a", None, false, now);
         session.quotes_open.insert("b".into());
         session.recipients_open.insert("b".into());
         assert_eq!(motion.body_alphas(now)["a"], motion::ARRIVE_FROM);

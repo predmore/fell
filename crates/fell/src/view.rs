@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fell_core::{
     AccountConfig, AccountId, CidRepairBatch, CidRepairProgress, DropReason, DroppedWrite,
@@ -48,7 +48,7 @@ use crate::mail_body::{
 use crate::mailbox;
 use crate::model::{
     Banner, DRAFT_NOT_THREAD, DownloadStatus, Fetch, FlagEdit, FolderIntent, LabelEdit, Overlay, PickerChoice,
-    QueryFault, ReadDwell, Session, Step, SyncKind, Toast, row_key,
+    QueryFault, ReadDwell, Session, Step, SyncKind, Toast, grouped, row_key,
 };
 use crate::motion::{self, Glide, LayerSwap, ListShift, Motion, RowMotion, SwapFrame, Transition};
 use crate::onboarding::Onboarding;
@@ -217,7 +217,6 @@ pub(crate) fn finish_onboarding(
     window.replace_root(cx, |window, cx| {
         let mut inbox = Inbox::focused(startup, false, window, cx);
         inbox.first_preview = FirstPreview::Handoff;
-        inbox.first_sync = true;
         inbox.waiting_for_first_rows = true;
         let now = inbox.motion.clock.now();
         inbox.motion.observe_header(&inbox.list_folder, None, None, now);
@@ -236,8 +235,6 @@ struct ReadIntent {
     switch: bool,
     /// Sync changed a body. Read it after the list resolves the thread key.
     refresh_open: bool,
-    /// First sync publishes the unread count with these rows.
-    first_sync: bool,
     /// Archive, move, or undo wrote to the store. Scroll to the selection
     /// instead of holding the viewport still.
     changed: bool,
@@ -254,7 +251,6 @@ impl ReadIntent {
     fn merge(mut self, later: ReadIntent) -> ReadIntent {
         self.switch |= later.switch;
         self.refresh_open |= later.refresh_open;
-        self.first_sync |= later.first_sync;
         self.changed |= later.changed;
         if later.select.is_some() {
             self.select = later.select;
@@ -612,7 +608,6 @@ struct Inbox {
     theme: Theme,
     setup_exit: Option<(gpui::Entity<Onboarding>, LayerSwap)>,
     first_preview: FirstPreview,
-    first_sync: bool,
     waiting_for_first_rows: bool,
     status_labels: StatusLabels,
     list_scroll: UniformListScrollHandle,
@@ -841,7 +836,6 @@ impl Inbox {
             session,
             setup_exit: None,
             first_preview: FirstPreview::Off,
-            first_sync: false,
             waiting_for_first_rows: false,
             status_labels: StatusLabels::default(),
             store,
@@ -1195,9 +1189,15 @@ impl Inbox {
                         if matches!(kind, SyncKind::Failed(_)) {
                             cx.global_mut::<ReplyChecks>().set_offline(true);
                         }
-                        let first_sync = inbox.first_sync;
+                        if let SyncKind::Syncing {
+                            progress: Some(progress),
+                            ..
+                        } = &kind
+                            && progress.folder == inbox.session.roles.label("INBOX")
+                        {
+                            inbox.motion.inbox_sync_total = Some(progress.total);
+                        }
                         if matches!(kind, SyncKind::Synced { .. }) {
-                            inbox.first_sync = false;
                             cx.global_mut::<ReplyChecks>().set_offline(false);
                             if wrote {
                                 inbox
@@ -1213,7 +1213,6 @@ impl Inbox {
                             inbox.request_threads(
                                 ReadIntent {
                                     refresh_open: true,
-                                    first_sync,
                                     ..ReadIntent::default()
                                 },
                                 cx,
@@ -1612,9 +1611,6 @@ impl Inbox {
         }
         self.waiting_for_first_rows &= rows.is_empty();
         self.session.set_page(rows, more_before, more_after, unread);
-        if intent.first_sync && !switched {
-            self.motion.set_unread(&self.list_folder, unread);
-        }
         if let Some(key) = &intent.select
             && self.session.select_if_present(key.thread_id.as_str())
             && self.session.cursor_id != before_id
@@ -4082,12 +4078,15 @@ impl Inbox {
             (height > px(0.)).then(|| f32::from(height))
         };
         refresh.apply(&mut self.session, &mut self.motion, now, height);
-        let opened = !self.session.cursor_awaits_body() && self.landing.stop_snapping();
+        let opened = !self.session.cursor_awaits_body() && self.landing.snapping();
         if (opened || self.reveal.pending())
             && self.motion.body_growth_running(now)
+            && layout_current
+            && let Some(placeholder) = ScrollAnchor::capture_message(scroll, selected, usize::from(self.conv_note_slot))
             && let Some(slide) = self.motion.motion.start(motion::FADE, now)
         {
-            self.body_landing = Some((clamped_offset(&self.conv_scroll), slide));
+            self.landing.stop_snapping();
+            self.body_landing = Some((placeholder.y, slide));
             self.reveal.cancel_pending();
         }
         if rich_arrived && self.session.reveal_matching_quote(selected) {
@@ -4735,6 +4734,7 @@ impl Render for Inbox {
             | verify_pin
             | setup_frame.is_some()
             | status_labels.outgoing.is_some()
+            | status_labels.count_fade.is_some()
             | self.row_widths.running(now)
             | spin_attachment
             | agents_animating
@@ -4982,7 +4982,7 @@ struct ConvFrame {
     /// Bodies fading in, by message id: their opacity.
     alphas: HashMap<String, f32>,
     card_alphas: HashMap<String, f32>,
-    heights: HashMap<String, (f32, f32)>,
+    heights: HashMap<String, (f32, f32, bool)>,
     preview_padding: Option<PreviewPadding>,
     disclosures: Disclosures,
     /// The message held at its previous viewport position, or at the top on open.
@@ -5682,15 +5682,11 @@ fn header(
         clip_shaped(window, &style, text, room.floor(), weight, None)
             .filter(|line| f32::from(line.width).ceil() <= room)
     };
-    let count_width = |unread| {
-        line_px_with_style(
-            window,
-            &style,
-            &format!("{unread} unread"),
-            FontWeight::NORMAL,
-        )
-        .ceil()
-    };
+    let figures = tabular_style(window, theme, theme.ui_px);
+    let count_text = |unread| format!("{} unread", grouped(unread));
+    let count_width =
+        |text: &str| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
+    let inbox_total = motion.inbox_sync_total;
     let count = |unread: usize| {
         div()
             .flex_none()
@@ -5700,89 +5696,97 @@ fn header(
             } else {
                 theme.dimmed
             }))
-            .child(format!("{unread} unread"))
+            .font(figures.font())
+            .child(count_text(unread))
     };
-    let folder_group =
-        |(folder, label): (&str, Option<&str>), unread: Option<usize>, count_fade: Option<(Option<usize>, f32)>| {
-            let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
-            let (old, shown) = count_fade.unwrap_or((None, 1.));
-            let count_room = count_width(888)
-                .max(unread.map_or(0., count_width))
-                .max(old.map_or(0., count_width));
-            let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
-            let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
-            let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
-            let name = if label.is_some() {
-                fit(&title, name_room, FontWeight::SEMIBOLD)
-            } else {
-                fit_folder_path(
-                    &title,
-                    FolderFit::Header,
-                    |path| {
-                        clip_shaped(
-                            window,
-                            &style,
-                            path,
-                            name_room.floor(),
-                            FontWeight::SEMIBOLD,
-                            None,
-                        )
-                    },
-                    |line| &line.text,
-                )
-            };
-            let name_width = name
-                .as_ref()
-                .map_or(0., |line| f32::from(line.width).ceil());
-            let detail = label
-                .map(|_| "Label".into())
-                .or_else(|| session.folder_detail(folder))
-                .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
-            let detail_space = detail
-                .as_ref()
-                .map_or(0., |line| 6. + f32::from(line.width).ceil());
-            let group = div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(COUNT_GAP))
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_baseline()
-                        .gap(px(6.))
-                        .children(name.map(|line| {
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(line.text)
-                        }))
-                        .children(detail.map(|line| {
-                            div()
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .text_color(rgb(theme.dimmed))
-                                .child(line.text)
-                        })),
-                )
-                .when(!drafts, |row| {
-                    row.child(
+    let folder_group = |(folder, label): (&str, Option<&str>),
+                        unread: Option<usize>,
+                        count_fade: Option<(Option<usize>, f32)>| {
+        let drafts = label.is_none() && session.roles.is(FolderRole::Drafts, folder);
+        let (old, shown) = count_fade.unwrap_or((None, 1.));
+        let bound = if label.is_none() && session.roles.is(FolderRole::Inbox, folder) {
+            inbox_total.map_or(888, |total| (total as usize).max(888))
+        } else {
+            888
+        };
+        let measure = |unread| count_width(&count_text(unread));
+        let count_room = count_width(&count_text(bound).replace(|c: char| c.is_ascii_digit(), "8"))
+            .max(unread.map_or(0., measure))
+            .max(old.map_or(0., measure));
+        let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
+        let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
+        let title = label.map_or_else(|| session.roles.label(folder), present::display_safe);
+        let name = if label.is_some() {
+            fit(&title, name_room, FontWeight::SEMIBOLD)
+        } else {
+            fit_folder_path(
+                &title,
+                FolderFit::Header,
+                |path| {
+                    clip_shaped(
+                        window,
+                        &style,
+                        path,
+                        name_room.floor(),
+                        FontWeight::SEMIBOLD,
+                        None,
+                    )
+                },
+                |line| &line.text,
+            )
+        };
+        let name_width = name
+            .as_ref()
+            .map_or(0., |line| f32::from(line.width).ceil());
+        let detail = label
+            .map(|_| "Label".into())
+            .or_else(|| session.folder_detail(folder))
+            .and_then(|text| fit(&text, name_room - name_width - 6., FontWeight::NORMAL));
+        let detail_space = detail
+            .as_ref()
+            .map_or(0., |line| 6. + f32::from(line.width).ceil());
+        let group = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(COUNT_GAP))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .children(name.map(|line| {
                         div()
                             .flex_none()
-                            .relative()
-                            .flex()
-                            .justify_end()
-                            .w(px(count_room))
-                            .children(unread.map(|unread| count(unread).opacity(shown)))
-                            .children(old.map(|old| {
-                                count(old).absolute().right_0().top_0().opacity(1. - shown)
-                            })),
-                    )
-                });
-            (group, name_width + detail_space + count_space)
-        };
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(line.text)
+                    }))
+                    .children(detail.map(|line| {
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme.dimmed))
+                            .child(line.text)
+                    })),
+            )
+            .when(!drafts, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .relative()
+                        .flex()
+                        .justify_end()
+                        .w(px(count_room))
+                        .children(unread.map(|unread| count(unread).opacity(shown)))
+                        .children(old.map(|old| {
+                            count(old).absolute().right_0().top_0().opacity(1. - shown)
+                        })),
+                )
+            });
+        (group, name_width + detail_space + count_space)
+    };
 
     let (current, current_width) =
         folder_group(scope, motion.header_unread(), motion.unread_count(now));
@@ -7087,6 +7091,15 @@ fn paint_shaped_text(
     .flex_none()
 }
 
+fn tabular_style(window: &Window, theme: &Theme, size: f32) -> TextStyle {
+    static FEATURES: OnceLock<gpui::FontFeatures> = OnceLock::new();
+    let mut style = conversation_line_style(window, theme, px(size));
+    style.font_features = FEATURES
+        .get_or_init(|| gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+        .clone();
+    style
+}
+
 /// The width of `text` as the status bar draws it: its size and family.
 fn bar_px(window: &Window, text: &str, size: f32, family: Option<&String>) -> f32 {
     if text.is_empty() {
@@ -7418,7 +7431,9 @@ impl BodyRefresh {
                     .expanded
                     .then(|| height(index))
                     .flatten();
-                motion.body_arrived(&messages[index].id, old_height, now);
+                let pending = session.messages[index].body_state == fell_core::BodyState::Pending
+                    && messages[index].body_state == fell_core::BodyState::Stored;
+                motion.body_arrived(&messages[index].id, old_height, pending, now);
             }
             session.refresh_same_messages(messages);
         } else {
@@ -7427,7 +7442,7 @@ impl BodyRefresh {
                     && ready != message.rich
                 {
                     if message.expanded {
-                        motion.body_arrived(&message.id, height(index), now);
+                        motion.body_arrived(&message.id, height(index), false, now);
                     }
                     message.rich = ready;
                 }
@@ -7562,14 +7577,16 @@ fn conversation(
                 block
             };
             let block = match frame.heights.get(&message.id) {
-                Some(&(from, progress)) if progress < 1.0 && message.expanded => GrowingMessage {
-                    inner: block,
-                    width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
-                    from,
-                    progress,
-                    gap: px(MESSAGE_GAP_PX),
+                Some(&(from, progress, _)) if progress < 1.0 && message.expanded => {
+                    GrowingMessage {
+                        inner: block,
+                        width: px(columns.pane_right + 2. * MESSAGE_PAD_PX),
+                        from,
+                        progress,
+                        gap: px(MESSAGE_GAP_PX),
+                    }
+                    .into_any_element()
                 }
-                .into_any_element(),
                 _ => block,
             };
             let block =
@@ -8285,19 +8302,58 @@ fn message_body(
 ) -> gpui::AnyElement {
     let alpha = frame.body_alpha(&message.id);
     if let Some(line) = present::missing_body_line(message.body_state, frame.syncing) {
-        return folds.columns.flow(
-            |columns| columns.prose,
-            |_, _| {
-                div()
-                    .pb(px(8.))
-                    .line_height(px(theme.ui_px * 1.45))
-                    .text_color(rgb(theme.dimmed))
-                    .opacity(alpha)
-                    .child(line.clone())
-                    .into_any_element()
-            },
-        );
+        return missing_message_body(theme, folds.columns, &line, alpha);
     }
+    let arriving = frame
+        .heights
+        .get(&message.id)
+        .is_some_and(|&(_, _, pending)| pending);
+    if !arriving || alpha >= 1.0 {
+        return stored_message_body(theme, message, folds, frame, alpha, cx);
+    }
+    let body = stored_message_body(theme, message, folds, frame, alpha, cx);
+    let line = present::missing_body_line(fell_core::BodyState::Pending, frame.syncing)
+        .expect("pending messages always have a placeholder");
+    div()
+        .relative()
+        .child(body)
+        .child(div().absolute().inset_0().child(missing_message_body(
+            theme,
+            folds.columns,
+            &line,
+            1.0 - alpha,
+        )))
+        .into_any_element()
+}
+
+fn missing_message_body(
+    theme: &Theme,
+    columns: ReaderColumns,
+    line: &str,
+    alpha: f32,
+) -> gpui::AnyElement {
+    columns.flow(
+        |columns| columns.prose,
+        |_, _| {
+            div()
+                .pb(px(8.))
+                .line_height(px(theme.ui_px * 1.45))
+                .text_color(rgb(theme.dimmed))
+                .opacity(alpha)
+                .child(line.to_owned())
+                .into_any_element()
+        },
+    )
+}
+
+fn stored_message_body(
+    theme: &Theme,
+    message: &ConvMessage,
+    folds: FoldView,
+    frame: &ConvFrame,
+    alpha: f32,
+    cx: &mut Context<Inbox>,
+) -> gpui::AnyElement {
     let reveal = frame.disclosures().quotes.get(&message.id).copied();
     if let Rich::Html(body) = &message.rich {
         return div()
@@ -8908,8 +8964,9 @@ impl StatusLabel {
         &self,
         theme: &Theme,
         size: f32,
+        room: f32,
         window: &Window,
-        fading_count: Option<(String, f32)>,
+        fading_count: Option<(&str, f32)>,
     ) -> (gpui::Div, f32) {
         let ui = theme.ui_family.as_ref();
         let label = div()
@@ -8927,19 +8984,24 @@ impl StatusLabel {
             let width = bar_px(window, &self.text, size, ui).ceil();
             return (label.child(self.text.clone()), width);
         };
-        let mono = theme
-            .mono_family
-            .clone()
-            .unwrap_or_else(|| "monospace".into());
-        let figure_width = |text| bar_px(window, text, size, Some(&mono)).ceil();
-        let mut count_room = figure_width(total).max(figure_width(done));
-        if let Some((old, _)) = &fading_count {
-            count_room = count_room.max(figure_width(old));
-        }
-        let width = bar_px(window, prefix, size, ui).ceil()
-            + count_room
-            + bar_px(window, suffix, size, ui).ceil();
-        let shown = fading_count.as_ref().map_or(1.0, |(_, progress)| *progress);
+        let figures = tabular_style(window, theme, size);
+        let figure_width =
+            |text| line_px_with_style(window, &figures, text, FontWeight::NORMAL).ceil();
+        let count_room =
+            figure_width(done).max(fading_count.map_or(0., |(old, _)| figure_width(old)));
+        let suffix_width = bar_px(window, suffix, size, ui).ceil();
+        // Keep the prefix through the whole download, even as its count
+        // gains digits. Only its fitting decision needs the wider measure.
+        let prefix_room = room - count_room.max(figure_width(total)) - suffix_width;
+        let short;
+        let prefix = if bar_px(window, prefix, size, ui).ceil() > prefix_room {
+            short = format!("Downloading {total} · ");
+            &short
+        } else {
+            prefix
+        };
+        let width = bar_px(window, prefix, size, ui).ceil() + count_room + suffix_width;
+        let shown = fading_count.map_or(1.0, |(_, progress)| progress);
         let label = label
             .flex()
             .items_baseline()
@@ -8949,17 +9011,15 @@ impl StatusLabel {
                     .relative()
                     .w(px(count_room))
                     .flex_none()
-                    .flex()
-                    .justify_end()
-                    .font_family(mono)
+                    .font(figures.font())
                     .child(div().opacity(shown).child(done.clone()))
                     .children(fading_count.map(|(old, progress)| {
                         div()
                             .absolute()
-                            .right_0()
+                            .left_0()
                             .top_0()
                             .opacity(1.0 - progress)
-                            .child(old)
+                            .child(old.to_owned())
                     })),
             )
             .child(div().flex_none().child(suffix.clone()));
@@ -8971,12 +9031,13 @@ impl StatusLabel {
 struct StatusLabels {
     current: Option<StatusLabel>,
     outgoing: Option<(StatusLabel, Transition)>,
-    last_count_update: Option<Instant>,
+    count_fade: motion::NumberFade<String>,
 }
 
 struct StatusLabelsFrame {
     current: StatusLabel,
     outgoing: Option<(StatusLabel, f32)>,
+    count_fade: Option<(String, f32)>,
 }
 
 impl StatusLabels {
@@ -8992,24 +9053,22 @@ impl StatusLabels {
         if let Some(old) = old {
             if old.phase != next.phase {
                 self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
-                self.last_count_update = None;
+                self.count_fade = motion::NumberFade::default();
             } else if let (Some(old_download), Some(next_download)) =
                 (&old.download, &next.download)
                 && old_download.done != next_download.done
+                && self.outgoing.is_none()
             {
-                // A burst keeps updating the incoming count on the original
-                // clock. After it settles, keep following the burst directly.
-                let quiet = self
-                    .last_count_update
-                    .replace(now)
-                    .is_none_or(|last| now.duration_since(last) >= motion::FADE);
-                if quiet && self.outgoing.is_none() {
-                    self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
-                }
+                self.count_fade
+                    .change(old_download.done.clone(), motion, now);
             }
         }
         StatusLabelsFrame {
             current: next,
+            count_fade: self
+                .count_fade
+                .frame(now)
+                .map(|(old, shown)| (old.clone(), shown)),
             outgoing: self
                 .outgoing
                 .as_ref()
@@ -9020,25 +9079,22 @@ impl StatusLabels {
 
 impl StatusLabelsFrame {
     fn fading_count(&self) -> Option<(&str, f32)> {
-        let (old, elapsed) = self.outgoing.as_ref()?;
-        let download = old.download.as_ref()?;
-        (old.phase == self.current.phase)
-            .then_some((download.done.as_str(), motion::ease_out(*elapsed)))
+        self.count_fade
+            .as_ref()
+            .map(|(old, shown)| (old.as_str(), *shown))
     }
 
-    fn draw(&self, theme: &Theme, size: f32, window: &Window) -> (gpui::Div, f32) {
-        if let Some((old, shown)) = self.fading_count() {
-            let old = old.to_owned();
-            return self.current.draw(theme, size, window, Some((old, shown)));
-        }
+    fn draw(&self, theme: &Theme, size: f32, room: f32, window: &Window) -> (gpui::Div, f32) {
         let Some((old, elapsed)) = &self.outgoing else {
-            return self.current.draw(theme, size, window, None);
+            return self
+                .current
+                .draw(theme, size, room, window, self.fading_count());
         };
 
         // Keep both measures while the phase changes. Only a brief, dim
         // overlap passes through the middle of the fade.
-        let (current, width) = self.current.draw(theme, size, window, None);
-        let (old, old_width) = old.draw(theme, size, window, None);
+        let (current, width) = self.current.draw(theme, size, room, window, None);
+        let (old, old_width) = old.draw(theme, size, room, window, None);
         let width = width.max(old_width);
         let incoming = motion::ease_out((*elapsed - 0.45) / 0.55);
         let outgoing = motion::fade_out(*elapsed / 0.6);
@@ -9100,7 +9156,17 @@ fn status_bar(
     } else {
         0.
     };
-    let sync_room = width - 2. * padding - 2. * gap - mode_width - dot_width - details_width;
+    let trailing = if noticed {
+        gap + dot_width
+    } else {
+        16. + if hint.is_empty() && count.is_empty() {
+            0.
+        } else {
+            gap + bar_px(window, &format!("{count}{hint}"), size, mono)
+        }
+    };
+    let sync_room =
+        width - 2. * padding - 3. * gap - mode_width - dot_width - details_width - trailing;
     // What the bar spends before the notice, measured as drawn: the
     // padding, the mode in mono, sync, the dots, the gaps between the
     // children. No typed keys show beside a notice, so no air after it.
@@ -9116,7 +9182,7 @@ fn status_bar(
                 .child(status_text(text.to_owned(), Some((&key, " for log")), theme));
             (label, width)
         } else {
-            labels.draw(theme, size, window)
+            labels.draw(theme, size, sync_room, window)
         }
     };
     let (label, sync_width) = draw_sync(size);

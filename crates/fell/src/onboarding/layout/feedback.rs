@@ -30,9 +30,9 @@ impl Connection {
     pub fn heading(self) -> (&'static str, &'static str) {
         match self {
             Self::Testing => ("Testing connection", "Checking both sign-ins."),
-            Self::Verified => ("Connection verified", "Both sign-ins work."),
-            Self::BridgeOffline => ("Connection test failed", "Open Bridge and sign in."),
-            Self::BothFailed => ("Connection test failed", "Both sign-ins failed."),
+            Self::Verified => ("Verified", "Both sign-ins work."),
+            Self::BridgeOffline => ("Sign-in failed", "Open Bridge and sign in."),
+            Self::BothFailed => ("Sign-in failed", "Both sign-ins failed."),
         }
     }
 }
@@ -53,10 +53,8 @@ pub(super) enum SaveState {
 impl SaveState {
     const KEYRING: (&'static str, &'static str) =
         ("Save your account", "Store your password to sync mail.");
-    const FILE: (&'static str, &'static str) = (
-        "Save password in file",
-        "Choose where to store your password.",
-    );
+    const FILE: (&'static str, &'static str) =
+        ("Save in a file", "Choose where to store your password.");
     const FAILED: (&'static str, &'static str) =
         ("Save your account", "Choose where to store your password.");
     pub const HEADINGS: [(&'static str, &'static str); 3] =
@@ -151,19 +149,17 @@ pub(super) type Actions = [Change<Option<Action>>; 3];
 impl Connection {
     fn actions(self) -> [Option<Action>; 3] {
         let back = Some(Action::new(Control::Back, "Back"));
+        let next = |label| Action::new(Control::Next, label);
         let (secondary, primary) = match self {
-            Self::Testing | Self::BothFailed => (None, None),
-            Self::Verified => (None, Some("Continue")),
+            Self::Testing => (None, Some(next("Testing…").disabled())),
+            Self::BothFailed => (None, None),
+            Self::Verified => (None, Some(next("Continue"))),
             Self::BridgeOffline => (
                 Some(Action::new(Control::Install, "Install Bridge ↗")),
-                Some("Try again"),
+                Some(next("Try again")),
             ),
         };
-        [
-            back,
-            secondary,
-            primary.map(|label| Action::new(Control::Next, label)),
-        ]
+        [back, secondary, primary]
     }
 }
 
@@ -238,7 +234,7 @@ impl<T: PartialEq> Change<T> {
         self.frame.is_some()
     }
 
-    pub fn visible(&self, live: bool) -> (&T, bool, f32) {
+    fn visible(&self, live: bool) -> (&T, bool, f32) {
         match (&self.frame, &self.swap) {
             (Some(SwapFrame::Leaving(opacity)), Some((old, _, from))) => {
                 (old, false, opacity * from)
@@ -285,11 +281,36 @@ impl<T: PartialEq> Change<Option<T>> {
     }
 }
 
+/// An overlapping swap for hints whose natural height can also change.
+#[derive(Default)]
+pub(super) struct Crossfade<T> {
+    pub value: T,
+    outgoing: Option<(T, Transition)>,
+    pub frame: Option<(T, f32)>,
+}
+
+impl<T: Copy + PartialEq> Crossfade<T> {
+    fn update(&mut self, next: T, motion: Motion, now: Instant) -> bool {
+        if self.value != next {
+            let old = std::mem::replace(&mut self.value, next);
+            self.outgoing = motion.start(motion::FADE, now).map(|fade| (old, fade));
+        }
+        self.outgoing = self.outgoing.filter(|(_, fade)| fade.running(now));
+        self.frame = self.outgoing.map(|(old, fade)| (old, fade.progress(now)));
+        self.frame.is_some()
+    }
+
+    fn settle(&mut self) {
+        self.outgoing = None;
+        self.frame = None;
+    }
+}
+
+pub(super) type ServerIssues = [Option<Issue>; 3];
+
 #[derive(Default)]
 pub(in crate::onboarding) struct Feedback {
-    pub(super) bridge: Change<Bridge>,
-    bridge_height: Option<(f32, Transition)>,
-    pub(super) bridge_resize: Option<f32>,
+    pub(super) bridge: Crossfade<Bridge>,
     pub(super) connection: Change<Connection>,
     pub(super) checks: [Change<Check>; 2],
     pub(super) bridge_offline: [Change<bool>; 2],
@@ -303,14 +324,12 @@ pub(in crate::onboarding) struct Feedback {
     pub(super) back_amount: f32,
     pub(super) email: Change<Option<Issue>>,
     pub(super) password: Change<Option<Issue>>,
-    pub(super) servers: [[Change<Option<Issue>>; 3]; 2],
+    pub(super) servers: [Crossfade<ServerIssues>; 2],
 }
 
 impl Feedback {
     pub fn settle(&mut self) {
         self.bridge.settle();
-        self.bridge_height = None;
-        self.bridge_resize = None;
         self.connection.settle();
         for action in self
             .connection_actions
@@ -331,7 +350,7 @@ impl Feedback {
         for offline in &mut self.bridge_offline {
             offline.settle();
         }
-        for issue in self.servers.iter_mut().flatten() {
+        for issue in &mut self.servers {
             issue.settle();
         }
     }
@@ -387,33 +406,40 @@ impl Feedback {
         self.back_amount = 0.;
     }
 
-    pub(super) fn issue(&self, field: Field) -> Option<&Change<Option<Issue>>> {
-        match field {
-            Field::Email => Some(&self.email),
-            Field::Password => Some(&self.password),
-            Field::Host(service) => Some(&self.servers[service as usize][0]),
-            Field::Port(service) => Some(&self.servers[service as usize][1]),
-            Field::Security(service) => Some(&self.servers[service as usize][2]),
-            Field::Name | Field::Username => None,
+    pub(super) fn error_amount(&self, field: Field) -> f32 {
+        let server = match field {
+            Field::Host(service) => Some((service, 0)),
+            Field::Port(service) => Some((service, 1)),
+            Field::Security(service) => Some((service, 2)),
+            _ => None,
+        };
+        if let Some((service, index)) = server {
+            let slot = &self.servers[service as usize];
+            return if slot.value[index].is_some() {
+                1.
+            } else {
+                slot.frame.map_or(
+                    0.,
+                    |(old, shown)| {
+                        if old[index].is_some() { 1. - shown } else { 0. }
+                    },
+                )
+            };
+        }
+        let issue = match field {
+            Field::Email => &self.email,
+            Field::Password => &self.password,
+            _ => return 0.,
+        };
+        if issue.value.is_some() {
+            1.
+        } else {
+            issue.clearing()
         }
     }
 
     pub fn refresh(&mut self, form: &Form, bridge: Bridge, motion: Motion, now: Instant) -> bool {
-        let offline = |status| if status == Bridge::Offline { 1. } else { 0. };
-        if offline(bridge) != offline(self.bridge.value) {
-            let from = self
-                .bridge_height
-                .map_or(offline(self.bridge.value), |(from, height)| {
-                    motion::lerp(from, offline(self.bridge.value), height.progress(now))
-                });
-            self.bridge_height = motion.start(motion::FADE, now).map(|height| (from, height));
-        }
-        self.bridge
-            .update(bridge, motion, now, motion::FADE, motion::FADE);
-        self.bridge_height = self.bridge_height.filter(|(_, height)| height.running(now));
-        self.bridge_resize = self
-            .bridge_height
-            .map(|(from, height)| motion::lerp(from, offline(bridge), height.progress(now)));
+        let bridge_active = self.bridge.update(bridge, motion, now);
         if form.step == Step::Connection {
             let state = if form.connected() {
                 Connection::Verified
@@ -477,24 +503,26 @@ impl Feedback {
             .update_optional(issue(Field::Email), false, motion, now);
         self.password
             .update_optional(issue(Field::Password), true, motion, now);
+        let mut server_active = false;
         for service in Service::ALL {
-            for (slot, field) in self.servers[service as usize].iter_mut().zip([
+            let issues = [
                 Field::Host(service),
                 Field::Port(service),
                 Field::Security(service),
-            ]) {
-                let issue = issue(field).map(|mut issue| {
+            ]
+            .map(|field| {
+                issue(field).map(|mut issue| {
                     if issue.suggest_starttls {
                         issue.suggest_starttls = form.offers_starttls(service);
                     }
                     issue
-                });
-                slot.update_optional(issue, false, motion, now);
-            }
+                })
+            });
+            server_active |= self.servers[service as usize].update(issues, motion, now);
         }
 
-        let mut active = self.bridge.tick(now)
-            | self.bridge_resize.is_some()
+        let mut active = bridge_active
+            | server_active
             | self.connection.tick(now)
             | self.save_title.tick(now)
             | self.save_subtitle.tick(now)
@@ -504,9 +532,6 @@ impl Feedback {
             | self.password.tick(now);
         for index in 0..self.checks.len() {
             active |= self.checks[index].tick(now) | self.bridge_offline[index].tick(now);
-        }
-        for issue in self.servers.iter_mut().flatten() {
-            active |= issue.tick(now);
         }
         for action in self
             .connection_actions
