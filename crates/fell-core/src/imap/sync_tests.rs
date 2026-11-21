@@ -3170,6 +3170,40 @@ fn internal_date_repair_uses_sent_when_inbox_keeps_refusing() {
 }
 
 #[test]
+fn truncated_internal_date_fetch_keeps_results_from_finished_mailboxes() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: (1..=5).map(|uid| dated_copy(uid, "inbox@x")).collect(),
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "sent@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    });
+    let backend = ImapBackend {
+        account_id: AccountId("truncated-dates".into()),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let sent = crate::RemoteId("imap:21:1:Sent".into());
+    let copies: Vec<_> = (1..=5)
+        .map(|uid| crate::RemoteId(format!("imap:20:{uid}:INBOX")))
+        .chain(std::iter::once(sent.clone()))
+        .collect();
+    let _limit = super::session::limit_untagged_to(4);
+    let mut checked = Vec::new();
+    let result = backend.fetch_internal_dates(&copies, &mut |id, date| {
+        checked.push((id.clone(), date));
+    });
+    assert!(matches!(result, Err(crate::Error::Backend(message)) if message.contains("truncated")));
+    assert_eq!(checked, vec![(sent, Some(1_707_512_400))]);
+}
+
+#[test]
 fn mail_deleted_on_the_server_is_gone_locally() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);

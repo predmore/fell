@@ -200,7 +200,9 @@ pub trait MailBackend {
 
     /// Read arrival dates without fetching bodies. Report every requested copy
     /// in a completed mailbox fetch, even when it returned no date. Skipped
-    /// mailboxes and incomplete fetches leave their copies unreported.
+    /// mailboxes and incomplete fetches leave their copies unreported. An
+    /// interrupted or truncated pass returns an error after reporting any
+    /// results from completed mailbox fetches.
     fn fetch_internal_dates(
         &self,
         _copies: &[crate::RemoteId],

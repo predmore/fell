@@ -4412,30 +4412,34 @@ mod tests {
         // is too small to accept the header that the cache already stored.
         let header_date = 1_707_512_400;
         let behind_latest = header_date - 86_400;
-        let (store, account, remote_id) = legacy_date_repair(header_date, behind_latest);
-        let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
-        assert_eq!(date(), 0);
+        for arrival in [behind_latest - 60, header_date + 60] {
+            let (store, account, remote_id) = legacy_date_repair(header_date, behind_latest);
+            let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
+            let checked = [(remote_id, Some(arrival))].into();
+            assert_eq!(date(), 0);
 
-        let batch = store.missing_internal_dates(&account).unwrap();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].copies.as_slice(), std::slice::from_ref(&remote_id));
-        let checked = [(remote_id, Some(behind_latest - 60))].into();
-        assert!(
-            !store
-                .finish_internal_dates(&account, &batch, &checked, behind_latest)
-                .unwrap()
-        );
-        assert_eq!(date(), 0);
+            // IDLE can trigger several sync passes before the clock moves.
+            for _ in 0..5 {
+                let batch = store.missing_internal_dates(&account).unwrap();
+                assert_eq!(batch.len(), 1);
+                assert!(
+                    !store
+                        .finish_internal_dates(&account, &batch, &checked, true, behind_latest)
+                        .unwrap()
+                );
+                assert_eq!(date(), 0);
+            }
 
-        let batch = store.missing_internal_dates(&account).unwrap();
-        assert_eq!(batch.len(), 1);
-        assert!(
-            store
-                .finish_internal_dates(&account, &batch, &checked, header_date + 86_400)
-                .unwrap()
-        );
-        assert_eq!(date(), header_date);
-        assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(
+                store
+                    .finish_internal_dates(&account, &batch, &checked, true, header_date + 1)
+                    .unwrap()
+            );
+            assert_eq!(date(), header_date);
+            assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -4448,7 +4452,7 @@ mod tests {
 
         assert!(
             store
-                .finish_internal_dates(&account, &batch, &checked, latest)
+                .finish_internal_dates(&account, &batch, &checked, true, latest)
                 .unwrap()
         );
         assert_eq!(
@@ -4459,26 +4463,120 @@ mod tests {
     }
 
     #[test]
-    fn date_repair_uses_arrival_at_the_cap_if_the_clock_stays_behind() {
+    fn date_repair_uses_arrival_at_the_cap_if_the_cutoff_keeps_advancing() {
         let arrival = 1_707_512_400;
         let latest = arrival + 86_400;
         let (store, account, remote_id) = legacy_date_repair(latest + 86_400, latest);
         let checked = [(remote_id, Some(arrival))].into();
         let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
 
-        for attempt in 1..=dates::MAX_DATE_REPAIR_ATTEMPTS {
+        for attempt in 0..4 {
             let batch = store.missing_internal_dates(&account).unwrap();
             assert_eq!(batch.len(), 1);
-            let last = attempt == dates::MAX_DATE_REPAIR_ATTEMPTS;
-            assert_eq!(
-                store
-                    .finish_internal_dates(&account, &batch, &checked, latest)
-                    .unwrap(),
-                last
+            let cutoff = latest + attempt * 600;
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, cutoff)
+                    .unwrap()
             );
-            assert_eq!(date(), if last { arrival } else { 0 });
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, cutoff + 599)
+                    .unwrap()
+            );
+            assert_eq!(date(), 0);
         }
+        let batch = store.missing_internal_dates(&account).unwrap();
+        assert!(
+            store
+                .finish_internal_dates(&account, &batch, &checked, true, latest + 4 * 600)
+                .unwrap()
+        );
+        assert_eq!(date(), arrival);
         assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_keeps_the_header_past_the_cap_when_the_arrival_is_too_new() {
+        let header = 1_707_512_400;
+        let latest = header - 86_400;
+        let (store, account, remote_id) = legacy_date_repair(header, latest);
+        let checked = [(remote_id, Some(header + 60))].into();
+        for attempt in 0..6 {
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, latest + attempt * 600)
+                    .unwrap()
+            );
+        }
+        let batch = store.missing_internal_dates(&account).unwrap();
+        assert!(
+            store
+                .finish_internal_dates(&account, &batch, &checked, true, header + 1)
+                .unwrap()
+        );
+        assert_eq!(
+            store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+            header
+        );
+        assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_upgrade_preserves_queue_and_starts_each_budget_at_zero() {
+        let latest = 1_707_512_400;
+        let header = latest + 86_400;
+        let (store, account, remote_id) = legacy_date_repair(header, latest);
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE internal_date_repair DROP COLUMN unchecked_attempts;
+                 ALTER TABLE internal_date_repair DROP COLUMN clock_attempts;
+                 ALTER TABLE internal_date_repair DROP COLUMN last_clock_latest;
+                 UPDATE internal_date_repair SET attempts = 4;",
+            )
+            .unwrap();
+        dates::ensure_date_repair_through(&store.conn, latest).unwrap();
+
+        let batch = store.missing_internal_dates(&account).unwrap();
+        let checked = [(remote_id, Some(latest - 60))].into();
+        let unchecked = std::collections::HashMap::new();
+        for attempt in 0..5 {
+            let observed = if attempt % 2 == 0 {
+                &checked
+            } else {
+                &unchecked
+            };
+            assert!(
+                !store
+                    .finish_internal_dates(
+                        &account,
+                        &batch,
+                        observed,
+                        false,
+                        latest + attempt * 600
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            !store
+                .finish_internal_dates(&account, &batch, &checked, true, latest)
+                .unwrap()
+        );
+        dates::ensure_date_repair_through(&store.conn, latest).unwrap();
+        let queued: (i64, i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT previous_date_unix, unchecked_attempts, clock_attempts, last_clock_latest
+                 FROM internal_date_repair",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, (header, 0, 1, latest));
     }
 
     #[test]

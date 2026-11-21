@@ -101,14 +101,21 @@ fn repair_internal_dates(
         .cloned()
         .collect();
     let mut checked = HashMap::new();
-    if !copies.is_empty() {
-        // Keep the results from any mailbox whose fetch finished before a
-        // connection dropped. Unchecked copies can be retried by the store.
-        let _ = backend.fetch_internal_dates(&copies, &mut |id, date| {
-            checked.insert(id.clone(), date);
-        });
-    }
-    store.finish_internal_dates(account, &batch, &checked, crate::latest_mail_date())
+    // Keep the results from finished mailboxes even when the fetch is
+    // interrupted. Only a completed pass spends a retry.
+    let fetch_complete = copies.is_empty()
+        || backend
+            .fetch_internal_dates(&copies, &mut |id, date| {
+                checked.insert(id.clone(), date);
+            })
+            .is_ok();
+    store.finish_internal_dates(
+        account,
+        &batch,
+        &checked,
+        fetch_complete,
+        crate::latest_mail_date(),
+    )
 }
 
 /// Cursor for walking unchecked Reply-To headers between sync passes.

@@ -29,6 +29,7 @@ pub(crate) fn fetch_reply_to(
             Ok(())
         },
     )
+    .map(|_| ())
 }
 
 pub(crate) fn fetch_internal_dates(
@@ -36,7 +37,7 @@ pub(crate) fn fetch_internal_dates(
     wanted: &[RemoteId],
     completed: &mut dyn FnMut(&RemoteId, Option<i64>),
 ) -> Result<()> {
-    fetch_copy_metadata(
+    let complete = fetch_copy_metadata(
         config,
         wanted,
         session::FetchItems::InternalDate,
@@ -48,7 +49,13 @@ pub(crate) fn fetch_internal_dates(
             }
             Ok(())
         },
-    )
+    )?;
+    if !complete {
+        return Err(crate::Error::Backend(
+            "IMAP INTERNALDATE fetch was truncated".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn fetch_copy_metadata<T>(
@@ -57,7 +64,7 @@ fn fetch_copy_metadata<T>(
     items: session::FetchItems,
     parse: impl Fn(&RemoteId, session::Fetched) -> Option<T>,
     mut persist: impl FnMut(&BTreeMap<u32, &RemoteId>, Vec<T>) -> Result<()>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut mailboxes = BTreeMap::<_, BTreeMap<_, _>>::new();
     for id in wanted {
         if let Some(copy) = parse_remote_id(&id.0)
@@ -70,10 +77,11 @@ fn fetch_copy_metadata<T>(
         }
     }
     if mailboxes.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut session = session::Session::open(config)?;
+    let mut complete = true;
     for ((mailbox, uidvalidity), copies) in mailboxes {
         let Some(examined) = session.examine(&mailbox)? else {
             continue;
@@ -95,10 +103,12 @@ fn fetch_copy_metadata<T>(
             }
             Ok(())
         })?;
-        if matches!(stop, session::FetchStop::Done) {
-            persist(&copies, fetched)?;
+        match stop {
+            session::FetchStop::Done => persist(&copies, fetched)?,
+            session::FetchStop::Refused => {}
+            session::FetchStop::Truncated { .. } => complete = false,
         }
     }
     session.logout();
-    Ok(())
+    Ok(complete)
 }
