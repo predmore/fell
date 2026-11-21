@@ -108,11 +108,9 @@ impl OnnxEmbedder {
         Ok(embedder)
     }
 
-    /// Mean of the token states, before normalisation.
-    fn run(&self, ids: &[i64]) -> TractResult<Vec<f32>> {
+    fn input_tensors(&self, ids: &[i64]) -> TractResult<TVec<TValue>> {
         let len = ids.len();
-        let tensors = self
-            .inputs
+        self.inputs
             .iter()
             .map(|input| {
                 let values = match input {
@@ -122,8 +120,29 @@ impl OnnxEmbedder {
                 };
                 Ok(Tensor::from(tract_ndarray::Array2::from_shape_vec((1, len), values)?).into())
             })
-            .collect::<TractResult<TVec<TValue>>>()?;
-        let outputs = self.plan.run(tensors)?;
+            .collect()
+    }
+
+    /// Measure the pinned graph alone for the store benchmark. Tokenization,
+    /// tensor construction, pooling, and the store remain part of the
+    /// end-to-end hybrid measurement.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn testing_graph_latency(&self, text: &str) -> Result<std::time::Duration, ModelError> {
+        let inference = |err: TractError| ModelError::Inference(format!("{err:#}"));
+        let ids = self.tokenizer.encode(text, self.max_tokens);
+        let tensors = self.input_tensors(&ids).map_err(inference)?;
+        let started = std::time::Instant::now();
+        let outputs = std::hint::black_box(self.plan.run(tensors).map_err(inference)?);
+        let elapsed = started.elapsed();
+        drop(outputs);
+        Ok(elapsed)
+    }
+
+    /// Mean of the token states, before normalisation.
+    fn run(&self, ids: &[i64]) -> TractResult<Vec<f32>> {
+        let len = ids.len();
+        let outputs = self.plan.run(self.input_tensors(ids)?)?;
         let states = outputs
             .first()
             .ok_or_else(|| TractError::msg("the graph has no output"))?
