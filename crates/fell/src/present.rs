@@ -71,9 +71,10 @@ pub struct ConvMessage {
 }
 
 /// What the conversation says in place of a body it does not have.
-pub fn missing_body_line(state: fell_core::BodyState) -> Option<String> {
+pub fn missing_body_line(state: fell_core::BodyState, syncing: bool) -> Option<String> {
     match state {
         fell_core::BodyState::Stored => None,
+        fell_core::BodyState::Pending if syncing => Some("Downloading…".into()),
         fell_core::BodyState::Pending => Some("Not downloaded yet".into()),
         fell_core::BodyState::TooLarge => Some(format!(
             "Too large to download (over {} MB)",
@@ -1375,13 +1376,17 @@ mod tests {
     #[test]
     fn a_body_not_downloaded_says_why() {
         use fell_core::BodyState::{Pending, Stored, TooLarge};
-        assert_eq!(missing_body_line(Stored), None);
+        assert_eq!(missing_body_line(Stored, true), None);
         assert_eq!(
-            missing_body_line(Pending).as_deref(),
+            missing_body_line(Pending, true).as_deref(),
+            Some("Downloading…")
+        );
+        assert_eq!(
+            missing_body_line(Pending, false).as_deref(),
             Some("Not downloaded yet")
         );
         assert_eq!(
-            missing_body_line(TooLarge).as_deref(),
+            missing_body_line(TooLarge, true).as_deref(),
             Some("Too large to download (over 32 MB)")
         );
     }

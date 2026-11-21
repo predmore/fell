@@ -36,6 +36,7 @@ pub struct Theme {
     label_outline: u32,
     selected_label_outline: u32,
     pub error: u32,
+    pub success: u32,
     pub border: u32,
     pub input_border: u32,
     pub star: u32,
@@ -170,6 +171,7 @@ fn map_palette(
     let (foreground, dimmed) = text_pair(foreground, dimmed, surface);
     let accent_raw = color(raw, &["accent", "blue", "color4", "color12"]).unwrap_or(foreground);
     let error_raw = color(raw, &["red", "bright_red", "color1"]).unwrap_or(0xcc3333);
+    let success_raw = color(raw, &["green", "bright_green", "color2"]).unwrap_or(0x31935d);
     let star_raw = color(raw, &["yellow", "bright_yellow", "color3"]).unwrap_or(accent_raw);
     // The row highlight is the theme selection, or the theme surface when a
     // palette has no selection key. A light wash stays light. Text on it is
@@ -204,6 +206,7 @@ fn map_palette(
         // A warning chip sits on a selected row too, so the error colour
         // holds AA on the selection as well as on the page.
         error: ensure_all(error_raw, &[background, surface, selection], TEXT_CONTRAST),
+        success: ensure_all(success_raw, &[background, surface], TEXT_CONTRAST),
         border,
         input_border: ensure_all(
             mix(border, foreground, 0.35),
@@ -267,6 +270,7 @@ pub fn contrast_ok(theme: &Theme) -> bool {
             || contrast(theme.dimmed, bg) < TEXT_CONTRAST
             || contrast(theme.accent, bg) < TEXT_CONTRAST
             || contrast(theme.error, bg) < TEXT_CONTRAST
+            || contrast(theme.success, bg) < TEXT_CONTRAST
             || contrast(theme.star, bg) < TEXT_CONTRAST
         {
             return false;

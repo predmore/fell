@@ -980,10 +980,14 @@ fn serve_reports_a_removed_account_before_listening() {
     let path = ctx.store();
     let store = Store::open(&path).unwrap();
     let mut account = store.list_accounts().unwrap().pop().unwrap();
+    account.email = fell_core::DEMO_MAILBOX_ADDRESS.into();
+    account.backend_kind = fell_core::BackendKind::Bridge;
+    store.upsert_account(&account).unwrap();
     store
         .set_agent_grant(&account.id, "bot", AgentGrant::enabled(true, false, false))
         .unwrap();
     account.id = AccountId("mail".into());
+    account.email = "reader@example.test".into();
     store.configure_account(&account, false).unwrap();
     let ran = ctx.run(
         &[

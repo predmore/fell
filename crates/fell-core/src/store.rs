@@ -643,20 +643,12 @@ impl Store {
     /// in the same transaction. Demo grants never follow the new account.
     pub fn configure_account(&self, account: &Account, write_back: bool) -> Result<()> {
         if crate::is_demo_account(&account.id) {
-            return Err(crate::Error::Invalid(
-                "Account ID is reserved for demo mail".into(),
-            ));
+            return Err(reserved_account_id(account.id.as_str()));
         }
         let tx = immediate_transaction(&self.conn)?;
+        crate::outbox::ensure_schema(&tx)?;
         for id in crate::backend::DEMO_ACCOUNT_IDS {
-            let exists = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
-                [id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if exists {
-                delete_demo_account(&tx, id)?;
-            }
+            delete_demo_account(&tx, id)?;
         }
         upsert_account_on(&tx, account)?;
         crate::outbox::set_write_back_on(&tx, &account.id, write_back)?;
@@ -2312,7 +2304,25 @@ fn upsert_account_on(conn: &Connection, account: &Account) -> Result<()> {
     Ok(())
 }
 
+fn reserved_account_id(id: &str) -> crate::Error {
+    crate::Error::Invalid(format!(
+        "Account ID \"{id}\" is reserved for demo mail. An existing real account with this ID must be migrated before setup can continue."
+    ))
+}
+
 fn delete_demo_account(conn: &Connection, id: &str) -> Result<()> {
+    let demo = conn
+        .query_row(
+            "SELECT email = ?2 AND backend_kind = 'bridge' FROM accounts WHERE id = ?1",
+            params![id, crate::DEMO_MAILBOX_ADDRESS],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?;
+    match demo {
+        None => return Ok(()),
+        Some(false) => return Err(reserved_account_id(id)),
+        Some(true) => {}
+    }
     for child in ["agent_action_messages", "agent_action_drafts"] {
         conn.execute(
             &format!(
@@ -4403,6 +4413,89 @@ mod tests {
             email: "o@x".into(),
             backend_kind: BackendKind::Bridge,
         }
+    }
+
+    #[test]
+    fn configure_account_preserves_real_mail_under_a_reserved_id() {
+        let store = Store::open_in_memory().unwrap();
+        let demo = Account {
+            id: AccountId("local".into()),
+            email: crate::DEMO_MAILBOX_ADDRESS.into(),
+            ..account()
+        };
+        let real = Account {
+            id: AccountId("fixture".into()),
+            ..account_b()
+        };
+        store.upsert_account(&demo).unwrap();
+        store.upsert_account(&real).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO compose_drafts (id, account_id, from_addr, to_addrs, cc_addrs,
+               bcc_addrs, subject, body, updated_unix)
+             VALUES ('draft', 'fixture', 'o@x', '', '', '', '', 'Unsent text', 0);
+             INSERT INTO server_outbox (account_id, kind, state, message_id, source_folder,
+               target_folder, created_unix)
+             VALUES ('fixture', 'move', 'pending', 'message', 'Inbox', 'Archive', 0);",
+            )
+            .unwrap();
+
+        let error = store.configure_account(&account(), true).unwrap_err();
+        assert!(error.to_string().contains("\"fixture\" is reserved"));
+        assert_eq!(
+            store.get_account(&real.id).unwrap().unwrap().email,
+            real.email
+        );
+        assert_eq!(store.list_accounts().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT body FROM compose_drafts WHERE id = 'draft'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Unsent text"
+        );
+        assert_eq!(
+            store.outbox(&real.id).unwrap()[0].state,
+            crate::outbox::OutboxState::Pending
+        );
+    }
+
+    #[test]
+    fn configure_account_retires_an_old_demo_database_without_an_outbox() {
+        let path = std::env::temp_dir().join(format!("fell-legacy-demo-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let demo = Account {
+            id: AccountId("local".into()),
+            email: crate::DEMO_MAILBOX_ADDRESS.into(),
+            ..account()
+        };
+        store.upsert_account(&demo).unwrap();
+        store
+            .upsert_message(&msg_for("local", "demo@x", None, None, "Demo", "Demo body"))
+            .unwrap();
+        drop(store);
+        // Model a persisted fixture store from before write-back was installed.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch("DROP TABLE server_outbox; DROP TABLE write_back_accounts;")
+            .unwrap();
+        drop(legacy);
+
+        let store = Store::open(&path).unwrap();
+        assert!(!store.list_threads(&demo.id).unwrap().is_empty());
+        let configured = account_b();
+        store.configure_account(&configured, true).unwrap();
+        assert!(store.get_account(&demo.id).unwrap().is_none());
+        assert!(store.list_threads(&demo.id).unwrap().is_empty());
+        assert!(store.write_back(&configured.id).unwrap());
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
     }
 
     fn msg_for(
