@@ -82,8 +82,7 @@ pub fn sync_with_progress(
         }
         Ok(())
     })?;
-    // A bounded repair of legacy dates rides on successful sync passes.
-    // A failed metadata fetch leaves the batch pending for the next pass.
+    // Repair a bounded page of legacy dates after a successful sync pass.
     if let Ok(changed) = repair_internal_dates(&account.id, backend, store) {
         report.changed |= changed;
     }
@@ -101,12 +100,15 @@ fn repair_internal_dates(
         .flat_map(|request| &request.copies)
         .cloned()
         .collect();
-    let dates = if copies.is_empty() {
-        HashMap::new()
-    } else {
-        backend.fetch_internal_dates(&copies)?.into_iter().collect()
-    };
-    store.finish_internal_dates(account, &batch, &dates)
+    let mut checked = HashMap::new();
+    if !copies.is_empty() {
+        // A dropped connection leaves incomplete copies queued. Keep the
+        // results from any mailbox whose fetch finished before it dropped.
+        let _ = backend.fetch_internal_dates(&copies, &mut |id, date| {
+            checked.insert(id.clone(), date);
+        });
+    }
+    store.finish_internal_dates(account, &batch, &checked)
 }
 
 /// Cursor for walking unchecked Reply-To headers between sync passes.

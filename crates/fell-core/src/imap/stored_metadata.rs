@@ -1,6 +1,6 @@
 //! Fetch metadata for copies already recorded in the local mailbox.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::backend::FetchedReplyTo;
 use crate::{RemoteId, Result};
@@ -22,32 +22,33 @@ pub(crate) fn fetch_reply_to(
                 addresses: rfc822::reply_to_from_header(&item.body)?,
             })
         },
-        persist,
+        |_, fetched| {
+            if !fetched.is_empty() {
+                persist(&fetched)?;
+            }
+            Ok(())
+        },
     )
 }
 
 pub(crate) fn fetch_internal_dates(
     config: &ImapConfig,
     wanted: &[RemoteId],
-) -> Result<Vec<(RemoteId, i64)>> {
-    let mut dates = Vec::new();
-    let latest = crate::latest_mail_date();
+    completed: &mut dyn FnMut(&RemoteId, Option<i64>),
+) -> Result<()> {
     fetch_copy_metadata(
         config,
         wanted,
         session::FetchItems::InternalDate,
-        |remote_id, item| {
-            let date = item
-                .internal_date
-                .filter(|date| (1..=latest).contains(date))?;
-            Some((remote_id.clone(), date))
-        },
-        |fetched| {
-            dates.extend_from_slice(fetched);
+        |_, item| Some((item.uid, item.internal_date?)),
+        |copies, fetched| {
+            let dates: HashMap<_, _> = fetched.into_iter().collect();
+            for (uid, id) in copies {
+                completed(id, dates.get(uid).copied());
+            }
             Ok(())
         },
-    )?;
-    Ok(dates)
+    )
 }
 
 fn fetch_copy_metadata<T>(
@@ -55,7 +56,7 @@ fn fetch_copy_metadata<T>(
     wanted: &[RemoteId],
     items: session::FetchItems,
     parse: impl Fn(&RemoteId, session::Fetched) -> Option<T>,
-    mut persist: impl FnMut(&[T]) -> Result<()>,
+    mut persist: impl FnMut(&BTreeMap<u32, &RemoteId>, Vec<T>) -> Result<()>,
 ) -> Result<()> {
     let mut mailboxes = BTreeMap::<_, BTreeMap<_, _>>::new();
     for id in wanted {
@@ -94,14 +95,8 @@ fn fetch_copy_metadata<T>(
             }
             Ok(())
         })?;
-        if matches!(stop, session::FetchStop::Done) && !fetched.is_empty() {
-            persist(&fetched)?;
-        } else if items == session::FetchItems::InternalDate
-            && !matches!(stop, session::FetchStop::Done)
-        {
-            return Err(crate::Error::Backend(
-                "imap: incomplete INTERNALDATE fetch".into(),
-            ));
+        if matches!(stop, session::FetchStop::Done) {
+            persist(&copies, fetched)?;
         }
     }
     session.logout();

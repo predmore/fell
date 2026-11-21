@@ -198,12 +198,15 @@ pub trait MailBackend {
         Ok(Vec::new())
     }
 
-    /// Read the arrival dates for already stored copies without fetching bodies.
+    /// Read arrival dates without fetching bodies. Report every requested copy
+    /// in a completed mailbox fetch, even when it returned no date. Skipped
+    /// mailboxes and incomplete fetches leave their copies unreported.
     fn fetch_internal_dates(
         &self,
         _copies: &[crate::RemoteId],
-    ) -> Result<Vec<(crate::RemoteId, i64)>> {
-        Ok(Vec::new())
+        _completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Check Reply-To by remote id. Deliver verified headers in batches;
@@ -313,8 +316,9 @@ impl MailBackend for BridgeBackend {
     fn fetch_internal_dates(
         &self,
         copies: &[crate::RemoteId],
-    ) -> Result<Vec<(crate::RemoteId, i64)>> {
-        crate::imap::fetch_internal_dates(&self.imap, copies)
+        completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        crate::imap::fetch_internal_dates(&self.imap, copies, completed)
     }
 
     fn fetch_reply_to(
@@ -390,8 +394,9 @@ impl MailBackend for ImapBackend {
     fn fetch_internal_dates(
         &self,
         copies: &[crate::RemoteId],
-    ) -> Result<Vec<(crate::RemoteId, i64)>> {
-        crate::imap::fetch_internal_dates(&self.config, copies)
+        completed: &mut dyn FnMut(&crate::RemoteId, Option<i64>),
+    ) -> Result<()> {
+        crate::imap::fetch_internal_dates(&self.config, copies, completed)
     }
 
     fn fetch_reply_to(

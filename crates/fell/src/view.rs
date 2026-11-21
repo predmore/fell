@@ -3860,13 +3860,14 @@ impl HeaderAccount {
         session: &Session,
         room: f32,
         gap: f32,
+        show_email: bool,
         fit: &impl Fn(&str, f32, FontWeight) -> Option<gpui::ShapedLine>,
     ) -> Self {
         let (name, email) = account_header(&session.account_name, &session.account_email);
         let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
         let quiet = full.is_none();
         let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
-        let email = name.as_ref().and_then(|line| {
+        let email = name.as_ref().filter(|_| show_email && !quiet).and_then(|line| {
             fit(
                 email?,
                 room - f32::from(line.width).ceil() - gap,
@@ -3919,6 +3920,7 @@ fn header(
     const FOLDER_GAP: f32 = 24.;
     const COUNT_GAP: f32 = 14.;
     const ACCOUNT_MIN: f32 = 88.;
+    const DETAIL_MIN_WIDTH: f32 = 420.;
 
     let style = conversation_line_style(window, theme, px(theme.ui_px));
     let room = (width - 2. * PAD - FOLDER_GAP).max(0.);
@@ -4018,11 +4020,14 @@ fn header(
     let (outgoing, incoming) = fade
         .as_ref()
         .map_or((0., 1.), |fade| fade.label_opacities(now));
-    let account = HeaderAccount::fit(session, room - current_width, COUNT_GAP, &fit);
+    let fit_account = |folder_width| {
+        HeaderAccount::fit(session, room - folder_width, COUNT_GAP, width >= DETAIL_MIN_WIDTH, &fit)
+    };
+    let account = fit_account(current_width);
     // Each account fit shares its half of the fade with its folder. This
     // keeps both fits at their own widths and the right edge anchored.
     let (account, account_opacities) = if let Some(fade) = fade {
-        let old = HeaderAccount::fit(session, room - old_width, COUNT_GAP, &fit);
+        let old = fit_account(old_width);
         let name_changes = old.name != account.name || old.quiet != account.quiet;
         let email_changes = name_changes || old.email != account.email;
         let (leaving, opacities) = fade.account_frame([name_changes, email_changes], now);
@@ -4458,8 +4463,6 @@ fn thread_line_one(
         - STAR_SLOT
         - 2.0 * THREAD_LINE_GAP)
         .max(0.0);
-    let sender_limit = room.min(text_width * 0.60).floor();
-    let (sender, sender_width) = names(theme, row, frame, selected, sender_limit, window);
     let labels = if row.labels.is_empty() && previous_labels.is_none() {
         None
     } else {
@@ -4468,11 +4471,22 @@ fn thread_line_one(
             row,
             background,
             dim,
-            (room - sender_width - THREAD_LINE_GAP).max(0.0),
+            (room * 0.40 - THREAD_LINE_GAP).max(0.0),
             previous_labels,
             window,
         )
     };
+    let label_space = labels
+        .as_ref()
+        .map_or(0.0, |(_, width)| width + THREAD_LINE_GAP);
+    let sender = names(
+        theme,
+        row,
+        frame,
+        selected,
+        (room - label_space).floor(),
+        window,
+    );
     div()
         .h(px(22.))
         .flex()
@@ -4506,7 +4520,7 @@ fn thread_line_one(
                             .child(THREAD_ATTACHMENT_MARK),
                     )
                 })
-                .children(labels),
+                .children(labels.map(|(group, _)| group)),
         )
         // A fixed slot every row keeps, so starring never moves the line.
         // The star fades in as it grows to full size, and out as it shrinks.
@@ -4548,7 +4562,7 @@ fn thread_label_group(
     room: f32,
     previous: Option<(Vec<String>, f32)>,
     window: &Window,
-) -> Option<gpui::Div> {
+) -> Option<(gpui::Div, f32)> {
     let style = conversation_line_style(window, theme, px((theme.ui_px - 2.0).max(11.0)));
     let outline = theme.label_outline(background);
     let layout = |labels: &[String]| {
@@ -4626,12 +4640,13 @@ fn thread_label_group(
     let (width, group) = layout(&row.labels);
     if let Some((previous, shown)) = previous {
         let (old_width, old_group) = layout(&previous);
-        if old_width.max(width) > 0.0 {
-            return Some(
+        let transition_width = old_width.max(width);
+        if transition_width > 0.0 {
+            return Some((
                 div()
                     .relative()
                     .flex_none()
-                    .w(px(old_width.max(width)))
+                    .w(px(transition_width))
                     .h(px(LABEL_CHIP_PX))
                     .child(group.opacity(shown))
                     .child(
@@ -4641,10 +4656,11 @@ fn thread_label_group(
                             .top(px(0.0))
                             .opacity(1.0 - shown),
                     ),
-            );
+                transition_width,
+            ));
         }
     }
-    (width > 0.0).then(|| group.flex_none())
+    (width > 0.0).then(|| (group.flex_none(), width))
 }
 
 /// A label on a row: an outline that fits inside the 22 px line, so all
@@ -4703,7 +4719,7 @@ fn names(
     selected: bool,
     limit: f32,
     window: &Window,
-) -> (gpui::Div, f32) {
+) -> gpui::Div {
     let dim = if selected {
         theme.on_selection
     } else {
@@ -4789,15 +4805,12 @@ fn names(
         }
         width
     };
-    (
-        div()
-            .relative()
-            .flex_none()
-            .w(px(width))
-            .overflow_hidden()
-            .child(line),
-        width,
-    )
+    div()
+        .relative()
+        .flex_none()
+        .w(px(width))
+        .overflow_hidden()
+        .child(line)
 }
 
 /// Line two: the subject and the snippet. `background` is the row's fill

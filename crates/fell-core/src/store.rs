@@ -4387,6 +4387,49 @@ mod tests {
     }
 
     #[test]
+    fn date_repair_restores_the_header_after_the_clock_catches_up() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        let mut message = msg("dated@x", None, None, "Field report", "Sample mail");
+        let header_date = crate::latest_mail_date() - 86_400;
+        message.headers.date_unix = header_date;
+        message.remote_id = RemoteId("imap:1:1:INBOX".into());
+        message.folders = vec!["INBOX".into()];
+        store.upsert_account(&account).unwrap();
+        store.upsert_message(&message).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE internal_date_repair;
+             DELETE FROM meta WHERE key = 'internal_date_repair_v1';",
+            )
+            .unwrap();
+
+        // The first open's clock is two days behind. Its one-day allowance
+        // is too small to accept the header that the cache already stored.
+        dates::ensure_date_repair_through(&store.conn, header_date - 86_400).unwrap();
+        let date = || store.folder_threads(&account.id, "INBOX").unwrap()[0].last_date_unix;
+        assert_eq!(date(), 0);
+
+        let batch = store.missing_internal_dates(&account.id).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].copies, [message.remote_id.clone()]);
+        let checked = [(message.remote_id, Some(header_date - 60))].into();
+        assert!(
+            store
+                .finish_internal_dates(&account.id, &batch, &checked)
+                .unwrap()
+        );
+        assert_eq!(date(), header_date);
+        assert!(
+            store
+                .missing_internal_dates(&account.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn message_lookup_seeks_by_account_and_message_id() {
         let store = Store::open_in_memory().unwrap();
         let plan: Vec<String> = store

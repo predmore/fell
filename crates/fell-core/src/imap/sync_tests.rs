@@ -2992,6 +2992,143 @@ fn legacy_inbox_dates_are_repaired_without_downloading_mail_again() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn dated_copy(uid: u32, id: &str) -> FixtureMessage {
+    literal(
+        uid,
+        &[],
+        1,
+        raw_message(
+            id,
+            None,
+            id,
+            "Rowan Park <rowan@example.test>",
+            "Sample mail.",
+            "X-Test-Internal-Date: 09-Feb-2024 21:00:00 +0000\r\n",
+        ),
+    )
+}
+
+fn queue_legacy_internal_dates(store: &Store) {
+    store
+        .conn
+        .execute_batch(
+            "INSERT INTO internal_date_repair (account_id, message_id, previous_date_unix)
+         SELECT account_id, message_id, 0 FROM messages;
+         UPDATE messages SET date_unix = 0;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn refused_internal_dates_leave_other_mailboxes_and_later_pages_free_to_finish() {
+    let state = TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: (1..=64)
+                    .map(|uid| dated_copy(uid, &format!("inbox-{uid:03}@x")))
+                    .collect(),
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "first@x"), dated_copy(2, "z-last@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    };
+    let server = TestServer::spawn(state);
+    let acct = account("refused-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = true;
+    let date = |id| stored(&store, &acct, id).unwrap().headers.date_unix;
+
+    // The refusing mailbox comes first in the fetch walk. Sent still
+    // commits its result and the next page reaches the last queued row.
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("first@x"), 1_707_512_400);
+    assert_eq!(date("z-last@x"), 0);
+    assert_eq!(date("inbox-001@x"), 0);
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("z-last@x"), 1_707_512_400);
+    assert_eq!(store.missing_internal_dates(&acct.id).unwrap().len(), 64);
+
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = false;
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("inbox-001@x"), 1_707_512_400);
+    assert!(store.missing_internal_dates(&acct.id).unwrap().is_empty());
+}
+
+#[test]
+fn internal_date_repair_waits_for_all_current_copies() {
+    let state = TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    };
+    let server = TestServer::spawn(state);
+    let acct = account("skipped-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    let queued = || store.missing_internal_dates(&acct.id).unwrap();
+    assert_eq!(queued()[0].copies.len(), 2);
+
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_examine = true;
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(queued().len(), 1);
+
+    // Store a stale copy id while leaving the unchanged sync checkpoint.
+    // The mailbox opens again, but the metadata read cannot use that UID.
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_examine = false;
+    store
+        .conn
+        .execute(
+            "UPDATE message_copies SET uidvalidity = 19 WHERE mailbox = 'INBOX'",
+            [],
+        )
+        .unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(queued().len(), 1);
+    assert_eq!(
+        stored(&store, &acct, "shared@x").unwrap().headers.date_unix,
+        0
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE message_copies SET uidvalidity = 20 WHERE mailbox = 'INBOX'",
+            [],
+        )
+        .unwrap();
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert!(queued().is_empty());
+    assert_eq!(
+        stored(&store, &acct, "shared@x").unwrap().headers.date_unix,
+        1_707_512_400
+    );
+}
+
 #[test]
 fn mail_deleted_on_the_server_is_gone_locally() {
     let server = TestServer::spawn(sample_state());
