@@ -224,4 +224,15 @@ mod tests {
         assert_cuts_are_longest_fitting_prefixes("Re: שלום עולם and the 2026 plan");
         assert_cuts_are_longest_fitting_prefixes("שלום Fell 42 עולם!");
     }
+
+    #[test]
+    fn a_long_sender_leaves_room_for_the_ellipsis() {
+        let sender = "Northwind Trail Station, Equipment and Route Planning Notifications";
+        let budget = 180.0;
+        let cuts = cuts(sender);
+        let end = cuts.fit(budget - shape("…").1, sender.len());
+        assert!(end > 0 && end < sender.len());
+        let visible = crate::present::ellipsis(kept(&sender[..end]));
+        assert!(shape(&visible).1 <= budget + 1.0, "{visible:?}");
+    }
 }

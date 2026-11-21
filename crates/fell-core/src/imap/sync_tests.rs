@@ -560,7 +560,8 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
     assert!(!stored(&store, &acct, "reply@x").unwrap().unread);
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ INTERNALDATE BODY.PEEK[])"),
         "only the copy the store does not hold is downloaded: {bodies:?}"
     );
 }
@@ -747,7 +748,8 @@ fn without_uidnext_only_new_uids_are_downloaded() {
     assert!(stored(&store, &acct, "d3@x").is_some());
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "{bodies:?}"
     );
     server.state.lock().expect("state").commands.clear();
@@ -1029,7 +1031,7 @@ fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
     assert!(
         body_fetches(&server)
             .iter()
-            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ BODY.PEEK[])")),
+            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ INTERNALDATE BODY.PEEK[])")),
         "{:?}",
         commands(&server)
     );
@@ -2075,7 +2077,8 @@ fn fetch_batches_survive_a_dropped_connection() {
     assert_eq!(report.new_messages, None);
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "only the body that never arrived is fetched again: {bodies:?}"
     );
     assert!(
@@ -2357,7 +2360,8 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
     // from a flags-only fetch.
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 1 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 1 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "{bodies:?}"
     );
     assert!(
@@ -2839,6 +2843,454 @@ fn folder_subjects(store: &Store, acct: &Account, folder: &str) -> Vec<String> {
         .into_iter()
         .map(|thread| thread.subject)
         .collect()
+}
+
+fn dated_inbox() -> TestState {
+    let entries = [
+        (
+            "New mail",
+            "Date: Fri, 9 Feb 2024 23:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 18:00:00 +0000\r\n",
+        ),
+        (
+            "Missing header date",
+            "",
+            "X-Test-Internal-Date:  9-Feb-2024 17:00:00 -0500\r\n",
+        ),
+        (
+            "Forged header date",
+            "Date: Mon, 14 Jan 2806 08:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 21:00:00 +0000\r\n",
+        ),
+        (
+            "Invalid header date",
+            "Date: 31 Feb 2024 19:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 19:00:00 +0000\r\n",
+        ),
+        ("No usable date", "", ""),
+    ];
+    let messages = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (subject, sent, arrival))| {
+            literal(
+                i as u32 + 1,
+                &[],
+                1,
+                format!(
+                    "From: Rowan Park <rowan@example.test>\r\nSubject: {subject}\r\n\
+                     Message-ID: <date-{i}@example.test>\r\n{sent}{arrival}\r\nSample mail."
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+    TestState {
+        mailboxes: vec![FixtureMailbox {
+            messages,
+            ..empty_mailbox("INBOX", 20)
+        }],
+        ..sample_state()
+    }
+}
+
+const EXPECTED_INBOX_DATES: &[(&str, i64)] = &[
+    ("New mail", 1_707_519_600),
+    ("Missing header date", 1_707_516_000),
+    ("Forged header date", 1_707_512_400),
+    ("Invalid header date", 1_707_505_200),
+    ("No usable date", 0),
+];
+
+fn assert_inbox_dates(store: &Store, acct: &Account) {
+    let threads = store.folder_threads(&acct.id, "INBOX").unwrap();
+    let dates: Vec<_> = threads
+        .iter()
+        .map(|thread| (thread.subject.as_str(), thread.last_date_unix))
+        .collect();
+    assert_eq!(dates, EXPECTED_INBOX_DATES);
+}
+
+#[test]
+fn inbox_dates_sort_by_header_or_arrival_from_the_first_rows() {
+    let server = TestServer::spawn(dated_inbox());
+    let acct = account("dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let mut saw_headers = false;
+    sync_with_progress(&acct, &backend, &store, &mut |report| {
+        if report.progress.as_ref().is_some_and(|page| page.done == 0)
+            && store.folder_threads(&acct.id, "INBOX").unwrap().len() == EXPECTED_INBOX_DATES.len()
+        {
+            assert_inbox_dates(&store, &acct);
+            saw_headers = true;
+        }
+    })
+    .unwrap();
+    assert!(saw_headers);
+    assert_inbox_dates(&store, &acct);
+}
+
+#[test]
+fn live_sync_repairs_skewed_dates_without_refetching_when_the_clock_catches_up() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![empty_mailbox("INBOX", 20)],
+        ..sample_state()
+    });
+    let acct = account("live-skewed-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let header_date = 1_707_512_400;
+    let behind_latest = header_date - 86_400;
+    let corrected_latest = header_date + 86_400;
+    crate::with_latest_mail_date(behind_latest, || sync_once(&acct, &backend, &store)).unwrap();
+
+    let sent = "Date: Fri, 9 Feb 2024 21:00:00 +0000\r\n";
+    let far_future = "Date: Mon, 14 Jan 2806 08:00:00 +0000\r\n";
+    let arrival = "X-Test-Internal-Date: 09-Feb-2024 22:00:00 +0000\r\n";
+    let entries = [
+        ("both", sent, arrival, header_date),
+        ("header", sent, "", header_date),
+        ("arrival", far_future, arrival, header_date + 3600),
+        ("implausible", far_future, "", 0),
+    ];
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").messages = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (id, header, arrival, _))| {
+            literal(
+                i as u32 + 1,
+                &[],
+                2,
+                format!(
+                    "From: Rowan Park <rowan@example.test>\r\nSubject: {id}\r\n\
+                     Message-ID: <{id}@example.test>\r\n{header}{arrival}\r\nSample mail."
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+
+    let date = |id| {
+        stored(&store, &acct, &format!("{id}@example.test"))
+            .unwrap()
+            .headers
+            .date_unix
+    };
+    let mut queued_during_sync = false;
+    let report = crate::with_latest_mail_date(behind_latest, || {
+        sync_with_progress(&acct, &backend, &store, &mut |_| {
+            if store.missing_internal_dates(&acct.id).unwrap().len() == 3 {
+                queued_during_sync = true;
+                // Later metadata replies no longer include the saved INTERNALDATE.
+                let mut state = server.state.lock().unwrap();
+                for message in &mut mailbox(&mut state, "INBOX").messages {
+                    message.raw = String::from_utf8_lossy(&message.raw)
+                        .replace(arrival, "")
+                        .into_bytes();
+                }
+            }
+        })
+    })
+    .unwrap();
+    assert_eq!(report.new_messages, Some(4));
+    assert!(queued_during_sync);
+    for (id, _, _, _) in entries {
+        assert_eq!(date(id), 0, "{id}");
+    }
+
+    server.state.lock().unwrap().commands.clear();
+    let report =
+        crate::with_latest_mail_date(corrected_latest, || sync_once(&acct, &backend, &store))
+            .unwrap();
+    assert_eq!(report.new_messages, Some(0));
+    assert!(report.changed);
+    for (id, _, _, expected) in entries {
+        assert_eq!(date(id), expected, "{id}");
+    }
+    assert!(store.missing_internal_dates(&acct.id).unwrap().is_empty());
+    assert!(body_fetches(&server).is_empty());
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|cmd| cmd.contains("INTERNALDATE"))
+    );
+}
+
+#[test]
+fn legacy_inbox_dates_are_repaired_without_downloading_mail_again() {
+    let server = TestServer::spawn(dated_inbox());
+    let acct = account("legacy-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let root = std::env::temp_dir().join(format!("fell-legacy-dates-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("mail.db");
+    {
+        let store = Store::open(&path).unwrap();
+        sync_once(&acct, &backend, &store).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE internal_date_repair;
+                 DELETE FROM meta WHERE key = 'internal_date_repair_v1';
+                 UPDATE messages SET date_unix = 0 WHERE subject = 'Missing header date';
+                 UPDATE messages SET date_unix = 26382787200 WHERE subject = 'Forged header date';",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let dates = store.folder_threads(&acct.id, "INBOX").unwrap();
+    assert_eq!(dates[0].subject, "New mail");
+    assert_eq!(
+        dates
+            .iter()
+            .find(|row| row.subject == "Forged header date")
+            .unwrap()
+            .last_date_unix,
+        0
+    );
+    server.state.lock().unwrap().commands.clear();
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_inbox_dates(&store, &acct);
+    assert!(body_fetches(&server).is_empty());
+    assert!(
+        commands(&server)
+            .iter()
+            .any(|cmd| cmd.ends_with("UID FETCH 2,3,5 (UID INTERNALDATE)"))
+    );
+    server.state.lock().unwrap().commands.clear();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|cmd| cmd.contains("INTERNALDATE"))
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn dated_copy(uid: u32, id: &str) -> FixtureMessage {
+    literal(
+        uid,
+        &[],
+        1,
+        raw_message(
+            id,
+            None,
+            id,
+            "Rowan Park <rowan@example.test>",
+            "Sample mail.",
+            "X-Test-Internal-Date: 09-Feb-2024 21:00:00 +0000\r\n",
+        ),
+    )
+}
+
+pub(super) fn queue_legacy_internal_dates(store: &Store) {
+    store
+        .conn
+        .execute_batch(
+            "INSERT INTO internal_date_repair (account_id, message_id, previous_date_unix)
+         SELECT account_id, message_id, 0 FROM messages;
+         UPDATE messages SET date_unix = 0;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn refused_internal_dates_leave_other_mailboxes_and_later_pages_free_to_finish() {
+    let state = TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: (1..=64)
+                    .map(|uid| dated_copy(uid, &format!("inbox-{uid:03}@x")))
+                    .collect(),
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "first@x"), dated_copy(2, "z-last@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    };
+    let server = TestServer::spawn(state);
+    let acct = account("refused-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = true;
+    let date = |id| stored(&store, &acct, id).unwrap().headers.date_unix;
+
+    // The refusing mailbox comes first in the fetch walk. Sent still
+    // commits its result and the next page reaches the last queued row.
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("first@x"), 1_707_512_400);
+    assert_eq!(date("z-last@x"), 0);
+    assert_eq!(date("inbox-001@x"), 0);
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("z-last@x"), 1_707_512_400);
+    assert_eq!(store.missing_internal_dates(&acct.id).unwrap().len(), 64);
+
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = false;
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("inbox-001@x"), 1_707_512_400);
+    assert!(store.missing_internal_dates(&acct.id).unwrap().is_empty());
+}
+
+#[test]
+fn internal_date_repair_waits_for_all_current_copies() {
+    let state = TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    };
+    let server = TestServer::spawn(state);
+    let acct = account("skipped-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    let queued = || store.missing_internal_dates(&acct.id).unwrap();
+    assert_eq!(queued()[0].copies.len(), 2);
+
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_examine = true;
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(queued().len(), 1);
+
+    // Store a stale copy id while leaving the unchanged sync checkpoint.
+    // The mailbox opens again, but the metadata read cannot use that UID.
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_examine = false;
+    store
+        .conn
+        .execute(
+            "UPDATE message_copies SET uidvalidity = 19 WHERE mailbox = 'INBOX'",
+            [],
+        )
+        .unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert_eq!(queued().len(), 1);
+    assert_eq!(
+        stored(&store, &acct, "shared@x").unwrap().headers.date_unix,
+        0
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE message_copies SET uidvalidity = 20 WHERE mailbox = 'INBOX'",
+            [],
+        )
+        .unwrap();
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert!(queued().is_empty());
+    assert_eq!(
+        stored(&store, &acct, "shared@x").unwrap().headers.date_unix,
+        1_707_512_400
+    );
+}
+
+#[test]
+fn internal_date_repair_uses_sent_when_inbox_keeps_refusing() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x"), dated_copy(2, "inbox-only@x")],
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    });
+    let acct = account("date-repair-cap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = true;
+    let date = |id| stored(&store, &acct, id).unwrap().headers.date_unix;
+    let queued = || store.missing_internal_dates(&acct.id).unwrap();
+
+    for _ in 1..5 {
+        sync_once(&acct, &backend, &store).unwrap();
+        assert_eq!(date("shared@x"), 0);
+        assert_eq!(queued().len(), 2);
+    }
+
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("shared@x"), 1_707_512_400);
+    assert_eq!(date("inbox-only@x"), 0);
+    assert!(queued().is_empty());
+}
+
+#[test]
+fn truncated_internal_date_fetch_keeps_results_from_finished_mailboxes() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: (1..=5).map(|uid| dated_copy(uid, "inbox@x")).collect(),
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "sent@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    });
+    let backend = ImapBackend {
+        account_id: AccountId("truncated-dates".into()),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let sent = crate::RemoteId("imap:21:1:Sent".into());
+    let copies: Vec<_> = (1..=5)
+        .map(|uid| crate::RemoteId(format!("imap:20:{uid}:INBOX")))
+        .chain(std::iter::once(sent.clone()))
+        .collect();
+    let _limit = super::session::limit_untagged_to(4);
+    let mut checked = Vec::new();
+    let result = backend.fetch_internal_dates(&copies, &mut |id, date| {
+        checked.push((id.clone(), date));
+    });
+    assert!(matches!(result, Err(crate::Error::Backend(message)) if message.contains("truncated")));
+    assert_eq!(checked, vec![(sent, Some(1_707_512_400))]);
 }
 
 #[test]
@@ -3703,7 +4155,7 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
     assert!(
         fetches
             .iter()
-            .any(|line| line.contains("UID FETCH 1,2,4,5 (UID FLAGS BODY.PEEK[])")),
+            .any(|line| line.contains("UID FETCH 1,2,4,5 (UID FLAGS INTERNALDATE BODY.PEEK[])")),
         "{fetches:?}"
     );
     assert!(fetches.iter().all(|line| line.contains("BODY.PEEK[]")));

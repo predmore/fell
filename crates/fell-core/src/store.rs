@@ -25,6 +25,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
+mod dates;
 pub(crate) mod intents;
 pub(crate) mod keywords;
 mod part_cache;
@@ -580,6 +581,7 @@ impl Store {
         if version < 5 {
             bodies::queue_unlisted_mail(&conn)?;
         }
+        dates::ensure_date_repair(&conn)?;
         crate::actions::migrate_purge_snapshots(&conn)?;
         keywords::migrate_reserved_labels(&conn)?;
         Ok(Self {
@@ -752,6 +754,12 @@ impl Store {
             }
             // A combined delta can carry the listing for these messages.
             new_messages += usize::from(insert_message(&tx, &message, &mut merge_roles)?);
+            if let Some(date) = delta.deferred_dates.get(&message.remote_id)
+                && message.headers.date_unix == 0
+                && let Some(id) = canonical_id_on(&tx, account_id, &message.headers.message_id)?
+            {
+                dates::queue_deferred_date(&tx, account_id, &id, *date)?;
+            }
         }
         let has_arrivals = !delta.messages.is_empty();
         for message_id in &delta.too_large {
@@ -2697,15 +2705,13 @@ fn write_kept(
         incoming_list,
         !like_alias,
     );
-    let date_unix = if alias || (incoming_list && stored.date_unix != 0) {
-        if stored.date_unix != 0 {
+    // A later copy or body fetch can omit a date we already learned.
+    let date_unix =
+        if stored.date_unix != 0 && (alias || incoming_list || message.headers.date_unix == 0) {
             stored.date_unix
         } else {
             message.headers.date_unix
-        }
-    } else {
-        message.headers.date_unix
-    };
+        };
     // The message row keeps the first copy's server id. The other copy's id
     // and folder live on the alias, so neither is discarded. A kept row with
     // no server id still records that alias, so a later sync or reply finds
@@ -4384,6 +4390,252 @@ mod tests {
         body: &str,
     ) -> Message {
         msg_for("a1", id, proton, in_reply_to, subject, body)
+    }
+
+    fn legacy_date_repair(previous: i64, latest: i64) -> (Store, AccountId, RemoteId) {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        let mut message = msg("dated@x", None, None, "Field report", "Sample mail");
+        message.headers.date_unix = previous;
+        message.remote_id = RemoteId("imap:1:1:INBOX".into());
+        message.folders = vec!["INBOX".into()];
+        store.upsert_account(&account).unwrap();
+        store.upsert_message(&message).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE internal_date_repair;
+             DELETE FROM meta WHERE key = 'internal_date_repair_v1';",
+            )
+            .unwrap();
+        dates::ensure_date_repair_through(&store.conn, latest).unwrap();
+        (store, account.id, message.remote_id)
+    }
+
+    #[test]
+    fn date_repair_restores_the_header_after_the_clock_catches_up() {
+        // The first open's clock is two days behind. Its one-day allowance
+        // is too small to accept the header that the cache already stored.
+        let header_date = 1_707_512_400;
+        let behind_latest = header_date - 86_400;
+        for arrival in [behind_latest - 60, header_date + 60] {
+            let (store, account, remote_id) = legacy_date_repair(header_date, behind_latest);
+            let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
+            let checked = [(remote_id, Some(arrival))].into();
+            assert_eq!(date(), 0);
+
+            // IDLE can trigger several sync passes before the clock moves.
+            for _ in 0..5 {
+                let batch = store.missing_internal_dates(&account).unwrap();
+                assert_eq!(batch.len(), 1);
+                assert!(
+                    !store
+                        .finish_internal_dates(&account, &batch, &checked, true, behind_latest)
+                        .unwrap()
+                );
+                assert_eq!(date(), 0);
+            }
+
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(
+                store
+                    .finish_internal_dates(&account, &batch, &checked, true, header_date + 1)
+                    .unwrap()
+            );
+            assert_eq!(date(), header_date);
+            assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn date_repair_uses_arrival_on_the_first_pass_for_a_year_2806_header() {
+        let arrival = 1_707_512_400;
+        let latest = arrival + 86_400;
+        let (store, account, remote_id) = legacy_date_repair(26_382_787_200, latest);
+        let batch = store.missing_internal_dates(&account).unwrap();
+        let checked = [(remote_id, Some(arrival))].into();
+
+        assert!(
+            store
+                .finish_internal_dates(&account, &batch, &checked, true, latest)
+                .unwrap()
+        );
+        assert_eq!(
+            store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+            arrival
+        );
+        assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_uses_arrival_at_the_cap_if_the_cutoff_keeps_advancing() {
+        let arrival = 1_707_512_400;
+        let latest = arrival + 86_400;
+        let (store, account, remote_id) = legacy_date_repair(latest + 86_400, latest);
+        let checked = [(remote_id, Some(arrival))].into();
+        let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
+
+        for attempt in 0..4 {
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert_eq!(batch.len(), 1);
+            let cutoff = latest + attempt * 600;
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, cutoff)
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, cutoff + 599)
+                    .unwrap()
+            );
+            assert_eq!(date(), 0);
+        }
+        let batch = store.missing_internal_dates(&account).unwrap();
+        assert!(
+            store
+                .finish_internal_dates(&account, &batch, &checked, true, latest + 4 * 600)
+                .unwrap()
+        );
+        assert_eq!(date(), arrival);
+        assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_keeps_the_header_past_the_cap_when_the_arrival_is_too_new() {
+        let header = 1_707_512_400;
+        let latest = header - 86_400;
+        let (store, account, remote_id) = legacy_date_repair(header, latest);
+        let checked = [(remote_id, Some(header + 60))].into();
+        for attempt in 0..6 {
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &checked, true, latest + attempt * 600)
+                    .unwrap()
+            );
+        }
+        let batch = store.missing_internal_dates(&account).unwrap();
+        assert!(
+            store
+                .finish_internal_dates(&account, &batch, &checked, true, header + 1)
+                .unwrap()
+        );
+        assert_eq!(
+            store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+            header
+        );
+        assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_remembers_a_future_arrival_without_a_usable_header() {
+        let latest = 1_707_512_400;
+        let arrival = latest + 86_400;
+        for previous in [0, 26_382_787_200] {
+            let (store, account, remote_id) = legacy_date_repair(previous, latest);
+            let batch = store.missing_internal_dates(&account).unwrap();
+            let reported = [(remote_id.clone(), Some(arrival))].into();
+            let omitted = [(remote_id, None)].into();
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &reported, true, latest)
+                    .unwrap()
+            );
+
+            for _ in 0..6 {
+                let batch = store.missing_internal_dates(&account).unwrap();
+                assert_eq!(batch.len(), 1);
+                assert!(
+                    !store
+                        .finish_internal_dates(&account, &batch, &omitted, true, latest + 599)
+                        .unwrap()
+                );
+            }
+            let queued: (i64, i64) = store
+                .conn
+                .query_row(
+                    "SELECT deferred_arrival_unix, clock_attempts FROM internal_date_repair",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(queued, (arrival, 1));
+            assert_eq!(
+                store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+                0
+            );
+
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert!(
+                store
+                    .finish_internal_dates(&account, &batch, &omitted, true, arrival)
+                    .unwrap()
+            );
+            assert_eq!(
+                store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+                arrival
+            );
+            assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn date_repair_upgrade_preserves_queue_and_starts_each_budget_at_zero() {
+        let latest = 1_707_512_400;
+        let header = latest + 86_400;
+        let (store, account, remote_id) = legacy_date_repair(header, latest);
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE internal_date_repair DROP COLUMN unchecked_attempts;
+                 ALTER TABLE internal_date_repair DROP COLUMN clock_attempts;
+                 ALTER TABLE internal_date_repair DROP COLUMN last_clock_latest;
+                 ALTER TABLE internal_date_repair DROP COLUMN deferred_arrival_unix;
+                 UPDATE internal_date_repair SET attempts = 4;",
+            )
+            .unwrap();
+        dates::ensure_date_repair_through(&store.conn, latest).unwrap();
+
+        let batch = store.missing_internal_dates(&account).unwrap();
+        let checked = [(remote_id, Some(latest - 60))].into();
+        let unchecked = std::collections::HashMap::new();
+        for attempt in 0..5 {
+            let observed = if attempt % 2 == 0 {
+                &checked
+            } else {
+                &unchecked
+            };
+            assert!(
+                !store
+                    .finish_internal_dates(
+                        &account,
+                        &batch,
+                        observed,
+                        false,
+                        latest + attempt * 600
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            !store
+                .finish_internal_dates(&account, &batch, &checked, true, latest)
+                .unwrap()
+        );
+        dates::ensure_date_repair_through(&store.conn, latest).unwrap();
+        let queued: (i64, i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT previous_date_unix, unchecked_attempts, clock_attempts, last_clock_latest
+                 FROM internal_date_repair",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, (header, 0, 1, latest));
     }
 
     #[test]
