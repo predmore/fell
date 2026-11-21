@@ -1256,6 +1256,10 @@ const ROW_PAD: f32 = 14.0;
 const SENDER_GAP: f32 = 5.0;
 const STAR: &str = "★";
 
+fn row_text_width(list_width: f32) -> f32 {
+    (list_width - LIST_BORDER_PX - 2.0 * ROW_PAD).max(0.0)
+}
+
 fn detail_budget(row_room: f32, room: f32, subject: f32, minimum: f32) -> f32 {
     (room - subject.max(MIN_SUBJECT))
         .max(minimum)
@@ -1273,6 +1277,7 @@ enum RowText {
 
 struct RowLine {
     sender_width: f32,
+    sender: Option<gpui::ShapedLine>,
     count: Option<String>,
     star: Option<f32>,
     attachment: Option<f32>,
@@ -1285,18 +1290,22 @@ fn fit_row_line(
     list_width: f32,
     folder: Option<&str>,
     related: bool,
-    date: Option<&str>,
+    dates: [&str; 2],
     shape: impl Fn(&str, RowText, Option<f32>) -> Option<gpui::ShapedLine>,
 ) -> RowLine {
     let line_width = |line: &gpui::ShapedLine| f32::from(line.width).ceil();
     let measure = |text: &str, kind| shape(text, kind, None).as_ref().map_or(0.0, line_width);
-    let row_room = (list_width - LIST_BORDER_PX - 2.0 * ROW_PAD).max(0.0);
+    let row_room = row_text_width(list_width);
     let count = (row.message_count > 1).then(|| format!("· {}", row.message_count));
-    let sender_width = (measure(&row.spans[0].text, RowText::Detail)
-        + count
-            .as_deref()
-            .map_or(0.0, |count| SENDER_GAP + measure(count, RowText::Detail)))
-    .min((row_room * 0.30).floor());
+    let count_width = count
+        .as_deref()
+        .map_or(0.0, |count| SENDER_GAP + measure(count, RowText::Detail));
+    let sender_text = &row.spans[0].text;
+    let sender_width =
+        (measure(sender_text, RowText::Detail) + count_width).min((row_room * 0.30).floor());
+    let sender_room = (sender_width - count_width).max(0.0);
+    let sender = shape(sender_text, RowText::Detail, Some(sender_room))
+        .filter(|line| line_width(line) <= sender_room);
     let star = row.starred.then(|| measure(STAR, RowText::Mark));
     let attachment = row
         .has_attachment
@@ -1316,14 +1325,12 @@ fn fit_row_line(
     // Reserve the timestamp and enough of the final folder word to
     // distinguish sibling folders when the subject needs clipping.
     let shape_detail = |text: &str| shape(text, RowText::Detail, None);
-    let date_text = date.and_then(shape_detail);
-    let dated_location = date
-        .filter(|_| folder.is_some())
-        .and_then(|date| shape_detail(&format!(" · {date}")));
-    let date_width = dated_location
+    let full_date = shape_detail(dates[0]);
+    let date_with_location = |date: &str| shape_detail(&format!(" · {date}"));
+    let full_date_with_location = full_date
         .as_ref()
-        .or(date_text.as_ref())
-        .map_or(0.0, line_width);
+        .filter(|_| folder.is_some())
+        .and_then(|date| date_with_location(&date.text));
     let related_prefix = if related { "Related · " } else { "" };
     let related = if related {
         shape_detail("Related")
@@ -1343,9 +1350,24 @@ fn fit_row_line(
         row_room,
         room,
         measure(subject, RowText::Subject),
-        date_width + location_min,
+        full_date_with_location
+            .as_ref()
+            .or(full_date.as_ref())
+            .map_or(0.0, line_width)
+            + location_min,
     );
-    let location_room = detail_room - date_width;
+    let fits_date = |line: &gpui::ShapedLine| line_width(line) <= detail_room;
+    let date = full_date.filter(fits_date).or_else(|| {
+        if dates[0] == dates[1] {
+            None
+        } else {
+            shape_detail(dates[1]).filter(fits_date)
+        }
+    });
+    let dated_location = date
+        .as_ref()
+        .and_then(|date| date_with_location(&date.text));
+    let location_room = detail_room - dated_location.as_ref().map_or(0.0, line_width);
     let location = folder
         .filter(|_| location_room > 0.0)
         .and_then(|folder| {
@@ -1360,17 +1382,18 @@ fn fit_row_line(
                 |line| line.text.strip_prefix(related_prefix).unwrap_or_default(),
             )
         })
-        .or_else(|| related.filter(|line| line_width(line) <= detail_room));
+        .or_else(|| related.filter(|line| line_width(line) <= location_room));
     let date = if location.is_some() {
         dated_location
     } else {
-        date_text.filter(|line| line_width(line) <= detail_room)
+        date
     };
     let detail = [location, date];
     let subject_room = room - detail.iter().flatten().map(line_width).sum::<f32>();
     let subject = shape(subject, RowText::Subject, Some(subject_room));
     RowLine {
         sender_width,
+        sender,
         count,
         star,
         attachment,
@@ -1417,15 +1440,22 @@ fn row(
     let size = px(theme.ui_px - 2.0);
     let style = conversation_line_style(window, theme, size);
     let subject_style = conversation_line_style(window, theme, px(theme.ui_px));
-    let date = (!hit.related)
-        .then(|| present::relative_date(now_unix(), row.date_unix))
-        .filter(|date| !date.is_empty());
+    let dates = if hit.related {
+        [String::new(), String::new()]
+    } else {
+        let now = now_unix();
+        [
+            present::relative_date(now, row.date_unix),
+            present::compact_relative_date(now, row.date_unix),
+        ]
+    };
     let folder = hit
         .folder
         .as_ref()
         .map(|folder| inbox.session.roles.label(folder));
     let RowLine {
         sender_width,
+        sender,
         count,
         star,
         attachment,
@@ -1436,7 +1466,7 @@ fn row(
         list_width,
         folder.as_deref(),
         hit.related,
-        date.as_deref(),
+        [&dates[0], &dates[1]],
         |text, kind, limit| {
             let (style, weight, color) = match kind {
                 RowText::Detail => (&style, FontWeight::NORMAL, Some(dim)),
@@ -1449,11 +1479,11 @@ fn row(
             }
         },
     );
-    let sender = &row.spans[0].text;
     let marks = [
         star.map(|width| (STAR, theme.star, width)),
         attachment.map(|width| (THREAD_ATTACHMENT_MARK, dim, width)),
     ];
+    let snippet_room = row_text_width(list_width);
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1468,11 +1498,20 @@ fn row(
                 background_color: Some(rgb(fill).into()),
                 ..HighlightStyle::default()
             };
-            StyledText::new(text)
-                .with_highlights(highlights.into_iter().map(|range| (range, highlight)))
+            let mut style = subject_style.clone();
+            style.color = rgb(dim).into();
+            fit_highlighted_excerpt(window, &style, &text, &highlights, highlight, snippet_room)
         }
-        _ => StyledText::new(row.snippet.clone()),
+        _ => clip_shaped(
+            window,
+            &subject_style,
+            &row.snippet,
+            snippet_room,
+            FontWeight::NORMAL,
+            Some(dim),
+        ),
     };
+    let excerpt = excerpt.filter(|line| line.width <= px(snippet_room));
     div()
         .id(gpui::ElementId::named_usize("search-row", index))
         .relative()
@@ -1525,7 +1564,7 @@ fn row(
                         .gap(px(SENDER_GAP))
                         .text_color(rgb(dim))
                         .text_size(size)
-                        .child(div().min_w_0().truncate().child(sender.clone()))
+                        .children(sender.map(|line| shaped_text(line, window)))
                         .children(count.map(|count| div().flex_none().child(count))),
                 )
                 .child(
@@ -1549,8 +1588,49 @@ fn row(
                     }),
                 )),
         )
-        .child(div().truncate().text_color(rgb(dim)).child(excerpt))
+        .child(
+            div()
+                .overflow_hidden()
+                .children(excerpt.map(|line| paint_shaped_text(line, window, true))),
+        )
         .into_any_element()
+}
+
+fn fit_highlighted_excerpt(
+    window: &Window,
+    style: &TextStyle,
+    text: &str,
+    highlights: &[Range<usize>],
+    highlight: HighlightStyle,
+    room: f32,
+) -> Option<gpui::ShapedLine> {
+    let size = style.font_size.to_pixels(window.rem_size());
+    let matched = style.clone().highlight(highlight);
+    // Measure the actual runs, including the heavier matches, against the inner row.
+    fit_shaped_line(text, room, f32::from(size), |candidate| {
+        let end = if text.starts_with(candidate) {
+            candidate.len()
+        } else {
+            candidate.len() - '…'.len_utf8()
+        };
+        let mut runs = Vec::new();
+        let mut offset = 0;
+        for range in highlights.iter().take_while(|range| range.start < end) {
+            if range.start > offset {
+                runs.push(style.to_run(range.start - offset));
+            }
+            offset = range.end.min(end);
+            runs.push(matched.to_run(offset - range.start));
+        }
+        if offset < candidate.len() {
+            runs.push(style.to_run(candidate.len() - offset));
+        }
+        Some(
+            window
+                .text_system()
+                .shape_line(candidate.to_owned().into(), size, &runs, None),
+        )
+    })
 }
 
 fn visible_excerpt(preview: &SearchPreview) -> (String, Vec<Range<usize>>) {
@@ -1649,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_search_rows_keep_the_subject_ellipsis_when_dates_do_not_fit() {
+    fn narrow_search_rows_fit_compact_dates_without_crowding_the_subject() {
         let mut row = present::ThreadRow {
             id: "field-report".into(),
             spans: vec![present::NameSpan {
@@ -1670,8 +1750,11 @@ mod tests {
         };
         // Deterministic glyph widths keep this row test independent of local fonts.
         let shape = |text: &str, kind, room: Option<f32>| {
+            if text.is_empty() {
+                return None;
+            }
             let glyph = match kind {
-                RowText::Detail => 7.0,
+                RowText::Detail => 7.5,
                 RowText::Subject => 8.0,
                 RowText::Mark => 14.0,
             };
@@ -1688,23 +1771,48 @@ mod tests {
             line.text = text.into();
             Some(line)
         };
-        let width = 280.0;
         let folder = Some("Projects/Field Operations/West Ridge Coordination");
-        for (date, marked) in [("November 21, 2025", false), ("Yesterday", true)] {
+        for (width, dates, marked, expected) in [
+            (280.0, ["Nov 21, 2025", "11/21/25"], false, Some("11/21/25")),
+            (280.0, ["Yesterday", "Yest."], true, Some("Yest.")),
+            (245.0, ["Yesterday", "Yest."], true, None),
+            (380.0, ["Yesterday", "Yest."], false, Some("Yesterday")),
+        ] {
             row.starred = marked;
             row.has_attachment = marked;
-            let layout = fit_row_line(&row, width, folder, false, Some(date), shape);
+            row.message_count = if marked { 3 } else { 1 };
+            let layout = fit_row_line(&row, width, folder, false, dates, shape);
             assert_eq!(layout.star.is_some(), marked);
             assert_eq!(layout.attachment.is_some(), marked);
-            assert!(layout.detail.iter().all(Option::is_none), "{date}");
-            let subject = layout.subject.unwrap();
-            assert!(
-                subject.text.starts_with("Field"),
-                "{date}: {}",
-                subject.text
+            assert_eq!(
+                layout.detail[1]
+                    .as_ref()
+                    .map(|line| line.text.trim_start_matches(" · ")),
+                expected,
             );
-            assert!(subject.text.ends_with('…'), "{date}: {}", subject.text);
-            assert!(f32::from(subject.width) >= MIN_SUBJECT, "{date}");
+            let sender = layout.sender.unwrap();
+            assert!(sender.text.ends_with('…'));
+            let count_width = layout.count.as_ref().map_or(0.0, |count| {
+                f32::from(shape(count, RowText::Detail, None).unwrap().width).ceil() + SENDER_GAP
+            });
+            assert!(f32::from(sender.width).ceil() + count_width <= layout.sender_width);
+            let row_room = row_text_width(width);
+            let room = row_room
+                - layout.sender_width
+                - if marked { 2.0 * (14.0 + ROW_GAP) } else { 0.0 }
+                - 2.0 * ROW_GAP;
+            let detail_width: f32 = layout
+                .detail
+                .iter()
+                .flatten()
+                .map(|line| f32::from(line.width).ceil())
+                .sum();
+            let subject = layout.subject.unwrap();
+            assert!(detail_width <= detail_budget(row_room, room, 0.0, 0.0));
+            assert!(subject.text.starts_with("Field"));
+            assert!(subject.text.ends_with('…'));
+            assert!(f32::from(subject.width) >= MIN_SUBJECT);
+            assert!(f32::from(subject.width) + detail_width <= room);
         }
     }
 }

@@ -3900,10 +3900,10 @@ enum FolderFit<'a> {
 fn fit_folder_path<T>(
     path: &str,
     mode: FolderFit<'_>,
-    fit: impl Fn(&str) -> Option<T>,
+    clip: impl Fn(&str) -> Option<T>,
     text: impl Fn(&T) -> &str,
 ) -> Option<T> {
-    let fit = |candidate: &str| fit(candidate).filter(|line| text(line) != "…");
+    let fit = |candidate: &str| clip(candidate).filter(|line| text(line) != "…");
     let full = fit(path);
     if full.as_ref().is_some_and(|line| text(line) == path) {
         return full;
@@ -3941,7 +3941,8 @@ fn fit_folder_path<T>(
                         .strip_prefix(&prefix)
                         .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
                 })
-                .or_else(|| fit(&format!("…/{leaf}")));
+                .or_else(|| exact(&format!("…/{leaf}")))
+                .or_else(|| clip(leaf));
         }
         if let Some(line) = exact(&shortened).filter(&keeps_match) {
             return Some(line);
@@ -3955,7 +3956,7 @@ fn fit_folder_path<T>(
             return Some(line);
         }
     } else if matches!(mode, FolderFit::Header) {
-        return full;
+        return full.or_else(|| clip(leaf));
     }
 
     let suffix = fit_folder_words("…", leaf, &exact).or_else(|| {
@@ -4000,10 +4001,17 @@ fn fit_folder_path<T>(
                 .take_while(|&(index, _)| index <= matched.start)
                 .last()
                 .map_or(0, |(index, _)| index);
-            return fit(&format!("…{}", &tail[start..]));
+            if let Some(line) = fit(&format!("…{}", &tail[start..]))
+                .filter(|line| folder_match(text(line), query).is_some())
+            {
+                return Some(line);
+            }
         }
     }
-    None
+    match mode {
+        FolderFit::Picker(_) => clip(leaf),
+        _ => None,
+    }
 }
 
 fn folder_match(label: &str, query: &str) -> Option<std::ops::Range<usize>> {
@@ -4193,7 +4201,16 @@ fn header(
         let name = fit_folder_path(
             &label,
             FolderFit::Header,
-            |path| fit(path, name_room, FontWeight::SEMIBOLD),
+            |path| {
+                clip_shaped(
+                    window,
+                    &style,
+                    path,
+                    name_room.floor(),
+                    FontWeight::SEMIBOLD,
+                    None,
+                )
+            },
             |line| &line.text,
         );
         let name_width = name
@@ -5273,21 +5290,32 @@ fn clip_shaped(
     weight: FontWeight,
     color: Option<u32>,
 ) -> Option<gpui::ShapedLine> {
+    let font_px = f32::from(style.font_size.to_pixels(window.rem_size()));
+    fit_shaped_line(text, max_px, font_px, |text| {
+        shape_ui_line(window, style, text, weight, color)
+    })
+}
+
+fn fit_shaped_line(
+    text: &str,
+    max_px: f32,
+    font_px: f32,
+    shape: impl Fn(&str) -> Option<gpui::ShapedLine>,
+) -> Option<gpui::ShapedLine> {
     // No glyph of a UI font is narrower than a fifth of an em, so more
     // characters than this can never fit.
-    let font_px = f32::from(style.font_size.to_pixels(window.rem_size()));
     let most = (max_px / (font_px * 0.2).max(1.0)).ceil() as usize + 2;
     let probe = match text.char_indices().nth(most) {
         Some((cut, _)) => &text[..cut],
         None => text,
     };
-    let mut line = shape_ui_line(window, style, probe, weight, color)?;
+    let mut line = shape(probe)?;
     if f32::from(line.width) <= max_px {
         if probe.len() == text.len() {
             return Some(line);
         }
         // Narrower glyphs than any font has: measure the whole line.
-        line = shape_ui_line(window, style, text, weight, color)?;
+        line = shape(text)?;
         if f32::from(line.width) <= max_px {
             return Some(line);
         }
@@ -5302,13 +5330,13 @@ fn clip_shaped(
         f32::from(line.width),
         shaped.len(),
     );
-    let mut room = max_px - line_px_with_style(window, style, "…", weight);
+    let mut room = max_px - f32::from(shape("…")?.width);
     // The whole line does not fit: the cut is before its end.
     let mut before = shaped.len();
     loop {
         let kept = text_cut::kept(&shaped[..cuts.fit(room, before)]);
         // No space or punctuation before the ellipsis: "Friday…".
-        let cut = shape_ui_line(window, style, &present::ellipsis(kept), weight, color)?;
+        let cut = shape(&present::ellipsis(kept))?;
         if kept.is_empty() || f32::from(cut.width) <= max_px {
             return Some(cut);
         }
@@ -5321,11 +5349,22 @@ fn clip_shaped(
 
 /// A line [`clip_shaped`] already shaped, drawn as it is.
 fn shaped_text(line: gpui::ShapedLine, window: &Window) -> gpui::Canvas<()> {
+    paint_shaped_text(line, window, false)
+}
+
+fn paint_shaped_text(
+    line: gpui::ShapedLine,
+    window: &Window,
+    background: bool,
+) -> gpui::Canvas<()> {
     let height = window.text_style().line_height_in_pixels(window.rem_size());
     let width = line.width;
     gpui::canvas(
         |_, _, _| {},
         move |bounds, _, window, cx| {
+            if background {
+                let _ = line.paint_background(bounds.origin, height, window, cx);
+            }
             let _ = line.paint(bounds.origin, height, window, cx);
         },
     )
@@ -7574,7 +7613,6 @@ fn folder_picker(
                         FolderFit::Picker(&query),
                         |path| {
                             clip_shaped(window, &style, path, label_room, FontWeight::NORMAL, None)
-                                .filter(|line| f32::from(line.width) <= label_room)
                         },
                         |line| &line.text,
                     );
@@ -7623,13 +7661,23 @@ fn folder_picker(
                         .children(label.map(|line| {
                             let matched = folder_match(&line.text, &query);
                             let highlight = HighlightStyle {
-                                color: Some(rgb(theme.accent).into()),
+                                color: Some(
+                                    rgb(if index == selected {
+                                        theme.on_selection_accent
+                                    } else {
+                                        theme.accent
+                                    })
+                                    .into(),
+                                ),
                                 ..HighlightStyle::default()
                             };
                             div()
                                 .flex_none()
                                 .whitespace_nowrap()
                                 .font_weight(FontWeight::NORMAL)
+                                .when(matched.is_some(), |label| {
+                                    label.text_color(rgb(detail_color))
+                                })
                                 .child(
                                     StyledText::new(line.text)
                                         .with_highlights(matched.map(|range| (range, highlight))),
@@ -7906,9 +7954,11 @@ mod tests {
         assert_eq!(fit(&sibling, 16, FolderFit::Search), "…training");
         assert_eq!(fit(path, 17, FolderFit::Header), "Projects/…/Field…");
         assert_eq!(fit("Field survey", 8, FolderFit::Search), "…survey");
-        for mode in [picker, FolderFit::Search, FolderFit::Header] {
-            assert!(fit_folder_path(path, mode, |_| Some("…"), |line| line).is_none());
+        for mode in [FolderFit::Picker("2026"), FolderFit::Header] {
+            assert_eq!(fit(path, 5, mode), "Fiel…");
+            assert_eq!(fit(path, 1, mode), "…");
         }
+        assert!(fit_folder_path(path, FolderFit::Search, |_| Some("…"), |line| line).is_none());
     }
 
     #[test]
