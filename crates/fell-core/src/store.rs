@@ -540,6 +540,7 @@ impl Store {
         // including the one that installs the threading triggers. Then the
         // threading tables, which the version 3 upgrade below already reads.
         summaries::ensure_thread_summaries(&conn)?;
+        ensure_agent_grant_revision(&conn)?;
         conn.execute_batch(sent_bcc::SENT_BCC_TABLE)?;
         conn.execute_batch(roles::ROLES_TABLE)?;
         conn.execute_batch(intents::INTENT_SCHEMA)?;
@@ -4011,6 +4012,33 @@ fn ensure_agent_action_columns(conn: &Connection) -> Result<()> {
         return Err(err.into());
     }
     Ok(())
+}
+
+fn ensure_agent_grant_revision(conn: &Connection) -> Result<()> {
+    if !column_names(conn, "agent_grants")?
+        .iter()
+        .any(|name| name == "revision")
+        && let Err(err) = conn.execute(
+            "ALTER TABLE agent_grants ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        && !duplicate_column(&err)
+    {
+        return Err(err.into());
+    }
+    // Track writes from older versions of the CLI as well. The trigger's
+    // own UPDATE only changes revision, so it never fires itself.
+    ensure_triggers(
+        conn,
+        "agent_grant_revision",
+        "1",
+        "CREATE TRIGGER bump_agent_grant_revision
+         AFTER UPDATE OF enabled, can_read, can_triage, can_draft ON agent_grants
+         BEGIN
+             UPDATE agent_grants SET revision = revision + 1
+             WHERE agent_id = NEW.agent_id AND account_id = NEW.account_id;
+         END;",
+    )
 }
 
 fn ensure_alias_columns(conn: &Connection) -> Result<()> {

@@ -80,12 +80,13 @@ impl Harness {
     /// Fell may edit it.
     ///
     /// - Codex: `~/.codex/config.toml` (`$CODEX_HOME`), `[mcp_servers.NAME]`.
-    /// - Gemini CLI: `~/.gemini/settings.json`, `mcpServers`.
+    /// - Gemini CLI: `~/.gemini/settings.json` (`$GEMINI_CLI_HOME`), `mcpServers`.
     /// - OpenCode: `$OPENCODE_CONFIG_DIR/opencode.json`, else
     ///   `~/.config/opencode/opencode.json`, `mcp.servers` (a server under
     ///   `mcp.servers` wins over one of the same name directly under `mcp`,
     ///   OpenCode's older layout).
-    /// - Goose: `~/.config/goose/config.yaml`, `extensions`.
+    /// - Goose: `~/.config/goose/config.yaml` or
+    ///   `$GOOSE_PATH_ROOT/config/config.yaml`, `extensions`.
     ///
     /// Claude Code is `None`. Its user-level servers live in `~/.claude.json`
     /// next to state Claude Code rewrites while it runs, so a write from here
@@ -105,13 +106,21 @@ impl Harness {
                 .clone()
                 .or_else(|| home.map(|home| home.join(".codex")))
                 .map(|dir| dir.join("config.toml")),
-            Self::Gemini => home.map(|home| home.join(".gemini/settings.json")),
+            Self::Gemini => env
+                .gemini_home
+                .as_deref()
+                .or(home)
+                .map(|home| home.join(".gemini/settings.json")),
             Self::OpenCode => env
                 .opencode_config_dir
                 .clone()
                 .or_else(|| xdg_config.map(|dir| dir.join("opencode")))
                 .map(|dir| dir.join("opencode.json")),
-            Self::Goose => xdg_config.map(|dir| dir.join("goose/config.yaml")),
+            Self::Goose => env
+                .goose_root
+                .as_ref()
+                .map(|root| root.join("config/config.yaml"))
+                .or_else(|| xdg_config.map(|dir| dir.join("goose/config.yaml"))),
         }
     }
 
@@ -136,7 +145,9 @@ pub(crate) struct Env {
     pub home: Option<PathBuf>,
     pub xdg_config: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    pub gemini_home: Option<PathBuf>,
     pub opencode_config_dir: Option<PathBuf>,
+    pub goose_root: Option<PathBuf>,
 }
 
 impl Env {
@@ -150,7 +161,9 @@ impl Env {
             home: dir("HOME"),
             xdg_config: dir("XDG_CONFIG_HOME"),
             codex_home: dir("CODEX_HOME"),
+            gemini_home: dir("GEMINI_CLI_HOME"),
             opencode_config_dir: dir("OPENCODE_CONFIG_DIR"),
+            goose_root: dir("GOOSE_PATH_ROOT"),
         }
     }
 
@@ -180,6 +193,8 @@ pub(crate) fn snippet(harness: Harness, spec: &ServerSpec) -> String {
                 "claude".to_string(),
                 "mcp".into(),
                 "add".into(),
+                "--transport".into(),
+                "stdio".into(),
                 "--scope".into(),
                 "user".into(),
                 ENTRY.into(),
@@ -1453,6 +1468,16 @@ pub(crate) mod tests {
         assert_eq!(
             path(Harness::Goose, &env),
             Path::new("/x/goose/config.yaml")
+        );
+        env.gemini_home = Some("/gemini".into());
+        assert_eq!(
+            path(Harness::Gemini, &env),
+            Path::new("/gemini/.gemini/settings.json")
+        );
+        env.goose_root = Some("/goose".into());
+        assert_eq!(
+            path(Harness::Goose, &env),
+            Path::new("/goose/config/config.yaml")
         );
         assert_eq!(
             env.display(Path::new("/h/.codex/config.toml")),

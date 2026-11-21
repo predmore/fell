@@ -71,6 +71,9 @@ pub enum Action {
     Help,
     About,
     ReopenReview,
+    Agents,
+    AgentControl(crate::model::agents::Control),
+    UndoAgentRevoke,
 }
 
 impl Action {
@@ -118,6 +121,9 @@ impl Action {
             Self::Help => "Help",
             Self::About => "About Fell",
             Self::ReopenReview => "Reopen agent review",
+            Self::Agents => "Agents",
+            Self::AgentControl(control) => control.command(),
+            Self::UndoAgentRevoke => "Undo agent revoke",
         }
     }
 
@@ -126,7 +132,7 @@ impl Action {
     }
 }
 
-const ALL_ACTIONS: [Action; 42] = [
+const ALL_ACTIONS: [Action; 43] = [
     Action::Next,
     Action::Prev,
     Action::First,
@@ -168,6 +174,7 @@ const ALL_ACTIONS: [Action; 42] = [
     Action::Palette,
     Action::Help,
     Action::ReopenReview,
+    Action::Agents,
     Action::About,
 ];
 
@@ -335,6 +342,11 @@ fn default_bindings() -> Vec<Binding> {
         Some("Attachments / agents"),
     );
     bind(
+        &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('a')],
+        Action::Agents,
+        Some("Agents"),
+    );
+    bind(
         &[KeyId::Leader, KeyId::Char('a'), KeyId::Char('r')],
         Action::ReopenReview,
         Some("Agents"),
@@ -451,6 +463,7 @@ pub fn palette_items(keymap: &Keymap, query: &str, recent: &[Action]) -> Vec<Pal
         let score = fuzzy(query, label).or_else(|| match action {
             Action::About => fuzzy(query, "version"),
             Action::ReopenReview => fuzzy(query, "Reopen closed agent review"),
+            Action::Agents => fuzzy(query, "Manage connected agents and mailbox access"),
             _ => None,
         });
         let Some(score) = score else {

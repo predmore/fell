@@ -452,10 +452,9 @@ fn claude_code_gets_its_own_command_and_no_file_is_written() {
     let ctx = Ctx::new();
     let ran = ctx.run(&["fell-mcp", "add", "claude-code", "--write"], "", false);
     ran.result.unwrap();
-    assert!(
-        ran.out
-            .starts_with("claude mcp add --scope user fell -- /opt/fell/fell-mcp serve --store ")
-    );
+    assert!(ran.out.starts_with(
+        "claude mcp add --transport stdio --scope user fell -- /opt/fell/fell-mcp serve --store "
+    ));
     assert!(ran.err.contains("Fell does not edit Claude Code's config"));
     assert!(!ctx.home().join(".claude.json").exists());
     assert_eq!(std::fs::read_dir(ctx.home()).unwrap().count(), 0);

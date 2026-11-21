@@ -97,6 +97,8 @@ pub struct Layer {
     folder_query: String,
     folder_index: usize,
     folder_intent: FolderIntent,
+    agents: Option<crate::model::agents::Agents>,
+    palette_from_agents: bool,
 }
 
 impl Layer {
@@ -109,6 +111,8 @@ impl Layer {
             folder_query: session.folder_query.clone(),
             folder_index: session.folder_index,
             folder_intent: session.folder_intent,
+            agents: (session.overlay == Overlay::Agents).then(|| session.agents.clone()),
+            palette_from_agents: session.palette_from_agents,
         }
     }
 
@@ -122,6 +126,13 @@ impl Layer {
         std::mem::swap(&mut self.folder_query, &mut session.folder_query);
         std::mem::swap(&mut self.folder_index, &mut session.folder_index);
         std::mem::swap(&mut self.folder_intent, &mut session.folder_intent);
+        if let Some(agents) = &mut self.agents {
+            std::mem::swap(agents, &mut session.agents);
+        }
+        std::mem::swap(
+            &mut self.palette_from_agents,
+            &mut session.palette_from_agents,
+        );
     }
 }
 

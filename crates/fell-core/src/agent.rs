@@ -51,6 +51,7 @@ pub struct AgentSummary {
     pub account_id: AccountId,
     pub grant: AgentGrant,
     pub last_action_unix: Option<i64>,
+    pub revision: i64,
 }
 
 /// One logged triage or draft action.
@@ -173,7 +174,8 @@ impl crate::Store {
         let mut stmt = self.conn.prepare(
             "SELECT g.agent_id, g.account_id, g.enabled, g.can_read, g.can_triage, g.can_draft,
                     (SELECT MAX(a.created_unix) FROM agent_actions a
-                     WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id)
+                     WHERE a.account_id = g.account_id AND a.actor = 'agent:' || g.agent_id),
+                    g.revision
              FROM agent_grants g
              ORDER BY g.agent_id, g.account_id",
         )?;
@@ -188,6 +190,7 @@ impl crate::Store {
                     draft: row.get::<_, i64>(5)? != 0,
                 },
                 last_action_unix: row.get(6)?,
+                revision: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -195,6 +198,40 @@ impl crate::Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Edit an existing row only if it is still the one the user saw.
+    /// Undo uses the revision of its revoke, so it cannot restore a grant
+    /// that was changed by another window or the CLI in the meantime.
+    pub fn update_agent_grant(
+        &self,
+        row: &AgentSummary,
+        grant: AgentGrant,
+    ) -> Result<Option<AgentSummary>> {
+        let tx = crate::store::immediate_transaction(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE agent_grants SET enabled = ?1, can_read = ?2, can_triage = ?3, can_draft = ?4
+             WHERE agent_id = ?5 AND account_id = ?6 AND revision = ?7",
+            params![
+                grant.enabled,
+                grant.read,
+                grant.triage,
+                grant.draft,
+                row.agent_id,
+                row.account_id.as_str(),
+                row.revision,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.seal_private_files()?;
+        tx.commit()?;
+        Ok(Some(AgentSummary {
+            grant,
+            revision: row.revision + 1,
+            ..row.clone()
+        }))
     }
 
     /// The stored grant. An unknown agent on a known account is disabled.

@@ -30,3 +30,6 @@ toml_edit = { version = "0.25.19", default-features = false, features = ["parse"
 # Tests index and rank with a tiny test embedder (`Store::testing_*`). Dev
 # only: `cargo build -p fell-mcp --release` does not enable `test-utils`.
 fell-core = { workspace = true, features = ["test-utils"] }
+
+# Isolated XDG roots for the real stdio binary test.
+tempfile = "3"

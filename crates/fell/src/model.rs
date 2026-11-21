@@ -1,5 +1,6 @@
 //! Inbox session: folders, selection, chords, palette. No drawing.
 
+pub mod agents;
 pub mod search;
 
 use std::collections::HashSet;
@@ -155,6 +156,7 @@ pub enum Overlay {
     Folders,
     Help,
     About,
+    Agents,
 }
 
 /// What confirming the folder picker does.
@@ -324,6 +326,7 @@ pub struct Step {
     pub search_request: bool,
     pub search_completion: bool,
     pub reveal_search_hit: bool,
+    pub agents: Option<agents::Request>,
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +386,8 @@ pub struct Session {
     /// on the recipient line opens only this; `q` opens everything.
     pub recipients_open: HashSet<String>,
     pub overlay: Overlay,
+    pub agents: agents::Agents,
+    pub palette_from_agents: bool,
     pub chord: Vec<KeyId>,
     pub chord_gen: u64,
     pub which_visible: bool,
@@ -471,6 +476,8 @@ impl Session {
             quotes_open: HashSet::new(),
             recipients_open: HashSet::new(),
             overlay: Overlay::None,
+            agents: agents::Agents::default(),
+            palette_from_agents: false,
             chord: Vec::new(),
             chord_gen: 0,
             which_visible: false,
@@ -729,6 +736,9 @@ impl Session {
     }
 
     pub fn palette(&self) -> Vec<PaletteItem> {
+        if self.palette_from_agents {
+            return self.agents.palette(&self.palette_query);
+        }
         keymap::recent_search_items(&self.palette_query, &self.recent_searches)
             .chain(keymap::palette_items(
                 &self.keymap,
@@ -1691,6 +1701,7 @@ impl Session {
         match self.overlay {
             Overlay::Palette => self.palette_key(key, page_rows),
             Overlay::Folders => self.folder_key(key),
+            Overlay::Agents => self.agents_key(key, page_rows),
             Overlay::Help => {
                 if matches!(key, KeyId::Escape | KeyId::Enter | KeyId::Char('?')) {
                     self.overlay = Overlay::None;
@@ -1707,16 +1718,44 @@ impl Session {
         }
     }
 
+    fn agents_key(&mut self, key: KeyId, page_rows: usize) -> Step {
+        if self.agents.confirm.is_none() {
+            match key {
+                KeyId::Escape => {
+                    self.dismiss_overlay();
+                    return Step::default();
+                }
+                KeyId::Char(':') | KeyId::CtrlShiftP => {
+                    return self.run(Action::Palette, page_rows);
+                }
+                _ => {}
+            }
+        }
+        Step {
+            agents: self.agents.key(key),
+            ..Step::default()
+        }
+    }
+
+    pub fn dismiss_overlay(&mut self) {
+        self.overlay = if std::mem::take(&mut self.palette_from_agents) {
+            Overlay::Agents
+        } else {
+            self.agents.confirm = None;
+            Overlay::None
+        };
+    }
+
     fn palette_key(&mut self, key: KeyId, page_rows: usize) -> Step {
         let len = self.palette().len();
         match key {
             KeyId::Escape => {
-                self.overlay = Overlay::None;
+                self.dismiss_overlay();
                 Step::default()
             }
             KeyId::Enter => {
                 let Some(item) = self.palette().get(self.palette_index).cloned() else {
-                    self.overlay = Overlay::None;
+                    self.dismiss_overlay();
                     return Step::default();
                 };
                 self.confirm_palette(item, page_rows)
@@ -1762,7 +1801,7 @@ impl Session {
     }
 
     pub fn confirm_palette(&mut self, item: PaletteItem, page_rows: usize) -> Step {
-        self.overlay = Overlay::None;
+        self.dismiss_overlay();
         let step = match item.search {
             Some(query) => self.apply_input(|session| {
                 let step = session.start_search(Some(query));
@@ -1855,6 +1894,21 @@ impl Session {
     }
 
     fn run(&mut self, action: Action, page_rows: usize) -> Step {
+        if self.overlay == Overlay::Agents {
+            let agents = match action {
+                Action::AgentControl(control) => {
+                    self.agents.activate(self.agents.selected, control)
+                }
+                Action::UndoAgentRevoke => self.agents.undo(),
+                _ => None,
+            };
+            if matches!(action, Action::AgentControl(_) | Action::UndoAgentRevoke) {
+                return Step {
+                    agents,
+                    ..Step::default()
+                };
+            }
+        }
         if !matches!(action, Action::Palette | Action::Help) {
             self.recent.retain(|item| *item != action);
             self.recent.insert(0, action);
@@ -1877,6 +1931,7 @@ impl Session {
                     | Action::SyncNow
                     | Action::Undo
                     | Action::ReopenReview
+                    | Action::Agents
             )
         {
             self.count.clear();
@@ -2156,6 +2211,7 @@ impl Session {
             }
             Action::Palette => {
                 self.count.clear();
+                self.palette_from_agents = self.overlay == Overlay::Agents;
                 self.overlay = Overlay::Palette;
                 self.palette_query.clear();
                 self.palette_index = 0;
@@ -2168,6 +2224,12 @@ impl Session {
                 self.count.clear();
                 self.overlay = Overlay::About;
             }
+            Action::Agents => {
+                self.count.clear();
+                self.overlay = Overlay::Agents;
+                step.agents = self.agents.open();
+            }
+            Action::AgentControl(_) | Action::UndoAgentRevoke => {}
             Action::ReopenReview => {
                 self.count.clear();
                 return Step {

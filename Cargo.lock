@@ -1982,6 +1982,7 @@ dependencies = [
  "rustix 1.1.6",
  "saphyr",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "toml_edit 0.25.19+spec-1.1.0",
 ]
