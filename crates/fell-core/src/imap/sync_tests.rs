@@ -3130,6 +3130,46 @@ fn internal_date_repair_waits_for_all_current_copies() {
 }
 
 #[test]
+fn internal_date_repair_uses_sent_when_inbox_keeps_refusing() {
+    let server = TestServer::spawn(TestState {
+        mailboxes: vec![
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x"), dated_copy(2, "inbox-only@x")],
+                ..empty_mailbox("INBOX", 20)
+            },
+            FixtureMailbox {
+                messages: vec![dated_copy(1, "shared@x")],
+                ..empty_mailbox("Sent", 21)
+            },
+        ],
+        ..sample_state()
+    });
+    let acct = account("date-repair-cap", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    sync_once(&acct, &backend, &store).unwrap();
+    queue_legacy_internal_dates(&store);
+    mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_fetch = true;
+    let date = |id| stored(&store, &acct, id).unwrap().headers.date_unix;
+    let queued = || store.missing_internal_dates(&acct.id).unwrap();
+
+    for _ in 1..5 {
+        sync_once(&acct, &backend, &store).unwrap();
+        assert_eq!(date("shared@x"), 0);
+        assert_eq!(queued().len(), 2);
+    }
+
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_eq!(date("shared@x"), 1_707_512_400);
+    assert_eq!(date("inbox-only@x"), 0);
+    assert!(queued().is_empty());
+}
+
+#[test]
 fn mail_deleted_on_the_server_is_gone_locally() {
     let server = TestServer::spawn(sample_state());
     let acct = account("a1", BackendKind::Imap);

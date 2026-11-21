@@ -6,6 +6,9 @@ use crate::{AccountId, MessageId, RemoteId, Result};
 
 use super::{BodyRequest, Store, bodies, immediate_transaction};
 
+pub(super) const MAX_DATE_REPAIR_ATTEMPTS: i64 = 5;
+const MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS: i64 = 30 * 86_400;
+
 pub(super) fn ensure_date_repair(conn: &Connection) -> Result<()> {
     ensure_date_repair_through(conn, crate::latest_mail_date())
 }
@@ -87,31 +90,36 @@ impl Store {
         account: &AccountId,
         batch: &[BodyRequest],
         checked: &HashMap<RemoteId, Option<i64>>,
+        latest: i64,
     ) -> Result<bool> {
         if batch.is_empty() {
             return Ok(false);
         }
         let tx = self.begin_sync_write()?;
         let mut changed = false;
-        let valid_dates = 1..=crate::latest_mail_date();
+        let valid_dates = 1..=latest;
+        let latest_plausible = latest.saturating_add(MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS);
         for request in batch {
             let id = request.message_id.as_str();
             let key = params![account.as_str(), id];
-            let Some(previous) = tx
+            let Some((previous, attempts)) = tx
                 .query_row(
-                    "SELECT previous_date_unix FROM internal_date_repair
+                    "SELECT previous_date_unix, attempts FROM internal_date_repair
                      WHERE account_id = ?1 AND message_id = ?2",
                     key,
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?
             else {
                 continue;
             };
             let copies = bodies::copies_of(&tx, account, id)?;
-            // Copies can move between the fetch and the write. Try again
-            // with the current copy set, after giving untried rows a turn.
-            if copies != request.copies || !copies.iter().all(|copy| checked.contains_key(copy)) {
+            let clock_may_be_behind = previous > latest && previous <= latest_plausible;
+            let incomplete =
+                copies != request.copies || !copies.iter().all(|copy| checked.contains_key(copy));
+            // Give the clock and unchecked copies another chance after
+            // untried rows. On the last attempt, use what we have.
+            if attempts < MAX_DATE_REPAIR_ATTEMPTS - 1 && (clock_may_be_behind || incomplete) {
                 tx.execute(
                     "UPDATE internal_date_repair SET attempts = attempts + 1
                      WHERE account_id = ?1 AND message_id = ?2",
@@ -123,9 +131,13 @@ impl Store {
                 .contains(&previous)
                 .then_some(previous)
                 .or_else(|| {
-                    copies
-                        .iter()
-                        .find_map(|copy| checked[copy].filter(|date| valid_dates.contains(date)))
+                    copies.iter().find_map(|copy| {
+                        checked
+                            .get(copy)
+                            .copied()
+                            .flatten()
+                            .filter(|date| valid_dates.contains(date))
+                    })
                 });
             if let Some(date) = date {
                 changed |= tx.execute(

@@ -102,13 +102,13 @@ fn repair_internal_dates(
         .collect();
     let mut checked = HashMap::new();
     if !copies.is_empty() {
-        // A dropped connection leaves incomplete copies queued. Keep the
-        // results from any mailbox whose fetch finished before it dropped.
+        // Keep the results from any mailbox whose fetch finished before a
+        // connection dropped. Unchecked copies can be retried by the store.
         let _ = backend.fetch_internal_dates(&copies, &mut |id, date| {
             checked.insert(id.clone(), date);
         });
     }
-    store.finish_internal_dates(account, &batch, &checked)
+    store.finish_internal_dates(account, &batch, &checked, crate::latest_mail_date())
 }
 
 /// Cursor for walking unchecked Reply-To headers between sync passes.
