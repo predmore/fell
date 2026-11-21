@@ -695,9 +695,11 @@ impl Inbox {
                                 cx.notify();
                                 return;
                             }
-                            // Refresh the open thread when either its parts
-                            // or its read and star state may have changed.
-                            SyncEvent::BodiesStored | SyncEvent::FlagsChanged => {
+                            // Refresh list rows and the open thread when
+                            // stored parts, state or previews change.
+                            SyncEvent::BodiesStored
+                            | SyncEvent::FlagsChanged
+                            | SyncEvent::SnippetsStored => {
                                 inbox.request_threads(
                                     ReadIntent {
                                         refresh_open: true,
@@ -3437,6 +3439,7 @@ impl Render for Inbox {
                 &self.palette_scroll,
                 &self.folder_scroll,
                 help,
+                window,
                 cx,
             )
         };
@@ -3881,12 +3884,13 @@ fn folder_path_ends(path: &str) -> Option<(&str, &str)> {
     Some((first, rest.rsplit('/').next().unwrap_or(rest)))
 }
 
-fn fit_folder_path(
+fn fit_folder_path<T>(
     path: &str,
-    fit: impl Fn(&str) -> Option<gpui::ShapedLine>,
-) -> Option<gpui::ShapedLine> {
+    fit: impl Fn(&str) -> Option<T>,
+    text: impl Fn(&T) -> &str,
+) -> Option<T> {
     let full = fit(path);
-    if full.as_ref().is_some_and(|line| line.text == path) {
+    if full.as_ref().is_some_and(|line| text(line) == path) {
         return full;
     }
     let Some((first, leaf)) = folder_path_ends(path) else {
@@ -3895,7 +3899,7 @@ fn fit_folder_path(
     let prefix = format!("{first}/…/");
     fit(&format!("{prefix}{leaf}"))
         .filter(|line| {
-            line.text
+            text(line)
                 .strip_prefix(&prefix)
                 .is_some_and(|leaf| !leaf.is_empty() && leaf != "…")
         })
@@ -4035,7 +4039,11 @@ fn header(
         let count_space = if drafts { 0. } else { COUNT_GAP + count_room };
         let name_room = (room - ACCOUNT_MIN - count_space).max(0.);
         let label = session.roles.label(folder);
-        let name = fit_folder_path(&label, |path| fit(path, name_room, FontWeight::SEMIBOLD));
+        let name = fit_folder_path(
+            &label,
+            |path| fit(path, name_room, FontWeight::SEMIBOLD),
+            |line| &line.text,
+        );
         let name_width = name
             .as_ref()
             .map_or(0., |line| f32::from(line.width).ceil());
@@ -6684,6 +6692,8 @@ fn recipient_lines(
         cx.notify();
     });
     let size = px(theme.ui_px - 1.0);
+    let style = conversation_line_style(window, theme, size);
+    let space = line_px_with_style(window, &style, " ", FontWeight::NORMAL);
     let details = || {
         div()
             .flex()
@@ -6692,11 +6702,10 @@ fn recipient_lines(
             .children(line.groups.iter().map(|group| {
                 div()
                     .flex()
-                    .gap(px(10.))
+                    .gap(px(space))
                     .child(
                         div()
                             .flex_shrink_0()
-                            .w(px(28.))
                             .text_color(rgb(theme.dimmed))
                             .child(group.label),
                     )
@@ -6751,7 +6760,6 @@ fn recipient_lines(
         // always matches the names on screen; the Bcc and key always show.
         // Only a single name too long for the pane is cut, with an ellipsis.
         // The text takes the box's colour, so hover reaches it.
-        let style = conversation_line_style(window, theme, size);
         let measure = |text: &str| line_px_with_style(window, &style, text, FontWeight::NORMAL);
         let (names, tail, _) =
             present::fit_recipients(line, |names, tail| measure(names) + measure(tail) <= width);
@@ -7041,6 +7049,8 @@ const ABOUT_ROW_PAD_Y: f32 = 7.0;
 const ABOUT_ROW_GAP: f32 = 2.0;
 const PICKER_ROW_PX: f32 = 34.0;
 const PICKER_GROUP_GAP: f32 = 8.0;
+const PICKER_ROW_MARGIN: f32 = 4.0;
+const PICKER_ROW_PAD: f32 = 10.0;
 /// Where the palette, folder picker and help card sit below the window's top.
 const CARD_TOP_PX: f32 = 72.0;
 
@@ -7118,6 +7128,7 @@ fn overlay(
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
     help: Option<(f32, gpui::Div)>,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     let top = help.as_ref().map_or(CARD_TOP_PX, |(top, _)| *top);
@@ -7147,7 +7158,7 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Folders => folder_picker(theme, session, folder_scroll, cx)
+            Overlay::Folders => folder_picker(theme, session, folder_scroll, window, cx)
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
@@ -7330,12 +7341,16 @@ fn folder_picker(
     theme: &Theme,
     session: &Session,
     scroll: &ScrollHandle,
+    window: &Window,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
     let choices = session.folder_choices();
     let selected = session.folder_index;
+    let width = PICKER_PX.min(f32::from(window.viewport_size().width));
+    let label_room = (width - 2.0 - 2.0 * (PICKER_ROW_MARGIN + PICKER_ROW_PAD)).max(0.0);
+    let style = conversation_line_style(window, theme, px(theme.ui_px));
     div()
-        .w(px(PICKER_PX))
+        .w(px(width))
         .max_h(px(PICKER_MAX_PX))
         .bg(rgb(theme.surface))
         .border_1()
@@ -7356,6 +7371,7 @@ fn folder_picker(
         )
         .child(
             div()
+                .flex_none()
                 .h(px(44.))
                 .px(px(14.))
                 .flex()
@@ -7385,10 +7401,18 @@ fn folder_picker(
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .track_scroll(scroll)
-                .py(px(4.))
+                .my(px(4.))
                 .children(choices.iter().enumerate().map(|(index, name)| {
                     let name = name.clone();
                     let label = session.roles.label(&name);
+                    let label = fit_folder_path(
+                        &label,
+                        |path| {
+                            clip_shaped(window, &style, path, label_room, FontWeight::NORMAL, None)
+                                .filter(|line| f32::from(line.width) <= label_room)
+                        },
+                        |line| &line.text,
+                    );
                     let detail = session.folder_detail(&name);
                     let detail_color = if index == selected {
                         theme.on_selection_dim
@@ -7398,8 +7422,8 @@ fn folder_picker(
                     let row = div()
                         .id(gpui::ElementId::named_usize("folder", index))
                         .h(px(PICKER_ROW_PX))
-                        .mx(px(4.))
-                        .px(px(10.))
+                        .mx(px(PICKER_ROW_MARGIN))
+                        .px(px(PICKER_ROW_PAD))
                         .flex()
                         .items_center()
                         .rounded_md()
@@ -7431,7 +7455,10 @@ fn folder_picker(
                         )
                         .gap(px(8.))
                         .overflow_hidden()
-                        .child(div().flex_none().child(label))
+                        .children(
+                            label
+                                .map(|line| div().flex_none().whitespace_nowrap().child(line.text)),
+                        )
                         .children(detail.map(|name| {
                             div()
                                 .min_w(px(0.))
@@ -7646,7 +7673,7 @@ mod tests {
     use super::{
         LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns,
         account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, key_from, message_content_width, moved_in_list,
+        expanded_header_widths, fit_folder_path, key_from, message_content_width, moved_in_list,
         should_follow_visible, unread_bar_dx, useful_header_email, write_back_notice,
     };
     use crate::keymap::KeyId;
@@ -7654,6 +7681,32 @@ mod tests {
     use crate::motion;
     use crate::present::Pane;
     use gpui::{IntoElement, Keystroke, Modifiers, div};
+
+    #[test]
+    fn folder_path_keeps_the_ends_and_ellipsizes_the_leaf() {
+        let fit = |path, capacity| {
+            fit_folder_path(
+                path,
+                |candidate| {
+                    let len = candidate.chars().count();
+                    Some(if len <= capacity {
+                        candidate.to_owned()
+                    } else {
+                        let head: String = candidate.chars().take(capacity - 1).collect();
+                        crate::present::ellipsis(&head)
+                    })
+                },
+                String::as_str,
+            )
+            .unwrap()
+        };
+        let path = "Projects/2026/Field survey";
+        assert_eq!(fit(path, 40), path);
+        assert_eq!(fit(path, 23), "Projects/…/Field survey");
+        assert_eq!(fit(path, 17), "Projects/…/Field…");
+        assert_eq!(fit(path, 10), "…/Field s…");
+        assert_eq!(fit("Field survey", 8), "Field s…");
+    }
 
     fn stroke(key: &str, key_char: &str, shift: bool) -> Keystroke {
         Keystroke {

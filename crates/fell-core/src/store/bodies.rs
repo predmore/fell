@@ -729,6 +729,74 @@ pub(super) fn read_at_stamp(
     )
 }
 
+pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
+    const KEY: &str = "html_snippet_block_spacing";
+    let progress = |conn: &Connection| {
+        conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
+            [KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+    };
+    let cursor = progress(conn)?;
+    if cursor < 0 {
+        return Ok(None);
+    }
+
+    // Decode and render outside the write transaction, keeping just the
+    // small replacement snippets for the transaction.
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.rowid, b.account_id, b.message_id, b.html, m.snippet, s.stamp
+         FROM message_bodies b JOIN messages m USING (account_id, message_id)
+         LEFT JOIN message_body_stamps s USING (account_id, message_id)
+         WHERE b.rowid > ?1 AND b.codec = ?2 AND b.html IS NOT NULL AND b.plain IS NULL
+         ORDER BY b.rowid LIMIT 16",
+    )?;
+    let mut rows = stmt.query(params![cursor, CODEC_DEFLATE])?;
+    let mut next = -1;
+    let mut updates = Vec::new();
+    while let Some(row) = rows.next()? {
+        next = row.get(0)?;
+        let html: Vec<u8> = row.get(3)?;
+        let old: String = row.get(4)?;
+        if let Ok(html) = decompress(&html)
+            && let Some(snippet) = crate::imap::html_snippet(&html)
+            && snippet != old
+        {
+            let account: String = row.get(1)?;
+            let message: String = row.get(2)?;
+            let stamp: Option<Vec<u8>> = row.get(5)?;
+            updates.push((account, message, old, stamp, snippet));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    let tx = super::immediate_transaction(conn)?;
+    if progress(&tx)? != cursor {
+        return Ok(Some(false));
+    }
+    let mut changed = false;
+    for (account, message, old, stamp, snippet) in updates {
+        changed |= tx.execute(
+            "UPDATE messages SET snippet = ?5
+             WHERE account_id = ?1 AND message_id = ?2 AND snippet = ?3
+               AND (SELECT stamp FROM message_body_stamps
+                    WHERE account_id = ?1 AND message_id = ?2) IS ?4",
+            params![account, message, old, stamp, snippet],
+        )? > 0;
+    }
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![KEY, next],
+    )?;
+    tx.commit()?;
+    Ok((next >= 0).then_some(changed))
+}
+
 fn read_text(
     conn: &Connection,
     sql: &str,

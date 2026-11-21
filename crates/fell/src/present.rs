@@ -361,7 +361,7 @@ fn recipient_name(person: &fell_core::Address, me: &str) -> String {
     if person.email.eq_ignore_ascii_case(me) {
         return "me".into();
     }
-    let name = display_name(&person.name, &person.email, me);
+    let name = one_line(&display_name(&person.name, &person.email, me));
     if name.eq_ignore_ascii_case("me") {
         person.email.clone()
     } else {
@@ -2137,6 +2137,19 @@ mod tests {
                 ("cc", "carol <carol@x>".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn recipient_header_collapses_whitespace_in_display_names() {
+        let message = addressed(
+            "ada@x",
+            &[("Robin", "me@x"), ("  Bob\t \u{a0}Stone  ", "bob@x")],
+            &[],
+            &[],
+        );
+        let line = recipient_line(&message, "me@x").unwrap();
+        assert_eq!(line.short, "to me, Bob Stone");
+        assert_eq!(line.groups[0].people, ["me <me@x>", "Bob Stone <bob@x>"]);
     }
 
     #[test]

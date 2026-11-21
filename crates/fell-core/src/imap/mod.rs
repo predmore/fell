@@ -26,7 +26,7 @@ pub(crate) use part_fetch::{CANCELLED as PART_FETCH_CANCELLED, fetch_part};
 #[cfg(test)]
 pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
-    CidReferences, attachment_names, has_attachment, is_bidi_control, parts_from_raw,
+    CidReferences, attachment_names, has_attachment, html_snippet, is_bidi_control, parts_from_raw,
 };
 pub(crate) use stored_metadata::{fetch_internal_dates, fetch_reply_to};
 
