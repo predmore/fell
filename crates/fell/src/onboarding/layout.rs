@@ -1001,6 +1001,44 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated nested Wayland compositor"]
     fn renders_both_steps_with_shared_button_labels_during_a_fade() {
+        check_in_nested_window(|setup, cx| {
+            // Identity and Server settings share Back and Test connection.
+            setup.form.edit_servers();
+            setup.change_step(Step::Identity, Control::Back, cx);
+            assert!(setup.transition.is_some());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an isolated nested Wayland compositor"]
+    fn unchanged_theme_keeps_setup_transitions_running() {
+        check_in_nested_window(|setup, cx| {
+            setup.form.edit_servers();
+            setup.change_step(Step::Identity, Control::Back, cx);
+            setup.bridge = Bridge::Offline;
+            let now = setup.clock.now();
+            let tick_feedback = |setup: &mut Onboarding| {
+                setup
+                    .feedback
+                    .refresh(&setup.form, setup.bridge, setup.motion, now)
+            };
+            assert!(tick_feedback(setup));
+
+            let mut theme = setup.theme.clone();
+            assert!(!setup.apply_theme(theme.clone()));
+            assert!(setup.transition.is_some());
+            assert!(tick_feedback(setup));
+
+            theme.accent ^= 1;
+            assert!(setup.apply_theme(theme));
+            assert!(setup.transition.is_none());
+            assert!(!tick_feedback(setup));
+        });
+    }
+
+    fn check_in_nested_window(
+        check: impl FnOnce(&mut Onboarding, &mut Context<Onboarding>) + 'static,
+    ) {
         let display = std::env::var_os("WAYLAND_DISPLAY")
             .map(PathBuf::from)
             .unwrap();
@@ -1036,10 +1074,7 @@ mod tests {
                 cx.update(|cx| {
                     handle
                         .update(cx, |setup, window, cx| {
-                            // Identity and Server settings share Back and Test connection.
-                            setup.form.edit_servers();
-                            setup.change_step(Step::Identity, Control::Back, cx);
-                            assert!(setup.transition.is_some());
+                            check(setup, cx);
                             window.defer(cx, move |window, cx| {
                                 window.draw(cx).clear();
                                 completed.set(true);

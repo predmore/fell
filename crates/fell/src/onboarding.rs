@@ -75,13 +75,22 @@ impl Onboarding {
         let view = Self::init(window, cx);
         view.watch_bridge(cx);
         theme::follow(cx, |view, next, cx| {
-            view.theme = next;
-            view.motion = Motion::from_env();
-            view.transition = None;
-            view.feedback.settle();
-            cx.notify();
+            if view.apply_theme(next) {
+                cx.notify();
+            }
         });
         view
+    }
+
+    fn apply_theme(&mut self, next: Theme) -> bool {
+        if self.theme == next {
+            return false;
+        }
+        self.theme = next;
+        self.motion = Motion::from_env();
+        self.transition = None;
+        self.feedback.settle();
+        true
     }
 
     fn init(window: &mut Window, cx: &mut Context<Self>) -> Self {
