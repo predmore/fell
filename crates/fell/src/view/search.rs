@@ -1216,20 +1216,12 @@ fn row(
     const PAD: f32 = 14.0;
     let size = px(theme.ui_px - 2.0);
     let style = conversation_line_style(window, theme, size);
-    let location = match &hit.folder {
-        Some(folder) if hit.related => {
-            Some(format!("Related · {}", inbox.session.roles.label(folder)))
-        }
-        None if hit.related => Some("Related".to_owned()),
-        Some(folder) => Some(inbox.session.roles.label(folder)),
-        None => None,
-    };
     // Only the folder label truncates. Give the timestamp its shaped
     // width so a long label cannot clip its last glyph or hide it.
     let date = (!hit.related).then(|| present::relative_date(now_unix(), row.date_unix));
     let dated_location = date
         .as_ref()
-        .filter(|_| location.is_some())
+        .filter(|_| hit.folder.is_some())
         .and_then(|date| {
             shape_ui_line(
                 window,
@@ -1246,17 +1238,43 @@ fn row(
         .as_ref()
         .map_or(0.0, |line| f32::from(line.width).ceil());
     let location_room = (detail_room - date_width).floor();
-    let location = location.and_then(|text| {
-        clip_shaped(
-            window,
-            &style,
-            &text,
-            location_room,
-            FontWeight::NORMAL,
-            Some(dim),
-        )
-        .filter(|line| f32::from(line.width).ceil() <= location_room)
-    });
+    let related_prefix = if hit.related { "Related · " } else { "" };
+    let location = hit
+        .folder
+        .as_ref()
+        .and_then(|folder| {
+            fit_folder_path(
+                &inbox.session.roles.label(folder),
+                FolderFit::Search,
+                |path| {
+                    let text = format!("{related_prefix}{path}");
+                    clip_shaped(
+                        window,
+                        &style,
+                        &text,
+                        location_room,
+                        FontWeight::NORMAL,
+                        Some(dim),
+                    )
+                    .filter(|line| f32::from(line.width).ceil() <= location_room)
+                },
+                |line| line.text.strip_prefix(related_prefix).unwrap_or_default(),
+            )
+        })
+        .or_else(|| {
+            hit.related
+                .then(|| {
+                    clip_shaped(
+                        window,
+                        &style,
+                        "Related",
+                        location_room,
+                        FontWeight::NORMAL,
+                        Some(dim),
+                    )
+                })
+                .flatten()
+        });
     let date = if location.is_some() {
         dated_location
     } else {

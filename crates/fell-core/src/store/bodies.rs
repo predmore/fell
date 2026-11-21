@@ -763,7 +763,7 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
         let old: String = row.get(4)?;
         if let Ok(html) = decompress(&html)
             && let Some(snippet) = crate::imap::html_snippet(&html)
-            && snippet != old
+            && is_spacing_repair(&old, &snippet)
         {
             let account: String = row.get(1)?;
             let message: String = row.get(2)?;
@@ -795,6 +795,45 @@ pub(super) fn repair_html_snippets(conn: &Connection) -> Result<Option<bool>> {
     )?;
     tx.commit()?;
     Ok((next >= 0).then_some(changed))
+}
+
+fn is_spacing_repair(old: &str, new: &str) -> bool {
+    // The renderer and the old MIME extractor disagree on hidden
+    // preheaders and image alt text. Only repair whitespace changes.
+    old != new
+        && old
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .eq(new.chars().filter(|ch| !ch.is_whitespace()))
+}
+
+pub(super) fn fill_fetched_html_snippet(
+    conn: &Connection,
+    account: &AccountId,
+    message: &str,
+    parts: &StoredParts,
+    snippet: &str,
+) -> Result<()> {
+    // FillGap can keep parts from a different copy. Use the preview only
+    // when its HTML was kept and the stored message is still HTML-only.
+    let old: Option<String> = conn
+        .prepare_cached(
+            "SELECT m.snippet FROM messages m JOIN message_bodies b USING (account_id, message_id)
+             WHERE m.account_id = ?1 AND m.message_id = ?2
+               AND b.codec = ?3 AND b.plain IS NULL AND b.html = ?4",
+        )?
+        .query_row(
+            params![account.as_str(), message, CODEC_DEFLATE, parts.html],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if old.is_some_and(|old| old.is_empty() || is_spacing_repair(&old, snippet)) {
+        conn.prepare_cached(
+            "UPDATE messages SET snippet = ?3 WHERE account_id = ?1 AND message_id = ?2",
+        )?
+        .execute(params![account.as_str(), message, snippet])?;
+    }
+    Ok(())
 }
 
 fn read_text(
