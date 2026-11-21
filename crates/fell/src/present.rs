@@ -959,6 +959,9 @@ pub(crate) fn compact_relative_date(now: i64, then: i64) -> String {
 }
 
 fn relative_date_label(now: i64, then: i64, compact: bool) -> String {
+    if then <= 0 {
+        return String::new();
+    }
     // A future timestamp is not "now". Compare first: saturating_sub never goes negative.
     if then > now {
         return month_day(now, then, compact);
@@ -1770,6 +1773,14 @@ mod tests {
         assert_eq!(rows[0].snippet, "hello there friend");
         assert_eq!(rows[0].date_unix, 1_700_000_000);
         assert_eq!(relative_date(1_700_000_120, rows[0].date_unix), "2m");
+    }
+
+    #[test]
+    fn absent_dates_have_no_label() {
+        for then in [0, -1] {
+            assert_eq!(relative_date(1_700_000_000, then), "");
+            assert_eq!(compact_relative_date(1_700_000_000, then), "");
+        }
     }
 
     #[test]

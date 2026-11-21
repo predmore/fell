@@ -56,6 +56,7 @@ pub(super) struct Fetched {
     pub body_missing: bool,
     /// `RFC822.SIZE`, when the reply had it.
     pub size: Option<u32>,
+    pub internal_date: Option<i64>,
 }
 
 /// One reply to [`Session::uid_fetch_part`].
@@ -94,15 +95,16 @@ pub(super) enum FetchStop {
 pub(super) enum FetchItems {
     /// `UID FLAGS`: enough to update a message already stored.
     Flags,
-    /// `UID FLAGS BODY.PEEK[]`: the whole message, for mail not stored yet.
+    /// The whole message and its server date, for mail not stored yet.
     Bodies,
-    /// `UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]`: enough for a list row and
-    /// threading, before the body is fetched.
+    /// Enough for a list row and threading, before the body is fetched.
     Headers,
     /// Identity headers, to link copies without their bodies.
     MessageId { bridge: bool },
     /// The original Reply-To header only, for legacy rows.
     ReplyTo,
+    /// The server arrival date for legacy rows with no usable date.
+    InternalDate,
 }
 
 const REPLY_TO_SECTION: &str = "HEADER.FIELDS (REPLY-TO)";
@@ -334,13 +336,14 @@ impl Session {
         let identity;
         let body = match items {
             FetchItems::Flags => "",
-            FetchItems::Bodies => " BODY.PEEK[]",
-            FetchItems::Headers => " RFC822.SIZE BODY.PEEK[HEADER]",
+            FetchItems::Bodies => " INTERNALDATE BODY.PEEK[]",
+            FetchItems::Headers => " RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]",
             FetchItems::MessageId { bridge } => {
                 identity = format!(" BODY.PEEK[{}]", identity_section(bridge));
                 &identity
             }
             FetchItems::ReplyTo => " BODY.PEEK[HEADER.FIELDS (REPLY-TO)]",
+            FetchItems::InternalDate => " INTERNALDATE",
         };
         // CHANGEDSINCE already requests MODSEQ implicitly. Other FETCHes
         // need to request it to retain a baseline for later conditional STORE.
@@ -349,7 +352,11 @@ impl Session {
         } else {
             ""
         };
-        let wanted = format!("(UID FLAGS{revision}{body})");
+        let wanted = if items == FetchItems::InternalDate {
+            "(UID INTERNALDATE)".into()
+        } else {
+            format!("(UID FLAGS{revision}{body})")
+        };
         let cmd = match changed_since {
             Some(modseq) if self.qresync => {
                 format!("UID FETCH {range} {wanted} (CHANGEDSINCE {modseq} VANISHED)")
@@ -388,7 +395,9 @@ impl Session {
                 continue;
             }
             let fetched = match items {
-                FetchItems::Bodies | FetchItems::Headers => parse_fetch(&text, literals),
+                FetchItems::Bodies | FetchItems::Headers | FetchItems::InternalDate => {
+                    parse_fetch(&text, literals)
+                }
                 FetchItems::MessageId { bridge } => {
                     parse_fetch_with_section(&text, literals, Some(identity_section(bridge)))
                 }
@@ -1708,6 +1717,7 @@ fn parse_fetch_with_section(
         skipped,
         body_missing,
         size: number_after(&upper, "RFC822.SIZE "),
+        internal_date: fetch_internal_date(text, &upper),
     })
 }
 
@@ -1729,6 +1739,7 @@ fn parse_flags(text: &str) -> Option<Fetched> {
         skipped: false,
         body_missing: false,
         size: None,
+        internal_date: None,
     })
 }
 
@@ -1746,6 +1757,20 @@ fn fetch_flags(text: &str, upper: &str) -> Option<Vec<String>> {
 }
 
 fn fetch_list<'a>(text: &'a str, upper: &str, key: &str) -> Option<&'a str> {
+    let list = fetch_item(text, upper, key, '(')?;
+    Some(list.split_once(')')?.0)
+}
+
+fn fetch_internal_date(text: &str, upper: &str) -> Option<i64> {
+    let quoted = fetch_item(text, upper, "INTERNALDATE", '"')?;
+    let value = quoted.split_once('"')?.0.trim_start();
+    let (day, rest) = value.split_once('-')?;
+    let (month, rest) = rest.split_once('-')?;
+    let date = mail_parser::DateTime::parse_rfc822(&format!("{day} {month} {rest}"))?;
+    super::rfc822::valid_date(&date)
+}
+
+fn fetch_item<'a>(text: &'a str, upper: &str, key: &str, delimiter: char) -> Option<&'a str> {
     // A quoted body or a nested list can contain the key too. Literal bytes
     // are already out of band.
     let start = upper.find("FETCH")? + "FETCH".len();
@@ -1772,8 +1797,8 @@ fn fetch_list<'a>(text: &'a str, upper: &str, key: &str) -> Option<&'a str> {
                     && items[index..].starts_with(key) =>
             {
                 let rest = text[start + index + key.len()..].trim_start();
-                if let Some(list) = rest.strip_prefix('(') {
-                    return Some(list.split_once(')')?.0);
+                if let Some(value) = rest.strip_prefix(delimiter) {
+                    return Some(value);
                 }
             }
             _ => {}
@@ -2331,6 +2356,25 @@ mod tests {
         .unwrap();
         assert!(!item.flags_present);
         assert!(item.body_missing);
+    }
+
+    #[test]
+    fn internaldate_is_a_top_level_fetch_item_with_a_numeric_zone() {
+        let parse = |text| super::parse_fetch(text, Vec::new()).unwrap().internal_date;
+        assert_eq!(
+            parse(r#"* 1 FETCH (UID 7 INTERNALDATE " 9-Feb-2024 17:00:00 -0500")"#),
+            Some(1_707_516_000)
+        );
+        assert_eq!(
+            parse(
+                r#"* 1 FETCH (UID 7 BODY[] "text with INTERNALDATE \"09-Feb-2024 22:00:00 +0000\"")"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse(r#"* 1 FETCH (UID 7 INTERNALDATE "31-Feb-2024 17:00:00 -0500")"#),
+            None
+        );
     }
 
     #[test]

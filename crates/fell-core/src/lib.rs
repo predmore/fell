@@ -115,3 +115,8 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Allow for a day of clock skew in mail timestamps.
+pub(crate) fn latest_mail_date() -> i64 {
+    outbox::now_unix().saturating_add(86_400)
+}

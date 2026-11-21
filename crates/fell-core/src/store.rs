@@ -25,6 +25,7 @@ use crate::threading::{ThreadId, resolve_thread_id};
 
 pub(crate) mod bodies;
 pub(crate) mod copies;
+mod dates;
 pub(crate) mod intents;
 pub(crate) mod keywords;
 mod part_cache;
@@ -580,6 +581,7 @@ impl Store {
         if version < 5 {
             bodies::queue_unlisted_mail(&conn)?;
         }
+        dates::ensure_date_repair(&conn)?;
         crate::actions::migrate_purge_snapshots(&conn)?;
         keywords::migrate_reserved_labels(&conn)?;
         Ok(Self {
@@ -2697,15 +2699,13 @@ fn write_kept(
         incoming_list,
         !like_alias,
     );
-    let date_unix = if alias || (incoming_list && stored.date_unix != 0) {
-        if stored.date_unix != 0 {
+    // A later copy or body fetch can omit a date we already learned.
+    let date_unix =
+        if stored.date_unix != 0 && (alias || incoming_list || message.headers.date_unix == 0) {
             stored.date_unix
         } else {
             message.headers.date_unix
-        }
-    } else {
-        message.headers.date_unix
-    };
+        };
     // The message row keeps the first copy's server id. The other copy's id
     // and folder live on the alias, so neither is discarded. A kept row with
     // no server id still records that alias, so a later sync or reply finds

@@ -11,9 +11,9 @@
 mod bodies;
 mod part_fetch;
 mod projections;
-mod reply_to;
 mod rfc822;
 mod session;
+mod stored_metadata;
 mod utf7;
 mod write_back;
 
@@ -21,15 +21,14 @@ pub(crate) use session::{TlsStream, is_loopback_host as host_is_loopback, wrap_t
 
 pub(crate) use bodies::fetch_bodies;
 pub(crate) use part_fetch::{CANCELLED as PART_FETCH_CANCELLED, fetch_part};
-pub(crate) use reply_to::fetch_reply_to;
 /// The parser sync stores fetched mail with, for tests that read back what
 /// Fell sends.
-#[cfg(test)]
 #[cfg(test)]
 pub(crate) use rfc822::to_message;
 pub(crate) use rfc822::{
     CidReferences, attachment_names, has_attachment, is_bidi_control, parts_from_raw,
 };
+pub(crate) use stored_metadata::{fetch_internal_dates, fetch_reply_to};
 
 #[cfg(test)]
 mod bridge_sync_tests;

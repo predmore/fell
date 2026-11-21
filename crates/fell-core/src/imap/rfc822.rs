@@ -10,7 +10,7 @@ use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use mail_parser::{HeaderForm, MessageParser, MessageRef, PartKind};
+use mail_parser::{DateTime, HeaderForm, MessageParser, MessageRef, PartKind};
 
 use crate::account::AccountId;
 use crate::message::{
@@ -132,14 +132,20 @@ pub(super) fn fetched_message(
     item: &session::Fetched,
     bridge: bool,
 ) -> Message {
-    parse_message(
+    let mut message = parse_message(
         account_id,
         (&mailbox.raw, &mailbox.decoded),
         (uidvalidity, item.uid),
         &item.flags,
         &item.body,
         bridge,
-    )
+    );
+    message.headers.date_unix = effective_date(
+        message.headers.date_unix,
+        item.internal_date,
+        crate::latest_mail_date(),
+    );
+    message
 }
 
 fn parse_message(
@@ -188,7 +194,7 @@ fn parse_message(
     let date_unix = parsed
         .as_ref()
         .and_then(|message| message.date())
-        .map(|date| date.to_timestamp())
+        .and_then(|date| valid_date(&date))
         .unwrap_or(0);
     let proton_conversation_id = parsed.as_ref().and_then(proton_conversation);
     let body_text = parsed
@@ -247,6 +253,23 @@ fn parse_message(
         attachment_names: attachment_names(&parts.mime_parts),
         parts: Some(parts),
     }
+}
+
+pub(super) fn valid_date(date: &DateTime) -> Option<i64> {
+    if !date.is_valid() {
+        return None;
+    }
+    // The parser permits days up to 31 before checking the month.
+    let round_trip = DateTime::from_timestamp(date.to_timestamp_local());
+    (round_trip.day == date.day).then(|| date.to_timestamp())
+}
+
+fn effective_date(header: i64, arrival: Option<i64>, latest: i64) -> i64 {
+    [Some(header), arrival]
+        .into_iter()
+        .flatten()
+        .find(|date| (1..=latest).contains(date))
+        .unwrap_or(0)
 }
 
 /// A list row from a message's header alone, before its body is fetched.
@@ -794,6 +817,15 @@ fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::account::AccountId;
+
+    #[test]
+    fn dates_allow_one_day_of_clock_skew() {
+        let now = 1_707_519_600;
+        let latest = now + 86_400;
+        assert_eq!(effective_date(latest, Some(now), latest), latest);
+        assert_eq!(effective_date(latest + 1, Some(now), latest), now);
+        assert_eq!(effective_date(0, Some(latest + 1), latest), 0);
+    }
 
     #[test]
     fn list_id_is_the_angle_addr_and_cjk_subject_parses() {

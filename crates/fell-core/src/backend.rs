@@ -198,6 +198,14 @@ pub trait MailBackend {
         Ok(Vec::new())
     }
 
+    /// Read the arrival dates for already stored copies without fetching bodies.
+    fn fetch_internal_dates(
+        &self,
+        _copies: &[crate::RemoteId],
+    ) -> Result<Vec<(crate::RemoteId, i64)>> {
+        Ok(Vec::new())
+    }
+
     /// Check Reply-To by remote id. Deliver verified headers in batches;
     /// a missing or unreadable copy is omitted. An empty address list means
     /// the server returned the header section with no usable Reply-To.
@@ -302,6 +310,13 @@ impl MailBackend for BridgeBackend {
         crate::imap::fetch_bodies(&self.imap, copies)
     }
 
+    fn fetch_internal_dates(
+        &self,
+        copies: &[crate::RemoteId],
+    ) -> Result<Vec<(crate::RemoteId, i64)>> {
+        crate::imap::fetch_internal_dates(&self.imap, copies)
+    }
+
     fn fetch_reply_to(
         &self,
         copies: &[crate::RemoteId],
@@ -370,6 +385,13 @@ impl MailBackend for ImapBackend {
 
     fn fetch_bodies(&self, copies: &[crate::RemoteId]) -> Result<Vec<FetchedBody>> {
         crate::imap::fetch_bodies(&self.config, copies)
+    }
+
+    fn fetch_internal_dates(
+        &self,
+        copies: &[crate::RemoteId],
+    ) -> Result<Vec<(crate::RemoteId, i64)>> {
+        crate::imap::fetch_internal_dates(&self.config, copies)
     }
 
     fn fetch_reply_to(

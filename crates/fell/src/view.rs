@@ -3840,6 +3840,15 @@ fn fit_folder_path(
         .or_else(|| fit(&format!("…/{leaf}")))
 }
 
+fn account_header<'a>(name: &'a str, email: &'a str) -> (&'a str, Option<&'a str>) {
+    let name = name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case(email) {
+        (email, None)
+    } else {
+        (name, (!email.is_empty()).then_some(email))
+    }
+}
+
 struct HeaderAccount {
     name: Option<SharedString>,
     email: Option<SharedString>,
@@ -3853,13 +3862,7 @@ impl HeaderAccount {
         gap: f32,
         fit: &impl Fn(&str, f32, FontWeight) -> Option<gpui::ShapedLine>,
     ) -> Self {
-        let account = session.account_name.trim();
-        let email = session.account_email.as_str();
-        let (name, email) = if account.is_empty() || account.eq_ignore_ascii_case(email) {
-            (email, None)
-        } else {
-            (account, (!email.is_empty()).then_some(email))
-        };
+        let (name, email) = account_header(&session.account_name, &session.account_email);
         let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
         let quiet = full.is_none();
         let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
@@ -7211,9 +7214,9 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, collapsed_sender_budget, ctrl_letter,
-        expanded_header_widths, key_from, moved_in_list, should_follow_visible, unread_bar_dx,
-        write_back_notice,
+        LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, account_header, collapsed_sender_budget,
+        ctrl_letter, expanded_header_widths, key_from, moved_in_list, should_follow_visible,
+        unread_bar_dx, write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7230,6 +7233,23 @@ mod tests {
             key: key.into(),
             key_char: Some(key_char.into()),
         }
+    }
+
+    #[test]
+    fn account_header_only_shows_a_distinct_display_name() {
+        let email = "reader@example.test";
+        assert_eq!(account_header("", email), (email, None));
+        assert_eq!(account_header("   ", email), (email, None));
+        assert_eq!(account_header(email, email), (email, None));
+        assert_eq!(
+            account_header(" Reader@example.test ", email),
+            (email, None)
+        );
+        assert_eq!(
+            account_header("Demo Reader", email),
+            ("Demo Reader", Some(email))
+        );
+        assert_eq!(account_header("Demo Reader", ""), ("Demo Reader", None));
     }
 
     #[test]

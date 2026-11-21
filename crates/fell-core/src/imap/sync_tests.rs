@@ -560,7 +560,8 @@ fn condstore_fetches_the_body_of_a_message_no_longer_deleted() {
     assert!(!stored(&store, &acct, "reply@x").unwrap().unread);
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS MODSEQ INTERNALDATE BODY.PEEK[])"),
         "only the copy the store does not hold is downloaded: {bodies:?}"
     );
 }
@@ -747,7 +748,8 @@ fn without_uidnext_only_new_uids_are_downloaded() {
     assert!(stored(&store, &acct, "d3@x").is_some());
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "{bodies:?}"
     );
     server.state.lock().expect("state").commands.clear();
@@ -1029,7 +1031,7 @@ fn a_body_fetch_that_leaves_out_a_uid_keeps_the_checkpoint_below_it() {
     assert!(
         body_fetches(&server)
             .iter()
-            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ BODY.PEEK[])")),
+            .any(|line| line.ends_with("UID FETCH 2:3 (UID FLAGS MODSEQ INTERNALDATE BODY.PEEK[])")),
         "{:?}",
         commands(&server)
     );
@@ -2075,7 +2077,8 @@ fn fetch_batches_survive_a_dropped_connection() {
     assert_eq!(report.new_messages, None);
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 3 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 3 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "only the body that never arrived is fetched again: {bodies:?}"
     );
     assert!(
@@ -2357,7 +2360,8 @@ fn missing_body_does_not_advance_the_checkpoint_past_that_uid() {
     // from a flags-only fetch.
     let bodies = body_fetches(&server);
     assert!(
-        bodies.len() == 1 && bodies[0].ends_with("UID FETCH 1 (UID FLAGS BODY.PEEK[])"),
+        bodies.len() == 1
+            && bodies[0].ends_with("UID FETCH 1 (UID FLAGS INTERNALDATE BODY.PEEK[])"),
         "{bodies:?}"
     );
     assert!(
@@ -2839,6 +2843,153 @@ fn folder_subjects(store: &Store, acct: &Account, folder: &str) -> Vec<String> {
         .into_iter()
         .map(|thread| thread.subject)
         .collect()
+}
+
+fn dated_inbox() -> TestState {
+    let entries = [
+        (
+            "New mail",
+            "Date: Fri, 9 Feb 2024 23:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 18:00:00 +0000\r\n",
+        ),
+        (
+            "Missing header date",
+            "",
+            "X-Test-Internal-Date:  9-Feb-2024 17:00:00 -0500\r\n",
+        ),
+        (
+            "Forged header date",
+            "Date: Mon, 14 Jan 2806 08:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 21:00:00 +0000\r\n",
+        ),
+        (
+            "Invalid header date",
+            "Date: 31 Feb 2024 19:00:00 +0000\r\n",
+            "X-Test-Internal-Date: 09-Feb-2024 19:00:00 +0000\r\n",
+        ),
+        ("No usable date", "", ""),
+    ];
+    let messages = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (subject, sent, arrival))| {
+            literal(
+                i as u32 + 1,
+                &[],
+                1,
+                format!(
+                    "From: Rowan Park <rowan@example.test>\r\nSubject: {subject}\r\n\
+                     Message-ID: <date-{i}@example.test>\r\n{sent}{arrival}\r\nSample mail."
+                )
+                .into_bytes(),
+            )
+        })
+        .collect();
+    TestState {
+        mailboxes: vec![FixtureMailbox {
+            messages,
+            ..empty_mailbox("INBOX", 20)
+        }],
+        ..sample_state()
+    }
+}
+
+const EXPECTED_INBOX_DATES: &[(&str, i64)] = &[
+    ("New mail", 1_707_519_600),
+    ("Missing header date", 1_707_516_000),
+    ("Forged header date", 1_707_512_400),
+    ("Invalid header date", 1_707_505_200),
+    ("No usable date", 0),
+];
+
+fn assert_inbox_dates(store: &Store, acct: &Account) {
+    let threads = store.folder_threads(&acct.id, "INBOX").unwrap();
+    let dates: Vec<_> = threads
+        .iter()
+        .map(|thread| (thread.subject.as_str(), thread.last_date_unix))
+        .collect();
+    assert_eq!(dates, EXPECTED_INBOX_DATES);
+}
+
+#[test]
+fn inbox_dates_sort_by_header_or_arrival_from_the_first_rows() {
+    let server = TestServer::spawn(dated_inbox());
+    let acct = account("dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let mut saw_headers = false;
+    sync_with_progress(&acct, &backend, &store, &mut |report| {
+        if report.progress.as_ref().is_some_and(|page| page.done == 0)
+            && store.folder_threads(&acct.id, "INBOX").unwrap().len() == EXPECTED_INBOX_DATES.len()
+        {
+            assert_inbox_dates(&store, &acct);
+            saw_headers = true;
+        }
+    })
+    .unwrap();
+    assert!(saw_headers);
+    assert_inbox_dates(&store, &acct);
+}
+
+#[test]
+fn legacy_inbox_dates_are_repaired_without_downloading_mail_again() {
+    let server = TestServer::spawn(dated_inbox());
+    let acct = account("legacy-dates", BackendKind::Imap);
+    let backend = ImapBackend {
+        account_id: acct.id.clone(),
+        config: config(server.addr.port()),
+        smtp: unused_smtp(),
+    };
+    let root = std::env::temp_dir().join(format!("fell-legacy-dates-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("mail.db");
+    {
+        let store = Store::open(&path).unwrap();
+        sync_once(&acct, &backend, &store).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE internal_date_repair;
+                 DELETE FROM meta WHERE key = 'internal_date_repair_v1';
+                 UPDATE messages SET date_unix = 0 WHERE subject = 'Missing header date';
+                 UPDATE messages SET date_unix = 26382787200 WHERE subject = 'Forged header date';",
+            )
+            .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let dates = store.folder_threads(&acct.id, "INBOX").unwrap();
+    assert_eq!(dates[0].subject, "New mail");
+    assert_eq!(
+        dates
+            .iter()
+            .find(|row| row.subject == "Forged header date")
+            .unwrap()
+            .last_date_unix,
+        0
+    );
+    server.state.lock().unwrap().commands.clear();
+    assert!(sync_once(&acct, &backend, &store).unwrap().changed);
+    assert_inbox_dates(&store, &acct);
+    assert!(body_fetches(&server).is_empty());
+    assert!(
+        commands(&server)
+            .iter()
+            .any(|cmd| cmd.ends_with("UID FETCH 2,3,5 (UID INTERNALDATE)"))
+    );
+    server.state.lock().unwrap().commands.clear();
+    sync_once(&acct, &backend, &store).unwrap();
+    assert!(
+        !commands(&server)
+            .iter()
+            .any(|cmd| cmd.contains("INTERNALDATE"))
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3703,7 +3854,7 @@ fn sync_stores_parts_and_old_mail_is_fetched_again_by_uid() {
     assert!(
         fetches
             .iter()
-            .any(|line| line.contains("UID FETCH 1,2,4,5 (UID FLAGS BODY.PEEK[])")),
+            .any(|line| line.contains("UID FETCH 1,2,4,5 (UID FLAGS INTERNALDATE BODY.PEEK[])")),
         "{fetches:?}"
     );
     assert!(fetches.iter().all(|line| line.contains("BODY.PEEK[]")));
@@ -4731,7 +4882,7 @@ fn legacy_reply_to_checks_the_whole_copy_set_before_accepting_absence() {
 
     // Even a normal reparse of the direct copy must preserve the unknown
     // state while the list copy has not been checked.
-    let direct = super::rfc822::to_message(
+    let direct = super::rfc822::parse_message(
         &acct.id,
         "INBOX",
         "INBOX",
