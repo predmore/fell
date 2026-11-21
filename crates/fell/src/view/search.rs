@@ -1178,6 +1178,17 @@ pub(super) fn rows(
     .track_scroll(scroll)
 }
 
+const ROW_GAP: f32 = 8.0;
+const MIN_SUBJECT: f32 = 72.0;
+
+fn detail_budget(row_room: f32, room: f32, subject: f32, minimum: f32) -> f32 {
+    (room - subject.max(MIN_SUBJECT))
+        .max(minimum)
+        .min(row_room * 0.45)
+        .min((room - MIN_SUBJECT).max(0.0))
+        .floor()
+}
+
 fn row(
     theme: &Theme,
     inbox: &Inbox,
@@ -1214,37 +1225,92 @@ fn row(
         motion::progress(inbox.search_view.arrival.as_ref(), inbox.frame_now),
     );
     const PAD: f32 = 14.0;
+    const SENDER_GAP: f32 = 5.0;
     let size = px(theme.ui_px - 2.0);
     let style = conversation_line_style(window, theme, size);
-    // Only the folder label truncates. Give the timestamp its shaped
-    // width so a long label cannot clip its last glyph or hide it.
-    let date = (!hit.related).then(|| present::relative_date(now_unix(), row.date_unix));
+    let subject_style = conversation_line_style(window, theme, px(theme.ui_px));
+    let measure = |style: &TextStyle, text: &str, weight| {
+        line_px_with_style(window, style, text, weight).ceil()
+    };
+    let row_room = (list_width - LIST_BORDER_PX - 2.0 * PAD).max(0.0);
+    let sender = &row.spans[0].text;
+    let count = (row.message_count > 1).then(|| format!("· {}", row.message_count));
+    let sender_width = (measure(&style, sender, FontWeight::NORMAL)
+        + count.as_deref().map_or(0.0, |count| {
+            SENDER_GAP + measure(&style, count, FontWeight::NORMAL)
+        }))
+    .min((row_room * 0.30).floor());
+    let marks = [
+        row.starred.then_some(("★", theme.star)),
+        row.has_attachment.then_some((THREAD_ATTACHMENT_MARK, dim)),
+    ];
+    let marks = marks.into_iter().flatten().map(|(text, color)| {
+        (
+            text,
+            color,
+            measure(&subject_style, text, FontWeight::NORMAL),
+        )
+    });
+    let marks_width: f32 = marks.clone().map(|(_, _, width)| width + ROW_GAP).sum();
+    let room = (row_room - sender_width - marks_width - 2.0 * ROW_GAP).max(0.0);
+    let subject = if row.subject.is_empty() {
+        "(No subject)"
+    } else {
+        &row.subject
+    };
+    // Reserve the timestamp and enough of the final folder word to
+    // distinguish sibling folders when the subject needs clipping.
+    let date = (!hit.related)
+        .then(|| present::relative_date(now_unix(), row.date_unix))
+        .filter(|date| !date.is_empty());
+    let shape_detail =
+        |text: &str| shape_ui_line(window, &style, text, FontWeight::NORMAL, Some(dim));
+    let date_text = date.as_deref().and_then(shape_detail);
     let dated_location = date
         .as_ref()
         .filter(|_| hit.folder.is_some())
-        .and_then(|date| {
-            shape_ui_line(
-                window,
-                &style,
-                &format!(" · {date}"),
-                FontWeight::NORMAL,
-                Some(dim),
-            )
-        });
-    // Give the detail one gap's leeway so a short folder name and time
-    // can fit together when their shaped width is just over the limit.
-    let detail_room = (list_width - LIST_BORDER_PX - 2.0 * PAD) * 0.30 + 8.0;
-    let date_width = dated_location
-        .as_ref()
-        .map_or(0.0, |line| f32::from(line.width).ceil());
-    let location_room = (detail_room - date_width).floor();
+        .and_then(|date| shape_detail(&format!(" · {date}")));
     let related_prefix = if hit.related { "Related · " } else { "" };
-    let location = hit
+    let folder = hit
         .folder
         .as_ref()
+        .map(|folder| inbox.session.roles.label(folder));
+    let line_width = |line: &gpui::ShapedLine| f32::from(line.width).ceil();
+    let date_width = dated_location
+        .as_ref()
+        .or(date_text.as_ref())
+        .map_or(0.0, line_width);
+    let related = if hit.related {
+        shape_detail("Related")
+    } else {
+        None
+    };
+    let location_min = folder.as_deref().map_or_else(
+        || related.as_ref().map_or(0.0, line_width),
+        |folder| {
+            let leaf = folder.rsplit('/').next().unwrap_or(folder);
+            let last = leaf.split_whitespace().next_back().unwrap_or(leaf);
+            let suffix = if last == leaf { "" } else { "…" };
+            measure(
+                &style,
+                &format!("{related_prefix}{suffix}{last}"),
+                FontWeight::NORMAL,
+            )
+            .min(120.0)
+        },
+    );
+    let detail_room = detail_budget(
+        row_room,
+        room,
+        measure(&subject_style, subject, FontWeight::SEMIBOLD),
+        date_width + location_min,
+    );
+    let location_room = detail_room - date_width;
+    let location = folder
+        .as_deref()
         .and_then(|folder| {
             fit_folder_path(
-                &inbox.session.roles.label(folder),
+                folder,
                 FolderFit::Search,
                 |path| {
                     let text = format!("{related_prefix}{path}");
@@ -1256,31 +1322,27 @@ fn row(
                         FontWeight::NORMAL,
                         Some(dim),
                     )
-                    .filter(|line| f32::from(line.width).ceil() <= location_room)
+                    .filter(|line| line_width(line) <= location_room)
                 },
                 |line| line.text.strip_prefix(related_prefix).unwrap_or_default(),
             )
         })
-        .or_else(|| {
-            hit.related
-                .then(|| {
-                    clip_shaped(
-                        window,
-                        &style,
-                        "Related",
-                        location_room,
-                        FontWeight::NORMAL,
-                        Some(dim),
-                    )
-                })
-                .flatten()
-        });
+        .or_else(|| related.filter(|line| line_width(line) <= detail_room));
     let date = if location.is_some() {
         dated_location
     } else {
-        date.as_deref()
-            .and_then(|date| shape_ui_line(window, &style, date, FontWeight::NORMAL, Some(dim)))
+        date_text
     };
+    let detail = location.into_iter().chain(date);
+    let subject_room = room - detail.clone().map(|line| line_width(&line)).sum::<f32>();
+    let subject = clip_shaped(
+        window,
+        &subject_style,
+        subject,
+        subject_room,
+        FontWeight::SEMIBOLD,
+        Some(foreground),
+    );
     let excerpt = match &hit.preview {
         Some(preview) if !preview.highlights.is_empty() => {
             let (text, highlights) = visible_excerpt(preview);
@@ -1341,52 +1403,44 @@ fn row(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(ROW_GAP))
                 .child(
                     div()
                         .flex()
                         .flex_none()
-                        .max_w(gpui::relative(0.30))
+                        .w(px(sender_width))
                         .min_w_0()
                         .items_center()
-                        .gap(px(5.))
+                        .gap(px(SENDER_GAP))
                         .text_color(rgb(dim))
                         .text_size(size)
-                        .child(div().min_w_0().truncate().child(row.spans[0].text.clone()))
-                        .when(row.message_count > 1, |sender| {
-                            sender
-                                .child(div().flex_none().child(format!("· {}", row.message_count)))
-                        }),
+                        .child(div().min_w_0().truncate().child(sender.clone()))
+                        .children(count.map(|count| div().flex_none().child(count))),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(if row.subject.is_empty() {
-                            "(No subject)".to_owned()
-                        } else {
-                            row.subject.clone()
-                        }),
+                        .overflow_hidden()
+                        .children(subject.map(|line| shaped_text(line, window))),
                 )
-                .when(row.starred, |line| {
-                    line.child(div().flex_none().text_color(rgb(theme.star)).child("★"))
-                })
-                .when(row.has_attachment, |line| {
-                    line.child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(dim))
-                            .child(THREAD_ATTACHMENT_MARK),
-                    )
-                })
-                .child(div().flex_none().flex().items_center().children(
-                    location.into_iter().chain(date).map(|line| {
-                        let width = f32::from(line.width).ceil();
-                        shaped_text(line, window).w(px(width))
-                    }),
-                )),
+                .children(marks.map(|(text, color, width)| {
+                    div()
+                        .flex_none()
+                        .w(px(width))
+                        .text_color(rgb(color))
+                        .child(text)
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .children(detail.map(|line| {
+                            let width = line_width(&line);
+                            shaped_text(line, window).w(px(width))
+                        })),
+                ),
         )
         .child(div().truncate().text_color(rgb(dim)).child(excerpt))
         .into_any_element()
@@ -1473,4 +1527,17 @@ pub(super) fn match_reason(
                 }),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detail_budget;
+
+    #[test]
+    fn search_details_use_spare_width_and_reserve_room_for_the_subject() {
+        assert_eq!(detail_budget(400., 300., 110., 100.), 180.);
+        assert_eq!(detail_budget(400., 300., 155., 100.), 145.);
+        assert_eq!(detail_budget(400., 300., 270., 100.), 100.);
+        assert_eq!(detail_budget(260., 150., 270., 100.), 78.);
+    }
 }

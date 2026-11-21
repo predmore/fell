@@ -19,11 +19,11 @@ use fell_core::{
 };
 use futures::StreamExt;
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, TextStyle,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
-    prelude::*, px, rgb, size, uniform_list,
+    App, Application, Bounds, Context, FocusHandle, FontWeight, HighlightStyle, InteractiveElement,
+    IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Render, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, TextStyle, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions, div, point, prelude::*, px, rgb, size, uniform_list,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -3911,17 +3911,25 @@ fn fit_folder_path<T>(
         .split_once('/')
         .map(|(first, rest)| (first, rest.rsplit('/').next().unwrap_or(rest)));
     let leaf = parents.map_or(path, |(_, leaf)| leaf);
+    let exact = |candidate: &str| fit(candidate).filter(|line| text(line) == candidate);
     let query = match mode {
-        FolderFit::Picker(query)
-            if !query.is_empty() && path.to_ascii_lowercase().contains(query) =>
-        {
-            query
-        }
+        FolderFit::Picker(query) => query,
         _ => "",
     };
-    let exact = |candidate: &str| fit(candidate).filter(|line| text(line) == candidate);
-    let keeps_match =
-        |line: &T| query.is_empty() || text(line).to_ascii_lowercase().contains(query);
+    let target = if folder_match(leaf, query).is_some() {
+        leaf
+    } else {
+        path
+    };
+    let anchor = folder_match(target, query).map(|matched| folder_match_words(target, matched));
+    let anchor_text = anchor
+        .as_ref()
+        .map(|words| target[words.clone()].to_ascii_lowercase());
+    let keeps_match = |line: &T| {
+        anchor_text
+            .as_deref()
+            .is_none_or(|words| folder_match(text(line), words).is_some())
+    };
     if let Some((first, _)) = parents {
         let prefix = format!("{first}/…/");
         let shortened = format!("{prefix}{leaf}");
@@ -3937,75 +3945,115 @@ fn fit_folder_path<T>(
         if let Some(line) = exact(&shortened).filter(&keeps_match) {
             return Some(line);
         }
-    }
-    if !matches!(mode, FolderFit::Picker(_)) {
-        return if parents.is_some() { fit(leaf) } else { full };
+        let leaf_label = if matches!(mode, FolderFit::Search) {
+            leaf.to_owned()
+        } else {
+            format!("…/{leaf}")
+        };
+        if let Some(line) = exact(&leaf_label).filter(&keeps_match) {
+            return Some(line);
+        }
+    } else if matches!(mode, FolderFit::Header) {
+        return full;
     }
 
-    let nested = parents.is_some();
-    if nested && let Some(line) = exact(&format!("…/{leaf}")).filter(&keeps_match) {
+    let suffix = fit_folder_words("…", leaf, &exact).or_else(|| {
+        let starts: Vec<_> = leaf
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .collect();
+        fit_folder_tail("…", leaf, &starts, &exact)
+    });
+    if let Some(line) = suffix.filter(&keeps_match) {
         return Some(line);
     }
-    // A match in a parent segment needs a slice of the full path.
-    let target = if query.is_empty() || leaf.to_ascii_lowercase().contains(query) {
-        leaf
-    } else {
-        path
-    };
-    let prefix = if nested && target != path {
-        "…/…"
-    } else {
-        "…"
-    };
-    let fit_suffix = |prefix: &str, tail: &str| {
-        let starts: Vec<_> = tail.grapheme_indices(true).map(|(i, _)| i).collect();
-        let first = starts
-            .partition_point(|&i| exact(&format!("{prefix}{}", tail[i..].trim_start())).is_none());
-        let start = *starts.get(first)?;
-        let suffix = tail[start..].trim_start();
-        // Prefer a whole word after the ellipsis when the width cut
-        // leaves a fragment. Keep a fragment if it carries the match or
-        // there is no complete word left.
-        if start > 0
-            && !tail[..start].ends_with(char::is_whitespace)
-            && !tail[start..].starts_with(char::is_whitespace)
-            && let Some((_, words)) = suffix.split_once(char::is_whitespace)
-            && let Some(line) =
-                exact(&format!("{prefix}{}", words.trim_start())).filter(&keeps_match)
+    if let Some(words) = anchor {
+        // The boundaries stay fixed while the query grows inside a word.
+        let tail = &target[words.start..];
+        let start = if words.start == 0 { "" } else { "…" };
+        if let Some(line) = exact(&format!("{start}{tail}")) {
+            return Some(line);
+        }
+        let after_match = target[words.end..].trim_start();
+        let prefix = format!("{start}{} … ", &target[words]);
+        if !after_match.is_empty()
+            && let Some(line) = fit_folder_words(&prefix, after_match, &exact)
         {
             return Some(line);
         }
-        exact(&format!("{prefix}{suffix}"))
-    };
-    if let Some(line) = fit_suffix(prefix, target).filter(&keeps_match) {
-        return Some(line);
-    }
-    if !query.is_empty()
-        && let Some(start) = target.to_ascii_lowercase().find(query)
-    {
-        let boundaries = || target.grapheme_indices(true).map(|(i, _)| i);
-        let start_of_match = boundaries().take_while(|&i| i <= start).last().unwrap_or(0);
-        let end_of_match = boundaries()
-            .find(|&i| i >= start + query.len())
-            .unwrap_or(target.len());
-        let tail = &target[start_of_match..];
-        let after_match = &target[end_of_match..];
-        let anchor = format!("{prefix}{}…", &target[start_of_match..end_of_match]);
-        // Keep both the match and the distinguishing word at the end if
-        // they fit. In smaller rooms, spend the width on the match.
-        if after_match
-            .split_whitespace()
-            .next_back()
-            .is_some_and(|last| exact(&format!("{anchor}{last}")).is_some())
-            && let Some(line) = fit_suffix(&anchor, after_match)
-        {
+        let head = format!("{start}{tail}");
+        if let Some(line) = fit(&head).filter(&keeps_match) {
+            if let Some(kept) = text(&line).strip_suffix('…')
+                && !head[kept.len()..].starts_with(folder_word_separator)
+                && let Some(end) = kept.rfind(folder_word_separator)
+                && let Some(whole) = exact(&format!("{}…", &kept[..end])).filter(&keeps_match)
+            {
+                return Some(whole);
+            }
             return Some(line);
         }
-        return fit(&format!("{prefix}{tail}"))
-            .filter(keeps_match)
-            .or_else(|| fit(tail));
+        // A single matched word can itself be wider than the picker.
+        if let Some(matched) = folder_match(tail, query) {
+            let start = tail
+                .grapheme_indices(true)
+                .take_while(|&(index, _)| index <= matched.start)
+                .last()
+                .map_or(0, |(index, _)| index);
+            return fit(&format!("…{}", &tail[start..]));
+        }
     }
-    fit(leaf)
+    exact("…")
+}
+
+fn folder_match(label: &str, query: &str) -> Option<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    let start = label.to_ascii_lowercase().find(query)?;
+    Some(start..start + query.len())
+}
+
+fn folder_match_words(label: &str, matched: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let start = label[..matched.start]
+        .rfind(folder_word_separator)
+        .map_or(0, |index| {
+            index + label[index..].chars().next().unwrap().len_utf8()
+        });
+    let end = label[matched.end..]
+        .find(folder_word_separator)
+        .map_or(label.len(), |index| matched.end + index);
+    start..end
+}
+
+fn folder_word_separator(ch: char) -> bool {
+    ch.is_whitespace() || ch == '/'
+}
+
+fn fit_folder_words<T>(prefix: &str, tail: &str, exact: &impl Fn(&str) -> Option<T>) -> Option<T> {
+    let mut starts = vec![0];
+    starts.extend(
+        tail.match_indices(char::is_whitespace)
+            .filter_map(|(index, space)| {
+                let start = index + space.len();
+                tail[start..]
+                    .chars()
+                    .next()
+                    .filter(|ch| !ch.is_whitespace())
+                    .map(|_| start)
+            }),
+    );
+    fit_folder_tail(prefix, tail, &starts, exact)
+}
+
+fn fit_folder_tail<T>(
+    prefix: &str,
+    tail: &str,
+    starts: &[usize],
+    exact: &impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    let first =
+        starts.partition_point(|&start| exact(&format!("{prefix}{}", &tail[start..])).is_none());
+    exact(&format!("{prefix}{}", &tail[*starts.get(first)?..]))
 }
 
 fn account_header<'a>(name: &'a str, email: &'a str) -> (&'a str, Option<&'a str>) {
@@ -7524,7 +7572,14 @@ fn folder_picker(
                         &label,
                         FolderFit::Picker(&query),
                         |path| {
-                            clip_shaped(window, &style, path, label_room, FontWeight::NORMAL, None)
+                            // Allow for the heavier match without changing the fit
+                            // as more of the same word is highlighted.
+                            let weight = if folder_match(path, &query).is_some() {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            };
+                            clip_shaped(window, &style, path, label_room, weight, None)
                                 .filter(|line| f32::from(line.width) <= label_room)
                         },
                         |line| &line.text,
@@ -7571,10 +7626,18 @@ fn folder_picker(
                         )
                         .gap(px(8.))
                         .overflow_hidden()
-                        .children(
-                            label
-                                .map(|line| div().flex_none().whitespace_nowrap().child(line.text)),
-                        )
+                        .children(label.map(|line| {
+                            let matched = folder_match(&line.text, &query);
+                            let highlight = HighlightStyle {
+                                color: Some(rgb(theme.accent).into()),
+                                font_weight: Some(FontWeight::SEMIBOLD),
+                                ..HighlightStyle::default()
+                            };
+                            div().flex_none().whitespace_nowrap().child(
+                                StyledText::new(line.text)
+                                    .with_highlights(matched.map(|range| (range, highlight))),
+                            )
+                        }))
                         .children(detail.map(|name| {
                             div()
                                 .min_w(px(0.))
@@ -7787,10 +7850,11 @@ impl<T: Styled> FontOpt for T {
 #[cfg(test)]
 mod tests {
     use super::{
-        FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX, ReaderColumns,
-        account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
-        expanded_header_widths, fit_folder_path, key_from, message_content_width, moved_in_list, picker_card_height,
-        should_follow_visible, unread_bar_dx, useful_header_email, write_back_notice,
+        FolderFit, LIST_BORDER_PX, MESSAGE_HEADER_GAP_PX, MESSAGE_PAD_PX, READING_MEASURE_PX,
+        ReaderColumns, account_header, collapsed_sender_budget, ctrl_letter, expanded_header_flow,
+        expanded_header_widths, fit_folder_path, key_from, message_content_width, moved_in_list,
+        picker_card_height, should_follow_visible, unread_bar_dx, useful_header_email,
+        write_back_notice,
     };
     use crate::keymap::KeyId;
     use crate::model::Overlay;
@@ -7822,17 +7886,29 @@ mod tests {
         assert_eq!(fit(path, 40, picker), path);
         assert_eq!(fit(path, 23, picker), "Projects/…/Field survey");
         assert_eq!(fit(path, 17, picker), "…/Field survey");
-        assert_eq!(fit(path, 11, picker), "…/…survey");
-        assert_eq!(fit(path, 10, picker), "…/…survey");
-        assert_eq!(fit(path, 10, FolderFit::Picker("field")), "…/…Field…");
-        assert_eq!(fit(path, 10, FolderFit::Picker("2026")), "…2026/Fie…");
+        assert_eq!(fit(path, 11, picker), "…survey");
+        assert_eq!(fit(path, 10, picker), "…survey");
+        assert_eq!(fit(path, 10, FolderFit::Picker("field")), "Field…");
+        assert_eq!(fit(path, 10, FolderFit::Picker("2026")), "…2026…");
         let long = "Projects/2026/Field survey equipment provisioning for remote area planning and regional coordination";
+        assert_eq!(
+            fit(long, 41, picker),
+            "…area planning and regional coordination"
+        );
         let matched = fit(long, 45, FolderFit::Picker("equipment provisioning"));
-        assert!(matched.starts_with("…/…equipment provisioning…"));
-        assert!(matched.ends_with("coordination"));
-        assert_eq!(fit(path, 10, FolderFit::Search), "Field sur…");
+        assert_eq!(matched, "…equipment provisioning … coordination");
+        for query in ["equ", "equipme", "equipment"] {
+            assert_eq!(
+                fit(long, 45, FolderFit::Picker(query)),
+                "…equipment … and regional coordination"
+            );
+        }
+        assert_eq!(fit(path, 10, FolderFit::Search), "…survey");
+        assert_eq!(fit(long, 16, FolderFit::Search), "…coordination");
+        let sibling = long.replace("coordination", "training");
+        assert_eq!(fit(&sibling, 16, FolderFit::Search), "…training");
         assert_eq!(fit(path, 17, FolderFit::Header), "Projects/…/Field…");
-        assert_eq!(fit("Field survey", 8, FolderFit::Search), "Field s…");
+        assert_eq!(fit("Field survey", 8, FolderFit::Search), "…survey");
     }
 
     #[test]
