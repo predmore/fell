@@ -217,21 +217,18 @@ impl Store {
                 + i64::from(
                     fetch_complete && unchecked && unchecked_attempts < MAX_UNCHECKED_ATTEMPTS,
                 );
-            let reported_arrivals = || copies.iter().filter_map(|copy| checked.get(copy)?.as_ref());
-            let arrival = reported_arrivals()
-                .copied()
+            // A later copy or an omitted INTERNALDATE cannot replace the
+            // earliest verified arrival, even while the row stays queued.
+            let earliest_arrival = copies
+                .iter()
+                .filter_map(|copy| checked.get(copy).copied().flatten())
                 .chain(saved_arrival)
-                .find(|date| valid_dates.contains(date));
-            // Keep a verified future arrival even if the next fetch omits it.
-            // Of several future copies, the earliest can become usable first.
-            let deferred_arrival = reported_arrivals()
-                .copied()
-                .chain(saved_arrival)
-                .filter(|date| plausible_future(*date))
+                .filter(|date| *date > 0)
                 .min();
+            let arrival = earliest_arrival.filter(|date| valid_dates.contains(date));
             let header = valid_dates.contains(&previous).then_some(previous);
             let clock_may_be_behind = plausible_future(previous)
-                || (header.is_none() && arrival.is_none() && deferred_arrival.is_some());
+                || (header.is_none() && earliest_arrival.is_some_and(plausible_future));
             let advance_clock = fetch_complete
                 && clock_may_be_behind
                 && clock_attempts < MAX_CLOCK_ATTEMPTS
@@ -257,9 +254,7 @@ impl Store {
                         } else {
                             last_clock_latest
                         },
-                        saved_arrival
-                            .filter(|date| valid_dates.contains(date))
-                            .or(deferred_arrival)
+                        earliest_arrival,
                     ],
                 )?;
                 continue;

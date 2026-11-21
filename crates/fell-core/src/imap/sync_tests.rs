@@ -3186,6 +3186,21 @@ fn internal_date_repair_waits_for_all_current_copies() {
     mailbox(&mut server.state.lock().unwrap(), "INBOX").reject_examine = true;
     sync_once(&acct, &backend, &store).unwrap();
     assert_eq!(queued().len(), 1);
+    // Sent supplied a usable arrival while INBOX was unchecked. Subsequent
+    // metadata replies from both mailboxes omit it.
+    {
+        let mut state = server.state.lock().unwrap();
+        for name in ["INBOX", "Sent"] {
+            mailbox(&mut state, name).messages[0].raw = raw_message(
+                "shared@x",
+                None,
+                "shared@x",
+                "Rowan Park <rowan@example.test>",
+                "Sample mail.",
+                "",
+            );
+        }
+    }
 
     // Store a stale copy id while leaving the unchanged sync checkpoint.
     // The mailbox opens again, but the metadata read cannot use that UID.

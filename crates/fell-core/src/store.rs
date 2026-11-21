@@ -4469,25 +4469,29 @@ mod tests {
     }
 
     #[test]
-    fn date_repair_uses_arrival_at_the_cap_if_the_cutoff_keeps_advancing() {
+    fn date_repair_uses_the_saved_arrival_at_the_clock_retry_cap() {
         let arrival = 1_707_512_400;
         let latest = arrival + 86_400;
         let (store, account, remote_id) = legacy_date_repair(latest + 86_400, latest);
-        let checked = [(remote_id, Some(arrival))].into();
+        let reported = [(remote_id.clone(), Some(arrival))].into();
+        let omitted = [(remote_id, None)].into();
         let date = || store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix;
 
-        for attempt in 0..4 {
+        for (attempt, checked) in [&reported, &omitted, &omitted, &omitted]
+            .into_iter()
+            .enumerate()
+        {
             let batch = store.missing_internal_dates(&account).unwrap();
             assert_eq!(batch.len(), 1);
-            let cutoff = latest + attempt * 600;
+            let cutoff = latest + attempt as i64 * 600;
             assert!(
                 !store
-                    .finish_internal_dates(&account, &batch, &checked, true, cutoff)
+                    .finish_internal_dates(&account, &batch, checked, true, cutoff)
                     .unwrap()
             );
             assert!(
                 !store
-                    .finish_internal_dates(&account, &batch, &checked, true, cutoff + 599)
+                    .finish_internal_dates(&account, &batch, &omitted, true, cutoff + 599)
                     .unwrap()
             );
             assert_eq!(date(), 0);
@@ -4495,11 +4499,71 @@ mod tests {
         let batch = store.missing_internal_dates(&account).unwrap();
         assert!(
             store
-                .finish_internal_dates(&account, &batch, &checked, true, latest + 4 * 600)
+                .finish_internal_dates(&account, &batch, &omitted, true, latest + 4 * 600)
                 .unwrap()
         );
         assert_eq!(date(), arrival);
         assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_repair_keeps_the_earliest_arrival_in_either_copy_order() {
+        let friday = 1_707_512_400;
+        let monday = friday + 3 * 86_400;
+        let latest = monday + 86_400;
+        for (inbox, sent) in [(friday, monday), (monday, friday)] {
+            for separate_replies in [false, true] {
+                let (store, account, inbox_id) = legacy_date_repair(0, latest);
+                let mut copy = msg("dated@x", None, None, "Field report", "Sample mail");
+                copy.headers.date_unix = 0;
+                copy.remote_id = RemoteId("imap:1:1:Sent".into());
+                copy.folders = vec!["Sent".into()];
+                store.upsert_message(&copy).unwrap();
+                let sent_id = copy.remote_id;
+                let batch = store.missing_internal_dates(&account).unwrap();
+                assert_eq!(batch[0].copies, [inbox_id.clone(), sent_id.clone()]);
+
+                if separate_replies {
+                    assert!(
+                        !store
+                            .finish_internal_dates(
+                                &account,
+                                &batch,
+                                &[(inbox_id.clone(), Some(inbox))].into(),
+                                true,
+                                latest,
+                            )
+                            .unwrap()
+                    );
+                }
+                let checked = [
+                    (inbox_id.clone(), (!separate_replies).then_some(inbox)),
+                    (sent_id.clone(), Some(sent)),
+                ]
+                .into();
+                assert!(
+                    store
+                        .finish_internal_dates(&account, &batch, &checked, true, latest)
+                        .unwrap()
+                );
+                assert!(
+                    !store
+                        .finish_internal_dates(
+                            &account,
+                            &batch,
+                            &[(inbox_id, Some(monday)), (sent_id, Some(monday))].into(),
+                            true,
+                            latest,
+                        )
+                        .unwrap()
+                );
+                assert_eq!(
+                    store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+                    friday
+                );
+                assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+            }
+        }
     }
 
     #[test]
