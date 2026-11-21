@@ -3008,7 +3008,7 @@ fn dated_copy(uid: u32, id: &str) -> FixtureMessage {
     )
 }
 
-fn queue_legacy_internal_dates(store: &Store) {
+pub(super) fn queue_legacy_internal_dates(store: &Store) {
     store
         .conn
         .execute_batch(
@@ -5093,7 +5093,7 @@ fn legacy_reply_to_checks_the_whole_copy_set_before_accepting_absence() {
 
     // Even a normal reparse of the direct copy must preserve the unknown
     // state while the list copy has not been checked.
-    let direct = super::rfc822::parse_message(
+    let direct = super::rfc822::to_message(
         &acct.id,
         "INBOX",
         "INBOX",

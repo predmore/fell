@@ -25,7 +25,10 @@ pub(super) fn ensure_date_repair_through(conn: &Connection, latest: i64) -> Resu
     };
     let has_budgets =
         |conn: &Connection| bodies::has_column(conn, "internal_date_repair", "last_clock_latest");
-    if seeded(conn)? && has_budgets(conn)? {
+    let has_deferred_arrival = |conn: &Connection| {
+        bodies::has_column(conn, "internal_date_repair", "deferred_arrival_unix")
+    };
+    if seeded(conn)? && has_budgets(conn)? && has_deferred_arrival(conn)? {
         return Ok(());
     }
     let tx = immediate_transaction(conn)?;
@@ -47,6 +50,11 @@ pub(super) fn ensure_date_repair_through(conn: &Connection, latest: i64) -> Resu
              ALTER TABLE internal_date_repair ADD COLUMN unchecked_attempts INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE internal_date_repair ADD COLUMN clock_attempts INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE internal_date_repair ADD COLUMN last_clock_latest INTEGER;",
+        )?;
+    }
+    if !has_deferred_arrival(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE internal_date_repair ADD COLUMN deferred_arrival_unix INTEGER;",
         )?;
     }
     if seeded(&tx)? {
@@ -111,12 +119,20 @@ impl Store {
         let mut changed = false;
         let valid_dates = 1..=latest;
         let latest_plausible = latest.saturating_add(MAX_PLAUSIBLE_CLOCK_SKEW_SECONDS);
+        let plausible_future = |date: i64| date > latest && date <= latest_plausible;
         for request in batch {
             let id = request.message_id.as_str();
             let key = params![account.as_str(), id];
-            let Some((previous, unchecked_attempts, clock_attempts, last_clock_latest)) = tx
+            let Some((
+                previous,
+                unchecked_attempts,
+                clock_attempts,
+                last_clock_latest,
+                saved_arrival,
+            )) = tx
                 .query_row(
-                    "SELECT previous_date_unix, unchecked_attempts, clock_attempts, last_clock_latest
+                    "SELECT previous_date_unix, unchecked_attempts, clock_attempts,
+                            last_clock_latest, deferred_arrival_unix
                      FROM internal_date_repair
                      WHERE account_id = ?1 AND message_id = ?2",
                     key,
@@ -126,6 +142,7 @@ impl Store {
                             row.get::<_, i64>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
                         ))
                     },
                 )
@@ -139,27 +156,35 @@ impl Store {
                 + i64::from(
                     fetch_complete && unchecked && unchecked_attempts < MAX_UNCHECKED_ATTEMPTS,
                 );
-            let clock_may_be_behind = previous > latest && previous <= latest_plausible;
+            let reported_arrivals = || copies.iter().filter_map(|copy| checked.get(copy)?.as_ref());
+            let arrival = reported_arrivals()
+                .copied()
+                .chain(saved_arrival)
+                .find(|date| valid_dates.contains(date));
+            // Keep a verified future arrival even if the next fetch omits it.
+            // Of several future copies, the earliest can become usable first.
+            let deferred_arrival = reported_arrivals()
+                .copied()
+                .chain(saved_arrival)
+                .filter(|date| plausible_future(*date))
+                .min();
+            let header = valid_dates.contains(&previous).then_some(previous);
+            let clock_may_be_behind = plausible_future(previous)
+                || (header.is_none() && arrival.is_none() && deferred_arrival.is_some());
             let advance_clock = fetch_complete
                 && clock_may_be_behind
                 && clock_attempts < MAX_CLOCK_ATTEMPTS
                 && last_clock_latest
                     .is_none_or(|last| latest >= last.saturating_add(CLOCK_RETRY_SECONDS));
             let clock_attempts = clock_attempts + i64::from(advance_clock);
-            let arrival = copies.iter().find_map(|copy| {
-                checked
-                    .get(copy)
-                    .copied()
-                    .flatten()
-                    .filter(|date| valid_dates.contains(date))
-            });
             if (clock_may_be_behind && (clock_attempts < MAX_CLOCK_ATTEMPTS || arrival.is_none()))
                 || (unchecked && unchecked_attempts < MAX_UNCHECKED_ATTEMPTS)
             {
                 // Rotate the page even when neither retry budget advances.
                 tx.execute(
                     "UPDATE internal_date_repair SET attempts = attempts + 1,
-                         unchecked_attempts = ?3, clock_attempts = ?4, last_clock_latest = ?5
+                         unchecked_attempts = ?3, clock_attempts = ?4, last_clock_latest = ?5,
+                         deferred_arrival_unix = ?6
                      WHERE account_id = ?1 AND message_id = ?2",
                     params![
                         account.as_str(),
@@ -170,16 +195,15 @@ impl Store {
                             Some(latest)
                         } else {
                             last_clock_latest
-                        }
+                        },
+                        saved_arrival
+                            .filter(|date| valid_dates.contains(date))
+                            .or(deferred_arrival)
                     ],
                 )?;
                 continue;
             }
-            let date = valid_dates
-                .contains(&previous)
-                .then_some(previous)
-                .or(arrival);
-            if let Some(date) = date {
+            if let Some(date) = header.or(arrival) {
                 changed |= tx.execute(
                     "UPDATE messages SET date_unix = ?3
                      WHERE account_id = ?1 AND message_id = ?2 AND date_unix = 0",

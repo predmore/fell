@@ -3867,13 +3867,16 @@ impl HeaderAccount {
         let full = fit(name, room, FontWeight::SEMIBOLD).filter(|line| line.text == name);
         let quiet = full.is_none();
         let name = full.or_else(|| fit(name, room, FontWeight::NORMAL));
-        let email = name.as_ref().filter(|_| show_email && !quiet).and_then(|line| {
-            fit(
-                email?,
-                room - f32::from(line.width).ceil() - gap,
-                FontWeight::NORMAL,
-            )
-        });
+        let email = name
+            .as_ref()
+            .filter(|_| show_email && !quiet)
+            .and_then(|line| {
+                fit(
+                    email?,
+                    room - f32::from(line.width).ceil() - gap,
+                    FontWeight::NORMAL,
+                )
+            });
         Self {
             name: name.map(|line| line.text),
             email: email.map(|line| line.text),
@@ -4021,7 +4024,13 @@ fn header(
         .as_ref()
         .map_or((0., 1.), |fade| fade.label_opacities(now));
     let fit_account = |folder_width| {
-        HeaderAccount::fit(session, room - folder_width, COUNT_GAP, width >= DETAIL_MIN_WIDTH, &fit)
+        HeaderAccount::fit(
+            session,
+            room - folder_width,
+            COUNT_GAP,
+            width >= DETAIL_MIN_WIDTH,
+            &fit,
+        )
     };
     let account = fit_account(current_width);
     // Each account fit shares its half of the fade with its folder. This

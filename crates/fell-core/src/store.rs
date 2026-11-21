@@ -4525,6 +4525,58 @@ mod tests {
     }
 
     #[test]
+    fn date_repair_remembers_a_future_arrival_without_a_usable_header() {
+        let latest = 1_707_512_400;
+        let arrival = latest + 86_400;
+        for previous in [0, 26_382_787_200] {
+            let (store, account, remote_id) = legacy_date_repair(previous, latest);
+            let batch = store.missing_internal_dates(&account).unwrap();
+            let reported = [(remote_id.clone(), Some(arrival))].into();
+            let omitted = [(remote_id, None)].into();
+            assert!(
+                !store
+                    .finish_internal_dates(&account, &batch, &reported, true, latest)
+                    .unwrap()
+            );
+
+            for _ in 0..6 {
+                let batch = store.missing_internal_dates(&account).unwrap();
+                assert_eq!(batch.len(), 1);
+                assert!(
+                    !store
+                        .finish_internal_dates(&account, &batch, &omitted, true, latest + 599)
+                        .unwrap()
+                );
+            }
+            let queued: (i64, i64) = store
+                .conn
+                .query_row(
+                    "SELECT deferred_arrival_unix, clock_attempts FROM internal_date_repair",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(queued, (arrival, 1));
+            assert_eq!(
+                store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+                0
+            );
+
+            let batch = store.missing_internal_dates(&account).unwrap();
+            assert!(
+                store
+                    .finish_internal_dates(&account, &batch, &omitted, true, arrival)
+                    .unwrap()
+            );
+            assert_eq!(
+                store.folder_threads(&account, "INBOX").unwrap()[0].last_date_unix,
+                arrival
+            );
+            assert!(store.missing_internal_dates(&account).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn date_repair_upgrade_preserves_queue_and_starts_each_budget_at_zero() {
         let latest = 1_707_512_400;
         let header = latest + 86_400;
@@ -4535,6 +4587,7 @@ mod tests {
                 "ALTER TABLE internal_date_repair DROP COLUMN unchecked_attempts;
                  ALTER TABLE internal_date_repair DROP COLUMN clock_attempts;
                  ALTER TABLE internal_date_repair DROP COLUMN last_clock_latest;
+                 ALTER TABLE internal_date_repair DROP COLUMN deferred_arrival_unix;
                  UPDATE internal_date_repair SET attempts = 4;",
             )
             .unwrap();
