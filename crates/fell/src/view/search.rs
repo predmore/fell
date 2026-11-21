@@ -359,6 +359,58 @@ impl Inbox {
         }
     }
 
+    pub(super) fn refresh_search_snippet(&mut self, message: MessageId, cx: &mut Context<Self>) {
+        let Some(search) = &self.session.search else {
+            return;
+        };
+        let Some(generation) = search.accepted_generation() else {
+            return;
+        };
+        let Some((thread, hit)) = search.hits.iter().find(|(_, hit)| hit.message == message) else {
+            return;
+        };
+        let thread = thread.clone();
+        let query = search.effective_query().to_owned();
+        let related = hit.related;
+        let account = self.account_id.clone();
+        let id = message.clone();
+        let reply = self.store.call_search(move |store| {
+            let snippet = store.message_snippet(&account, &id).ok().flatten()?;
+            let preview = if related {
+                None
+            } else {
+                store
+                    .search_previews(&account, &query, std::slice::from_ref(&id))
+                    .ok()
+                    .and_then(|mut previews| previews.remove(&id))
+            };
+            Some((snippet, preview))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some((snippet, preview))) = reply.await else {
+                return;
+            };
+            let _ = this.update(cx, |inbox, cx| {
+                let current = inbox
+                    .session
+                    .search
+                    .as_ref()
+                    .and_then(Search::accepted_generation);
+                if current != Some(generation) {
+                    inbox.refresh_search_snippet(message, cx);
+                } else if inbox
+                    .session
+                    .set_search_snippet(generation, &thread, &message, &snippet, preview)
+                {
+                    inbox.search_view.rows_previews =
+                        inbox.search_view.rows_previews.wrapping_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn cancel_search_work(&self) {
         self.search_view
             .current
@@ -899,7 +951,9 @@ impl Inbox {
                         return;
                     }
                     for (thread, id) in batch {
-                        if let Some(hit) = search.hits.get_mut(&thread) {
+                        if let Some(hit) = search.hits.get_mut(&thread)
+                            && hit.preview.is_none()
+                        {
                             hit.preview = previews.remove(&id);
                         }
                     }

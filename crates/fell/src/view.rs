@@ -1830,16 +1830,16 @@ impl Inbox {
                         inbox.bodies_asked.answered(&id);
                         if has_html {
                             if inbox.session.search.is_some() {
+                                inbox.refresh_search_snippet(MessageId(id.clone()), cx);
                                 inbox.reread_open_thread(cx);
-                            } else {
-                                inbox.request_threads(
-                                    ReadIntent {
-                                        refresh_open: true,
-                                        ..ReadIntent::default()
-                                    },
-                                    cx,
-                                );
                             }
+                            inbox.request_threads(
+                                ReadIntent {
+                                    refresh_open: true,
+                                    ..ReadIntent::default()
+                                },
+                                cx,
+                            );
                         } else {
                             for message in &mut inbox.session.messages {
                                 if message.id == id && message.rich == Rich::Missing {

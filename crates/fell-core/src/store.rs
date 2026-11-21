@@ -998,6 +998,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The list snippet for a canonical message ID from a search hit.
+    pub fn message_snippet(
+        &self,
+        account_id: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Option<String>> {
+        self.conn
+            .prepare_cached(
+                "SELECT snippet FROM messages WHERE account_id = ?1 AND message_id = ?2",
+            )?
+            .query_row(params![account_id.as_str(), message_id.as_str()], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// The HTML and plain parts and bulk headers of one message, by its id
     /// or an id that collapsed into it.
     ///
