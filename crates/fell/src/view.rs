@@ -56,7 +56,7 @@ use crate::render::READING_MEASURE_PX;
 use crate::reply_check::{ReplyCheck, ReplyChecks};
 use crate::row_widths::{self, RowFrame, RowWidths};
 use crate::scroll_anchor::{
-    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, ReaderLanding, Reveal, RevealPhase,
+    LandingGlide, LandingHold, LayoutProbe, LayoutSlot, MessageProbes, ReaderLanding, Reveal, RevealPhase,
     ScrollAnchor, clamped_offset,
 };
 use crate::store_actor::StoreClient;
@@ -2277,12 +2277,10 @@ impl Inbox {
                             inbox.invalidate_conversation_layout();
                             inbox.reveal = Reveal::Waiting;
                             inbox.motion.show_thread(&mut inbox.session, view);
-                            // A new thread starts at the top of the reader's
-                            // message. Scrolling only far enough to show its
-                            // end would cut the row above it, or its header
-                            // when it is tall. A thread that fits stays put.
-                            if automatic {
-                                inbox.landing.hold_preview(
+                            // Keep the initial header landing while the
+                            // preview's pending bodies fill in.
+                            if automatic || inbox.session.cursor_awaits_body() {
+                                inbox.landing.hold_opening(
                                     inbox
                                         .session
                                         .messages
@@ -7350,15 +7348,11 @@ fn conversation(
     };
     let live = Live(live.0 && leaving.is_none());
     let arrival = leaving.map_or_else(|| motion.arrival(now), |(reader, _)| reader.arrival);
+    let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
     let hold = frame
         .anchor
-        .filter(|_| leaving.is_none())
-        .map(|anchor| (anchor, LayoutSlot::default()));
-    let bottom = frame
-        .anchor
-        .filter(|anchor| leaving.is_none() && anchor.start_if_short)
-        .map(|_| LayoutSlot::default());
-    let chip_probe = (live.0 && frame.reveal_attachment).then(LayoutSlot::default);
+        .filter(|_| leaving.is_none() && scroll.is_some() && chip_probe.is_none())
+        .map(|anchor| MessageProbes::new(anchor, shown.len()));
     let collapsed_rows = OnceCell::new();
     let retained = !frame.preview_current && session.search.is_some() && !subject.is_empty();
     // Short subjects keep their one-line measure in both modes.
@@ -7411,27 +7405,9 @@ fn conversation(
             } else {
                 block
             };
-            let block = if let Some((anchor, probe)) = &hold
-                && anchor.index == index
-            {
-                LayoutProbe {
-                    inner: block,
-                    slot: probe.clone(),
-                }
-                .into_any_element()
-            } else {
-                block
-            };
-            if let Some(bottom) = &bottom
-                && index + 1 == session.messages.len()
-            {
-                LayoutProbe {
-                    inner: block,
-                    slot: bottom.clone(),
-                }
-                .into_any_element()
-            } else {
-                block
+            match &hold {
+                Some(probes) => probes.wrap(index, block),
+                None => block,
             }
         })
         .collect();
@@ -7526,37 +7502,17 @@ fn conversation(
                             window,
                             cx,
                         )
-                    });
-                let body = div()
-                    .id("conversation-scroll")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .map(|body| match &scroll {
-                        Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
-                        None => body.overflow_hidden(),
                     })
-                    .px(px(CONVERSATION_PAD_PX))
-                    .pb(px(CONVERSATION_BOTTOM_PX))
-                    .when(arrival < 1.0, |body| body.opacity(arrival))
-                    .children(note)
-                    .children(messages)
-                    .into_any_element();
-                let landing = chip_probe
-                    .map(|probe| (None, probe))
-                    .or_else(|| hold.map(|(anchor, probe)| (Some(anchor.y), probe)));
-                match (&scroll, landing) {
-                    (Some(scroll), Some((y, probe))) => LandingHold {
-                        inner: body,
-                        probe,
-                        bottom: bottom.map(|probe| (probe, px(CONVERSATION_BOTTOM_PX))),
-                        scroll: scroll.clone(),
-                        y,
-                        glide: frame.return_glide,
-                        frames: frame.frames.clone(),
-                    }
-                    .into_any_element(),
-                    _ => body,
-                }
+                    .map(IntoElement::into_any_element);
+                conversation_body(
+                note.into_iter().chain(messages),
+                scroll,
+                hold,
+                chip_probe,
+                arrival,
+                frame.return_glide,
+                frame.frames.clone(),
+                )
             }
         })
         .when(retained, |pane| {
@@ -7573,6 +7529,39 @@ fn expanded_card_fill(theme: &Theme, focus: f32) -> u32 {
         theme.surface,
         motion::lerp(0.4, 1.0, focus),
     )
+}
+
+fn conversation_body(
+    children: impl IntoIterator<Item = gpui::AnyElement>,
+    scroll: Option<ScrollHandle>,
+    hold: Option<MessageProbes>,
+    chip_probe: Option<LayoutSlot>,
+    arrival: f32,
+    return_glide: Option<LandingGlide>,
+    frames: Option<SharedFrameLog>,
+) -> gpui::AnyElement {
+    let body = div()
+        .id("conversation-scroll")
+        .flex_1()
+        .min_h(px(0.))
+        .map(|body| match &scroll {
+            Some(scroll) => body.overflow_y_scroll().track_scroll(scroll),
+            None => body.overflow_hidden(),
+        })
+        .px(px(CONVERSATION_PAD_PX))
+        .pb(px(CONVERSATION_BOTTOM_PX))
+        .when(arrival < 1.0, |body| body.opacity(arrival))
+        .children(children)
+        .into_any_element();
+    match (scroll, hold, chip_probe) {
+        (Some(scroll), Some(hold), _) => hold
+            .hold(body, scroll, px(CONVERSATION_BOTTOM_PX), return_glide, frames)
+            .into_any_element(),
+        (Some(scroll), _, Some(probe)) => {
+            LandingHold::reveal(body, scroll, probe, frames).into_any_element()
+        }
+        _ => body,
+    }
 }
 
 fn preview_shield(theme: &Theme, results_current: bool) -> impl IntoElement {
@@ -10262,6 +10251,149 @@ mod tests {
         assert!(preview.expire(exit + FIRST_PREVIEW_WAIT));
         assert!(!preview.waits_for_body());
         assert!(preview.take());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated nested Wayland compositor"]
+    fn opening_landings_use_the_real_conversation_end_probe() {
+        use std::cell::Cell;
+        use std::os::unix::fs::FileTypeExt;
+        use std::path::PathBuf;
+        use std::rc::Rc;
+
+        use super::{MessageProbes, ReaderLanding, ScrollAnchor, conversation_body};
+        use gpui::{App, Context, IntoElement, Render, ScrollHandle, Window, div, prelude::*, px};
+
+        let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        assert_eq!(
+            std::env::var_os("FELL_TEST_NESTED_WAYLAND").as_deref(),
+            Some(display.as_os_str())
+        );
+        assert!(display.is_absolute() && display.parent() == Some(runtime.as_path()));
+        assert!(display.metadata().unwrap().file_type().is_socket());
+        assert!(std::env::var_os("DISPLAY").is_none());
+
+        struct Case {
+            heights: &'static [f32],
+            automatic: bool,
+            pending: bool,
+            expected_header: usize,
+            scroll: ScrollHandle,
+        }
+
+        struct Landings(Vec<Case>);
+
+        impl Render for Landings {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .children(self.0.iter().enumerate().map(|(index, case)| {
+                        let mut landing = ReaderLanding::default();
+                        if case.automatic {
+                            landing.hold_opening(Some("newest"));
+                        } else {
+                            landing.hold(Some("newest"));
+                        }
+                        let anchor = landing
+                            .anchor(
+                                Some("newest"),
+                                ScrollAnchor {
+                                    index: case.heights.len() - 1,
+                                    y: px(0.),
+                                    snap_headers: case.pending,
+                                },
+                                false,
+                            )
+                            .unwrap();
+                        let probes = MessageProbes::new(anchor, case.heights.len());
+                        let cards = case
+                            .heights
+                            .iter()
+                            .enumerate()
+                            .map(|(index, height)| {
+                                let card = div().h(px(*height)).mb(px(8.)).into_any_element();
+                                probes.wrap(index, card)
+                            })
+                            .collect();
+                        div()
+                            .id(("case", index))
+                            .flex()
+                            .flex_col()
+                            .w(px(125.))
+                            .h(px(300.))
+                            .child(conversation_body(
+                                cards,
+                                Some(case.scroll.clone()),
+                                Some(probes),
+                                None,
+                                1.,
+                                None,
+                            ))
+                    }))
+            }
+        }
+
+        let checked = Rc::new(Cell::new(false));
+        let completed = checked.clone();
+        gpui::Application::new().run(move |cx: &mut App| {
+            let handle = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|_| {
+                        Landings(
+                            [
+                                (&[160., 90., 200., 80.][..], true, false, 2),
+                                (&[160., 90., 200., 68.][..], false, true, 2),
+                                (&[60., 80.][..], true, false, 0),
+                                (&[160., 400.][..], true, false, 1),
+                            ]
+                            .into_iter()
+                            .map(|(heights, automatic, pending, expected_header)| Case {
+                                heights,
+                                automatic,
+                                pending,
+                                expected_header,
+                                scroll: ScrollHandle::new(),
+                            })
+                            .collect(),
+                        )
+                    })
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                cx.update(|cx| {
+                    let entity = handle.entity(cx).unwrap();
+                    handle
+                        .update(cx, |_, window, cx| {
+                            window.defer(cx, move |window, cx| {
+                                window.draw(cx).clear();
+                                for case in &entity.read(cx).0 {
+                                    let view = case.scroll.bounds();
+                                    let header =
+                                        case.scroll.bounds_for_item(case.expected_header).unwrap();
+                                    let newest = case
+                                        .scroll
+                                        .bounds_for_item(case.heights.len() - 1)
+                                        .unwrap();
+                                    let offset = case.scroll.offset().y;
+                                    assert_eq!(header.top() + offset, view.top());
+                                    assert!(newest.top() + offset < view.bottom());
+                                    assert!(offset >= -case.scroll.max_offset().height);
+                                }
+                                completed.set(true);
+                                cx.quit();
+                            });
+                        })
+                        .unwrap();
+                })
+                .unwrap();
+            })
+            .detach();
+        });
+        assert!(checked.get());
     }
 
     #[test]

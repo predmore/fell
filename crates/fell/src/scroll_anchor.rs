@@ -11,9 +11,9 @@ use crate::{frame_log::SharedFrameLog, model::Session, motion, present};
 pub(super) struct ScrollAnchor {
     pub index: usize,
     pub y: Pixels,
-    /// For an automatic preview or pending body, open at the start when
-    /// aligning the selected message would clip the one above it.
-    pub start_if_short: bool,
+    /// For an automatic or pending preview, align to a complete header
+    /// when the selected message is too close to the end to align itself.
+    pub snap_headers: bool,
 }
 
 /// An explicit message jump owns its landing even if it starts with a
@@ -21,18 +21,18 @@ pub(super) struct ScrollAnchor {
 #[derive(Default)]
 pub(super) struct ReaderLanding {
     id: Option<String>,
-    preview: bool,
+    snap_headers: bool,
 }
 
 impl ReaderLanding {
     pub fn hold(&mut self, id: Option<&str>) {
         self.id = id.map(str::to_owned);
-        self.preview = false;
+        self.snap_headers = false;
     }
 
-    pub fn hold_preview(&mut self, id: Option<&str>) {
+    pub fn hold_opening(&mut self, id: Option<&str>) {
         self.hold(id);
-        self.preview = true;
+        self.snap_headers = true;
     }
 
     pub fn anchor(
@@ -44,7 +44,7 @@ impl ReaderLanding {
         if self.id.as_deref() != id {
             self.hold(None);
         }
-        anchor.start_if_short |= self.preview;
+        anchor.snap_headers |= self.snap_headers;
         (!gliding && self.id.is_some()).then_some(anchor)
     }
 }
@@ -54,7 +54,7 @@ impl ScrollAnchor {
         Self {
             index: session.message_cursor,
             y: px(0.),
-            start_if_short: reveal == Reveal::Waiting && session.cursor_awaits_body(),
+            snap_headers: reveal == Reveal::Waiting && session.cursor_awaits_body(),
         }
     }
 
@@ -92,7 +92,7 @@ impl ScrollAnchor {
                 .map(|y| Self {
                     index: index - first_message,
                     y,
-                    start_if_short: false,
+                    snap_headers: false,
                 })
         })
     }
@@ -104,7 +104,7 @@ impl ScrollAnchor {
         first_message: usize,
     ) -> Option<Self> {
         let item = scroll.bounds_for_item(first_message + index)?;
-        visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y, start_if_short: false })
+        visible_top(scroll.bounds(), clamped_offset(scroll), item).map(|y| Self { index, y, snap_headers: false })
     }
 }
 
@@ -186,17 +186,30 @@ fn offset_to_hold(view: Bounds<Pixels>, item: Bounds<Pixels>, y: Pixels) -> Pixe
     (y - (item.top() - view.top())).min(px(0.))
 }
 
-fn landing_offset(
+fn offset_to_header(
     view: Bounds<Pixels>,
     item: Bounds<Pixels>,
     y: Pixels,
-    content_end: Option<Pixels>,
+    headers: &[Bounds<Pixels>],
+    bottom_padding: Pixels,
 ) -> Pixels {
-    if content_end.is_some_and(|end| end - item.top() + y < view.size.height) {
-        px(0.)
-    } else {
-        offset_to_hold(view, item, y)
+    let target = offset_to_hold(view, item, y);
+    let Some(last) = headers.last() else {
+        return target;
+    };
+    let limit = (view.bottom() - last.bottom() - bottom_padding).min(px(0.));
+    if target >= limit || limit == px(0.) {
+        return target.max(limit);
     }
+
+    // Start on the closest earlier header that still shows the selected
+    // message. A long intervening body may leave no such header reachable.
+    headers
+        .iter()
+        .rev()
+        .map(|header| offset_to_hold(view, *header, y))
+        .find(|offset| *offset >= limit && *offset < px(0.) && item.top() + *offset < view.bottom())
+        .unwrap_or(limit)
 }
 
 fn offset_to_reveal(view: Bounds<Pixels>, item: Bounds<Pixels>, offset: Pixels) -> Pixels {
@@ -213,6 +226,65 @@ fn offset_to_reveal(view: Bounds<Pixels>, item: Bounds<Pixels>, offset: Pixels) 
 
 pub(super) type LayoutSlot = Rc<Cell<Option<LayoutId>>>;
 
+/// Probes for the live conversation. A snapped landing uses the same cards
+/// that determine the scroll div's max offset, including its last card.
+pub(super) struct MessageProbes {
+    anchor: ScrollAnchor,
+    selected: LayoutSlot,
+    headers: Vec<LayoutSlot>,
+}
+
+impl MessageProbes {
+    pub fn new(anchor: ScrollAnchor, count: usize) -> Self {
+        let headers: Vec<_> = if anchor.snap_headers {
+            (0..count).map(|_| LayoutSlot::default()).collect()
+        } else {
+            Vec::new()
+        };
+        let selected = headers.get(anchor.index).cloned().unwrap_or_default();
+        Self {
+            anchor,
+            selected,
+            headers,
+        }
+    }
+
+    pub fn wrap(&self, index: usize, inner: AnyElement) -> AnyElement {
+        let slot = self
+            .headers
+            .get(index)
+            .or((index == self.anchor.index).then_some(&self.selected));
+        match slot {
+            Some(slot) => LayoutProbe {
+                inner,
+                slot: slot.clone(),
+            }
+            .into_any_element(),
+            None => inner,
+        }
+    }
+
+    pub fn hold(
+        self,
+        inner: AnyElement,
+        scroll: ScrollHandle,
+        bottom_padding: Pixels,
+        glide: Option<LandingGlide>,
+        frames: Option<SharedFrameLog>,
+    ) -> LandingHold {
+        LandingHold {
+            inner,
+            probe: self.selected,
+            headers: self.headers,
+            bottom_padding,
+            scroll,
+            y: Some(self.anchor.y),
+            glide,
+            frames,
+        }
+    }
+}
+
 /// Apply the offset before the scroll div prepaints its children. GPUI's
 /// `scroll_to_top_of_item` uses the previous frame's viewport bounds, which
 /// can put the message in the wrong place for a frame if the header moves.
@@ -220,9 +292,8 @@ pub(super) struct LandingHold {
     pub inner: AnyElement,
     /// The layout of the reader's message, from [`LayoutProbe`].
     pub probe: LayoutSlot,
-    /// The end of the last card and bottom padding, used when a
-    /// landing may fall back to the top of the thread.
-    pub bottom: Option<(LayoutSlot, Pixels)>,
+    headers: Vec<LayoutSlot>,
+    bottom_padding: Pixels,
     pub scroll: ScrollHandle,
     /// Relative viewport position to hold. None reveals a focused chip
     /// with the smallest scroll that brings its bounds into view.
@@ -237,6 +308,26 @@ pub(super) struct LandingHold {
 pub(super) struct LandingGlide {
     pub from: Pixels,
     pub progress: f32,
+}
+
+impl LandingHold {
+    pub fn reveal(
+        inner: AnyElement,
+        scroll: ScrollHandle,
+        probe: LayoutSlot,
+        frames: Option<SharedFrameLog>,
+    ) -> Self {
+        Self {
+            inner,
+            probe,
+            headers: Vec::new(),
+            bottom_padding: px(0.),
+            scroll,
+            y: None,
+            glide: None,
+            frames,
+        }
+    }
 }
 
 impl IntoElement for LandingHold {
@@ -286,11 +377,12 @@ impl gpui::Element for LandingHold {
             let mut offset = before;
             offset.y = match self.y {
                 Some(y) => {
-                    let end = self.bottom.as_ref().and_then(|(probe, padding)| {
-                        Some(window.layout_bounds(probe.get()?).bottom() + *padding)
-                    });
-                    let target = landing_offset(bounds, item, y, end);
-
+                    let headers: smallvec::SmallVec<[_; 16]> = self
+                        .headers
+                        .iter()
+                        .filter_map(|probe| Some(window.layout_bounds(probe.get()?)))
+                        .collect();
+                    let target = offset_to_header(bounds, item, y, &headers, self.bottom_padding);
                     self.glide.map_or(target, |glide| {
                         let moving =
                             motion::lerp(f32::from(glide.from), f32::from(target), glide.progress);
@@ -468,7 +560,7 @@ mod tests {
         let target = ScrollAnchor {
             index: 2,
             y: px(0.),
-            start_if_short: false,
+            snap_headers: false,
         };
         assert!(landing.anchor(Some("last"), target, true).is_none());
         let anchor = landing.anchor(Some("last"), target, false).unwrap();
@@ -481,45 +573,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_landing_starts_at_the_top_only_if_alignment_would_clamp() {
+    fn header_landing_keeps_the_newest_visible_when_only_a_long_body_precedes_it() {
         let view = vertical_bounds(50., 300.);
-        let pending = vertical_bounds(420., 60.);
+        let oldest = vertical_bounds(50., 380.);
+        let newest = vertical_bounds(438., 60.);
         assert_eq!(
-            landing_offset(view, pending, px(0.), Some(px(500.))),
-            px(0.)
-        );
-        assert_eq!(
-            landing_offset(view, pending, px(0.), Some(px(740.))),
-            px(-370.)
-        );
-        assert_eq!(landing_offset(view, pending, px(0.), None), px(-370.));
-    }
-
-    #[test]
-    fn automatic_preview_uses_the_top_when_the_newest_header_cannot_align() {
-        let mut landing = ReaderLanding::default();
-        landing.hold_preview(Some("last"));
-        let anchor = landing
-            .anchor(
-                Some("last"),
-                ScrollAnchor {
-                    index: 2,
-                    y: px(0.),
-                    start_if_short: false,
-                },
-                false,
-            )
-            .unwrap();
-        assert!(anchor.start_if_short);
-        let view = vertical_bounds(50., 300.);
-        let newest = vertical_bounds(420., 120.);
-        assert_eq!(
-            landing_offset(view, newest, anchor.y, Some(px(560.))),
-            px(0.)
-        );
-        assert_eq!(
-            landing_offset(view, newest, anchor.y, Some(px(760.))),
-            px(-370.)
+            offset_to_header(view, newest, px(0.), &[oldest, newest], px(28.)),
+            px(-176.),
         );
     }
 

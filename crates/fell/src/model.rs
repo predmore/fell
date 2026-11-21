@@ -3245,12 +3245,12 @@ mod tests {
         assert!(crate::present::awaiting_bodies(&session.messages));
         let landing = ScrollAnchor::landing(&session, Reveal::Waiting);
         assert_eq!(landing.index, 1);
-        assert!(!landing.start_if_short);
+        assert!(!landing.snap_headers);
 
         session.messages[1].body_state = BodyState::Pending;
         let landing = ScrollAnchor::landing(&session, Reveal::Waiting);
         assert_eq!(landing.index, 1);
-        assert!(landing.start_if_short);
+        assert!(landing.snap_headers);
     }
 
     #[test]
