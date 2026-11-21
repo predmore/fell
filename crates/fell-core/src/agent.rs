@@ -272,25 +272,7 @@ impl crate::Store {
 
     pub fn list_labels(&self, account_id: &AccountId) -> Result<Vec<String>> {
         require_account(&self.conn, account_id)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT labels FROM thread_summary WHERE account_id = ?1 AND labels != ''
-                 UNION
-                 SELECT labels FROM messages m WHERE m.account_id = ?1 AND EXISTS (
-                     SELECT 1 FROM thread_summary_dirty d
-                     WHERE d.account_id = m.account_id AND d.thread_id = m.thread_id
-                 )
-                 UNION
-                 SELECT substr(folder, 8) FROM mailbox_views
-                 WHERE account_id = ?1 AND kind = 'label'",
-        )?;
-        let rows = stmt.query_map(params![account_id.as_str()], |row| row.get::<_, String>(0))?;
-        let mut labels = std::collections::BTreeSet::new();
-        for row in rows {
-            for label in split_field(&row?) {
-                labels.insert(label);
-            }
-        }
-        Ok(labels.into_iter().collect())
+        crate::store::label_names(&self.conn, account_id)
     }
 
     pub fn add_thread_label(

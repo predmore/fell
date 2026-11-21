@@ -1328,7 +1328,7 @@ mod tests {
                 .contains("venue-2@fell.test")
         );
         assert!(
-            session.is_open(session.message_cursor),
+            session.is_open(&session.messages[session.message_cursor].id),
             "the only hall match here is folded"
         );
         session.on_key(KeyId::Char('N'), 10);

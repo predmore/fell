@@ -1,9 +1,10 @@
-//! One row per thread for folder lists, kept current by writes.
+//! One row per thread for folder and label lists, kept current by writes.
 //!
 //! `thread_summary` holds what a list row shows: subject, latest snippet and
 //! sender, participants, labels, and markers. `thread_folders` has one row
 //! per (thread, folder) with the folder's unread state, so a folder list is
-//! an index range instead of a scan of every message.
+//! an index range instead of a scan of every message. `thread_labels` does
+//! the same for labels, with the thread's unread state across all folders.
 //!
 //! Triggers queue every thread a message write touches in
 //! `thread_summary_dirty`, whatever code made the write. Each write
@@ -13,7 +14,7 @@
 //! writer skipped the refresh.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 
@@ -93,9 +94,27 @@ CREATE INDEX IF NOT EXISTS idx_thread_folders_unread
     ON thread_folders(account_id, folder_key, thread_id) WHERE unread = 1;
 "#;
 
-/// Value of `meta.thread_summary` once the tables match this code. Version 2
-/// added `thread_folders.last_date`.
-const SUMMARY_VERSION: &str = "2";
+const LABEL_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS thread_labels (
+    account_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    last_date INTEGER NOT NULL,
+    unread INTEGER NOT NULL,
+    PRIMARY KEY (account_id, thread_id, label)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_thread_labels_list
+    ON thread_labels(account_id, label, last_date DESC, thread_id);
+CREATE INDEX IF NOT EXISTS idx_thread_labels_unread
+    ON thread_labels(account_id, label, thread_id) WHERE unread = 1;
+"#;
+
+const INSERT_LABEL: &str =
+    "INSERT OR IGNORE INTO thread_labels (account_id, thread_id, label, last_date, unread)
+     VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// Version 2 added `thread_folders.last_date`. Version 3 added `thread_labels`.
+const SUMMARY_VERSION: &str = "3";
 
 /// Bump when [`SUMMARY_TRIGGERS`] changes. They are rebuilt only then, in
 /// one transaction (see [`super::ensure_triggers`]).
@@ -165,7 +184,8 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
         tx.execute_batch(FOLDER_TABLE)?;
         return tx.commit();
     }
-    if version.as_deref() == Some("1") && table_exists(&tx, "thread_folders")? {
+    let from_v1 = version.as_deref() == Some("1") && table_exists(&tx, "thread_folders")?;
+    if from_v1 {
         // Version 1 rows are right apart from the date. Add it from the
         // summaries instead of recomputing every thread under the write
         // lock: fell and fell-mcp share the file, and a recompute of a large
@@ -185,17 +205,21 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
                    AND s.thread_id = thread_folders.thread_id
              ), 0);",
         )?;
-        // The indexes go in after the dates, so the update does not keep
-        // them current row by row.
+    }
+    if from_v1 || version.as_deref() == Some("2") {
         tx.execute_batch(FOLDER_TABLE)?;
+        tx.execute_batch(LABEL_TABLE)?;
+        tx.execute("DELETE FROM thread_labels", [])?;
+        backfill_labels(&tx)?;
         stamp_version(&tx)?;
         return tx.commit();
     }
     // No summaries yet, or a version this code does not know: build them
     // from `messages`. An unknown `thread_folders` may lack columns, and
     // every row is rebuilt below, so replace the table.
-    tx.execute_batch("DROP TABLE IF EXISTS thread_folders;")?;
+    tx.execute_batch("DROP TABLE IF EXISTS thread_folders; DROP TABLE IF EXISTS thread_labels;")?;
     tx.execute_batch(FOLDER_TABLE)?;
+    tx.execute_batch(LABEL_TABLE)?;
     tx.execute_batch(
         "DELETE FROM thread_summary;
          DELETE FROM account_folders;
@@ -205,6 +229,29 @@ pub(super) fn ensure_thread_summaries(conn: &Connection) -> Result<()> {
     stamp_version(&tx)?;
     // Commit recomputes every queued thread.
     tx.commit()
+}
+
+fn backfill_labels(conn: &Connection) -> Result<()> {
+    let mut scan = conn.prepare(
+        "SELECT account_id, thread_id, labels, last_date, EXISTS (
+             SELECT 1 FROM messages m WHERE m.account_id = s.account_id
+                 AND m.thread_id = s.thread_id AND m.unread = 1
+         )
+         FROM thread_summary s WHERE labels != ''",
+    )?;
+    let mut scan = scan.query([])?;
+    let mut insert = conn.prepare_cached(INSERT_LABEL)?;
+    while let Some(row) = scan.next()? {
+        let account: String = row.get(0)?;
+        let thread: String = row.get(1)?;
+        let labels: String = row.get(2)?;
+        let date: i64 = row.get(3)?;
+        let unread: bool = row.get(4)?;
+        for label in split_field(&labels) {
+            insert.execute(params![account, thread, label, date, unread])?;
+        }
+    }
+    Ok(())
 }
 
 fn stamp_version(conn: &Connection) -> Result<()> {
@@ -270,6 +317,9 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
         conn.prepare_cached("DELETE FROM thread_summary WHERE account_id = ?1 AND thread_id = ?2")?;
     let mut drop_folders =
         conn.prepare_cached("DELETE FROM thread_folders WHERE account_id = ?1 AND thread_id = ?2")?;
+    let mut drop_labels =
+        conn.prepare_cached("DELETE FROM thread_labels WHERE account_id = ?1 AND thread_id = ?2")?;
+    let mut put_label = conn.prepare_cached(INSERT_LABEL)?;
     let mut put_summary = conn.prepare_cached(
         "INSERT INTO thread_summary (
             account_id, thread_id, subject, snippet, last_date, message_count, starred,
@@ -297,6 +347,7 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
         }
         drop_summary.execute(params![account, thread])?;
         drop_folders.execute(params![account, thread])?;
+        drop_labels.execute(params![account, thread])?;
         if let Some(summary) = compute(conn, account, thread)? {
             put_summary.execute(params![
                 account,
@@ -312,6 +363,15 @@ pub(super) fn refresh_dirty(conn: &Connection) -> Result<()> {
                 summary.participants,
                 summary.labels,
             ])?;
+            for label in split_field(&summary.labels) {
+                put_label.execute(params![
+                    account,
+                    thread,
+                    label,
+                    summary.last_date,
+                    summary.unread
+                ])?;
+            }
             for folder in &summary.folders {
                 touched.insert((account.clone(), folder.key.clone()));
                 put_folder.execute(params![
@@ -625,18 +685,19 @@ pub struct ThreadList {
     /// More rows pass the filter below the last one returned.
     pub more: bool,
     /// Unread threads in the whole folder, ignoring the filter. `None` for a
-    /// label, which has no unread index.
+    /// label, whose unread count is not part of the paginated listing API.
     pub unread: Option<usize>,
 }
 
-/// Reads one folder's list. Built inside a snapshot, so every read through
+/// Reads one folder or label. Built inside a snapshot, so every read through
 /// it sees the same moment.
 struct ListReader<'a> {
     conn: &'a Connection,
     account: &'a str,
-    /// Folder keys the name matches: one, or a few aliases.
+    index: ListIndex,
+    /// One label or the folder keys the name matches.
     keys: Vec<String>,
-    /// Threads still in the refresh queue that are in this folder, computed
+    /// Threads still in the refresh queue that are in this list, computed
     /// from `messages`, in list order. Usually empty.
     queued: Vec<FolderThread>,
     /// The account has threads in the refresh queue, in any folder.
@@ -645,22 +706,55 @@ struct ListReader<'a> {
     filter: ListFilter,
 }
 
+#[derive(Clone, Copy)]
+enum ListIndex {
+    Folder,
+    Label,
+}
+
+impl ListIndex {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Folder => "thread_folders",
+            Self::Label => "thread_labels",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Folder => "folder_key",
+            Self::Label => "label",
+        }
+    }
+}
+
 impl<'a> ListReader<'a> {
     fn new(conn: &'a Connection, account_id: &'a AccountId, folder: &str) -> Result<Self> {
-        Self::filtered(conn, account_id, folder, ListFilter::default())
+        Self::filtered(
+            conn,
+            account_id,
+            ListSource::Folder(folder),
+            ListFilter::default(),
+        )
     }
 
     fn filtered(
         conn: &'a Connection,
         account_id: &'a AccountId,
-        folder: &str,
+        source: ListSource<'_>,
         filter: ListFilter,
     ) -> Result<Self> {
         let account = account_id.as_str();
-        let keys: Vec<String> = folder_query_names(folder)
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
+        let (index, keys) = match source {
+            ListSource::Folder(folder) => (
+                ListIndex::Folder,
+                folder_query_names(folder)
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
+            ),
+            ListSource::Label(label) => (ListIndex::Label, vec![label.to_owned()]),
+        };
         let mut queued = Vec::new();
         let waiting = queued_threads(conn, account)?;
         let any_queued = !waiting.is_empty();
@@ -668,12 +762,19 @@ impl<'a> ListReader<'a> {
             let Some(summary) = compute(conn, account, &thread)? else {
                 continue;
             };
-            let mut unread = None;
-            for membership in &summary.folders {
-                if keys.contains(&membership.key) {
-                    unread = Some(unread.unwrap_or(false) | membership.unread);
-                }
-            }
+            let unread = match source {
+                ListSource::Folder(_) => summary
+                    .folders
+                    .iter()
+                    .filter(|membership| keys.contains(&membership.key))
+                    .map(|membership| membership.unread)
+                    .reduce(|a, b| a || b),
+                ListSource::Label(label) => summary
+                    .labels
+                    .split('\u{1e}')
+                    .any(|name| !name.is_empty() && name == label)
+                    .then_some(summary.unread),
+            };
             if let Some(unread) = unread {
                 queued.push(folder_thread(&thread, &summary, unread));
             }
@@ -682,6 +783,7 @@ impl<'a> ListReader<'a> {
         Ok(Self {
             conn,
             account,
+            index,
             keys,
             queued,
             any_queued,
@@ -705,8 +807,8 @@ impl<'a> ListReader<'a> {
         let mut found: Vec<FolderThread> = Vec::new();
         for key in &self.keys {
             let (sql, bind) = window_sql(
-                self.account,
-                key,
+                self.index,
+                (self.account, key),
                 lower,
                 upper,
                 from_end,
@@ -803,7 +905,7 @@ impl<'a> ListReader<'a> {
 
     /// Unread threads in the folder. Reads only the unread rows.
     fn unread(&self) -> Result<usize> {
-        let sql = unread_sql(self.keys.len(), self.any_queued);
+        let sql = unread_sql(self.index, self.keys.len(), self.any_queued);
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let mut bind = Vec::with_capacity(1 + self.keys.len());
         bind.push(self.account.to_string());
@@ -841,8 +943,8 @@ fn list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderThread> {
 /// A bound on `(date, thread)` is a range on the date column, which the
 /// index seeks to, plus a filter that only drops rows tied on that date.
 fn window_sql(
-    account: &str,
-    key: &str,
+    index: ListIndex,
+    (account, key): (&str, &str),
     lower: Bound<&ListKey>,
     upper: Bound<&ListKey>,
     from_end: bool,
@@ -850,14 +952,16 @@ fn window_sql(
     filter: &ListFilter,
 ) -> (String, Vec<Value>) {
     let mut bind: Vec<Value> = vec![account.to_string().into(), key.to_string().into()];
-    let mut sql = String::from(
+    let table = index.table();
+    let column = index.key();
+    let mut sql = format!(
         "SELECT ts.thread_id, ts.subject, ts.snippet, tf.last_date, ts.message_count,
                 tf.unread, ts.starred, ts.has_attachment, ts.latest_email,
                 ts.latest_name, ts.participants, ts.labels
-         FROM thread_folders tf INDEXED BY idx_thread_folders_list
+         FROM {table} tf INDEXED BY idx_{table}_list
          CROSS JOIN thread_summary ts
            ON ts.account_id = tf.account_id AND ts.thread_id = tf.thread_id
-         WHERE tf.account_id = ?1 AND tf.folder_key = ?2",
+         WHERE tf.account_id = ?1 AND tf.{column} = ?2",
     );
     if filter.unread_only {
         sql.push_str("\n           AND tf.unread = 1");
@@ -922,7 +1026,9 @@ fn window_sql(
 
 /// `skip_queued` leaves out threads in the refresh queue, whose rows may be
 /// stale. With the queue empty, the per-row check is skipped.
-fn unread_sql(keys: usize, skip_queued: bool) -> String {
+fn unread_sql(index: ListIndex, keys: usize, skip_queued: bool) -> String {
+    let table = index.table();
+    let column = index.key();
     let placeholders = (0..keys)
         .map(|index| format!("?{}", index + 2))
         .collect::<Vec<_>>()
@@ -944,8 +1050,8 @@ fn unread_sql(keys: usize, skip_queued: bool) -> String {
     };
     format!(
         "SELECT {count}
-         FROM thread_folders tf INDEXED BY idx_thread_folders_unread
-         WHERE tf.account_id = ?1 AND tf.folder_key IN ({placeholders}) AND tf.unread = 1
+         FROM {table} tf INDEXED BY idx_{table}_unread
+         WHERE tf.account_id = ?1 AND tf.{column} IN ({placeholders}) AND tf.unread = 1
            {queued}"
     )
 }
@@ -974,8 +1080,7 @@ pub(super) fn folder_page(
 }
 
 /// Up to `limit` rows of `source` below `after` (from the top when `None`)
-/// that pass `filter`. A folder reads its list index, so the cost follows the
-/// rows read; a label reads every thread summary in the account.
+/// that pass `filter`, using the source's list index.
 pub(super) fn thread_list(
     conn: &Connection,
     account_id: &AccountId,
@@ -986,23 +1091,11 @@ pub(super) fn thread_list(
 ) -> Result<ThreadList> {
     in_one_snapshot(conn, || {
         let lower = after.map_or(Unbounded, Excluded);
-        let (mut threads, unread) = match source {
-            ListSource::Folder(folder) => {
-                let reader = ListReader::filtered(conn, account_id, folder, filter.clone())?;
-                let rows = reader.rows(lower, Unbounded, false, Some(limit.saturating_add(1)))?;
-                (rows, Some(reader.unread()?))
-            }
-            ListSource::Label(label) => (
-                label_rows(
-                    conn,
-                    account_id,
-                    label,
-                    filter,
-                    after,
-                    limit.saturating_add(1),
-                )?,
-                None,
-            ),
+        let reader = ListReader::filtered(conn, account_id, source, filter.clone())?;
+        let mut threads = reader.rows(lower, Unbounded, false, Some(limit.saturating_add(1)))?;
+        let unread = match source {
+            ListSource::Folder(_) => Some(reader.unread()?),
+            ListSource::Label(_) => None,
         };
         let more = threads.len() > limit;
         threads.truncate(limit);
@@ -1022,124 +1115,87 @@ pub(super) fn label_page(
     follow: Option<&ThreadId>,
 ) -> Result<(FolderPage, Option<ListKey>)> {
     in_one_snapshot(conn, || {
-        let mut rows = label_rows(
+        let reader = ListReader::filtered(
             conn,
             account,
-            label,
-            &ListFilter::default(),
-            None,
-            usize::MAX,
+            ListSource::Label(label),
+            ListFilter::default(),
         )?;
-        let unread = rows.iter().filter(|row| row.unread).count();
-        let followed = follow
-            .and_then(|id| rows.iter().find(|row| &row.thread_id == id))
-            .map(ListKey::of);
-        let (start, end) = match span {
-            FolderSpan::Top { rows: count } => (0, (*count).min(rows.len())),
-            FolderSpan::Bottom { rows: count } => (rows.len().saturating_sub(*count), rows.len()),
-            FolderSpan::Window {
-                first,
-                last,
-                before,
-                after,
-            } => {
-                let start = first.as_ref().map_or(0, |first| {
-                    rows.partition_point(|row| ListKey::of(row) < *first.min(last))
-                        .saturating_sub(*before)
-                });
-                let end = rows
-                    .partition_point(|row| ListKey::of(row) <= *last)
-                    .saturating_add(*after)
-                    .min(rows.len());
-                (start, end)
+        let page = reader.page(span)?;
+        let followed = match follow {
+            Some(id) => {
+                let current = page
+                    .threads
+                    .iter()
+                    .chain(&reader.queued)
+                    .find(|row| &row.thread_id == id);
+                match current {
+                    Some(row) => Some(ListKey::of(row)),
+                    None => conn
+                        .prepare_cached(
+                            "SELECT last_date FROM thread_labels t
+                             WHERE account_id = ?1 AND thread_id = ?2 AND label = ?3
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM thread_summary_dirty d
+                                   WHERE d.account_id = t.account_id AND d.thread_id = t.thread_id
+                               )",
+                        )?
+                        .query_row(params![account.as_str(), id.0, label], |row| {
+                            Ok(ListKey {
+                                date_unix: row.get(0)?,
+                                thread_id: id.clone(),
+                            })
+                        })
+                        .optional()?,
+                }
             }
+            None => None,
         };
-        let more_after = end < rows.len();
-        rows.truncate(end);
-        rows.drain(..start);
-        Ok((
-            FolderPage {
-                threads: rows,
-                more_before: start != 0,
-                more_after,
-                unread,
-            },
-            followed,
-        ))
+        Ok((page, followed))
     })
 }
 
-/// Threads carrying `label`, in list order. Label tokens sit in
-/// `thread_summary.labels`, which has no index, so this reads every summary
-/// in the account and sorts the matches.
-fn label_rows(
-    conn: &Connection,
-    account_id: &AccountId,
-    label: &str,
-    filter: &ListFilter,
-    after: Option<&ListKey>,
-    limit: usize,
-) -> Result<Vec<FolderThread>> {
-    let account = account_id.as_str();
-    let any_unread = "EXISTS (
-               SELECT 1 FROM messages m
-               WHERE m.account_id = ts.account_id AND m.thread_id = ts.thread_id
-                 AND m.unread = 1
-           )";
-    let mut bind: Vec<Value> = vec![account.to_string().into(), label.to_string().into()];
-    let mut sql = format!(
-        "SELECT ts.thread_id, ts.subject, ts.snippet, ts.last_date, ts.message_count,
-                {any_unread}, ts.starred, ts.has_attachment, ts.latest_email,
-                ts.latest_name, ts.participants, ts.labels
-         FROM thread_summary ts
-         WHERE ts.account_id = ?1
-           AND instr(char(30) || ts.labels || char(30), char(30) || ?2 || char(30)) > 0
-           AND NOT EXISTS (
-               SELECT 1 FROM thread_summary_dirty d
-               WHERE d.account_id = ts.account_id AND d.thread_id = ts.thread_id
-           )"
-    );
-    if let Some(since) = filter.since {
-        bind.push(since.into());
-        sql.push_str(&format!("\n           AND ts.last_date >= ?{}", bind.len()));
-    }
-    if let Some(at) = after {
-        bind.push(at.date_unix.into());
-        bind.push(at.thread_id.0.clone().into());
-        let (date, thread) = (bind.len() - 1, bind.len());
-        sql.push_str(&format!(
-            "\n           AND (ts.last_date < ?{date} OR (ts.last_date = ?{date} AND ts.thread_id > ?{thread}))"
-        ));
-    }
-    if filter.unread_only {
-        sql.push_str(&format!("\n           AND {any_unread}"));
-    }
-    bind.push((limit.min(i64::MAX as usize) as i64).into());
-    sql.push_str(&format!(
-        "\n         ORDER BY ts.last_date DESC, ts.thread_id ASC LIMIT ?{}",
-        bind.len()
-    ));
-    let mut found: Vec<FolderThread> = {
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(bind.iter()), list_row)?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    for thread in queued_threads(conn, account)? {
-        let Some(summary) = compute(conn, account, &thread)? else {
-            continue;
+/// Walk the label prefix of the list index, seeking past all memberships
+/// of each name. A label carried by 100,000 threads costs one seek.
+pub(crate) fn label_names(conn: &Connection, account: &AccountId) -> Result<Vec<String>> {
+    in_one_snapshot(conn, || {
+        let account = account.as_str();
+        let queued = queued_threads(conn, account)?;
+        let skip_queued = if queued.is_empty() {
+            ""
+        } else {
+            "AND NOT EXISTS (
+                 SELECT 1 FROM thread_summary_dirty d
+                 WHERE d.account_id = t.account_id AND d.thread_id = t.thread_id
+             )"
         };
-        if !summary.labels.split('\u{1e}').any(|token| token == label) {
-            continue;
+        let mut next = conn.prepare_cached(&format!(
+            "SELECT label FROM thread_labels t INDEXED BY idx_thread_labels_list
+             WHERE account_id = ?1 AND label > ?2 {skip_queued}
+             ORDER BY label LIMIT 1",
+        ))?;
+        let mut names = BTreeSet::new();
+        let mut last = String::new();
+        while let Some(name) = next
+            .query_row(params![account, last], |r| r.get(0))
+            .optional()?
+        {
+            last = name;
+            names.insert(last.clone());
         }
-        let row = folder_thread(&thread, &summary, summary.unread);
-        let below = after.is_none_or(|at| ListKey::of(&row) > *at);
-        if below && filter.keeps(&row) {
-            found.push(row);
+        for thread in queued {
+            if let Some(summary) = compute(conn, account, &thread)? {
+                names.extend(split_field(&summary.labels));
+            }
         }
-    }
-    found.sort_by_key(ListKey::of);
-    found.truncate(limit);
-    Ok(found)
+        let mut mailboxes = conn.prepare_cached(
+            "SELECT substr(folder, 8) FROM mailbox_views WHERE account_id = ?1 AND kind = 'label'",
+        )?;
+        for label in mailboxes.query_map([account], |r| r.get::<_, String>(0))? {
+            names.extend(split_field(&label?));
+        }
+        Ok(names.into_iter().collect())
+    })
 }
 
 /// Where `thread` sits in `folder`'s list now, or `None` when it is not in
@@ -1626,8 +1682,8 @@ mod tests {
             since: Some(1_600_000_000),
         };
         let (sql, bind) = window_sql(
-            "acct",
-            "inbox",
+            ListIndex::Folder,
+            ("acct", "inbox"),
             Excluded(&key),
             Unbounded,
             false,
@@ -1933,8 +1989,8 @@ mod tests {
             (Unbounded, Excluded(&key), true),
         ] {
             let (sql, bind) = window_sql(
-                "acct",
-                "inbox",
+                ListIndex::Folder,
+                ("acct", "inbox"),
                 lower,
                 upper,
                 from_end,
@@ -1964,7 +2020,11 @@ mod tests {
         }
         let bind: Vec<Value> = vec!["acct".to_string().into(), "inbox".to_string().into()];
         for skip_queued in [false, true] {
-            let plan = plan(&store, &unread_sql(1, skip_queued), &bind);
+            let plan = plan(
+                &store,
+                &unread_sql(ListIndex::Folder, 1, skip_queued),
+                &bind,
+            );
             assert!(
                 plan.iter()
                     .any(|step| step.contains("idx_thread_folders_unread")),
@@ -2011,8 +2071,8 @@ mod tests {
         let full = store.folder_threads(&account().id, "INBOX").unwrap();
         let middle = ListKey::of(&full[threads / 2]);
         let (sql, bind) = window_sql(
-            "acct",
-            "inbox",
+            ListIndex::Folder,
+            ("acct", "inbox"),
             Excluded(&middle),
             Unbounded,
             false,
@@ -2070,6 +2130,96 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn label_pages_backfill_and_follow_the_current_membership() {
+        let path = temp_mailbox("thread-labels-v2");
+        let account = account();
+        let (older, newer) = {
+            let store = Store::open(&path).unwrap();
+            store.upsert_account(&account).unwrap();
+            let mut rng = Rng(17);
+            let messages = [(10, "work", true), (20, "work", false), (30, "Work", true)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (date, label, unread))| {
+                    let mut message = message(&mut rng, index, &[]);
+                    message.headers.date_unix = date;
+                    message.labels = vec![label.into()];
+                    message.unread = unread;
+                    message
+                })
+                .collect();
+            store
+                .apply_delta(
+                    &account.id,
+                    &MailboxDelta {
+                        messages,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let (page, _) = store
+                .label_page(&account.id, "work", &FolderSpan::Top { rows: 2 }, None)
+                .unwrap();
+            assert_eq!(page.threads.len(), 2);
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE thread_labels;
+                 UPDATE meta SET value = '2' WHERE key = 'thread_summary';",
+                )
+                .unwrap();
+            (ListKey::of(&page.threads[1]), ListKey::of(&page.threads[0]))
+        };
+        let store = Store::open(&path).unwrap();
+        assert_eq!(summary_version_of(&store), SUMMARY_VERSION);
+        assert_eq!(store.list_labels(&account.id).unwrap(), ["Work", "work"]);
+        let (top, followed) = store
+            .label_page(
+                &account.id,
+                "work",
+                &FolderSpan::Top { rows: 1 },
+                Some(&older.thread_id),
+            )
+            .unwrap();
+        assert_eq!(followed, Some(older.clone()));
+        assert_eq!(ListKey::of(&top.threads[0]), newer);
+        assert_eq!(top.unread, 1);
+        assert!(!top.more_before && top.more_after);
+        let (bottom, _) = store
+            .label_page(&account.id, "work", &FolderSpan::Bottom { rows: 1 }, None)
+            .unwrap();
+        assert_eq!(ListKey::of(&bottom.threads[0]), older);
+        assert!(bottom.more_before && !bottom.more_after);
+        for flush in [false, true] {
+            if flush {
+                super::super::immediate_transaction(&store.conn)
+                    .unwrap()
+                    .commit()
+                    .unwrap();
+            } else {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE messages SET labels = 'personal', unread = 0 WHERE labels = 'Work'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                store.list_labels(&account.id).unwrap(),
+                ["personal", "work"]
+            );
+            let (page, _) = store
+                .label_page(&account.id, "personal", &FolderSpan::Top { rows: 1 }, None)
+                .unwrap();
+            assert_eq!(page.threads.len(), 1);
+            assert_eq!(page.unread, 0);
+        }
+        drop(store);
+        remove_mailbox(&path);
     }
 
     fn snippet_of(store: &Store, thread: &str) -> String {

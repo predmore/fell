@@ -55,12 +55,16 @@ pub(super) fn observe(
     let removed = before
         .iter()
         .any(|keyword| is_label(keyword) && !contains(&unique, keyword));
-    let added: Vec<_> = unique
+    let mut added: Vec<_> = unique
         .into_iter()
         .filter(|keyword| is_label(keyword) && !contains(&before, keyword))
         .collect();
     if !added.is_empty() {
-        expire_readd_suppression(conn, account_id, &message_id, &added)?;
+        let unsettled = crate::outbox::labels::unsettled_labels(conn, account_id, &message_id)?;
+        added.retain(|keyword| !contains(&unsettled, keyword));
+        if !added.is_empty() {
+            expire_readd_suppression(conn, account_id, &message_id, &added)?;
+        }
     }
     conn.prepare_cached(
         "UPDATE message_copies SET keywords = ?5
@@ -89,8 +93,9 @@ pub(super) fn reconcile(
     let mut managed = managed_labels(conn, account_id, message_id)?;
     let before = managed.clone();
     if check_removed && !managed.is_empty() {
+        let unsettled = crate::outbox::labels::unsettled_labels(conn, account_id, message_id)?;
         let supported = supported_keywords(conn, account_id, message_id)?;
-        managed.retain(|keyword| contains(&supported, keyword));
+        managed.retain(|keyword| contains(&supported, keyword) || contains(&unsettled, keyword));
     }
     if added.is_empty() && managed == before {
         return Ok(false);

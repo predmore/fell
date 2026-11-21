@@ -77,17 +77,25 @@ impl WriteSession {
         keyword: &str,
     ) -> Result<Option<bool>, WriteError> {
         let reply = self.run("UID FETCH", &format!("UID FETCH {uid} (UID FLAGS)"))?;
-        Ok(reply
+        let flags = reply
             .untagged
             .iter()
             .filter_map(|line| parse_flags(&line.text))
-            .find(|flags| flags.uid == uid)
-            .map(|flags| {
-                flags
-                    .flags
-                    .iter()
-                    .any(|flag| flag.eq_ignore_ascii_case(keyword))
-            }))
+            .find(|flags| flags.uid == uid);
+        if flags.is_none()
+            && reply
+                .untagged
+                .iter()
+                .any(|line| super::uid_in_fetch_text(&line.text) == Some(uid))
+        {
+            return Err(WriteError::Refused("UID FETCH returned no FLAGS".into()));
+        }
+        Ok(flags.map(|flags| {
+            flags
+                .flags
+                .iter()
+                .any(|flag| flag.eq_ignore_ascii_case(keyword))
+        }))
     }
 
     pub(in crate::imap) fn set_keyword(
@@ -96,10 +104,21 @@ impl WriteSession {
         keyword: &str,
         value: bool,
     ) -> Result<(), WriteError> {
+        if !crate::outbox::labels::keyword_atom(keyword) {
+            return Err(WriteError::Refused("expected a single IMAP keyword".into()));
+        }
+        self.store_one_flag(uid, keyword, value)
+    }
+
+    pub(in crate::imap) fn mark_deleted(&mut self, uid: u32) -> Result<(), WriteError> {
+        self.store_one_flag(uid, "\\Deleted", true)
+    }
+
+    fn store_one_flag(&mut self, uid: u32, flag: &str, value: bool) -> Result<(), WriteError> {
         let sign = if value { '+' } else { '-' };
         self.run(
             "UID STORE",
-            &format!("UID STORE {uid} {sign}FLAGS.SILENT ({keyword})"),
+            &format!("UID STORE {uid} {sign}FLAGS.SILENT ({flag})"),
         )
         .map(|_| ())
     }
