@@ -3,6 +3,7 @@
 mod attachment_actions;
 mod attachment_chips;
 mod disclosure;
+mod help;
 mod search;
 
 use std::cell::OnceCell;
@@ -291,6 +292,7 @@ struct Inbox {
     conv_scroll: ScrollHandle,
     palette_scroll: ScrollHandle,
     folder_scroll: ScrollHandle,
+    help_scroll: help::HelpScroll,
     search_view: search::SearchView,
     search_preview: gpui::Entity<search::CachedPreview>,
     search_rows: gpui::Entity<search::CachedRows>,
@@ -436,6 +438,7 @@ impl Inbox {
             conv_scroll: ScrollHandle::new(),
             palette_scroll: ScrollHandle::new(),
             folder_scroll: ScrollHandle::new(),
+            help_scroll: help::HelpScroll::default(),
             search_view: search::SearchView::default(),
             search_preview: cx.new(|_| search::CachedPreview::new(reader.clone())),
             search_rows: cx.new(|_| search::CachedRows(reader)),
@@ -2719,6 +2722,18 @@ impl Inbox {
         // Input never waits on an animation.
         self.settle_motion();
         window.focus(&self.focus);
+        if self.session.overlay == Overlay::Help {
+            let now = self.motion.clock.now();
+            self.help_scroll.prepare(now, || {
+                help::Layout::for_window(&self.theme, &self.session, window)
+            });
+            if self.help_scroll.on_key(key, &self.motion.motion, now) {
+                self.motion.end_key();
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
         // The wheel moves the viewport without moving message_cursor. j, k,
         // and q aim at the message now on screen in either pane. Enter and o
         // do that only while the conversation is focused, so they expand the
@@ -2766,6 +2781,7 @@ impl Inbox {
             pane: self.session.pane,
             searching: self.session.search.is_some(),
             search_generation: self.session.search_generation,
+            help_open: self.session.overlay == Overlay::Help,
         }
     }
 
@@ -2777,7 +2793,11 @@ impl Inbox {
             pane: pane_before,
             searching,
             search_generation,
+            help_open,
         } = before;
+        if !help_open && self.session.overlay == Overlay::Help {
+            self.help_scroll = help::HelpScroll::default();
+        }
         let search_changed = self.after_search_step(&step, searching, search_generation, cx);
         if self.open_thread.is_some() && self.open_thread == self.session.cursor_id {
             if step.reveal_attachment {
@@ -3356,7 +3376,8 @@ impl Render for Inbox {
         let animating = self.motion.tick(now)
             | self.row_widths.running(now)
             | spin_attachment
-            | self.search_view.animating(now);
+            | self.search_view.animating(now)
+            | (self.session.overlay == Overlay::Help && self.help_scroll.running(now));
         if animating {
             window.request_animation_frame();
         } else {
@@ -3369,8 +3390,6 @@ impl Render for Inbox {
         let theme = self.theme.clone();
         let list_scroll = self.list_scroll.clone();
         let conv_scroll = self.conv_scroll.clone();
-        let palette_scroll = self.palette_scroll.clone();
-        let folder_scroll = self.folder_scroll.clone();
         let focus = self.focus.clone();
         let split = self.split;
         let card = self
@@ -3386,23 +3405,29 @@ impl Render for Inbox {
             leaving.push(which_key_popup(&theme, &self.session, (opacity, 0.0)).into_any_element());
             layer.swap(&mut self.session);
         }
+        let mut overlay_card = |session: &Session, motion, live| {
+            let help = self
+                .help_scroll
+                .card(&theme, session, window, now, live, cx);
+            overlay(
+                &theme,
+                session,
+                motion,
+                card,
+                live,
+                &self.palette_scroll,
+                &self.folder_scroll,
+                help,
+                cx,
+            )
+        };
         if let Some((layer, opacity)) = self.motion.closing_overlay(now) {
             layer.swap(&mut self.session);
-            leaving.push(
-                overlay(
-                    &theme,
-                    &self.session,
-                    (opacity, 0.0),
-                    card,
-                    false,
-                    &palette_scroll,
-                    &folder_scroll,
-                    cx,
-                )
-                .into_any_element(),
-            );
+            leaving.push(overlay_card(&self.session, (opacity, 0.0), false).into_any_element());
             layer.swap(&mut self.session);
         }
+        let active_overlay = (self.session.overlay != Overlay::None)
+            .then(|| overlay_card(&self.session, self.motion.overlay(now), true));
         let warm = self.warm_layer(width, panes, animating, window, cx);
         let subject = self.shown_subject();
         let cached_preview = self.search_preview_for(panes, animating || refreshing_body, &subject);
@@ -3423,7 +3448,7 @@ impl Render for Inbox {
                 folder: self.list_folder.clone(),
                 leaving,
                 warm,
-                card,
+                active_overlay,
                 conv,
                 cached_preview,
                 cached_search_rows,
@@ -3433,8 +3458,6 @@ impl Render for Inbox {
             split,
             list_scroll,
             conv_scroll,
-            palette_scroll,
-            folder_scroll,
             focus,
             window,
             cx,
@@ -3480,8 +3503,7 @@ struct Shown {
     leaving: Vec<gpui::AnyElement>,
     /// What a `G` will show, drawn unseen under the panes.
     warm: Option<gpui::AnyElement>,
-    /// The palette's or folder picker's height as drawn this frame.
-    card: Option<f32>,
+    active_overlay: Option<gpui::Div>,
     /// The folder the rows on screen come from. The header names it, so
     /// after `gs` its name and count change in the frame the rows do.
     folder: String,
@@ -3554,8 +3576,6 @@ fn shell(
     split: f32,
     list_scroll: UniformListScrollHandle,
     conv_scroll: ScrollHandle,
-    palette_scroll: ScrollHandle,
-    folder_scroll: ScrollHandle,
     focus: FocusHandle,
     window: &Window,
     cx: &mut Context<Inbox>,
@@ -3570,7 +3590,7 @@ fn shell(
         folder,
         leaving,
         warm,
-        card,
+        active_overlay,
         conv,
         cached_preview,
         cached_search_rows,
@@ -3774,18 +3794,7 @@ fn shell(
             session.which_visible && session.overlay == Overlay::None && !session.chord.is_empty(),
             |root| root.child(which_key_popup(&theme, session, motion.which(now))),
         )
-        .when(session.overlay != Overlay::None, |root| {
-            root.child(overlay(
-                &theme,
-                session,
-                motion.overlay(now),
-                card,
-                true,
-                &palette_scroll,
-                &folder_scroll,
-                cx,
-            ))
-        })
+        .children(active_overlay)
 }
 
 /// Whether a conversation drawn takes the pointer. The warm copies
@@ -4133,6 +4142,7 @@ struct StepBefore {
     pane: Pane,
     searching: bool,
     search_generation: u64,
+    help_open: bool,
 }
 
 /// How a thread row is drawn.
@@ -6309,7 +6319,15 @@ fn which_key_popup(theme: &Theme, session: &Session, (opacity, rise): (f32, f32)
                         .text_color(rgb(theme.accent))
                         .child(item.key),
                 )
-                .child(div().child(item.label))
+                .child(div().flex_1().child(item.label))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_none()
+                        .text_right()
+                        .text_color(rgb(theme.dimmed))
+                        .children(item.is_group.then_some("›")),
+                )
         }))
 }
 
@@ -6378,8 +6396,6 @@ fn about_palette_height(theme: &Theme, window: &Window) -> f32 {
         .unwrap_or(mono_px + 4.0);
     theme.ui_px + 4.0 + stamp_height + 2.0 * ABOUT_ROW_PAD_Y + ABOUT_ROW_GAP
 }
-const HELP_PX: f32 = 520.0;
-
 /// `(opacity, drop)`: the card fades in as it settles the last few pixels
 /// down; its width never changes, so nothing in it re-flows. `card`: the
 /// palette's or folder picker's height, easing to fit its items. `live`: false
@@ -6394,8 +6410,10 @@ fn overlay(
     live: bool,
     palette_scroll: &ScrollHandle,
     folder_scroll: &ScrollHandle,
+    help: Option<(f32, gpui::Div)>,
     cx: &mut Context<Inbox>,
 ) -> gpui::Div {
+    let top = help.as_ref().map_or(CARD_TOP_PX, |(top, _)| *top);
     div()
         .absolute()
         .top(px(0.))
@@ -6404,7 +6422,7 @@ fn overlay(
         .bottom(px(0.))
         .flex()
         .justify_center()
-        .pt(px(CARD_TOP_PX - drop))
+        .pt(px((top - drop).max(0.)))
         .when(session.overlay == Overlay::About, |layer| {
             layer.items_start()
         })
@@ -6426,7 +6444,10 @@ fn overlay(
                 .when_some(card, |card, height| card.h(px(height)))
                 .opacity(opacity)
                 .into_any_element(),
-            Overlay::Help => help(theme, session, cx).opacity(opacity).into_any_element(),
+            Overlay::Help => help
+                .map_or_else(div, |(_, content)| content)
+                .opacity(opacity)
+                .into_any_element(),
             Overlay::About => about(theme, cx).opacity(opacity).into_any_element(),
             Overlay::None => div().into_any_element(),
         })
@@ -6703,83 +6724,6 @@ fn folder_picker(
                                 .text_color(rgb(detail_color))
                                 .child(name)
                         }))
-                })),
-        )
-}
-
-fn help(theme: &Theme, session: &Session, cx: &mut Context<Inbox>) -> gpui::Div {
-    let lines: Vec<_> = Action::all()
-        .iter()
-        .copied()
-        .filter(|action| *action != Action::About)
-        .map(|action| {
-            (
-                action.label().to_string(),
-                crate::keymap::binding_text(&session.keymap, action),
-            )
-        })
-        .collect();
-    div()
-        .w(px(HELP_PX))
-        .max_h(px(460.))
-        .bg(rgb(theme.surface))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .rounded_md()
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .on_mouse_down(
-            MouseButton::Left,
-            // A card fading out after it closed lets clicks through.
-            cx.listener(|inbox, _, _, cx| {
-                if inbox.session.overlay != Overlay::None {
-                    cx.stop_propagation();
-                }
-            }),
-        )
-        .child(
-            div()
-                .px(px(14.))
-                .py(px(10.))
-                .border_b(px(1.))
-                .border_color(rgb(theme.border))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Keys"),
-        )
-        .when_some(session.detail_text(), |card, error| {
-            card.child(
-                div()
-                    .px(px(14.))
-                    .py(px(8.))
-                    .text_color(rgb(theme.error))
-                    .child(error),
-            )
-        })
-        .child(
-            div()
-                .id("help-rows")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .px(px(14.))
-                .py(px(8.))
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .children(lines.into_iter().map(|(label, binding)| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(12.))
-                        .child(div().flex_1().child(label))
-                        .child(
-                            div()
-                                .font_family_opt(theme.mono_family.clone())
-                                .text_color(rgb(theme.dimmed))
-                                .child(binding),
-                        )
                 })),
         )
 }
